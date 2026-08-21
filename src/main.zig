@@ -13,7 +13,12 @@ fn enableRawMode(fd: posix.fd_t) !posix.termios {
     raw.lflag.ISIG = false;
     raw.lflag.IEXTEN = false;
     raw.iflag.IXON = false;
+    raw.iflag.ICRNL = false;
     raw.oflag.OPOST = false;
+    raw.iflag.BRKINT = false;
+    raw.iflag.INPCK = false;
+    raw.iflag.ISTRIP = false;
+    raw.cflag.CSIZE = .CS8;
     raw.cc[@intFromEnum(posix.V.MIN)] = 1;
     raw.cc[@intFromEnum(posix.V.TIME)] = 0;
     try posix.tcsetattr(fd, .FLUSH, raw);
