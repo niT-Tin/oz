@@ -5,6 +5,11 @@ const ascii = std.ascii;
 
 const oz = @import("oz");
 
+fn die(message: []const u8) noreturn {
+    std.debug.print("{s}\r\n", .{message});
+    std.os.exit(1);
+}
+
 fn enableRawMode(fd: posix.fd_t) !posix.termios {
     const original = try posix.tcgetattr(fd);
     var raw = original;
@@ -26,13 +31,18 @@ fn enableRawMode(fd: posix.fd_t) !posix.termios {
 }
 
 fn disableRawMode(fd: posix.fd_t, original: posix.termios) void {
-    posix.tcsetattr(fd, .FLUSH, original) catch {};
+    posix.tcsetattr(fd, .FLUSH, original) catch |err| {
+        // allocator?
+        die(std.fmt.allocPrint("Error restoring terminal attributes: {s}", .{err}));
+    };
 }
 
 pub fn main(init: std.process.Init) !void {
     _ = init;
     const fd = posix.STDIN_FILENO;
-    const original = try enableRawMode(fd);
+    const original = enableRawMode(fd) catch |err| {
+        die(std.fmt.allocPrint("Error enabling raw mode: {s}", .{err}));
+    };
     defer disableRawMode(fd, original);
 
     var buf: [1]u8 = undefined;
@@ -43,7 +53,7 @@ pub fn main(init: std.process.Init) !void {
         if (ascii.isControl(buf[0])) {
             std.debug.print("{d}\r\n", .{buf[0]});
         } else {
-            std.debug.print("{d} ('{c}')\r\n", .{buf[0], buf[0]});
+            std.debug.print("{d} ('{c}')\r\n", .{ buf[0], buf[0] });
         }
     }
 }
