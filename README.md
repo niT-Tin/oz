@@ -1,6 +1,6 @@
 # oz
 
-一个从零开始实现的终端文本编辑器，使用 Zig 编写（学习项目，灵感来自 [kilo](https://viewsourcecode.org/snaptoken/kilo/)）。
+自己实现、自己用的终端文本编辑器，使用 Zig 编写。
 
 ## 构建与运行
 
