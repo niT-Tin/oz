@@ -4437,3 +4437,145 @@ test "e2e: cc replaces the whole line and enters insert" {
     _ = try f.readPositionalAll(io, buf, 0);
     try std.testing.expectEqualStrings("aaa\nbbb\nX", buf);
 }
+
+test "file tree: Ctrl-w h/l switches focus between sidebar and buffer" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}foc.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "one\ntwo\nthree\nfour\nfive\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    const sel_bg = packRgb(54, 74, 130);
+
+    // open file tree; default focus is the sidebar
+    try sess.send(" e");
+    waited = 0;
+    while (!grid.contains("files")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    // j moves the sidebar selection to row 2 (content rows start at 1)
+    try sess.send("j");
+    waited = 0;
+    while (!grid.rowHasBg(2, sel_bg)) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.rowHasBg(2, sel_bg));
+
+    // Ctrl-w h → buffer focus; j now moves the buffer cursor (line 2, 3…)
+    try sess.send("\x17");
+    try sess.send("h");
+    try sess.send("j");
+    waited = 0;
+    while (!grid.contains("line 2/")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("line 2/"));
+    try sess.send("j");
+    waited = 0;
+    while (!grid.contains("line 3/")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("line 3/"));
+
+    // Ctrl-w l → sidebar focus again; j moves the sidebar (highlight follows)
+    try sess.send("\x17");
+    try sess.send("l");
+    waited = 0;
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 2000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        break;
+    }
+    try sess.send("j");
+    waited = 0;
+    var sel_moved = false;
+    while (!sel_moved) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        // the sidebar selection (54,74,130) must have moved to row 3
+        if (grid.rowHasBg(3, sel_bg)) sel_moved = true;
+    }
+    try std.testing.expect(sel_moved);
+
+    // h closes the tree back to buffer focus
+    try sess.send("h");
+    waited = 0;
+    while (grid.contains("files")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("files"));
+
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}

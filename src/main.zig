@@ -91,6 +91,12 @@ const App = struct {
     /// Scroll-window top for the sidebar: the selection moves freely inside
     /// the window; the window scrolls only when it crosses an edge.
     filetree_top: usize = 0,
+    /// Window focus (vim Ctrl-w hjkl): which pane receives hjkl — the
+    /// file-tree sidebar or the buffer. The sidebar keeps rendering either
+    /// way; only the focused pane reacts to keys.
+    focus: enum { buffer, filetree } = .buffer,
+    /// Ctrl-w seen, awaiting the window-motion key (h/l/j/k).
+    pending_window: bool = false,
     filetree_files: std.ArrayList([]u8) = .empty,
 
     // fuzzy picker (<leader>sf / <leader>st / <leader>sb / <leader>sr)
@@ -219,8 +225,31 @@ const App = struct {
             return;
         }
 
-        // File tree navigation (j/k/Enter/Esc); other keys fall through
-        if (self.filetree_active) {
+        // Ctrl-w window commands: switch keyboard focus between the file-tree
+        // sidebar and the buffer (vim window navigation). Not in insert mode
+        // — there Ctrl+w still deletes the word before the cursor.
+        if (key.codepoint == 'w' and key.mods.ctrl and self.state.mode != .insert) {
+            self.pending_window = true;
+            return;
+        }
+        if (self.pending_window) {
+            self.pending_window = false;
+            if (key.codepoint == vaxis.Key.escape) return;
+            switch (key.codepoint) {
+                'h', 'l', 'j', 'k' => {
+                    if (self.filetree_active) {
+                        self.focus = if (self.focus == .filetree) .buffer else .filetree;
+                    }
+                },
+                else => {},
+            }
+            return;
+        }
+
+        // File tree navigation (j/k/Enter/Esc); other keys fall through.
+        // Only the focused pane reacts: with buffer focus the sidebar stays
+        // visible but hjkl move the buffer cursor.
+        if (self.filetree_active and self.focus == .filetree) {
             if (try self.filetreeKey(key)) return;
         }
 
@@ -1252,6 +1281,7 @@ const App = struct {
         }
         self.filetree_top = 0;
         self.filetree_sel = 0;
+        self.focus = .filetree;
         if (self.filetree_files.items.len == 0) {
             var root = try std.Io.Dir.cwd().openDir(self.io, ".", .{ .iterate = true });
             defer root.close(self.io);
@@ -1269,6 +1299,7 @@ const App = struct {
         if (self.filetree_files.items.len == 0) {
             try self.toggleFiletree();
         }
+        self.focus = .filetree;
         if (self.cur().path) |p| {
             for (self.filetree_files.items, 0..) |f, i| {
                 if (std.mem.eql(u8, f, p)) {
@@ -1292,16 +1323,27 @@ const App = struct {
                 if (self.filetree_sel > 0) self.filetree_sel -= 1;
                 return true;
             },
+            'h', vaxis.Key.left => {
+                // vim-ish: h closes the tree back to the buffer focus
+                self.filetree_active = false;
+                self.focus = .buffer;
+                return true;
+            },
+            'l', vaxis.Key.right => {
+                return true; // no expansion in M1; swallow
+            },
             vaxis.Key.enter => {
                 if (self.filetree_files.items.len > 0) {
                     const f = self.filetree_files.items[self.filetree_sel];
                     self.filetree_active = false;
+                    self.focus = .buffer;
                     try self.openFile(f);
                 }
                 return true;
             },
             vaxis.Key.escape => {
                 self.filetree_active = false;
+                self.focus = .buffer;
                 return true;
             },
             else => return false,
@@ -1441,6 +1483,7 @@ const App = struct {
                 // navigation mode so j/k/↑↓ control the buffer afterwards
                 // (vim: picker confirm drops focus back to the buffer).
                 self.filetree_active = false;
+                self.focus = .buffer;
                 if (self.picker_mode == .grep) {
                     if (self.grep_results.items.len > 0) {
                         const r = self.grep_results.items[self.picker_sel];
@@ -2554,13 +2597,22 @@ const App = struct {
         }};
         _ = win.print(&status_seg, .{ .row_offset = @intCast(height - 1), .wrap = .none });
 
-        // cursor position
-        const cursor_col = self.cur().cursor - self.cur().pt.lineStart(cursor_line);
-        const cursor_row = cursor_line - self.cur().view_top + self.contentTop();
-        self.vx.screen.cursor = .{
-            .row = @intCast(cursor_row),
-            .col = @intCast(self.contentCol() + gutter + cursor_col), // gutter offset
-        };
+        // cursor position — in the file tree when the tree has focus,
+        // otherwise in the buffer
+        if (self.filetree_active and self.focus == .filetree) {
+            const sel_row: u32 = 1 + @as(u32, @intCast(self.filetree_sel -| self.filetree_top));
+            self.vx.screen.cursor = .{
+                .row = @intCast(sel_row),
+                .col = 0,
+            };
+        } else {
+            const cursor_col = self.cur().cursor - self.cur().pt.lineStart(cursor_line);
+            const cursor_row = cursor_line - self.cur().view_top + self.contentTop();
+            self.vx.screen.cursor = .{
+                .row = @intCast(cursor_row),
+                .col = @intCast(self.contentCol() + gutter + cursor_col), // gutter offset
+            };
+        }
         self.vx.screen.cursor_vis = true;
         self.vx.screen.cursor_shape = if (self.state.mode == .insert) .beam else .block;
 
