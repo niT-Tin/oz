@@ -428,10 +428,14 @@ const App = struct {
                 try self.deleteWordBefore();
                 return;
             }
-            // Tab: insert indentation (vim default: a tab character)
+            // Tab: insert indentation. Spaces, not a literal tab: a \t is a
+            // terminal control character whose display width differs between
+            // the terminal and vaxis's cell grid (causing the cursor/char
+            // misalignment bug). vim default without expandtab is a tab, but
+            // spaces are predictable here (M1).
             if (key.codepoint == vaxis.Key.tab) {
                 self.prev_insert_key = key;
-                try self.insertText("\t");
+                try self.insertText("    ");
                 return;
             }
             // Alt+b / Alt+f: emacs word motion. Pure cursor movement — no
@@ -2651,7 +2655,12 @@ const App = struct {
 
             const line_len = self.cur().pt.lineLen(line);
             const line_start = self.cur().pt.lineStart(line);
-            const n: u32 = @min(line_len, win.width);
+            var n: u32 = @min(line_len, win.width);
+            // don't cut a multibyte char in half at the line end — a lone
+            // UTF-8 continuation byte renders as U+FFFD ("box with ?")
+            while (n > 0 and n < line_len and (self.cur().pt.byteAt(line_start + n) & 0xC0) == 0x80) {
+                n -= 1;
+            }
             const text = try a.alloc(u8, n);
             self.cur().pt.copyRange(line_start, text);
 
@@ -2857,16 +2866,21 @@ const App = struct {
             return;
         }
 
-        // insert-mode completion menu (Ctrl+n): a picker-style list right
-        // above the status bar; the selected row is highlighted like the
+        // insert-mode completion menu (Ctrl+n): a vim-style list directly
+        // below the cursor line; the selected row is highlighted like the
         // fuzzy picker's selection. The buffer cursor is left untouched.
         if (self.completion_active) {
             const total = self.completion_words.items.len;
             const list_rows = @min(@as(usize, 8), total);
-            // keep the selection inside the window
             var top: usize = 0;
             if (self.completion_sel >= list_rows) top = self.completion_sel - list_rows + 1;
-            const start_row = height - 1 - @as(u32, @intCast(list_rows)) - 1;
+            const c_line = self.cur().pt.lineOf(self.cur().cursor);
+            const c_col = self.cur().cursor - self.cur().pt.lineStart(c_line);
+            var start_row = c_line - self.cur().view_top + self.contentTop() + 1;
+            if (start_row + list_rows > height) {
+                // near the bottom: show the menu above the cursor instead
+                start_row = c_line - self.cur().view_top + self.contentTop() - list_rows;
+            }
             var k: usize = 0;
             while (k < list_rows) : (k += 1) {
                 const seg = [_]vaxis.Segment{.{
@@ -2876,7 +2890,11 @@ const App = struct {
                     else
                         .{},
                 }};
-                _ = win.print(&seg, .{ .row_offset = @intCast(start_row + k), .wrap = .none });
+                _ = win.print(&seg, .{
+                    .row_offset = @intCast(start_row + k),
+                    .col_offset = @intCast(self.contentCol() + gutter + c_col),
+                    .wrap = .none,
+                });
             }
         }
 

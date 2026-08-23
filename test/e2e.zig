@@ -4645,7 +4645,7 @@ test "insert Ctrl+n: keyword completion inserts the top candidate" {
         }
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
-        var r: usize = 15;
+        var r: usize = 1;
         while (r < grid.rows) : (r += 1) {
             if (grid.rowHasBg(r, sel_bg) and rowContains(&grid, r, "alpha")) {
                 menu_shown = true;
@@ -4753,7 +4753,7 @@ test "insert Ctrl+n: Esc dismisses the menu and stays in insert" {
         }
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
-        var r: usize = 15;
+        var r: usize = 1;
         while (r < grid.rows) : (r += 1) {
             if (grid.rowHasBg(r, sel_bg) and rowContains(&grid, r, "alpha")) {
                 menu_shown = true;
