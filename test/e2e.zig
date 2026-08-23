@@ -5259,3 +5259,210 @@ test "insert: typing 'j' at end of a line keeps the next line's first word color
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
+
+test "windows: :vs splits side-by-side; Ctrl-w l/h switch; :q closes one; :qa quits" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}win.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "line1\nline2\nline3\nline4\nline5\nline6\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // :vs — vertical split: both halves show line1 (left col 4+, right col 44+)
+    try sess.send(":vs\r");
+    waited = 0;
+    var both = false;
+    while (!both) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        const row = grid.rowText(1);
+        both = std.mem.indexOf(u8, row[44..], "line1") != null and std.mem.indexOf(u8, row[0..40], "line1") != null;
+    }
+    if (!both) {
+        std.debug.print("after :vs:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(both);
+
+    // the new (right) window has focus; Ctrl-w h → left window, j moves its
+    // cursor independently (state bar shows line 2/7), Ctrl-w l back to the
+    // right window which still sits on line 1.
+    try sess.send("\x17h");
+    waited = 0;
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 2000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        break;
+    }
+    try sess.send("j");
+    waited = 0;
+    while (!grid.contains("line 2/7")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!grid.contains("line 2/7")) {
+        std.debug.print("after Ctrl-w h + j:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("line 2/7"));
+    try sess.send("\x17l");
+    waited = 0;
+    while (!grid.contains("line 1/7")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("line 1/7"));
+
+    // :q closes the focused (right) window → single window again
+    try sess.send(":q\r");
+    waited = 0;
+    var single = false;
+    while (!single) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        const row = grid.rowText(1);
+        single = std.mem.indexOf(u8, row[0..80], "line1") != null and std.mem.indexOf(u8, row[44..], "line1") == null;
+    }
+    if (!single) {
+        std.debug.print("after :q (window close):\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(single);
+
+    // :qa exits the editor entirely
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "windows: :sp splits stacked; each window scrolls independently" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}winsp.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "topline\nsecond\nthird\nfourth\nfifth\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // :sp — horizontal split: line 1 shows "topline" twice (top row 1 and the
+    // bottom half starts at row 12)
+    try sess.send(":sp\r");
+    waited = 0;
+    var both = false;
+    while (!both) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        both = rowContains(&grid, 1, "topline") and rowContains(&grid, 12, "topline");
+    }
+    if (!both) {
+        std.debug.print("after :sp:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(both);
+
+    // both windows keep independent viewports: bottom window (focused) scrolls
+    // down with G, top window stays on line 1
+    try sess.send("G");
+    waited = 0;
+    while (!grid.contains("line 6/6")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("line 6/6"));
+    try std.testing.expect(rowContains(&grid, 1, "topline")); // top window unchanged
+
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}

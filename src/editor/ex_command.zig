@@ -13,6 +13,12 @@ pub const Command = union(enum) {
     quit_force,
     /// :wq — write then quit.
     write_quit,
+    /// :qa / :qa! — quit every window/buffer (exit the editor).
+    quit_all,
+    /// :vs — vertical split (side-by-side windows).
+    vsplit,
+    /// :sp — horizontal split (stacked windows).
+    split,
     /// :e <file> — open file (replacing the current buffer).
     edit: []const u8,
     /// :bn / :bp / :bd / :ls — buffer management (M0: single buffer).
@@ -74,7 +80,13 @@ pub fn parse(line: []const u8) Command {
     if (std.mem.eql(u8, word, "q") or std.mem.eql(u8, word, "quit")) {
         return if (args.len == 0) .quit else .unknown;
     }
-    if (std.mem.eql(u8, word, "q!")) return .quit_force;
+    if (std.mem.eql(u8, word, "q!") or std.mem.eql(u8, word, "quit!")) return .quit_force;
+    if (std.mem.eql(u8, word, "qa") or std.mem.eql(u8, word, "qall") or
+        std.mem.eql(u8, word, "qa!") or std.mem.eql(u8, word, "qall!")) return .quit_all;
+    if (std.mem.eql(u8, word, "vs") or std.mem.eql(u8, word, "vsplit") or
+        std.mem.eql(u8, word, "vnew")) return .vsplit;
+    if (std.mem.eql(u8, word, "sp") or std.mem.eql(u8, word, "split") or
+        std.mem.eql(u8, word, "new")) return .split;
     if (std.mem.eql(u8, word, "wq") or std.mem.eql(u8, word, "x")) {
         return if (args.len == 0) .write_quit else .unknown;
     }
@@ -142,6 +154,12 @@ test "parse: write/quit family" {
     try std.testing.expect(parse("wq") == .write_quit);
     try std.testing.expect(parse("") == .empty);
     try std.testing.expect(parse("   ") == .empty);
+    try std.testing.expect(parse("qa") == .quit_all);
+    try std.testing.expect(parse("qall!") == .quit_all);
+    try std.testing.expect(parse("vs") == .vsplit);
+    try std.testing.expect(parse("vsplit") == .vsplit);
+    try std.testing.expect(parse("sp") == .split);
+    try std.testing.expect(parse("split") == .split);
 }
 
 test "parse: edit with and without args" {

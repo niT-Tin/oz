@@ -23,13 +23,35 @@ const status_row_count: u32 = 1;
 const App = struct {
     /// One open document. `pt`/`history` own their allocations; the struct is
     /// moved between the list and the active slots (never copied-and-deinit'd).
+    /// Cursor/viewport live in Window — the same buffer may be shown in
+    /// several split windows with independent cursors.
     const Buffer = struct {
         pt: buffer.PieceTable,
         history: buffer.History,
-        cursor: u32 = 0,
-        view_top: u32 = 0,
         path: ?[]u8 = null,
         dirty: bool = false,
+    };
+
+    /// One split window: which buffer it shows plus its own cursor/viewport.
+    const Window = struct {
+        buf: usize = 0,
+        cursor: u32 = 0,
+        view_top: u32 = 0,
+    };
+
+    /// Split orientation (vim: :sp = horizontal split = stacked rows,
+    /// :vs = vertical split = side-by-side columns).
+    const SplitDir = enum { horizontal, vertical };
+
+    /// Window layout tree. Leaves index into `windows`; splits divide the
+    /// screen rectangle between two subtrees.
+    const WinNode = union(enum) {
+        leaf: usize,
+        split: struct {
+            dir: SplitDir,
+            a: *WinNode,
+            b: *WinNode,
+        },
     };
 
     const GrepResult = struct { path: []u8, line: u32, text: []u8 };
@@ -45,6 +67,10 @@ const App = struct {
     state: editor.Mode.State,
     buffers: std.ArrayList(Buffer) = .empty,
     current: usize = 0,
+    /// Split windows (one per leaf). `current_win` is the focused leaf.
+    windows: std.ArrayList(Window) = .empty,
+    win_root: ?*WinNode = null,
+    current_win: usize = 0,
     in_insert: bool = false,
     quit: bool = false,
 
@@ -124,11 +150,258 @@ const App = struct {
     /// [completion_pos, cursor) with the selected word.
     completion_pos: u32 = 0,
 
-    /// The active buffer (all per-buffer state lives here).
+    /// The active buffer (the focused window's buffer; per-buffer document
+    /// state lives here, per-window cursor/viewport in `windows`).
     fn cur(self: *App) *Buffer {
-        return &self.buffers.items[self.current];
+        return &self.buffers.items[self.windows.items[self.current_win].buf];
     }
 
+    /// The focused window's cursor (byte offset in its buffer).
+    fn curCursor(self: *App) *u32 {
+        return &self.windows.items[self.current_win].cursor;
+    }
+
+    /// The focused window's viewport top (first visible line).
+    fn curViewTop(self: *App) *u32 {
+        return &self.windows.items[self.current_win].view_top;
+    }
+
+    /// Free a window tree (recursive).
+    fn freeWinTree(self: *App, node: *WinNode) void {
+        switch (node.*) {
+            .leaf => self.alloc.destroy(node),
+            .split => |*s| {
+                self.freeWinTree(s.a);
+                self.freeWinTree(s.b);
+                self.alloc.destroy(node);
+            },
+        }
+    }
+
+    // ---- split windows (:vs / :sp / :q / Ctrl-w) ----
+
+    /// Split the focused window in `dir`; the new window shows the same
+    /// buffer with a copy of the current cursor/viewport and takes focus
+    /// (vim: the split command focuses the new window).
+    fn splitWindow(self: *App, dir: SplitDir) !void {
+        const cur_win = self.current_win;
+        try self.windows.append(self.alloc, .{
+            .buf = self.windows.items[cur_win].buf,
+            .cursor = self.windows.items[cur_win].cursor,
+            .view_top = self.windows.items[cur_win].view_top,
+        });
+        const new_idx: usize = self.windows.items.len - 1;
+        const root = self.win_root orelse return;
+        try self.replaceLeaf(root, cur_win, dir, new_idx);
+        self.current_win = new_idx;
+    }
+
+    /// Replace the leaf `leaf_idx` under `node` with a split of it and a new
+    /// leaf `new_idx` (recursive; the leaf must exist).
+    fn replaceLeaf(self: *App, node: *WinNode, leaf_idx: usize, dir: SplitDir, new_idx: usize) !void {
+        switch (node.*) {
+            .leaf => |i| {
+                if (i == leaf_idx) {
+                    const a = try self.alloc.create(WinNode);
+                    errdefer self.alloc.destroy(a);
+                    a.* = .{ .leaf = leaf_idx };
+                    const b = try self.alloc.create(WinNode);
+                    b.* = .{ .leaf = new_idx };
+                    node.* = .{ .split = .{ .dir = dir, .a = a, .b = b } };
+                }
+            },
+            .split => |*s| {
+                try self.replaceLeaf(s.a, leaf_idx, dir, new_idx);
+                try self.replaceLeaf(s.b, leaf_idx, dir, new_idx);
+            },
+        }
+    }
+
+    /// Remove the leaf `leaf_idx` from the tree rooted at `root`. Returns the
+    /// replacement subtree for `root` (a promoted sibling when the removed
+    /// leaf was a direct child), freeing the removed split node.
+    fn removeWindow(self: *App, root: *WinNode, leaf_idx: usize) ?*WinNode {
+        switch (root.*) {
+            .leaf => |i| return if (i == leaf_idx) null else root,
+            .split => |*s| {
+                if (self.removeWindow(s.a, leaf_idx)) |na| {
+                    s.a = na;
+                } else {
+                    // left subtree vanished → right sibling takes its place
+                    const promoted = s.b;
+                    self.alloc.destroy(root);
+                    return promoted;
+                }
+                if (self.removeWindow(s.b, leaf_idx)) |nb| {
+                    s.b = nb;
+                    return root;
+                } else {
+                    const promoted = s.a;
+                    self.alloc.destroy(root);
+                    return promoted;
+                }
+            },
+        }
+    }
+
+    /// The leftmost leaf index in the tree (a valid focus target).
+    fn firstLeaf(self: *App, node: *WinNode) usize {
+        return switch (node.*) {
+            .leaf => |i| i,
+            .split => |s| self.firstLeaf(s.a),
+        };
+    }
+
+    /// After removing a window, decrement every leaf index above `removed`
+    /// (the windows list was shifted down by one).
+    fn adjustLeafIndices(self: *App, node: *WinNode, removed: usize) void {
+        switch (node.*) {
+            .leaf => |*i| {
+                if (i.* > removed) i.* -= 1;
+            },
+            .split => |*s| {
+                self.adjustLeafIndices(s.a, removed);
+                self.adjustLeafIndices(s.b, removed);
+            },
+        }
+    }
+
+    /// One leaf window's screen rectangle (content area coordinates).
+    const LeafRect = struct {
+        win: usize,
+        row: u32,
+        col: u32,
+        height: u32,
+        width: u32,
+    };
+
+    /// Compute each leaf window's rectangle from the split tree.
+    fn layoutWindows(self: *App, a: std.mem.Allocator, content_top: u32, content_rows: u32, content_col: u32, total_width: u32) ![]LeafRect {
+        var out = std.ArrayList(LeafRect).empty;
+        const root = self.win_root orelse return &.{};
+        try self.layoutNode(a, root, .{
+            .win = 0,
+            .row = content_top,
+            .col = content_col,
+            .height = content_rows,
+            .width = total_width,
+        }, &out);
+        return out.toOwnedSlice(a);
+    }
+
+    fn layoutNode(self: *App, a: std.mem.Allocator, node: *WinNode, rect: LeafRect, out: *std.ArrayList(LeafRect)) !void {
+        switch (node.*) {
+            .leaf => |i| try out.append(a, .{ .win = i, .row = rect.row, .col = rect.col, .height = rect.height, .width = rect.width }),
+            .split => |*s| switch (s.dir) {
+                .horizontal => {
+                    const h1 = rect.height / 2;
+                    try self.layoutNode(a, s.a, .{ .win = 0, .row = rect.row, .col = rect.col, .height = h1, .width = rect.width }, out);
+                    try self.layoutNode(a, s.b, .{ .win = 0, .row = rect.row + h1, .col = rect.col, .height = rect.height - h1, .width = rect.width }, out);
+                },
+                .vertical => {
+                    const w1 = rect.width / 2;
+                    try self.layoutNode(a, s.a, .{ .win = 0, .row = rect.row, .col = rect.col, .height = rect.height, .width = w1 }, out);
+                    try self.layoutNode(a, s.b, .{ .win = 0, .row = rect.row, .col = rect.col + w1, .height = rect.height, .width = rect.width - w1 }, out);
+                },
+            },
+        }
+    }
+
+    /// :q — close the focused window. With several windows the tree loses one
+    /// leaf and focus moves to its neighbor; with one window the buffer is
+    /// closed (next buffer takes over, or the app quits when it was the last).
+    fn closeWindow(self: *App) void {
+        if (self.windows.items.len <= 1) {
+            self.closeSingleWindow();
+            return;
+        }
+        const cur_win = self.current_win;
+        const root = self.win_root orelse return;
+        const new_root = self.removeWindow(root, cur_win) orelse unreachable; // ≥2 windows: never the root itself
+        self.win_root = new_root;
+        _ = self.windows.orderedRemove(cur_win);
+        self.adjustLeafIndices(self.win_root.?, cur_win);
+        self.current_win = self.firstLeaf(self.win_root.?);
+        // sync the current buffer/highlighter with the surviving window
+        const b = self.windows.items[self.current_win].buf;
+        if (b != self.current) {
+            self.current = b;
+            self.syntax_dirty = true;
+            self.syntax_revision = std.math.maxInt(u64);
+        }
+        self.state.mode = .normal;
+        self.visual_anchor = null;
+        self.in_insert = false;
+    }
+
+    /// Last-window :q — vim behavior: closing the last window quits the
+    /// editor (all buffers end together). Multi-window :q only closes the
+    /// focused window (closeWindow's other branch).
+    fn closeSingleWindow(self: *App) void {
+        self.quit = true;
+    }
+
+    /// Make window `i` the focused one, syncing the current buffer and the
+    /// highlighter (vim: the focused window's buffer is "the" current buffer).
+    fn switchWindowTo(self: *App, i: usize) void {
+        self.current_win = i;
+        const b = self.windows.items[i].buf;
+        if (b != self.current) {
+            self.current = b;
+            self.syntax_dirty = true;
+            self.syntax_revision = std.math.maxInt(u64);
+        }
+        self.visual_anchor = null;
+        self.in_insert = false;
+        self.state.mode = .normal;
+    }
+
+    /// Ctrl-w hjkl: move focus to the leaf window geometrically in `dir`
+    /// (vim semantics — the nearest window in that direction, preferring
+    /// windows that overlap the current one).
+    fn navigateWindow(self: *App, dir: enum { left, right, up, down }) void {
+        if (self.windows.items.len <= 1) return;
+        const height: u32 = self.vx.window().height;
+        if (height <= status_row_count) return;
+        const content_rows = height - status_row_count - tab_bar_rows;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const leaves = self.layoutWindows(a, self.contentTop(), content_rows, self.contentCol(), self.vx.window().width) catch return;
+        var cur_rect: ?LeafRect = null;
+        for (leaves) |lr| {
+            if (lr.win == self.current_win) {
+                cur_rect = lr;
+                break;
+            }
+        }
+        const cr = cur_rect orelse return;
+        var best: ?usize = null;
+        var best_score: i64 = std.math.maxInt(i64);
+        for (leaves) |lr| {
+            if (lr.win == self.current_win) continue;
+            const in_dir = switch (dir) {
+                .left => lr.col + lr.width <= cr.col,
+                .right => lr.col >= cr.col + cr.width,
+                .up => lr.row + lr.height <= cr.row,
+                .down => lr.row >= cr.row + cr.height,
+            };
+            if (!in_dir) continue;
+            const dx = @as(i64, @intCast(lr.col + lr.width / 2)) - @as(i64, @intCast(cr.col + cr.width / 2));
+            const dy = @as(i64, @intCast(lr.row + lr.height / 2)) - @as(i64, @intCast(cr.row + cr.height / 2));
+            const adx: i64 = if (dx < 0) -dx else dx;
+            const ady: i64 = if (dy < 0) -dy else dy;
+            const score: i64 = switch (dir) {
+                .left, .right => adx * 2 + ady,
+                .up, .down => ady * 2 + adx,
+            };
+            if (score < best_score) {
+                best_score = score;
+                best = lr.win;
+            }
+        }
+        if (best) |b| self.switchWindowTo(b);
+    }
     fn create(init: std.process.Init) !*App {
         const self = try init.gpa.create(App);
         errdefer init.gpa.destroy(self);
@@ -173,6 +446,12 @@ const App = struct {
             .pt = try buffer.PieceTable.init(init.gpa, ""),
             .history = buffer.History.init(init.gpa),
         });
+        // one window showing buffer 0 (the initial empty buffer)
+        try self.windows.append(init.gpa, .{ .buf = 0 });
+        const leaf = try init.gpa.create(WinNode);
+        leaf.* = .{ .leaf = 0 };
+        self.win_root = leaf;
+        errdefer init.gpa.destroy(leaf);
         // NOTE: loop holds pointers to self.tty / self.vx, so the App must
         // stay at a stable address (heap) — never move it after this.
         self.loop = vaxis.Loop(vaxis.Event).init(init.io, &self.tty, &self.vx);
@@ -196,6 +475,8 @@ const App = struct {
             if (buf.path) |p| self.alloc.free(p);
         }
         self.buffers.deinit(self.alloc);
+        if (self.win_root) |root| self.freeWinTree(root);
+        self.windows.deinit(self.alloc);
         self.cmdline.deinit(self.alloc);
         for (self.cmd_history.items) |h| self.alloc.free(h);
         self.cmd_history.deinit(self.alloc);
@@ -240,9 +521,9 @@ const App = struct {
             return;
         }
 
-        // Ctrl-w window commands: switch keyboard focus between the file-tree
-        // sidebar and the buffer (vim window navigation). Not in insert mode
-        // — there Ctrl+w still deletes the word before the cursor.
+        // Ctrl-w window commands: switch keyboard focus between split windows
+        // (vim Ctrl-w hjkl geometric navigation) and the file-tree sidebar.
+        // Not in insert mode — there Ctrl+w still deletes the word before it.
         if (key.codepoint == 'w' and key.mods.ctrl and self.state.mode != .insert) {
             self.pending_window = true;
             return;
@@ -251,11 +532,18 @@ const App = struct {
             self.pending_window = false;
             if (key.codepoint == vaxis.Key.escape) return;
             switch (key.codepoint) {
-                'h', 'l', 'j', 'k' => {
+                // With the file-tree sidebar open, h/l toggle its focus (the
+                // sidebar is oz's own pane, not a vim window). Without it,
+                // h/l/j/k move between split windows geometrically.
+                'h', 'l' => {
                     if (self.filetree_active) {
                         self.focus = if (self.focus == .filetree) .buffer else .filetree;
+                    } else {
+                        self.navigateWindow(if (key.codepoint == 'h') .left else .right);
                     }
                 },
+                'j' => if (!self.filetree_active) self.navigateWindow(.down),
+                'k' => if (!self.filetree_active) self.navigateWindow(.up),
                 else => {},
             }
             return;
@@ -404,9 +692,9 @@ const App = struct {
                 if (p.codepoint == 'j' and key.codepoint == 'k' and
                     !key.mods.ctrl and !key.mods.alt and !key.mods.super)
                 {
-                    if (self.cur().cursor > 0 and self.cur().pt.byteAt(self.cur().cursor - 1) == 'j') {
-                        try self.cur().history.record(&self.cur().pt, self.cur().cursor - 1, 1, "");
-                        self.cur().cursor -= 1;
+                    if (self.curCursor().* > 0 and self.cur().pt.byteAt(self.curCursor().* - 1) == 'j') {
+                        try self.cur().history.record(&self.cur().pt, self.curCursor().* - 1, 1, "");
+                        self.curCursor().* -= 1;
                     }
                     self.exitInsert();
                     return;
@@ -444,13 +732,13 @@ const App = struct {
             // as codepoint 'b'/'f' with mods.alt.
             if (key.mods.alt and !key.mods.ctrl and !key.mods.super) {
                 if (key.codepoint == 'b') {
-                    self.cur().cursor = buffer.ops.wordStartBefore(&self.cur().pt, self.cur().cursor);
+                    self.curCursor().* = buffer.ops.wordStartBefore(&self.cur().pt, self.curCursor().*);
                     return;
                 }
                 if (key.codepoint == 'f') {
-                    var c = self.cur().cursor;
+                    var c = self.curCursor().*;
                     editor.Motion.apply(&self.cur().pt, .word_next_end, .{}, &c, 1);
-                    self.cur().cursor = c;
+                    self.curCursor().* = c;
                     return;
                 }
             }
@@ -472,9 +760,9 @@ const App = struct {
             .pending => {},
             .action => |a| try self.execAction(a.action, a.count),
             .motion => |m| {
-                var new_cursor = self.cur().cursor;
+                var new_cursor = self.curCursor().*;
                 editor.Motion.apply(&self.cur().pt, m.motion, m.args, &new_cursor, m.count);
-                self.cur().cursor = new_cursor;
+                self.curCursor().* = new_cursor;
             },
             .op_motion => |m| {
                 // dd / cc / yy: motion == .line_start + exclusive_end == false is
@@ -482,7 +770,7 @@ const App = struct {
                 // .line_start with exclusive_end == true, so unambiguous). Must
                 // delete/change/yank `count` whole lines, not [cursor, line start).
                 if (m.motion == .line_start and !m.exclusive_end) {
-                    const line = self.cur().pt.lineOf(self.cur().cursor);
+                    const line = self.cur().pt.lineOf(self.curCursor().*);
                     const n = @max(m.count, 1);
                     const start_line = @min(line, self.cur().pt.lineCount() - 1);
                     const end_line = @min(start_line + n - 1, self.cur().pt.lineCount() - 1);
@@ -494,7 +782,7 @@ const App = struct {
                 }
                 // text object (diw / ci( / yaw …): resolve at the cursor
                 if (m.text_object) |kind| {
-                    const rng = editor.TextObject.range(&self.cur().pt, kind, self.cur().cursor);
+                    const rng = editor.TextObject.range(&self.cur().pt, kind, self.curCursor().*);
                     try self.applyOpRange(m.op, rng.start, rng.end, false);
                     return;
                 }
@@ -504,15 +792,15 @@ const App = struct {
                         if (self.state.mode == .visual_block) {
                             try self.applyBlockOp(m.op);
                         } else {
-                            try self.applyOpRangeEx(m.op, anchor, self.cur().cursor, false, .inclusive_cursor);
+                            try self.applyOpRangeEx(m.op, anchor, self.curCursor().*, false, .inclusive_cursor);
                         }
                     }
                     self.exitVisualAfterOp(m.op);
                     return;
                 }
                 // normal mode: d/c/y over [cursor, target)
-                const target_pos = editor.Motion.target(&self.cur().pt, m.motion, m.args, self.cur().cursor, m.count);
-                try self.applyOpRange(m.op, self.cur().cursor, target_pos, m.exclusive_end);
+                const target_pos = editor.Motion.target(&self.cur().pt, m.motion, m.args, self.curCursor().*, m.count);
+                try self.applyOpRange(m.op, self.curCursor().*, target_pos, m.exclusive_end);
             },
             .surround => |s| try self.execSurround(s),
             .align_lines => |a| try self.execAlign(a),
@@ -571,9 +859,9 @@ const App = struct {
         const anchor = self.visual_anchor orelse return null;
         const pt = &self.cur().pt;
         const a_line = pt.lineOf(anchor);
-        const c_line = pt.lineOf(self.cur().cursor);
+        const c_line = pt.lineOf(self.curCursor().*);
         const a_col = anchor - pt.lineStart(a_line);
-        const c_col = self.cur().cursor - pt.lineStart(c_line);
+        const c_col = self.curCursor().* - pt.lineStart(c_line);
         return .{
             .top = @min(a_line, c_line),
             .bottom = @max(a_line, c_line),
@@ -610,7 +898,7 @@ const App = struct {
                     // session undo group (typing joins it).
                     try self.placeBlockCursors(rect, false);
                 } else {
-                    self.cur().cursor = pt.lineStart(rect.top) + @min(rect.left, pt.lineLen(rect.top));
+                    self.curCursor().* = pt.lineStart(rect.top) + @min(rect.left, pt.lineLen(rect.top));
                 }
             },
             .yank => {
@@ -821,7 +1109,7 @@ const App = struct {
 
     /// Keep the visible (main) cursor on the main multi-cursor's position.
     fn mcSyncCursor(self: *App) void {
-        if (self.mc.len() > 0) self.cur().cursor = self.mc.cursors.items[self.mc.main];
+        if (self.mc.len() > 0) self.curCursor().* = self.mc.cursors.items[self.mc.main];
     }
 
     // ---- easymotion (s / <leader>f) ----
@@ -849,7 +1137,7 @@ const App = struct {
         if ((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z')) {
             for (self.em_matches) |m| {
                 if (m.label == ch) {
-                    self.cur().cursor = m.pos;
+                    self.curCursor().* = m.pos;
                     break;
                 }
             }
@@ -868,7 +1156,7 @@ const App = struct {
     /// Delete the character before the cursor (backspace). The edit lands in
     /// the open insert undo group so it stays part of the insert session.
     fn deleteBeforeCursor(self: *App) !void {
-        if (self.cur().cursor == 0) return;
+        if (self.curCursor().* == 0) return;
         // safety net: make sure the insert-session group is open even if a
         // future entry path forgets to open it (backspace is a deletion, and
         // history.record would otherwise auto-open/close its own group)
@@ -876,24 +1164,24 @@ const App = struct {
             self.cur().history.beginGroup();
             self.in_insert = true;
         }
-        const start = buffer.ops.prevCharStart(&self.cur().pt, self.cur().cursor);
-        try self.cur().history.record(&self.cur().pt, start, self.cur().cursor - start, "");
-        self.cur().cursor = start;
+        const start = buffer.ops.prevCharStart(&self.cur().pt, self.curCursor().*);
+        try self.cur().history.record(&self.cur().pt, start, self.curCursor().* - start, "");
+        self.curCursor().* = start;
         self.markDirty();
     }
 
     /// Delete the word before the cursor (Ctrl-w). Vim semantics: walk back
     /// over whitespace then word characters; deletes [start, cursor).
     fn deleteWordBefore(self: *App) !void {
-        if (self.cur().cursor == 0) return;
-        const start = buffer.ops.wordStartBefore(&self.cur().pt, self.cur().cursor);
-        if (start == self.cur().cursor) return;
+        if (self.curCursor().* == 0) return;
+        const start = buffer.ops.wordStartBefore(&self.cur().pt, self.curCursor().*);
+        if (start == self.curCursor().*) return;
         if (!self.in_insert) {
             self.cur().history.beginGroup();
             self.in_insert = true;
         }
-        try self.cur().history.record(&self.cur().pt, start, self.cur().cursor - start, "");
-        self.cur().cursor = start;
+        try self.cur().history.record(&self.cur().pt, start, self.curCursor().* - start, "");
+        self.curCursor().* = start;
         self.markDirty();
     }
 
@@ -914,8 +1202,8 @@ const App = struct {
     /// a word prefix the key is swallowed (no candidates, no side effect).
     fn startCompletion(self: *App) !void {
         if (self.completion_active) return;
-        if (self.cur().cursor == 0) return;
-        if (!isWordByte(self.cur().pt.byteAt(self.cur().cursor - 1))) return;
+        if (self.curCursor().* == 0) return;
+        if (!isWordByte(self.cur().pt.byteAt(self.curCursor().* - 1))) return;
         try self.collectCompletionWords();
         if (self.completion_words.items.len > 0) {
             self.completion_active = true;
@@ -929,7 +1217,7 @@ const App = struct {
     /// excluded from the candidates.
     fn collectCompletionWords(self: *App) !void {
         const pt = &self.cur().pt;
-        const cursor = self.cur().cursor;
+        const cursor = self.curCursor().*;
         // start of the word under/behind the cursor — the replacement anchor
         var pos = cursor;
         while (pos > 0 and isWordByte(pt.byteAt(pos - 1))) pos -= 1;
@@ -1053,14 +1341,14 @@ const App = struct {
         }
         const word = self.completion_words.items[self.completion_sel];
         const pt = &self.cur().pt;
-        const cursor = self.cur().cursor;
+        const cursor = self.curCursor().*;
         const pos = @min(self.completion_pos, cursor);
         if (!self.in_insert) {
             self.cur().history.beginGroup();
             self.in_insert = true;
         }
         try self.cur().history.record(pt, pos, cursor - pos, word);
-        self.cur().cursor = pos + @as(u32, @intCast(word.len));
+        self.curCursor().* = pos + @as(u32, @intCast(word.len));
         self.markDirty();
         self.closeCompletion();
     }
@@ -1088,7 +1376,7 @@ const App = struct {
             self.in_insert = true;
         }
         const pt = &self.cur().pt;
-        const cursor = self.cur().cursor;
+        const cursor = self.curCursor().*;
         const line = pt.lineOf(cursor);
         const line_start = pt.lineStart(line);
         const col = cursor - line_start;
@@ -1117,7 +1405,7 @@ const App = struct {
             self.in_insert = true;
         }
         const pt = &self.cur().pt;
-        const cursor = self.cur().cursor;
+        const cursor = self.curCursor().*;
         const line = pt.lineOf(cursor);
         const line_start = pt.lineStart(line);
         const line_end = line_start + pt.lineLen(line);
@@ -1260,8 +1548,11 @@ const App = struct {
         switch (cmd) {
             .empty => {},
             .write => try self.writeBuffer(),
-            .quit => self.quit = true, // M0: no dirty tracking; :q behaves like :q!
-            .quit_force => self.quit = true,
+            .quit => self.closeWindow(), // :q closes the focused window (or its buffer when it is the last window)
+            .quit_force => self.closeWindow(),
+            .quit_all => self.quit = true,
+            .vsplit => try self.splitWindow(.vertical),
+            .split => try self.splitWindow(.horizontal),
             .write_quit => {
                 try self.writeBuffer();
                 self.quit = true;
@@ -1269,7 +1560,7 @@ const App = struct {
             .edit => |path| try self.openFile(path),
             .buffer_next => try self.switchBuffer(1),
             .buffer_prev => try self.switchBuffer(-1),
-            .buffer_delete => self.closeCurrent(),
+            .buffer_delete => self.closeCurrentBuffer(),
             .buffer_list => try self.listBuffers(),
             .noh => try self.setMsg(try self.alloc.dupe(u8, "")),
             .set => |opt| try self.setMsg(try std.fmt.allocPrint(self.alloc, "set {s} (M0: accepted, no-op)", .{opt})),
@@ -1286,15 +1577,15 @@ const App = struct {
         var end_line: u32 = undefined;
         if (sub.visual) {
             const anchor = self.visual_anchor orelse return;
-            const s = @min(anchor, self.cur().cursor);
-            const e = @max(anchor, self.cur().cursor);
+            const s = @min(anchor, self.curCursor().*);
+            const e = @max(anchor, self.curCursor().*);
             start_line = self.cur().pt.lineOf(s);
             end_line = self.cur().pt.lineOf(e);
         } else if (sub.whole_file) {
             start_line = 0;
             end_line = self.cur().pt.lineCount() - 1;
         } else {
-            start_line = self.cur().pt.lineOf(self.cur().cursor);
+            start_line = self.cur().pt.lineOf(self.curCursor().*);
             end_line = start_line;
         }
 
@@ -1378,8 +1669,8 @@ const App = struct {
             self.in_insert = true;
         }
         // record() snapshots the pre-edit state and applies the edit itself
-        try self.cur().history.record(&self.cur().pt, self.cur().cursor, 0, text);
-        self.cur().cursor += @intCast(text.len);
+        try self.cur().history.record(&self.cur().pt, self.curCursor().*, 0, text);
+        self.curCursor().* += @intCast(text.len);
         self.markDirty();
     }
 
@@ -1414,11 +1705,11 @@ const App = struct {
                 self.cur().history.beginGroup();
                 try self.cur().history.record(&self.cur().pt, start, end - start, "");
                 self.cur().history.endGroup();
-                self.cur().cursor = start;
+                self.curCursor().* = start;
                 self.markDirty();
             },
             .change => {
-                self.cur().cursor = start;
+                self.curCursor().* = start;
                 self.cur().history.beginGroup();
                 try self.cur().history.record(&self.cur().pt, start, end - start, "");
                 self.state.mode = .insert;
@@ -1449,22 +1740,22 @@ const App = struct {
                 try self.applyEdit(res.start, res.end, res.text);
             },
             .delete => {
-                const res = (try editor.surround.delete(self.alloc, &self.cur().pt, self.cur().cursor)) orelse {
+                const res = (try editor.surround.delete(self.alloc, &self.cur().pt, self.curCursor().*)) orelse {
                     try self.setMsg(try self.alloc.dupe(u8, "E54: Unmatched delimiter"));
                     return;
                 };
                 defer self.alloc.free(res.text);
                 try self.applyEdit(res.start, res.end, res.text);
-                self.cur().cursor = res.start;
+                self.curCursor().* = res.start;
             },
             .change => {
-                const res = (try editor.surround.change(self.alloc, &self.cur().pt, self.cur().cursor, s.ch)) orelse {
+                const res = (try editor.surround.change(self.alloc, &self.cur().pt, self.curCursor().*, s.ch)) orelse {
                     try self.setMsg(try self.alloc.dupe(u8, "E54: Unmatched delimiter"));
                     return;
                 };
                 defer self.alloc.free(res.text);
                 try self.applyEdit(res.start, res.end, res.text);
-                self.cur().cursor = res.start;
+                self.curCursor().* = res.start;
             },
         }
     }
@@ -1474,11 +1765,11 @@ const App = struct {
     fn surroundRange(self: *App, motion: ?editor.Motion.Motion, args: editor.Motion.Args, count: u32, text_object: ?editor.TextObject.Kind) ?editor.TextObject.Range {
         var rng: editor.TextObject.Range = undefined;
         if (text_object) |kind| {
-            const r = editor.TextObject.range(&self.cur().pt, kind, self.cur().cursor);
+            const r = editor.TextObject.range(&self.cur().pt, kind, self.curCursor().*);
             rng = .{ .start = r.start, .end = r.end };
         } else if (motion) |m| {
-            const target = editor.Motion.target(&self.cur().pt, m, args, self.cur().cursor, count);
-            rng = .{ .start = @min(self.cur().cursor, target), .end = @max(self.cur().cursor, target) };
+            const target = editor.Motion.target(&self.cur().pt, m, args, self.curCursor().*, count);
+            rng = .{ .start = @min(self.curCursor().*, target), .end = @max(self.curCursor().*, target) };
         } else return null;
         // trim trailing spaces/tabs (not newlines)
         while (rng.end > rng.start) {
@@ -1495,19 +1786,19 @@ const App = struct {
         var end_line: u32 = undefined;
         if (a.selection) {
             const anchor = self.visual_anchor orelse return;
-            const s = @min(anchor, self.cur().cursor);
-            const e = @max(anchor, self.cur().cursor);
+            const s = @min(anchor, self.curCursor().*);
+            const e = @max(anchor, self.curCursor().*);
             start_line = self.cur().pt.lineOf(s);
             end_line = self.cur().pt.lineOf(e);
             self.exitVisual();
         } else {
             var rng: editor.TextObject.Range = undefined;
             if (a.text_object) |kind| {
-                const r = editor.TextObject.range(&self.cur().pt, kind, self.cur().cursor);
+                const r = editor.TextObject.range(&self.cur().pt, kind, self.curCursor().*);
                 rng = .{ .start = r.start, .end = r.end };
             } else if (a.motion) |m| {
-                const target = editor.Motion.target(&self.cur().pt, m, a.args, self.cur().cursor, a.count);
-                rng = .{ .start = @min(self.cur().cursor, target), .end = @max(self.cur().cursor, target) };
+                const target = editor.Motion.target(&self.cur().pt, m, a.args, self.curCursor().*, a.count);
+                rng = .{ .start = @min(self.curCursor().*, target), .end = @max(self.curCursor().*, target) };
             } else return;
             start_line = self.cur().pt.lineOf(rng.start);
             end_line = self.cur().pt.lineOf(rng.end);
@@ -1519,7 +1810,7 @@ const App = struct {
         var end = self.cur().pt.lineStart(end_line) + self.cur().pt.lineLen(end_line);
         if (end_line + 1 < self.cur().pt.lineCount()) end += 1; // include trailing '\n'
         try self.applyEdit(start, end, text);
-        self.cur().cursor = start;
+        self.curCursor().* = start;
     }
 
     fn applyEdit(self: *App, start: u32, end: u32, text: []const u8) !void {
@@ -1544,13 +1835,13 @@ const App = struct {
             try self.setMsg(try self.alloc.dupe(u8, "E505: No comment style for filetype"));
             return;
         };
-        const line = self.cur().pt.lineOf(self.cur().cursor);
+        const line = self.cur().pt.lineOf(self.curCursor().*);
         const toggle = try editor.comment.toggleLines(self.alloc, &self.cur().pt, line, line, style);
         defer self.alloc.free(toggle.text);
         const start = self.cur().pt.lineStart(line);
         const end = start + self.cur().pt.lineLen(line); // toggleLines text excludes the trailing '\n'
         try self.applyEdit(start, end, toggle.text);
-        self.cur().cursor = start;
+        self.curCursor().* = start;
     }
 
     fn exitVisual(self: *App) void {
@@ -1575,7 +1866,7 @@ const App = struct {
     fn mcSelectNext(self: *App) !void {
         if (!self.mc_active) {
             self.mc.clear();
-            _ = try self.mc.add(self.cur().cursor);
+            _ = try self.mc.add(self.curCursor().*);
             self.mc_active = true;
         } else {
             _ = try self.mc.addNextMatch(&self.cur().pt);
@@ -1839,8 +2130,8 @@ const App = struct {
                         self.closePicker();
                         try self.openFile(r.path);
                         const line = @min(r.line - 1, self.cur().pt.lineCount() - 1);
-                        self.cur().cursor = self.cur().pt.lineStart(line);
-                        self.cur().view_top = line;
+                        self.curCursor().* = self.cur().pt.lineStart(line);
+                        self.curViewTop().* = line;
                     }
                     return;
                 }
@@ -2023,13 +2314,16 @@ const App = struct {
     fn switchTo(self: *App, i: usize) void {
         if (self.buffers.items.len == 0) return;
         self.current = i % self.buffers.items.len;
+        // the focused window follows the switch; other split windows keep
+        // showing whatever buffer they had
+        self.windows.items[self.current_win].buf = self.current;
         self.state.mode = .normal;
         // leaving the buffer invalidates any visual selection from it
         // (gt / :bn / :e / picker-enter all land here, some without the
         // command-line exitVisual fallback)
         self.visual_anchor = null;
         self.in_insert = false;
-        self.cur().cursor = @min(self.cur().cursor, self.cur().pt.len());
+        self.curCursor().* = @min(self.curCursor().*, self.cur().pt.len());
         // the highlighter tree belongs to the old buffer: force a full
         // reparse (revision sentinel makes the incremental check fail)
         self.syntax_dirty = true;
@@ -2075,20 +2369,39 @@ const App = struct {
         self.switchTo(self.buffers.items.len - 1);
     }
 
-    /// Close the current buffer; switch to a neighbor. The last buffer stays.
-    fn closeCurrent(self: *App) void {
+    /// Close the buffer at `buf_idx`; every window showing it points at the
+    /// next buffer. The last buffer stays. Used by :bd and the single-window
+    /// :q path.
+    fn closeBufferAt(self: *App, buf_idx: usize) void {
         if (self.buffers.items.len <= 1) return;
-        var buf = self.buffers.orderedRemove(self.current);
+        var buf = self.buffers.orderedRemove(buf_idx);
         buf.history.deinit();
         buf.pt.deinit();
         if (buf.path) |p| self.alloc.free(p);
         if (self.current >= self.buffers.items.len) self.current = self.buffers.items.len - 1;
+        if (buf_idx < self.current) self.current -= 1;
+        // point every window at the surviving buffer, fixing up shifted indices
+        for (self.windows.items) |*w| {
+            if (w.buf > buf_idx) {
+                w.buf -= 1;
+            } else if (w.buf == buf_idx) {
+                w.buf = self.current;
+            }
+        }
         self.state.mode = .normal;
         // closing the buffer also discards a visual selection anchored in it
         self.visual_anchor = null;
         self.in_insert = false;
         self.syntax_dirty = true;
         self.syntax_revision = std.math.maxInt(u64);
+    }
+
+    /// :bd — close the focused window's buffer; the window shows the next one.
+    fn closeCurrentBuffer(self: *App) void {
+        const buf = self.windows.items[self.current_win].buf;
+        self.closeBufferAt(buf);
+        self.windows.items[self.current_win].buf = self.current;
+        self.windows.items[self.current_win].cursor = @min(self.windows.items[self.current_win].cursor, self.cur().pt.len());
     }
 
     /// FNV-1a hash of the current buffer content (for dirty detection).
@@ -2267,12 +2580,12 @@ const App = struct {
                     self.in_insert = false;
                 }
                 _ = self.cur().history.undo(&self.cur().pt);
-                self.cur().cursor = @min(self.cur().cursor, self.cur().pt.len());
+                self.curCursor().* = @min(self.curCursor().*, self.cur().pt.len());
                 self.syntax_dirty = true;
             },
             .redo => {
                 _ = self.cur().history.redo(&self.cur().pt);
-                self.cur().cursor = @min(self.cur().cursor, self.cur().pt.len());
+                self.curCursor().* = @min(self.curCursor().*, self.cur().pt.len());
                 self.syntax_dirty = true;
             },
             .insert_mode => {
@@ -2285,12 +2598,12 @@ const App = struct {
             },
             .append => {
                 // a: insert after the character under the cursor
-                const line = self.cur().pt.lineOf(self.cur().cursor);
+                const line = self.cur().pt.lineOf(self.curCursor().*);
                 const end = self.cur().pt.lineStart(line) + self.cur().pt.lineLen(line);
-                if (self.cur().cursor < end) {
-                    var i = self.cur().cursor + 1;
+                if (self.curCursor().* < end) {
+                    var i = self.curCursor().* + 1;
                     while (i < end and (self.cur().pt.byteAt(i) & 0xC0) == 0x80) : (i += 1) {}
-                    self.cur().cursor = i;
+                    self.curCursor().* = i;
                 }
                 self.beginInsertSession();
                 self.cur().history.beginGroup();
@@ -2299,7 +2612,7 @@ const App = struct {
             },
             .insert_before => {
                 // I: first non-blank of the line
-                const line = self.cur().pt.lineOf(self.cur().cursor);
+                const line = self.cur().pt.lineOf(self.curCursor().*);
                 const ls = self.cur().pt.lineStart(line);
                 const end = ls + self.cur().pt.lineLen(line);
                 var pos = ls;
@@ -2308,7 +2621,7 @@ const App = struct {
                     if (c != ' ' and c != '\t') break;
                     pos += 1;
                 }
-                self.cur().cursor = pos;
+                self.curCursor().* = pos;
                 self.beginInsertSession();
                 self.cur().history.beginGroup();
                 self.in_insert = true;
@@ -2316,8 +2629,8 @@ const App = struct {
             },
             .append_end => {
                 // A: end of the line
-                const line = self.cur().pt.lineOf(self.cur().cursor);
-                self.cur().cursor = self.cur().pt.lineStart(line) + self.cur().pt.lineLen(line);
+                const line = self.cur().pt.lineOf(self.curCursor().*);
+                self.curCursor().* = self.cur().pt.lineStart(line) + self.cur().pt.lineLen(line);
                 self.beginInsertSession();
                 self.cur().history.beginGroup();
                 self.in_insert = true;
@@ -2327,12 +2640,12 @@ const App = struct {
                 // o: new line below, cursor on it. The inserted '\n' joins the
                 // insert-session undo group (left open until exitInsert), so
                 // one undo reverts the whole o+typing session.
-                const line = self.cur().pt.lineOf(self.cur().cursor);
+                const line = self.cur().pt.lineOf(self.curCursor().*);
                 const pos = self.cur().pt.lineStart(line) + self.cur().pt.lineLen(line);
                 self.beginInsertSession();
                 self.cur().history.beginGroup();
                 try self.cur().history.record(&self.cur().pt, pos, 0, "\n");
-                self.cur().cursor = pos + 1;
+                self.curCursor().* = pos + 1;
                 self.in_insert = true;
                 self.state.mode = .insert;
                 // structural edit (newline): force a full reparse next frame —
@@ -2343,26 +2656,26 @@ const App = struct {
             },
             .insert_line_before => {
                 // O: new line above, cursor on it (same open-group semantics)
-                const line = self.cur().pt.lineOf(self.cur().cursor);
+                const line = self.cur().pt.lineOf(self.curCursor().*);
                 const pos = self.cur().pt.lineStart(line);
                 self.beginInsertSession();
                 self.cur().history.beginGroup();
                 try self.cur().history.record(&self.cur().pt, pos, 0, "\n");
-                self.cur().cursor = pos;
+                self.curCursor().* = pos;
                 self.in_insert = true;
                 self.state.mode = .insert;
             },
             .visual_char => {
                 self.state.mode = .visual_char;
-                self.visual_anchor = self.cur().cursor;
+                self.visual_anchor = self.curCursor().*;
             },
             .visual_line => {
                 self.state.mode = .visual_line;
-                self.visual_anchor = self.cur().cursor;
+                self.visual_anchor = self.curCursor().*;
             },
             .visual_block => {
                 self.state.mode = .visual_block;
-                self.visual_anchor = self.cur().cursor;
+                self.visual_anchor = self.curCursor().*;
             },
             .delete, .change, .yank => {
                 // multi-cursor: d deletes the selected word at every cursor
@@ -2383,7 +2696,7 @@ const App = struct {
                         if (self.state.mode == .visual_block) {
                             try self.applyBlockOp(action);
                         } else {
-                            try self.applyOpRangeEx(action, anchor, self.cur().cursor, false, .inclusive_cursor);
+                            try self.applyOpRangeEx(action, anchor, self.curCursor().*, false, .inclusive_cursor);
                         }
                     }
                     self.exitVisualAfterOp(action);
@@ -2420,7 +2733,7 @@ const App = struct {
             .picker_grep => try self.openGrepPicker(),
             .picker_buffers => try self.openBufferPicker(),
             .picker_recent => try self.openRecentPicker(),
-            .close_buffer => self.closeCurrent(),
+            .close_buffer => self.closeCurrentBuffer(),
             .filetree_toggle => try self.toggleFiletree(),
             .filetree_locate => try self.locateInFiletree(),
             .paste => try self.pasteBuffer(false),
@@ -2526,11 +2839,11 @@ const App = struct {
     /// Normal-mode Ctrl+a/x: increment the number at/after the cursor and
     /// place the cursor just after it (vim). One undo step.
     fn execNumberDeltaAtCursor(self: *App, delta: i64) !void {
-        const n = self.numberAtOrAfter(self.cur().cursor) orelse return;
+        const n = self.numberAtOrAfter(self.curCursor().*) orelse return;
         self.cur().history.beginGroup();
         const new_end = try self.replaceNumber(n, delta);
         self.cur().history.endGroup();
-        self.cur().cursor = new_end;
+        self.curCursor().* = new_end;
         self.markDirty();
     }
 
@@ -2539,8 +2852,8 @@ const App = struct {
     /// earlier offsets stay valid.
     fn execSelectionNumberDelta(self: *App, delta: i64) !void {
         const anchor = self.visual_anchor orelse return;
-        const s = @min(anchor, self.cur().cursor);
-        const e = @max(anchor, self.cur().cursor);
+        const s = @min(anchor, self.curCursor().*);
+        const e = @max(anchor, self.curCursor().*);
         const pt = &self.cur().pt;
         const start_line = pt.lineOf(s);
         const end_line = pt.lineOf(e);
@@ -2588,8 +2901,8 @@ const App = struct {
     /// processed bottom-up so earlier lines keep valid offsets.
     fn execSelectionNumberColumn(self: *App, delta: i64) !void {
         const anchor = self.visual_anchor orelse return;
-        const s = @min(anchor, self.cur().cursor);
-        const e = @max(anchor, self.cur().cursor);
+        const s = @min(anchor, self.curCursor().*);
+        const e = @max(anchor, self.curCursor().*);
         const pt = &self.cur().pt;
         const start_line = pt.lineOf(s);
         const end_line = pt.lineOf(e);
@@ -2616,13 +2929,13 @@ const App = struct {
             try self.setMsg(try self.alloc.dupe(u8, "E353: Nothing in register"));
             return;
         };
-        var pos = self.cur().cursor;
+        var pos = self.curCursor().*;
         if (!before) {
             // p: after the character under the cursor (or at line end)
-            const line = self.cur().pt.lineOf(self.cur().cursor);
+            const line = self.cur().pt.lineOf(self.curCursor().*);
             const line_end = self.cur().pt.lineStart(line) + self.cur().pt.lineLen(line);
-            if (self.cur().cursor < line_end) {
-                var i = self.cur().cursor + 1;
+            if (self.curCursor().* < line_end) {
+                var i = self.curCursor().* + 1;
                 while (i < line_end and (self.cur().pt.byteAt(i) & 0xC0) == 0x80) : (i += 1) {}
                 pos = i;
             }
@@ -2630,7 +2943,7 @@ const App = struct {
         self.cur().history.beginGroup();
         try self.cur().history.record(&self.cur().pt, pos, 0, buf);
         self.cur().history.endGroup();
-        self.cur().cursor = pos + @as(u32, @intCast(buf.len));
+        self.curCursor().* = pos + @as(u32, @intCast(buf.len));
     }
 
     // ---- rendering ----
@@ -2660,6 +2973,138 @@ const App = struct {
         return @max(3, digits) + 1;
     }
 
+    /// Render one split window's lines into `rect` (content-area coordinates).
+    /// The highlighter is bound to the current buffer, so only the focused
+    /// window gets syntax highlighting and the (single) visual selection.
+    fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_focused: bool) !void {
+        const win = self.vx.window();
+        const w = &self.windows.items[rect.win];
+        const buf = &self.buffers.items[w.buf];
+
+        const cursor_line = buf.pt.lineOf(w.cursor);
+        const line_count = buf.pt.lineCount();
+        // relative-number gutter: computed once per frame per window
+        const gutter = self.gutterWidth(line_count);
+        const gutter_digits = gutter - 1;
+
+        // keep cursor line visible, centered-ish (per-window viewport)
+        if (w.cursor < buf.pt.lineStart(w.view_top)) {
+            w.view_top = cursor_line;
+        }
+        const view_bottom = w.view_top + rect.height;
+        if (cursor_line >= view_bottom) {
+            w.view_top = cursor_line - rect.height + 1;
+        }
+        if (w.view_top + rect.height > line_count and line_count > rect.height) {
+            w.view_top = line_count - rect.height;
+        }
+
+        // syntax spans covering the visible byte range (focused window only)
+        const merged = if (is_focused) try self.visibleSpans(a, w.view_top, rect.height) else &.{};
+        var span_i: usize = 0;
+        var row: u32 = rect.row;
+        var line = w.view_top;
+        while (row < rect.row + rect.height and line < line_count) : ({
+            line += 1;
+            row += 1;
+        }) {
+            const rel: u32 = if (line == cursor_line)
+                line + 1
+            else if (line > cursor_line)
+                line - cursor_line
+            else
+                cursor_line - line;
+            // allocPrint's width is comptime-only, so pad by hand: digits
+            // right-aligned in the numeric field plus one trailing space
+            const num_raw = try std.fmt.allocPrint(a, "{d}", .{rel});
+            const num_str = try a.alloc(u8, gutter);
+            @memset(num_str[0..gutter], ' ');
+            @memcpy(num_str[gutter_digits - num_raw.len .. gutter_digits], num_raw);
+            num_str[gutter - 1] = ' ';
+
+            const line_len = buf.pt.lineLen(line);
+            const line_start = buf.pt.lineStart(line);
+            var n: u32 = @min(line_len, rect.width);
+            // don't cut a multibyte char in half at the line end — a lone
+            // UTF-8 continuation byte renders as U+FFFD ("box with ?")
+            while (n > 0 and n < line_len and (buf.pt.byteAt(line_start + n) & 0xC0) == 0x80) {
+                n -= 1;
+            }
+            const text = try a.alloc(u8, n);
+            buf.pt.copyRange(line_start, text);
+
+            // visual selection bounds as local columns (both = n if absent);
+            // only the focused window carries the selection
+            var sel_s: u32 = n;
+            var sel_e: u32 = n;
+            if (is_focused) {
+                if (self.visual_anchor) |anchor| {
+                    var sel_start = @min(anchor, w.cursor);
+                    var sel_end = @max(anchor, w.cursor);
+                    // V (visual_line) selects whole lines
+                    if (self.state.mode == .visual_line) {
+                        sel_start = buf.pt.lineStart(buf.pt.lineOf(sel_start));
+                        sel_end = buf.pt.lineStart(buf.pt.lineOf(sel_end)) + buf.pt.lineLen(buf.pt.lineOf(sel_end));
+                    }
+                    // Ctrl+v (visual_block) selects a rectangle
+                    if (self.state.mode == .visual_block) {
+                        if (self.blockRect()) |br| {
+                            if (line >= br.top and line <= br.bottom) {
+                                sel_s = @min(br.left, line_len);
+                                sel_e = @min(br.right + 1, line_len);
+                            }
+                        }
+                    } else {
+                        const line_end = line_start + line_len;
+                        if (sel_start < line_end and sel_end > line_start) {
+                            sel_s = @max(sel_start, line_start) - line_start;
+                            sel_e = @min(sel_end, line_end) - line_start;
+                        }
+                    }
+                }
+            }
+
+            // split the line into styled runs: syntax fg from the merged
+            // spans, cursorline bg on the cursor's row, selection bg wins
+            const is_cur_line = line == cursor_line;
+            var segs = std.ArrayList(vaxis.Segment).empty;
+            try segs.append(a, .{
+                .text = num_str,
+                .style = if (is_cur_line) .{ .bg = .{ .rgb = .{ 40, 48, 68 } } } else .{},
+            });
+            var col: u32 = 0;
+            while (col < n) {
+                while (span_i < merged.len and merged[span_i].end <= line_start + col) span_i += 1;
+                var next: u32 = n;
+                var fg: ?vaxis.Style = null;
+                if (span_i < merged.len) {
+                    const sp = merged[span_i];
+                    if (sp.start < line_start + n and sp.end > line_start + col) {
+                        fg = syntaxStyle(sp.style);
+                        const sp_start: u32 = if (sp.start > line_start) sp.start - line_start else 0;
+                        const sp_end: u32 = if (sp.end < line_start + n) sp.end - line_start else n;
+                        next = if (sp_start > col) sp_start else sp_end;
+                    }
+                }
+                if (sel_s > col and sel_s < next) next = sel_s;
+                if (sel_e > col and sel_e < next) next = sel_e;
+                const in_sel = col >= sel_s and col < sel_e;
+                var style: vaxis.Style = .{};
+                if (is_cur_line) style.bg = .{ .rgb = .{ 40, 48, 68 } };
+                if (in_sel) style.bg = .{ .rgb = .{ 54, 74, 130 } };
+                if (fg) |f| style.fg = f.fg;
+                try segs.append(a, .{ .text = text[col..next], .style = style });
+                col = next;
+            }
+
+            _ = win.print(segs.items, .{
+                .row_offset = @intCast(row),
+                .col_offset = @intCast(rect.col),
+                .wrap = .none,
+            });
+        }
+    }
+
     fn render(self: *App) !void {
         // vaxis cells reference the text slices passed to print, so all text
         // must stay alive until vx.render(); a per-frame arena handles that.
@@ -2675,12 +3120,11 @@ const App = struct {
         // Content area rows: below the tab bar, above the status bar.
         const content_rows = height - status_row_count - tab_bar_rows;
 
-        const cursor_line = self.cur().pt.lineOf(self.cur().cursor);
+        const cursor_line = self.cur().pt.lineOf(self.curCursor().*);
         const line_count = self.cur().pt.lineCount();
         // relative-number gutter: computed once per frame, reused by the
-        // line loop, cursor offset, mc highlight and easymotion labels
+        // cursor offset, mc highlight and easymotion labels
         const gutter = self.gutterWidth(line_count);
-        const gutter_digits = gutter - 1;
 
         // tab bar: one entry per buffer, current highlighted, + dirty marker
         {
@@ -2739,123 +3183,15 @@ const App = struct {
             return;
         }
 
-        // keep cursor line visible, centered-ish
-        if (self.cur().cursor < self.cur().pt.lineStart(self.cur().view_top)) {
-            self.cur().view_top = cursor_line;
-        }
-        const view_bottom = self.cur().view_top + content_rows;
-        if (cursor_line >= view_bottom) {
-            self.cur().view_top = cursor_line - content_rows + 1;
-        }
-        if (self.cur().view_top + content_rows > line_count and line_count > content_rows) {
-            self.cur().view_top = line_count - content_rows;
-        }
-
-        var row: u32 = self.contentTop(); // content starts below the tab bar
-        var line = self.cur().view_top;
-        // syntax spans covering the visible byte range (empty when inactive)
-        const merged = try self.visibleSpans(a, self.cur().view_top, content_rows);
-        var span_i: usize = 0;
-        while (row < self.contentTop() + content_rows and line < line_count) : ({
-            line += 1;
-            row += 1;
-        }) {
-            const rel: u32 = if (line == cursor_line)
-                line + 1
-            else if (line > cursor_line)
-                line - cursor_line
-            else
-                cursor_line - line;
-            // allocPrint's width is comptime-only, so pad by hand: digits
-            // right-aligned in the numeric field plus one trailing space
-            const num_raw = try std.fmt.allocPrint(a, "{d}", .{rel});
-            const num_str = try a.alloc(u8, gutter);
-            @memset(num_str[0..gutter], ' ');
-            @memcpy(num_str[gutter_digits - num_raw.len .. gutter_digits], num_raw);
-            num_str[gutter - 1] = ' ';
-
-            const line_len = self.cur().pt.lineLen(line);
-            const line_start = self.cur().pt.lineStart(line);
-            var n: u32 = @min(line_len, win.width);
-            // don't cut a multibyte char in half at the line end — a lone
-            // UTF-8 continuation byte renders as U+FFFD ("box with ?")
-            while (n > 0 and n < line_len and (self.cur().pt.byteAt(line_start + n) & 0xC0) == 0x80) {
-                n -= 1;
-            }
-            const text = try a.alloc(u8, n);
-            self.cur().pt.copyRange(line_start, text);
-
-            // visual selection bounds as local columns (both = n if absent)
-            var sel_s: u32 = n;
-            var sel_e: u32 = n;
-            if (self.visual_anchor) |anchor| {
-                var sel_start = @min(anchor, self.cur().cursor);
-                var sel_end = @max(anchor, self.cur().cursor);
-                // V (visual_line) selects whole lines: the anchor line starts
-                // at its first byte and the cursor line runs to its end —
-                // pressing V mid-line must light the whole row, not [cursor..]
-                if (self.state.mode == .visual_line) {
-                    sel_start = self.cur().pt.lineStart(self.cur().pt.lineOf(sel_start));
-                    sel_end = self.cur().pt.lineStart(self.cur().pt.lineOf(sel_end)) + self.cur().pt.lineLen(self.cur().pt.lineOf(sel_end));
-                }
-                // Ctrl+v (visual_block) selects a rectangle: every line
-                // between the anchor/cursor rows shares the same column slice
-                // [left, min(right+1, lineLen)) — rows outside the block or
-                // shorter than the left column get no highlight.
-                if (self.state.mode == .visual_block) {
-                    if (self.blockRect()) |rect| {
-                        if (line >= rect.top and line <= rect.bottom) {
-                            sel_s = @min(rect.left, line_len);
-                            sel_e = @min(rect.right + 1, line_len);
-                        }
-                    }
-                } else {
-                    const line_end = line_start + line_len;
-                    if (sel_start < line_end and sel_end > line_start) {
-                        sel_s = @max(sel_start, line_start) - line_start;
-                        sel_e = @min(sel_end, line_end) - line_start;
-                    }
-                }
-            }
-
-            // split the line into styled runs: syntax fg from the merged
-            // spans, cursorline bg on the cursor's row, selection bg wins
-            const is_cur_line = line == cursor_line;
-            var segs = std.ArrayList(vaxis.Segment).empty;
-            try segs.append(a, .{
-                .text = num_str,
-                .style = if (is_cur_line) .{ .bg = .{ .rgb = .{ 40, 48, 68 } } } else .{},
-            });
-            var col: u32 = 0;
-            while (col < n) {
-                while (span_i < merged.len and merged[span_i].end <= line_start + col) span_i += 1;
-                var next: u32 = n;
-                var fg: ?vaxis.Style = null;
-                if (span_i < merged.len) {
-                    const sp = merged[span_i];
-                    if (sp.start < line_start + n and sp.end > line_start + col) {
-                        fg = syntaxStyle(sp.style);
-                        const sp_start: u32 = if (sp.start > line_start) sp.start - line_start else 0;
-                        const sp_end: u32 = if (sp.end < line_start + n) sp.end - line_start else n;
-                        next = if (sp_start > col) sp_start else sp_end;
-                    }
-                }
-                if (sel_s > col and sel_s < next) next = sel_s;
-                if (sel_e > col and sel_e < next) next = sel_e;
-                const in_sel = col >= sel_s and col < sel_e;
-                var style: vaxis.Style = .{};
-                if (is_cur_line) style.bg = .{ .rgb = .{ 40, 48, 68 } };
-                if (in_sel) style.bg = .{ .rgb = .{ 54, 74, 130 } };
-                if (fg) |f| style.fg = f.fg;
-                try segs.append(a, .{ .text = text[col..next], .style = style });
-                col = next;
-            }
-
-            _ = win.print(segs.items, .{
-                .row_offset = @intCast(row),
-                .col_offset = @intCast(self.contentCol()),
-                .wrap = .none,
-            });
+        // split windows: every leaf gets a rectangle and renders its buffer;
+        // the focused window carries syntax highlighting and the selection
+        const leaves = try self.layoutWindows(a, self.contentTop(), content_rows, self.contentCol(), win.width);
+        var cur_rect: LeafRect = .{ .win = self.current_win, .row = 0, .col = 0, .height = 0, .width = 0 };
+        var li: usize = 0;
+        while (li < leaves.len) : (li += 1) {
+            const lr = leaves[li];
+            if (lr.win == self.current_win) cur_rect = lr;
+            try self.renderWindowLines(a, lr, lr.win == self.current_win);
         }
 
         // file tree sidebar
@@ -2896,7 +3232,7 @@ const App = struct {
                 const w = self.mc.wordRange(&self.cur().pt, cpos);
                 if (w.end <= w.start) continue;
                 const wline = self.cur().pt.lineOf(w.start);
-                if (wline < self.cur().view_top or wline >= self.cur().view_top + content_rows) continue;
+                if (wline < self.curViewTop().* or wline >= self.curViewTop().* + content_rows) continue;
                 const ls = self.cur().pt.lineStart(wline);
                 var p = w.start;
                 while (p < w.end) {
@@ -2907,7 +3243,7 @@ const App = struct {
                     var char_buf: [4]u8 = undefined;
                     self.cur().pt.copyRange(p, char_buf[0..clen]);
                     const g = try a.dupe(u8, char_buf[0..clen]);
-                    win.writeCell(@intCast(self.contentCol() + gutter + col), @intCast(self.contentTop() + wline - self.cur().view_top), .{
+                    win.writeCell(@intCast(self.contentCol() + gutter + col), @intCast(self.contentTop() + wline - self.curViewTop().*), .{
                         .char = .{ .grapheme = g, .width = 1 },
                         .style = .{ .bg = .{ .rgb = .{ 54, 74, 130 } } },
                     });
@@ -2920,10 +3256,10 @@ const App = struct {
         if (self.em_labels) {
             for (self.em_matches) |m| {
                 const mline = self.cur().pt.lineOf(m.pos);
-                if (mline < self.cur().view_top or mline >= self.cur().view_top + content_rows) continue;
+                if (mline < self.curViewTop().* or mline >= self.curViewTop().* + content_rows) continue;
                 const col_in_line = m.pos - self.cur().pt.lineStart(mline);
                 const label = try a.dupe(u8, &[_]u8{m.label});
-                win.writeCell(@intCast(self.contentCol() + gutter + col_in_line), @intCast(self.contentTop() + mline - self.cur().view_top), .{
+                win.writeCell(@intCast(self.contentCol() + gutter + col_in_line), @intCast(self.contentTop() + mline - self.curViewTop().*), .{
                     .char = .{ .grapheme = label, .width = 1 },
                     .style = .{ .fg = .{ .rgb = .{ 250, 189, 47 } }, .bg = .{ .rgb = .{ 54, 74, 130 } } },
                 });
@@ -3008,12 +3344,12 @@ const App = struct {
             const list_rows = @min(@as(usize, 8), total);
             var top: usize = 0;
             if (self.completion_sel >= list_rows) top = self.completion_sel - list_rows + 1;
-            const c_line = self.cur().pt.lineOf(self.cur().cursor);
-            const c_col = self.cur().cursor - self.cur().pt.lineStart(c_line);
-            var start_row = c_line - self.cur().view_top + self.contentTop() + 1;
+            const c_line = self.cur().pt.lineOf(self.curCursor().*);
+            const c_col = self.curCursor().* - self.cur().pt.lineStart(c_line);
+            var start_row = c_line - self.curViewTop().* + self.contentTop() + 1;
             if (start_row + list_rows > height) {
                 // near the bottom: show the menu above the cursor instead
-                start_row = c_line - self.cur().view_top + self.contentTop() - list_rows;
+                start_row = c_line - self.curViewTop().* + self.contentTop() - list_rows;
             }
             var k: usize = 0;
             while (k < list_rows) : (k += 1) {
@@ -3042,13 +3378,13 @@ const App = struct {
             try std.fmt.allocPrint(
                 a,
                 "{s} line {d}/{d} col {d}  {s}",
-                .{ mode_str, cursor_line + 1, line_count, self.cur().cursor - self.cur().pt.lineStart(cursor_line), m },
+                .{ mode_str, cursor_line + 1, line_count, self.curCursor().* - self.cur().pt.lineStart(cursor_line), m },
             )
         else
             try std.fmt.allocPrint(
                 a,
                 "{s} line {d}/{d} col {d}",
-                .{ mode_str, cursor_line + 1, line_count, self.cur().cursor - self.cur().pt.lineStart(cursor_line) },
+                .{ mode_str, cursor_line + 1, line_count, self.curCursor().* - self.cur().pt.lineStart(cursor_line) },
             );
         const status_seg = [_]vaxis.Segment{.{
             .text = status,
@@ -3065,8 +3401,8 @@ const App = struct {
                 .col = 0,
             };
         } else {
-            const cursor_col = self.cur().cursor - self.cur().pt.lineStart(cursor_line);
-            const cursor_row = cursor_line - self.cur().view_top + self.contentTop();
+            const cursor_col = self.curCursor().* - self.cur().pt.lineStart(cursor_line);
+            const cursor_row = cursor_line - self.curViewTop().* + self.contentTop();
             self.vx.screen.cursor = .{
                 .row = @intCast(cursor_row),
                 .col = @intCast(self.contentCol() + gutter + cursor_col), // gutter offset
@@ -3195,7 +3531,7 @@ pub fn main(init: std.process.Init) !void {
         break; // M0: first file only
     }
     if (target_line > 0) {
-        app.cur().cursor = app.cur().pt.lineStart(@min(target_line - 1, app.cur().pt.lineCount() - 1));
+        app.curCursor().* = app.cur().pt.lineStart(@min(target_line - 1, app.cur().pt.lineCount() - 1));
     }
 
     try app.loadRecent();

@@ -590,6 +590,7 @@ Client = {
 - [x] 统一 fuzzy picker：文件（sf）/ grep（st，ripgrep）/ buffer（sb）/ 最近文件（sr）
 - [x] 命令模式增强：历史（会话内）+ Tab 补全（路径）+ `:s` 替换 + `:'<,'>s` 视觉范围注入
 - [x] Dashboard（最近文件持久化 `~/.cache/oz/recent`）
+- [x] 多窗口 split：`:vs`/`:sp` 分割 + Ctrl-w h/j/k/l 几何切换 + `:q` 关窗口 + `:qa` 全退（窗口独立 cursor/viewport，同 buffer 可多窗口）
 
 **M1 通过 = 日常写代码主流程可替代 vim。**
 
