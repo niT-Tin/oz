@@ -157,9 +157,14 @@ pub const Highlighter = struct {
         self.parser.destroy();
     }
 
-    /// (Re)parse `text`, reusing the previous tree incrementally.
+    /// Full reparse of `text`. Deliberately passes null as the old tree:
+    /// tree-sitter's incremental path reuses the old tree's internal state
+    /// and corrupts the result when the new text is a *different document*
+    /// (buffer switch) with no edit() records — exactly the "highlight garbles
+    /// after switching buffers" bug. Buffer switches and multi-edit fallbacks
+    /// land here; the single-edit incremental path lives in `reparseEdit`.
     pub fn reparse(self: *Highlighter, text: []const u8) !void {
-        const new_tree = try self.parser.parseString(self.tree, text);
+        const new_tree = try self.parser.parseString(null, text);
         if (self.tree) |old| old.destroy();
         self.tree = new_tree;
     }
@@ -354,4 +359,28 @@ test "highlight: sequential reparseEdit calls keep byte spans stable" {
     }
     try std.testing.expect(keyword_ok);
     try std.testing.expect(number_ok);
+}
+test "highlight: reparse with different text (buffer switch) stays correct" {
+    const alloc = std.testing.allocator;
+    var hl = try Highlighter.init(alloc, "zig");
+    defer hl.deinit();
+    // parse one document, then fully reparse a different one — the buffer
+    // switch case (regression: reusing the stale tree corrupted the spans)
+    try hl.reparse("const std = @import(\"std\");\n");
+    const src2 = "const Piece = struct {\n    start: u32, // comment\n};\n";
+    try hl.reparse(src2);
+    var spans = std.ArrayList(Span).empty;
+    defer spans.deinit(alloc);
+    try hl.spansInRange(0, @intCast(src2.len), alloc, &spans);
+    var piece_ok = false;
+    var struct_ok = false;
+    var comment_ok = false;
+    for (spans.items) |sp| {
+        if (sp.style == .type and sp.start == 6 and sp.end == 11) piece_ok = true;
+        if (sp.style == .keyword and sp.start == 14 and sp.end == 20) struct_ok = true;
+        if (sp.style == .comment and std.mem.eql(u8, src2[sp.start..sp.end], "// comment")) comment_ok = true;
+    }
+    try std.testing.expect(piece_ok);
+    try std.testing.expect(struct_ok);
+    try std.testing.expect(comment_ok);
 }
