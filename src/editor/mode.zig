@@ -92,6 +92,17 @@ pub const Result = union(enum) {
         exclusive_end: bool = true,
         text_object: ?TextObject.Kind = null,
     },
+    /// Align lines by a delimiter (ga{motion}{char} / visual-ga{char}).
+    /// The caller aligns the lines covered by the stored range (or the visual
+    /// selection) on the first `char` of each line.
+    align_lines: struct {
+        char: u8,
+        motion: ?Motion.Motion = null,
+        args: Motion.Args = .{},
+        count: u32 = 1,
+        text_object: ?TextObject.Kind = null,
+        selection: bool = false, // visual-mode ga: align the selection
+    },
 };
 
 /// Pending surround sequence state (after y/d/c + 's').
@@ -112,6 +123,21 @@ pub const SurroundPending = union(enum) {
         exclusive_end: bool,
         text_object: ?TextObject.Kind = null,
     },
+};
+
+/// ga sequence state.
+pub const AlignPending = union(enum) {
+    /// ga in normal mode: waiting for the motion (or 'i'/'a' text object)
+    motion,
+    /// motion seen: waiting for the delimiter char
+    char: struct {
+        motion: Motion.Motion,
+        args: Motion.Args,
+        count: u32,
+        text_object: ?TextObject.Kind = null,
+    },
+    /// ga in visual mode: the selection is the range, waiting for the char
+    visual_char,
 };
 
 const max_count_digits = 9; // count saturates at 999_999_999 (fits u32)
@@ -137,11 +163,15 @@ pub const State = struct {
     pending_text_object: ?u8 = null,
     /// leader (Space) seen, awaiting the next key (<leader>f etc.)
     pending_leader: bool = false,
+    /// <leader>s seen (picker family), awaiting f/t/b
+    pending_leader_s: bool = false,
     /// surround sequence (ys/ds/cs) in progress
     pending_surround: ?SurroundPending = null,
     /// 'g' + 'c' seen (comment sequence), awaiting 'c' (line) — gc in visual
     /// mode is handled by the caller
     pending_gc: bool = false,
+    /// ga sequence in progress (motion/text object, then the delimiter char)
+    pending_align: ?AlignPending = null,
 
     /// backing storage for count_digits. The slice points into this buffer,
     /// so State must not be copied by value while a count is pending.
@@ -202,6 +232,22 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
             resetPending(state);
             return .pending;
         }
+        // gaiw etc.: the text object feeds an align
+        if (state.pending_align) |pa| {
+            if (pa == .motion) {
+                state.pending_align = .{
+                    .char = .{
+                        .motion = .left, // unused with text_object
+                        .args = .{},
+                        .count = 1,
+                        .text_object = kind,
+                    },
+                };
+                return .pending;
+            }
+            resetPending(state);
+            return .pending;
+        }
         if (state.pending_op) |op| {
             return emitTextObject(state, op, kind);
         }
@@ -213,6 +259,27 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         return handleSurround(state, key, keymap);
     }
 
+    // 0d) align sequence (ga): motion/text object then the delimiter char
+    if (state.pending_align != null) {
+        return handleAlign(state, key, keymap);
+    }
+
+    // 0a2) <leader>s pending (picker family)
+    if (state.pending_leader_s) {
+        state.pending_leader_s = false;
+        if (isEscape(key)) {
+            resetPending(state);
+            return .pending;
+        }
+        switch (key.codepoint) {
+            'f' => return emitAction(state, .picker_file), // <leader>sf files
+            else => {
+                resetPending(state);
+                return .pending;
+            },
+        }
+    }
+
     // 0b) leader (Space) pending — next key picks the <leader> action.
     if (state.pending_leader) {
         state.pending_leader = false;
@@ -222,6 +289,10 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         }
         switch (key.codepoint) {
             'f' => return emitAction(state, .leader_find), // <leader>f easymotion
+            's' => {
+                state.pending_leader_s = true;
+                return .pending;
+            },
             else => {
                 resetPending(state);
                 return .pending;
@@ -273,6 +344,15 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
             // gcc / gc — comment sequences
             'c' => {
                 state.pending_gc = true;
+                return .pending;
+            },
+            // ga — align lines by a delimiter
+            'a' => {
+                state.pending_align = if (state.mode == .visual_char or
+                    state.mode == .visual_line or state.mode == .visual_block)
+                    .visual_char
+                else
+                    .motion;
                 return .pending;
             },
             else => {
@@ -444,6 +524,7 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .leader_find => emitAction(state, .leader_find),
         .toggle_comment_line => emitAction(state, .toggle_comment_line),
         .mc_add => emitAction(state, .mc_add),
+        .picker_file => emitAction(state, .picker_file),
         .leader => blk: {
             state.pending_leader = true;
             break :blk .pending;
@@ -679,8 +760,61 @@ fn resetPending(state: *State) void {
     state.pending_find = null;
     state.pending_text_object = null;
     state.pending_leader = false;
+    state.pending_leader_s = false;
     state.pending_surround = null;
+    state.pending_align = null;
     resetCount(state);
+}
+
+// ---- align (ga) ----
+
+fn handleAlign(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
+    if (isEscape(key)) {
+        resetPending(state);
+        return .pending;
+    }
+    switch (state.pending_align.?) {
+        .visual_char => {
+            const ch = charOf(key) orelse {
+                resetPending(state);
+                return .pending;
+            };
+            state.pending_align = null;
+            return .{ .align_lines = .{ .char = ch, .selection = true } };
+        },
+        .motion => {
+            // 'i'/'a' → text object (gaiw, gai(…) — resolved by the text-object
+            // branch which converts .motion into .char
+            if (key.codepoint == 'i' or key.codepoint == 'a') {
+                state.pending_text_object = @intCast(key.codepoint);
+                return .pending;
+            }
+            if (KeyEvent.lookup(keymap, key)) |action| {
+                if (actionToMotion(action)) |m| {
+                    const count = countValue(state);
+                    resetCount(state);
+                    state.pending_align = .{ .char = .{ .motion = m, .args = .{}, .count = count } };
+                    return .pending;
+                }
+            }
+            resetPending(state);
+            return .pending;
+        },
+        .char => |saved| {
+            const ch = charOf(key) orelse {
+                resetPending(state);
+                return .pending;
+            };
+            state.pending_align = null;
+            return .{ .align_lines = .{
+                .char = ch,
+                .motion = saved.motion,
+                .args = saved.args,
+                .count = saved.count,
+                .text_object = saved.text_object,
+            } };
+        },
+    }
 }
 
 // ---- surround (ys / ds / cs) ----
@@ -876,6 +1010,37 @@ test "surround: ysw' adds with motion, ds( deletes, cs'\" changes" {
     _ = handle(&s5, press('s'), Keymaps.normal);
     const r5 = handle(&s5, esc(), Keymaps.normal);
     try testing.expectEqual(.pending, tag(r5));
+}
+
+test "align: ga{motion}{char} and visual-ga{char}" {
+    var s = State.init();
+    _ = handle(&s, press('g'), Keymaps.normal);
+    _ = handle(&s, press('a'), Keymaps.normal);
+    _ = handle(&s, press('w'), Keymaps.normal);
+    const r = handle(&s, press('='), Keymaps.normal);
+    try testing.expectEqual(.align_lines, tag(r));
+    try testing.expectEqual(@as(u8, '='), r.align_lines.char);
+    try testing.expectEqual(Motion.Motion.word_next, r.align_lines.motion);
+    try testing.expect(!r.align_lines.selection);
+
+    // gai{ — text object feeds the align
+    var s2 = State.init();
+    _ = handle(&s2, press('g'), Keymaps.normal);
+    _ = handle(&s2, press('a'), Keymaps.normal);
+    _ = handle(&s2, press('i'), Keymaps.normal);
+    _ = handle(&s2, press('{'), Keymaps.normal);
+    const r2 = handle(&s2, press('='), Keymaps.normal);
+    try testing.expectEqual(.align_lines, tag(r2));
+    try testing.expectEqual(TextObject.Kind.inner_brace, r2.align_lines.text_object);
+
+    // visual mode: ga{char} directly
+    var s3 = State.init();
+    s3.mode = .visual_char;
+    _ = handle(&s3, press('g'), Keymaps.normal);
+    _ = handle(&s3, press('a'), Keymaps.normal);
+    const r3 = handle(&s3, press('='), Keymaps.normal);
+    try testing.expectEqual(.align_lines, tag(r3));
+    try testing.expect(r3.align_lines.selection);
 }
 
 test "operator + text object: diw / ci( / yaw" {

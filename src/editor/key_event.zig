@@ -71,6 +71,7 @@ pub const ActionId = enum {
     leader, // space — leader prefix
     toggle_comment_line, // gcc — comment/uncomment the current line
     mc_add, // Ctrl+n — multi-cursor: select word / add next match
+    picker_file, // <leader>sf — fuzzy file picker
     enter_command_mode, // :
     normal_mode, // esc / ctrl-c
     insert_exit, // jk special-cased by Mode

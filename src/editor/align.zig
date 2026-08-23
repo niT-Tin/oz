@@ -62,7 +62,9 @@ pub fn alignLines(
         const ll = pt.lineLen(line);
 
         if (firstDelim(pt, line, delim)) |d| {
-            // Leading whitespace stays put; the padding goes right after it.
+            // Vim/tabular semantics: leading whitespace stays, the content
+            // before the delimiter stays, and the padding spaces are inserted
+            // right before the delimiter so all delimiters sit in max_col.
             var indent: usize = 0;
             while (indent < d) : (indent += 1) {
                 const b = pt.byteAt(ls + @as(u32, @intCast(indent)));
@@ -71,10 +73,12 @@ pub fn alignLines(
             const pad: usize = max_col - d;
             pt.copyRange(ls, out[w .. w + indent]);
             w += indent;
+            pt.copyRange(ls + @as(u32, @intCast(indent)), out[w .. w + (d - indent)]);
+            w += d - indent;
             @memset(out[w .. w + pad], ' ');
             w += pad;
-            pt.copyRange(ls + @as(u32, @intCast(indent)), out[w .. w + (ll - indent)]);
-            w += ll - indent;
+            pt.copyRange(ls + @as(u32, @intCast(d)), out[w .. w + (ll - d)]);
+            w += ll - d;
         } else {
             pt.copyRange(ls, out[w .. w + ll]);
             w += ll;
@@ -123,15 +127,14 @@ fn alignAndCheck(
 }
 
 test "align: pads '=' to the max column, keeps indentation, leaves no-delim lines alone" {
-    // Padding goes right AFTER the leading whitespace (DESIGN.md §1.3:
-    // "补到原前导空白之后，即保持行首缩进"): a line without indentation gets
-    // its padding at the line start.
-    //   "a = 1"       pre=2  -> pad 5, no indent -> "     a = 1"
-    //   "longer = 22" pre=7  (the max)           -> unchanged
-    //   "  b = 3"     pre=4  -> pad 3 after "  " -> "     b = 3"
-    //   "no delim here"                          -> unchanged
+    // Vim/tabular semantics: padding is inserted right before the delimiter,
+    // so all delimiters sit in the max column (DESIGN.md §1.3 "按分隔符对齐").
+    //   "a = 1"       '=' at 2 -> pad 5 -> "a      = 1"
+    //   "longer = 22" '=' at 7 (the max)        -> unchanged
+    //   "  b = 3"     '=' at 5 -> pad 2 -> "  b   = 3"
+    //   "no delim here"                        -> unchanged
     const input = "a = 1\nlonger = 22\n  b = 3\nno delim here\n";
-    const expected = "     a = 1\nlonger = 22\n     b = 3\nno delim here\n";
+    const expected = "a      = 1\nlonger = 22\n  b    = 3\nno delim here\n";
     try alignAndCheck(testing.allocator, input, 0, 3, '=', expected);
 }
 
@@ -149,21 +152,21 @@ test "align: no line has the delimiter -> the range is returned unchanged" {
 
 test "align: CJK lines are padded by bytes" {
     // "中文" is 6 bytes; '=' in "中文=1" sits at byte 6, so "ab=2" gets 4
-    // spaces at the line start (no leading whitespace to pad after).
+    // spaces right before its '='.
     const input = "中文=1\nab=2\n";
-    const expected = "中文=1\n    ab=2\n";
+    const expected = "中文=1\nab    =2\n";
     try alignAndCheck(testing.allocator, input, 0, 1, '=', expected);
 }
 
 test "align: only the first delimiter per line is aligned" {
     const input = "a = b = c\nx=y\n";
-    const expected = "a = b = c\n x=y\n";
+    const expected = "a = b = c\nx =y\n";
     try alignAndCheck(testing.allocator, input, 0, 1, '=', expected);
 }
 
 test "align: empty line inside the range is left alone" {
     const input = "a=1\n\nbb=2\n";
-    const expected = " a=1\n\nbb=2\n";
+    const expected = "a =1\n\nbb=2\n"; // '=' columns 1 and 2 → max 2
     try alignAndCheck(testing.allocator, input, 0, 2, '=', expected);
 }
 
@@ -175,7 +178,7 @@ test "align: sub-range replacement starts at the range's first line" {
 
 test "align: last line without a trailing newline stays newline-free" {
     const input = "a=1\nbb=2";
-    const expected = " a=1\nbb=2";
+    const expected = "a =1\nbb=2";
     try alignAndCheck(testing.allocator, input, 0, 1, '=', expected);
 }
 
@@ -185,7 +188,7 @@ test "align: aligned lines share one delimiter column (copyRange per line)" {
     defer pt.deinit();
     const out = try alignLines(testing.allocator, &pt, 0, 3, '=');
     defer testing.allocator.free(out);
-    try testing.expectEqualStrings(" x = 1\nyy = 2\nzzz=3\nplain line\n", out);
+    try testing.expectEqualStrings("x  = 1\nyy = 2\nzzz=3\nplain line\n", out);
 
     // Verify the delimiter column directly against the aligned text.
     var result = try PieceTable.init(testing.allocator, out);

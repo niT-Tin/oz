@@ -8,6 +8,7 @@ const vaxis = @import("vaxis");
 
 const buffer = @import("buffer/root.zig");
 const editor = @import("editor/root.zig");
+const util = @import("util/root.zig");
 
 // Silence vaxis's per-frame debug logging (pollutes the tty byte stream and
 // interferes with e2e screen reconstruction).
@@ -57,6 +58,13 @@ const App = struct {
     mc: editor.MultiCursor = undefined,
     mc_active: bool = false,
 
+    // fuzzy picker (<leader>sf)
+    picker_active: bool = false,
+    picker_files: std.ArrayList([]u8) = .empty, // owned paths
+    picker_input: std.ArrayList(u8) = .empty,
+    picker_matches: std.ArrayList(usize) = .empty, // indices into picker_files
+    picker_sel: usize = 0,
+
     fn create(init: std.process.Init) !*App {
         const self = try init.gpa.create(App);
         errdefer init.gpa.destroy(self);
@@ -93,6 +101,9 @@ const App = struct {
             .cmdline = .empty,
             .cmd_history = .empty,
             .mc = editor.MultiCursor.init(init.gpa),
+            .picker_files = .empty,
+            .picker_input = .empty,
+            .picker_matches = .empty,
         };
         // NOTE: loop holds pointers to self.tty / self.vx, so the App must
         // stay at a stable address (heap) — never move it after this.
@@ -121,6 +132,10 @@ const App = struct {
         if (self.yank_buffer) |b| self.alloc.free(b);
         if (self.em_matches.len > 0) self.alloc.free(self.em_matches);
         self.mc.deinit();
+        for (self.picker_files.items) |f| self.alloc.free(f);
+        self.picker_files.deinit(self.alloc);
+        self.picker_input.deinit(self.alloc);
+        self.picker_matches.deinit(self.alloc);
     }
 
     // ---- input ----
@@ -129,6 +144,12 @@ const App = struct {
         // EasyMotion capture: query char, then a label to jump to
         if (self.em_active) {
             try self.handleEasyMotionKey(key);
+            return;
+        }
+
+        // Fuzzy picker input
+        if (self.picker_active) {
+            try self.handlePickerKey(key);
             return;
         }
 
@@ -236,6 +257,7 @@ const App = struct {
                 try self.applyOpRange(m.op, self.cursor, target_pos, m.exclusive_end);
             },
             .surround => |s| try self.execSurround(s),
+            .align_lines => |a| try self.execAlign(a),
             .command_mode => {
                 // ':' pressed: open the command line (Mode already set .command)
                 self.cmdline.clearRetainingCapacity();
@@ -567,6 +589,39 @@ const App = struct {
         return rng;
     }
 
+    /// ga: align lines [start_line, end_line] on the first `char`.
+    fn execAlign(self: *App, a: anytype) !void {
+        var start_line: u32 = undefined;
+        var end_line: u32 = undefined;
+        if (a.selection) {
+            const anchor = self.visual_anchor orelse return;
+            const s = @min(anchor, self.cursor);
+            const e = @max(anchor, self.cursor);
+            start_line = self.pt.lineOf(s);
+            end_line = self.pt.lineOf(e);
+            self.exitVisual();
+        } else {
+            var rng: editor.TextObject.Range = undefined;
+            if (a.text_object) |kind| {
+                const r = editor.TextObject.range(&self.pt, kind, self.cursor);
+                rng = .{ .start = r.start, .end = r.end };
+            } else if (a.motion) |m| {
+                const target = editor.Motion.target(&self.pt, m, a.args, self.cursor, a.count);
+                rng = .{ .start = @min(self.cursor, target), .end = @max(self.cursor, target) };
+            } else return;
+            start_line = self.pt.lineOf(rng.start);
+            end_line = self.pt.lineOf(rng.end);
+            if (rng.end > rng.start and rng.end == self.pt.lineStart(rng.end)) end_line -|= 1;
+        }
+        const text = try editor.align_text.alignLines(self.alloc, &self.pt, start_line, end_line, a.char);
+        defer self.alloc.free(text);
+        const start = self.pt.lineStart(start_line);
+        var end = self.pt.lineStart(end_line) + self.pt.lineLen(end_line);
+        if (end_line + 1 < self.pt.lineCount()) end += 1; // include trailing '\n'
+        try self.applyEdit(start, end, text);
+        self.cursor = start;
+    }
+
     fn applyEdit(self: *App, start: u32, end: u32, text: []const u8) !void {
         self.history.beginGroup();
         try self.history.record(&self.pt, start, end - start, text);
@@ -612,6 +667,113 @@ const App = struct {
         } else {
             _ = try self.mc.addNextMatch(&self.pt);
         }
+    }
+
+    // ---- fuzzy picker (<leader>sf) ----
+
+    fn openPicker(self: *App) !void {
+        if (self.picker_files.items.len == 0) {
+            // cwd() has fd == AT.FDCWD (-100), which the dir iterator can't
+            // getdents on — open a real directory handle first.
+            var root = try std.Io.Dir.cwd().openDir(self.io, ".", .{ .iterate = true });
+            defer root.close(self.io);
+            try self.walkDir(root, "");
+        }
+        self.picker_input.clearRetainingCapacity();
+        self.picker_sel = 0;
+        try self.pickerRefilter();
+        self.picker_active = true;
+    }
+
+    fn walkDir(self: *App, dir: std.Io.Dir, prefix: []const u8) !void {
+        var it = dir.iterate();
+        while (try it.next(self.io)) |entry| {
+            const name = entry.name;
+            if (name.len == 0 or name[0] == '.') continue;
+            if (std.mem.eql(u8, name, "zig-out") or std.mem.eql(u8, name, "node_modules")) continue;
+            const path = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ prefix, name });
+            switch (entry.kind) {
+                .directory => {
+                    var sub = try dir.openDir(self.io, name, .{ .iterate = true });
+                    defer sub.close(self.io);
+                    const sub_prefix = try std.fmt.allocPrint(self.alloc, "{s}/", .{path});
+                    try self.walkDir(sub, sub_prefix);
+                    self.alloc.free(sub_prefix);
+                    self.alloc.free(path);
+                },
+                .file => try self.picker_files.append(self.alloc, path),
+                else => self.alloc.free(path),
+            }
+        }
+    }
+
+    fn handlePickerKey(self: *App, key: vaxis.Key) !void {
+        switch (key.codepoint) {
+            vaxis.Key.escape => self.closePicker(),
+            vaxis.Key.enter => {
+                if (self.picker_matches.items.len > 0) {
+                    const f = self.picker_files.items[self.picker_matches.items[self.picker_sel]];
+                    self.closePicker();
+                    try self.openFile(f);
+                }
+            },
+            vaxis.Key.backspace => {
+                if (self.picker_input.items.len > 0) {
+                    _ = self.picker_input.pop();
+                    self.picker_sel = 0;
+                    try self.pickerRefilter();
+                }
+            },
+            vaxis.Key.down => {
+                if (self.picker_sel + 1 < self.picker_matches.items.len) self.picker_sel += 1;
+            },
+            vaxis.Key.up => {
+                if (self.picker_sel > 0) self.picker_sel -= 1;
+            },
+            else => {
+                if (key.codepoint == 'n' and key.mods.ctrl) {
+                    if (self.picker_sel + 1 < self.picker_matches.items.len) self.picker_sel += 1;
+                } else if (key.codepoint == 'p' and key.mods.ctrl) {
+                    if (self.picker_sel > 0) self.picker_sel -= 1;
+                } else if (key.text) |t| {
+                    try self.picker_input.appendSlice(self.alloc, t);
+                    self.picker_sel = 0;
+                    try self.pickerRefilter();
+                }
+            },
+        }
+    }
+
+    fn pickerRefilter(self: *App) !void {
+        self.picker_matches.clearRetainingCapacity();
+        const needle = self.picker_input.items;
+        if (needle.len == 0) {
+            const n = @min(self.picker_files.items.len, 20);
+            var i: usize = 0;
+            while (i < n) : (i += 1) try self.picker_matches.append(self.alloc, i);
+            return;
+        }
+        // top-20 by fzy score (small insertion-sort)
+        var top: [20]struct { idx: usize, score: f64 } = undefined;
+        var ntop: usize = 0;
+        for (self.picker_files.items, 0..) |f, i| {
+            const m = try util.fzy.match(self.alloc, f, needle) orelse continue;
+            defer self.alloc.free(m.positions);
+            var k = ntop;
+            while (k > 0 and top[k - 1].score < m.score) : (k -= 1) {
+                if (k < 20) top[k] = top[k - 1];
+            }
+            if (ntop < 20) ntop += 1;
+            if (k < 20) top[k] = .{ .idx = i, .score = m.score };
+        }
+        var j: usize = 0;
+        while (j < ntop) : (j += 1) try self.picker_matches.append(self.alloc, top[j].idx);
+        if (self.picker_sel >= self.picker_matches.items.len) self.picker_sel = 0;
+    }
+
+    fn closePicker(self: *App) void {
+        self.picker_active = false;
+        self.picker_sel = 0;
     }
 
     fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !void {
@@ -713,6 +875,7 @@ const App = struct {
                 }
             },
             .mc_add => try self.mcSelectNext(),
+            .picker_file => try self.openPicker(),
             .paste => try self.pasteBuffer(false),
             .paste_before => try self.pasteBuffer(true),
             .toggle_comment_line => try self.toggleCommentLine(),
@@ -882,6 +1045,37 @@ const App = struct {
                     .style = .{ .fg = .{ .rgb = .{ 250, 189, 47 } }, .bg = .{ .rgb = .{ 54, 74, 130 } } },
                 });
             }
+        }
+
+        // fuzzy picker overlay
+        if (self.picker_active) {
+            const list_rows = @min(@as(usize, 10), self.picker_matches.items.len);
+            const start_row = height - 1 - @as(u32, @intCast(list_rows)) - 1;
+            var ri: usize = 0;
+            while (ri < list_rows) : (ri += 1) {
+                const fname = self.picker_files.items[self.picker_matches.items[ri]];
+                const seg = [_]vaxis.Segment{.{
+                    .text = fname,
+                    .style = if (ri == self.picker_sel)
+                        .{ .bg = .{ .rgb = .{ 54, 74, 130 } } }
+                    else
+                        .{},
+                }};
+                _ = win.print(&seg, .{ .row_offset = @intCast(start_row + ri), .wrap = .none });
+            }
+            const prompt = try std.fmt.allocPrint(a, "> {s}", .{self.picker_input.items});
+            const prompt_seg = [_]vaxis.Segment{.{
+                .text = prompt,
+                .style = .{ .fg = .{ .rgb = .{ 192, 202, 245 } }, .bg = .{ .rgb = .{ 41, 46, 66 } } },
+            }};
+            _ = win.print(&prompt_seg, .{ .row_offset = @intCast(height - 1), .wrap = .none });
+            self.vx.screen.cursor = .{
+                .row = @intCast(height - 1),
+                .col = @intCast(2 + self.picker_input.items.len),
+            };
+            self.vx.screen.cursor_shape = .block;
+            try self.vx.render(self.tty.writer());
+            return;
         }
 
         // status bar (or command line in command mode)
