@@ -113,18 +113,33 @@ const App = struct {
             return;
         }
 
-        // Insert mode: characters insert directly; jk exits.
+        // Insert mode: characters insert directly; jk exits (removing the
+        // just-typed 'j'), backspace and Ctrl-w delete before the cursor.
         if (self.state.mode == .insert) {
             if (key.codepoint == vaxis.Key.escape or (key.codepoint == 'c' and key.mods.ctrl)) {
                 self.exitInsert();
                 return;
             }
-            // jk → exit insert without inserting the 'k'
+            // jk → drop the 'j' we just inserted, then exit (no chars left)
             if (self.prev_insert_key) |p| {
-                if (p.codepoint == 'j' and key.codepoint == 'k') {
+                if (p.codepoint == 'j' and key.codepoint == 'k' and
+                    !key.mods.ctrl and !key.mods.alt and !key.mods.super)
+                {
+                    if (self.cursor > 0 and self.pt.byteAt(self.cursor - 1) == 'j') {
+                        try self.history.record(&self.pt, self.cursor - 1, 1, "");
+                        self.cursor -= 1;
+                    }
                     self.exitInsert();
                     return;
                 }
+            }
+            if (key.codepoint == vaxis.Key.backspace) {
+                try self.deleteBeforeCursor();
+                return;
+            }
+            if (key.codepoint == 'w' and key.mods.ctrl) {
+                try self.deleteWordBefore();
+                return;
             }
             self.prev_insert_key = key;
             if (key.text) |text| {
@@ -177,6 +192,25 @@ const App = struct {
         self.history.endGroup();
         self.in_insert = false;
         self.prev_insert_key = null;
+    }
+
+    /// Delete the character before the cursor (backspace). The edit lands in
+    /// the open insert undo group so it stays part of the insert session.
+    fn deleteBeforeCursor(self: *App) !void {
+        if (self.cursor == 0) return;
+        const start = buffer.ops.prevCharStart(&self.pt, self.cursor);
+        try self.history.record(&self.pt, start, self.cursor - start, "");
+        self.cursor = start;
+    }
+
+    /// Delete the word before the cursor (Ctrl-w). Vim semantics: walk back
+    /// over whitespace then word characters; deletes [start, cursor).
+    fn deleteWordBefore(self: *App) !void {
+        if (self.cursor == 0) return;
+        const start = buffer.ops.wordStartBefore(&self.pt, self.cursor);
+        if (start == self.cursor) return;
+        try self.history.record(&self.pt, start, self.cursor - start, "");
+        self.cursor = start;
     }
 
     // ---- command line (':') ----

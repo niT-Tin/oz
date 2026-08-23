@@ -9,6 +9,7 @@ const std = @import("std");
 pub const piece_table = @import("buffer/piece_table.zig");
 pub const utf8 = @import("buffer/utf8.zig");
 pub const history = @import("buffer/history.zig");
+pub const ops = @import("buffer/ops.zig");
 pub const fzy = @import("util/fzy.zig");
 pub const json_rpc = @import("util/json_rpc.zig");
 pub const key_event = @import("editor/key_event.zig");
