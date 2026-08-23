@@ -2166,6 +2166,200 @@ test "visual block: <C-v> block + I/A inserts on every line" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+test "visual block: rectangle semantics — highlight and d delete per column" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    // uneven line lengths: the old byte-range path highlighted [anchor..cursor)
+    // bytes, which on these rows is NOT a rectangle (row 0 would light "aa",
+    // row 1 the whole line). vim semantics: every covered row shares the
+    // same single-column slice.
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}blk.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "aaa\nbbbb\ncc\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    const sel_bg = packRgb(54, 74, 130);
+    // cursor → col 1, Ctrl+v (anchor col 1), j j → cursor line 2 col 1.
+    // Screen layout: row 0 = tab bar, content col 0 = gutter (4 wide for a
+    // 3-line file), so file line n sits on screen row n+1 and its byte col 1
+    // is screen col 5.
+    try sess.send("l\x16jj");
+    waited = 0;
+    var block_hl = false;
+    while (!block_hl) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        if (grid.bg_buf[1 * grid.cols + 5] == sel_bg and
+            grid.bg_buf[2 * grid.cols + 5] == sel_bg and
+            grid.bg_buf[3 * grid.cols + 5] == sel_bg)
+        {
+            block_hl = true;
+        }
+    }
+    if (!block_hl) {
+        std.debug.print("block highlight missing:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(block_hl);
+    // the rectangle must NOT light column 0 or 2 on any row (the byte-range
+    // path lit col 2 on row 0 and col 0..3 on row 1)
+    try std.testing.expect(grid.bg_buf[1 * grid.cols + 4] != sel_bg);
+    try std.testing.expect(grid.bg_buf[1 * grid.cols + 6] != sel_bg);
+    try std.testing.expect(grid.bg_buf[2 * grid.cols + 4] != sel_bg);
+    try std.testing.expect(grid.bg_buf[3 * grid.cols + 4] != sel_bg);
+
+    // d deletes exactly one column from every covered row: aa / bbb / c
+    try sess.send("d");
+    waited = 0;
+    while (!rowContains(&grid, 1, "aa") or rowContains(&grid, 1, "aaa")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!rowContains(&grid, 1, "aa") or rowContains(&grid, 1, "aaa")) {
+        std.debug.print("after block d:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(rowContains(&grid, 1, "aa"));
+    try std.testing.expect(!rowContains(&grid, 1, "aaa"));
+    try std.testing.expect(rowContains(&grid, 2, "bbb"));
+    try std.testing.expect(rowContains(&grid, 3, "c"));
+
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    const f = try std.Io.Dir.cwd().openFile(io, name, .{ .mode = .read_only });
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    try std.testing.expectEqualStrings("aa\nbbb\nc\n", buf);
+}
+
+test "visual block: c deletes the rectangle and types at the top-left cursor" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}blkc.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "aaa\nbbbb\ncc\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // block rows 0..2 col 1, then c: deletes the column everywhere and enters
+    // insert at the block's top-left (row 0 col 1). Typing 'X' replaces only
+    // there (vim c on a block): aXa / bbb / c.
+    try sess.send("l\x16jjcX");
+    waited = 0;
+    while (!rowContains(&grid, 1, "aXa")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!rowContains(&grid, 1, "aXa")) {
+        std.debug.print("after block c:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(rowContains(&grid, 1, "aXa"));
+    try std.testing.expect(rowContains(&grid, 2, "bbb"));
+    try std.testing.expect(rowContains(&grid, 3, "c"));
+    try std.testing.expect(grid.contains("INSERT"));
+
+    // Esc exits insert (sent alone — Esc followed by ':' would merge into
+    // Alt+':'), then :wq persists.
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    const f = try std.Io.Dir.cwd().openFile(io, name, .{ .mode = .read_only });
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    try std.testing.expectEqualStrings("aXa\nbbb\nc\n", buf);
+}
+
 test "visual block: multi-cursor backspace, ctrl-w and jk stay in sync" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -4918,4 +5112,125 @@ test "insert Ctrl+n: no candidates when the cursor is not inside a word" {
     defer alloc.free(buf);
     _ = try f.readPositionalAll(io, buf, 0);
     try std.testing.expectEqualStrings("alpha beta gamma\nconst alpha = 1;\n", buf);
+}
+
+/// fg of the first char of `needle` on row `r`, or null when absent.
+fn fgOfOnRow(grid: *Grid, r: usize, needle: []const u8) ?u32 {
+    const row_text = grid.rowText(r);
+    var c: usize = 0;
+    while (c + needle.len <= grid.cols) : (c += 1) {
+        if (std.mem.eql(u8, row_text[c .. c + needle.len], needle)) {
+            return grid.fg_buf[r * grid.cols + c];
+        }
+    }
+    return null;
+}
+
+test "insert: typing 'j' at end of a line keeps the next line's first word color" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}jcol.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const std = @import(\"std\");\npub fn main() void {\n    const x = 1;\n    const y = 2;\n}\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+    // quick probe: is ANY "const" gold on the initial render of a multi-line
+    // zig file (regression check for the j-typing report)
+    const any_gold = grid.containsFg("const", packRgb(224, 175, 104));
+    if (!any_gold) {
+        std.debug.print("no gold 'const' anywhere on initial render:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(any_gold);
+
+    const gold = packRgb(224, 175, 104);
+    const cursorline_bg = packRgb(40, 48, 68);
+    // rows: 0 = tab bar, 1.. = file lines. Move the cursor down two lines
+    // (file line 2 = "    const x = 1;"), waiting on the cursorline highlight
+    // so the motions have actually been processed (a content-only wait is
+    // satisfied by the initial frame before the keys are handled).
+    try sess.send("jj"); // cursor → file line 2
+    waited = 0;
+    while (!grid.rowHasBg(3, cursorline_bg)) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.rowHasBg(3, cursorline_bg));
+    // the next line ("    const y = 2;") is on screen row 4; its "const"
+    // must be gold before typing anything
+    const before = fgOfOnRow(&grid, 4, "const");
+    if (before != gold) {
+        std.debug.print("before typing j: row4 'const' fg = 0x{x:0>6}\n", .{before orelse 0});
+        grid.dump();
+    }
+    try std.testing.expectEqual(gold, before);
+
+    // A → insert at end of line 2, type 'j'; the NEXT line's first word
+    // ("const y") must keep its keyword color.
+    try sess.send("Aj");
+    waited = 0;
+    while (!rowContains(&grid, 3, "const x = 1;j")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(rowContains(&grid, 3, "const x = 1;j"));
+    const after = fgOfOnRow(&grid, 4, "const");
+    if (after != gold) {
+        std.debug.print("after typing j: row4 'const' fg = 0x{x:0>6}\n", .{after orelse 0});
+        grid.dump();
+    }
+    try std.testing.expectEqual(gold, after);
+
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
 }

@@ -501,9 +501,13 @@ const App = struct {
                 // visual mode: the operator acts on the selection
                 if (self.isVisual()) {
                     if (self.visual_anchor) |anchor| {
-                        try self.applyOpRangeEx(m.op, anchor, self.cur().cursor, false, .inclusive_cursor);
+                        if (self.state.mode == .visual_block) {
+                            try self.applyBlockOp(m.op);
+                        } else {
+                            try self.applyOpRangeEx(m.op, anchor, self.cur().cursor, false, .inclusive_cursor);
+                        }
                     }
-                    self.exitVisual();
+                    self.exitVisualAfterOp(m.op);
                     return;
                 }
                 // normal mode: d/c/y over [cursor, target)
@@ -552,6 +556,84 @@ const App = struct {
     }
 
     // ---- visual-block multi-cursor insert (<C-v> block then I/A) ----
+
+    /// The vim visual-block rectangle: the lines between the anchor and
+    /// cursor rows and the columns between their columns (both ends
+    /// inclusive). Columns are byte columns within a line.
+    const BlockRect = struct {
+        top: u32,
+        bottom: u32,
+        left: u32,
+        right: u32,
+    };
+
+    fn blockRect(self: *App) ?BlockRect {
+        const anchor = self.visual_anchor orelse return null;
+        const pt = &self.cur().pt;
+        const a_line = pt.lineOf(anchor);
+        const c_line = pt.lineOf(self.cur().cursor);
+        const a_col = anchor - pt.lineStart(a_line);
+        const c_col = self.cur().cursor - pt.lineStart(c_line);
+        return .{
+            .top = @min(a_line, c_line),
+            .bottom = @max(a_line, c_line),
+            .left = @min(a_col, c_col),
+            .right = @max(a_col, c_col),
+        };
+    }
+
+    /// d/c/y over a visual-block rectangle: operate on every covered line's
+    /// [left, min(right+1, lineLen)) slice — bottom-up for edits so earlier
+    /// positions stay valid; blank slices on short lines are skipped.
+    fn applyBlockOp(self: *App, op: editor.KeyEvent.ActionId) !void {
+        const rect = self.blockRect() orelse return;
+        const pt = &self.cur().pt;
+        switch (op) {
+            .delete, .change => {
+                self.cur().history.beginGroup();
+                var line = rect.bottom + 1;
+                while (line > rect.top) {
+                    line -= 1;
+                    const ls = pt.lineStart(line);
+                    const len = pt.lineLen(line);
+                    if (rect.left >= len) continue;
+                    const end = @min(rect.right + 1, len);
+                    try self.cur().history.record(pt, ls + rect.left, end - rect.left, "");
+                }
+                self.cur().history.endGroup();
+                self.cur().cursor = pt.lineStart(rect.top) + @min(rect.left, pt.lineLen(rect.top));
+                self.markDirty();
+                if (op == .change) {
+                    // enter insert (empty-range cc also lands here): the undo
+                    // group stays open so typing joins one session
+                    self.cur().history.beginGroup();
+                    self.state.mode = .insert;
+                    self.in_insert = true;
+                }
+            },
+            .yank => {
+                var buf = std.ArrayList(u8).empty;
+                defer buf.deinit(self.alloc);
+                var line = rect.top;
+                while (line <= rect.bottom) : (line += 1) {
+                    const ls = pt.lineStart(line);
+                    const len = pt.lineLen(line);
+                    if (rect.left < len) {
+                        const end = @min(rect.right + 1, len);
+                        const seg = try self.alloc.alloc(u8, end - rect.left);
+                        defer self.alloc.free(seg);
+                        pt.copyRange(ls + rect.left, seg);
+                        try buf.appendSlice(self.alloc, seg);
+                    }
+                    if (line < rect.bottom) try buf.append(self.alloc, '\n');
+                }
+                if (self.yank_buffer) |b| self.alloc.free(b);
+                self.yank_buffer = try buf.toOwnedSlice(self.alloc);
+                try self.setMsg(try std.fmt.allocPrint(self.alloc, "yanked block {d} bytes", .{self.yank_buffer.?.len}));
+            },
+            else => {},
+        }
+    }
 
     /// I/A after a Ctrl+v block: place one insert cursor per line of the
     /// block and enter insert mode. I puts each cursor at the block's left
@@ -1478,6 +1560,18 @@ const App = struct {
         self.visual_anchor = null;
     }
 
+    /// Visual-mode d/c/y teardown: `.change` keeps the insert mode that
+    /// applyOpRangeEx/applyBlockOp entered (vim: c on a selection types in
+    /// insert); only the stale anchor is cleared. Other operators exit to
+    /// normal.
+    fn exitVisualAfterOp(self: *App, op: editor.KeyEvent.ActionId) void {
+        if (op == .change) {
+            self.visual_anchor = null;
+        } else {
+            self.exitVisual();
+        }
+    }
+
     /// Ctrl+n: first press selects the word under the cursor, later presses
     /// add the next matching word as another cursor.
     fn mcSelectNext(self: *App) !void {
@@ -2281,12 +2375,18 @@ const App = struct {
                     self.mc_active = false;
                     return;
                 }
-                // visual mode: the operator acts on the selection directly
+                // visual mode: the operator acts on the selection directly.
+                // A visual-block selection is a rectangle — d/c/y apply to
+                // every covered line's column slice, not one byte range.
                 if (self.isVisual()) {
                     if (self.visual_anchor) |anchor| {
-                        try self.applyOpRangeEx(action, anchor, self.cur().cursor, false, .inclusive_cursor);
+                        if (self.state.mode == .visual_block) {
+                            try self.applyBlockOp(action);
+                        } else {
+                            try self.applyOpRangeEx(action, anchor, self.cur().cursor, false, .inclusive_cursor);
+                        }
                     }
-                    self.exitVisual();
+                    self.exitVisualAfterOp(action);
                 }
             },
             .mc_add => try self.mcSelectNext(),
@@ -2698,10 +2798,23 @@ const App = struct {
                     sel_start = self.cur().pt.lineStart(self.cur().pt.lineOf(sel_start));
                     sel_end = self.cur().pt.lineStart(self.cur().pt.lineOf(sel_end)) + self.cur().pt.lineLen(self.cur().pt.lineOf(sel_end));
                 }
-                const line_end = line_start + line_len;
-                if (sel_start < line_end and sel_end > line_start) {
-                    sel_s = @max(sel_start, line_start) - line_start;
-                    sel_e = @min(sel_end, line_end) - line_start;
+                // Ctrl+v (visual_block) selects a rectangle: every line
+                // between the anchor/cursor rows shares the same column slice
+                // [left, min(right+1, lineLen)) — rows outside the block or
+                // shorter than the left column get no highlight.
+                if (self.state.mode == .visual_block) {
+                    if (self.blockRect()) |rect| {
+                        if (line >= rect.top and line <= rect.bottom) {
+                            sel_s = @min(rect.left, line_len);
+                            sel_e = @min(rect.right + 1, line_len);
+                        }
+                    }
+                } else {
+                    const line_end = line_start + line_len;
+                    if (sel_start < line_end and sel_end > line_start) {
+                        sel_s = @max(sel_start, line_start) - line_start;
+                        sel_e = @min(sel_end, line_end) - line_start;
+                    }
                 }
             }
 

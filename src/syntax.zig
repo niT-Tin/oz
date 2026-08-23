@@ -54,6 +54,112 @@ pub const Span = struct {
     style: Style,
 };
 
+/// A raw byte interval (ERROR-node coverage).
+const ByteRange = struct {
+    start: u32,
+    end: u32, // exclusive
+};
+
+/// Cheap per-line lexer fallback for tree-sitter ERROR regions: keywords,
+/// strings, characters, numbers and comments get their normal style even
+/// while the text is syntactically broken. Identifiers render as variables,
+/// everything else stays default. `start_byte` anchors the slice back into
+/// the document so emitted spans use absolute byte offsets.
+fn fallbackLex(text: []const u8, start_byte: u32, arena: std.mem.Allocator, out: *std.ArrayList(Span)) !void {
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        // line comment // … or # … (zig/python/bash)
+        if (c == '/' and i + 1 < text.len and text[i + 1] == '/') {
+            var j = i;
+            while (j < text.len and text[j] != '\n') j += 1;
+            try out.append(arena, .{ .start = start_byte + @as(u32, @intCast(i)), .end = start_byte + @as(u32, @intCast(j)), .style = .comment });
+            i = j;
+            continue;
+        }
+        if (c == '#') {
+            var j = i;
+            while (j < text.len and text[j] != '\n') j += 1;
+            try out.append(arena, .{ .start = start_byte + @as(u32, @intCast(i)), .end = start_byte + @as(u32, @intCast(j)), .style = .comment });
+            i = j;
+            continue;
+        }
+        // string literal "…" (backslash escapes)
+        if (c == '"') {
+            var j = i + 1;
+            while (j < text.len and text[j] != '"') {
+                if (text[j] == '\\') j += 1;
+                j += 1;
+            }
+            if (j < text.len) j += 1; // closing quote
+            try out.append(arena, .{ .start = start_byte + @as(u32, @intCast(i)), .end = start_byte + @as(u32, @intCast(j)), .style = .string });
+            i = j;
+            continue;
+        }
+        // character literal 'x' (keep it off the string rule)
+        if (c == '\'') {
+            var j = i + 1;
+            while (j < text.len and text[j] != '\'') {
+                if (text[j] == '\\') j += 1;
+                j += 1;
+            }
+            if (j < text.len) j += 1;
+            try out.append(arena, .{ .start = start_byte + @as(u32, @intCast(i)), .end = start_byte + @as(u32, @intCast(j)), .style = .character });
+            i = j;
+            continue;
+        }
+        // number: 0x/0b/0o, digits, separators, floats
+        if (c >= '0' and c <= '9') {
+            var j = i;
+            while (j < text.len and (isIdentCont(text[j]) or text[j] == '.' or text[j] == 'x' or text[j] == 'b' or text[j] == 'o')) j += 1;
+            try out.append(arena, .{ .start = start_byte + @as(u32, @intCast(i)), .end = start_byte + @as(u32, @intCast(j)), .style = .number });
+            i = j;
+            continue;
+        }
+        // identifier / keyword
+        if (isIdentStart(c)) {
+            var j = i;
+            while (j < text.len and isIdentCont(text[j])) j += 1;
+            const style: Style = if (isFallbackKeyword(text[i..j])) .keyword else .variable;
+            try out.append(arena, .{ .start = start_byte + @as(u32, @intCast(i)), .end = start_byte + @as(u32, @intCast(j)), .style = style });
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+fn isIdentStart(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
+}
+
+fn isIdentCont(c: u8) bool {
+    return isIdentStart(c) or (c >= '0' and c <= '9');
+}
+
+/// Cross-language keyword set for the ERROR-region fallback lexer. Being
+/// generous here is fine: the fallback only runs inside syntactically broken
+/// regions, where a wrong keyword guess beats an uncolored token.
+fn isFallbackKeyword(word: []const u8) bool {
+    const kw = [_][]const u8{
+        "const",      "pub",            "fn",          "var",      "if",        "else",      "return",   "while",       "for",
+        "break",      "continue",       "struct",      "enum",     "union",     "switch",    "case",     "try",         "catch",
+        "defer",      "errdefer",       "unreachable", "comptime", "export",    "extern",    "inline",   "noalias",     "opaque",
+        "suspend",    "usingnamespace", "test",        "volatile", "allowzero", "align",     "callconv", "linksection", "addrspace",
+        "and",        "or",             "not",         "true",     "false",     "null",      "import",   "from",        "as",
+        "def",        "class",          "function",    "let",      "new",       "this",      "in",       "is",          "of",
+        "do",         "then",           "end",         "local",    "global",    "static",    "void",     "int",         "float",
+        "double",     "bool",           "string",      "type",     "use",       "mod",       "impl",     "trait",       "match",
+        "loop",       "mut",            "async",       "await",    "yield",     "self",      "super",    "interface",   "extends",
+        "implements", "package",        "namespace",   "public",   "private",   "protected", "abstract", "final",       "override",
+        "sizeof",     "typeof",         "instanceof",  "elif",     "except",    "with",      "assert",   "lambda",
+    };
+    for (kw) |k| {
+        if (std.mem.eql(u8, k, word)) return true;
+    }
+    return false;
+}
+
 /// Files larger than this get no syntax pass (see file header).
 pub const SIZE_LIMIT: usize = 100 * 1024;
 
@@ -237,7 +343,50 @@ pub const Highlighter = struct {
             if (s == e) continue;
             try out.append(arena, .{ .start = s, .end = e, .style = style });
         }
+        // tree-sitter's error recovery can swallow whole regions (e.g. typing
+        // "1;j" — a syntax error — makes the ERROR node cover "const y" on the
+        // NEXT line, so the keyword loses its capture). Fall back to a cheap
+        // per-line lexer INSIDE ERROR nodes so keywords/strings/comments/numbers
+        // keep their colors while the text is syntactically broken. The lexer
+        // runs only on ERROR ranges intersecting the visible range, so the
+        // O(visible) contract holds.
+        const text = self.prev_text orelse return;
+        var errs = std.ArrayList(ByteRange).empty;
+        defer errs.deinit(arena);
+        try self.collectErrorRanges(start_byte, end_byte, arena, &errs);
+        for (errs.items) |r| {
+            if (r.end <= r.start) continue;
+            if (r.end > text.len) continue;
+            try fallbackLex(text[r.start..r.end], r.start, arena, out);
+        }
         std.mem.sort(Span, out.items, {}, lessThan);
+    }
+
+    /// Walk the tree (pruned to the byte range) collecting ERROR nodes.
+    fn collectErrorRanges(self: *Highlighter, start: u32, end: u32, arena: std.mem.Allocator, out: *std.ArrayList(ByteRange)) !void {
+        const tree = self.tree orelse return;
+        var stack: [256]treez.Node = undefined;
+        var sp: usize = 0;
+        stack[sp] = tree.getRootNode();
+        sp += 1;
+        while (sp > 0) {
+            sp -= 1;
+            const n = stack[sp];
+            const ns = n.getStartByte();
+            const ne = n.getEndByte();
+            if (ne <= start or ns >= end) continue; // outside the visible range
+            if (std.mem.eql(u8, n.getType(), "ERROR")) {
+                try out.append(arena, .{ .start = ns, .end = ne });
+                continue; // don't descend into the error's own children
+            }
+            var i: u32 = 0;
+            while (i < n.getChildCount()) : (i += 1) {
+                if (sp < stack.len) {
+                    stack[sp] = n.getChild(i);
+                    sp += 1;
+                }
+            }
+        }
     }
 
     fn lessThan(_: void, a: Span, b: Span) bool {
@@ -412,4 +561,131 @@ test "highlight: reparse with different text (buffer switch) stays correct" {
     try std.testing.expect(piece_ok);
     try std.testing.expect(struct_ok);
     try std.testing.expect(comment_ok);
+}
+
+fn dumpSpans(text: []const u8, spans: []const Span) void {
+    std.debug.print("\ntext=[{s}]\n", .{text});
+    for (spans) |sp| std.debug.print(" [{d},{d}){s}->{s}", .{ sp.start, sp.end, text[sp.start..sp.end], @tagName(sp.style) });
+    std.debug.print("\n", .{});
+}
+
+fn spanAt(spans: []const Span, byte: u32) ?Style {
+    for (spans) |sp| {
+        if (sp.start <= byte and byte < sp.end) return sp.style;
+    }
+    return null;
+}
+
+test "repro: insert 'j' at end of an indented fn-body line keeps next-line keyword" {
+    const alloc = std.testing.allocator;
+    // the e2e shape that reproduces "下一行第一个单词变色": a real zig file,
+    // cursor at end of an indented line inside a function body.
+    const src = "const std = @import(\"std\");\npub fn main() void {\n    const x = 1;\n    const y = 2;\n}\n";
+    var hl = try Highlighter.init(alloc, "zig");
+    defer hl.deinit();
+    try hl.reparse(src);
+    var spans0 = std.ArrayList(Span).empty;
+    defer spans0.deinit(alloc);
+    try hl.spansInRange(0, @intCast(src.len), alloc, &spans0);
+    // line 2 = "    const x = 1;" starts at 50, its 'const' at 54
+    try std.testing.expectEqual(Style.keyword, spanAt(spans0.items, 54).?);
+    // line 3 = "    const y = 2;" starts at 67, 'const' at 71
+    try std.testing.expectEqual(Style.keyword, spanAt(spans0.items, 71).?);
+
+    // insert 'j' at end of line 2 (byte 66, before '\n')
+    const new_src = "const std = @import(\"std\");\npub fn main() void {\n    const x = 1;j\n    const y = 2;\n}\n";
+    try hl.reparseEdit(66, 66, 67, new_src);
+
+    var spans = std.ArrayList(Span).empty;
+    defer spans.deinit(alloc);
+    try hl.spansInRange(0, @intCast(new_src.len), alloc, &spans);
+    // line 3's 'const' now at byte 72 — must still be keyword (regression:
+    // e2e showed it turn into the variable color 0xc0caf5)
+    const st = spanAt(spans.items, 72);
+    if (st != Style.keyword) dumpSpans(new_src, spans.items);
+    try std.testing.expectEqual(Style.keyword, st);
+}
+
+test "full reparse of the same syntax-error text" {
+    const alloc = std.testing.allocator;
+    const new_src = "const std = @import(\"std\");\npub fn main() void {\n    const x = 1;j\n    const y = 2;\n}\n";
+    var hl = try Highlighter.init(alloc, "zig");
+    defer hl.deinit();
+    try hl.reparse(new_src);
+    var spans = std.ArrayList(Span).empty;
+    defer spans.deinit(alloc);
+    try hl.spansInRange(0, @intCast(new_src.len), alloc, &spans);
+    const st = spanAt(spans.items, 72);
+    if (st != Style.keyword) dumpSpans(new_src, spans.items);
+    try std.testing.expectEqual(Style.keyword, st);
+}
+
+test "indented const is still a keyword" {
+    const alloc = std.testing.allocator;
+    const src = "    const x = 1;\n";
+    var hl = try Highlighter.init(alloc, "zig");
+    defer hl.deinit();
+    try hl.reparse(src);
+    var spans = std.ArrayList(Span).empty;
+    defer spans.deinit(alloc);
+    try hl.spansInRange(0, @intCast(src.len), alloc, &spans);
+    const st = spanAt(spans.items, 4);
+    if (st != Style.keyword) dumpSpans(src, spans.items);
+    try std.testing.expectEqual(Style.keyword, st);
+}
+
+test "repro: insert 'j' at end of line does not disturb next-line keyword" {
+    const alloc = std.testing.allocator;
+    const src = "const x = 1;\nconst y = 2;\n";
+    var hl = try Highlighter.init(alloc, "zig");
+    defer hl.deinit();
+    try hl.reparse(src);
+
+    // sanity: before the edit both "const"s are keywords
+    var spans0 = std.ArrayList(Span).empty;
+    defer spans0.deinit(alloc);
+    try hl.spansInRange(0, @intCast(src.len), alloc, &spans0);
+    try std.testing.expectEqual(Style.keyword, spanAt(spans0.items, 0).?);
+    try std.testing.expectEqual(Style.keyword, spanAt(spans0.items, 13).?);
+
+    // insert 'j' right after ";" (byte 12, before the "\n")
+    const new_src = "const x = 1;j\nconst y = 2;\n";
+    try hl.reparseEdit(12, 12, 13, new_src);
+
+    var spans = std.ArrayList(Span).empty;
+    defer spans.deinit(alloc);
+    try hl.spansInRange(0, @intCast(new_src.len), alloc, &spans);
+    const k0 = spanAt(spans.items, 0).?; // first const
+    const k1 = spanAt(spans.items, 14).?; // second const (next line)
+    if (k0 != Style.keyword or k1 != Style.keyword) dumpSpans(new_src, spans.items);
+    try std.testing.expectEqual(Style.keyword, k0);
+    try std.testing.expectEqual(Style.keyword, k1);
+}
+
+test "repro: o-then-type-j keeps the line below highlighted" {
+    const alloc = std.testing.allocator;
+    // state after `o` on line 1 of "const x = 1;\nconst y = 2;\n": the new
+    // empty line is inserted (full reparse), then typing 'j' is one more edit.
+    const after_o = "const x = 1;\n\nconst y = 2;\n";
+    var hl = try Highlighter.init(alloc, "zig");
+    defer hl.deinit();
+    try hl.reparse(after_o);
+    var spans0 = std.ArrayList(Span).empty;
+    defer spans0.deinit(alloc);
+    try hl.spansInRange(0, @intCast(after_o.len), alloc, &spans0);
+    try std.testing.expectEqual(Style.keyword, spanAt(spans0.items, 14).?); // "const y" after o
+
+    // type 'j' on the new (empty) line: insert at byte 13 (its start)
+    const after_j = "const x = 1;\nj\nconst y = 2;\n";
+    try hl.reparseEdit(13, 13, 14, after_j);
+
+    var spans = std.ArrayList(Span).empty;
+    defer spans.deinit(alloc);
+    try hl.spansInRange(0, @intCast(after_j.len), alloc, &spans);
+    // "const y" now starts at byte 15; must still be keyword
+    const k0 = spanAt(spans.items, 0).?;
+    const k1 = spanAt(spans.items, 15).?;
+    if (k0 != Style.keyword or k1 != Style.keyword) dumpSpans(after_j, spans.items);
+    try std.testing.expectEqual(Style.keyword, k0);
+    try std.testing.expectEqual(Style.keyword, k1);
 }
