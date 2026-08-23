@@ -438,7 +438,8 @@ const App = struct {
                     const pos = self.mc.cursors.items[i];
                     if (pos > 0 and self.cur().pt.byteAt(pos - 1) == 'j') {
                         try self.cur().history.record(&self.cur().pt, pos - 1, 1, "");
-                        self.mc.cursors.items[i] -= 1;
+                        // the deletion shifts every cursor at/after it back
+                        for (self.mc.cursors.items[i..]) |*c| c.* -= 1;
                     }
                 }
                 self.exitMcInsert();
@@ -460,8 +461,9 @@ const App = struct {
     }
 
     /// Insert `text` at every visual-block cursor. One history.record per
-    /// cursor, applied right-to-left so earlier positions stay valid; each
-    /// cursor then moves forward by `text.len`.
+    /// cursor, applied right-to-left so earlier positions stay valid; every
+    /// cursor at or after an insertion point moves forward by `text.len`
+    /// (mirrors MultiCursor.applyInsert, but each edit lands in history).
     fn mcInsertText(self: *App, text: []const u8) !void {
         if (!self.in_insert) {
             self.cur().history.beginGroup();
@@ -473,14 +475,15 @@ const App = struct {
             i -= 1;
             const pos = self.mc.cursors.items[i];
             try self.cur().history.record(&self.cur().pt, pos, 0, text);
-            self.mc.cursors.items[i] = pos + tlen;
+            for (self.mc.cursors.items[i..]) |*c| c.* += tlen;
         }
         self.mcSyncCursor();
         self.markDirty();
     }
 
     /// Backspace at every visual-block cursor: delete one character before
-    /// each cursor (right-to-left), cursors land on the deletion start.
+    /// each cursor (right-to-left); cursors at/after a deletion shift back,
+    /// ones inside its range clamp to its start.
     fn mcBackspace(self: *App) !void {
         var i = self.mc.cursors.items.len;
         while (i > 0) {
@@ -488,14 +491,20 @@ const App = struct {
             const pos = self.mc.cursors.items[i];
             if (pos == 0) continue;
             const start = buffer.ops.prevCharStart(&self.cur().pt, pos);
-            try self.cur().history.record(&self.cur().pt, start, pos - start, "");
-            self.mc.cursors.items[i] = start;
+            const del = pos - start;
+            try self.cur().history.record(&self.cur().pt, start, del, "");
+            var j: usize = 0;
+            while (j < self.mc.cursors.items.len) : (j += 1) {
+                const c = self.mc.cursors.items[j];
+                if (c < start) continue;
+                self.mc.cursors.items[j] = if (c >= pos) c - del else start;
+            }
         }
         self.mcSyncCursor();
     }
 
     /// Ctrl-w at every visual-block cursor: delete the word before each
-    /// cursor (right-to-left), cursors land on the deletion start.
+    /// cursor (right-to-left); cursors shift like backspace.
     fn mcDeleteWordBefore(self: *App) !void {
         var i = self.mc.cursors.items.len;
         while (i > 0) {
@@ -504,8 +513,14 @@ const App = struct {
             if (pos == 0) continue;
             const start = buffer.ops.wordStartBefore(&self.cur().pt, pos);
             if (start == pos) continue;
-            try self.cur().history.record(&self.cur().pt, start, pos - start, "");
-            self.mc.cursors.items[i] = start;
+            const del = pos - start;
+            try self.cur().history.record(&self.cur().pt, start, del, "");
+            var j: usize = 0;
+            while (j < self.mc.cursors.items.len) : (j += 1) {
+                const c = self.mc.cursors.items[j];
+                if (c < start) continue;
+                self.mc.cursors.items[j] = if (c >= pos) c - del else start;
+            }
         }
         self.mcSyncCursor();
     }
@@ -1830,7 +1845,7 @@ const App = struct {
             self.cur().view_top = line_count - content_rows;
         }
 
-        var row: u32 = 0;
+        var row: u32 = self.contentTop(); // content starts below the tab bar
         var line = self.cur().view_top;
         // syntax spans covering the visible byte range (empty when inactive)
         const merged = try self.visibleSpans(a, self.cur().view_top, content_rows);
@@ -2046,7 +2061,7 @@ const App = struct {
 
         // cursor position
         const cursor_col = self.cur().cursor - self.cur().pt.lineStart(cursor_line);
-        const cursor_row = cursor_line - self.cur().view_top;
+        const cursor_row = cursor_line - self.cur().view_top + self.contentTop();
         self.vx.screen.cursor = .{
             .row = @intCast(cursor_row),
             .col = @intCast(self.contentCol() + 5 + cursor_col), // gutter offset

@@ -2006,63 +2006,10 @@ test "visual block: <C-v> block + I/A inserts on every line" {
     }
     try std.testing.expect(grid.contains("NORMAL"));
 
-    // TEMP DEBUG: dump raw bytes after initial render
-    {
-        const raw = sess.captured();
-        var dbg_i: usize = 0;
-        while (dbg_i < raw.len) : (dbg_i += 1) {
-            const b = raw[dbg_i];
-            if (b == 0x1b) {
-                var j = dbg_i + 1;
-                while (j < raw.len and !(raw[j] >= 0x40 and raw[j] <= 0x7e)) : (j += 1) {}
-                if (j < raw.len) {
-                    const seq = raw[dbg_i .. j + 1];
-                    std.debug.print("[ESC{s}]", .{seq[1..]});
-                    dbg_i = j;
-                }
-                continue;
-            }
-            if (b >= 0x20 and b < 0x7f) {
-                std.debug.print("{c}", .{b});
-            } else {
-                std.debug.print("[0x{x:0>2}]", .{b});
-            }
-        }
-        std.debug.print("\n--- end raw dump ---\n", .{});
-    }
-
     // --- I: <C-v> (0x16 = ctrl-v) selects a 1-column block, j j grows it to
     // --- three lines, then I + "XX" types at the block's left edge on every
     // --- line at once. Esc returns to normal with a single cursor.
-    try sess.send("\x16jjI");
-    waited = 0;
-    while (!grid.contains("INSERT")) {
-        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
-        if (n == 0) {
-            waited += 200;
-            if (waited >= 5000) break;
-            continue;
-        }
-        sess.used += n;
-        grid.feed(sess.out[sess.used - n .. sess.used]);
-    }
-    std.debug.print("after \\x16jjI (insert entered):\n", .{});
-    grid.dump();
-    try sess.send("X");
-    waited = 0;
-    while (!grid.contains("Xaaa")) {
-        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
-        if (n == 0) {
-            waited += 200;
-            if (waited >= 5000) break;
-            continue;
-        }
-        sess.used += n;
-        grid.feed(sess.out[sess.used - n .. sess.used]);
-    }
-    std.debug.print("after first X:\n", .{});
-    grid.dump();
-    try sess.send("X");
+    try sess.send("\x16jjIXX");
     waited = 0;
     while (!grid.contains("XXaaa")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
@@ -2080,10 +2027,6 @@ test "visual block: <C-v> block + I/A inserts on every line" {
     }
     try std.testing.expect(grid.contains("XXaaa"));
     try std.testing.expect(grid.contains("XXbbb"));
-    if (!grid.contains("XXccc")) {
-        std.debug.print("after block I (no XXccc):\n", .{});
-        grid.dump();
-    }
     try std.testing.expect(grid.contains("XXccc"));
     try std.testing.expect(!grid.contains("aXX"));
     try std.testing.expect(grid.contains("INSERT"));
@@ -2124,6 +2067,180 @@ test "visual block: <C-v> block + I/A inserts on every line" {
     try std.testing.expect(grid.contains("XXaaaYY"));
     try std.testing.expect(grid.contains("XXbbbYY"));
     try std.testing.expect(grid.contains("XXcccYY"));
+
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    // --- undo: each multi-cursor insert session is one undo group, so one
+    // --- `u` reverts the whole A session and another reverts the whole I
+    // --- session, back to the original file.
+    try sess.send("u");
+    waited = 0;
+    while (grid.contains("XXaaaYY")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("XXaaaYY"));
+    try std.testing.expect(grid.contains("XXaaa"));
+    try std.testing.expect(grid.contains("XXbbb"));
+    try std.testing.expect(grid.contains("XXccc"));
+
+    try sess.send("u");
+    waited = 0;
+    while (grid.contains("XXaaa")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("XXaaa"));
+    try std.testing.expect(grid.contains("aaa"));
+    try std.testing.expect(grid.contains("bbb"));
+    try std.testing.expect(grid.contains("ccc"));
+
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "visual block: multi-cursor backspace, ctrl-w and jk stay in sync" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "aaa\nbbb\nccc\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // --- jk: I + X, then j k — the 'j' is dropped at every cursor and the
+    // --- insert session exits, leaving Xaaa / Xbbb / Xccc.
+    try sess.send("\x16jjIXjk");
+    waited = 0;
+    while (!grid.contains("Xaaa") or grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!grid.contains("Xaaa") or grid.contains("INSERT")) {
+        std.debug.print("after block jk:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("Xaaa"));
+    try std.testing.expect(grid.contains("Xbbb"));
+    try std.testing.expect(grid.contains("Xccc"));
+    try std.testing.expect(!grid.contains("Xjaaa"));
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    // --- backspace: I + "ab" then BS (0x7f) deletes the just-typed 'b' at
+    // --- every cursor → aaaa / abbb / accc, then Esc.
+    try sess.send("\x16jjIab\x7f");
+    waited = 0;
+    while (!grid.contains("aaaa") or grid.contains("aabaa")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!grid.contains("aaaa") or grid.contains("aabaa")) {
+        std.debug.print("after block backspace:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("aaaa"));
+    try std.testing.expect(grid.contains("abbb"));
+    try std.testing.expect(grid.contains("accc"));
+    try std.testing.expect(!grid.contains("aabaa"));
+    try std.testing.expect(!grid.contains("abbbb"));
+    try std.testing.expect(!grid.contains("acbcc"));
+    try std.testing.expect(grid.contains("INSERT"));
+
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    // --- ctrl-w (0x17): I + "foo " then Ctrl-w deletes " aaa" at every
+    // --- cursor → foo / foo / foo.
+    try sess.send("\x16jjIfoo \x17");
+    waited = 0;
+    while (!grid.contains("foo") or grid.contains("foo aaa")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!grid.contains("foo") or grid.contains("foo aaa")) {
+        std.debug.print("after block ctrl-w:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("foo"));
+    try std.testing.expect(!grid.contains("foo aaa"));
 
     try sess.send("\x1b");
     waited = 0;
