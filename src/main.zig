@@ -941,6 +941,10 @@ const App = struct {
     /// reused, so keys are duplicated — the pending buffer can be overwritten
     /// by the very next word.
     fn countCompletionWord(self: *App, counts: *std.StringHashMap(u32), word: []const u8, typed: []const u8) !void {
+        // prefix filter: only words starting with the typed prefix are
+        // candidates (vim C-n keyword completion); the exact typed word is
+        // excluded
+        if (word.len < typed.len or !std.mem.startsWith(u8, word, typed)) return;
         if (word.len == typed.len and std.mem.eql(u8, word, typed)) return;
         // fast path: word already counted — no allocation
         if (counts.getPtr(word)) |p| {
@@ -1340,6 +1344,8 @@ const App = struct {
                 self.state.mode = .insert;
                 self.in_insert = true; // keep the group open; exitInsert closes it
                 self.markDirty();
+                self.syntax_dirty = true;
+                self.syntax_revision = std.math.maxInt(u64);
             },
             .yank => {
                 if (self.yank_buffer) |b| self.alloc.free(b);
@@ -2070,6 +2076,16 @@ const App = struct {
             rev > self.syntax_revision and
             rev - self.syntax_revision == 1 and
             hist.last_record != null;
+        {
+            var buf: [128]u8 = undefined;
+            const m = std.fmt.bufPrint(&buf, "refresh ft={s} rev={d} syncrev={d} parsed={} incremental={}\n", .{ self.syntax_ft, rev, self.syntax_revision, parsed, incremental }) catch "";
+            const f0 = std.os.linux.openat(std.os.linux.AT.FDCWD, "/tmp/dbg.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644);
+            if (f0 != std.math.maxInt(usize)) {
+                const f: i32 = @intCast(f0);
+                _ = std.os.linux.write(f, m.ptr, m.len);
+                _ = std.os.linux.close(f);
+            }
+        }
         if (incremental) {
             const e = hist.last_record.?;
             try hl.reparseEdit(e.pos, e.pos + @as(u32, @intCast(e.before.len)), e.pos + @as(u32, @intCast(e.after.len)), text);
@@ -2225,6 +2241,11 @@ const App = struct {
                 self.cur().cursor = pos + 1;
                 self.in_insert = true;
                 self.state.mode = .insert;
+                // structural edit (newline): force a full reparse next frame —
+                // incremental parsing of a newline is where highlight drift
+                // shows up ("o then type then jk leaves gray chars")
+                self.syntax_dirty = true;
+                self.syntax_revision = std.math.maxInt(u64);
             },
             .insert_line_before => {
                 // O: new line above, cursor on it (same open-group semantics)
