@@ -88,6 +88,9 @@ const App = struct {
     // file tree (<leader>e)
     filetree_active: bool = false,
     filetree_sel: usize = 0,
+    /// Scroll-window top for the sidebar: the selection moves freely inside
+    /// the window; the window scrolls only when it crosses an edge.
+    filetree_top: usize = 0,
     filetree_files: std.ArrayList([]u8) = .empty,
 
     // fuzzy picker (<leader>sf / <leader>st / <leader>sb / <leader>sr)
@@ -97,6 +100,8 @@ const App = struct {
     picker_input: std.ArrayList(u8) = .empty,
     picker_matches: std.ArrayList(usize) = .empty, // indices into picker_files
     picker_sel: usize = 0,
+    /// Scroll-window top for the picker list (same semantics as filetree_top).
+    picker_top: usize = 0,
     // grep mode: one result per line from rg
     grep_results: std.ArrayList(GrepResult) = .empty,
 
@@ -198,6 +203,15 @@ const App = struct {
     // ---- input ----
 
     fn handleKey(self: *App, key: vaxis.Key) !void {
+        // Command mode first: while the ':' command line is open, Enter/Esc
+        // and the rest must reach it — the file-tree and picker overlays
+        // would otherwise swallow Enter (opening a file / confirming) and
+        // :q could never execute.
+        if (self.state.mode == .command) {
+            try self.handleCommandKey(key);
+            return;
+        }
+
         // File tree navigation (j/k/Enter/Esc); other keys fall through
         if (self.filetree_active) {
             if (try self.filetreeKey(key)) return;
@@ -258,12 +272,6 @@ const App = struct {
             !key.mods.ctrl and !key.mods.alt and !key.mods.super)
         {
             try self.blockInsert(key.codepoint == 'A');
-            return;
-        }
-
-        // Command mode: the ':' command line
-        if (self.state.mode == .command) {
-            try self.handleCommandKey(key);
             return;
         }
 
@@ -1040,6 +1048,7 @@ const App = struct {
             self.filetree_active = false;
             return;
         }
+        self.filetree_top = 0;
         if (self.filetree_files.items.len == 0) {
             var root = try std.Io.Dir.cwd().openDir(self.io, ".", .{ .iterate = true });
             defer root.close(self.io);
@@ -1061,6 +1070,7 @@ const App = struct {
             for (self.filetree_files.items, 0..) |f, i| {
                 if (std.mem.eql(u8, f, p)) {
                     self.filetree_sel = i;
+                    self.filetree_top = 0;
                     break;
                 }
             }
@@ -1107,6 +1117,7 @@ const App = struct {
         }
         self.picker_input.clearRetainingCapacity();
         self.picker_sel = 0;
+        self.picker_top = 0;
         try self.pickerRefilter();
         self.picker_active = true;
     }
@@ -1141,6 +1152,7 @@ const App = struct {
         self.picker_mode = .buffers;
         self.picker_input.clearRetainingCapacity();
         self.picker_sel = 0;
+        self.picker_top = 0;
         try self.pickerRefilter();
         self.picker_active = true;
     }
@@ -1149,6 +1161,7 @@ const App = struct {
         self.picker_mode = .recent;
         self.picker_input.clearRetainingCapacity();
         self.picker_sel = 0;
+        self.picker_top = 0;
         try self.pickerRefilter();
         self.picker_active = true;
     }
@@ -1162,6 +1175,7 @@ const App = struct {
         self.picker_mode = .grep;
         self.picker_input.clearRetainingCapacity();
         self.picker_sel = 0;
+        self.picker_top = 0;
         self.picker_active = true;
     }
 
@@ -1883,9 +1897,13 @@ const App = struct {
             }
 
             // split the line into styled runs: syntax fg from the merged
-            // spans, selection bg over the selected columns
+            // spans, cursorline bg on the cursor's row, selection bg wins
+            const is_cur_line = line == cursor_line;
             var segs = std.ArrayList(vaxis.Segment).empty;
-            try segs.append(a, .{ .text = num_str });
+            try segs.append(a, .{
+                .text = num_str,
+                .style = if (is_cur_line) .{ .bg = .{ .rgb = .{ 40, 48, 68 } } } else .{},
+            });
             var col: u32 = 0;
             while (col < n) {
                 while (span_i < merged.len and merged[span_i].end <= line_start + col) span_i += 1;
@@ -1903,7 +1921,9 @@ const App = struct {
                 if (sel_s > col and sel_s < next) next = sel_s;
                 if (sel_e > col and sel_e < next) next = sel_e;
                 const in_sel = col >= sel_s and col < sel_e;
-                var style: vaxis.Style = if (in_sel) .{ .bg = .{ .rgb = .{ 54, 74, 130 } } } else .{};
+                var style: vaxis.Style = .{};
+                if (is_cur_line) style.bg = .{ .rgb = .{ 40, 48, 68 } };
+                if (in_sel) style.bg = .{ .rgb = .{ 54, 74, 130 } };
                 if (fg) |f| style.fg = f.fg;
                 try segs.append(a, .{ .text = text[col..next], .style = style });
                 col = next;
@@ -1923,8 +1943,18 @@ const App = struct {
                 .style = .{ .fg = .{ .rgb = .{ 250, 189, 47 } }, .bold = true },
             }};
             _ = win.print(&title_seg, .{ .row_offset = 0, .col_offset = 0, .wrap = .none });
-            var ri: usize = 0;
-            while (ri < @min(self.filetree_files.items.len, @as(usize, content_rows))) : (ri += 1) {
+            // vim-style scroll window (same semantics as the picker)
+            const ft_len = self.filetree_files.items.len;
+            const ft_vis = @min(ft_len, @as(usize, content_rows));
+            if (ft_len > ft_vis) {
+                if (self.filetree_top + ft_vis > ft_len) self.filetree_top = ft_len - ft_vis;
+                if (self.filetree_sel < self.filetree_top) self.filetree_top = self.filetree_sel;
+                if (self.filetree_sel >= self.filetree_top + ft_vis) self.filetree_top = self.filetree_sel - ft_vis + 1;
+            } else self.filetree_top = 0;
+            const ft_top = self.filetree_top;
+            var k: usize = 0;
+            while (k < ft_vis) : (k += 1) {
+                const ri = ft_top + k;
                 const f = self.filetree_files.items[ri];
                 const label = if (f.len > filetree_width) f[f.len - filetree_width ..] else f;
                 const seg = [_]vaxis.Segment{.{
@@ -1934,7 +1964,7 @@ const App = struct {
                     else
                         .{ .fg = .{ .rgb = .{ 122, 162, 247 } } },
                 }};
-                _ = win.print(&seg, .{ .row_offset = @intCast(1 + ri), .col_offset = 0, .wrap = .none });
+                _ = win.print(&seg, .{ .row_offset = @intCast(1 + k), .col_offset = 0, .wrap = .none });
             }
         }
 
@@ -1982,9 +2012,19 @@ const App = struct {
         if (self.picker_active) {
             const total = if (self.picker_mode == .grep) self.grep_results.items.len else self.picker_matches.items.len;
             const list_rows = @min(@as(usize, 10), total);
+            // vim-style scroll window: the selection moves freely inside the
+            // window; the window scrolls only when the selection crosses an
+            // edge (persisted in picker_top so it doesn't jump around).
+            if (total > list_rows) {
+                if (self.picker_top + list_rows > total) self.picker_top = total - list_rows;
+                if (self.picker_sel < self.picker_top) self.picker_top = self.picker_sel;
+                if (self.picker_sel >= self.picker_top + list_rows) self.picker_top = self.picker_sel - list_rows + 1;
+            } else self.picker_top = 0;
+            const top = self.picker_top;
             const start_row = height - 1 - @as(u32, @intCast(list_rows)) - 1;
-            var ri: usize = 0;
-            while (ri < list_rows) : (ri += 1) {
+            var k: usize = 0;
+            while (k < list_rows) : (k += 1) {
+                const ri = top + k;
                 const label: []const u8 = if (self.picker_mode == .grep) blk: {
                     const r = self.grep_results.items[ri];
                     break :blk std.fmt.allocPrint(a, "{s}:{d}: {s}", .{ r.path, r.line, r.text }) catch "…";
@@ -2002,7 +2042,7 @@ const App = struct {
                     else
                         .{},
                 }};
-                _ = win.print(&seg, .{ .row_offset = @intCast(start_row + ri), .wrap = .none });
+                _ = win.print(&seg, .{ .row_offset = @intCast(start_row + k), .wrap = .none });
             }
             const prompt = try std.fmt.allocPrint(a, "> {s}", .{self.picker_input.items});
             const prompt_seg = [_]vaxis.Segment{.{

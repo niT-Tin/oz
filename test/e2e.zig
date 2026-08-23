@@ -263,21 +263,26 @@ const Grid = struct {
     cols: usize = 80,
     buf: []u8, // rows*cols
     fg_buf: []u32, // rows*cols packed RGB (0 = default)
+    bg_buf: []u32, // rows*cols packed RGB (0 = default)
     row: usize = 0,
     col: usize = 0,
     fg: u32 = 0, // current fg color (packed RGB, 0 = default)
+    bg: u32 = 0, // current bg color (packed RGB, 0 = default)
 
     fn init(alloc: std.mem.Allocator) !Grid {
         const buf = try alloc.alloc(u8, 24 * 80);
         @memset(buf, ' ');
         const fg_buf = try alloc.alloc(u32, 24 * 80);
         @memset(fg_buf, 0);
-        return .{ .buf = buf, .fg_buf = fg_buf };
+        const bg_buf = try alloc.alloc(u32, 24 * 80);
+        @memset(bg_buf, 0);
+        return .{ .buf = buf, .fg_buf = fg_buf, .bg_buf = bg_buf };
     }
 
     fn deinit(self: *Grid, alloc: std.mem.Allocator) void {
         alloc.free(self.buf);
         alloc.free(self.fg_buf);
+        alloc.free(self.bg_buf);
     }
 
     fn cell(self: *Grid, row: usize, col: usize) *u8 {
@@ -357,6 +362,7 @@ const Grid = struct {
                     if (self.row < self.rows and self.col < self.cols) {
                         self.cell(self.row, self.col).* = b;
                         self.fg_buf[self.row * self.cols + self.col] = self.fg;
+                        self.bg_buf[self.row * self.cols + self.col] = self.bg;
                     }
                     self.col += 1;
                     i += 1;
@@ -376,14 +382,28 @@ const Grid = struct {
             'G' => self.col = @min(p0 - 1, self.cols - 1),
             'd' => self.row = @min(p0 - 1, self.rows - 1),
             'm' => {
-                // SGR: 0 reset, 39 fg default, 38;2;r;g;b (or 38:2:r:g:b) fg
+                // SGR: 0 reset, 39/49 fg/bg default, 38/48;2;r;g;b (or
+                // 38/48:2:r:g:b) fg/bg
                 var k: usize = 0;
                 while (k < np) {
                     const p = params[k];
-                    if (p == 0 or p == 39) {
+                    if (p == 0) {
                         self.fg = 0;
+                        self.bg = 0;
+                    } else if (p == 39) {
+                        self.fg = 0;
+                    } else if (p == 49) {
+                        self.bg = 0;
                     } else if (p == 38 and k + 4 < np and params[k + 1] == 2) {
                         self.fg = packRgb(
+                            @intCast(params[k + 2]),
+                            @intCast(params[k + 3]),
+                            @intCast(params[k + 4]),
+                        );
+                        k += 5;
+                        continue;
+                    } else if (p == 48 and k + 4 < np and params[k + 1] == 2) {
+                        self.bg = packRgb(
                             @intCast(params[k + 2]),
                             @intCast(params[k + 3]),
                             @intCast(params[k + 4]),
@@ -420,6 +440,21 @@ const Grid = struct {
                     if (self.fg_buf[r * self.cols + c] == fg) return true;
                 }
             }
+        }
+        return false;
+    }
+
+    /// Raw text of one row (may contain trailing spaces).
+    fn rowText(self: *Grid, r: usize) []const u8 {
+        return self.buf[r * self.cols .. (r + 1) * self.cols];
+    }
+
+    /// true if any cell on row `r` has the given packed bg color (selection
+    /// highlight assertions).
+    fn rowHasBg(self: *Grid, r: usize, bg: u32) bool {
+        var c: usize = 0;
+        while (c < self.cols) : (c += 1) {
+            if (self.bg_buf[r * self.cols + c] == bg) return true;
         }
         return false;
     }
@@ -2379,3 +2414,173 @@ test "visual block: 非 0 列块 / 空行 clamp / 单行块边界" {
     try std.testing.expectEqualStrings("YYXXaaaa\nXX\nXXcccc\n", buf);
 }
 
+test "file tree: sidebar scrolls as the selection moves past the window" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}f.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "hello\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // <leader>e — the sidebar lists the project (29+ files, more than the
+    // ~22 visible sidebar rows)
+    try sess.send(" e");
+    waited = 0;
+    while (!grid.contains("files")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    // alphabetical order: DESIGN.md is the first entry
+    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(1), "DESIGN.md") != null);
+
+    // 24 × j — the selection crosses the window bottom; the first visible
+    // entry must become the second file (README.md) — the list follows
+    try sess.send("jjjjjjjjjjjjjjjjjjjjjjjj");
+    waited = 0;
+    while (std.mem.indexOf(u8, grid.rowText(1), "README.md") == null) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (std.mem.indexOf(u8, grid.rowText(1), "README.md") == null) {
+        std.debug.print("filetree grid after scroll:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(1), "README.md") != null);
+
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "picker: list scrolls with the selection; the highlighted row stays visible" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}p.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "hello\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // <leader>sf — the project file picker (55+ entries > 10 visible rows)
+    try sess.send(" sf");
+    waited = 0;
+    while (!grid.contains("> ")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    const sel_bg = packRgb(54, 74, 130);
+    const list_top: usize = 24 - 1 - 10 - 1; // the picker list window
+    // the selection starts on the first window row
+    try std.testing.expect(grid.rowHasBg(list_top, sel_bg));
+
+    // 15 × Ctrl+n (0x0E) — the selection crosses the window bottom; the
+    // highlighted row must stay visible and no longer be the first row
+    try sess.send("\x0e\x0e\x0e\x0e\x0e\x0e\x0e\x0e\x0e\x0e\x0e\x0e\x0e\x0e\x0e");
+    waited = 0;
+    var sel_visible = false;
+    var sel_not_top = false;
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        sel_visible = false;
+        sel_not_top = true;
+        var r: usize = list_top;
+        while (r < list_top + 10) : (r += 1) {
+            if (grid.rowHasBg(r, sel_bg)) {
+                sel_visible = true;
+                if (r == list_top) sel_not_top = false;
+            }
+        }
+        if (sel_visible and sel_not_top) break;
+    }
+    try std.testing.expect(sel_visible);
+    try std.testing.expect(sel_not_top);
+
+    // Esc closes the picker (':q' would be eaten by the filter), then quit
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("> ")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
