@@ -354,7 +354,56 @@ const App = struct {
                 _ = self.history.redo(&self.pt);
                 self.cursor = @min(self.cursor, self.pt.len());
             },
-            .insert_mode, .append, .insert_before, .append_end, .insert_line_after, .insert_line_before => {
+            .insert_mode => self.state.mode = .insert,
+            .append => {
+                // a: insert after the character under the cursor
+                const line = self.pt.lineOf(self.cursor);
+                const end = self.pt.lineStart(line) + self.pt.lineLen(line);
+                if (self.cursor < end) {
+                    var i = self.cursor + 1;
+                    while (i < end and (self.pt.byteAt(i) & 0xC0) == 0x80) : (i += 1) {}
+                    self.cursor = i;
+                }
+                self.state.mode = .insert;
+            },
+            .insert_before => {
+                // I: first non-blank of the line
+                const line = self.pt.lineOf(self.cursor);
+                const ls = self.pt.lineStart(line);
+                const end = ls + self.pt.lineLen(line);
+                var pos = ls;
+                while (pos < end) {
+                    const c = self.pt.byteAt(pos);
+                    if (c != ' ' and c != '\t') break;
+                    pos += 1;
+                }
+                self.cursor = pos;
+                self.state.mode = .insert;
+            },
+            .append_end => {
+                // A: end of the line
+                const line = self.pt.lineOf(self.cursor);
+                self.cursor = self.pt.lineStart(line) + self.pt.lineLen(line);
+                self.state.mode = .insert;
+            },
+            .insert_line_after => {
+                // o: new line below, cursor on it
+                const line = self.pt.lineOf(self.cursor);
+                const pos = self.pt.lineStart(line) + self.pt.lineLen(line);
+                self.history.beginGroup();
+                try self.history.record(&self.pt, pos, 0, "\n");
+                self.history.endGroup();
+                self.cursor = pos + 1;
+                self.state.mode = .insert;
+            },
+            .insert_line_before => {
+                // O: new line above, cursor on it
+                const line = self.pt.lineOf(self.cursor);
+                const pos = self.pt.lineStart(line);
+                self.history.beginGroup();
+                try self.history.record(&self.pt, pos, 0, "\n");
+                self.history.endGroup();
+                self.cursor = pos;
                 self.state.mode = .insert;
             },
             .visual_char => self.state.mode = .visual_char,
