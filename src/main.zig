@@ -264,6 +264,27 @@ const App = struct {
             return;
         }
 
+        // 'n' with an active multi-cursor selection extends the selection:
+        // add the next matching word — the plain-key twin of Ctrl+n (which
+        // carries mods.ctrl and is handled by the keymap as .mc_add).
+        if (self.mc_active and self.state.mode != .insert and !self.isVisual() and
+            key.codepoint == 'n' and !key.mods.ctrl and !key.mods.alt and !key.mods.super)
+        {
+            try self.mcSelectNext();
+            return;
+        }
+
+        // 'c' with an active multi-cursor selection changes every selected
+        // word: delete each word and enter insert mode with the cursors on
+        // the word-start slots; every typed key then applies at all cursors
+        // via handleMcInsertKey (like visual-block I/A insert).
+        if (self.mc_active and self.state.mode != .insert and !self.isVisual() and
+            key.codepoint == 'c' and !key.mods.ctrl and !key.mods.alt and !key.mods.super)
+        {
+            try self.mcChangeWords();
+            return;
+        }
+
         // Visual block (<C-v>) then I/A: fan one insert cursor out per line
         // of the block and enter insert mode (vim visual-block insert).
         // Intercepted before the mode state machine, whose I/A would only
@@ -1128,6 +1149,44 @@ const App = struct {
         }
     }
 
+    /// 'c' with an active multi-cursor selection: delete the word under every
+    /// cursor (right-to-left, so earlier positions stay valid) and enter
+    /// insert mode with the cursors still on their word-start slots. Cursors
+    /// at/after each deleted range shift back so every position stays valid
+    /// (unlike the 'd' path — 'd' clears the cursors, 'c' keeps them for the
+    /// synchronized insert session via handleMcInsertKey). The deletion is
+    /// one undo group; typing opens the next one.
+    fn mcChangeWords(self: *App) !void {
+        const pt = &self.cur().pt;
+        self.cur().history.beginGroup();
+        var i = self.mc.cursors.items.len;
+        while (i > 0) {
+            i -= 1;
+            const pos = self.mc.cursors.items[i];
+            const w = self.mc.wordRange(pt, pos);
+            if (w.end <= w.start) continue; // no word at this cursor → skip it
+            const wlen = w.end - w.start;
+            try self.cur().history.record(pt, pos, wlen, "");
+            // shift every other cursor at/after the deleted range back; the
+            // cursor at `pos` (a word start) stays put
+            for (self.mc.cursors.items, 0..) |*c, j| {
+                if (j == i) continue;
+                if (c.* >= pos + wlen) {
+                    c.* -= wlen;
+                } else if (c.* > pos) {
+                    c.* = pos; // inside the deleted word — clamp (never happens)
+                }
+            }
+        }
+        self.cur().history.endGroup();
+        self.mc_active = true; // stays active: the insert session is synchronized
+        self.state.mode = .insert;
+        self.in_insert = false; // the first insertText opens the undo group
+        self.prev_insert_key = null;
+        self.mcSyncCursor();
+        self.markDirty();
+    }
+
     // ---- file tree (<leader>e / <leader>E) ----
 
     fn toggleFiletree(self: *App) !void {
@@ -1709,7 +1768,6 @@ const App = struct {
     }
 
     fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !void {
-        _ = count;
         switch (action) {
             .undo => {
                 if (self.in_insert) {
@@ -1809,6 +1867,30 @@ const App = struct {
                 }
             },
             .mc_add => try self.mcSelectNext(),
+            .increment, .decrement => {
+                // Ctrl+a / Ctrl+x: a visual selection increments every number
+                // in every selected line; otherwise the number at/after the
+                // cursor. `count` is the delta (vim: 5<C-a> adds 5).
+                const delta: i64 = if (action == .increment) @as(i64, count) else -@as(i64, count);
+                if (self.isVisual()) {
+                    try self.execSelectionNumberDelta(delta);
+                    self.exitVisual();
+                } else {
+                    try self.execNumberDeltaAtCursor(delta);
+                }
+            },
+            .increment_visual, .decrement_visual => {
+                // g Ctrl+a / g Ctrl+x: visual column increment — each line's
+                // first number gets ±(count + line offset, 1-based). Normal
+                // mode g Ctrl+a is plain Ctrl+a (vim).
+                const delta: i64 = if (action == .increment_visual) @as(i64, count) else -@as(i64, count);
+                if (self.isVisual()) {
+                    try self.execSelectionNumberColumn(delta);
+                    self.exitVisual();
+                } else {
+                    try self.execNumberDeltaAtCursor(delta);
+                }
+            },
             .next_buffer => try self.switchBuffer(1),
             .prev_buffer => try self.switchBuffer(-1),
             .picker_file => try self.openPicker(),
@@ -1830,6 +1912,178 @@ const App = struct {
             .enter_command_mode => {},
             else => {},
         }
+    }
+
+    // ---- number increment/decrement (Ctrl+a / Ctrl+x / g Ctrl+a / g Ctrl+x) ----
+
+    /// One number occurrence in the document: byte range plus parsed value.
+    const Number = struct {
+        start: u32,
+        end: u32, // exclusive
+        value: i64,
+    };
+
+    fn isDigitByte(b: u8) bool {
+        return b >= '0' and b <= '9';
+    }
+
+    /// Expand the digit run containing `digit_pos` into the whole number.
+    /// A '-' immediately before the run is included as the sign, unless it is
+    /// itself glued to a preceding digit ("1-5" with the cursor on 5 is the
+    /// number 5, while "-5" is -5). Returns null when the digits do not fit
+    /// i64 (the number is then left untouched).
+    fn numberAtDigit(self: *App, digit_pos: u32) ?Number {
+        const pt = &self.cur().pt;
+        const len = pt.len();
+        var start = digit_pos;
+        while (start > 0 and isDigitByte(pt.byteAt(start - 1))) start -= 1;
+        if (start > 0 and pt.byteAt(start - 1) == '-' and
+            (start == 1 or !isDigitByte(pt.byteAt(start - 2))))
+        {
+            start -= 1;
+        }
+        var end = digit_pos + 1;
+        while (end < len and isDigitByte(pt.byteAt(end))) end += 1;
+        var v: i64 = 0;
+        var i = start;
+        const neg = if (i < end and pt.byteAt(i) == '-') blk: {
+            i += 1;
+            break :blk true;
+        } else false;
+        while (i < end) : (i += 1) {
+            const d = pt.byteAt(i) - '0';
+            if (v > @divTrunc(std.math.maxInt(i64) - @as(i64, d), 10)) return null; // overflow
+            v = v * 10 + @as(i64, d);
+        }
+        return .{ .start = start, .end = end, .value = if (neg) -v else v };
+    }
+
+    /// The first number at or after `pos` (vim Ctrl+a semantics): the digit
+    /// run under the cursor, else the next digit run (optionally '-' signed)
+    /// scanning forward. Returns null when no number exists at/after `pos`.
+    fn numberAtOrAfter(self: *App, pos: u32) ?Number {
+        const pt = &self.cur().pt;
+        const len = pt.len();
+        if (pos >= len) return null;
+        if (isDigitByte(pt.byteAt(pos))) return self.numberAtDigit(pos);
+        var i = pos;
+        while (i < len) : (i += 1) {
+            const b = pt.byteAt(i);
+            if (isDigitByte(b)) return self.numberAtDigit(i);
+            if (b == '-' and i + 1 < len and isDigitByte(pt.byteAt(i + 1))) {
+                return self.numberAtDigit(i + 1);
+            }
+        }
+        return null;
+    }
+
+    /// The first number in [ls, le) (column-increment target), if any.
+    fn firstNumberInLine(self: *App, ls: u32, le: u32) ?Number {
+        var p = ls;
+        while (p < le) {
+            const b = self.cur().pt.byteAt(p);
+            if (isDigitByte(b)) return self.numberAtDigit(p);
+            if (b == '-' and p + 1 < le and isDigitByte(self.cur().pt.byteAt(p + 1))) {
+                return self.numberAtDigit(p + 1);
+            }
+            p += 1;
+        }
+        return null;
+    }
+
+    /// Replace one number with value+delta; returns the byte end of the new
+    /// text (the number may have grown or shrunk).
+    fn replaceNumber(self: *App, n: Number, delta: i64) !u32 {
+        const new = try std.fmt.allocPrint(self.alloc, "{d}", .{n.value + delta});
+        defer self.alloc.free(new);
+        try self.cur().history.record(&self.cur().pt, n.start, n.end - n.start, new);
+        return n.start + @as(u32, @intCast(new.len));
+    }
+
+    /// Normal-mode Ctrl+a/x: increment the number at/after the cursor and
+    /// place the cursor just after it (vim). One undo step.
+    fn execNumberDeltaAtCursor(self: *App, delta: i64) !void {
+        const n = self.numberAtOrAfter(self.cur().cursor) orelse return;
+        self.cur().history.beginGroup();
+        const new_end = try self.replaceNumber(n, delta);
+        self.cur().history.endGroup();
+        self.cur().cursor = new_end;
+        self.markDirty();
+    }
+
+    /// Visual-mode Ctrl+a/x: increment every number in every line covered by
+    /// the selection. One undo group; edits are applied right-to-left so the
+    /// earlier offsets stay valid.
+    fn execSelectionNumberDelta(self: *App, delta: i64) !void {
+        const anchor = self.visual_anchor orelse return;
+        const s = @min(anchor, self.cur().cursor);
+        const e = @max(anchor, self.cur().cursor);
+        const pt = &self.cur().pt;
+        const start_line = pt.lineOf(s);
+        const end_line = pt.lineOf(e);
+        self.cur().history.beginGroup();
+        var numbers = std.ArrayList(Number).empty;
+        defer numbers.deinit(self.alloc);
+        var line = start_line;
+        while (line <= end_line) : (line += 1) {
+            const ls = pt.lineStart(line);
+            const le = ls + pt.lineLen(line);
+            var p = ls;
+            while (p < le) {
+                const b = pt.byteAt(p);
+                if (isDigitByte(b)) {
+                    const n = self.numberAtDigit(p) orelse {
+                        p += 1;
+                        continue;
+                    };
+                    try numbers.append(self.alloc, n);
+                    p = n.end;
+                } else if (b == '-' and p + 1 < le and isDigitByte(pt.byteAt(p + 1))) {
+                    const n = self.numberAtDigit(p + 1) orelse {
+                        p += 1;
+                        continue;
+                    };
+                    try numbers.append(self.alloc, n);
+                    p = n.end;
+                } else {
+                    p += 1;
+                }
+            }
+        }
+        var i = numbers.items.len;
+        while (i > 0) {
+            i -= 1;
+            _ = try self.replaceNumber(numbers.items[i], delta);
+        }
+        self.cur().history.endGroup();
+        self.markDirty();
+    }
+
+    /// Visual-mode g Ctrl+a/x (vim column increment): each selected line's
+    /// FIRST number gets ±(count + line offset), the i-th selected line (i
+    /// starting at 1) getting ±i with count 1. One undo group; lines are
+    /// processed bottom-up so earlier lines keep valid offsets.
+    fn execSelectionNumberColumn(self: *App, delta: i64) !void {
+        const anchor = self.visual_anchor orelse return;
+        const s = @min(anchor, self.cur().cursor);
+        const e = @max(anchor, self.cur().cursor);
+        const pt = &self.cur().pt;
+        const start_line = pt.lineOf(s);
+        const end_line = pt.lineOf(e);
+        self.cur().history.beginGroup();
+        var line = end_line;
+        while (true) {
+            const ls = pt.lineStart(line);
+            const le = ls + pt.lineLen(line);
+            if (self.firstNumberInLine(ls, le)) |n| {
+                const offset: i64 = @intCast(line - start_line + 1);
+                _ = try self.replaceNumber(n, delta * offset);
+            }
+            if (line == start_line) break;
+            line -= 1;
+        }
+        self.cur().history.endGroup();
+        self.markDirty();
     }
 
     /// p / P: insert the yank buffer at the cursor (M1 simplification: p

@@ -368,6 +368,21 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
             resetPending(state);
             return .pending;
         }
+        // g Ctrl+a / g Ctrl+x — number increment/decrement. In visual mode
+        // they are the column operations (each line's first number ± its
+        // 1-based line offset); in normal mode g Ctrl+a is plain Ctrl+a.
+        if (key.codepoint == 'a' and key.mods.ctrl) {
+            return if (isVisualMode(state))
+                emitAction(state, .increment_visual)
+            else
+                emitAction(state, .increment);
+        }
+        if (key.codepoint == 'x' and key.mods.ctrl) {
+            return if (isVisualMode(state))
+                emitAction(state, .decrement_visual)
+            else
+                emitAction(state, .decrement);
+        }
         switch (key.codepoint) {
             'g' => return emitMotion(state, .first_line, .{}),
             // ge = end of previous word
@@ -557,6 +572,10 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .easymotion => emitAction(state, .easymotion),
         .leader_find => emitAction(state, .leader_find),
         .toggle_comment_line => emitAction(state, .toggle_comment_line),
+        .increment => emitAction(state, .increment),
+        .decrement => emitAction(state, .decrement),
+        .increment_visual => emitAction(state, .increment_visual),
+        .decrement_visual => emitAction(state, .decrement_visual),
         .mc_add => emitAction(state, .mc_add),
         .picker_file => emitAction(state, .picker_file),
         .picker_grep => emitAction(state, .picker_grep),
@@ -766,6 +785,13 @@ fn reverseFind(motion: Motion.Motion) Motion.Motion {
 
 fn isPlain(key: vaxis.Key) bool {
     return key.mods.eql(.{});
+}
+
+fn isVisualMode(state: *const State) bool {
+    return switch (state.mode) {
+        .visual_char, .visual_line, .visual_block => true,
+        else => false,
+    };
 }
 
 fn isEscape(key: vaxis.Key) bool {
@@ -1294,4 +1320,68 @@ test "command mode: Esc exits to normal" {
     const r = handle(&s, esc(), Keymaps.normal);
     try testing.expectEqual(.to_normal, tag(r));
     try testing.expectEqual(Mode.normal, s.mode);
+}
+
+test "Ctrl+a / Ctrl+x → action increment / decrement" {
+    var s = State.init();
+    const r = handle(&s, .{ .codepoint = 'a', .mods = .{ .ctrl = true } }, Keymaps.normal);
+    try testing.expectEqual(.action, tag(r));
+    try testing.expectEqual(KeyEvent.ActionId.increment, r.action.action);
+
+    var s2 = State.init();
+    const r2 = handle(&s2, .{ .codepoint = 'x', .mods = .{ .ctrl = true } }, Keymaps.normal);
+    try testing.expectEqual(.action, tag(r2));
+    try testing.expectEqual(KeyEvent.ActionId.decrement, r2.action.action);
+}
+
+test "visual Ctrl+a / Ctrl+x fall through to the plain increment actions" {
+    var s = State.init();
+    s.mode = .visual_char;
+    const r = handle(&s, .{ .codepoint = 'a', .mods = .{ .ctrl = true } }, Keymaps.normal);
+    try testing.expectEqual(.action, tag(r));
+    try testing.expectEqual(KeyEvent.ActionId.increment, r.action.action);
+
+    var s2 = State.init();
+    s2.mode = .visual_line;
+    const r2 = handle(&s2, .{ .codepoint = 'x', .mods = .{ .ctrl = true } }, Keymaps.normal);
+    try testing.expectEqual(.action, tag(r2));
+    try testing.expectEqual(KeyEvent.ActionId.decrement, r2.action.action);
+}
+
+test "g Ctrl+a: visual → increment_visual, normal → increment; g Ctrl+x → decrement" {
+    // normal mode: g Ctrl+a ≡ Ctrl+a
+    var s = State.init();
+    _ = handle(&s, press('g'), Keymaps.normal);
+    const r = handle(&s, .{ .codepoint = 'a', .mods = .{ .ctrl = true } }, Keymaps.normal);
+    try testing.expectEqual(.action, tag(r));
+    try testing.expectEqual(KeyEvent.ActionId.increment, r.action.action);
+
+    // normal g Ctrl+x ≡ Ctrl+x
+    var s2 = State.init();
+    _ = handle(&s2, press('g'), Keymaps.normal);
+    const r2 = handle(&s2, .{ .codepoint = 'x', .mods = .{ .ctrl = true } }, Keymaps.normal);
+    try testing.expectEqual(.action, tag(r2));
+    try testing.expectEqual(KeyEvent.ActionId.decrement, r2.action.action);
+
+    // visual mode: g Ctrl+a emits the column-increment action
+    var s3 = State.init();
+    s3.mode = .visual_line;
+    _ = handle(&s3, press('g'), Keymaps.normal);
+    const r3 = handle(&s3, .{ .codepoint = 'a', .mods = .{ .ctrl = true } }, Keymaps.normal);
+    try testing.expectEqual(.action, tag(r3));
+    try testing.expectEqual(KeyEvent.ActionId.increment_visual, r3.action.action);
+
+    // visual mode: g Ctrl+x emits the column-decrement action
+    var s4 = State.init();
+    s4.mode = .visual_block;
+    _ = handle(&s4, press('g'), Keymaps.normal);
+    const r4 = handle(&s4, .{ .codepoint = 'x', .mods = .{ .ctrl = true } }, Keymaps.normal);
+    try testing.expectEqual(.action, tag(r4));
+    try testing.expectEqual(KeyEvent.ActionId.decrement_visual, r4.action.action);
+
+    // plain 'g' then 'a' (no ctrl) is still the align sequence, not increment
+    var s5 = State.init();
+    _ = handle(&s5, press('g'), Keymaps.normal);
+    const r5 = handle(&s5, press('a'), Keymaps.normal);
+    try testing.expectEqual(.pending, tag(r5));
 }

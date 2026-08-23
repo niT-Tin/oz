@@ -70,6 +70,10 @@ pub const ActionId = enum {
     leader_find, // <leader>f — EasyMotion across windows (M1: same as s)
     leader, // space — leader prefix
     toggle_comment_line, // gcc — comment/uncomment the current line
+    increment, // Ctrl+a — add 1 to the number at/after the cursor (or every number in a visual selection)
+    decrement, // Ctrl+x — subtract 1 from the number at/after the cursor (or every number in a visual selection)
+    increment_visual, // g Ctrl+a — visual column increment: each line's first number +i (i = 1-based line offset)
+    decrement_visual, // g Ctrl+x — visual column decrement: each line's first number -i
     mc_add, // Ctrl+n — multi-cursor: select word / add next match
     picker_file, // <leader>sf — fuzzy file picker
     picker_grep, // <leader>st — grep picker

@@ -72,6 +72,8 @@ pub const normal: KeyMap = &.{
     act(.{ .codepoint = 'r', .mods = .{ .ctrl = true } }, .redo),
     act(.{ .codepoint = 'v', .mods = .{ .ctrl = true } }, .visual_block),
     act(.{ .codepoint = 'n', .mods = .{ .ctrl = true } }, .mc_add),
+    act(.{ .codepoint = 'a', .mods = .{ .ctrl = true } }, .increment),
+    act(.{ .codepoint = 'x', .mods = .{ .ctrl = true } }, .decrement),
 };
 
 /// Insert mode keymap (M0 minimal: everything not bound is reported back to
@@ -124,6 +126,8 @@ test "normal keymap covers the M0 key set" {
     try std.testing.expectEqual(.page_down, L(normal, .{ .codepoint = 'f', .mods = .{ .ctrl = true } }));
     try std.testing.expectEqual(.redo, L(normal, .{ .codepoint = 'r', .mods = .{ .ctrl = true } }));
     try std.testing.expectEqual(.visual_block, L(normal, .{ .codepoint = 'v', .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(.increment, L(normal, .{ .codepoint = 'a', .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(.decrement, L(normal, .{ .codepoint = 'x', .mods = .{ .ctrl = true } }));
     // 'g' is the gg/ge prefix (bound to noop; Mode interprets the sequence)
     try std.testing.expectEqual(.noop, L(normal, .{ .codepoint = 'g' }));
     // unbound keys / wrong modifiers → null
