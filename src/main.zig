@@ -22,6 +22,7 @@ const status_row_count: u32 = 1;
 const App = struct {
     io: std.Io,
     alloc: std.mem.Allocator,
+    env_map: *std.process.Environ.Map,
     vx: vaxis.Vaxis,
     tty: vaxis.Tty,
     tty_buffer: []u8,
@@ -58,6 +59,10 @@ const App = struct {
     mc: editor.MultiCursor = undefined,
     mc_active: bool = false,
 
+    // recent files (dashboard)
+    recent_files: std.ArrayList([]u8) = .empty,
+    recent_sel: usize = 0,
+
     // fuzzy picker (<leader>sf)
     picker_active: bool = false,
     picker_files: std.ArrayList([]u8) = .empty, // owned paths
@@ -91,6 +96,7 @@ const App = struct {
         self.* = .{
             .io = init.io,
             .alloc = init.gpa,
+            .env_map = init.environ_map,
             .vx = vx,
             .tty = tty,
             .tty_buffer = tty_buffer,
@@ -132,6 +138,8 @@ const App = struct {
         if (self.yank_buffer) |b| self.alloc.free(b);
         if (self.em_matches.len > 0) self.alloc.free(self.em_matches);
         self.mc.deinit();
+        for (self.recent_files.items) |f| self.alloc.free(f);
+        self.recent_files.deinit(self.alloc);
         for (self.picker_files.items) |f| self.alloc.free(f);
         self.picker_files.deinit(self.alloc);
         self.picker_input.deinit(self.alloc);
@@ -141,6 +149,11 @@ const App = struct {
     // ---- input ----
 
     fn handleKey(self: *App, key: vaxis.Key) !void {
+        // Dashboard (no file open): j/k/Enter navigate recent files
+        if (self.isDashboard()) {
+            if (try self.dashboardKey(key)) return;
+        }
+
         // EasyMotion capture: query char, then a label to jump to
         if (self.em_active) {
             try self.handleEasyMotionKey(key);
@@ -511,6 +524,7 @@ const App = struct {
         self.history = buffer.History.init(self.alloc); // undo history belongs to the buffer
         if (self.file_path) |p| self.alloc.free(p);
         self.file_path = try self.alloc.dupe(u8, path);
+        try self.addRecent(path);
         self.cursor = 0;
         self.view_top = 0;
     }
@@ -811,6 +825,91 @@ const App = struct {
         self.picker_sel = 0;
     }
 
+    // ---- dashboard ----
+
+    fn isDashboard(self: *const App) bool {
+        return self.file_path == null and self.pt.len() == 0 and
+            self.state.mode == .normal and !self.picker_active and !self.em_active;
+    }
+
+    /// j/k/Enter for the recent-files list; returns true if consumed.
+    fn dashboardKey(self: *App, key: vaxis.Key) !bool {
+        switch (key.codepoint) {
+            'j' => {
+                if (self.recent_sel + 1 < self.recent_files.items.len) self.recent_sel += 1;
+                return true;
+            },
+            'k' => {
+                if (self.recent_sel > 0) self.recent_sel -= 1;
+                return true;
+            },
+            vaxis.Key.enter => {
+                if (self.recent_files.items.len > 0) {
+                    try self.openFile(self.recent_files.items[self.recent_sel]);
+                    self.recent_sel = 0;
+                }
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    fn addRecent(self: *App, path: []const u8) !void {
+        for (self.recent_files.items, 0..) |f, i| {
+            if (std.mem.eql(u8, f, path)) {
+                _ = self.recent_files.orderedRemove(i);
+                break;
+            }
+        }
+        const copy = try self.alloc.dupe(u8, path);
+        errdefer self.alloc.free(copy);
+        try self.recent_files.insert(self.alloc, 0, copy);
+        while (self.recent_files.items.len > 10) {
+            if (self.recent_files.pop()) |f| self.alloc.free(f);
+        }
+    }
+
+    /// Load recent files from ~/.cache/oz/recent (one path per line).
+    fn loadRecent(self: *App) !void {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const home = self.env_map.get("HOME") orelse return;
+        const dir_path = try std.fmt.bufPrint(&buf, "{s}/.cache/oz", .{home});
+        var dir = std.Io.Dir.cwd().openDir(self.io, dir_path, .{}) catch return;
+        defer dir.close(self.io);
+        const file = dir.openFile(self.io, "recent", .{ .mode = .read_only }) catch return;
+        defer file.close(self.io);
+        const size = (try file.stat(self.io)).size;
+        if (size == 0) return;
+        const content = try self.alloc.alloc(u8, @intCast(size));
+        defer self.alloc.free(content);
+        _ = try file.readPositionalAll(self.io, content, 0);
+        var it = std.mem.splitScalar(u8, content, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            const copy = try self.alloc.dupe(u8, line);
+            errdefer self.alloc.free(copy);
+            self.recent_files.append(self.alloc, copy) catch {};
+        }
+    }
+
+    /// Persist recent files to ~/.cache/oz/recent.
+    fn saveRecent(self: *App) !void {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const home = self.env_map.get("HOME") orelse return;
+        const dir_path = try std.fmt.bufPrint(&buf, "{s}/.cache/oz", .{home});
+        var dir = std.Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true }) catch blk: {
+            try std.Io.Dir.cwd().createDirPath(self.io, dir_path);
+            break :blk try std.Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true });
+        };
+        defer dir.close(self.io);
+        const file = try dir.createFile(self.io, "recent", .{ .truncate = true });
+        defer file.close(self.io);
+        for (self.recent_files.items) |f| {
+            try file.writeStreamingAll(self.io, f);
+            try file.writeStreamingAll(self.io, "\n");
+        }
+    }
+
     fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !void {
         _ = count;
         switch (action) {
@@ -967,6 +1066,40 @@ const App = struct {
 
         const cursor_line = self.pt.lineOf(self.cursor);
         const line_count = self.pt.lineCount();
+
+        // dashboard (no file open): title + recent files + hints
+        if (self.isDashboard()) {
+            const title_seg = [_]vaxis.Segment{.{
+                .text = " oz  ",
+                .style = .{ .fg = .{ .rgb = .{ 250, 189, 47 } }, .bold = true },
+            }};
+            _ = win.print(&title_seg, .{ .row_offset = 2, .col_offset = 2, .wrap = .none });
+            const sub_seg = [_]vaxis.Segment{.{
+                .text = " 终端文本编辑器  —  j/k 选择 · Enter 打开 · <leader>sf 找文件 · :e 打开 · :q 退出",
+                .style = .{ .fg = .{ .rgb = .{ 86, 95, 137 } } },
+            }};
+            _ = win.print(&sub_seg, .{ .row_offset = 3, .col_offset = 2, .wrap = .none });
+            var ri: usize = 0;
+            while (ri < @min(self.recent_files.items.len, 8)) : (ri += 1) {
+                const fname = self.recent_files.items[ri];
+                const row: u32 = 5 + @as(u32, @intCast(ri));
+                const seg = [_]vaxis.Segment{.{
+                    .text = fname,
+                    .style = if (ri == self.recent_sel)
+                        .{ .bg = .{ .rgb = .{ 54, 74, 130 } } }
+                    else
+                        .{ .fg = .{ .rgb = .{ 122, 162, 247 } } },
+                }};
+                _ = win.print(&seg, .{ .row_offset = @intCast(row), .col_offset = 2, .wrap = .none });
+            }
+            self.vx.screen.cursor = .{
+                .row = @intCast(5 + @as(u32, @intCast(@min(self.recent_sel, 7)))),
+                .col = 2,
+            };
+            self.vx.screen.cursor_shape = .block;
+            try self.vx.render(self.tty.writer());
+            return;
+        }
 
         // keep cursor line visible, centered-ish
         if (self.cursor < self.pt.lineStart(self.view_top)) {
@@ -1259,6 +1392,7 @@ pub fn main(init: std.process.Init) !void {
             app.pt = try buffer.PieceTable.init(app.alloc, bytes);
             if (app.file_path) |p| app.alloc.free(p);
             app.file_path = try app.alloc.dupe(u8, file_path);
+            try app.addRecent(file_path);
         }
         break; // M0: first file only
     }
@@ -1266,5 +1400,7 @@ pub fn main(init: std.process.Init) !void {
         app.cursor = app.pt.lineStart(@min(target_line - 1, app.pt.lineCount() - 1));
     }
 
+    try app.loadRecent();
+    defer app.saveRecent() catch {};
     try app.run();
 }

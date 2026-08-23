@@ -16,6 +16,9 @@ const linux = std.os.linux;
 /// Installed binary, relative to the project root (the run step's cwd).
 const oz_exe_path = "zig-out/bin/oz";
 
+/// Per-test counter so tests don't share the /tmp/oz_e2e_<pid>.txt file.
+var tmp_counter: usize = 0;
+
 // Linux ioctl numbers (no libc needed).
 const TIOCGPTN: u32 = 0x80045430; // get pty number
 const TIOCSPTLCK: u32 = 0x40045431; // unlock pty
@@ -107,7 +110,7 @@ fn spawnChild(io: Io, pty: *Pty, argv: []const []const u8) !std.posix.pid_t {
     }
     const argv_z: [*:null]const ?[*:0]const u8 = @ptrCast(&arg_ptrs);
 
-    const env_ptrs = [3]?[*:0]const u8{ "TERM=xterm-256color", "PATH=/usr/bin:/bin:/usr/local/bin", null };
+    const env_ptrs = [4]?[*:0]const u8{ "TERM=xterm-256color", "PATH=/usr/bin:/bin:/usr/local/bin", "HOME=/tmp", null };
     const envp: [*:null]const ?[*:0]const u8 = @ptrCast(&env_ptrs);
 
     const rc = linux.fork();
@@ -388,7 +391,8 @@ test "smoke: spawn oz, render a file, quit cleanly" {
 
     // temp input file (deleted at test end, after the child has read it)
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}.txt", .{linux.getpid()});
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
         const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
@@ -436,7 +440,8 @@ test "insert text in insert mode, esc back to normal" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}.txt", .{linux.getpid()});
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
         const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
@@ -506,7 +511,8 @@ test ":wq writes the buffer to disk and exits" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}.txt", .{linux.getpid()});
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
         const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
@@ -583,7 +589,8 @@ test "insert mode: jk leaves no chars, backspace and ctrl-w delete" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}.txt", .{linux.getpid()});
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
         const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
@@ -682,7 +689,8 @@ test "M1a: text objects, visual ops, yank/paste, easymotion" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}.txt", .{linux.getpid()});
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
         const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
@@ -784,8 +792,6 @@ test "M1a: text objects, visual ops, yank/paste, easymotion" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    std.debug.print("after snacY grid:\n", .{});
-    grid.dump();
     try std.testing.expect(grid.contains("Y"));
     try std.testing.expect(!grid.contains("Xone"));
 
@@ -798,8 +804,14 @@ test "surround: ysw' wraps, ds( deletes, cs(->[ changes" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}.txt", .{linux.getpid()});
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        // the test types the content itself ("ihello world")
+    }
 
     var sess = try Session.spawn(io, &.{ oz_exe_path, name });
     defer sess.close();
@@ -980,7 +992,8 @@ test "visual ga= aligns delimiter columns" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}.txt", .{linux.getpid()});
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
         const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
@@ -1031,8 +1044,18 @@ test "picker: <leader>sf fuzzy-finds and opens a file" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
-    // The child inherits the test's cwd (project root); the picker walks it.
-    var sess = try Session.spawn(io, &.{oz_exe_path});
+    // Spawn with a temp file so the editor starts in normal mode (not the
+    // dashboard); the picker still walks the project root cwd.
+    var fname_buf: [128:0]u8 = undefined;
+    const fname = try std.fmt.bufPrintZ(&fname_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, fname) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, fname, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "placeholder\n");
+    }
+    var sess = try Session.spawn(io, &.{ oz_exe_path, fname });
     defer sess.close();
     defer killPid(sess.pid);
 
@@ -1094,7 +1117,8 @@ test ":%s substitutes across the file, :s on the current line" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}.txt", .{linux.getpid()});
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
         const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
@@ -1139,4 +1163,81 @@ test ":%s substitutes across the file, :s on the current line" {
 
     const exit_code = try sess.commandAndWaitExit(":q\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "dashboard shows recent files; Enter reopens" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "recent file content\n");
+    }
+
+    // First run: open the file, then quit
+    {
+        var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.init(alloc);
+        defer grid.deinit(alloc);
+        var waited: i32 = 0;
+        while (!grid.contains("NORMAL")) {
+            const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+            if (n == 0) {
+                waited += 200;
+                if (waited >= 5000) break;
+                continue;
+            }
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        try std.testing.expect(grid.contains("recent file content"));
+        const code = try sess.commandAndWaitExit(":q\r");
+        try std.testing.expectEqual(@as(u32, 0), code);
+    }
+
+    // Second run: no file arg → dashboard with the recent file; Enter reopens it
+    {
+        var sess = try Session.spawn(io, &.{oz_exe_path});
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.init(alloc);
+        defer grid.deinit(alloc);
+        var waited: i32 = 0;
+        while (!grid.contains("终端文本编辑器") or !grid.contains(name)) {
+            const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+            if (n == 0) {
+                waited += 200;
+                if (waited >= 5000) break;
+                continue;
+            }
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        try std.testing.expect(grid.contains("终端文本编辑器"));
+        try std.testing.expect(grid.contains(name));
+
+        try sess.send("\r");
+        waited = 0;
+        while (!grid.contains("recent file content")) {
+            const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+            if (n == 0) {
+                waited += 200;
+                if (waited >= 5000) break;
+                continue;
+            }
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        try std.testing.expect(grid.contains("recent file content"));
+
+        const code = try sess.commandAndWaitExit(":q\r");
+        try std.testing.expectEqual(@as(u32, 0), code);
+    }
 }
