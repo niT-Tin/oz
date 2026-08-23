@@ -536,6 +536,25 @@ Client = {
 - 迭代闭环 = 改代码 → 跑 `zig build test` / `zig build e2e` → 读 stdout 判定 → 继续
 - 无法在真实终端肉眼看效果时，一律以 L2/L3 断言为准；真机冒烟仅作为发布前最后一步（可由用户在真实终端确认）
 
+### 12.7 性能契约（终端编辑器性能调查报告.md 的落实）
+
+> 背景调查：`~/sources/myFFmpeg/src/cabac.zig`（124KB，token 极密）在 nvim 里滚动/输入卡顿。
+> 根因 = **token 密度 × 装饰系统数**：tree-sitter 高亮 + rainbow + semantic tokens 三个系统
+> 各自给同一批 token 建对象（extmark），成本随**全文件 token 数**线性增长，与可见区域无关。
+> Zed 快在 GPU + 增量解析 + 只渲染可见区域。调查产物在 /tmp（重启丢失），核心结论归档于此。
+
+**铁律：渲染成本必须 O(可见区域)，与文件大小解耦。** 具体落实（已实现，2026-08）：
+
+| 环节 | 实现 | 实测 |
+|------|------|------|
+| 语法高亮 query | `ts_query_cursor_set_byte_range` 限定视口；产出一张扁平 `[]Span`（src/syntax.zig），无 per-token 对象 | 可见区 query ~9ms/帧（24 行）；全文件 query 303ms（**从不执行**） |
+| 增量解析 | 单编辑走 `tree.edit` + old_tree 增量路径（history.revision/last_record 判定）；多编辑/undo/切换 buffer 回退全量 | 90KB 文件打字 48ms/键 → **~3ms/键** |
+| 大文件降级 | >100KB 完全跳过语法 pass（与 nvim 缓解报告同阈值） | cabac.zig(124KB) 零语法开销 |
+| 行索引 | 每编辑后全量重建（O(文件) 字节扫描，M1 现状）；B-tree 缓存行偏移是 M2+ 优化项 | 12MB 打字 ~30ms/键；源码级 <1MB 时 <3ms/键 |
+| 渲染 | vaxis diff 渲染只发变更 cell + 颜色连续段合并 SGR | 滚动 30 屏任意文件 <50ms |
+
+**验证方式**（防退化）：`zig build e2e` 含两条语法契约测试——zig 文件关键字/注释颜色断言（Grid 解析器记录 SGR fg），以及 >100KB 文件零颜色断言。人工基准：造 ~90KB zig 文件跑 `script` 会话测打字/滚动墙钟。
+
 ---
 
 ## 13. 分阶段路线图
@@ -561,16 +580,16 @@ Client = {
 
 ### M1 — MVP（spec §12 第一段，≈4-6 周）
 
-- 文本对象 `iw/aw/i(/a(...` + d/c/y/v 组合
-- surround（ys/ds/cs）、注释（gcc/gc）、对齐（ga）
-- EasyMotion（s / leader f）
-- 多光标（Ctrl+n + Visual Block 加光标）
-- tree-sitter 高亮（首批：zig/rust/go/python/ts/js/json/markdown，其余随用随加）
-- TabBar（图标/修改标记/诊断计数）+ buffer 管理（leader bb/bn/bj/bk）
-- 文件树（leader e/E）
-- 统一 fuzzy picker：文件（git 仓库含 hidden）/ grep（ripgrep）/ buffer / 最近文件
-- 命令模式增强：历史持久（会话内）+ Tab 补全（命令名/路径/选项）+ `:s` 替换（inccommand 实时预览）+ Visual 选区范围注入（`:'<,'>s`）
-- Dashboard
+- [x] 文本对象 `iw/aw/i(/a(...` + d/c/y/v 组合
+- [x] surround（ys/ds/cs）、注释（gcc/gc）、对齐（ga）
+- [x] EasyMotion（s / leader f）
+- [x] 多光标（Ctrl+n + Visual Block 加光标）
+- [x] tree-sitter 高亮（首批：zig/rust/go/python/ts/js/json/c/cpp/bash/lua/toml/yaml，视口 query + 增量解析 + 100KB 降级，见 §12.7）
+- [x] TabBar（图标/修改标记）+ buffer 管理（leader bb/bn/bj/bk、gt/gT、:bn/:bp/:bd/:ls）
+- [x] 文件树（leader e/E）
+- [x] 统一 fuzzy picker：文件（sf）/ grep（st，ripgrep）/ buffer（sb）/ 最近文件（sr）
+- [x] 命令模式增强：历史（会话内）+ Tab 补全（路径）+ `:s` 替换 + `:'<,'>s` 视觉范围注入
+- [x] Dashboard（最近文件持久化 `~/.cache/oz/recent`）
 
 **M1 通过 = 日常写代码主流程可替代 vim。**
 
