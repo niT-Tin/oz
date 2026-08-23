@@ -1772,7 +1772,8 @@ const App = struct {
 
         const height: u32 = win.height;
         if (height <= status_row_count) return;
-        const content_rows = height - status_row_count;
+        // Content area rows: below the tab bar, above the status bar.
+        const content_rows = height - status_row_count - tab_bar_rows;
 
         const cursor_line = self.cur().pt.lineOf(self.cur().cursor);
         const line_count = self.cur().pt.lineCount();
@@ -1850,7 +1851,7 @@ const App = struct {
         // syntax spans covering the visible byte range (empty when inactive)
         const merged = try self.visibleSpans(a, self.cur().view_top, content_rows);
         var span_i: usize = 0;
-        while (row < content_rows and line < line_count) : ({
+        while (row < self.contentTop() + content_rows and line < line_count) : ({
             line += 1;
             row += 1;
         }) {
