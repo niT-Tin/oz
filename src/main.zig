@@ -3029,6 +3029,13 @@ const App = struct {
         const w = &self.windows.items[rect.win];
         const buf = &self.buffers.items[w.buf];
 
+        // A buffer edited through ANOTHER window may have shrunk under this
+        // window's cursor/viewport (e.g. delete at EOF while a split window's
+        // cursor sat there) — clamp before any line math, which asserts on
+        // out-of-range positions (lineOf / lineStart).
+        if (w.cursor > buf.pt.len()) w.cursor = buf.pt.len();
+        if (w.view_top > buf.pt.lineCount() -| 1) w.view_top = buf.pt.lineCount() -| 1;
+
         const cursor_line = buf.pt.lineOf(w.cursor);
         const line_count = buf.pt.lineCount();
         // relative-number gutter: computed once per frame per window

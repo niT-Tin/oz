@@ -5698,3 +5698,97 @@ test "windows: :vs keeps the old window left; Ctrl-w h/l + :e target the focused
     const exit_code = try sess.commandAndWaitExit(":qa\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
+
+test "windows: editing in one split clamps the other window's stale cursor (no crash)" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, "build.zig" });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+    // right window: cursor to EOF (doc_len). Left window: delete a char —
+    // the doc shrinks under the right window's cursor → must clamp, not crash.
+    try sess.send(":vs\r\x17lG");
+    waited = 0;
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 2000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        break;
+    }
+    try sess.send("\x17h");
+    waited = 0;
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 2000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        break;
+    }
+    // delete the char at the end of the LAST line (shrinks the doc)
+    try sess.send("G$xi");
+    waited = 0;
+    var ok = false;
+    while (!ok) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        if (grid.contains("INSERT")) ok = true;
+    }
+    if (!ok) {
+        std.debug.print("oz crashed while editing:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(ok);
+    // backspace too (shrink again), then Esc
+    try sess.send("\x7f\x1b");
+    waited = 0;
+    var normal = false;
+    while (!normal) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        if (grid.contains("NORMAL") and !grid.contains("INSERT")) normal = true;
+    }
+    if (!normal) {
+        std.debug.print("oz crashed after backspace:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(normal);
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
