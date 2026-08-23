@@ -2669,6 +2669,56 @@ test "visual line: Esc exits and clears the stale selection highlight" {
     }
     try std.testing.expect(sel_cleared);
 
+    // Second path: ':' from an extended visual selection opens the command
+    // line (cmdline gets "'<,'>"), then Esc cancels it — the anchor must go
+    // too, or the selection highlight survives the cancel. (V alone leaves
+    // anchor == cursor, which renders no highlight; Vj makes it visible.)
+    try sess.send("Vj:");
+    waited = 0;
+    sel_visible = false;
+    while (!sel_visible or !grid.contains("'<,'>")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        sel_visible = false;
+        var r: usize = 0;
+        while (r < grid.rows) : (r += 1) {
+            if (grid.rowHasBg(r, sel_bg)) {
+                sel_visible = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(sel_visible);
+
+    try sess.send("\x1b");
+    waited = 0;
+    sel_cleared = false;
+    while (!sel_cleared) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        sel_cleared = true;
+        var r: usize = 0;
+        while (r < grid.rows) : (r += 1) {
+            if (grid.rowHasBg(r, sel_bg)) {
+                sel_cleared = false;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(sel_cleared);
+
     const exit_code = try sess.commandAndWaitExit(":q\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
@@ -2790,6 +2840,138 @@ test "picker: keys win over the file tree while both are open" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "visual line: gt buffer switch drops the selection highlight" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var na_buf: [128:0]u8 = undefined;
+    const na = try std.fmt.bufPrintZ(&na_buf, "/tmp/oz_e2e_{d}_{d}gta.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, na, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "AAA\nAAA\nAAA\n");
+    }
+    var nb_buf: [128:0]u8 = undefined;
+    const nb = try std.fmt.bufPrintZ(&nb_buf, "/tmp/oz_e2e_{d}_{d}gtb.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, nb) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, nb, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "BBB\nBBB\nBBB\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, na });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // Move the cursor in buffer a.txt (each buffer keeps its own cursor).
+    // The stale-anchor leak is only visible when the target buffer's cursor
+    // differs from the leaked anchor — with both at 0 the range is empty
+    // and render paints nothing.
+    try sess.send("j");
+    waited = 0;
+    while (!grid.contains("line 2/")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("line 2/"));
+
+    // :e b.txt — second buffer
+    try sess.send(":e ");
+    try sess.send(nb);
+    try sess.send("\r");
+    waited = 0;
+    while (!grid.contains("BBB") or grid.contains("AAA")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("BBB"));
+
+    const sel_bg = packRgb(54, 74, 130);
+
+    // V then j — a visible selection on buffer b.txt (V alone renders no
+    // highlight because anchor == cursor)
+    try sess.send("Vj");
+    waited = 0;
+    var sel_visible = false;
+    while (!sel_visible) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        var r: usize = 0;
+        while (r < grid.rows) : (r += 1) {
+            if (grid.rowHasBg(r, sel_bg)) {
+                sel_visible = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(sel_visible);
+
+    // gt in visual mode — switchBuffer → switchTo must drop the anchor, or
+    // the old buffer's selection leaks onto the new buffer
+    try sess.send("gt");
+    waited = 0;
+    while (!grid.contains("AAA") or grid.contains("BBB")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("AAA"));
+    var sel_cleared = true;
+    var r: usize = 0;
+    while (r < grid.rows) : (r += 1) {
+        if (grid.rowHasBg(r, sel_bg)) {
+            sel_cleared = false;
+            break;
+        }
+    }
+    try std.testing.expect(sel_cleared);
+
     const exit_code = try sess.commandAndWaitExit(":q\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }

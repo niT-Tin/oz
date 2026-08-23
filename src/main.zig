@@ -622,6 +622,9 @@ const App = struct {
         // cancel
         if (key.codepoint == vaxis.Key.escape or (key.codepoint == 'c' and key.mods.ctrl)) {
             self.state.mode = .normal;
+            // Esc cancelling ':' from visual mode must drop the anchor too
+            // (it was kept so :'<,'>s could resolve the range on Enter).
+            self.visual_anchor = null;
             self.cmdline.clearRetainingCapacity();
             self.cmd_hist_idx = null;
             return;
@@ -1430,6 +1433,10 @@ const App = struct {
         if (self.buffers.items.len == 0) return;
         self.current = i % self.buffers.items.len;
         self.state.mode = .normal;
+        // leaving the buffer invalidates any visual selection from it
+        // (gt / :bn / :e / picker-enter all land here, some without the
+        // command-line exitVisual fallback)
+        self.visual_anchor = null;
         self.in_insert = false;
         self.cur().cursor = @min(self.cur().cursor, self.cur().pt.len());
         // the highlighter tree belongs to the old buffer: force a full
@@ -1486,6 +1493,8 @@ const App = struct {
         if (buf.path) |p| self.alloc.free(p);
         if (self.current >= self.buffers.items.len) self.current = self.buffers.items.len - 1;
         self.state.mode = .normal;
+        // closing the buffer also discards a visual selection anchored in it
+        self.visual_anchor = null;
         self.in_insert = false;
         self.syntax_dirty = true;
         self.syntax_revision = std.math.maxInt(u64);
