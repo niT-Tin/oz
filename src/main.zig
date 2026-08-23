@@ -20,6 +20,8 @@ pub const std_options: std.Options = .{
 const status_row_count: u32 = 1;
 
 const App = struct {
+    const GrepResult = struct { path: []u8, line: u32, text: []u8 };
+
     io: std.Io,
     alloc: std.mem.Allocator,
     env_map: *std.process.Environ.Map,
@@ -63,12 +65,15 @@ const App = struct {
     recent_files: std.ArrayList([]u8) = .empty,
     recent_sel: usize = 0,
 
-    // fuzzy picker (<leader>sf)
+    // fuzzy picker (<leader>sf / <leader>st)
+    picker_mode: enum { files, grep } = .files,
     picker_active: bool = false,
     picker_files: std.ArrayList([]u8) = .empty, // owned paths
     picker_input: std.ArrayList(u8) = .empty,
     picker_matches: std.ArrayList(usize) = .empty, // indices into picker_files
     picker_sel: usize = 0,
+    // grep mode: one result per line from rg
+    grep_results: std.ArrayList(GrepResult) = .empty,
 
     fn create(init: std.process.Init) !*App {
         const self = try init.gpa.create(App);
@@ -142,6 +147,11 @@ const App = struct {
         self.recent_files.deinit(self.alloc);
         for (self.picker_files.items) |f| self.alloc.free(f);
         self.picker_files.deinit(self.alloc);
+        for (self.grep_results.items) |g| {
+            self.alloc.free(g.path);
+            self.alloc.free(g.text);
+        }
+        self.grep_results.deinit(self.alloc);
         self.picker_input.deinit(self.alloc);
         self.picker_matches.deinit(self.alloc);
     }
@@ -397,6 +407,12 @@ const App = struct {
             },
             else => {},
         }
+        // Tab: complete the file path after ":e "
+        if (key.codepoint == vaxis.Key.tab) {
+            try self.completeCommandPath();
+            return;
+        }
+
         // Ctrl-w: delete the word before the cursor (M0: back to last space)
         if (key.codepoint == 'w' and key.mods.ctrl) {
             var i = self.cmdline.items.len;
@@ -407,6 +423,45 @@ const App = struct {
         if (key.text) |text| {
             try self.cmdline.appendSlice(self.alloc, text);
         }
+    }
+
+    /// Tab in command mode: complete the path prefix after ":e ".
+    /// Cycles through matches on repeated Tab.
+    fn completeCommandPath(self: *App) !void {
+        const line = self.cmdline.items;
+        // find the token after "e " / ":e " (the leading ':' isn't stored)
+        if (line.len < 3 or line[0] != 'e' or line[1] != ' ') return;
+        const prefix = line[2..];
+
+        var matches = std.ArrayList([]const u8).empty;
+        defer {
+            for (matches.items) |m| self.alloc.free(m);
+            matches.deinit(self.alloc);
+        }
+        var root = try std.Io.Dir.cwd().openDir(self.io, ".", .{ .iterate = true });
+        defer root.close(self.io);
+        var files = std.ArrayList([]u8).empty;
+        defer {
+            for (files.items) |f| self.alloc.free(f);
+            files.deinit(self.alloc);
+        }
+        try self.walkInto(root, "", &files);
+        for (files.items) |f| {
+            if (std.mem.startsWith(u8, f, prefix)) {
+                const c = try self.alloc.dupe(u8, f);
+                try matches.append(self.alloc, c);
+            }
+        }
+        if (matches.items.len == 0) return;
+
+        // cycle: self.cmd_hist_idx doubles as a completion cursor
+        const cycle = (self.cmd_hist_idx orelse 0) + 1;
+        const chosen = matches.items[cycle % matches.items.len];
+        self.cmd_hist_idx = cycle % matches.items.len;
+
+        self.cmdline.clearRetainingCapacity();
+        try self.cmdline.appendSlice(self.alloc, "e ");
+        try self.cmdline.appendSlice(self.alloc, chosen);
     }
 
     fn pushHistory(self: *App, line: []const u8) !void {
@@ -735,6 +790,10 @@ const App = struct {
     }
 
     fn walkDir(self: *App, dir: std.Io.Dir, prefix: []const u8) !void {
+        try self.walkInto(dir, prefix, &self.picker_files);
+    }
+
+    fn walkInto(self: *App, dir: std.Io.Dir, prefix: []const u8, out: *std.ArrayList([]u8)) !void {
         var it = dir.iterate();
         while (try it.next(self.io)) |entry| {
             const name = entry.name;
@@ -746,20 +805,89 @@ const App = struct {
                     var sub = try dir.openDir(self.io, name, .{ .iterate = true });
                     defer sub.close(self.io);
                     const sub_prefix = try std.fmt.allocPrint(self.alloc, "{s}/", .{path});
-                    try self.walkDir(sub, sub_prefix);
+                    try self.walkInto(sub, sub_prefix, out);
                     self.alloc.free(sub_prefix);
                     self.alloc.free(path);
                 },
-                .file => try self.picker_files.append(self.alloc, path),
+                .file => try out.append(self.alloc, path),
                 else => self.alloc.free(path),
             }
         }
+    }
+
+    fn openGrepPicker(self: *App) !void {
+        self.picker_mode = .grep;
+        self.picker_input.clearRetainingCapacity();
+        self.picker_sel = 0;
+        self.picker_active = true;
+    }
+
+    /// Run rg for the current query and store results (path:line:text).
+    fn runGrep(self: *App) !void {
+        for (self.grep_results.items) |g| {
+            self.alloc.free(g.path);
+            self.alloc.free(g.text);
+        }
+        self.grep_results.clearRetainingCapacity();
+
+        const query = self.picker_input.items;
+        if (query.len == 0) return;
+
+        var child = std.process.spawn(self.io, .{
+            .argv = &.{ "rg", "--no-heading", "-n", query },
+            .stdout = .pipe,
+            .stderr = .ignore,
+        }) catch return;
+        defer _ = child.wait(self.io) catch {};
+
+        // Read ALL of rg's output until EOF — stopping early deadlocks: the
+        // kernel pipe buffer fills, rg blocks writing, and wait() never
+        // returns. Cap at ~1MB for sanity.
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.alloc);
+        var tmp: [4096]u8 = undefined;
+        while (out.items.len < 1024 * 1024) {
+            const n = child.stdout.?.readStreaming(self.io, &.{&tmp}) catch break;
+            if (n == 0) break;
+            try out.appendSlice(self.alloc, tmp[0..n]);
+        }
+        if (out.items.len >= 1024 * 1024) {
+            _ = child.kill(self.io);
+        }
+        var it = std.mem.splitScalar(u8, out.items, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            // path:line:text
+            const c1 = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const c2 = std.mem.indexOfScalarPos(u8, line, c1 + 1, ':') orelse continue;
+            const path = line[0..c1];
+            const line_no = std.fmt.parseUnsigned(u32, line[c1 + 1 .. c2], 10) catch continue;
+            const text = line[c2 + 1 ..];
+            const path_c = try self.alloc.dupe(u8, path);
+            errdefer self.alloc.free(path_c);
+            const text_c = try self.alloc.dupe(u8, text);
+            errdefer self.alloc.free(text_c);
+            try self.grep_results.append(self.alloc, .{ .path = path_c, .line = line_no, .text = text_c });
+            if (self.grep_results.items.len >= 50) break;
+        }
+        if (self.picker_sel >= self.grep_results.items.len) self.picker_sel = 0;
     }
 
     fn handlePickerKey(self: *App, key: vaxis.Key) !void {
         switch (key.codepoint) {
             vaxis.Key.escape => self.closePicker(),
             vaxis.Key.enter => {
+                if (self.picker_mode == .grep) {
+                    if (self.grep_results.items.len > 0) {
+                        const r = self.grep_results.items[self.picker_sel];
+                        self.closePicker();
+                        try self.openFile(r.path);
+                        const line = @min(r.line - 1, self.pt.lineCount() - 1);
+                        self.cursor = self.pt.lineStart(line);
+                        self.view_top = line;
+                    }
+                    return;
+                }
                 if (self.picker_matches.items.len > 0) {
                     const f = self.picker_files.items[self.picker_matches.items[self.picker_sel]];
                     self.closePicker();
@@ -770,24 +898,34 @@ const App = struct {
                 if (self.picker_input.items.len > 0) {
                     _ = self.picker_input.pop();
                     self.picker_sel = 0;
-                    try self.pickerRefilter();
+                    if (self.picker_mode == .grep) {
+                        try self.runGrep();
+                    } else {
+                        try self.pickerRefilter();
+                    }
                 }
             },
             vaxis.Key.down => {
-                if (self.picker_sel + 1 < self.picker_matches.items.len) self.picker_sel += 1;
+                const n = if (self.picker_mode == .grep) self.grep_results.items.len else self.picker_matches.items.len;
+                if (self.picker_sel + 1 < n) self.picker_sel += 1;
             },
             vaxis.Key.up => {
                 if (self.picker_sel > 0) self.picker_sel -= 1;
             },
             else => {
                 if (key.codepoint == 'n' and key.mods.ctrl) {
-                    if (self.picker_sel + 1 < self.picker_matches.items.len) self.picker_sel += 1;
+                    const n = if (self.picker_mode == .grep) self.grep_results.items.len else self.picker_matches.items.len;
+                    if (self.picker_sel + 1 < n) self.picker_sel += 1;
                 } else if (key.codepoint == 'p' and key.mods.ctrl) {
                     if (self.picker_sel > 0) self.picker_sel -= 1;
                 } else if (key.text) |t| {
                     try self.picker_input.appendSlice(self.alloc, t);
                     self.picker_sel = 0;
-                    try self.pickerRefilter();
+                    if (self.picker_mode == .grep) {
+                        try self.runGrep();
+                    } else {
+                        try self.pickerRefilter();
+                    }
                 }
             },
         }
@@ -823,6 +961,7 @@ const App = struct {
     fn closePicker(self: *App) void {
         self.picker_active = false;
         self.picker_sel = 0;
+        self.picker_mode = .files;
     }
 
     // ---- dashboard ----
@@ -1010,6 +1149,7 @@ const App = struct {
             },
             .mc_add => try self.mcSelectNext(),
             .picker_file => try self.openPicker(),
+            .picker_grep => try self.openGrepPicker(),
             .paste => try self.pasteBuffer(false),
             .paste_before => try self.pasteBuffer(true),
             .toggle_comment_line => try self.toggleCommentLine(),
@@ -1217,13 +1357,17 @@ const App = struct {
 
         // fuzzy picker overlay
         if (self.picker_active) {
-            const list_rows = @min(@as(usize, 10), self.picker_matches.items.len);
+            const total = if (self.picker_mode == .grep) self.grep_results.items.len else self.picker_matches.items.len;
+            const list_rows = @min(@as(usize, 10), total);
             const start_row = height - 1 - @as(u32, @intCast(list_rows)) - 1;
             var ri: usize = 0;
             while (ri < list_rows) : (ri += 1) {
-                const fname = self.picker_files.items[self.picker_matches.items[ri]];
+                const label: []const u8 = if (self.picker_mode == .grep) blk: {
+                    const r = self.grep_results.items[ri];
+                    break :blk std.fmt.allocPrint(a, "{s}:{d}: {s}", .{ r.path, r.line, r.text }) catch "…";
+                } else self.picker_files.items[self.picker_matches.items[ri]];
                 const seg = [_]vaxis.Segment{.{
-                    .text = fname,
+                    .text = label,
                     .style = if (ri == self.picker_sel)
                         .{ .bg = .{ .rgb = .{ 54, 74, 130 } } }
                     else

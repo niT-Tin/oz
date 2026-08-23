@@ -273,6 +273,7 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         }
         switch (key.codepoint) {
             'f' => return emitAction(state, .picker_file), // <leader>sf files
+            't' => return emitAction(state, .picker_grep), // <leader>st grep
             else => {
                 resetPending(state);
                 return .pending;
@@ -525,6 +526,7 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .toggle_comment_line => emitAction(state, .toggle_comment_line),
         .mc_add => emitAction(state, .mc_add),
         .picker_file => emitAction(state, .picker_file),
+        .picker_grep => emitAction(state, .picker_grep),
         .leader => blk: {
             state.pending_leader = true;
             break :blk .pending;
