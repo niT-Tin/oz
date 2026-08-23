@@ -4561,8 +4561,23 @@ test "file tree: Ctrl-w h/l switches focus between sidebar and buffer" {
     }
     try std.testing.expect(sel_moved);
 
-    // h closes the tree back to buffer focus
+    // 'h' in the sidebar must NOT close the tree (pane switching is Ctrl-w);
+    // Esc closes it and returns focus to the buffer
     try sess.send("h");
+    waited = 0;
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 2000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        break;
+    }
+    try std.testing.expect(grid.contains("files"));
+    try sess.send("\x1b");
     waited = 0;
     while (grid.contains("files")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);

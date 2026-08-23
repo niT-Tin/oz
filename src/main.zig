@@ -97,6 +97,11 @@ const App = struct {
     focus: enum { buffer, filetree } = .buffer,
     /// Ctrl-w seen, awaiting the window-motion key (h/l/j/k).
     pending_window: bool = false,
+    /// Content hash at insert-session entry, so an insert session that ends
+    /// with no net change can clear the dirty flag ("typed then deleted it
+    /// all back" must not mark the buffer modified).
+    insert_base_hash: u64 = 0,
+    insert_was_dirty: bool = false,
     filetree_files: std.ArrayList([]u8) = .empty,
 
     // fuzzy picker (<leader>sf / <leader>st / <leader>sb / <leader>sr)
@@ -369,6 +374,12 @@ const App = struct {
                 try self.deleteWordBefore();
                 return;
             }
+            // Tab: insert indentation (vim default: a tab character)
+            if (key.codepoint == vaxis.Key.tab) {
+                self.prev_insert_key = key;
+                try self.insertText("\t");
+                return;
+            }
             // Alt+b / Alt+f: emacs word motion. Pure cursor movement — no
             // text change, and prev_insert_key stays untouched (the jk exit
             // and backspace paths must not see these). vaxis parses ESC+b/f
@@ -473,6 +484,13 @@ const App = struct {
         self.cur().history.endGroup();
         self.in_insert = false;
         self.prev_insert_key = null;
+        self.endInsertSession();
+        // Force a full reparse on the next render: incremental edits during
+        // the insert session may have drifted the highlight tree (the "some
+        // characters turn comment-gray after jk" bug). A full reparse on
+        // every insert exit guarantees correct colors once back in normal.
+        self.syntax_dirty = true;
+        self.syntax_revision = std.math.maxInt(u64);
     }
 
     // ---- visual-block multi-cursor insert (<C-v> block then I/A) ----
@@ -658,6 +676,9 @@ const App = struct {
         self.cur().history.endGroup();
         self.in_insert = false;
         self.prev_insert_key = null;
+        self.endInsertSession();
+        self.syntax_dirty = true;
+        self.syntax_revision = std.math.maxInt(u64);
     }
 
     /// Keep the visible (main) cursor on the main multi-cursor's position.
@@ -1323,15 +1344,10 @@ const App = struct {
                 if (self.filetree_sel > 0) self.filetree_sel -= 1;
                 return true;
             },
-            'h', vaxis.Key.left => {
-                // vim-ish: h closes the tree back to the buffer focus
-                self.filetree_active = false;
-                self.focus = .buffer;
-                return true;
-            },
-            'l', vaxis.Key.right => {
-                return true; // no expansion in M1; swallow
-            },
+            // h/l: no tree expansion/collapse in M1 — swallow so they don't
+            // fall through to the buffer (pane switching is Ctrl-w hjkl).
+            // 'h' deliberately does NOT close the tree.
+            'h', 'l', vaxis.Key.left, vaxis.Key.right => return true,
             vaxis.Key.enter => {
                 if (self.filetree_files.items.len > 0) {
                     const f = self.filetree_files.items[self.filetree_sel];
@@ -1742,6 +1758,39 @@ const App = struct {
         self.syntax_revision = std.math.maxInt(u64);
     }
 
+    /// FNV-1a hash of the current buffer content (for dirty detection).
+    fn contentHash(self: *App) u64 {
+        var h: u64 = 0xcbf29ce484222325;
+        var buf: [4096]u8 = undefined;
+        var off: u32 = 0;
+        const len = self.cur().pt.len();
+        while (off < len) {
+            const n: u32 = @intCast(@min(buf.len, len - off));
+            self.cur().pt.copyRange(off, buf[0..n]);
+            for (buf[0..n]) |b| {
+                h ^= b;
+                h *%= 0x100000001b3;
+            }
+            off += n;
+        }
+        return h;
+    }
+
+    /// Called when an insert session begins (all entry paths).
+    fn beginInsertSession(self: *App) void {
+        self.insert_base_hash = self.contentHash();
+        self.insert_was_dirty = self.cur().dirty;
+    }
+
+    /// Called when an insert session ends (exitInsert / exitMcInsert): a
+    /// session with zero net change clears the dirty flag.
+    fn endInsertSession(self: *App) void {
+        const now = self.contentHash();
+        if (!self.insert_was_dirty and now == self.insert_base_hash) {
+            self.cur().dirty = false;
+        }
+    }
+
     fn markDirty(self: *App) void {
         self.cur().dirty = true;
         self.syntax_dirty = true;
@@ -1886,6 +1935,7 @@ const App = struct {
             .insert_mode => {
                 // open the undo group immediately so the whole insert session
                 // (deletes first or not) is one undo step
+                self.beginInsertSession();
                 self.cur().history.beginGroup();
                 self.in_insert = true;
                 self.state.mode = .insert;
@@ -1899,6 +1949,7 @@ const App = struct {
                     while (i < end and (self.cur().pt.byteAt(i) & 0xC0) == 0x80) : (i += 1) {}
                     self.cur().cursor = i;
                 }
+                self.beginInsertSession();
                 self.cur().history.beginGroup();
                 self.in_insert = true;
                 self.state.mode = .insert;
@@ -1915,6 +1966,7 @@ const App = struct {
                     pos += 1;
                 }
                 self.cur().cursor = pos;
+                self.beginInsertSession();
                 self.cur().history.beginGroup();
                 self.in_insert = true;
                 self.state.mode = .insert;
@@ -1923,6 +1975,7 @@ const App = struct {
                 // A: end of the line
                 const line = self.cur().pt.lineOf(self.cur().cursor);
                 self.cur().cursor = self.cur().pt.lineStart(line) + self.cur().pt.lineLen(line);
+                self.beginInsertSession();
                 self.cur().history.beginGroup();
                 self.in_insert = true;
                 self.state.mode = .insert;
@@ -1933,6 +1986,7 @@ const App = struct {
                 // one undo reverts the whole o+typing session.
                 const line = self.cur().pt.lineOf(self.cur().cursor);
                 const pos = self.cur().pt.lineStart(line) + self.cur().pt.lineLen(line);
+                self.beginInsertSession();
                 self.cur().history.beginGroup();
                 try self.cur().history.record(&self.cur().pt, pos, 0, "\n");
                 self.cur().cursor = pos + 1;
@@ -1943,6 +1997,7 @@ const App = struct {
                 // O: new line above, cursor on it (same open-group semantics)
                 const line = self.cur().pt.lineOf(self.cur().cursor);
                 const pos = self.cur().pt.lineStart(line);
+                self.beginInsertSession();
                 self.cur().history.beginGroup();
                 try self.cur().history.record(&self.cur().pt, pos, 0, "\n");
                 self.cur().cursor = pos;
