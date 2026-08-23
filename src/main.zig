@@ -116,6 +116,14 @@ const App = struct {
     // grep mode: one result per line from rg
     grep_results: std.ArrayList(GrepResult) = .empty,
 
+    // insert-mode keyword completion (Ctrl+n)
+    completion_active: bool = false,
+    completion_words: std.ArrayList([]u8) = .empty, // owned candidate words
+    completion_sel: usize = 0,
+    /// Start of the word being typed when the menu opened; Enter replaces
+    /// [completion_pos, cursor) with the selected word.
+    completion_pos: u32 = 0,
+
     /// The active buffer (all per-buffer state lives here).
     fn cur(self: *App) *Buffer {
         return &self.buffers.items[self.current];
@@ -209,6 +217,8 @@ const App = struct {
         self.grep_results.deinit(self.alloc);
         self.picker_input.deinit(self.alloc);
         self.picker_matches.deinit(self.alloc);
+        for (self.completion_words.items) |w| self.alloc.free(w);
+        self.completion_words.deinit(self.alloc);
     }
 
     // ---- input ----
@@ -340,6 +350,50 @@ const App = struct {
             if (self.mc_active) {
                 try self.handleMcInsertKey(key);
                 return;
+            }
+            // ---- insert-mode keyword completion (Ctrl+n) ----
+            // Esc while the menu is open only dismisses it (stays in insert);
+            // a second Esc exits the insert session as usual.
+            if (self.completion_active and key.codepoint == vaxis.Key.escape) {
+                self.closeCompletion();
+                return;
+            }
+            // Ctrl+n: next candidate when the menu is open; otherwise collect
+            // candidates and open the menu — but only when the cursor is
+            // inside a word. Without a word prefix the key is swallowed.
+            if (key.codepoint == 'n' and key.mods.ctrl and !key.mods.alt and !key.mods.super) {
+                if (self.completion_active) {
+                    const n = self.completion_words.items.len;
+                    if (n > 0) self.completion_sel = (self.completion_sel + 1) % n;
+                } else {
+                    try self.startCompletion();
+                }
+                return;
+            }
+            if (self.completion_active) {
+                // Ctrl+p / ↑: previous candidate; ↓: next candidate
+                if ((key.codepoint == 'p' and key.mods.ctrl and !key.mods.alt and !key.mods.super) or
+                    key.codepoint == vaxis.Key.up)
+                {
+                    const n = self.completion_words.items.len;
+                    if (n > 0) self.completion_sel = (self.completion_sel + n - 1) % n;
+                    return;
+                }
+                if (key.codepoint == vaxis.Key.down) {
+                    const n = self.completion_words.items.len;
+                    if (n > 0) self.completion_sel = (self.completion_sel + 1) % n;
+                    return;
+                }
+                // Enter / Tab: accept the selected word (replaces the typed
+                // prefix), overriding the default newline / tab insert.
+                if (key.codepoint == vaxis.Key.enter or key.codepoint == vaxis.Key.tab) {
+                    try self.acceptCompletion();
+                    return;
+                }
+                // anything else (typing, backspace, Ctrl+w, j/k, Ctrl+c…):
+                // dismiss the menu, then fall through to the normal insert
+                // handling so jk exit, Esc exit and text entry behave as usual.
+                self.closeCompletion();
             }
             if (key.codepoint == vaxis.Key.escape or (key.codepoint == 'c' and key.mods.ctrl)) {
                 self.exitInsert();
@@ -757,6 +811,181 @@ const App = struct {
         try self.cur().history.record(&self.cur().pt, start, self.cur().cursor - start, "");
         self.cur().cursor = start;
         self.markDirty();
+    }
+
+    // ---- insert-mode keyword completion (Ctrl+n) ----
+
+    /// Word characters for keyword completion: [a-zA-Z0-9_] plus any
+    /// non-ASCII byte (mirrors editor/multicursor.zig's classification).
+    fn isWordByte(b: u8) bool {
+        return (b >= 'a' and b <= 'z') or
+            (b >= 'A' and b <= 'Z') or
+            (b >= '0' and b <= '9') or
+            b == '_' or
+            b >= 0x80;
+    }
+
+    /// Ctrl+n in insert mode with the cursor inside a word: collect keyword
+    /// candidates from the whole buffer and open the completion menu. Without
+    /// a word prefix the key is swallowed (no candidates, no side effect).
+    fn startCompletion(self: *App) !void {
+        if (self.completion_active) return;
+        if (self.cur().cursor == 0) return;
+        if (!isWordByte(self.cur().pt.byteAt(self.cur().cursor - 1))) return;
+        try self.collectCompletionWords();
+        if (self.completion_words.items.len > 0) {
+            self.completion_active = true;
+            self.completion_sel = 0;
+        }
+    }
+
+    /// Scan the whole buffer for words and fill completion_words with the
+    /// most frequent ones (ties broken alphabetically), capped at 20. The
+    /// word currently being typed (from completion_pos to the cursor) is
+    /// excluded from the candidates.
+    fn collectCompletionWords(self: *App) !void {
+        const pt = &self.cur().pt;
+        const cursor = self.cur().cursor;
+        // start of the word under/behind the cursor — the replacement anchor
+        var pos = cursor;
+        while (pos > 0 and isWordByte(pt.byteAt(pos - 1))) pos -= 1;
+        if (pos == cursor) return; // cursor not inside a word
+        self.completion_pos = pos;
+        const typed_len = cursor - pos;
+        const typed = try self.alloc.alloc(u8, typed_len);
+        defer self.alloc.free(typed);
+        if (typed_len > 0) pt.copyRange(pos, typed);
+
+        var counts = std.StringHashMap(u32).init(self.alloc);
+        defer {
+            var it = counts.iterator();
+            while (it.next()) |e| self.alloc.free(e.key_ptr.*);
+            counts.deinit();
+        }
+
+        // Scan the document in chunks, stitching words that straddle a chunk
+        // boundary: the word bytes are accumulated in `pending` until a
+        // non-word byte ends them.
+        var pending = std.ArrayList(u8).empty;
+        defer pending.deinit(self.alloc);
+        var chunk: [4096]u8 = undefined;
+        var off: u32 = 0;
+        const doc_len = pt.len();
+        while (off < doc_len) {
+            const n: usize = @intCast(@min(chunk.len, doc_len - off));
+            pt.copyRange(off, chunk[0..n]);
+            var i: usize = 0;
+            while (i < n) {
+                if (isWordByte(chunk[i])) {
+                    var j = i;
+                    while (j < n and isWordByte(chunk[j])) j += 1;
+                    try pending.appendSlice(self.alloc, chunk[i..j]);
+                    if (j == n) break; // may continue on the next chunk
+                    try self.countCompletionWord(&counts, pending.items, typed);
+                    pending.clearRetainingCapacity();
+                    i = j;
+                } else {
+                    if (pending.items.len > 0) {
+                        try self.countCompletionWord(&counts, pending.items, typed);
+                        pending.clearRetainingCapacity();
+                    }
+                    i += 1;
+                }
+            }
+            off += @intCast(n);
+        }
+        // a word running to the end of the document
+        if (pending.items.len > 0) {
+            try self.countCompletionWord(&counts, pending.items, typed);
+            pending.clearRetainingCapacity();
+        }
+
+        // (word, count) pairs, sorted by count desc then word asc
+        const Pair = struct { word: []const u8, count: u32 };
+        var pairs = std.ArrayList(Pair).empty;
+        defer pairs.deinit(self.alloc);
+        {
+            var it = counts.iterator();
+            while (it.next()) |e| {
+                try pairs.append(self.alloc, .{ .word = e.key_ptr.*, .count = e.value_ptr.* });
+            }
+        }
+        std.mem.sort(Pair, pairs.items, {}, struct {
+            fn lt(_: void, a: Pair, b: Pair) bool {
+                if (a.count != b.count) return a.count > b.count;
+                return std.mem.lessThan(u8, a.word, b.word);
+            }
+        }.lt);
+
+        const max_words: usize = 20;
+        const limit = @min(max_words, pairs.items.len);
+        try self.completion_words.ensureTotalCapacity(self.alloc, limit);
+        errdefer {
+            for (self.completion_words.items) |owned| self.alloc.free(owned);
+            self.completion_words.clearRetainingCapacity();
+        }
+        var k: usize = 0;
+        while (k < limit) : (k += 1) {
+            const w = try self.alloc.dupe(u8, pairs.items[k].word);
+            try self.completion_words.append(self.alloc, w);
+        }
+        self.completion_sel = 0;
+    }
+
+    /// Count one occurrence of `word` (skipping the word currently being
+    /// typed). StringHashMap does not copy keys, and the scan buffers are
+    /// reused, so keys are duplicated — the pending buffer can be overwritten
+    /// by the very next word.
+    fn countCompletionWord(self: *App, counts: *std.StringHashMap(u32), word: []const u8, typed: []const u8) !void {
+        if (word.len == typed.len and std.mem.eql(u8, word, typed)) return;
+        // fast path: word already counted — no allocation
+        if (counts.getPtr(word)) |p| {
+            p.* += 1;
+            return;
+        }
+        const key = try self.alloc.dupe(u8, word);
+        errdefer self.alloc.free(key);
+        const gop = try counts.getOrPut(key);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = 1;
+        } else {
+            self.alloc.free(key); // duplicate of an existing key — drop ours
+            gop.value_ptr.* += 1;
+        }
+    }
+
+    /// Enter/Tab while the menu is open: replace the typed prefix
+    /// [completion_pos, cursor) with the selected word — one edit inside the
+    /// open insert-session undo group — then close the menu (insert stays
+    /// active, the session continues).
+    fn acceptCompletion(self: *App) !void {
+        if (self.completion_words.items.len == 0 or self.completion_sel >= self.completion_words.items.len) {
+            self.closeCompletion();
+            return;
+        }
+        const word = self.completion_words.items[self.completion_sel];
+        const pt = &self.cur().pt;
+        const cursor = self.cur().cursor;
+        const pos = @min(self.completion_pos, cursor);
+        if (!self.in_insert) {
+            self.cur().history.beginGroup();
+            self.in_insert = true;
+        }
+        try self.cur().history.record(pt, pos, cursor - pos, word);
+        self.cur().cursor = pos + @as(u32, @intCast(word.len));
+        self.markDirty();
+        self.closeCompletion();
+    }
+
+    /// Drop the completion menu and free its candidate words (the list keeps
+    /// its capacity for the next trigger).
+    fn closeCompletion(self: *App) void {
+        if (!self.completion_active and self.completion_words.items.len == 0) return;
+        for (self.completion_words.items) |w| self.alloc.free(w);
+        self.completion_words.clearRetainingCapacity();
+        self.completion_active = false;
+        self.completion_sel = 0;
+        self.completion_pos = 0;
     }
 
     /// Enter in insert mode (vim semantics): split the current line at the
@@ -2626,6 +2855,29 @@ const App = struct {
             self.vx.screen.cursor_shape = .block;
             try self.vx.render(self.tty.writer());
             return;
+        }
+
+        // insert-mode completion menu (Ctrl+n): a picker-style list right
+        // above the status bar; the selected row is highlighted like the
+        // fuzzy picker's selection. The buffer cursor is left untouched.
+        if (self.completion_active) {
+            const total = self.completion_words.items.len;
+            const list_rows = @min(@as(usize, 8), total);
+            // keep the selection inside the window
+            var top: usize = 0;
+            if (self.completion_sel >= list_rows) top = self.completion_sel - list_rows + 1;
+            const start_row = height - 1 - @as(u32, @intCast(list_rows)) - 1;
+            var k: usize = 0;
+            while (k < list_rows) : (k += 1) {
+                const seg = [_]vaxis.Segment{.{
+                    .text = self.completion_words.items[top + k],
+                    .style = if (top + k == self.completion_sel)
+                        .{ .bg = .{ .rgb = .{ 54, 74, 130 } } }
+                    else
+                        .{},
+                }};
+                _ = win.print(&seg, .{ .row_offset = @intCast(start_row + k), .wrap = .none });
+            }
         }
 
         const mode_str = switch (self.state.mode) {

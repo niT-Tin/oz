@@ -4594,3 +4594,328 @@ test "file tree: Ctrl-w h/l switches focus between sidebar and buffer" {
     const exit_code = try sess.commandAndWaitExit(":q\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
+
+test "insert Ctrl+n: keyword completion inserts the top candidate" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}comp.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "alpha beta gamma\nconst alpha = 1;\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+    const sel_bg = packRgb(54, 74, 130);
+
+    // jj → last (empty) line, i → insert, type "al", Ctrl+n (\x0e). The menu
+    // shows the whole-buffer words by frequency: alpha (2×) first; the typed
+    // prefix "al" is excluded from the candidates. The selected row is the
+    // picker highlight (54,74,130) in the bottom list (rows ≥ 15).
+    try sess.send("jji" ++ "al" ++ "\x0e");
+    waited = 0;
+    var menu_shown = false;
+    while (!menu_shown) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        var r: usize = 15;
+        while (r < grid.rows) : (r += 1) {
+            if (grid.rowHasBg(r, sel_bg) and rowContains(&grid, r, "alpha")) {
+                menu_shown = true;
+                break;
+            }
+        }
+    }
+    if (!menu_shown) {
+        std.debug.print("completion menu did not appear:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(menu_shown);
+
+    // Ctrl+n → next candidate, Ctrl+p → back to the top candidate, Enter
+    // accepts: "alpha" replaces the typed prefix "al" → line 3 = "alpha".
+    try sess.send("\x0e\x10\r");
+    waited = 0;
+    while (rowContains(&grid, 3, "alpha") == false) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (rowContains(&grid, 3, "alpha") == false) {
+        std.debug.print("after accept:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(rowContains(&grid, 3, "alpha"));
+
+    // Esc exits insert (menu is already closed), then :wq persists.
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    const f = try std.Io.Dir.cwd().openFile(io, name, .{ .mode = .read_only });
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    try std.testing.expectEqualStrings("alpha beta gamma\nconst alpha = 1;\nalpha", buf);
+}
+
+test "insert Ctrl+n: Esc dismisses the menu and stays in insert" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}compc.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "alpha beta gamma\nconst alpha = 1;\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+    const sel_bg = packRgb(54, 74, 130);
+
+    try sess.send("jji" ++ "al" ++ "\x0e");
+    waited = 0;
+    var menu_shown = false;
+    while (!menu_shown) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        var r: usize = 15;
+        while (r < grid.rows) : (r += 1) {
+            if (grid.rowHasBg(r, sel_bg) and rowContains(&grid, r, "alpha")) {
+                menu_shown = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(menu_shown);
+
+    // Esc dismisses the menu only — insert mode continues, the typed prefix
+    // stays untouched; further typing still lands in the buffer.
+    try sess.send("\x1b");
+    waited = 0;
+    var menu_gone = false;
+    while (!menu_gone) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        var any_hl = false;
+        var r: usize = 0;
+        while (r < grid.rows) : (r += 1) {
+            if (grid.rowHasBg(r, sel_bg)) {
+                any_hl = true;
+                break;
+            }
+        }
+        if (!any_hl and grid.contains("INSERT")) menu_gone = true;
+    }
+    if (!menu_gone) {
+        std.debug.print("menu not dismissed:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(menu_gone);
+
+    try sess.send("x");
+    waited = 0;
+    while (rowContains(&grid, 3, "alx") == false) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(rowContains(&grid, 3, "alx"));
+
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    const f = try std.Io.Dir.cwd().openFile(io, name, .{ .mode = .read_only });
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    try std.testing.expectEqualStrings("alpha beta gamma\nconst alpha = 1;\nalx", buf);
+}
+
+test "insert Ctrl+n: no candidates when the cursor is not inside a word" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}compn.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "alpha beta gamma\nconst alpha = 1;\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+    const sel_bg = packRgb(54, 74, 130);
+
+    // Cursor on the empty last line (byte before it is '\n', not a word
+    // byte): Ctrl+n is swallowed — no menu, insert continues untouched.
+    try sess.send("jji\x0e");
+    waited = 0;
+    var any_hl = false;
+    var timeout = false;
+    while (!timeout) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 1200) timeout = true;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        var r: usize = 0;
+        while (r < grid.rows) : (r += 1) {
+            if (grid.rowHasBg(r, sel_bg)) {
+                any_hl = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(!any_hl);
+    try std.testing.expect(grid.contains("INSERT"));
+
+    // Esc exits insert; the untouched session leaves the file unchanged.
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    const f = try std.Io.Dir.cwd().openFile(io, name, .{ .mode = .read_only });
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    try std.testing.expectEqualStrings("alpha beta gamma\nconst alpha = 1;\n", buf);
+}
