@@ -3366,3 +3366,195 @@ test "insert Alt-b/Alt-f: emacs word motion moves the cursor" {
     const exit_code = try sess.commandAndWaitExit(":q\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
+
+test "picker confirm leaves file-tree mode; j/k control the buffer" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}g.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "one\ntwo\nthree\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+
+    // file tree open, then grep picker "fn" → confirm jumps to a project file
+    try sess.send(" e");
+    waited = 0;
+    while (!grid.contains("files")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    // sf: the synchronous file picker (no rg subprocess latency). The
+    // project lists DESIGN.md first (alphabetical) — confirming opens it
+    try sess.send(" sf");
+    waited = 0;
+    while (!grid.contains("> ") or !grid.contains("DESIGN.md")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("> "));
+    // Enter confirms DESIGN.md: the picker closes and the status bar reports
+    // a real project file (663 lines, not the 3-line temp file)
+    try sess.send("\r");
+    waited = 0;
+    var jumped = false;
+    while (!jumped) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        if (!grid.contains("> ") and grid.contains("line 1/") and !grid.contains("line 1/3") and !grid.contains("line 1/4")) jumped = true;
+    }
+    try std.testing.expect(jumped);
+
+    // j must now move the buffer cursor (line number in the status bar rises)
+    try sess.send("j");
+    waited = 0;
+    var line2_seen = false;
+    while (!line2_seen) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        if (grid.contains("line 2/")) line2_seen = true;
+    }
+    try std.testing.expect(line2_seen);
+
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "visual line V selects whole lines from mid-line" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}v.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "abc\nxyz\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+
+    // 'l' puts the cursor mid-line (col 1), V + j selects both whole lines:
+    // the selection must include the first column of row 1 (line 1's start)
+    const sel_bg = packRgb(54, 74, 130);
+    try sess.send("lVj");
+    waited = 0;
+    // wait for j to actually land on line 2 (VISUAL + status "line 2/"), so
+    // the selection spans both whole lines before we assert the highlight
+    while (!(grid.contains(" VISUAL ") and grid.contains("line 2/"))) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!(grid.contains(" VISUAL ") and grid.contains("line 2/"))) {
+        std.debug.print("lVj: cursor did not reach line 2; status below\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains(" VISUAL "));
+    try std.testing.expect(grid.contains("line 2/"));
+    // the first column of content rows 1 and 2 must be inside the selection
+    // (whole-line selection starts at column 0), and the gutter column (0..4)
+    // is not — assert the content column has the bg
+    if (!grid.rowHasBg(1, sel_bg) or !grid.rowHasBg(2, sel_bg)) {
+        std.debug.print("\nV select rows 1..2 bg: r1={} r2={}\n", .{ grid.rowHasBg(1, sel_bg), grid.rowHasBg(2, sel_bg) });
+        var rr: usize = 1;
+        while (rr <= 2) : (rr += 1) {
+            std.debug.print("row{d} cols:", .{rr});
+            var cc: usize = 0;
+            while (cc < 12) : (cc += 1) {
+                std.debug.print(" [{d}:{x}]", .{ cc, grid.bg_buf[rr * 80 + cc] });
+            }
+            std.debug.print("\n", .{});
+        }
+        grid.dump();
+    }
+    try std.testing.expect(grid.rowHasBg(1, sel_bg));
+    try std.testing.expect(grid.rowHasBg(2, sel_bg));
+
+    // Esc clears it
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.rowHasBg(1, sel_bg)) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.rowHasBg(1, sel_bg));
+
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}

@@ -1321,6 +1321,10 @@ const App = struct {
         switch (key.codepoint) {
             vaxis.Key.escape => self.closePicker(),
             vaxis.Key.enter => {
+                // Confirming jumps into the target file: leave the file-tree
+                // navigation mode so j/k/↑↓ control the buffer afterwards
+                // (vim: picker confirm drops focus back to the buffer).
+                self.filetree_active = false;
                 if (self.picker_mode == .grep) {
                     if (self.grep_results.items.len > 0) {
                         const r = self.grep_results.items[self.picker_sel];
@@ -1981,8 +1985,15 @@ const App = struct {
             var sel_s: u32 = n;
             var sel_e: u32 = n;
             if (self.visual_anchor) |anchor| {
-                const sel_start = @min(anchor, self.cur().cursor);
-                const sel_end = @max(anchor, self.cur().cursor);
+                var sel_start = @min(anchor, self.cur().cursor);
+                var sel_end = @max(anchor, self.cur().cursor);
+                // V (visual_line) selects whole lines: the anchor line starts
+                // at its first byte and the cursor line runs to its end —
+                // pressing V mid-line must light the whole row, not [cursor..]
+                if (self.state.mode == .visual_line) {
+                    sel_start = self.cur().pt.lineStart(self.cur().pt.lineOf(sel_start));
+                    sel_end = self.cur().pt.lineStart(self.cur().pt.lineOf(sel_end)) + self.cur().pt.lineLen(self.cur().pt.lineOf(sel_end));
+                }
                 const line_end = line_start + line_len;
                 if (sel_start < line_end and sel_end > line_start) {
                     sel_s = @max(sel_start, line_start) - line_start;

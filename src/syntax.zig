@@ -317,3 +317,41 @@ test "highlight: reparseEdit keeps byte spans correct after an edit" {
     try std.testing.expect(keyword_at_0);
     try std.testing.expect(number_at_12);
 }
+test "highlight: sequential reparseEdit calls keep byte spans stable" {
+    const alloc = std.testing.allocator;
+    const src = "const a = 1;\nconst b = 2;\nconst c = 3;\n";
+    var hl = try Highlighter.init(alloc, "zig");
+    defer hl.deinit();
+    try hl.reparse(src);
+
+    // simulate typing in a syntax-legal spot: grow "a" into "axxxxx" with
+    // one 'x' per edit (positions shift every time — the drift test)
+    var text: []u8 = try alloc.dupe(u8, src);
+    defer alloc.free(text);
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        const pos: u32 = @intCast(6 + i); // right after "a" (and the x's)
+        const new_text = try std.fmt.allocPrint(alloc, "{s}x{s}", .{ text[0..pos], text[pos..] });
+        alloc.free(text);
+        text = new_text;
+        try hl.reparseEdit(pos, pos, pos + 1, text);
+    }
+
+    var spans = std.ArrayList(Span).empty;
+    defer spans.deinit(alloc);
+    try hl.spansInRange(0, @intCast(text.len), alloc, &spans);
+    // final text "const axxxxx = 1;..." — keyword [0,5), number "1" at byte 15
+    var keyword_ok = false;
+    var number_ok = false;
+    for (spans.items) |sp| {
+        if (sp.style == .keyword and sp.start == 0 and sp.end == 5) keyword_ok = true;
+        if (sp.style == .number and sp.start == 15 and sp.end == 16) number_ok = true;
+    }
+    if (!keyword_ok or !number_ok) {
+        std.debug.print("\ntext=[{s}]\nspans:", .{text});
+        for (spans.items) |sp| std.debug.print(" [{d},{d}){s}", .{ sp.start, sp.end, @tagName(sp.style) });
+        std.debug.print("\n", .{});
+    }
+    try std.testing.expect(keyword_ok);
+    try std.testing.expect(number_ok);
+}
