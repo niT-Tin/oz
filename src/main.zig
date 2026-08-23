@@ -78,8 +78,8 @@ const App = struct {
     filetree_sel: usize = 0,
     filetree_files: std.ArrayList([]u8) = .empty,
 
-    // fuzzy picker (<leader>sf / <leader>st)
-    picker_mode: enum { files, grep, buffers } = .files,
+    // fuzzy picker (<leader>sf / <leader>st / <leader>sb / <leader>sr)
+    picker_mode: enum { files, grep, buffers, recent } = .files,
     picker_active: bool = false,
     picker_files: std.ArrayList([]u8) = .empty, // owned paths
     picker_input: std.ArrayList(u8) = .empty,
@@ -317,6 +317,11 @@ const App = struct {
                 self.cmdline.clearRetainingCapacity();
                 self.cmd_hist_idx = null;
                 try self.setMsg(try self.alloc.dupe(u8, ""));
+                // From visual mode vim auto-types :'<,'>; :s then applies to
+                // the selection (the anchor survives until Enter).
+                if (self.visual_anchor != null) {
+                    try self.cmdline.appendSlice(self.alloc, "'<,'>");
+                }
             },
             .to_normal => {
                 self.state.mode = .normal;
@@ -407,6 +412,7 @@ const App = struct {
         }
         switch (key.codepoint) {
             vaxis.Key.enter => {
+                const from_visual = self.visual_anchor != null;
                 const line = self.cmdline.items;
                 const cmd = editor.ex_command.parse(line);
                 if (cmd != .empty) try self.pushHistory(line);
@@ -415,6 +421,7 @@ const App = struct {
                 // execCommand must run BEFORE clearing: Command slices borrow
                 // the cmdline buffer (pattern/replacement/edit paths)
                 try self.execCommand(cmd);
+                if (from_visual) self.exitVisual();
                 self.cmdline.clearRetainingCapacity();
             },
             vaxis.Key.backspace => {
@@ -536,11 +543,25 @@ const App = struct {
         }
     }
 
-    /// :s/pat/rep[/g] — literal substitution on the current line or whole
-    /// file (M1: no regex). The replacement lands in one undo group.
+    /// :s/pat/rep[/g] — literal substitution on the current line, the whole
+    /// file (:%), or the visual selection (:'<,'>, M1: no regex). The
+    /// replacement lands in one undo group.
     fn execSubstitute(self: *App, sub: anytype) !void {
-        const start_line = if (sub.whole_file) 0 else self.cur().pt.lineOf(self.cur().cursor);
-        const end_line = if (sub.whole_file) self.cur().pt.lineCount() - 1 else start_line;
+        var start_line: u32 = undefined;
+        var end_line: u32 = undefined;
+        if (sub.visual) {
+            const anchor = self.visual_anchor orelse return;
+            const s = @min(anchor, self.cur().cursor);
+            const e = @max(anchor, self.cur().cursor);
+            start_line = self.cur().pt.lineOf(s);
+            end_line = self.cur().pt.lineOf(e);
+        } else if (sub.whole_file) {
+            start_line = 0;
+            end_line = self.cur().pt.lineCount() - 1;
+        } else {
+            start_line = self.cur().pt.lineOf(self.cur().cursor);
+            end_line = start_line;
+        }
 
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
@@ -921,6 +942,14 @@ const App = struct {
         self.picker_active = true;
     }
 
+    fn openRecentPicker(self: *App) !void {
+        self.picker_mode = .recent;
+        self.picker_input.clearRetainingCapacity();
+        self.picker_sel = 0;
+        try self.pickerRefilter();
+        self.picker_active = true;
+    }
+
     fn bufferName(self: *const App, i: usize) []const u8 {
         const buf = &self.buffers.items[i];
         return if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
@@ -999,6 +1028,15 @@ const App = struct {
                     }
                     return;
                 }
+                if (self.picker_mode == .recent) {
+                    if (self.picker_matches.items.len > 0) {
+                        const ri = self.picker_matches.items[self.picker_sel];
+                        const path = self.recent_files.items[ri];
+                        self.closePicker();
+                        try self.openFile(path);
+                    }
+                    return;
+                }
                 if (self.picker_mode == .buffers) {
                     if (self.picker_matches.items.len > 0) {
                         const bi = self.picker_matches.items[self.picker_sel];
@@ -1052,6 +1090,24 @@ const App = struct {
 
     fn pickerRefilter(self: *App) !void {
         self.picker_matches.clearRetainingCapacity();
+        if (self.picker_mode == .recent) {
+            // match against recent-file paths; matches index into recent_files
+            const needle = self.picker_input.items;
+            var ri: usize = 0;
+            while (ri < self.recent_files.items.len) : (ri += 1) {
+                const path = self.recent_files.items[ri];
+                if (needle.len == 0) {
+                    try self.picker_matches.append(self.alloc, ri);
+                    continue;
+                }
+                const m = try util.fzy.match(self.alloc, path, needle) orelse continue;
+                defer self.alloc.free(m.positions);
+                try self.picker_matches.append(self.alloc, ri);
+                if (self.picker_matches.items.len >= 20) break;
+            }
+            if (self.picker_sel >= self.picker_matches.items.len) self.picker_sel = 0;
+            return;
+        }
         if (self.picker_mode == .buffers) {
             // match against buffer names; matches index into buffers
             const needle = self.picker_input.items;
@@ -1356,6 +1412,8 @@ const App = struct {
             .picker_file => try self.openPicker(),
             .picker_grep => try self.openGrepPicker(),
             .picker_buffers => try self.openBufferPicker(),
+            .picker_recent => try self.openRecentPicker(),
+            .close_buffer => self.closeCurrent(),
             .filetree_toggle => try self.toggleFiletree(),
             .filetree_locate => try self.locateInFiletree(),
             .paste => try self.pasteBuffer(false),
@@ -1633,6 +1691,9 @@ const App = struct {
                 } else if (self.picker_mode == .buffers) blk: {
                     const bi = self.picker_matches.items[ri];
                     break :blk std.fmt.allocPrint(a, "{d} {s}", .{ bi + 1, self.bufferName(bi) }) catch "…";
+                } else if (self.picker_mode == .recent) blk: {
+                    const ri2 = self.picker_matches.items[ri];
+                    break :blk self.recent_files.items[ri2];
                 } else self.picker_files.items[self.picker_matches.items[ri]];
                 const seg = [_]vaxis.Segment{.{
                     .text = label,

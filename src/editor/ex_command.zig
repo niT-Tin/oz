@@ -25,9 +25,13 @@ pub const Command = union(enum) {
     /// :set <option> — M0: accepted, applied if recognized, else ignored.
     set: []const u8,
     /// :s/pat/rep[/g] — substitute on the current line; :%s for the whole
-    /// file. M1: literal substring matching (no regex).
+    /// file; :'<,'>s for the visual selection. M1: literal substring
+    /// matching (no regex).
     substitute: struct {
         whole_file: bool,
+        /// True when the command came from visual mode (:'<,'>s) — the
+        /// caller applies it to the visual line range.
+        visual: bool,
         pattern: []const u8,
         replacement: []const u8,
         global: bool,
@@ -46,7 +50,16 @@ fn trim(s: []const u8) []const u8 {
 
 /// Parse a command line (without the leading ':').
 pub fn parse(line: []const u8) Command {
-    const t = trim(line);
+    var t = trim(line);
+    if (t.len == 0) return .empty;
+
+    // vim auto-types :'<,'> when ':' is pressed in visual mode. Strip the
+    // range marks; only :s uses them (the caller resolves the range).
+    var visual = false;
+    if (t.len >= 5 and std.mem.eql(u8, t[0..5], "'<,'>")) {
+        visual = true;
+        t = t[5..];
+    }
     if (t.len == 0) return .empty;
 
     // split into command word and arguments at the first space/tab
@@ -111,6 +124,7 @@ pub fn parse(line: []const u8) Command {
         const global = std.mem.indexOfScalar(u8, flags, 'g') != null;
         return .{ .substitute = .{
             .whole_file = whole_file,
+            .visual = visual,
             .pattern = t[i + 2 .. pe],
             .replacement = t[pe + 1 .. rep_end],
             .global = global,
@@ -156,6 +170,14 @@ test "parse: buffers, noh, set, unknown" {
     try std.testing.expect(sub2 == .substitute);
     try std.testing.expect(!sub2.substitute.whole_file);
     try std.testing.expect(!sub2.substitute.global);
+    const vsub = parse("'<,'>s/foo/bar/");
+    try std.testing.expect(vsub == .substitute);
+    try std.testing.expect(vsub.substitute.visual);
+    try std.testing.expect(!vsub.substitute.whole_file);
+    try std.testing.expectEqualStrings("foo", vsub.substitute.pattern);
+    try std.testing.expectEqualStrings("bar", vsub.substitute.replacement);
+    try std.testing.expect(parse("'<,'>") == .empty);
+    try std.testing.expect(parse("'<,'>w") == .write);
     try std.testing.expect(parse("foobar") == .unknown);
     try std.testing.expect(parse("w extra") == .unknown);
     try std.testing.expect(parse("q extra") == .unknown);

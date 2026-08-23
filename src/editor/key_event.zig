@@ -74,6 +74,8 @@ pub const ActionId = enum {
     picker_file, // <leader>sf — fuzzy file picker
     picker_grep, // <leader>st — grep picker
     picker_buffers, // <leader>sb — buffer picker
+    picker_recent, // <leader>sr — recent files picker
+    close_buffer, // <leader>bk — close current buffer
     filetree_toggle, // <leader>e — toggle file tree
     filetree_locate, // <leader>E — locate current file in tree
     next_buffer, // gt — next tab

@@ -163,8 +163,10 @@ pub const State = struct {
     pending_text_object: ?u8 = null,
     /// leader (Space) seen, awaiting the next key (<leader>f etc.)
     pending_leader: bool = false,
-    /// <leader>s seen (picker family), awaiting f/t/b
+    /// <leader>s seen (picker family), awaiting f/t/b/r
     pending_leader_s: bool = false,
+    /// <leader>b seen (buffer family), awaiting b/n/j/k
+    pending_leader_b: bool = false,
     /// surround sequence (ys/ds/cs) in progress
     pending_surround: ?SurroundPending = null,
     /// 'g' + 'c' seen (comment sequence), awaiting 'c' (line) — gc in visual
@@ -275,6 +277,27 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
             'f' => return emitAction(state, .picker_file), // <leader>sf files
             't' => return emitAction(state, .picker_grep), // <leader>st grep
             'b' => return emitAction(state, .picker_buffers), // <leader>sb buffers
+            'r' => return emitAction(state, .picker_recent), // <leader>sr recent files
+            else => {
+                resetPending(state);
+                return .pending;
+            },
+        }
+    }
+
+    // 0a3) <leader>b pending (buffer family): bb prev / bn next / bj pick /
+    //     bk close.
+    if (state.pending_leader_b) {
+        state.pending_leader_b = false;
+        if (isEscape(key)) {
+            resetPending(state);
+            return .pending;
+        }
+        switch (key.codepoint) {
+            'b' => return emitAction(state, .prev_buffer), // <leader>bb prev
+            'n' => return emitAction(state, .next_buffer), // <leader>bn next
+            'j' => return emitAction(state, .picker_buffers), // <leader>bj pick
+            'k' => return emitAction(state, .close_buffer), // <leader>bk close
             else => {
                 resetPending(state);
                 return .pending;
@@ -295,6 +318,10 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
             'E' => return emitAction(state, .filetree_locate), // <leader>E locate
             's' => {
                 state.pending_leader_s = true;
+                return .pending;
+            },
+            'b' => {
+                state.pending_leader_b = true;
                 return .pending;
             },
             else => {
@@ -534,6 +561,8 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .picker_file => emitAction(state, .picker_file),
         .picker_grep => emitAction(state, .picker_grep),
         .picker_buffers => emitAction(state, .picker_buffers),
+        .picker_recent => emitAction(state, .picker_recent),
+        .close_buffer => emitAction(state, .close_buffer),
         .filetree_toggle => emitAction(state, .filetree_toggle),
         .filetree_locate => emitAction(state, .filetree_locate),
         .next_buffer => emitAction(state, .next_buffer),
@@ -774,6 +803,7 @@ fn resetPending(state: *State) void {
     state.pending_text_object = null;
     state.pending_leader = false;
     state.pending_leader_s = false;
+    state.pending_leader_b = false;
     state.pending_surround = null;
     state.pending_align = null;
     resetCount(state);

@@ -1574,3 +1574,268 @@ test "buffer picker: <leader>sb lists open buffers, Enter switches" {
     const exit_code = try sess.commandAndWaitExit(":q\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
+
+test "buffer keys: <leader>bn switches, <leader>bk closes" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var na_buf: [128:0]u8 = undefined;
+    const na = try std.fmt.bufPrintZ(&na_buf, "/tmp/oz_e2e_{d}_{d}ka.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, na, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "AAA\n");
+    }
+    var nb_buf: [128:0]u8 = undefined;
+    const nb = try std.fmt.bufPrintZ(&nb_buf, "/tmp/oz_e2e_{d}_{d}kb.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, nb) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, nb, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "BBB\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, na });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("AAA"));
+
+    // :e b.txt → current is b.txt (BBB)
+    try sess.send(":e ");
+    try sess.send(nb);
+    try sess.send("\r");
+    waited = 0;
+    while (!grid.contains("BBB") or grid.contains("AAA")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("BBB"));
+
+    // <leader>bn — next buffer wraps to a.txt
+    try sess.send(" bn");
+    waited = 0;
+    while (!grid.contains("AAA") or grid.contains("BBB")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("AAA"));
+
+    // <leader>bk — close the current (a.txt); b.txt remains
+    try sess.send(" bk");
+    waited = 0;
+    while (!grid.contains("BBB") or grid.contains("AAA")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("BBB"));
+    try std.testing.expect(!grid.contains("AAA"));
+
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test ":'<,'>s substitutes within the visual range only" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}vs.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "foo\nbar\nfoo\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // v then j: select lines 1-2. ':' should pre-fill :'<,'>
+    try sess.send("vj:");
+    waited = 0;
+    while (!grid.contains("'<,'>")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!grid.contains("'<,'>")) {
+        std.debug.print("cmdline grid:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("'<,'>"));
+
+    // :'<,'>s/foo/BAZ/ — only lines 1-2 (bar) are in range; line 3 keeps foo
+    try sess.send("s/foo/BAZ/\r");
+    waited = 0;
+    while (grid.contains("'<,'>")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("BAZ"));
+    try std.testing.expect(grid.contains("bar"));
+    try std.testing.expect(grid.contains("foo"));
+
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    const f = try std.Io.Dir.cwd().openFile(io, name, .{ .mode = .read_only });
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    try std.testing.expectEqualStrings("BAZ\nbar\nfoo\n", buf);
+}
+
+test "recent picker: <leader>sr lists and reopens a recent file" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var na_buf: [128:0]u8 = undefined;
+    const na = try std.fmt.bufPrintZ(&na_buf, "/tmp/oz_e2e_{d}_{d}ra.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, na, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "AAA\n");
+    }
+    var nb_buf: [128:0]u8 = undefined;
+    const nb = try std.fmt.bufPrintZ(&nb_buf, "/tmp/oz_e2e_{d}_{d}rb.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, nb) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, nb, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "BBB\n");
+    }
+    // seed the recent list so the picker has something to reopen
+    std.Io.Dir.cwd().createDirPath(io, "/tmp/.cache/oz") catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, "/tmp/.cache/oz/recent", .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, nb);
+        try f.writeStreamingAll(io, "\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, na });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("AAA"));
+
+    // <leader>sr — the seeded recent path is listed (filtered by basename)
+    const base = std.fs.path.basename(nb);
+    try sess.send(" sr");
+    try sess.send(base);
+    waited = 0;
+    while (!grid.contains(base)) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!grid.contains(base)) {
+        std.debug.print("recent picker grid:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains(base));
+
+    // Enter — opens the recent file (BBB)
+    try sess.send("\r");
+    waited = 0;
+    while (!grid.contains("BBB") or grid.contains("AAA")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("BBB"));
+
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
