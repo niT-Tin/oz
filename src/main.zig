@@ -2963,14 +2963,14 @@ const App = struct {
 
     /// Width of the relative-line-number gutter in cells: digits of the
     /// largest possible relative number (≤ the file's line count, since a
-    /// relative number is a line offset) + one trailing space, with a
-    /// minimum of 3 digits so small files keep a stable gutter.
+    /// relative number is a line offset) + one trailing space. Adaptive —
+    /// narrow for small files (vim's relativenumber fits the digits).
     fn gutterWidth(self: *const App, line_count: u32) u32 {
         _ = self;
         var digits: u32 = 1;
         var n: u32 = line_count;
         while (n >= 10) : (n /= 10) digits += 1;
-        return @max(3, digits) + 1;
+        return digits + 1;
     }
 
     /// Render one split window's lines into `rect` (content-area coordinates).
@@ -2999,8 +2999,12 @@ const App = struct {
             w.view_top = line_count - rect.height;
         }
 
-        // syntax spans covering the visible byte range (focused window only)
-        const merged = if (is_focused) try self.visibleSpans(a, w.view_top, rect.height) else &.{};
+        // syntax spans covering the visible byte range. The highlighter is
+        // bound to the current buffer, so every window showing that buffer
+        // gets highlighting (all splits of the same file); windows showing
+        // other buffers render plain.
+        const use_syntax = w.buf == self.current;
+        const merged = if (use_syntax) try self.visibleSpans(a, w.view_top, rect.height) else &.{};
         var span_i: usize = 0;
         var row: u32 = rect.row;
         var line = w.view_top;
@@ -3243,7 +3247,7 @@ const App = struct {
                     var char_buf: [4]u8 = undefined;
                     self.cur().pt.copyRange(p, char_buf[0..clen]);
                     const g = try a.dupe(u8, char_buf[0..clen]);
-                    win.writeCell(@intCast(self.contentCol() + gutter + col), @intCast(self.contentTop() + wline - self.curViewTop().*), .{
+                    win.writeCell(@intCast(cur_rect.col + gutter + col), @intCast(cur_rect.row + wline - self.curViewTop().*), .{
                         .char = .{ .grapheme = g, .width = 1 },
                         .style = .{ .bg = .{ .rgb = .{ 54, 74, 130 } } },
                     });
@@ -3259,7 +3263,7 @@ const App = struct {
                 if (mline < self.curViewTop().* or mline >= self.curViewTop().* + content_rows) continue;
                 const col_in_line = m.pos - self.cur().pt.lineStart(mline);
                 const label = try a.dupe(u8, &[_]u8{m.label});
-                win.writeCell(@intCast(self.contentCol() + gutter + col_in_line), @intCast(self.contentTop() + mline - self.curViewTop().*), .{
+                win.writeCell(@intCast(cur_rect.col + gutter + col_in_line), @intCast(cur_rect.row + mline - self.curViewTop().*), .{
                     .char = .{ .grapheme = label, .width = 1 },
                     .style = .{ .fg = .{ .rgb = .{ 250, 189, 47 } }, .bg = .{ .rgb = .{ 54, 74, 130 } } },
                 });
@@ -3346,10 +3350,10 @@ const App = struct {
             if (self.completion_sel >= list_rows) top = self.completion_sel - list_rows + 1;
             const c_line = self.cur().pt.lineOf(self.curCursor().*);
             const c_col = self.curCursor().* - self.cur().pt.lineStart(c_line);
-            var start_row = c_line - self.curViewTop().* + self.contentTop() + 1;
+            var start_row = c_line - self.curViewTop().* + cur_rect.row + 1;
             if (start_row + list_rows > height) {
                 // near the bottom: show the menu above the cursor instead
-                start_row = c_line - self.curViewTop().* + self.contentTop() - list_rows;
+                start_row = c_line - self.curViewTop().* + cur_rect.row - list_rows;
             }
             var k: usize = 0;
             while (k < list_rows) : (k += 1) {
@@ -3362,7 +3366,7 @@ const App = struct {
                 }};
                 _ = win.print(&seg, .{
                     .row_offset = @intCast(start_row + k),
-                    .col_offset = @intCast(self.contentCol() + gutter + c_col),
+                    .col_offset = @intCast(cur_rect.col + gutter + c_col),
                     .wrap = .none,
                 });
             }
@@ -3402,10 +3406,10 @@ const App = struct {
             };
         } else {
             const cursor_col = self.curCursor().* - self.cur().pt.lineStart(cursor_line);
-            const cursor_row = cursor_line - self.curViewTop().* + self.contentTop();
+            const cursor_row = cursor_line - self.curViewTop().* + cur_rect.row;
             self.vx.screen.cursor = .{
                 .row = @intCast(cursor_row),
-                .col = @intCast(self.contentCol() + gutter + cursor_col), // gutter offset
+                .col = @intCast(cur_rect.col + gutter + cursor_col), // window offset + gutter
             };
         }
         self.vx.screen.cursor_vis = true;

@@ -2223,9 +2223,9 @@ test "visual block: rectangle semantics — highlight and d delete per column" {
 
     const sel_bg = packRgb(54, 74, 130);
     // cursor → col 1, Ctrl+v (anchor col 1), j j → cursor line 2 col 1.
-    // Screen layout: row 0 = tab bar, content col 0 = gutter (4 wide for a
+    // Screen layout: row 0 = tab bar, content col 0 = gutter (2 wide for a
     // 3-line file), so file line n sits on screen row n+1 and its byte col 1
-    // is screen col 5.
+    // is screen col 3.
     try sess.send("l\x16jj");
     waited = 0;
     var block_hl = false;
@@ -2238,9 +2238,9 @@ test "visual block: rectangle semantics — highlight and d delete per column" {
         }
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
-        if (grid.bg_buf[1 * grid.cols + 5] == sel_bg and
-            grid.bg_buf[2 * grid.cols + 5] == sel_bg and
-            grid.bg_buf[3 * grid.cols + 5] == sel_bg)
+        if (grid.bg_buf[1 * grid.cols + 3] == sel_bg and
+            grid.bg_buf[2 * grid.cols + 3] == sel_bg and
+            grid.bg_buf[3 * grid.cols + 3] == sel_bg)
         {
             block_hl = true;
         }
@@ -2252,10 +2252,10 @@ test "visual block: rectangle semantics — highlight and d delete per column" {
     try std.testing.expect(block_hl);
     // the rectangle must NOT light column 0 or 2 on any row (the byte-range
     // path lit col 2 on row 0 and col 0..3 on row 1)
+    try std.testing.expect(grid.bg_buf[1 * grid.cols + 2] != sel_bg);
     try std.testing.expect(grid.bg_buf[1 * grid.cols + 4] != sel_bg);
-    try std.testing.expect(grid.bg_buf[1 * grid.cols + 6] != sel_bg);
-    try std.testing.expect(grid.bg_buf[2 * grid.cols + 4] != sel_bg);
-    try std.testing.expect(grid.bg_buf[3 * grid.cols + 4] != sel_bg);
+    try std.testing.expect(grid.bg_buf[2 * grid.cols + 2] != sel_bg);
+    try std.testing.expect(grid.bg_buf[3 * grid.cols + 2] != sel_bg);
 
     // d deletes exactly one column from every covered row: aa / bbb / c
     try sess.send("d");
@@ -5293,7 +5293,7 @@ test "windows: :vs splits side-by-side; Ctrl-w l/h switch; :q closes one; :qa qu
     }
     try std.testing.expect(grid.contains("NORMAL"));
 
-    // :vs — vertical split: both halves show line1 (left col 4+, right col 44+)
+    // :vs — vertical split: both halves show "line1" (appears twice on row 1)
     try sess.send(":vs\r");
     waited = 0;
     var both = false;
@@ -5307,7 +5307,9 @@ test "windows: :vs splits side-by-side; Ctrl-w l/h switch; :q closes one; :qa qu
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
         const row = grid.rowText(1);
-        both = std.mem.indexOf(u8, row[44..], "line1") != null and std.mem.indexOf(u8, row[0..40], "line1") != null;
+        const first = std.mem.indexOf(u8, row, "line1");
+        const second = if (first) |f| std.mem.indexOfPos(u8, row, f + 1, "line1") else null;
+        both = first != null and second != null;
     }
     if (!both) {
         std.debug.print("after :vs:\n", .{});
@@ -5376,7 +5378,9 @@ test "windows: :vs splits side-by-side; Ctrl-w l/h switch; :q closes one; :qa qu
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
         const row = grid.rowText(1);
-        single = std.mem.indexOf(u8, row[0..80], "line1") != null and std.mem.indexOf(u8, row[44..], "line1") == null;
+        const first = std.mem.indexOf(u8, row, "line1");
+        const second = if (first) |f| std.mem.indexOfPos(u8, row, f + 1, "line1") else null;
+        single = first != null and second == null; // exactly one window left
     }
     if (!single) {
         std.debug.print("after :q (window close):\n", .{});
