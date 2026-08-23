@@ -2081,7 +2081,9 @@ const App = struct {
             switch (event) {
                 .key_press => |key| try self.handleKey(key),
                 .paste => |text| {
-                    if (self.state.mode == .insert) try self.insertText(text);
+                    if (self.state.mode == .insert) {
+                        if (self.mc_active) try self.mcInsertText(text) else try self.insertText(text);
+                    }
                 },
                 .winsize => |ws| {
                     try self.vx.resize(self.alloc, self.tty.writer(), ws);

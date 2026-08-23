@@ -2260,3 +2260,122 @@ test "visual block: multi-cursor backspace, ctrl-w and jk stay in sync" {
     if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
+
+test "visual block: 非 0 列块 / 空行 clamp / 单行块边界" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        // 行 1 是空行: "aaaa\n\ncccc\n"
+        try f.writeStreamingAll(io, "aaaa\n\ncccc\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // --- 非 0 列块 + 空行 clamp: l(col 1) <C-v> j j I "XX". 光标在行 0
+    // --- col 1, j 到空行时 moveVert clamp 到 col 0, 所以块左边界 = col 0:
+    // --- 行 0 → XXaaaa, 空行(行尾=col 0) → XX, 行 2 → XXcccc.
+    try sess.send("l\x16jjIXX");
+    waited = 0;
+    while (!grid.contains("XXaaaa")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!grid.contains("XXaaaa")) {
+        std.debug.print("after boundary block I:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("XXaaaa"));
+    try std.testing.expect(grid.contains("XXcccc"));
+    try std.testing.expect(!grid.contains("aXX"));
+
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    // --- 单行块: 0 回行首, <C-v> I "YY" 只影响行 0 (块只有 1 行).
+    try sess.send("0\x16IYY");
+    waited = 0;
+    while (!grid.contains("YYXXaaaa")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!grid.contains("YYXXaaaa")) {
+        std.debug.print("after single-line block:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("YYXXaaaa"));
+
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    // :wq 落盘后读文件做精确断言
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    const f = try std.Io.Dir.cwd().openFile(io, name, .{ .mode = .read_only });
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    try std.testing.expectEqualStrings("YYXXaaaa\nXX\nXXcccc\n", buf);
+}
+
