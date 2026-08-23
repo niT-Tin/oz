@@ -73,6 +73,7 @@ pub const ActionId = enum {
     mc_add, // Ctrl+n — multi-cursor: select word / add next match
     picker_file, // <leader>sf — fuzzy file picker
     picker_grep, // <leader>st — grep picker
+    picker_buffers, // <leader>sb — buffer picker
     filetree_toggle, // <leader>e — toggle file tree
     filetree_locate, // <leader>E — locate current file in tree
     next_buffer, // gt — next tab

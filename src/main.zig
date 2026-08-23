@@ -79,7 +79,7 @@ const App = struct {
     filetree_files: std.ArrayList([]u8) = .empty,
 
     // fuzzy picker (<leader>sf / <leader>st)
-    picker_mode: enum { files, grep } = .files,
+    picker_mode: enum { files, grep, buffers } = .files,
     picker_active: bool = false,
     picker_files: std.ArrayList([]u8) = .empty, // owned paths
     picker_input: std.ArrayList(u8) = .empty,
@@ -913,6 +913,19 @@ const App = struct {
         }
     }
 
+    fn openBufferPicker(self: *App) !void {
+        self.picker_mode = .buffers;
+        self.picker_input.clearRetainingCapacity();
+        self.picker_sel = 0;
+        try self.pickerRefilter();
+        self.picker_active = true;
+    }
+
+    fn bufferName(self: *const App, i: usize) []const u8 {
+        const buf = &self.buffers.items[i];
+        return if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
+    }
+
     fn openGrepPicker(self: *App) !void {
         self.picker_mode = .grep;
         self.picker_input.clearRetainingCapacity();
@@ -986,6 +999,14 @@ const App = struct {
                     }
                     return;
                 }
+                if (self.picker_mode == .buffers) {
+                    if (self.picker_matches.items.len > 0) {
+                        const bi = self.picker_matches.items[self.picker_sel];
+                        self.closePicker();
+                        self.switchTo(bi);
+                    }
+                    return;
+                }
                 if (self.picker_matches.items.len > 0) {
                     const f = self.picker_files.items[self.picker_matches.items[self.picker_sel]];
                     self.closePicker();
@@ -1031,6 +1052,24 @@ const App = struct {
 
     fn pickerRefilter(self: *App) !void {
         self.picker_matches.clearRetainingCapacity();
+        if (self.picker_mode == .buffers) {
+            // match against buffer names; matches index into buffers
+            const needle = self.picker_input.items;
+            var bi: usize = 0;
+            while (bi < self.buffers.items.len) : (bi += 1) {
+                const name = self.bufferName(bi);
+                if (needle.len == 0) {
+                    try self.picker_matches.append(self.alloc, bi);
+                    continue;
+                }
+                const m = try util.fzy.match(self.alloc, name, needle) orelse continue;
+                defer self.alloc.free(m.positions);
+                try self.picker_matches.append(self.alloc, bi);
+                if (self.picker_matches.items.len >= 20) break;
+            }
+            if (self.picker_sel >= self.picker_matches.items.len) self.picker_sel = 0;
+            return;
+        }
         const needle = self.picker_input.items;
         if (needle.len == 0) {
             const n = @min(self.picker_files.items.len, 20);
@@ -1094,7 +1133,7 @@ const App = struct {
     fn addRecent(self: *App, path: []const u8) !void {
         for (self.recent_files.items, 0..) |f, i| {
             if (std.mem.eql(u8, f, path)) {
-                _ = self.recent_files.orderedRemove(i);
+                self.alloc.free(self.recent_files.orderedRemove(i));
                 break;
             }
         }
@@ -1316,6 +1355,7 @@ const App = struct {
             .prev_buffer => try self.switchBuffer(-1),
             .picker_file => try self.openPicker(),
             .picker_grep => try self.openGrepPicker(),
+            .picker_buffers => try self.openBufferPicker(),
             .filetree_toggle => try self.toggleFiletree(),
             .filetree_locate => try self.locateInFiletree(),
             .paste => try self.pasteBuffer(false),
@@ -1590,6 +1630,9 @@ const App = struct {
                 const label: []const u8 = if (self.picker_mode == .grep) blk: {
                     const r = self.grep_results.items[ri];
                     break :blk std.fmt.allocPrint(a, "{s}:{d}: {s}", .{ r.path, r.line, r.text }) catch "…";
+                } else if (self.picker_mode == .buffers) blk: {
+                    const bi = self.picker_matches.items[ri];
+                    break :blk std.fmt.allocPrint(a, "{d} {s}", .{ bi + 1, self.bufferName(bi) }) catch "…";
                 } else self.picker_files.items[self.picker_matches.items[ri]];
                 const seg = [_]vaxis.Segment{.{
                     .text = label,

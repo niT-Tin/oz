@@ -274,6 +274,7 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         switch (key.codepoint) {
             'f' => return emitAction(state, .picker_file), // <leader>sf files
             't' => return emitAction(state, .picker_grep), // <leader>st grep
+            'b' => return emitAction(state, .picker_buffers), // <leader>sb buffers
             else => {
                 resetPending(state);
                 return .pending;
@@ -532,6 +533,7 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .mc_add => emitAction(state, .mc_add),
         .picker_file => emitAction(state, .picker_file),
         .picker_grep => emitAction(state, .picker_grep),
+        .picker_buffers => emitAction(state, .picker_buffers),
         .filetree_toggle => emitAction(state, .filetree_toggle),
         .filetree_locate => emitAction(state, .filetree_locate),
         .next_buffer => emitAction(state, .next_buffer),
