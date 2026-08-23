@@ -53,6 +53,10 @@ const App = struct {
     em_labels: bool = false, // matches computed, labels shown
     em_matches: []editor.easymotion.Match = &.{},
 
+    // multi-cursor (Ctrl+n)
+    mc: editor.MultiCursor = undefined,
+    mc_active: bool = false,
+
     fn create(init: std.process.Init) !*App {
         const self = try init.gpa.create(App);
         errdefer init.gpa.destroy(self);
@@ -88,6 +92,7 @@ const App = struct {
             .history = buffer.History.init(init.gpa),
             .cmdline = .empty,
             .cmd_history = .empty,
+            .mc = editor.MultiCursor.init(init.gpa),
         };
         // NOTE: loop holds pointers to self.tty / self.vx, so the App must
         // stay at a stable address (heap) — never move it after this.
@@ -115,6 +120,7 @@ const App = struct {
         if (self.msg) |m| self.alloc.free(m);
         if (self.yank_buffer) |b| self.alloc.free(b);
         if (self.em_matches.len > 0) self.alloc.free(self.em_matches);
+        self.mc.deinit();
     }
 
     // ---- input ----
@@ -123,6 +129,34 @@ const App = struct {
         // EasyMotion capture: query char, then a label to jump to
         if (self.em_active) {
             try self.handleEasyMotionKey(key);
+            return;
+        }
+
+        // Esc cancels an active multi-cursor selection
+        if (self.mc_active and key.codepoint == vaxis.Key.escape) {
+            self.mc.clear();
+            self.mc_active = false;
+            return;
+        }
+
+        // 'd' with an active multi-cursor selection deletes the selected word
+        // at every cursor (normal-mode 'd' would pend for a motion instead);
+        // cursors sit at word starts, so the word is [pos, pos+wlen)
+        if (self.mc_active and key.codepoint == 'd' and !key.mods.ctrl and !key.mods.alt) {
+            const w = self.mc.wordRange(&self.pt, self.mc.cursors.items[self.mc.main]);
+            if (w.end > w.start) {
+                const wlen = w.end - w.start;
+                self.history.beginGroup();
+                var i = self.mc.cursors.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const pos = self.mc.cursors.items[i];
+                    try self.history.record(&self.pt, pos, wlen, "");
+                }
+                self.history.endGroup();
+            }
+            self.mc.clear();
+            self.mc_active = false;
             return;
         }
 
@@ -201,6 +235,7 @@ const App = struct {
                 const target_pos = editor.Motion.target(&self.pt, m.motion, m.args, self.cursor, m.count);
                 try self.applyOpRange(m.op, self.cursor, target_pos, m.exclusive_end);
             },
+            .surround => |s| try self.execSurround(s),
             .command_mode => {
                 // ':' pressed: open the command line (Mode already set .command)
                 self.cmdline.clearRetainingCapacity();
@@ -481,6 +516,63 @@ const App = struct {
         }
     }
 
+    // ---- surround (ys / ds / cs) ----
+
+    fn execSurround(self: *App, s: anytype) !void {
+        switch (s.op) {
+            .add => {
+                const rng = self.surroundRange(s.motion, s.args, s.count, s.text_object) orelse return;
+                const res = try editor.surround.add(self.alloc, &self.pt, .{ .start = rng.start, .end = rng.end }, s.ch);
+                defer self.alloc.free(res.text);
+                try self.applyEdit(res.start, res.end, res.text);
+            },
+            .delete => {
+                const res = (try editor.surround.delete(self.alloc, &self.pt, self.cursor)) orelse {
+                    try self.setMsg(try self.alloc.dupe(u8, "E54: Unmatched delimiter"));
+                    return;
+                };
+                defer self.alloc.free(res.text);
+                try self.applyEdit(res.start, res.end, res.text);
+                self.cursor = res.start;
+            },
+            .change => {
+                const res = (try editor.surround.change(self.alloc, &self.pt, self.cursor, s.ch)) orelse {
+                    try self.setMsg(try self.alloc.dupe(u8, "E54: Unmatched delimiter"));
+                    return;
+                };
+                defer self.alloc.free(res.text);
+                try self.applyEdit(res.start, res.end, res.text);
+                self.cursor = res.start;
+            },
+        }
+    }
+
+    /// Range covered by a surround-add motion/text object; trailing whitespace
+    /// is trimmed so ysw wraps the word, not "word " (vim-surround behavior).
+    fn surroundRange(self: *App, motion: ?editor.Motion.Motion, args: editor.Motion.Args, count: u32, text_object: ?editor.TextObject.Kind) ?editor.TextObject.Range {
+        var rng: editor.TextObject.Range = undefined;
+        if (text_object) |kind| {
+            const r = editor.TextObject.range(&self.pt, kind, self.cursor);
+            rng = .{ .start = r.start, .end = r.end };
+        } else if (motion) |m| {
+            const target = editor.Motion.target(&self.pt, m, args, self.cursor, count);
+            rng = .{ .start = @min(self.cursor, target), .end = @max(self.cursor, target) };
+        } else return null;
+        // trim trailing spaces/tabs (not newlines)
+        while (rng.end > rng.start) {
+            const c = self.pt.byteAt(rng.end - 1);
+            if (c != ' ' and c != '\t') break;
+            rng.end -= 1;
+        }
+        return rng;
+    }
+
+    fn applyEdit(self: *App, start: u32, end: u32, text: []const u8) !void {
+        self.history.beginGroup();
+        try self.history.record(&self.pt, start, end - start, text);
+        self.history.endGroup();
+    }
+
     fn isVisual(self: *const App) bool {
         return switch (self.state.mode) {
             .visual_char, .visual_line, .visual_block => true,
@@ -488,9 +580,38 @@ const App = struct {
         };
     }
 
+    /// gcc: comment/uncomment the current line (vim semantics: fully commented
+    /// lines get uncommented, otherwise everything is commented).
+    fn toggleCommentLine(self: *App) !void {
+        const ft = filetypeOf(self.file_path);
+        const style = editor.comment.styleForFiletype(ft) orelse {
+            try self.setMsg(try self.alloc.dupe(u8, "E505: No comment style for filetype"));
+            return;
+        };
+        const line = self.pt.lineOf(self.cursor);
+        const toggle = try editor.comment.toggleLines(self.alloc, &self.pt, line, line, style);
+        defer self.alloc.free(toggle.text);
+        const start = self.pt.lineStart(line);
+        const end = start + self.pt.lineLen(line); // toggleLines text excludes the trailing '\n'
+        try self.applyEdit(start, end, toggle.text);
+        self.cursor = start;
+    }
+
     fn exitVisual(self: *App) void {
         self.state.mode = .normal;
         self.visual_anchor = null;
+    }
+
+    /// Ctrl+n: first press selects the word under the cursor, later presses
+    /// add the next matching word as another cursor.
+    fn mcSelectNext(self: *App) !void {
+        if (!self.mc_active) {
+            self.mc.clear();
+            _ = try self.mc.add(self.cursor);
+            self.mc_active = true;
+        } else {
+            _ = try self.mc.addNextMatch(&self.pt);
+        }
     }
 
     fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !void {
@@ -573,6 +694,16 @@ const App = struct {
                 self.visual_anchor = self.cursor;
             },
             .delete, .change, .yank => {
+                // multi-cursor: d deletes the selected word at every cursor
+                if (self.mc_active and action == .delete) {
+                    const w = self.mc.wordRange(&self.pt, self.mc.cursors.items[self.mc.main]);
+                    if (w.end > w.start) {
+                        _ = try self.mc.applyDelete(&self.pt, w.end - w.start);
+                    }
+                    self.mc.clear();
+                    self.mc_active = false;
+                    return;
+                }
                 // visual mode: the operator acts on the selection directly
                 if (self.isVisual()) {
                     if (self.visual_anchor) |anchor| {
@@ -581,8 +712,10 @@ const App = struct {
                     self.exitVisual();
                 }
             },
+            .mc_add => try self.mcSelectNext(),
             .paste => try self.pasteBuffer(false),
             .paste_before => try self.pasteBuffer(true),
+            .toggle_comment_line => try self.toggleCommentLine(),
             .easymotion, .leader_find => {
                 // start the EasyMotion capture flow
                 self.em_active = true;
@@ -711,6 +844,32 @@ const App = struct {
             });
         }
 
+        // multi-cursor word highlights (overlay)
+        if (self.mc_active) {
+            for (self.mc.cursors.items) |cpos| {
+                const w = self.mc.wordRange(&self.pt, cpos);
+                if (w.end <= w.start) continue;
+                const wline = self.pt.lineOf(w.start);
+                if (wline < self.view_top or wline >= self.view_top + content_rows) continue;
+                const ls = self.pt.lineStart(wline);
+                var p = w.start;
+                while (p < w.end) {
+                    const col = p - ls;
+                    if (col >= win.width - 5) break;
+                    var clen: u32 = 1;
+                    while (p + clen < w.end and (self.pt.byteAt(p + clen) & 0xC0) == 0x80) : (clen += 1) {}
+                    var char_buf: [4]u8 = undefined;
+                    self.pt.copyRange(p, char_buf[0..clen]);
+                    const g = try a.dupe(u8, char_buf[0..clen]);
+                    win.writeCell(@intCast(5 + col), @intCast(wline - self.view_top), .{
+                        .char = .{ .grapheme = g, .width = 1 },
+                        .style = .{ .bg = .{ .rgb = .{ 54, 74, 130 } } },
+                    });
+                    p += clen;
+                }
+            }
+        }
+
         // easymotion labels: overwrite the matched cells with jump labels
         if (self.em_labels) {
             for (self.em_matches) |m| {
@@ -801,6 +960,15 @@ const App = struct {
         try self.vx.exitAltScreen(self.tty.writer());
     }
 };
+
+/// Filetype from a file path's extension ("src/main.zig" → "zig").
+fn filetypeOf(path: ?[]const u8) []const u8 {
+    const p = path orelse return "";
+    const base = std.fs.path.basename(p);
+    const ext = std.fs.path.extension(base);
+    if (ext.len <= 1) return "";
+    return ext[1..];
+}
 
 fn parseLineArg(arg: []const u8) ?u32 {
     if (std.mem.indexOfScalar(u8, arg, ':')) |idx| {

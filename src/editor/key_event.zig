@@ -69,6 +69,8 @@ pub const ActionId = enum {
     easymotion, // s — EasyMotion jump (DESIGN.md §1.2)
     leader_find, // <leader>f — EasyMotion across windows (M1: same as s)
     leader, // space — leader prefix
+    toggle_comment_line, // gcc — comment/uncomment the current line
+    mc_add, // Ctrl+n — multi-cursor: select word / add next match
     enter_command_mode, // :
     normal_mode, // esc / ctrl-c
     insert_exit, // jk special-cased by Mode

@@ -71,6 +71,7 @@ pub const normal: KeyMap = &.{
     act(.{ .codepoint = 'f', .mods = .{ .ctrl = true } }, .page_down),
     act(.{ .codepoint = 'r', .mods = .{ .ctrl = true } }, .redo),
     act(.{ .codepoint = 'v', .mods = .{ .ctrl = true } }, .visual_block),
+    act(.{ .codepoint = 'n', .mods = .{ .ctrl = true } }, .mc_add),
 };
 
 /// Insert mode keymap (M0 minimal: everything not bound is reported back to

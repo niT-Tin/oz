@@ -80,6 +80,38 @@ pub const Result = union(enum) {
     command_mode,
     /// Exit insert/visual mode back to normal (jk / Esc).
     to_normal,
+    /// Surround operation (ys/ds/cs, DESIGN.md §1.3). For `add` the range is
+    /// the stored motion / text object; for delete/change the caller resolves
+    /// the delimiters around the cursor.
+    surround: struct {
+        op: enum { add, delete, change },
+        ch: u8,
+        motion: ?Motion.Motion = null,
+        args: Motion.Args = .{},
+        count: u32 = 1,
+        exclusive_end: bool = true,
+        text_object: ?TextObject.Kind = null,
+    },
+};
+
+/// Pending surround sequence state (after y/d/c + 's').
+pub const SurroundPending = union(enum) {
+    /// ds: waiting for the delimiter char to delete
+    delete,
+    /// cs: waiting for the old delimiter char
+    change_old,
+    /// cs: old char seen, waiting for the new delimiter char
+    change_new: u8,
+    /// ys: waiting for the motion (or 'i'/'a' text object)
+    add_motion,
+    /// ys: motion seen, waiting for the wrapper char
+    add_char: struct {
+        motion: Motion.Motion,
+        args: Motion.Args,
+        count: u32,
+        exclusive_end: bool,
+        text_object: ?TextObject.Kind = null,
+    },
 };
 
 const max_count_digits = 9; // count saturates at 999_999_999 (fits u32)
@@ -105,6 +137,11 @@ pub const State = struct {
     pending_text_object: ?u8 = null,
     /// leader (Space) seen, awaiting the next key (<leader>f etc.)
     pending_leader: bool = false,
+    /// surround sequence (ys/ds/cs) in progress
+    pending_surround: ?SurroundPending = null,
+    /// 'g' + 'c' seen (comment sequence), awaiting 'c' (line) — gc in visual
+    /// mode is handled by the caller
+    pending_gc: bool = false,
 
     /// backing storage for count_digits. The slice points into this buffer,
     /// so State must not be copied by value while a count is pending.
@@ -132,6 +169,50 @@ pub fn handle(
 }
 
 fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
+    // 0) operator + text object (diw / ci( / yaw …): 'i'/'a' seen, awaiting
+    //    the target character. Runs before the surround branch: ysiw reuses
+    //    this state with pending_surround == .add_motion.
+    if (state.pending_text_object) |inner| {
+        state.pending_text_object = null;
+        if (isEscape(key)) {
+            resetPending(state);
+            return .pending;
+        }
+        const kind = blk: {
+            if (key.codepoint > 0xFF) break :blk null;
+            break :blk textObjectKind(inner, @intCast(key.codepoint));
+        } orelse {
+            resetPending(state);
+            return .pending;
+        };
+        // ysiw etc.: the text object feeds a surround add
+        if (state.pending_surround) |sp| {
+            if (sp == .add_motion) {
+                state.pending_surround = .{
+                    .add_char = .{
+                        .motion = .left, // unused with text_object
+                        .args = .{},
+                        .count = 1,
+                        .exclusive_end = true,
+                        .text_object = kind,
+                    },
+                };
+                return .pending;
+            }
+            resetPending(state);
+            return .pending;
+        }
+        if (state.pending_op) |op| {
+            return emitTextObject(state, op, kind);
+        }
+        return .pending;
+    }
+
+    // 0c) surround sequence (ys/ds/cs) in progress — consumes keys.
+    if (state.pending_surround != null) {
+        return handleSurround(state, key, keymap);
+    }
+
     // 0b) leader (Space) pending — next key picks the <leader> action.
     if (state.pending_leader) {
         state.pending_leader = false;
@@ -146,27 +227,6 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
                 return .pending;
             },
         }
-    }
-
-    // 0) operator + text object (diw / ci( / yaw …): 'i'/'a' seen, awaiting
-    //    the target character.
-    if (state.pending_text_object) |inner| {
-        state.pending_text_object = null;
-        if (isEscape(key)) {
-            resetPending(state);
-            return .pending;
-        }
-        const kind = blk: {
-            if (key.codepoint > 0xFF) break :blk null;
-            break :blk textObjectKind(inner, @intCast(key.codepoint));
-        } orelse {
-            resetPending(state);
-            return .pending;
-        };
-        if (state.pending_op) |op| {
-            return emitTextObject(state, op, kind);
-        }
-        return .pending;
     }
 
     // 1) f/F/t/T target char pending — the next key IS the target.
@@ -184,6 +244,22 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
     }
 
     // 2) 'g' prefix pending (gg / ge / ...).
+    // 'g' + 'c' seen (gcc comment toggle, gc visual handled by caller)
+    if (state.pending_gc) {
+        state.pending_gc = false;
+        if (isEscape(key)) {
+            resetPending(state);
+            return .pending;
+        }
+        switch (key.codepoint) {
+            'c' => return emitAction(state, .toggle_comment_line), // gcc
+            else => {
+                resetPending(state);
+                return .pending;
+            },
+        }
+    }
+
     if (state.pending_g) {
         state.pending_g = false;
         if (isEscape(key)) {
@@ -194,6 +270,11 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
             'g' => return emitMotion(state, .first_line, .{}),
             // ge = end of previous word
             'e' => return emitMotion(state, .word_prev_end, .{}),
+            // gcc / gc — comment sequences
+            'c' => {
+                state.pending_gc = true;
+                return .pending;
+            },
             else => {
                 resetPending(state);
                 return .pending;
@@ -220,6 +301,17 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         // 'i'/'a' after an operator start a text object (diw, ci(, yaw…)
         if (key.codepoint == 'i' or key.codepoint == 'a') {
             state.pending_text_object = @intCast(key.codepoint);
+            return .pending;
+        }
+        // 's' after y/d/c starts a surround sequence (ys / ds / cs)
+        if (key.codepoint == 's' and (op == .yank or op == .delete or op == .change)) {
+            state.pending_op = null;
+            state.pending_surround = switch (op) {
+                .yank => .add_motion,
+                .delete => .delete,
+                .change => .change_old,
+                else => unreachable,
+            };
             return .pending;
         }
         if (KeyEvent.lookup(keymap, key)) |action| {
@@ -350,6 +442,8 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .paste_before => emitAction(state, .paste_before),
         .easymotion => emitAction(state, .easymotion),
         .leader_find => emitAction(state, .leader_find),
+        .toggle_comment_line => emitAction(state, .toggle_comment_line),
+        .mc_add => emitAction(state, .mc_add),
         .leader => blk: {
             state.pending_leader = true;
             break :blk .pending;
@@ -583,7 +677,88 @@ fn resetPending(state: *State) void {
     state.pending_op = null;
     state.pending_g = false;
     state.pending_find = null;
+    state.pending_text_object = null;
+    state.pending_leader = false;
+    state.pending_surround = null;
     resetCount(state);
+}
+
+// ---- surround (ys / ds / cs) ----
+
+fn charOf(key: vaxis.Key) ?u8 {
+    return if (key.codepoint > 0 and key.codepoint <= 0xFF) @intCast(key.codepoint) else null;
+}
+
+fn handleSurround(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
+    if (isEscape(key)) {
+        resetPending(state);
+        return .pending;
+    }
+    switch (state.pending_surround.?) {
+        .delete => {
+            const ch = charOf(key) orelse {
+                resetPending(state);
+                return .pending;
+            };
+            state.pending_surround = null;
+            return .{ .surround = .{ .op = .delete, .ch = ch } };
+        },
+        .change_old => {
+            const ch = charOf(key) orelse {
+                resetPending(state);
+                return .pending;
+            };
+            state.pending_surround = .{ .change_new = ch };
+            return .pending;
+        },
+        .change_new => {
+            const ch = charOf(key) orelse {
+                resetPending(state);
+                return .pending;
+            };
+            state.pending_surround = null;
+            return .{ .surround = .{ .op = .change, .ch = ch } };
+        },
+        .add_motion => {
+            // 'i'/'a' → text object (ysiw, ysa(…) — resolved by the text-object
+            // branch which converts .add_motion into .add_char
+            if (key.codepoint == 'i' or key.codepoint == 'a') {
+                state.pending_text_object = @intCast(key.codepoint);
+                return .pending;
+            }
+            if (KeyEvent.lookup(keymap, key)) |action| {
+                if (actionToMotion(action)) |m| {
+                    const count = countValue(state);
+                    resetCount(state);
+                    state.pending_surround = .{ .add_char = .{
+                        .motion = m,
+                        .args = .{},
+                        .count = count,
+                        .exclusive_end = true,
+                    } };
+                    return .pending;
+                }
+            }
+            resetPending(state);
+            return .pending;
+        },
+        .add_char => |saved| {
+            const ch = charOf(key) orelse {
+                resetPending(state);
+                return .pending;
+            };
+            state.pending_surround = null;
+            return .{ .surround = .{
+                .op = .add,
+                .ch = ch,
+                .motion = saved.motion,
+                .args = saved.args,
+                .count = saved.count,
+                .exclusive_end = saved.exclusive_end,
+                .text_object = saved.text_object,
+            } };
+        },
+    }
 }
 
 // ---- tests (parser-level; no document / cursor involved) ----
@@ -655,6 +830,52 @@ test "dd/yy → line-wise op_motion" {
     try testing.expectEqual(.op_motion, tag(r2));
     try testing.expectEqual(KeyEvent.ActionId.yank, r2.op_motion.op);
     try testing.expect(!r2.op_motion.exclusive_end);
+}
+
+test "surround: ysw' adds with motion, ds( deletes, cs'\" changes" {
+    var s = State.init();
+    _ = handle(&s, press('y'), Keymaps.normal);
+    _ = handle(&s, press('s'), Keymaps.normal);
+    _ = handle(&s, press('w'), Keymaps.normal);
+    const r = handle(&s, press('\''), Keymaps.normal);
+    try testing.expectEqual(.surround, tag(r));
+    try testing.expectEqual(@as(u8, '\''), r.surround.ch);
+    try testing.expectEqual(Motion.Motion.word_next, r.surround.motion);
+    try testing.expect(r.surround.op == .add);
+
+    var s2 = State.init();
+    _ = handle(&s2, press('d'), Keymaps.normal);
+    _ = handle(&s2, press('s'), Keymaps.normal);
+    const r2 = handle(&s2, press('('), Keymaps.normal);
+    try testing.expectEqual(.surround, tag(r2));
+    try testing.expect(r2.surround.op == .delete);
+    try testing.expectEqual(@as(u8, '('), r2.surround.ch);
+
+    var s3 = State.init();
+    _ = handle(&s3, press('c'), Keymaps.normal);
+    _ = handle(&s3, press('s'), Keymaps.normal);
+    _ = handle(&s3, press('\''), Keymaps.normal);
+    const r3 = handle(&s3, press('"'), Keymaps.normal);
+    try testing.expectEqual(.surround, tag(r3));
+    try testing.expect(r3.surround.op == .change);
+    try testing.expectEqual(@as(u8, '"'), r3.surround.ch);
+
+    // ysiw: text object feeds the surround add
+    var s4 = State.init();
+    _ = handle(&s4, press('y'), Keymaps.normal);
+    _ = handle(&s4, press('s'), Keymaps.normal);
+    _ = handle(&s4, press('i'), Keymaps.normal);
+    _ = handle(&s4, press('w'), Keymaps.normal);
+    const r4 = handle(&s4, press('('), Keymaps.normal);
+    try testing.expectEqual(.surround, tag(r4));
+    try testing.expectEqual(TextObject.Kind.inner_word, r4.surround.text_object);
+
+    // Esc cancels a pending surround sequence
+    var s5 = State.init();
+    _ = handle(&s5, press('d'), Keymaps.normal);
+    _ = handle(&s5, press('s'), Keymaps.normal);
+    const r5 = handle(&s5, esc(), Keymaps.normal);
+    try testing.expectEqual(.pending, tag(r5));
 }
 
 test "operator + text object: diw / ci( / yaw" {

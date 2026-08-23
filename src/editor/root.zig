@@ -8,5 +8,5 @@ pub const TextObject = @import("text_object.zig");
 pub const surround = @import("surround.zig");
 pub const comment = @import("comment.zig");
 pub const align_text = @import("align.zig");
-pub const MultiCursor = @import("multicursor.zig");
+pub const MultiCursor = @import("multicursor.zig").MultiCursor;
 pub const easymotion = @import("easymotion.zig");
