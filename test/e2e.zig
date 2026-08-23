@@ -223,6 +223,21 @@ const Session = struct {
             }
         }
     }
+
+    /// Send keys, then wait for the child to exit cleanly (replying to DSR
+    /// queries along the way). Returns the exit code.
+    fn commandAndWaitExit(self: *Session, keys: []const u8) !u32 {
+        try self.send(keys);
+        var exit_code: ?u32 = null;
+        var waited: i32 = 0;
+        while (exit_code == null and waited < 5000) {
+            try self.drainAndReply();
+            exit_code = try self.tryWaitExit();
+            _ = std.Io.sleep(self.io, std.Io.Duration.fromNanoseconds(200 * std.time.ns_per_ms), .real) catch {};
+            waited += 200;
+        }
+        return exit_code orelse 0xffff;
+    }
 };
 
 fn killPid(pid: std.posix.pid_t) void {
@@ -410,26 +425,10 @@ test "smoke: spawn oz, render a file, quit cleanly" {
     try std.testing.expect(grid.contains("line two"));
     try std.testing.expect(grid.contains("line three"));
 
-    // TEMP(M0): 'q' quits until command mode lands
-    try sess.send("q");
-
-    // The child stops its tty reader thread by writing a DSR query and
-    // waiting for the terminal's reply; answer it until the child exits.
-    var exit_code: ?u32 = null;
-    var waited2: i32 = 0;
-    while (exit_code == null and waited2 < 5000) {
-        try sess.drainAndReply();
-        exit_code = try sess.tryWaitExit();
-        _ = std.Io.sleep(io, std.Io.Duration.fromNanoseconds(200 * std.time.ns_per_ms), .real) catch {};
-        waited2 += 200;
-    }
-    if (exit_code) |code| {
-        if (code != 0) std.debug.print("oz exited with code {d}\n", .{code});
-        try std.testing.expectEqual(@as(u32, 0), code);
-    } else {
-        killPid(sess.pid);
-        try std.testing.expect(false); // child did not exit cleanly in time
-    }
+    // quit via command mode
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
 test "insert text in insert mode, esc back to normal" {
@@ -498,14 +497,83 @@ test "insert text in insert mode, esc back to normal" {
     }
     try std.testing.expect(!grid.contains("INSERT"));
 
-    try sess.send("q");
-    var exit_code: ?u32 = null;
-    var waited2: i32 = 0;
-    while (exit_code == null and waited2 < 5000) {
-        try sess.drainAndReply();
-        exit_code = try sess.tryWaitExit();
-        _ = std.Io.sleep(io, std.Io.Duration.fromNanoseconds(200 * std.time.ns_per_ms), .real) catch {};
-        waited2 += 200;
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test ":wq writes the buffer to disk and exits" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}.txt", .{linux.getpid()});
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "base\n");
     }
-    if (exit_code) |code| try std.testing.expectEqual(@as(u32, 0), code) else killPid(sess.pid);
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // modify the buffer, then :wq
+    try sess.send("iHELLO");
+    waited = 0;
+    while (!grid.contains("HELLObase")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("HELLObase"));
+
+    // esc back to normal (sent alone: ESC immediately followed by ':' would
+    // be parsed as Alt+':')
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    // the edit must have been written to disk
+    const f = try std.Io.Dir.cwd().openFile(io, name, .{ .mode = .read_only });
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    try std.testing.expectEqualStrings("HELLObase\n", buf);
 }

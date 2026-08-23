@@ -34,6 +34,14 @@ const App = struct {
     in_insert: bool = false,
     quit: bool = false,
 
+    // command line (':') state
+    cmdline: std.ArrayList(u8),
+    cmd_history: std.ArrayList([]u8),
+    cmd_hist_idx: ?usize = null,
+    prev_insert_key: ?vaxis.Key = null,
+    file_path: ?[]u8 = null,
+    msg: ?[]u8 = null, // transient status message (owned)
+
     fn create(init: std.process.Init) !*App {
         const self = try init.gpa.create(App);
         errdefer init.gpa.destroy(self);
@@ -67,6 +75,8 @@ const App = struct {
             .state = editor.Mode.State.init(),
             .pt = try buffer.PieceTable.init(init.gpa, ""),
             .history = buffer.History.init(init.gpa),
+            .cmdline = .empty,
+            .cmd_history = .empty,
         };
         // NOTE: loop holds pointers to self.tty / self.vx, so the App must
         // stay at a stable address (heap) — never move it after this.
@@ -87,25 +97,36 @@ const App = struct {
         self.alloc.free(self.tty_buffer);
         self.history.deinit();
         self.pt.deinit();
+        self.cmdline.deinit(self.alloc);
+        for (self.cmd_history.items) |h| self.alloc.free(h);
+        self.cmd_history.deinit(self.alloc);
+        if (self.file_path) |p| self.alloc.free(p);
+        if (self.msg) |m| self.alloc.free(m);
     }
 
     // ---- input ----
 
     fn handleKey(self: *App, key: vaxis.Key) !void {
-        // TEMP(M0): quit until command mode lands (vim: :q)
-        if (self.state.mode == .normal and key.codepoint == 'q' and key.mods.ctrl == false and key.mods.alt == false) {
-            self.quit = true;
+        // Command mode: the ':' command line
+        if (self.state.mode == .command) {
+            try self.handleCommandKey(key);
             return;
         }
 
-        // Insert mode: characters insert directly (jk handled via Mode).
+        // Insert mode: characters insert directly; jk exits.
         if (self.state.mode == .insert) {
             if (key.codepoint == vaxis.Key.escape or (key.codepoint == 'c' and key.mods.ctrl)) {
-                self.state.mode = .normal;
-                self.history.endGroup();
-                self.in_insert = false;
+                self.exitInsert();
                 return;
             }
+            // jk → exit insert without inserting the 'k'
+            if (self.prev_insert_key) |p| {
+                if (p.codepoint == 'j' and key.codepoint == 'k') {
+                    self.exitInsert();
+                    return;
+                }
+            }
+            self.prev_insert_key = key;
             if (key.text) |text| {
                 try self.insertText(text);
                 return;
@@ -136,7 +157,10 @@ const App = struct {
                 }
             },
             .command_mode => {
-                // M0: no command line yet; swallow ':'
+                // ':' pressed: open the command line (Mode already set .command)
+                self.cmdline.clearRetainingCapacity();
+                self.cmd_hist_idx = null;
+                try self.setMsg(try self.alloc.dupe(u8, ""));
             },
             .to_normal => {
                 self.state.mode = .normal;
@@ -146,6 +170,152 @@ const App = struct {
                 }
             },
         }
+    }
+
+    fn exitInsert(self: *App) void {
+        self.state.mode = .normal;
+        self.history.endGroup();
+        self.in_insert = false;
+        self.prev_insert_key = null;
+    }
+
+    // ---- command line (':') ----
+
+    fn handleCommandKey(self: *App, key: vaxis.Key) !void {
+        // cancel
+        if (key.codepoint == vaxis.Key.escape or (key.codepoint == 'c' and key.mods.ctrl)) {
+            self.state.mode = .normal;
+            self.cmdline.clearRetainingCapacity();
+            self.cmd_hist_idx = null;
+            return;
+        }
+        switch (key.codepoint) {
+            vaxis.Key.enter => {
+                const line = self.cmdline.items;
+                const cmd = editor.ex_command.parse(line);
+                if (cmd != .empty) try self.pushHistory(line);
+                self.state.mode = .normal;
+                self.cmd_hist_idx = null;
+                self.cmdline.clearRetainingCapacity();
+                try self.execCommand(cmd);
+            },
+            vaxis.Key.backspace => {
+                if (self.cmdline.items.len > 0) _ = self.cmdline.pop();
+            },
+            vaxis.Key.up => {
+                self.cmd_hist_idx = if (self.cmd_hist_idx) |i|
+                    if (i > 0) i - 1 else i
+                else if (self.cmd_history.items.len > 0)
+                    self.cmd_history.items.len - 1
+                else
+                    null;
+                try self.loadHistory();
+            },
+            vaxis.Key.down => {
+                self.cmd_hist_idx = if (self.cmd_hist_idx) |i|
+                    if (i + 1 < self.cmd_history.items.len) i + 1 else null
+                else
+                    null;
+                try self.loadHistory();
+            },
+            else => {},
+        }
+        // Ctrl-w: delete the word before the cursor (M0: back to last space)
+        if (key.codepoint == 'w' and key.mods.ctrl) {
+            var i = self.cmdline.items.len;
+            while (i > 0 and self.cmdline.items[i - 1] != ' ') : (i -= 1) {}
+            self.cmdline.shrinkRetainingCapacity(i);
+            return;
+        }
+        if (key.text) |text| {
+            try self.cmdline.appendSlice(self.alloc, text);
+        }
+    }
+
+    fn pushHistory(self: *App, line: []const u8) !void {
+        if (self.cmd_history.items.len > 0 and
+            std.mem.eql(u8, self.cmd_history.items[self.cmd_history.items.len - 1], line))
+            return;
+        const copy = try self.alloc.dupe(u8, line);
+        errdefer self.alloc.free(copy);
+        try self.cmd_history.append(self.alloc, copy);
+        while (self.cmd_history.items.len > 100) {
+            self.alloc.free(self.cmd_history.orderedRemove(0));
+        }
+    }
+
+    fn loadHistory(self: *App) !void {
+        self.cmdline.clearRetainingCapacity();
+        if (self.cmd_hist_idx) |i| {
+            try self.cmdline.appendSlice(self.alloc, self.cmd_history.items[i]);
+        }
+    }
+
+    fn execCommand(self: *App, cmd: editor.ex_command.Command) !void {
+        switch (cmd) {
+            .empty => {},
+            .write => try self.writeBuffer(),
+            .quit => self.quit = true, // M0: no dirty tracking; :q behaves like :q!
+            .quit_force => self.quit = true,
+            .write_quit => {
+                try self.writeBuffer();
+                self.quit = true;
+            },
+            .edit => |path| try self.openFile(path),
+            .buffer_next, .buffer_prev, .buffer_delete => try self.setMsg(try self.alloc.dupe(u8, "M0: single buffer")),
+            .buffer_list => try self.setMsg(try self.alloc.dupe(u8, "M0: single buffer (1)")),
+            .noh => try self.setMsg(try self.alloc.dupe(u8, "")),
+            .set => |opt| try self.setMsg(try std.fmt.allocPrint(self.alloc, "set {s} (M0: accepted, no-op)", .{opt})),
+            .unknown => try self.setMsg(try self.alloc.dupe(u8, "E492: Not an editor command")),
+        }
+    }
+
+    fn setMsg(self: *App, owned: []u8) !void {
+        if (self.msg) |m| self.alloc.free(m);
+        self.msg = owned;
+    }
+
+    fn writeBuffer(self: *App) !void {
+        const path = self.file_path orelse {
+            try self.setMsg(try self.alloc.dupe(u8, "E32: No file name"));
+            return;
+        };
+        self.saveFile(path) catch |e| {
+            try self.setMsg(try std.fmt.allocPrint(self.alloc, "write failed: {s}", .{@errorName(e)}));
+            return;
+        };
+        try self.setMsg(try std.fmt.allocPrint(self.alloc, "written: {s}", .{path}));
+    }
+
+    fn saveFile(self: *App, path: []const u8) !void {
+        var f = try std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = true });
+        defer f.close(self.io);
+        const len = self.pt.len();
+        const buf = try self.alloc.alloc(u8, len);
+        defer self.alloc.free(buf);
+        self.pt.copyRange(0, buf);
+        try f.writeStreamingAll(self.io, buf);
+    }
+
+    fn openFile(self: *App, path: []const u8) !void {
+        var file = std.Io.Dir.cwd().openFile(self.io, path, .{ .mode = .read_only }) catch |e| {
+            try self.setMsg(try std.fmt.allocPrint(self.alloc, "E484: cannot open {s}: {s}", .{ path, @errorName(e) }));
+            return;
+        };
+        defer file.close(self.io);
+        const size = (try file.stat(self.io)).size;
+        const bytes = try self.alloc.alloc(u8, @intCast(size));
+        defer self.alloc.free(bytes);
+        _ = try file.readPositionalAll(self.io, bytes, 0);
+
+        self.pt.deinit();
+        self.pt = try buffer.PieceTable.init(self.alloc, bytes);
+        self.history.deinit();
+        self.history = buffer.History.init(self.alloc); // undo history belongs to the buffer
+        if (self.file_path) |p| self.alloc.free(p);
+        self.file_path = try self.alloc.dupe(u8, path);
+        self.cursor = 0;
+        self.view_top = 0;
     }
 
     fn insertText(self: *App, text: []const u8) !void {
@@ -257,18 +427,41 @@ const App = struct {
             });
         }
 
-        // status bar
+        // status bar (or command line in command mode)
+        if (self.state.mode == .command) {
+            const prompt = try std.fmt.allocPrint(a, ":{s}", .{self.cmdline.items});
+            const cmd_seg = [_]vaxis.Segment{.{
+                .text = prompt,
+                .style = .{ .fg = .{ .rgb = .{ 192, 202, 245 } }, .bg = .{ .rgb = .{ 41, 46, 66 } } },
+            }};
+            _ = win.print(&cmd_seg, .{ .row_offset = @intCast(height - 1), .wrap = .none });
+            self.vx.screen.cursor = .{
+                .row = @intCast(height - 1),
+                .col = @intCast(1 + self.cmdline.items.len),
+            };
+            self.vx.screen.cursor_shape = .block;
+            try self.vx.render(self.tty.writer());
+            return;
+        }
+
         const mode_str = switch (self.state.mode) {
             .normal => " NORMAL ",
             .insert => " INSERT ",
             .visual_char, .visual_line, .visual_block => " VISUAL ",
             .command => " COMMAND ",
         };
-        const status = try std.fmt.allocPrint(
-            a,
-            "{s} line {d}/{d} col {d}",
-            .{ mode_str, cursor_line + 1, line_count, self.cursor - self.pt.lineStart(cursor_line) },
-        );
+        const status = if (self.msg) |m|
+            try std.fmt.allocPrint(
+                a,
+                "{s} line {d}/{d} col {d}  {s}",
+                .{ mode_str, cursor_line + 1, line_count, self.cursor - self.pt.lineStart(cursor_line), m },
+            )
+        else
+            try std.fmt.allocPrint(
+                a,
+                "{s} line {d}/{d} col {d}",
+                .{ mode_str, cursor_line + 1, line_count, self.cursor - self.pt.lineStart(cursor_line) },
+            );
         const status_seg = [_]vaxis.Segment{.{
             .text = status,
             .style = .{ .fg = .{ .rgb = .{ 192, 202, 245 } }, .bg = .{ .rgb = .{ 41, 46, 66 } } },
@@ -334,7 +527,7 @@ pub fn main(init: std.process.Init) !void {
         }
         const file_path = if (parseLineArg(content) != null) content[0..std.mem.lastIndexOfScalar(u8, content, ':').?] else content;
         if (file_path.len > 0) {
-            var file = std.Io.Dir.openFileAbsolute(app.io, file_path, .{ .mode = .read_only }) catch continue;
+            var file = std.Io.Dir.cwd().openFile(app.io, file_path, .{ .mode = .read_only }) catch continue;
             defer file.close(app.io);
             const size = (try file.stat(app.io)).size;
             const bytes = try app.alloc.alloc(u8, @intCast(size));
@@ -342,6 +535,8 @@ pub fn main(init: std.process.Init) !void {
             _ = try file.readPositionalAll(app.io, bytes, 0);
             app.pt.deinit();
             app.pt = try buffer.PieceTable.init(app.alloc, bytes);
+            if (app.file_path) |p| app.alloc.free(p);
+            app.file_path = try app.alloc.dupe(u8, file_path);
         }
         break; // M0: first file only
     }

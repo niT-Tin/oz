@@ -15,6 +15,7 @@ pub const key_event = @import("editor/key_event.zig");
 pub const keymaps = @import("editor/keymaps.zig");
 pub const mode = @import("editor/mode.zig");
 pub const motion = @import("editor/motion.zig");
+pub const ex_command = @import("editor/ex_command.zig");
 
 test {
     std.testing.refAllDecls(@This());
