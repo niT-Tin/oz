@@ -601,14 +601,16 @@ const App = struct {
                     try self.cur().history.record(pt, ls + rect.left, end - rect.left, "");
                 }
                 self.cur().history.endGroup();
-                self.cur().cursor = pt.lineStart(rect.top) + @min(rect.left, pt.lineLen(rect.top));
                 self.markDirty();
                 if (op == .change) {
-                    // enter insert (empty-range cc also lands here): the undo
-                    // group stays open so typing joins one session
-                    self.cur().history.beginGroup();
-                    self.state.mode = .insert;
-                    self.in_insert = true;
+                    // vim blockwise change: after deleting the rectangle, one
+                    // insert cursor per covered line at the block's left edge
+                    // — the typed text lands in EVERY line of the block, not
+                    // just at the cursor. placeBlockCursors opens the insert
+                    // session undo group (typing joins it).
+                    try self.placeBlockCursors(rect, false);
+                } else {
+                    self.cur().cursor = pt.lineStart(rect.top) + @min(rect.left, pt.lineLen(rect.top));
                 }
             },
             .yank => {
@@ -635,42 +637,38 @@ const App = struct {
         }
     }
 
-    /// I/A after a Ctrl+v block: place one insert cursor per line of the
-    /// block and enter insert mode. I puts each cursor at the block's left
-    /// edge; A (append) puts them one column past the block's right edge
-    /// (vim: the right edge is the last selected column, so +1 inserts right
-    /// after the selection's rightmost character). Both clamp to the end of
-    /// the line, so short/empty lines get their cursor at end-of-line.
-    /// The anchor line's cursor is added first so it becomes the main one.
+    /// I/A after a Ctrl+v block (or blockwise c after the rectangle was
+    /// deleted): place one insert cursor per line of the block and enter
+    /// insert mode. I puts each cursor at the block's left edge; A (append)
+    /// puts them one column past the block's right edge (vim: the right edge
+    /// is the last selected column, so +1 inserts right after the selection's
+    /// rightmost character). Both clamp to the end of the line, so
+    /// short/empty lines get their cursor at end-of-line. The top line's
+    /// cursor is added first so it becomes the main one.
     fn blockInsert(self: *App, append: bool) !void {
-        const anchor = self.visual_anchor orelse return;
-        const pt = &self.cur().pt;
-        const a_line = pt.lineOf(anchor);
-        const c_line = pt.lineOf(self.cur().cursor);
-        const min_line = @min(a_line, c_line);
-        const max_line = @max(a_line, c_line);
-        const a_col = anchor - pt.lineStart(a_line);
-        const c_col = self.cur().cursor - pt.lineStart(c_line);
-        const left_col = @min(a_col, c_col);
-        const right_col = @max(a_col, c_col);
+        const rect = self.blockRect() orelse return;
+        try self.placeBlockCursors(rect, append);
+    }
 
+    fn placeBlockCursors(self: *App, rect: BlockRect, append: bool) !void {
+        const pt = &self.cur().pt;
         self.mc.clear();
         const anchor_col: u32 = if (append)
-            @min(right_col + 1, pt.lineLen(a_line))
+            @min(rect.right + 1, pt.lineLen(rect.top))
         else
-            @min(left_col, pt.lineLen(a_line));
-        _ = try self.mc.add(pt.lineStart(a_line) + anchor_col);
-        var line = min_line;
-        while (line <= max_line) : (line += 1) {
-            if (line == a_line) continue;
+            @min(rect.left, pt.lineLen(rect.top));
+        _ = try self.mc.add(pt.lineStart(rect.top) + anchor_col);
+        var line = rect.top;
+        while (line <= rect.bottom) : (line += 1) {
+            if (line == rect.top) continue;
             const col: u32 = if (append)
-                @min(right_col + 1, pt.lineLen(line))
+                @min(rect.right + 1, pt.lineLen(line))
             else
-                @min(left_col, pt.lineLen(line));
+                @min(rect.left, pt.lineLen(line));
             _ = try self.mc.add(pt.lineStart(line) + col);
         }
         self.mc_active = true;
-        self.visual_anchor = null; // the selection is consumed by I/A
+        self.visual_anchor = null; // the selection is consumed by I/A/c
         self.state.mode = .insert;
         // open the undo group immediately: the first key (backspace or
         // typing) must join the same session group

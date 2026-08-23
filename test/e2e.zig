@@ -2308,8 +2308,10 @@ test "visual block: c deletes the rectangle and types at the top-left cursor" {
     try std.testing.expect(grid.contains("NORMAL"));
 
     // block rows 0..2 col 1, then c: deletes the column everywhere and enters
-    // insert at the block's top-left (row 0 col 1). Typing 'X' replaces only
-    // there (vim c on a block): aXa / bbb / c.
+    // insert at the block's top-left (row 0 col 1). Typing 'X' then applies
+    // to EVERY line of the block at the same column (vim blockwise change —
+    // the typed text lands in each line, not just at the cursor): aXa /
+    // bXbb (row "bbbb" minus col 1, 'X' at col 1) / cX.
     try sess.send("l\x16jjcX");
     waited = 0;
     while (!rowContains(&grid, 1, "aXa")) {
@@ -2327,8 +2329,8 @@ test "visual block: c deletes the rectangle and types at the top-left cursor" {
         grid.dump();
     }
     try std.testing.expect(rowContains(&grid, 1, "aXa"));
-    try std.testing.expect(rowContains(&grid, 2, "bbb"));
-    try std.testing.expect(rowContains(&grid, 3, "c"));
+    try std.testing.expect(rowContains(&grid, 2, "bXbb"));
+    try std.testing.expect(rowContains(&grid, 3, "cX"));
     try std.testing.expect(grid.contains("INSERT"));
 
     // Esc exits insert (sent alone — Esc followed by ':' would merge into
@@ -2357,7 +2359,7 @@ test "visual block: c deletes the rectangle and types at the top-left cursor" {
     const buf = try alloc.alloc(u8, @intCast(size));
     defer alloc.free(buf);
     _ = try f.readPositionalAll(io, buf, 0);
-    try std.testing.expectEqualStrings("aXa\nbbb\nc\n", buf);
+    try std.testing.expectEqualStrings("aXa\nbXbb\ncX\n", buf);
 }
 
 test "visual block: multi-cursor backspace, ctrl-w and jk stay in sync" {
