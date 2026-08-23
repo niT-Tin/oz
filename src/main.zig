@@ -358,8 +358,10 @@ const App = struct {
                 if (cmd != .empty) try self.pushHistory(line);
                 self.state.mode = .normal;
                 self.cmd_hist_idx = null;
-                self.cmdline.clearRetainingCapacity();
+                // execCommand must run BEFORE clearing: Command slices borrow
+                // the cmdline buffer (pattern/replacement/edit paths)
                 try self.execCommand(cmd);
+                self.cmdline.clearRetainingCapacity();
             },
             vaxis.Key.backspace => {
                 if (self.cmdline.items.len > 0) _ = self.cmdline.pop();
@@ -428,8 +430,41 @@ const App = struct {
             .buffer_list => try self.setMsg(try self.alloc.dupe(u8, "M0: single buffer (1)")),
             .noh => try self.setMsg(try self.alloc.dupe(u8, "")),
             .set => |opt| try self.setMsg(try std.fmt.allocPrint(self.alloc, "set {s} (M0: accepted, no-op)", .{opt})),
+            .substitute => |sub| try self.execSubstitute(sub),
             .unknown => try self.setMsg(try self.alloc.dupe(u8, "E492: Not an editor command")),
         }
+    }
+
+    /// :s/pat/rep[/g] — literal substitution on the current line or whole
+    /// file (M1: no regex). The replacement lands in one undo group.
+    fn execSubstitute(self: *App, sub: anytype) !void {
+        const start_line = if (sub.whole_file) 0 else self.pt.lineOf(self.cursor);
+        const end_line = if (sub.whole_file) self.pt.lineCount() - 1 else start_line;
+
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.alloc);
+        var changed: bool = false;
+        var line = start_line;
+        while (line <= end_line) : (line += 1) {
+            const ll = self.pt.lineLen(line);
+            const ls = self.pt.lineStart(line);
+            const buf = try self.alloc.alloc(u8, ll);
+            defer self.alloc.free(buf);
+            self.pt.copyRange(ls, buf);
+
+            const n = replaceLiteral(&out, self.alloc, buf, sub.pattern, sub.replacement, sub.global);
+            if (n > 0) changed = true;
+            if (line < self.pt.lineCount() - 1) try out.append(self.alloc, '\n');
+        }
+
+        if (!changed) {
+            try self.setMsg(try self.alloc.dupe(u8, "E486: Pattern not found"));
+            return;
+        }
+        const start = self.pt.lineStart(start_line);
+        var end = self.pt.lineStart(end_line) + self.pt.lineLen(end_line);
+        if (end_line + 1 < self.pt.lineCount()) end += 1;
+        try self.applyEdit(start, end, out.items);
     }
 
     fn setMsg(self: *App, owned: []u8) !void {
@@ -1154,6 +1189,33 @@ const App = struct {
         try self.vx.exitAltScreen(self.tty.writer());
     }
 };
+
+/// Append `haystack` with every occurrence of `pat` replaced by `rep`
+/// (all if `global`, else only the first). Returns the replacement count.
+fn replaceLiteral(out: *std.ArrayList(u8), allocator: std.mem.Allocator, haystack: []const u8, pat: []const u8, rep: []const u8, global: bool) usize {
+    if (pat.len == 0) {
+        out.appendSlice(allocator, haystack) catch {};
+        return 0;
+    }
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < haystack.len) {
+        if (std.mem.indexOfPos(u8, haystack, i, pat)) |pos| {
+            out.appendSlice(allocator, haystack[i..pos]) catch return count;
+            out.appendSlice(allocator, rep) catch return count;
+            count += 1;
+            i = pos + pat.len;
+            if (!global) {
+                out.appendSlice(allocator, haystack[i..]) catch return count;
+                return count;
+            }
+        } else {
+            out.appendSlice(allocator, haystack[i..]) catch return count;
+            return count;
+        }
+    }
+    return count;
+}
 
 /// Filetype from a file path's extension ("src/main.zig" → "zig").
 fn filetypeOf(path: ?[]const u8) []const u8 {

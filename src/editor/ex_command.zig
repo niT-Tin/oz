@@ -24,6 +24,14 @@ pub const Command = union(enum) {
     noh,
     /// :set <option> — M0: accepted, applied if recognized, else ignored.
     set: []const u8,
+    /// :s/pat/rep[/g] — substitute on the current line; :%s for the whole
+    /// file. M1: literal substring matching (no regex).
+    substitute: struct {
+        whole_file: bool,
+        pattern: []const u8,
+        replacement: []const u8,
+        global: bool,
+    },
     /// Anything unrecognized.
     unknown,
 };
@@ -67,6 +75,48 @@ pub fn parse(line: []const u8) Command {
     if (std.mem.eql(u8, word, "noh") or std.mem.eql(u8, word, "nohlsearch")) return .noh;
     if (std.mem.eql(u8, word, "set")) return .{ .set = args };
 
+    // :s/pat/rep/g and :%s/pat/rep/g
+    if (t[0] == 's' or (t.len >= 2 and t[0] == '%' and t[1] == 's')) {
+        const whole_file = t[0] == '%';
+        const i: usize = if (whole_file) 1 else 0;
+        if (i + 1 >= t.len or t[i] != 's' or t[i + 1] != '/') return .unknown;
+        // pattern: up to unescaped '/'
+        var j = i + 2;
+        var pat_end: ?usize = null;
+        while (j < t.len) : (j += 1) {
+            if (t[j] == '\\') {
+                j += 1;
+                continue;
+            }
+            if (t[j] == '/') {
+                pat_end = j;
+                break;
+            }
+        }
+        const pe = pat_end orelse return .unknown;
+        // replacement: up to unescaped '/' or end
+        var k = pe + 1;
+        var rep_end: usize = t.len;
+        while (k < t.len) : (k += 1) {
+            if (t[k] == '\\') {
+                k += 1;
+                continue;
+            }
+            if (t[k] == '/') {
+                rep_end = k;
+                break;
+            }
+        }
+        const flags = t[rep_end + 1 ..];
+        const global = std.mem.indexOfScalar(u8, flags, 'g') != null;
+        return .{ .substitute = .{
+            .whole_file = whole_file,
+            .pattern = t[i + 2 .. pe],
+            .replacement = t[pe + 1 .. rep_end],
+            .global = global,
+        } };
+    }
+
     return .unknown;
 }
 
@@ -96,6 +146,16 @@ test "parse: buffers, noh, set, unknown" {
     const c = parse("set tabstop=2");
     try std.testing.expect(c == .set);
     try std.testing.expectEqualStrings("tabstop=2", c.set);
+    const sub = parse("%s/foo/bar/g");
+    try std.testing.expect(sub == .substitute);
+    try std.testing.expect(sub.substitute.whole_file);
+    try std.testing.expectEqualStrings("foo", sub.substitute.pattern);
+    try std.testing.expectEqualStrings("bar", sub.substitute.replacement);
+    try std.testing.expect(sub.substitute.global);
+    const sub2 = parse("s/a/b/");
+    try std.testing.expect(sub2 == .substitute);
+    try std.testing.expect(!sub2.substitute.whole_file);
+    try std.testing.expect(!sub2.substitute.global);
     try std.testing.expect(parse("foobar") == .unknown);
     try std.testing.expect(parse("w extra") == .unknown);
     try std.testing.expect(parse("q extra") == .unknown);
