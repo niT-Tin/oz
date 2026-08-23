@@ -5792,3 +5792,116 @@ test "windows: editing in one split clamps the other window's stale cursor (no c
     const exit_code = try sess.commandAndWaitExit(":qa\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
+
+test "windows: both splits keep highlighting when showing different buffers" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    // the user flow: oz build.zig → :vs → open the tree → open another zig
+    // file in the focused window — BOTH windows must stay highlighted.
+    var sess = try Session.spawn(io, &.{ oz_exe_path, "build.zig" });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+    const gold = packRgb(224, 175, 104);
+
+    // :vs — the focused (right) window shows build.zig, both halves gold
+    try sess.send(":vs\r");
+    waited = 0;
+    var right_gold = false;
+    while (!right_gold) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        const row = grid.rowText(1);
+        if (std.mem.indexOf(u8, row[40..80], "const") != null) {
+            const c = 40 + std.mem.indexOf(u8, row[40..80], "const").?;
+            right_gold = grid.fg_buf[1 * grid.cols + c] == gold;
+        }
+    }
+    if (!right_gold) {
+        std.debug.print("right half not gold after :vs:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(right_gold);
+
+    // Ctrl-w h → LEFT window, :e src/buffer/utf8.zig there. Now the left
+    // window shows utf8.zig and the right still build.zig — BOTH gold.
+    try sess.send("\x17h");
+    waited = 0;
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 2000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        break;
+    }
+    try sess.send(":e src/buffer/utf8.zig\r");
+    waited = 0;
+    var left_gold = false;
+    var right_still_gold = false;
+    while (!(left_gold and right_still_gold)) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        var r: usize = 1;
+        while (r < 8 and !(left_gold and right_still_gold)) : (r += 1) {
+            const row = grid.rowText(r);
+            // left half (utf8.zig): any gold keyword in rows 2..8
+            if (std.mem.indexOf(u8, row[0..40], "const") != null or
+                std.mem.indexOf(u8, row[0..40], "pub") != null or
+                std.mem.indexOf(u8, row[0..40], "fn") != null)
+            {
+                var c: usize = 2;
+                while (c < 40) : (c += 1) {
+                    if (grid.fg_buf[r * grid.cols + c] == gold) {
+                        left_gold = true;
+                        break;
+                    }
+                }
+            }
+            // right half (build.zig): "const std" still gold on row 1
+            if (std.mem.indexOf(u8, row[40..80], "const") != null) {
+                const cc = 40 + std.mem.indexOf(u8, row[40..80], "const").?;
+                if (grid.fg_buf[r * grid.cols + cc] == gold) right_still_gold = true;
+            }
+        }
+    }
+    if (!(left_gold and right_still_gold)) {
+        std.debug.print("after :e utf8.zig in left window:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(left_gold);
+    try std.testing.expect(right_still_gold);
+
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}

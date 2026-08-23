@@ -30,6 +30,13 @@ const App = struct {
         history: buffer.History,
         path: ?[]u8 = null,
         dirty: bool = false,
+        /// tree-sitter highlighter for THIS buffer (independent of any
+        /// window) — lazily built on the first render of a window showing it,
+        /// so every split window gets real highlighting for its own buffer.
+        hl: ?syntax.Highlighter = null,
+        /// history.revision at this buffer's last parse (incremental-parse
+        /// bookkeeping; maxInt forces a full reparse).
+        syntax_revision: u64 = 0,
     };
 
     /// One split window: which buffer it shows plus its own cursor/viewport.
@@ -99,17 +106,6 @@ const App = struct {
     // recent files (dashboard)
     recent_files: std.ArrayList([]u8) = .empty,
     recent_sel: usize = 0,
-
-    // tree-sitter syntax highlighting (src/syntax.zig). The highlighter
-    // lives here (not in Buffer) so switching buffers just invalidates it.
-    syntax_hl: ?syntax.Highlighter = null,
-    /// Filetype the highlighter was built (or attempted) for. Remembered even
-    /// on init failure so we don't retry the failed language every frame.
-    syntax_ft: []const u8 = "",
-    /// Buffer text changed since the last parse → reparse on next render.
-    syntax_dirty: bool = true,
-    /// history.revision at the last parse — incremental-parse bookkeeping.
-    syntax_revision: u64 = 0,
 
     // file tree (<leader>e)
     filetree_active: bool = false,
@@ -373,8 +369,6 @@ const App = struct {
         const b = self.windows.items[self.current_win].buf;
         if (b != self.current) {
             self.current = b;
-            self.syntax_dirty = true;
-            self.syntax_revision = std.math.maxInt(u64);
         }
         self.state.mode = .normal;
         self.visual_anchor = null;
@@ -395,8 +389,6 @@ const App = struct {
         const b = self.windows.items[i].buf;
         if (b != self.current) {
             self.current = b;
-            self.syntax_dirty = true;
-            self.syntax_revision = std.math.maxInt(u64);
         }
         self.visual_anchor = null;
         self.in_insert = false;
@@ -519,6 +511,7 @@ const App = struct {
         for (self.buffers.items) |*buf| {
             buf.history.deinit();
             buf.pt.deinit();
+            if (buf.hl) |*h| h.deinit();
             if (buf.path) |p| self.alloc.free(p);
         }
         self.buffers.deinit(self.alloc);
@@ -535,7 +528,6 @@ const App = struct {
         self.filetree_files.deinit(self.alloc);
         for (self.recent_files.items) |f| self.alloc.free(f);
         self.recent_files.deinit(self.alloc);
-        if (self.syntax_hl) |*h| h.deinit();
         for (self.picker_files.items) |f| self.alloc.free(f);
         self.picker_files.deinit(self.alloc);
         for (self.grep_results.items) |g| {
@@ -886,8 +878,7 @@ const App = struct {
         // the insert session may have drifted the highlight tree (the "some
         // characters turn comment-gray after jk" bug). A full reparse on
         // every insert exit guarantees correct colors once back in normal.
-        self.syntax_dirty = true;
-        self.syntax_revision = std.math.maxInt(u64);
+        self.cur().syntax_revision = std.math.maxInt(u64);
     }
 
     // ---- visual-block multi-cursor insert (<C-v> block then I/A) ----
@@ -1150,8 +1141,9 @@ const App = struct {
         self.in_insert = false;
         self.prev_insert_key = null;
         self.endInsertSession();
-        self.syntax_dirty = true;
-        self.syntax_revision = std.math.maxInt(u64);
+        // Force a full reparse on the next render: incremental edits during
+        // the insert session may have drifted the highlight tree.
+        self.cur().syntax_revision = std.math.maxInt(u64);
     }
 
     /// Keep the visible (main) cursor on the main multi-cursor's position.
@@ -1762,8 +1754,7 @@ const App = struct {
                 self.state.mode = .insert;
                 self.in_insert = true; // keep the group open; exitInsert closes it
                 self.markDirty();
-                self.syntax_dirty = true;
-                self.syntax_revision = std.math.maxInt(u64);
+                self.cur().syntax_revision = std.math.maxInt(u64);
             },
             .yank => {
                 if (self.yank_buffer) |b| self.alloc.free(b);
@@ -2371,10 +2362,6 @@ const App = struct {
         self.visual_anchor = null;
         self.in_insert = false;
         self.curCursor().* = @min(self.curCursor().*, self.cur().pt.len());
-        // the highlighter tree belongs to the old buffer: force a full
-        // reparse (revision sentinel makes the incremental check fail)
-        self.syntax_dirty = true;
-        self.syntax_revision = std.math.maxInt(u64);
     }
 
     /// Move `delta` buffers (wrapping). gt / gT.
@@ -2424,6 +2411,7 @@ const App = struct {
         var buf = self.buffers.orderedRemove(buf_idx);
         buf.history.deinit();
         buf.pt.deinit();
+        if (buf.hl) |*h| h.deinit();
         if (buf.path) |p| self.alloc.free(p);
         if (self.current >= self.buffers.items.len) self.current = self.buffers.items.len - 1;
         if (buf_idx < self.current) self.current -= 1;
@@ -2440,8 +2428,6 @@ const App = struct {
         // closing the buffer also discards a visual selection anchored in it
         self.visual_anchor = null;
         self.in_insert = false;
-        self.syntax_dirty = true;
-        self.syntax_revision = std.math.maxInt(u64);
     }
 
     /// :bd — close the focused window's buffer; the window shows the next one.
@@ -2487,81 +2473,56 @@ const App = struct {
 
     fn markDirty(self: *App) void {
         self.cur().dirty = true;
-        self.syntax_dirty = true;
     }
 
     // ---- tree-sitter syntax highlighting ----
 
-    /// Ensure the highlighter matches the current buffer's filetype. Returns
-    /// null when the filetype has no grammar, the file is over the size
-    /// limit, or init failed (remembered via syntax_ft — no retry storm).
-    fn ensureSyntax(self: *App) ?*syntax.Highlighter {
-        const ft = filetypeOf(self.cur().path);
-        if (self.syntax_ft.len > 0 and std.mem.eql(u8, self.syntax_ft, ft)) {
-            return if (self.syntax_hl) |*h| h else null;
+    /// Merged non-overlapping spans for the visible byte range of `buf`
+    /// (later spans win overlaps), arena-allocated. Empty when highlighting
+    /// is inactive (no grammar for the filetype / over the size limit).
+    ///
+    /// Every buffer owns its highlighter (`Buffer.hl`), so ANY window —
+    /// focused or not, showing the current buffer or another — gets real
+    /// tree-sitter highlighting for what it displays. Reparse policy: a
+    /// single recorded edit since the last parse takes the incremental path
+    /// (tree.edit + parse); everything else (undo/redo, multi-edit ops, first
+    /// parse, forced full reparses) falls back to a full reparse — the
+    /// incremental bookkeeping must never guess.
+    fn visibleSpansFor(self: *App, buf: *Buffer, arena: std.mem.Allocator, view_top: u32, content_rows: u32) ![]syntax.Span {
+        if (buf.hl == null) {
+            const ft = filetypeOf(buf.path);
+            const lang = syntax.languageFor(ft) orelse return &.{};
+            if (buf.pt.len() > syntax.SIZE_LIMIT) return &.{};
+            buf.hl = syntax.Highlighter.init(self.alloc, lang) catch null;
         }
-        // filetype changed (or first time): rebuild
-        if (self.syntax_hl) |*h| h.deinit();
-        self.syntax_hl = null;
-        self.syntax_ft = ft;
-        const lang = syntax.languageFor(ft) orelse return null;
-        if (self.cur().pt.len() > syntax.SIZE_LIMIT) return null;
-        self.syntax_hl = syntax.Highlighter.init(self.alloc, lang) catch null;
-        if (self.syntax_hl != null) self.syntax_dirty = true;
-        return if (self.syntax_hl) |*h| h else null;
-    }
-
-    /// Reparse the buffer text when it changed since the last parse.
-    /// Single recorded edits take the incremental path (tree.edit + parse);
-    /// everything else (undo/redo, multi-edit ops, first parse) falls back
-    /// to a full reparse — the incremental bookkeeping must never guess.
-    fn refreshSyntax(self: *App) !void {
-        const hl = self.ensureSyntax() orelse return;
-        if (!self.syntax_dirty) return;
-        self.syntax_dirty = false;
-        const hist = &self.cur().history;
+        const hl = &buf.hl.?;
+        const hist = &buf.history;
         const rev = hist.revision;
         const parsed = hl.tree != null;
-        if (parsed and rev == self.syntax_revision) return;
-        const len = self.cur().pt.len();
-        const text = try self.alloc.alloc(u8, len);
-        defer self.alloc.free(text);
-        self.cur().pt.copyRange(0, text);
-        const incremental = parsed and
-            rev > self.syntax_revision and
-            rev - self.syntax_revision == 1 and
-            hist.last_record != null;
-        {
-            var buf: [128]u8 = undefined;
-            const m = std.fmt.bufPrint(&buf, "refresh ft={s} rev={d} syncrev={d} parsed={} incremental={}\n", .{ self.syntax_ft, rev, self.syntax_revision, parsed, incremental }) catch "";
-            const f0 = std.os.linux.openat(std.os.linux.AT.FDCWD, "/tmp/dbg.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644);
-            if (f0 != std.math.maxInt(usize)) {
-                const f: i32 = @intCast(f0);
-                _ = std.os.linux.write(f, m.ptr, m.len);
-                _ = std.os.linux.close(f);
+        if (!(parsed and rev == buf.syntax_revision)) {
+            const len = buf.pt.len();
+            const text = try self.alloc.alloc(u8, len);
+            defer self.alloc.free(text);
+            buf.pt.copyRange(0, text);
+            const incremental = parsed and
+                rev > buf.syntax_revision and
+                rev - buf.syntax_revision == 1 and
+                hist.last_record != null;
+            if (incremental) {
+                const e = hist.last_record.?;
+                try hl.reparseEdit(e.pos, e.pos + @as(u32, @intCast(e.before.len)), e.pos + @as(u32, @intCast(e.after.len)), text);
+            } else {
+                try hl.reparse(text);
             }
+            buf.syntax_revision = rev;
         }
-        if (incremental) {
-            const e = hist.last_record.?;
-            try hl.reparseEdit(e.pos, e.pos + @as(u32, @intCast(e.before.len)), e.pos + @as(u32, @intCast(e.after.len)), text);
-        } else {
-            try hl.reparse(text);
-        }
-        self.syntax_revision = rev;
-    }
-
-    /// Merged non-overlapping spans for the visible byte range (later spans
-    /// win overlaps), arena-allocated. Empty when highlighting is inactive.
-    fn visibleSpans(self: *App, arena: std.mem.Allocator, view_top: u32, content_rows: u32) ![]syntax.Span {
-        try self.refreshSyntax();
-        _ = self.ensureSyntax() orelse return &.{};
-        const line_count = self.cur().pt.lineCount();
-        const start = self.cur().pt.lineStart(@min(view_top, line_count));
+        const line_count = buf.pt.lineCount();
+        const start = buf.pt.lineStart(@min(view_top, line_count));
         const vbottom = @min(view_top + content_rows, line_count);
         // lineStart has no EOF sentinel: the last visible line's end is pt.len()
-        const end: u32 = if (vbottom >= line_count) self.cur().pt.len() else self.cur().pt.lineStart(vbottom);
+        const end: u32 = if (vbottom >= line_count) buf.pt.len() else buf.pt.lineStart(vbottom);
         var raw = std.ArrayList(syntax.Span).empty;
-        try self.syntax_hl.?.spansInRange(@intCast(start), @intCast(end), arena, &raw);
+        try hl.spansInRange(@intCast(start), @intCast(end), arena, &raw);
         var out = std.ArrayList(syntax.Span).empty;
         for (raw.items) |sp| {
             while (out.items.len > 0) {
@@ -2629,12 +2590,10 @@ const App = struct {
                 }
                 _ = self.cur().history.undo(&self.cur().pt);
                 self.curCursor().* = @min(self.curCursor().*, self.cur().pt.len());
-                self.syntax_dirty = true;
             },
             .redo => {
                 _ = self.cur().history.redo(&self.cur().pt);
                 self.curCursor().* = @min(self.curCursor().*, self.cur().pt.len());
-                self.syntax_dirty = true;
             },
             .insert_mode => {
                 // open the undo group immediately so the whole insert session
@@ -2699,8 +2658,7 @@ const App = struct {
                 // structural edit (newline): force a full reparse next frame —
                 // incremental parsing of a newline is where highlight drift
                 // shows up ("o then type then jk leaves gray chars")
-                self.syntax_dirty = true;
-                self.syntax_revision = std.math.maxInt(u64);
+                self.cur().syntax_revision = std.math.maxInt(u64);
             },
             .insert_line_before => {
                 // O: new line above, cursor on it (same open-group semantics)
@@ -2712,6 +2670,8 @@ const App = struct {
                 self.curCursor().* = pos;
                 self.in_insert = true;
                 self.state.mode = .insert;
+                // structural edit (newline): force a full reparse next frame
+                self.cur().syntax_revision = std.math.maxInt(u64);
             },
             .visual_char => {
                 self.state.mode = .visual_char;
@@ -3054,12 +3014,10 @@ const App = struct {
             w.view_top = line_count - rect.height;
         }
 
-        // syntax spans covering the visible byte range. The highlighter is
-        // bound to the current buffer, so every window showing that buffer
-        // gets highlighting (all splits of the same file); windows showing
-        // other buffers render plain.
-        const use_syntax = w.buf == self.current;
-        const merged = if (use_syntax) try self.visibleSpans(a, w.view_top, rect.height) else &.{};
+        // syntax spans covering the visible byte range — every window uses
+        // its own buffer's highlighter, so splits showing different buffers
+        // each get real tree-sitter highlighting.
+        const merged = try self.visibleSpansFor(buf, a, w.view_top, rect.height);
         var span_i: usize = 0;
         var row: u32 = rect.row;
         var line = w.view_top;
