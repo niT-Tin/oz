@@ -1251,6 +1251,7 @@ const App = struct {
             return;
         }
         self.filetree_top = 0;
+        self.filetree_sel = 0;
         if (self.filetree_files.items.len == 0) {
             var root = try std.Io.Dir.cwd().openDir(self.io, ".", .{ .iterate = true });
             defer root.close(self.io);
