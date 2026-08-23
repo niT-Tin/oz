@@ -29,6 +29,14 @@ pub const History = struct {
     redo_stack: std.ArrayList(Group),
     /// non-null while a group is open (between beginGroup/endGroup)
     open: ?Group,
+    /// Monotonic counter bumped on every document mutation (record/undo/
+    /// redo). Syntax highlighting polls it to detect text changes between
+    /// parses.
+    revision: u64 = 0,
+    /// The most recent edit applied via `record` (null after undo/redo — the
+    /// change then has no single-edit description). The stored value shares
+    /// `before`/`after` with the group's Edit entries (History owns them).
+    last_record: ?Edit = null,
 
     pub fn init(allocator: std.mem.Allocator) History {
         return .{
@@ -94,6 +102,8 @@ pub const History = struct {
             .before = before,
             .after = after_copy,
         });
+        self.last_record = .{ .pos = pos, .before = before, .after = after_copy };
+        self.revision += 1;
 
         if (auto_group) self.endGroup();
     }
@@ -140,6 +150,8 @@ pub const History = struct {
             _ = pt.replace(e.pos, @intCast(e.after.len), e.before) catch unreachable;
         }
         self.redo_stack.append(self.allocator, g) catch unreachable;
+        self.revision += 1;
+        self.last_record = null; // undo has no single-edit description
         return true;
     }
 
@@ -151,6 +163,8 @@ pub const History = struct {
             _ = pt.replace(e.pos, @intCast(e.before.len), e.after) catch unreachable;
         }
         self.undo_stack.append(self.allocator, g) catch unreachable;
+        self.revision += 1;
+        self.last_record = null;
         return true;
     }
 

@@ -1972,3 +1972,174 @@ test "tree-sitter: files over the size limit get no highlight pass" {
     const exit_code = try sess.commandAndWaitExit(":q\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
+
+test "visual block: <C-v> block + I/A inserts on every line" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "aaa\nbbb\nccc\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // TEMP DEBUG: dump raw bytes after initial render
+    {
+        const raw = sess.captured();
+        var dbg_i: usize = 0;
+        while (dbg_i < raw.len) : (dbg_i += 1) {
+            const b = raw[dbg_i];
+            if (b == 0x1b) {
+                var j = dbg_i + 1;
+                while (j < raw.len and !(raw[j] >= 0x40 and raw[j] <= 0x7e)) : (j += 1) {}
+                if (j < raw.len) {
+                    const seq = raw[dbg_i .. j + 1];
+                    std.debug.print("[ESC{s}]", .{seq[1..]});
+                    dbg_i = j;
+                }
+                continue;
+            }
+            if (b >= 0x20 and b < 0x7f) {
+                std.debug.print("{c}", .{b});
+            } else {
+                std.debug.print("[0x{x:0>2}]", .{b});
+            }
+        }
+        std.debug.print("\n--- end raw dump ---\n", .{});
+    }
+
+    // --- I: <C-v> (0x16 = ctrl-v) selects a 1-column block, j j grows it to
+    // --- three lines, then I + "XX" types at the block's left edge on every
+    // --- line at once. Esc returns to normal with a single cursor.
+    try sess.send("\x16jjI");
+    waited = 0;
+    while (!grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    std.debug.print("after \\x16jjI (insert entered):\n", .{});
+    grid.dump();
+    try sess.send("X");
+    waited = 0;
+    while (!grid.contains("Xaaa")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    std.debug.print("after first X:\n", .{});
+    grid.dump();
+    try sess.send("X");
+    waited = 0;
+    while (!grid.contains("XXaaa")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!grid.contains("XXaaa")) {
+        std.debug.print("after block I:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("XXaaa"));
+    try std.testing.expect(grid.contains("XXbbb"));
+    if (!grid.contains("XXccc")) {
+        std.debug.print("after block I (no XXccc):\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("XXccc"));
+    try std.testing.expect(!grid.contains("aXX"));
+    try std.testing.expect(grid.contains("INSERT"));
+
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    // --- A: 0 back to the line start, re-select a block across the full
+    // --- lines (<C-v> j j $), then A + "YY" appends right after the block's
+    // --- right edge — here the end of line — on every line at once.
+    try sess.send("0\x16jj$AYY");
+    waited = 0;
+    while (!grid.contains("XXaaaYY")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!grid.contains("XXaaaYY")) {
+        std.debug.print("after block A:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("XXaaaYY"));
+    try std.testing.expect(grid.contains("XXbbbYY"));
+    try std.testing.expect(grid.contains("XXcccYY"));
+
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}

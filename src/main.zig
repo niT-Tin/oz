@@ -82,6 +82,8 @@ const App = struct {
     syntax_ft: []const u8 = "",
     /// Buffer text changed since the last parse → reparse on next render.
     syntax_dirty: bool = true,
+    /// history.revision at the last parse — incremental-parse bookkeeping.
+    syntax_revision: u64 = 0,
 
     // file tree (<leader>e)
     filetree_active: bool = false,
@@ -218,8 +220,9 @@ const App = struct {
             return;
         }
 
-        // Esc cancels an active multi-cursor selection
-        if (self.mc_active and key.codepoint == vaxis.Key.escape) {
+        // Esc cancels an active multi-cursor selection (word cursors). In
+        // insert mode Esc exits the insert session instead (see below).
+        if (self.mc_active and self.state.mode != .insert and key.codepoint == vaxis.Key.escape) {
             self.mc.clear();
             self.mc_active = false;
             return;
@@ -228,7 +231,7 @@ const App = struct {
         // 'd' with an active multi-cursor selection deletes the selected word
         // at every cursor (normal-mode 'd' would pend for a motion instead);
         // cursors sit at word starts, so the word is [pos, pos+wlen)
-        if (self.mc_active and key.codepoint == 'd' and !key.mods.ctrl and !key.mods.alt) {
+        if (self.mc_active and self.state.mode != .insert and key.codepoint == 'd' and !key.mods.ctrl and !key.mods.alt) {
             const w = self.mc.wordRange(&self.cur().pt, self.mc.cursors.items[self.mc.main]);
             if (w.end > w.start) {
                 const wlen = w.end - w.start;
@@ -246,6 +249,18 @@ const App = struct {
             return;
         }
 
+        // Visual block (<C-v>) then I/A: fan one insert cursor out per line
+        // of the block and enter insert mode (vim visual-block insert).
+        // Intercepted before the mode state machine, whose I/A would only
+        // move the single main cursor.
+        if (self.state.mode == .visual_block and self.visual_anchor != null and
+            (key.codepoint == 'I' or key.codepoint == 'A') and
+            !key.mods.ctrl and !key.mods.alt and !key.mods.super)
+        {
+            try self.blockInsert(key.codepoint == 'A');
+            return;
+        }
+
         // Command mode: the ':' command line
         if (self.state.mode == .command) {
             try self.handleCommandKey(key);
@@ -255,6 +270,13 @@ const App = struct {
         // Insert mode: characters insert directly; jk exits (removing the
         // just-typed 'j'), backspace and Ctrl-w delete before the cursor.
         if (self.state.mode == .insert) {
+            // Visual-block multi-cursor insert (I/A after <C-v>): every key
+            // applies at every cursor. The single-cursor path below is
+            // unchanged.
+            if (self.mc_active) {
+                try self.handleMcInsertKey(key);
+                return;
+            }
             if (key.codepoint == vaxis.Key.escape or (key.codepoint == 'c' and key.mods.ctrl)) {
                 self.exitInsert();
                 return;
@@ -349,6 +371,161 @@ const App = struct {
         self.cur().history.endGroup();
         self.in_insert = false;
         self.prev_insert_key = null;
+    }
+
+    // ---- visual-block multi-cursor insert (<C-v> block then I/A) ----
+
+    /// I/A after a Ctrl+v block: place one insert cursor per line of the
+    /// block and enter insert mode. I puts each cursor at the block's left
+    /// edge; A (append) puts them one column past the block's right edge
+    /// (vim: the right edge is the last selected column, so +1 inserts right
+    /// after the selection's rightmost character). Both clamp to the end of
+    /// the line, so short/empty lines get their cursor at end-of-line.
+    /// The anchor line's cursor is added first so it becomes the main one.
+    fn blockInsert(self: *App, append: bool) !void {
+        const anchor = self.visual_anchor orelse return;
+        const pt = &self.cur().pt;
+        const a_line = pt.lineOf(anchor);
+        const c_line = pt.lineOf(self.cur().cursor);
+        const min_line = @min(a_line, c_line);
+        const max_line = @max(a_line, c_line);
+        const a_col = anchor - pt.lineStart(a_line);
+        const c_col = self.cur().cursor - pt.lineStart(c_line);
+        const left_col = @min(a_col, c_col);
+        const right_col = @max(a_col, c_col);
+
+        self.mc.clear();
+        const anchor_col: u32 = if (append)
+            @min(right_col + 1, pt.lineLen(a_line))
+        else
+            @min(left_col, pt.lineLen(a_line));
+        _ = try self.mc.add(pt.lineStart(a_line) + anchor_col);
+        var line = min_line;
+        while (line <= max_line) : (line += 1) {
+            if (line == a_line) continue;
+            const col: u32 = if (append)
+                @min(right_col + 1, pt.lineLen(line))
+            else
+                @min(left_col, pt.lineLen(line));
+            _ = try self.mc.add(pt.lineStart(line) + col);
+        }
+        self.mc_active = true;
+        self.visual_anchor = null; // the selection is consumed by I/A
+        self.state.mode = .insert;
+        self.in_insert = false; // the first insertText opens the undo group
+        self.prev_insert_key = null;
+        self.mcSyncCursor();
+    }
+
+    /// Insert-mode keys with an active visual-block multi-cursor selection.
+    /// Mirrors the single-cursor insert path, but every edit applies at every
+    /// cursor (one history.record per cursor, right-to-left so the earlier
+    /// positions stay valid) and the whole session lives in one undo group.
+    fn handleMcInsertKey(self: *App, key: vaxis.Key) !void {
+        // Esc / Ctrl-c: exit, one main cursor remains
+        if (key.codepoint == vaxis.Key.escape or (key.codepoint == 'c' and key.mods.ctrl)) {
+            self.exitMcInsert();
+            return;
+        }
+        // jk → drop the just-typed 'j' at every cursor, then exit
+        if (self.prev_insert_key) |p| {
+            if (p.codepoint == 'j' and key.codepoint == 'k' and
+                !key.mods.ctrl and !key.mods.alt and !key.mods.super)
+            {
+                var i = self.mc.cursors.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const pos = self.mc.cursors.items[i];
+                    if (pos > 0 and self.cur().pt.byteAt(pos - 1) == 'j') {
+                        try self.cur().history.record(&self.cur().pt, pos - 1, 1, "");
+                        self.mc.cursors.items[i] -= 1;
+                    }
+                }
+                self.exitMcInsert();
+                return;
+            }
+        }
+        if (key.codepoint == vaxis.Key.backspace) {
+            try self.mcBackspace();
+            return;
+        }
+        if (key.codepoint == 'w' and key.mods.ctrl) {
+            try self.mcDeleteWordBefore();
+            return;
+        }
+        self.prev_insert_key = key;
+        if (key.text) |text| {
+            try self.mcInsertText(text);
+        }
+    }
+
+    /// Insert `text` at every visual-block cursor. One history.record per
+    /// cursor, applied right-to-left so earlier positions stay valid; each
+    /// cursor then moves forward by `text.len`.
+    fn mcInsertText(self: *App, text: []const u8) !void {
+        if (!self.in_insert) {
+            self.cur().history.beginGroup();
+            self.in_insert = true;
+        }
+        const tlen: u32 = @intCast(text.len);
+        var i = self.mc.cursors.items.len;
+        while (i > 0) {
+            i -= 1;
+            const pos = self.mc.cursors.items[i];
+            try self.cur().history.record(&self.cur().pt, pos, 0, text);
+            self.mc.cursors.items[i] = pos + tlen;
+        }
+        self.mcSyncCursor();
+        self.markDirty();
+    }
+
+    /// Backspace at every visual-block cursor: delete one character before
+    /// each cursor (right-to-left), cursors land on the deletion start.
+    fn mcBackspace(self: *App) !void {
+        var i = self.mc.cursors.items.len;
+        while (i > 0) {
+            i -= 1;
+            const pos = self.mc.cursors.items[i];
+            if (pos == 0) continue;
+            const start = buffer.ops.prevCharStart(&self.cur().pt, pos);
+            try self.cur().history.record(&self.cur().pt, start, pos - start, "");
+            self.mc.cursors.items[i] = start;
+        }
+        self.mcSyncCursor();
+    }
+
+    /// Ctrl-w at every visual-block cursor: delete the word before each
+    /// cursor (right-to-left), cursors land on the deletion start.
+    fn mcDeleteWordBefore(self: *App) !void {
+        var i = self.mc.cursors.items.len;
+        while (i > 0) {
+            i -= 1;
+            const pos = self.mc.cursors.items[i];
+            if (pos == 0) continue;
+            const start = buffer.ops.wordStartBefore(&self.cur().pt, pos);
+            if (start == pos) continue;
+            try self.cur().history.record(&self.cur().pt, start, pos - start, "");
+            self.mc.cursors.items[i] = start;
+        }
+        self.mcSyncCursor();
+    }
+
+    /// Exit a visual-block multi-cursor insert session: close the undo group,
+    /// drop the extra cursors and leave a single main cursor (the block's
+    /// anchor-line cursor) in normal mode.
+    fn exitMcInsert(self: *App) void {
+        self.mcSyncCursor();
+        self.mc.clear();
+        self.mc_active = false;
+        self.state.mode = .normal;
+        self.cur().history.endGroup();
+        self.in_insert = false;
+        self.prev_insert_key = null;
+    }
+
+    /// Keep the visible (main) cursor on the main multi-cursor's position.
+    fn mcSyncCursor(self: *App) void {
+        if (self.mc.len() > 0) self.cur().cursor = self.mc.cursors.items[self.mc.main];
     }
 
     // ---- easymotion (s / <leader>f) ----
@@ -1221,7 +1398,10 @@ const App = struct {
         self.state.mode = .normal;
         self.in_insert = false;
         self.cur().cursor = @min(self.cur().cursor, self.cur().pt.len());
-        self.syntax_dirty = true; // the highlighter tree belongs to the old buffer
+        // the highlighter tree belongs to the old buffer: force a full
+        // reparse (revision sentinel makes the incremental check fail)
+        self.syntax_dirty = true;
+        self.syntax_revision = std.math.maxInt(u64);
     }
 
     /// Move `delta` buffers (wrapping). gt / gT.
@@ -1273,6 +1453,8 @@ const App = struct {
         if (self.current >= self.buffers.items.len) self.current = self.buffers.items.len - 1;
         self.state.mode = .normal;
         self.in_insert = false;
+        self.syntax_dirty = true;
+        self.syntax_revision = std.math.maxInt(u64);
     }
 
     fn markDirty(self: *App) void {
@@ -1302,15 +1484,32 @@ const App = struct {
     }
 
     /// Reparse the buffer text when it changed since the last parse.
+    /// Single recorded edits take the incremental path (tree.edit + parse);
+    /// everything else (undo/redo, multi-edit ops, first parse) falls back
+    /// to a full reparse — the incremental bookkeeping must never guess.
     fn refreshSyntax(self: *App) !void {
         const hl = self.ensureSyntax() orelse return;
         if (!self.syntax_dirty) return;
         self.syntax_dirty = false;
+        const hist = &self.cur().history;
+        const rev = hist.revision;
+        const parsed = hl.tree != null;
+        if (parsed and rev == self.syntax_revision) return;
         const len = self.cur().pt.len();
         const text = try self.alloc.alloc(u8, len);
         defer self.alloc.free(text);
         self.cur().pt.copyRange(0, text);
-        try hl.reparse(text);
+        const incremental = parsed and
+            rev > self.syntax_revision and
+            rev - self.syntax_revision == 1 and
+            hist.last_record != null;
+        if (incremental) {
+            const e = hist.last_record.?;
+            try hl.reparseEdit(e.pos, e.pos + @as(u32, @intCast(e.before.len)), e.pos + @as(u32, @intCast(e.after.len)), text);
+        } else {
+            try hl.reparse(text);
+        }
+        self.syntax_revision = rev;
     }
 
     /// Merged non-overlapping spans for the visible byte range (later spans

@@ -164,6 +164,26 @@ pub const Highlighter = struct {
         self.tree = new_tree;
     }
 
+    /// Incremental reparse: record a single edit [pos, old_end) → [pos,
+    /// new_end) on the current tree, then parse the new text. Only byte
+    /// offsets matter to our consumers — the point fields are approximated
+    /// (zero); tree-sitter needs them only for position metadata we never
+    /// read.
+    pub fn reparseEdit(self: *Highlighter, pos: u32, old_end: u32, new_end: u32, text: []const u8) !void {
+        if (self.tree) |t| {
+            const zero = treez.Point{ .row = 0, .column = 0 };
+            t.edit(&.{
+                .start_byte = pos,
+                .old_end_byte = old_end,
+                .new_end_byte = new_end,
+                .start_point = zero,
+                .old_end_point = zero,
+                .new_end_point = zero,
+            });
+        }
+        try self.reparse(text);
+    }
+
     /// Run the highlight query over [start_byte, end_byte) and append spans
     /// to `out` (allocated from `arena`, e.g. the render frame arena). The
     /// query cursor is byte-range limited — the O(visible) contract.
@@ -267,4 +287,33 @@ test "highlight: byte-range limiting only yields spans inside the range" {
     for (spans.items) |sp| {
         try std.testing.expect(sp.start >= ls and sp.end <= le);
     }
+}
+
+test "highlight: reparseEdit keeps byte spans correct after an edit" {
+    const alloc = std.testing.allocator;
+    const src = "const a = 1;\nconst b = 2;\n";
+    var hl = try Highlighter.init(alloc, "zig");
+    defer hl.deinit();
+    try hl.reparse(src);
+
+    // single edit: "a" (byte 6) → "aaa" (bytes 6..8)
+    const new_src = "const aaa = 1;\nconst b = 2;\n";
+    try hl.reparseEdit(6, 7, 9, new_src);
+
+    var spans = std.ArrayList(Span).empty;
+    defer spans.deinit(alloc);
+    try hl.spansInRange(0, @intCast(new_src.len), alloc, &spans);
+    var keyword_at_0 = false;
+    var number_at_12 = false;
+    for (spans.items) |sp| {
+        if (sp.style == .keyword and sp.start == 0 and sp.end == 5) keyword_at_0 = true;
+        if (sp.style == .number and sp.start == 12 and sp.end == 13) number_at_12 = true;
+    }
+    if (!keyword_at_0 or !number_at_12) {
+        std.debug.print("spans:", .{});
+        for (spans.items) |sp| std.debug.print(" [{d},{d}) {s}", .{ sp.start, sp.end, @tagName(sp.style) });
+        std.debug.print("\n", .{});
+    }
+    try std.testing.expect(keyword_at_0);
+    try std.testing.expect(number_at_12);
 }
