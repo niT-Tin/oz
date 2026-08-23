@@ -9,6 +9,7 @@ const vaxis = @import("vaxis");
 const buffer = @import("buffer/root.zig");
 const editor = @import("editor/root.zig");
 const util = @import("util/root.zig");
+const syntax = @import("syntax.zig");
 
 // Silence vaxis's per-frame debug logging (pollutes the tty byte stream and
 // interferes with e2e screen reconstruction).
@@ -72,6 +73,15 @@ const App = struct {
     // recent files (dashboard)
     recent_files: std.ArrayList([]u8) = .empty,
     recent_sel: usize = 0,
+
+    // tree-sitter syntax highlighting (src/syntax.zig). The highlighter
+    // lives here (not in Buffer) so switching buffers just invalidates it.
+    syntax_hl: ?syntax.Highlighter = null,
+    /// Filetype the highlighter was built (or attempted) for. Remembered even
+    /// on init failure so we don't retry the failed language every frame.
+    syntax_ft: []const u8 = "",
+    /// Buffer text changed since the last parse → reparse on next render.
+    syntax_dirty: bool = true,
 
     // file tree (<leader>e)
     filetree_active: bool = false,
@@ -171,6 +181,7 @@ const App = struct {
         self.filetree_files.deinit(self.alloc);
         for (self.recent_files.items) |f| self.alloc.free(f);
         self.recent_files.deinit(self.alloc);
+        if (self.syntax_hl) |*h| h.deinit();
         for (self.picker_files.items) |f| self.alloc.free(f);
         self.picker_files.deinit(self.alloc);
         for (self.grep_results.items) |g| {
@@ -1210,6 +1221,7 @@ const App = struct {
         self.state.mode = .normal;
         self.in_insert = false;
         self.cur().cursor = @min(self.cur().cursor, self.cur().pt.len());
+        self.syntax_dirty = true; // the highlighter tree belongs to the old buffer
     }
 
     /// Move `delta` buffers (wrapping). gt / gT.
@@ -1265,6 +1277,69 @@ const App = struct {
 
     fn markDirty(self: *App) void {
         self.cur().dirty = true;
+        self.syntax_dirty = true;
+    }
+
+    // ---- tree-sitter syntax highlighting ----
+
+    /// Ensure the highlighter matches the current buffer's filetype. Returns
+    /// null when the filetype has no grammar, the file is over the size
+    /// limit, or init failed (remembered via syntax_ft — no retry storm).
+    fn ensureSyntax(self: *App) ?*syntax.Highlighter {
+        const ft = filetypeOf(self.cur().path);
+        if (self.syntax_ft.len > 0 and std.mem.eql(u8, self.syntax_ft, ft)) {
+            return if (self.syntax_hl) |*h| h else null;
+        }
+        // filetype changed (or first time): rebuild
+        if (self.syntax_hl) |*h| h.deinit();
+        self.syntax_hl = null;
+        self.syntax_ft = ft;
+        const lang = syntax.languageFor(ft) orelse return null;
+        if (self.cur().pt.len() > syntax.SIZE_LIMIT) return null;
+        self.syntax_hl = syntax.Highlighter.init(self.alloc, lang) catch null;
+        if (self.syntax_hl != null) self.syntax_dirty = true;
+        return if (self.syntax_hl) |*h| h else null;
+    }
+
+    /// Reparse the buffer text when it changed since the last parse.
+    fn refreshSyntax(self: *App) !void {
+        const hl = self.ensureSyntax() orelse return;
+        if (!self.syntax_dirty) return;
+        self.syntax_dirty = false;
+        const len = self.cur().pt.len();
+        const text = try self.alloc.alloc(u8, len);
+        defer self.alloc.free(text);
+        self.cur().pt.copyRange(0, text);
+        try hl.reparse(text);
+    }
+
+    /// Merged non-overlapping spans for the visible byte range (later spans
+    /// win overlaps), arena-allocated. Empty when highlighting is inactive.
+    fn visibleSpans(self: *App, arena: std.mem.Allocator, view_top: u32, content_rows: u32) ![]syntax.Span {
+        try self.refreshSyntax();
+        _ = self.ensureSyntax() orelse return &.{};
+        const line_count = self.cur().pt.lineCount();
+        const start = self.cur().pt.lineStart(@min(view_top, line_count));
+        const vbottom = @min(view_top + content_rows, line_count);
+        // lineStart has no EOF sentinel: the last visible line's end is pt.len()
+        const end: u32 = if (vbottom >= line_count) self.cur().pt.len() else self.cur().pt.lineStart(vbottom);
+        var raw = std.ArrayList(syntax.Span).empty;
+        try self.syntax_hl.?.spansInRange(@intCast(start), @intCast(end), arena, &raw);
+        var out = std.ArrayList(syntax.Span).empty;
+        for (raw.items) |sp| {
+            while (out.items.len > 0) {
+                var last = &out.items[out.items.len - 1];
+                if (sp.start >= last.end) break; // disjoint
+                if (sp.start <= last.start) {
+                    _ = out.pop(); // covers the previous span wholly
+                    continue;
+                }
+                last.end = sp.start; // later span wins the overlap
+                break;
+            }
+            try out.append(arena, sp);
+        }
+        return out.items;
     }
 
     /// Load recent files from ~/.cache/oz/recent (one path per line).
@@ -1318,10 +1393,12 @@ const App = struct {
                 }
                 _ = self.cur().history.undo(&self.cur().pt);
                 self.cur().cursor = @min(self.cur().cursor, self.cur().pt.len());
+                self.syntax_dirty = true;
             },
             .redo => {
                 _ = self.cur().history.redo(&self.cur().pt);
                 self.cur().cursor = @min(self.cur().cursor, self.cur().pt.len());
+                self.syntax_dirty = true;
             },
             .insert_mode => self.state.mode = .insert,
             .append => {
@@ -1556,6 +1633,9 @@ const App = struct {
 
         var row: u32 = 0;
         var line = self.cur().view_top;
+        // syntax spans covering the visible byte range (empty when inactive)
+        const merged = try self.visibleSpans(a, self.cur().view_top, content_rows);
+        var span_i: usize = 0;
         while (row < content_rows and line < line_count) : ({
             line += 1;
             row += 1;
@@ -1574,42 +1654,47 @@ const App = struct {
             const text = try a.alloc(u8, n);
             self.cur().pt.copyRange(line_start, text);
 
-            // visual selection highlight (M1: char-wise range; line/block
-            // kinds reuse the char range)
-            var segs: [4]vaxis.Segment = undefined;
-            var nseg: usize = 0;
-            segs[nseg] = .{ .text = num_str };
-            nseg += 1;
+            // visual selection bounds as local columns (both = n if absent)
+            var sel_s: u32 = n;
+            var sel_e: u32 = n;
             if (self.visual_anchor) |anchor| {
                 const sel_start = @min(anchor, self.cur().cursor);
                 const sel_end = @max(anchor, self.cur().cursor);
                 const line_end = line_start + line_len;
                 if (sel_start < line_end and sel_end > line_start) {
-                    const s = @max(sel_start, line_start) - line_start;
-                    const e = @min(sel_end, line_end) - line_start;
-                    if (s > 0) {
-                        segs[nseg] = .{ .text = text[0..s] };
-                        nseg += 1;
-                    }
-                    segs[nseg] = .{
-                        .text = text[s..e],
-                        .style = .{ .bg = .{ .rgb = .{ 54, 74, 130 } } },
-                    };
-                    nseg += 1;
-                    if (e < n) {
-                        segs[nseg] = .{ .text = text[e..n] };
-                        nseg += 1;
-                    }
-                } else {
-                    segs[nseg] = .{ .text = text };
-                    nseg += 1;
+                    sel_s = @max(sel_start, line_start) - line_start;
+                    sel_e = @min(sel_end, line_end) - line_start;
                 }
-            } else {
-                segs[nseg] = .{ .text = text };
-                nseg += 1;
             }
 
-            _ = win.print(segs[0..nseg], .{
+            // split the line into styled runs: syntax fg from the merged
+            // spans, selection bg over the selected columns
+            var segs = std.ArrayList(vaxis.Segment).empty;
+            try segs.append(a, .{ .text = num_str });
+            var col: u32 = 0;
+            while (col < n) {
+                while (span_i < merged.len and merged[span_i].end <= line_start + col) span_i += 1;
+                var next: u32 = n;
+                var fg: ?vaxis.Style = null;
+                if (span_i < merged.len) {
+                    const sp = merged[span_i];
+                    if (sp.start < line_start + n and sp.end > line_start + col) {
+                        fg = syntaxStyle(sp.style);
+                        const sp_start: u32 = if (sp.start > line_start) sp.start - line_start else 0;
+                        const sp_end: u32 = if (sp.end < line_start + n) sp.end - line_start else n;
+                        next = if (sp_start > col) sp_start else sp_end;
+                    }
+                }
+                if (sel_s > col and sel_s < next) next = sel_s;
+                if (sel_e > col and sel_e < next) next = sel_e;
+                const in_sel = col >= sel_s and col < sel_e;
+                var style: vaxis.Style = if (in_sel) .{ .bg = .{ .rgb = .{ 54, 74, 130 } } } else .{};
+                if (fg) |f| style.fg = f.fg;
+                try segs.append(a, .{ .text = text[col..next], .style = style });
+                col = next;
+            }
+
+            _ = win.print(segs.items, .{
                 .row_offset = @intCast(row),
                 .col_offset = @intCast(self.contentCol()),
                 .wrap = .none,
@@ -1830,6 +1915,23 @@ fn filetypeOf(path: ?[]const u8) []const u8 {
     const ext = std.fs.path.extension(base);
     if (ext.len <= 1) return "";
     return ext[1..];
+}
+
+/// Kanagawa-wave-flavored palette for the tree-sitter capture groups
+/// (src/syntax.zig Style). Background 41,46,66; fg 192,202,245.
+fn syntaxStyle(style: syntax.Style) vaxis.Style {
+    return switch (style) {
+        .default => .{},
+        .comment => .{ .fg = .{ .rgb = .{ 116, 127, 148 } } },
+        .keyword => .{ .fg = .{ .rgb = .{ 224, 175, 104 } } }, // gold
+        .string => .{ .fg = .{ .rgb = .{ 152, 195, 121 } } }, // green
+        .number, .constant, .boolean, .character => .{ .fg = .{ .rgb = .{ 210, 126, 139 } } }, // red
+        .function, .tag, .namespace => .{ .fg = .{ .rgb = .{ 122, 162, 247 } } }, // blue
+        .type, .constructor, .label => .{ .fg = .{ .rgb = .{ 124, 199, 199 } } }, // cyan
+        .operator, .variable, .parameter, .property => .{ .fg = .{ .rgb = .{ 192, 202, 245 } } },
+        .attribute, .builtin => .{ .fg = .{ .rgb = .{ 224, 175, 104 } } },
+        .punctuation => .{ .fg = .{ .rgb = .{ 122, 124, 135 } } },
+    };
 }
 
 fn parseLineArg(arg: []const u8) ?u32 {

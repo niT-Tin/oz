@@ -38,6 +38,13 @@
             .url = "git+https://github.com/neurocyte/libvaxis?ref=main#200ee5df1e862b03b971d9fdb48656b502c72434",
             .hash = "vaxis-0.6.0-BWNV_ALfCQCcOilT8JtOaYa4gzMl_9oApKk0HfxNFo5Z",
         },
+        // tree-sitter C runtime + 90 grammars + the treez Zig binding
+        // (neurocyte fork, same source flow-syntax consumes). Cached locally,
+        // no network at build time.
+        .tree_sitter = .{
+            .url = "https://github.com/neurocyte/tree-sitter/releases/download/master-6dcdaba7bcf5c0e5c5d420033e0e437aa8873a96/source.tar.gz",
+            .hash = "tree_sitter-0.26.7-z0LhyPQ75zM947UORMphQFT3SJWIT5tt4IVTNqmWn7JZ",
+        },
     },
     // Specifies the set of files and directories that are included in this package.
     // Only files and directories listed here are included in the `hash` that

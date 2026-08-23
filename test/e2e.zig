@@ -247,26 +247,37 @@ fn killPid(pid: std.posix.pid_t) void {
     _ = linux.kill(pid, std.posix.SIG.KILL);
 }
 
+/// Pack an RGB triple for Grid.fg assertions.
+fn packRgb(r: u8, g: u8, b: u8) u32 {
+    return (@as(u32, r) << 16) | (@as(u32, g) << 8) | b;
+}
+
 /// Minimal ANSI parser that reconstructs a character grid from the terminal
 /// byte stream (nvim Screen-expectations in miniature). Handles CSI cursor
-/// positioning (H/f/G), SGR (ignored), private-mode and OSC sequences; ASCII
-/// only — good enough for M0 assertions. Diff-rendered streams only emit
-/// changed cells, so raw byte matching is unreliable; the grid is not.
+/// positioning (H/f/G), SGR fg colors (38;2;r;g;b and 38:2:r:g:b), private-
+/// mode and OSC sequences; ASCII only — good enough for M0 assertions.
+/// Diff-rendered streams only emit changed cells, so raw byte matching is
+/// unreliable; the grid is not.
 const Grid = struct {
     rows: usize = 24,
     cols: usize = 80,
     buf: []u8, // rows*cols
+    fg_buf: []u32, // rows*cols packed RGB (0 = default)
     row: usize = 0,
     col: usize = 0,
+    fg: u32 = 0, // current fg color (packed RGB, 0 = default)
 
     fn init(alloc: std.mem.Allocator) !Grid {
         const buf = try alloc.alloc(u8, 24 * 80);
         @memset(buf, ' ');
-        return .{ .buf = buf };
+        const fg_buf = try alloc.alloc(u32, 24 * 80);
+        @memset(fg_buf, 0);
+        return .{ .buf = buf, .fg_buf = fg_buf };
     }
 
     fn deinit(self: *Grid, alloc: std.mem.Allocator) void {
         alloc.free(self.buf);
+        alloc.free(self.fg_buf);
     }
 
     fn cell(self: *Grid, row: usize, col: usize) *u8 {
@@ -345,6 +356,7 @@ const Grid = struct {
                     }
                     if (self.row < self.rows and self.col < self.cols) {
                         self.cell(self.row, self.col).* = b;
+                        self.fg_buf[self.row * self.cols + self.col] = self.fg;
                     }
                     self.col += 1;
                     i += 1;
@@ -363,7 +375,26 @@ const Grid = struct {
             },
             'G' => self.col = @min(p0 - 1, self.cols - 1),
             'd' => self.row = @min(p0 - 1, self.rows - 1),
-            else => {}, // SGR (m), clear (J/K), modes (h/l), etc. ignored
+            'm' => {
+                // SGR: 0 reset, 39 fg default, 38;2;r;g;b (or 38:2:r:g:b) fg
+                var k: usize = 0;
+                while (k < np) {
+                    const p = params[k];
+                    if (p == 0 or p == 39) {
+                        self.fg = 0;
+                    } else if (p == 38 and k + 4 < np and params[k + 1] == 2) {
+                        self.fg = packRgb(
+                            @intCast(params[k + 2]),
+                            @intCast(params[k + 3]),
+                            @intCast(params[k + 4]),
+                        );
+                        k += 5;
+                        continue;
+                    }
+                    k += 1;
+                }
+            },
+            else => {}, // clear (J/K), modes (h/l), etc. ignored
         }
     }
 
@@ -373,6 +404,22 @@ const Grid = struct {
         while (r < self.rows) : (r += 1) {
             const row_text = self.buf[r * self.cols .. (r + 1) * self.cols];
             if (std.mem.indexOf(u8, row_text, needle) != null) return true;
+        }
+        return false;
+    }
+
+    /// true if `needle` appears on any row with the given packed fg color on
+    /// its first character (tree-sitter color assertions).
+    fn containsFg(self: *Grid, needle: []const u8, fg: u32) bool {
+        var r: usize = 0;
+        while (r < self.rows) : (r += 1) {
+            const row_text = self.buf[r * self.cols .. (r + 1) * self.cols];
+            var c: usize = 0;
+            while (c + needle.len <= self.cols) : (c += 1) {
+                if (std.mem.eql(u8, row_text[c .. c + needle.len], needle)) {
+                    if (self.fg_buf[r * self.cols + c] == fg) return true;
+                }
+            }
         }
         return false;
     }
@@ -1835,6 +1882,92 @@ test "recent picker: <leader>sr lists and reopens a recent file" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(grid.contains("BBB"));
+
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "tree-sitter: zig keywords/comments/strings get syntax colors" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}syn.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const x = 1; // note\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // kanagawa palette (src/main.zig syntaxStyle): keyword gold,
+    // comment faded gray, string green. Assert on the packed fg of the
+    // first character of each token.
+    try std.testing.expect(grid.containsFg("const", packRgb(224, 175, 104)));
+    try std.testing.expect(grid.containsFg("// note", packRgb(116, 127, 148)));
+
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "tree-sitter: files over the size limit get no highlight pass" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}big.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        // >100 KB: syntax.SIZE_LIMIT disables the highlight pass entirely
+        var i: usize = 0;
+        while (i < 110 * 1024) : (i += 1) {
+            try f.writeStreamingAll(io, "const x = 1;\n");
+        }
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+    // no gold anywhere: the pass was skipped, text renders in default fg
+    try std.testing.expect(!grid.containsFg("const", packRgb(224, 175, 104)));
 
     const exit_code = try sess.commandAndWaitExit(":q\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);

@@ -22,6 +22,14 @@ pub fn build(b: *std.Build) void {
     });
     const vaxis_mod = vaxis_dep.module("vaxis");
 
+    // tree-sitter (C runtime + grammars + treez Zig binding). The treez
+    // module links the static library; importers must also link libc.
+    const ts_dep = b.dependency("tree_sitter", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const treez_mod = ts_dep.module("treez");
+
     // ---- executable ----
     const exe = b.addExecutable(.{
         .name = "oz",
@@ -31,9 +39,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "vaxis", .module = vaxis_mod },
+                .{ .name = "treez", .module = treez_mod },
             },
         }),
     });
+    exe.root_module.link_libc = true;
     b.installArtifact(exe);
 
     // ---- run step ----
@@ -53,9 +63,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "vaxis", .module = vaxis_mod },
+                .{ .name = "treez", .module = treez_mod },
             },
         }),
     });
+    tests.root_module.link_libc = true;
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests (L1 logic + L2 render snapshots)");
     test_step.dependOn(&run_tests.step);
