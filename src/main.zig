@@ -42,6 +42,11 @@ const App = struct {
     file_path: ?[]u8 = null,
     msg: ?[]u8 = null, // transient status message (owned)
 
+    // visual selection
+    visual_anchor: ?u32 = null,
+    // yank buffer (M0: in-memory; OSC52 system clipboard is a later step)
+    yank_buffer: ?[]u8 = null,
+
     fn create(init: std.process.Init) !*App {
         const self = try init.gpa.create(App);
         errdefer init.gpa.destroy(self);
@@ -102,6 +107,7 @@ const App = struct {
         self.cmd_history.deinit(self.alloc);
         if (self.file_path) |p| self.alloc.free(p);
         if (self.msg) |m| self.alloc.free(m);
+        if (self.yank_buffer) |b| self.alloc.free(b);
     }
 
     // ---- input ----
@@ -164,12 +170,23 @@ const App = struct {
                 self.cursor = cur;
             },
             .op_motion => |m| {
-                // M0: d/c/y over [cursor, target)
-                const target_pos = editor.Motion.target(&self.pt, m.motion, m.args, self.cursor, m.count);
-                switch (m.op) {
-                    .delete => try self.deleteRange(self.cursor, target_pos, m.exclusive_end),
-                    else => {}, // change/yank wired in later milestones
+                // text object (diw / ci( / yaw …): resolve at the cursor
+                if (m.text_object) |kind| {
+                    const rng = editor.TextObject.range(&self.pt, kind, self.cursor);
+                    try self.applyOpRange(m.op, rng.start, rng.end, false);
+                    return;
                 }
+                // visual mode: the operator acts on the selection
+                if (self.isVisual()) {
+                    if (self.visual_anchor) |anchor| {
+                        try self.applyOpRange(m.op, anchor, self.cursor, false);
+                    }
+                    self.exitVisual();
+                    return;
+                }
+                // normal mode: d/c/y over [cursor, target)
+                const target_pos = editor.Motion.target(&self.pt, m.motion, m.args, self.cursor, m.count);
+                try self.applyOpRange(m.op, self.cursor, target_pos, m.exclusive_end);
             },
             .command_mode => {
                 // ':' pressed: open the command line (Mode already set .command)
@@ -373,6 +390,60 @@ const App = struct {
         self.cursor = start;
     }
 
+    /// Apply an operator (d/c/y) over a range. `exclusive` trims the end char
+    /// (vim exclusive motions); text objects and selections pass false with an
+    /// already-exact range.
+    fn applyOpRange(self: *App, op: editor.KeyEvent.ActionId, from: u32, to: u32, exclusive: bool) !void {
+        switch (op) {
+            .delete => try self.deleteRange(from, to, exclusive),
+            .change => try self.changeRange(from, to, exclusive),
+            .yank => try self.yankRange(from, to, exclusive),
+            else => {},
+        }
+    }
+
+    /// c{motion} / c{motion} / visual-c: delete the range and enter insert
+    /// mode; the deletion and the typed replacement share one undo group.
+    fn changeRange(self: *App, from: u32, to: u32, exclusive: bool) !void {
+        const start = @min(from, to);
+        var end = @max(from, to);
+        if (exclusive and end > start) end -= 1;
+        self.cursor = start;
+        if (end <= start) {
+            self.state.mode = .insert;
+            self.in_insert = true; // empty change: open group so typing stays undoable
+            return;
+        }
+        self.history.beginGroup();
+        try self.history.record(&self.pt, start, end - start, "");
+        self.state.mode = .insert;
+        self.in_insert = true; // keep the group open; exitInsert closes it
+    }
+
+    /// y{motion} / visual-y: copy the range into the yank buffer.
+    fn yankRange(self: *App, from: u32, to: u32, exclusive: bool) !void {
+        const start = @min(from, to);
+        var end = @max(from, to);
+        if (exclusive and end > start) end -= 1;
+        if (self.yank_buffer) |b| self.alloc.free(b);
+        const buf = try self.alloc.alloc(u8, end - start);
+        self.pt.copyRange(start, buf);
+        self.yank_buffer = buf;
+        try self.setMsg(try std.fmt.allocPrint(self.alloc, "yanked {d} bytes", .{buf.len}));
+    }
+
+    fn isVisual(self: *const App) bool {
+        return switch (self.state.mode) {
+            .visual_char, .visual_line, .visual_block => true,
+            else => false,
+        };
+    }
+
+    fn exitVisual(self: *App) void {
+        self.state.mode = .normal;
+        self.visual_anchor = null;
+    }
+
     fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !void {
         _ = count;
         switch (action) {
@@ -440,12 +511,56 @@ const App = struct {
                 self.cursor = pos;
                 self.state.mode = .insert;
             },
-            .visual_char => self.state.mode = .visual_char,
-            .visual_line => self.state.mode = .visual_line,
-            .visual_block => self.state.mode = .visual_block,
+            .visual_char => {
+                self.state.mode = .visual_char;
+                self.visual_anchor = self.cursor;
+            },
+            .visual_line => {
+                self.state.mode = .visual_line;
+                self.visual_anchor = self.cursor;
+            },
+            .visual_block => {
+                self.state.mode = .visual_block;
+                self.visual_anchor = self.cursor;
+            },
+            .delete, .change, .yank => {
+                // visual mode: the operator acts on the selection directly
+                if (self.isVisual()) {
+                    if (self.visual_anchor) |anchor| {
+                        try self.applyOpRange(action, anchor, self.cursor, false);
+                    }
+                    self.exitVisual();
+                }
+            },
+            .paste => try self.pasteBuffer(false),
+            .paste_before => try self.pasteBuffer(true),
             .enter_command_mode => {},
             else => {},
         }
+    }
+
+    /// p / P: insert the yank buffer at the cursor (M1 simplification: p
+    /// inserts after the current char when not at line end, P at the cursor).
+    fn pasteBuffer(self: *App, before: bool) !void {
+        const buf = self.yank_buffer orelse {
+            try self.setMsg(try self.alloc.dupe(u8, "E353: Nothing in register"));
+            return;
+        };
+        var pos = self.cursor;
+        if (!before) {
+            // p: after the character under the cursor (or at line end)
+            const line = self.pt.lineOf(self.cursor);
+            const line_end = self.pt.lineStart(line) + self.pt.lineLen(line);
+            if (self.cursor < line_end) {
+                var i = self.cursor + 1;
+                while (i < line_end and (self.pt.byteAt(i) & 0xC0) == 0x80) : (i += 1) {}
+                pos = i;
+            }
+        }
+        self.history.beginGroup();
+        try self.history.record(&self.pt, pos, 0, buf);
+        self.history.endGroup();
+        self.cursor = pos + @as(u32, @intCast(buf.len));
     }
 
     // ---- rendering ----
@@ -499,11 +614,42 @@ const App = struct {
             const text = try a.alloc(u8, n);
             self.pt.copyRange(line_start, text);
 
-            const segs = [_]vaxis.Segment{
-                .{ .text = num_str },
-                .{ .text = text },
-            };
-            _ = win.print(&segs, .{
+            // visual selection highlight (M1: char-wise range; line/block
+            // kinds reuse the char range)
+            var segs: [4]vaxis.Segment = undefined;
+            var nseg: usize = 0;
+            segs[nseg] = .{ .text = num_str };
+            nseg += 1;
+            if (self.visual_anchor) |anchor| {
+                const sel_start = @min(anchor, self.cursor);
+                const sel_end = @max(anchor, self.cursor);
+                const line_end = line_start + line_len;
+                if (sel_start < line_end and sel_end > line_start) {
+                    const s = @max(sel_start, line_start) - line_start;
+                    const e = @min(sel_end, line_end) - line_start;
+                    if (s > 0) {
+                        segs[nseg] = .{ .text = text[0..s] };
+                        nseg += 1;
+                    }
+                    segs[nseg] = .{
+                        .text = text[s..e],
+                        .style = .{ .bg = .{ .rgb = .{ 54, 74, 130 } } },
+                    };
+                    nseg += 1;
+                    if (e < n) {
+                        segs[nseg] = .{ .text = text[e..n] };
+                        nseg += 1;
+                    }
+                } else {
+                    segs[nseg] = .{ .text = text };
+                    nseg += 1;
+                }
+            } else {
+                segs[nseg] = .{ .text = text };
+                nseg += 1;
+            }
+
+            _ = win.print(segs[0..nseg], .{
                 .row_offset = @intCast(row),
                 .col_offset = 0,
                 .wrap = .none,

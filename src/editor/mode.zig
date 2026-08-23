@@ -29,6 +29,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const KeyEvent = @import("key_event.zig");
 const Motion = @import("motion.zig");
+const TextObject = @import("text_object.zig");
 
 pub const Mode = enum {
     normal,
@@ -65,12 +66,15 @@ pub const Result = union(enum) {
     /// exclusive_end == false — a sentinel for "count whole lines" that the
     /// caller must special-case (it is unambiguous: d0 is .line_start_bol,
     /// d^ is .line_start with exclusive_end == true).
+    /// When `text_object` is set (diw / ci( / yaw …) the motion fields are
+    /// unused; the caller resolves the text object at the cursor instead.
     op_motion: struct {
         op: KeyEvent.ActionId,
         motion: Motion.Motion,
         args: Motion.Args,
         count: u32,
         exclusive_end: bool,
+        text_object: ?TextObject.Kind = null,
     },
     /// Enter command mode (from ':'), with the leading char already consumed.
     command_mode,
@@ -96,6 +100,9 @@ pub const State = struct {
     pending_g: bool = false,
     /// f/F/t/T seen, awaiting the target char (stores the find action)
     pending_find: ?KeyEvent.ActionId = null,
+    /// operator + 'i'/'a' seen (text-object inner/around), awaiting the target
+    /// char (w ( ) [ { < ' " `); stores 'i' or 'a'
+    pending_text_object: ?u8 = null,
 
     /// backing storage for count_digits. The slice points into this buffer,
     /// so State must not be copied by value while a count is pending.
@@ -123,6 +130,27 @@ pub fn handle(
 }
 
 fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
+    // 0) operator + text object (diw / ci( / yaw …): 'i'/'a' seen, awaiting
+    //    the target character.
+    if (state.pending_text_object) |inner| {
+        state.pending_text_object = null;
+        if (isEscape(key)) {
+            resetPending(state);
+            return .pending;
+        }
+        const kind = blk: {
+            if (key.codepoint > 0xFF) break :blk null;
+            break :blk textObjectKind(inner, @intCast(key.codepoint));
+        } orelse {
+            resetPending(state);
+            return .pending;
+        };
+        if (state.pending_op) |op| {
+            return emitTextObject(state, op, kind);
+        }
+        return .pending;
+    }
+
     // 1) f/F/t/T target char pending — the next key IS the target.
     if (state.pending_find) |find_action| {
         state.pending_find = null;
@@ -169,6 +197,11 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
     if (state.pending_op) |op| {
         if (isEscape(key)) {
             resetPending(state);
+            return .pending;
+        }
+        // 'i'/'a' after an operator start a text object (diw, ci(, yaw…)
+        if (key.codepoint == 'i' or key.codepoint == 'a') {
+            state.pending_text_object = @intCast(key.codepoint);
             return .pending;
         }
         if (KeyEvent.lookup(keymap, key)) |action| {
@@ -295,6 +328,8 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .undo => emitAction(state, .undo),
         .redo => emitAction(state, .redo),
         .repeat_last => emitAction(state, .repeat_last),
+        .paste => emitAction(state, .paste),
+        .paste_before => emitAction(state, .paste_before),
         // never produced by the keymap tables
         .insert_char, .insert_exit, .noop => .pending,
     };
@@ -334,7 +369,15 @@ fn handleVisual(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         resetPending(state);
         return .to_normal;
     }
-    // M0: visual shares the normal-mode parser (motions, operators, count).
+    // d/c/y act directly on the selection (vim: no motion needed after them)
+    if (state.pending_op == null) {
+        if (KeyEvent.lookup(keymap, key)) |action| {
+            if (action == .delete or action == .change or action == .yank) {
+                return emitAction(state, action);
+            }
+        }
+    }
+    // otherwise visual shares the normal-mode parser (motions, operators…)
     return handleNormal(state, key, keymap);
 }
 
@@ -372,6 +415,42 @@ fn emitMotion(state: *State, motion: Motion.Motion, args: Motion.Args) Result {
         .count = count,
         .exclusive_end = exclusive_end,
     } };
+}
+
+/// Operator + text object (diw / ci( / yaw …). The caller resolves the
+/// object's range at the cursor.
+fn emitTextObject(state: *State, op: KeyEvent.ActionId, kind: TextObject.Kind) Result {
+    const count = countValue(state);
+    resetCount(state);
+    state.pending_op = null;
+    state.last_action = op;
+    state.last_count = count;
+    return .{
+        .op_motion = .{
+            .op = op,
+            .motion = .left, // unused when text_object is set
+            .args = .{},
+            .count = count,
+            .exclusive_end = true,
+            .text_object = kind,
+        },
+    };
+}
+
+/// Map a text-object target character (after 'i' or 'a') to a Kind.
+fn textObjectKind(inner: u8, ch: u8) ?TextObject.Kind {
+    const around = inner == 'a';
+    return switch (ch) {
+        'w' => if (around) .around_word else .inner_word,
+        '(', ')' => if (around) .around_paren else .inner_paren,
+        '[', ']' => if (around) .around_bracket else .inner_bracket,
+        '{', '}' => if (around) .around_brace else .inner_brace,
+        '<', '>' => if (around) .around_angle else .inner_angle,
+        '\'' => if (around) .around_quote else .inner_quote,
+        '"' => if (around) .around_dquote else .inner_dquote,
+        '`' => if (around) .around_tick else .inner_tick,
+        else => null,
+    };
 }
 
 fn emitAction(state: *State, action: KeyEvent.ActionId) Result {
@@ -552,6 +631,39 @@ test "dd/yy → line-wise op_motion" {
     try testing.expectEqual(.op_motion, tag(r2));
     try testing.expectEqual(KeyEvent.ActionId.yank, r2.op_motion.op);
     try testing.expect(!r2.op_motion.exclusive_end);
+}
+
+test "operator + text object: diw / ci( / yaw" {
+    var s = State.init();
+    _ = handle(&s, press('d'), Keymaps.normal);
+    _ = handle(&s, press('i'), Keymaps.normal);
+    const r = handle(&s, press('w'), Keymaps.normal);
+    try testing.expectEqual(.op_motion, tag(r));
+    try testing.expectEqual(KeyEvent.ActionId.delete, r.op_motion.op);
+    try testing.expectEqual(TextObject.Kind.inner_word, r.op_motion.text_object);
+
+    var s2 = State.init();
+    _ = handle(&s2, press('c'), Keymaps.normal);
+    _ = handle(&s2, press('i'), Keymaps.normal);
+    const r2 = handle(&s2, press('('), Keymaps.normal);
+    try testing.expectEqual(.op_motion, tag(r2));
+    try testing.expectEqual(KeyEvent.ActionId.change, r2.op_motion.op);
+    try testing.expectEqual(TextObject.Kind.inner_paren, r2.op_motion.text_object);
+
+    var s3 = State.init();
+    _ = handle(&s3, press('y'), Keymaps.normal);
+    _ = handle(&s3, press('a'), Keymaps.normal);
+    const r3 = handle(&s3, press('w'), Keymaps.normal);
+    try testing.expectEqual(.op_motion, tag(r3));
+    try testing.expectEqual(KeyEvent.ActionId.yank, r3.op_motion.op);
+    try testing.expectEqual(TextObject.Kind.around_word, r3.op_motion.text_object);
+
+    // Esc cancels a pending text object
+    var s4 = State.init();
+    _ = handle(&s4, press('d'), Keymaps.normal);
+    _ = handle(&s4, press('i'), Keymaps.normal);
+    const r4 = handle(&s4, esc(), Keymaps.normal);
+    try testing.expectEqual(.pending, tag(r4));
 }
 
 test "operator + count after op: d2w" {

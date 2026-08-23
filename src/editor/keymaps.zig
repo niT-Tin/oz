@@ -50,6 +50,8 @@ pub const normal: KeyMap = &.{
     // editing
     act(.{ .codepoint = 'u' }, .undo),
     act(.{ .codepoint = '.' }, .repeat_last),
+    act(.{ .codepoint = 'p' }, .paste),
+    act(.{ .codepoint = 'P' }, .paste_before),
     act(.{ .codepoint = 'd' }, .delete),
     act(.{ .codepoint = 'c' }, .change),
     act(.{ .codepoint = 'y' }, .yank),

@@ -64,6 +64,8 @@ pub const ActionId = enum {
     undo, // u
     redo, // ctrl-r
     repeat_last, // .
+    paste, // p
+    paste_before, // P
     enter_command_mode, // :
     normal_mode, // esc / ctrl-c
     insert_exit, // jk special-cased by Mode
