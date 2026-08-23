@@ -1682,7 +1682,9 @@ const App = struct {
             vaxis.Key.enter => {
                 if (self.filetree_files.items.len > 0) {
                     const f = self.filetree_files.items[self.filetree_sel];
-                    self.filetree_active = false;
+                    // open the file but keep the tree visible — only
+                    // <space>e (toggleFiletree) or Esc closes it; focus moves
+                    // back to the buffer so typing edits, not the tree
                     self.focus = .buffer;
                     try self.openFile(f);
                 }

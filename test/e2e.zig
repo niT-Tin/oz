@@ -1447,10 +1447,28 @@ test "file tree: <leader>e shows files, Enter opens one" {
     try std.testing.expect(grid.contains(" files "));
     try std.testing.expect(grid.contains("build.zig"));
 
-    // Enter opens the selected entry (the first sorted file: DESIGN.md)
+    // Enter opens the selected entry (the first sorted file: DESIGN.md) but
+    // KEEPS the tree open — only <space>e (toggle) or Esc close it; focus
+    // returns to the buffer so typing edits the file.
     try sess.send("\r");
     waited = 0;
-    while (!grid.contains("NORMAL") or grid.contains(" files ")) {
+    while (!grid.contains("# oz") or !grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("# oz")); // DESIGN.md header (ASCII part)
+    try std.testing.expect(grid.contains(" files ")); // tree stays open after Enter
+
+    // <space>e toggles the tree closed (and is the only toggle)
+    try sess.send(" e");
+    waited = 0;
+    while (grid.contains(" files ")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -1461,7 +1479,7 @@ test "file tree: <leader>e shows files, Enter opens one" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(!grid.contains(" files "));
-    try std.testing.expect(grid.contains("# oz")); // DESIGN.md header (ASCII part)
+    try std.testing.expect(grid.contains("# oz"));
 
     const exit_code = try sess.commandAndWaitExit(":q\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
@@ -4178,10 +4196,12 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
     }
     try std.testing.expect(std.mem.indexOf(u8, grid.rowText(1), "DESIGN.md") != null);
 
-    // j × 1 → README.md, Enter opens it (markdown has no zig grammar)
+    // j × 1 → README.md, Enter opens it (markdown has no zig grammar). The
+    // tree STAYS open (only <space>e / Esc close it) — the buffer tab shows
+    // README.md after the " files " title.
     try sess.send("j\r");
     waited = 0;
-    while (grid.contains("files")) {
+    while (std.mem.indexOf(u8, grid.rowText(0), "README.md") == null) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -4192,21 +4212,24 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(std.mem.indexOf(u8, grid.rowText(0), "README.md") != null);
+    try std.testing.expect(grid.contains("files")); // the tree did not close
 
-    // reopen the tree; the selection keeps its position (README.md, idx 1).
-    // Step j one at a time until the highlighted row shows the ops.zig entry
-    // (idx 6 — src/buffer/ops.zig, before piece_table.zig etc.), then Enter.
-    try sess.send(" e");
+    // The tree is still open with focus on the buffer (Enter moves focus).
+    // Ctrl-w l → sidebar focus, then step j one at a time until the
+    // highlighted row shows the ops.zig entry (idx 6 — src/buffer/ops.zig,
+    // before piece_table.zig etc.), then Enter.
+    try sess.send("\x17l");
     waited = 0;
-    while (std.mem.indexOf(u8, grid.rowText(1), "DESIGN.md") == null) {
+    while (true) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
-            if (waited >= 5000) break;
+            if (waited >= 2000) break;
             continue;
         }
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
+        break;
     }
     const sel_bg = packRgb(54, 74, 130);
     var ops_selected = false;
