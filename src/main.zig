@@ -212,6 +212,13 @@ const App = struct {
             return;
         }
 
+        // Fuzzy picker input — the picker is a modal overlay, so its keys
+        // must win over the file-tree sidebar (which sits behind it).
+        if (self.picker_active) {
+            try self.handlePickerKey(key);
+            return;
+        }
+
         // File tree navigation (j/k/Enter/Esc); other keys fall through
         if (self.filetree_active) {
             if (try self.filetreeKey(key)) return;
@@ -225,12 +232,6 @@ const App = struct {
         // EasyMotion capture: query char, then a label to jump to
         if (self.em_active) {
             try self.handleEasyMotionKey(key);
-            return;
-        }
-
-        // Fuzzy picker input
-        if (self.picker_active) {
-            try self.handlePickerKey(key);
             return;
         }
 
@@ -370,6 +371,10 @@ const App = struct {
                     self.cur().history.endGroup();
                     self.in_insert = false;
                 }
+                // Esc from visual mode must clear the selection anchor, or
+                // the render loop keeps painting the stale selection
+                // highlight (anchor is null on the insert-exit path anyway).
+                self.visual_anchor = null;
             },
         }
     }
@@ -1843,6 +1848,7 @@ const App = struct {
                 .row = @intCast(self.contentTop() + 5 + @as(u32, @intCast(@min(self.recent_sel, 7)))),
                 .col = 2,
             };
+            self.vx.screen.cursor_vis = true;
             self.vx.screen.cursor_shape = .block;
             try self.vx.render(self.tty.writer());
             return;
@@ -2054,6 +2060,7 @@ const App = struct {
                 .row = @intCast(height - 1),
                 .col = @intCast(2 + self.picker_input.items.len),
             };
+            self.vx.screen.cursor_vis = true;
             self.vx.screen.cursor_shape = .block;
             try self.vx.render(self.tty.writer());
             return;
@@ -2071,6 +2078,7 @@ const App = struct {
                 .row = @intCast(height - 1),
                 .col = @intCast(1 + self.cmdline.items.len),
             };
+            self.vx.screen.cursor_vis = true;
             self.vx.screen.cursor_shape = .block;
             try self.vx.render(self.tty.writer());
             return;
@@ -2107,6 +2115,7 @@ const App = struct {
             .row = @intCast(cursor_row),
             .col = @intCast(self.contentCol() + 5 + cursor_col), // gutter offset
         };
+        self.vx.screen.cursor_vis = true;
         self.vx.screen.cursor_shape = if (self.state.mode == .insert) .beam else .block;
 
         try self.vx.render(self.tty.writer());

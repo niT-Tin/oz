@@ -2584,3 +2584,212 @@ test "picker: list scrolls with the selection; the highlighted row stays visible
     const exit_code = try sess.commandAndWaitExit(":q\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
+
+test "visual line: Esc exits and clears the stale selection highlight" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}vl.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "aaa\nbbb\nccc\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    const sel_bg = packRgb(54, 74, 130);
+
+    // V (visual line) then j — the selection spans the first two lines
+    try sess.send("Vj");
+    waited = 0;
+    var sel_visible = false;
+    while (!sel_visible) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        var r: usize = 0;
+        while (r < grid.rows) : (r += 1) {
+            if (grid.rowHasBg(r, sel_bg)) {
+                sel_visible = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(sel_visible);
+
+    // Esc alone (separate write so it isn't Alt+<key>) → back to normal;
+    // the selection highlight must be gone (regression: the anchor stayed
+    // set and render kept painting the stale selection).
+    try sess.send("\x1b");
+    waited = 0;
+    var sel_cleared = false;
+    while (!sel_cleared) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        sel_cleared = true;
+        var r: usize = 0;
+        while (r < grid.rows) : (r += 1) {
+            if (grid.rowHasBg(r, sel_bg)) {
+                sel_cleared = false;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(sel_cleared);
+
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "picker: keys win over the file tree while both are open" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}ft2.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "hello\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    const sel_bg = packRgb(54, 74, 130);
+
+    // <leader>e — file tree sidebar
+    try sess.send(" e");
+    waited = 0;
+    while (!grid.contains("files")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    // the sidebar selection starts on the first entry row (title is row 0)
+    try std.testing.expect(grid.rowHasBg(1, sel_bg));
+
+    // <leader>sf — fuzzy file picker over the still-open file tree
+    try sess.send(" sf");
+    waited = 0;
+    while (!grid.contains("> ")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    const list_top: usize = 24 - 1 - 10 - 1; // the picker list window
+    try std.testing.expect(grid.rowHasBg(list_top, sel_bg));
+
+    // 3 × Ctrl+n — the picker selection must move down the list while the
+    // file-tree selection stays put (before the fix the sidebar ate the
+    // keys and its highlight jumped to row 4).
+    try sess.send("\x0e\x0e\x0e");
+    waited = 0;
+    while (!grid.rowHasBg(list_top + 3, sel_bg)) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.rowHasBg(list_top + 3, sel_bg));
+    // the sidebar highlight stays on row 1 (its own selection never moved)
+    try std.testing.expect(grid.rowHasBg(1, sel_bg));
+
+    // One more ↓ (ESC[B) — arrow keys are also routed to the picker now;
+    // before the fix the file tree ate them and its highlight moved to row
+    // 2 while the picker selection stood still.
+    try sess.send("\x1b[B");
+    waited = 0;
+    while (!grid.rowHasBg(list_top + 4, sel_bg)) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.rowHasBg(list_top + 4, sel_bg));
+    try std.testing.expect(grid.rowHasBg(1, sel_bg));
+
+    // Esc closes the picker (':q' would be eaten by the filter), then quit
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("> ")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
