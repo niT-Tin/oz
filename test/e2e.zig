@@ -1377,3 +1377,98 @@ test "file tree: <leader>e shows files, Enter opens one" {
     const exit_code = try sess.commandAndWaitExit(":q\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
+
+test "multi-buffer: :e opens a tab, gt/:bn switch, :bd closes" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var na_buf: [128:0]u8 = undefined;
+    const na = try std.fmt.bufPrintZ(&na_buf, "/tmp/oz_e2e_{d}_{d}a.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, na, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "AAA\n");
+    }
+    var nb_buf: [128:0]u8 = undefined;
+    const nb = try std.fmt.bufPrintZ(&nb_buf, "/tmp/oz_e2e_{d}_{d}b.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, nb) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, nb, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "BBB\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, na });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("AAA"));
+    try std.testing.expect(grid.contains("a.txt"));
+
+    // :e b.txt — opens a new tab; content switches to BBB
+    try sess.send(":e ");
+    try sess.send(nb);
+    try sess.send("\r");
+    waited = 0;
+    while (!grid.contains("BBB") or grid.contains("AAA")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("BBB"));
+
+    // gt — back to a.txt
+    try sess.send("gt");
+    waited = 0;
+    while (!grid.contains("AAA") or grid.contains("BBB")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("AAA"));
+
+    // :bd — close the current (a.txt), falling back to b.txt
+    try sess.send(":bd\r");
+    waited = 0;
+    while (!grid.contains("BBB") or grid.contains("AAA")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("BBB"));
+    try std.testing.expect(!grid.contains("AAA"));
+
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}

@@ -20,6 +20,17 @@ pub const std_options: std.Options = .{
 const status_row_count: u32 = 1;
 
 const App = struct {
+    /// One open document. `pt`/`history` own their allocations; the struct is
+    /// moved between the list and the active slots (never copied-and-deinit'd).
+    const Buffer = struct {
+        pt: buffer.PieceTable,
+        history: buffer.History,
+        cursor: u32 = 0,
+        view_top: u32 = 0,
+        path: ?[]u8 = null,
+        dirty: bool = false,
+    };
+
     const GrepResult = struct { path: []u8, line: u32, text: []u8 };
 
     io: std.Io,
@@ -31,10 +42,8 @@ const App = struct {
     loop: vaxis.Loop(vaxis.Event),
 
     state: editor.Mode.State,
-    pt: buffer.PieceTable,
-    history: buffer.History,
-    cursor: u32 = 0, // byte offset
-    view_top: u32 = 0, // first visible line
+    buffers: std.ArrayList(Buffer) = .empty,
+    current: usize = 0,
     in_insert: bool = false,
     quit: bool = false,
 
@@ -43,7 +52,6 @@ const App = struct {
     cmd_history: std.ArrayList([]u8),
     cmd_hist_idx: ?usize = null,
     prev_insert_key: ?vaxis.Key = null,
-    file_path: ?[]u8 = null,
     msg: ?[]u8 = null, // transient status message (owned)
 
     // visual selection
@@ -80,6 +88,11 @@ const App = struct {
     // grep mode: one result per line from rg
     grep_results: std.ArrayList(GrepResult) = .empty,
 
+    /// The active buffer (all per-buffer state lives here).
+    fn cur(self: *App) *Buffer {
+        return &self.buffers.items[self.current];
+    }
+
     fn create(init: std.process.Init) !*App {
         const self = try init.gpa.create(App);
         errdefer init.gpa.destroy(self);
@@ -112,8 +125,7 @@ const App = struct {
             .tty_buffer = tty_buffer,
             .loop = undefined,
             .state = editor.Mode.State.init(),
-            .pt = try buffer.PieceTable.init(init.gpa, ""),
-            .history = buffer.History.init(init.gpa),
+            .buffers = .empty,
             .cmdline = .empty,
             .cmd_history = .empty,
             .mc = editor.MultiCursor.init(init.gpa),
@@ -121,6 +133,10 @@ const App = struct {
             .picker_input = .empty,
             .picker_matches = .empty,
         };
+        try self.buffers.append(init.gpa, .{
+            .pt = try buffer.PieceTable.init(init.gpa, ""),
+            .history = buffer.History.init(init.gpa),
+        });
         // NOTE: loop holds pointers to self.tty / self.vx, so the App must
         // stay at a stable address (heap) — never move it after this.
         self.loop = vaxis.Loop(vaxis.Event).init(init.io, &self.tty, &self.vx);
@@ -138,12 +154,15 @@ const App = struct {
         self.vx.deinit(self.alloc, self.tty.writer());
         self.tty.deinit();
         self.alloc.free(self.tty_buffer);
-        self.history.deinit();
-        self.pt.deinit();
+        for (self.buffers.items) |*buf| {
+            buf.history.deinit();
+            buf.pt.deinit();
+            if (buf.path) |p| self.alloc.free(p);
+        }
+        self.buffers.deinit(self.alloc);
         self.cmdline.deinit(self.alloc);
         for (self.cmd_history.items) |h| self.alloc.free(h);
         self.cmd_history.deinit(self.alloc);
-        if (self.file_path) |p| self.alloc.free(p);
         if (self.msg) |m| self.alloc.free(m);
         if (self.yank_buffer) |b| self.alloc.free(b);
         if (self.em_matches.len > 0) self.alloc.free(self.em_matches);
@@ -199,17 +218,17 @@ const App = struct {
         // at every cursor (normal-mode 'd' would pend for a motion instead);
         // cursors sit at word starts, so the word is [pos, pos+wlen)
         if (self.mc_active and key.codepoint == 'd' and !key.mods.ctrl and !key.mods.alt) {
-            const w = self.mc.wordRange(&self.pt, self.mc.cursors.items[self.mc.main]);
+            const w = self.mc.wordRange(&self.cur().pt, self.mc.cursors.items[self.mc.main]);
             if (w.end > w.start) {
                 const wlen = w.end - w.start;
-                self.history.beginGroup();
+                self.cur().history.beginGroup();
                 var i = self.mc.cursors.items.len;
                 while (i > 0) {
                     i -= 1;
                     const pos = self.mc.cursors.items[i];
-                    try self.history.record(&self.pt, pos, wlen, "");
+                    try self.cur().history.record(&self.cur().pt, pos, wlen, "");
                 }
-                self.history.endGroup();
+                self.cur().history.endGroup();
             }
             self.mc.clear();
             self.mc_active = false;
@@ -234,9 +253,9 @@ const App = struct {
                 if (p.codepoint == 'j' and key.codepoint == 'k' and
                     !key.mods.ctrl and !key.mods.alt and !key.mods.super)
                 {
-                    if (self.cursor > 0 and self.pt.byteAt(self.cursor - 1) == 'j') {
-                        try self.history.record(&self.pt, self.cursor - 1, 1, "");
-                        self.cursor -= 1;
+                    if (self.cur().cursor > 0 and self.cur().pt.byteAt(self.cur().cursor - 1) == 'j') {
+                        try self.cur().history.record(&self.cur().pt, self.cur().cursor - 1, 1, "");
+                        self.cur().cursor -= 1;
                     }
                     self.exitInsert();
                     return;
@@ -268,28 +287,28 @@ const App = struct {
             .pending => {},
             .action => |a| try self.execAction(a.action, a.count),
             .motion => |m| {
-                var cur = self.cursor;
-                editor.Motion.apply(&self.pt, m.motion, m.args, &cur, m.count);
-                self.cursor = cur;
+                var new_cursor = self.cur().cursor;
+                editor.Motion.apply(&self.cur().pt, m.motion, m.args, &new_cursor, m.count);
+                self.cur().cursor = new_cursor;
             },
             .op_motion => |m| {
                 // text object (diw / ci( / yaw …): resolve at the cursor
                 if (m.text_object) |kind| {
-                    const rng = editor.TextObject.range(&self.pt, kind, self.cursor);
+                    const rng = editor.TextObject.range(&self.cur().pt, kind, self.cur().cursor);
                     try self.applyOpRange(m.op, rng.start, rng.end, false);
                     return;
                 }
                 // visual mode: the operator acts on the selection
                 if (self.isVisual()) {
                     if (self.visual_anchor) |anchor| {
-                        try self.applyOpRangeEx(m.op, anchor, self.cursor, false, .inclusive_cursor);
+                        try self.applyOpRangeEx(m.op, anchor, self.cur().cursor, false, .inclusive_cursor);
                     }
                     self.exitVisual();
                     return;
                 }
                 // normal mode: d/c/y over [cursor, target)
-                const target_pos = editor.Motion.target(&self.pt, m.motion, m.args, self.cursor, m.count);
-                try self.applyOpRange(m.op, self.cursor, target_pos, m.exclusive_end);
+                const target_pos = editor.Motion.target(&self.cur().pt, m.motion, m.args, self.cur().cursor, m.count);
+                try self.applyOpRange(m.op, self.cur().cursor, target_pos, m.exclusive_end);
             },
             .surround => |s| try self.execSurround(s),
             .align_lines => |a| try self.execAlign(a),
@@ -302,7 +321,7 @@ const App = struct {
             .to_normal => {
                 self.state.mode = .normal;
                 if (self.in_insert) {
-                    self.history.endGroup();
+                    self.cur().history.endGroup();
                     self.in_insert = false;
                 }
             },
@@ -311,7 +330,7 @@ const App = struct {
 
     fn exitInsert(self: *App) void {
         self.state.mode = .normal;
-        self.history.endGroup();
+        self.cur().history.endGroup();
         self.in_insert = false;
         self.prev_insert_key = null;
     }
@@ -331,7 +350,7 @@ const App = struct {
                 self.em_query = @intCast(key.codepoint);
                 if (self.em_matches.len > 0) self.alloc.free(self.em_matches);
                 const q = [1]u8{self.em_query};
-                self.em_matches = try editor.easymotion.find(self.alloc, &self.pt, &q);
+                self.em_matches = try editor.easymotion.find(self.alloc, &self.cur().pt, &q);
                 self.em_labels = true;
             }
             return;
@@ -341,7 +360,7 @@ const App = struct {
         if ((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z')) {
             for (self.em_matches) |m| {
                 if (m.label == ch) {
-                    self.cursor = m.pos;
+                    self.cur().cursor = m.pos;
                     break;
                 }
             }
@@ -360,20 +379,20 @@ const App = struct {
     /// Delete the character before the cursor (backspace). The edit lands in
     /// the open insert undo group so it stays part of the insert session.
     fn deleteBeforeCursor(self: *App) !void {
-        if (self.cursor == 0) return;
-        const start = buffer.ops.prevCharStart(&self.pt, self.cursor);
-        try self.history.record(&self.pt, start, self.cursor - start, "");
-        self.cursor = start;
+        if (self.cur().cursor == 0) return;
+        const start = buffer.ops.prevCharStart(&self.cur().pt, self.cur().cursor);
+        try self.cur().history.record(&self.cur().pt, start, self.cur().cursor - start, "");
+        self.cur().cursor = start;
     }
 
     /// Delete the word before the cursor (Ctrl-w). Vim semantics: walk back
     /// over whitespace then word characters; deletes [start, cursor).
     fn deleteWordBefore(self: *App) !void {
-        if (self.cursor == 0) return;
-        const start = buffer.ops.wordStartBefore(&self.pt, self.cursor);
-        if (start == self.cursor) return;
-        try self.history.record(&self.pt, start, self.cursor - start, "");
-        self.cursor = start;
+        if (self.cur().cursor == 0) return;
+        const start = buffer.ops.wordStartBefore(&self.cur().pt, self.cur().cursor);
+        if (start == self.cur().cursor) return;
+        try self.cur().history.record(&self.cur().pt, start, self.cur().cursor - start, "");
+        self.cur().cursor = start;
     }
 
     // ---- command line (':') ----
@@ -506,8 +525,10 @@ const App = struct {
                 self.quit = true;
             },
             .edit => |path| try self.openFile(path),
-            .buffer_next, .buffer_prev, .buffer_delete => try self.setMsg(try self.alloc.dupe(u8, "M0: single buffer")),
-            .buffer_list => try self.setMsg(try self.alloc.dupe(u8, "M0: single buffer (1)")),
+            .buffer_next => try self.switchBuffer(1),
+            .buffer_prev => try self.switchBuffer(-1),
+            .buffer_delete => self.closeCurrent(),
+            .buffer_list => try self.listBuffers(),
             .noh => try self.setMsg(try self.alloc.dupe(u8, "")),
             .set => |opt| try self.setMsg(try std.fmt.allocPrint(self.alloc, "set {s} (M0: accepted, no-op)", .{opt})),
             .substitute => |sub| try self.execSubstitute(sub),
@@ -518,33 +539,48 @@ const App = struct {
     /// :s/pat/rep[/g] — literal substitution on the current line or whole
     /// file (M1: no regex). The replacement lands in one undo group.
     fn execSubstitute(self: *App, sub: anytype) !void {
-        const start_line = if (sub.whole_file) 0 else self.pt.lineOf(self.cursor);
-        const end_line = if (sub.whole_file) self.pt.lineCount() - 1 else start_line;
+        const start_line = if (sub.whole_file) 0 else self.cur().pt.lineOf(self.cur().cursor);
+        const end_line = if (sub.whole_file) self.cur().pt.lineCount() - 1 else start_line;
 
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
         var changed: bool = false;
         var line = start_line;
         while (line <= end_line) : (line += 1) {
-            const ll = self.pt.lineLen(line);
-            const ls = self.pt.lineStart(line);
+            const ll = self.cur().pt.lineLen(line);
+            const ls = self.cur().pt.lineStart(line);
             const buf = try self.alloc.alloc(u8, ll);
             defer self.alloc.free(buf);
-            self.pt.copyRange(ls, buf);
+            self.cur().pt.copyRange(ls, buf);
 
             const n = replaceLiteral(&out, self.alloc, buf, sub.pattern, sub.replacement, sub.global);
             if (n > 0) changed = true;
-            if (line < self.pt.lineCount() - 1) try out.append(self.alloc, '\n');
+            if (line < self.cur().pt.lineCount() - 1) try out.append(self.alloc, '\n');
         }
 
         if (!changed) {
             try self.setMsg(try self.alloc.dupe(u8, "E486: Pattern not found"));
             return;
         }
-        const start = self.pt.lineStart(start_line);
-        var end = self.pt.lineStart(end_line) + self.pt.lineLen(end_line);
-        if (end_line + 1 < self.pt.lineCount()) end += 1;
+        const start = self.cur().pt.lineStart(start_line);
+        var end = self.cur().pt.lineStart(end_line) + self.cur().pt.lineLen(end_line);
+        if (end_line + 1 < self.cur().pt.lineCount()) end += 1;
         try self.applyEdit(start, end, out.items);
+    }
+
+    /// :ls — list buffers in the status message.
+    fn listBuffers(self: *App) !void {
+        var list = std.ArrayList(u8).empty;
+        defer list.deinit(self.alloc);
+        for (self.buffers.items, 0..) |*buf, i| {
+            if (i > 0) try list.append(self.alloc, ' ');
+            const marker = if (buf.dirty) "+" else " ";
+            const name = if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
+            const part = try std.fmt.allocPrint(self.alloc, "{s}{d} {s}", .{ marker, i + 1, name });
+            defer self.alloc.free(part);
+            try list.appendSlice(self.alloc, part);
+        }
+        try self.setMsg(try list.toOwnedSlice(self.alloc));
     }
 
     fn setMsg(self: *App, owned: []u8) !void {
@@ -553,7 +589,7 @@ const App = struct {
     }
 
     fn writeBuffer(self: *App) !void {
-        const path = self.file_path orelse {
+        const path = self.cur().path orelse {
             try self.setMsg(try self.alloc.dupe(u8, "E32: No file name"));
             return;
         };
@@ -561,49 +597,34 @@ const App = struct {
             try self.setMsg(try std.fmt.allocPrint(self.alloc, "write failed: {s}", .{@errorName(e)}));
             return;
         };
+        self.cur().dirty = false;
         try self.setMsg(try std.fmt.allocPrint(self.alloc, "written: {s}", .{path}));
     }
 
     fn saveFile(self: *App, path: []const u8) !void {
         var f = try std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = true });
         defer f.close(self.io);
-        const len = self.pt.len();
+        const len = self.cur().pt.len();
         const buf = try self.alloc.alloc(u8, len);
         defer self.alloc.free(buf);
-        self.pt.copyRange(0, buf);
+        self.cur().pt.copyRange(0, buf);
         try f.writeStreamingAll(self.io, buf);
     }
 
     fn openFile(self: *App, path: []const u8) !void {
-        var file = std.Io.Dir.cwd().openFile(self.io, path, .{ .mode = .read_only }) catch |e| {
-            try self.setMsg(try std.fmt.allocPrint(self.alloc, "E484: cannot open {s}: {s}", .{ path, @errorName(e) }));
-            return;
-        };
-        defer file.close(self.io);
-        const size = (try file.stat(self.io)).size;
-        const bytes = try self.alloc.alloc(u8, @intCast(size));
-        defer self.alloc.free(bytes);
-        _ = try file.readPositionalAll(self.io, bytes, 0);
-
-        self.pt.deinit();
-        self.pt = try buffer.PieceTable.init(self.alloc, bytes);
-        self.history.deinit();
-        self.history = buffer.History.init(self.alloc); // undo history belongs to the buffer
-        if (self.file_path) |p| self.alloc.free(p);
-        self.file_path = try self.alloc.dupe(u8, path);
-        try self.addRecent(path);
-        self.cursor = 0;
-        self.view_top = 0;
+        // Multi-buffer semantics: open in a new buffer (or switch if open).
+        try self.openInBuffer(path);
     }
 
     fn insertText(self: *App, text: []const u8) !void {
         if (!self.in_insert) {
-            self.history.beginGroup();
+            self.cur().history.beginGroup();
             self.in_insert = true;
         }
         // record() snapshots the pre-edit state and applies the edit itself
-        try self.history.record(&self.pt, self.cursor, 0, text);
-        self.cursor += @intCast(text.len);
+        try self.cur().history.record(&self.cur().pt, self.cur().cursor, 0, text);
+        self.cur().cursor += @intCast(text.len);
+        self.markDirty();
     }
 
     /// Visual-selection end semantics: vim's character-wise selection includes
@@ -621,7 +642,7 @@ const App = struct {
         const start = @min(from, to);
         var end = @max(from, to);
         if (exclusive and end > start) end -= 1;
-        if (sel == .inclusive_cursor and end < self.pt.len()) end += 1;
+        if (sel == .inclusive_cursor and end < self.cur().pt.len()) end += 1;
         if (end <= start) {
             if (op == .change) {
                 self.state.mode = .insert;
@@ -631,22 +652,24 @@ const App = struct {
         }
         switch (op) {
             .delete => {
-                self.history.beginGroup();
-                try self.history.record(&self.pt, start, end - start, "");
-                self.history.endGroup();
-                self.cursor = start;
+                self.cur().history.beginGroup();
+                try self.cur().history.record(&self.cur().pt, start, end - start, "");
+                self.cur().history.endGroup();
+                self.cur().cursor = start;
+                self.markDirty();
             },
             .change => {
-                self.cursor = start;
-                self.history.beginGroup();
-                try self.history.record(&self.pt, start, end - start, "");
+                self.cur().cursor = start;
+                self.cur().history.beginGroup();
+                try self.cur().history.record(&self.cur().pt, start, end - start, "");
                 self.state.mode = .insert;
                 self.in_insert = true; // keep the group open; exitInsert closes it
+                self.markDirty();
             },
             .yank => {
                 if (self.yank_buffer) |b| self.alloc.free(b);
                 const buf = try self.alloc.alloc(u8, end - start);
-                self.pt.copyRange(start, buf);
+                self.cur().pt.copyRange(start, buf);
                 self.yank_buffer = buf;
                 try self.setMsg(try std.fmt.allocPrint(self.alloc, "yanked {d} bytes", .{buf.len}));
             },
@@ -660,27 +683,27 @@ const App = struct {
         switch (s.op) {
             .add => {
                 const rng = self.surroundRange(s.motion, s.args, s.count, s.text_object) orelse return;
-                const res = try editor.surround.add(self.alloc, &self.pt, .{ .start = rng.start, .end = rng.end }, s.ch);
+                const res = try editor.surround.add(self.alloc, &self.cur().pt, .{ .start = rng.start, .end = rng.end }, s.ch);
                 defer self.alloc.free(res.text);
                 try self.applyEdit(res.start, res.end, res.text);
             },
             .delete => {
-                const res = (try editor.surround.delete(self.alloc, &self.pt, self.cursor)) orelse {
+                const res = (try editor.surround.delete(self.alloc, &self.cur().pt, self.cur().cursor)) orelse {
                     try self.setMsg(try self.alloc.dupe(u8, "E54: Unmatched delimiter"));
                     return;
                 };
                 defer self.alloc.free(res.text);
                 try self.applyEdit(res.start, res.end, res.text);
-                self.cursor = res.start;
+                self.cur().cursor = res.start;
             },
             .change => {
-                const res = (try editor.surround.change(self.alloc, &self.pt, self.cursor, s.ch)) orelse {
+                const res = (try editor.surround.change(self.alloc, &self.cur().pt, self.cur().cursor, s.ch)) orelse {
                     try self.setMsg(try self.alloc.dupe(u8, "E54: Unmatched delimiter"));
                     return;
                 };
                 defer self.alloc.free(res.text);
                 try self.applyEdit(res.start, res.end, res.text);
-                self.cursor = res.start;
+                self.cur().cursor = res.start;
             },
         }
     }
@@ -690,15 +713,15 @@ const App = struct {
     fn surroundRange(self: *App, motion: ?editor.Motion.Motion, args: editor.Motion.Args, count: u32, text_object: ?editor.TextObject.Kind) ?editor.TextObject.Range {
         var rng: editor.TextObject.Range = undefined;
         if (text_object) |kind| {
-            const r = editor.TextObject.range(&self.pt, kind, self.cursor);
+            const r = editor.TextObject.range(&self.cur().pt, kind, self.cur().cursor);
             rng = .{ .start = r.start, .end = r.end };
         } else if (motion) |m| {
-            const target = editor.Motion.target(&self.pt, m, args, self.cursor, count);
-            rng = .{ .start = @min(self.cursor, target), .end = @max(self.cursor, target) };
+            const target = editor.Motion.target(&self.cur().pt, m, args, self.cur().cursor, count);
+            rng = .{ .start = @min(self.cur().cursor, target), .end = @max(self.cur().cursor, target) };
         } else return null;
         // trim trailing spaces/tabs (not newlines)
         while (rng.end > rng.start) {
-            const c = self.pt.byteAt(rng.end - 1);
+            const c = self.cur().pt.byteAt(rng.end - 1);
             if (c != ' ' and c != '\t') break;
             rng.end -= 1;
         }
@@ -711,37 +734,38 @@ const App = struct {
         var end_line: u32 = undefined;
         if (a.selection) {
             const anchor = self.visual_anchor orelse return;
-            const s = @min(anchor, self.cursor);
-            const e = @max(anchor, self.cursor);
-            start_line = self.pt.lineOf(s);
-            end_line = self.pt.lineOf(e);
+            const s = @min(anchor, self.cur().cursor);
+            const e = @max(anchor, self.cur().cursor);
+            start_line = self.cur().pt.lineOf(s);
+            end_line = self.cur().pt.lineOf(e);
             self.exitVisual();
         } else {
             var rng: editor.TextObject.Range = undefined;
             if (a.text_object) |kind| {
-                const r = editor.TextObject.range(&self.pt, kind, self.cursor);
+                const r = editor.TextObject.range(&self.cur().pt, kind, self.cur().cursor);
                 rng = .{ .start = r.start, .end = r.end };
             } else if (a.motion) |m| {
-                const target = editor.Motion.target(&self.pt, m, a.args, self.cursor, a.count);
-                rng = .{ .start = @min(self.cursor, target), .end = @max(self.cursor, target) };
+                const target = editor.Motion.target(&self.cur().pt, m, a.args, self.cur().cursor, a.count);
+                rng = .{ .start = @min(self.cur().cursor, target), .end = @max(self.cur().cursor, target) };
             } else return;
-            start_line = self.pt.lineOf(rng.start);
-            end_line = self.pt.lineOf(rng.end);
-            if (rng.end > rng.start and rng.end == self.pt.lineStart(rng.end)) end_line -|= 1;
+            start_line = self.cur().pt.lineOf(rng.start);
+            end_line = self.cur().pt.lineOf(rng.end);
+            if (rng.end > rng.start and rng.end == self.cur().pt.lineStart(rng.end)) end_line -|= 1;
         }
-        const text = try editor.align_text.alignLines(self.alloc, &self.pt, start_line, end_line, a.char);
+        const text = try editor.align_text.alignLines(self.alloc, &self.cur().pt, start_line, end_line, a.char);
         defer self.alloc.free(text);
-        const start = self.pt.lineStart(start_line);
-        var end = self.pt.lineStart(end_line) + self.pt.lineLen(end_line);
-        if (end_line + 1 < self.pt.lineCount()) end += 1; // include trailing '\n'
+        const start = self.cur().pt.lineStart(start_line);
+        var end = self.cur().pt.lineStart(end_line) + self.cur().pt.lineLen(end_line);
+        if (end_line + 1 < self.cur().pt.lineCount()) end += 1; // include trailing '\n'
         try self.applyEdit(start, end, text);
-        self.cursor = start;
+        self.cur().cursor = start;
     }
 
     fn applyEdit(self: *App, start: u32, end: u32, text: []const u8) !void {
-        self.history.beginGroup();
-        try self.history.record(&self.pt, start, end - start, text);
-        self.history.endGroup();
+        self.cur().history.beginGroup();
+        try self.cur().history.record(&self.cur().pt, start, end - start, text);
+        self.cur().history.endGroup();
+        self.markDirty();
     }
 
     fn isVisual(self: *const App) bool {
@@ -754,18 +778,18 @@ const App = struct {
     /// gcc: comment/uncomment the current line (vim semantics: fully commented
     /// lines get uncommented, otherwise everything is commented).
     fn toggleCommentLine(self: *App) !void {
-        const ft = filetypeOf(self.file_path);
+        const ft = filetypeOf(self.cur().path);
         const style = editor.comment.styleForFiletype(ft) orelse {
             try self.setMsg(try self.alloc.dupe(u8, "E505: No comment style for filetype"));
             return;
         };
-        const line = self.pt.lineOf(self.cursor);
-        const toggle = try editor.comment.toggleLines(self.alloc, &self.pt, line, line, style);
+        const line = self.cur().pt.lineOf(self.cur().cursor);
+        const toggle = try editor.comment.toggleLines(self.alloc, &self.cur().pt, line, line, style);
         defer self.alloc.free(toggle.text);
-        const start = self.pt.lineStart(line);
-        const end = start + self.pt.lineLen(line); // toggleLines text excludes the trailing '\n'
+        const start = self.cur().pt.lineStart(line);
+        const end = start + self.cur().pt.lineLen(line); // toggleLines text excludes the trailing '\n'
         try self.applyEdit(start, end, toggle.text);
-        self.cursor = start;
+        self.cur().cursor = start;
     }
 
     fn exitVisual(self: *App) void {
@@ -778,10 +802,10 @@ const App = struct {
     fn mcSelectNext(self: *App) !void {
         if (!self.mc_active) {
             self.mc.clear();
-            _ = try self.mc.add(self.cursor);
+            _ = try self.mc.add(self.cur().cursor);
             self.mc_active = true;
         } else {
-            _ = try self.mc.addNextMatch(&self.pt);
+            _ = try self.mc.addNextMatch(&self.cur().pt);
         }
     }
 
@@ -809,7 +833,7 @@ const App = struct {
         if (self.filetree_files.items.len == 0) {
             try self.toggleFiletree();
         }
-        if (self.file_path) |p| {
+        if (self.cur().path) |p| {
             for (self.filetree_files.items, 0..) |f, i| {
                 if (std.mem.eql(u8, f, p)) {
                     self.filetree_sel = i;
@@ -956,9 +980,9 @@ const App = struct {
                         const r = self.grep_results.items[self.picker_sel];
                         self.closePicker();
                         try self.openFile(r.path);
-                        const line = @min(r.line - 1, self.pt.lineCount() - 1);
-                        self.cursor = self.pt.lineStart(line);
-                        self.view_top = line;
+                        const line = @min(r.line - 1, self.cur().pt.lineCount() - 1);
+                        self.cur().cursor = self.cur().pt.lineStart(line);
+                        self.cur().view_top = line;
                     }
                     return;
                 }
@@ -1040,8 +1064,8 @@ const App = struct {
 
     // ---- dashboard ----
 
-    fn isDashboard(self: *const App) bool {
-        return self.file_path == null and self.pt.len() == 0 and
+    fn isDashboard(self: *App) bool {
+        return self.cur().path == null and self.cur().pt.len() == 0 and
             self.state.mode == .normal and !self.picker_active and !self.em_active;
     }
 
@@ -1080,6 +1104,72 @@ const App = struct {
         while (self.recent_files.items.len > 10) {
             if (self.recent_files.pop()) |f| self.alloc.free(f);
         }
+    }
+
+    // ---- multi-buffer ----
+
+    /// Switch to the buffer at index `i` (clamped, wraps).
+    fn switchTo(self: *App, i: usize) void {
+        if (self.buffers.items.len == 0) return;
+        self.current = i % self.buffers.items.len;
+        self.state.mode = .normal;
+        self.in_insert = false;
+        self.cur().cursor = @min(self.cur().cursor, self.cur().pt.len());
+    }
+
+    /// Move `delta` buffers (wrapping). gt / gT.
+    fn switchBuffer(self: *App, delta: i32) !void {
+        const n = self.buffers.items.len;
+        if (n == 0) return;
+        var next = @as(i32, @intCast(self.current)) + delta;
+        if (next < 0) next += @as(i32, @intCast(n));
+        self.switchTo(@intCast(@mod(next, @as(i32, @intCast(n)))));
+    }
+
+    /// Open `path` in a new buffer unless it is already open (then switch).
+    fn openInBuffer(self: *App, path: []const u8) !void {
+        for (self.buffers.items, 0..) |*buf, i| {
+            if (buf.path) |p| {
+                if (std.mem.eql(u8, p, path)) {
+                    self.switchTo(i);
+                    return;
+                }
+            }
+        }
+        // load the file
+        var file = std.Io.Dir.cwd().openFile(self.io, path, .{ .mode = .read_only }) catch |e| {
+            try self.setMsg(try std.fmt.allocPrint(self.alloc, "E484: cannot open {s}: {s}", .{ path, @errorName(e) }));
+            return;
+        };
+        defer file.close(self.io);
+        const size = (try file.stat(self.io)).size;
+        const bytes = try self.alloc.alloc(u8, @intCast(size));
+        defer self.alloc.free(bytes);
+        _ = try file.readPositionalAll(self.io, bytes, 0);
+
+        try self.buffers.append(self.alloc, .{
+            .pt = try buffer.PieceTable.init(self.alloc, bytes),
+            .history = buffer.History.init(self.alloc),
+            .path = try self.alloc.dupe(u8, path),
+        });
+        try self.addRecent(path);
+        self.switchTo(self.buffers.items.len - 1);
+    }
+
+    /// Close the current buffer; switch to a neighbor. The last buffer stays.
+    fn closeCurrent(self: *App) void {
+        if (self.buffers.items.len <= 1) return;
+        var buf = self.buffers.orderedRemove(self.current);
+        buf.history.deinit();
+        buf.pt.deinit();
+        if (buf.path) |p| self.alloc.free(p);
+        if (self.current >= self.buffers.items.len) self.current = self.buffers.items.len - 1;
+        self.state.mode = .normal;
+        self.in_insert = false;
+    }
+
+    fn markDirty(self: *App) void {
+        self.cur().dirty = true;
     }
 
     /// Load recent files from ~/.cache/oz/recent (one path per line).
@@ -1128,86 +1218,86 @@ const App = struct {
         switch (action) {
             .undo => {
                 if (self.in_insert) {
-                    self.history.endGroup();
+                    self.cur().history.endGroup();
                     self.in_insert = false;
                 }
-                _ = self.history.undo(&self.pt);
-                self.cursor = @min(self.cursor, self.pt.len());
+                _ = self.cur().history.undo(&self.cur().pt);
+                self.cur().cursor = @min(self.cur().cursor, self.cur().pt.len());
             },
             .redo => {
-                _ = self.history.redo(&self.pt);
-                self.cursor = @min(self.cursor, self.pt.len());
+                _ = self.cur().history.redo(&self.cur().pt);
+                self.cur().cursor = @min(self.cur().cursor, self.cur().pt.len());
             },
             .insert_mode => self.state.mode = .insert,
             .append => {
                 // a: insert after the character under the cursor
-                const line = self.pt.lineOf(self.cursor);
-                const end = self.pt.lineStart(line) + self.pt.lineLen(line);
-                if (self.cursor < end) {
-                    var i = self.cursor + 1;
-                    while (i < end and (self.pt.byteAt(i) & 0xC0) == 0x80) : (i += 1) {}
-                    self.cursor = i;
+                const line = self.cur().pt.lineOf(self.cur().cursor);
+                const end = self.cur().pt.lineStart(line) + self.cur().pt.lineLen(line);
+                if (self.cur().cursor < end) {
+                    var i = self.cur().cursor + 1;
+                    while (i < end and (self.cur().pt.byteAt(i) & 0xC0) == 0x80) : (i += 1) {}
+                    self.cur().cursor = i;
                 }
                 self.state.mode = .insert;
             },
             .insert_before => {
                 // I: first non-blank of the line
-                const line = self.pt.lineOf(self.cursor);
-                const ls = self.pt.lineStart(line);
-                const end = ls + self.pt.lineLen(line);
+                const line = self.cur().pt.lineOf(self.cur().cursor);
+                const ls = self.cur().pt.lineStart(line);
+                const end = ls + self.cur().pt.lineLen(line);
                 var pos = ls;
                 while (pos < end) {
-                    const c = self.pt.byteAt(pos);
+                    const c = self.cur().pt.byteAt(pos);
                     if (c != ' ' and c != '\t') break;
                     pos += 1;
                 }
-                self.cursor = pos;
+                self.cur().cursor = pos;
                 self.state.mode = .insert;
             },
             .append_end => {
                 // A: end of the line
-                const line = self.pt.lineOf(self.cursor);
-                self.cursor = self.pt.lineStart(line) + self.pt.lineLen(line);
+                const line = self.cur().pt.lineOf(self.cur().cursor);
+                self.cur().cursor = self.cur().pt.lineStart(line) + self.cur().pt.lineLen(line);
                 self.state.mode = .insert;
             },
             .insert_line_after => {
                 // o: new line below, cursor on it
-                const line = self.pt.lineOf(self.cursor);
-                const pos = self.pt.lineStart(line) + self.pt.lineLen(line);
-                self.history.beginGroup();
-                try self.history.record(&self.pt, pos, 0, "\n");
-                self.history.endGroup();
-                self.cursor = pos + 1;
+                const line = self.cur().pt.lineOf(self.cur().cursor);
+                const pos = self.cur().pt.lineStart(line) + self.cur().pt.lineLen(line);
+                self.cur().history.beginGroup();
+                try self.cur().history.record(&self.cur().pt, pos, 0, "\n");
+                self.cur().history.endGroup();
+                self.cur().cursor = pos + 1;
                 self.state.mode = .insert;
             },
             .insert_line_before => {
                 // O: new line above, cursor on it
-                const line = self.pt.lineOf(self.cursor);
-                const pos = self.pt.lineStart(line);
-                self.history.beginGroup();
-                try self.history.record(&self.pt, pos, 0, "\n");
-                self.history.endGroup();
-                self.cursor = pos;
+                const line = self.cur().pt.lineOf(self.cur().cursor);
+                const pos = self.cur().pt.lineStart(line);
+                self.cur().history.beginGroup();
+                try self.cur().history.record(&self.cur().pt, pos, 0, "\n");
+                self.cur().history.endGroup();
+                self.cur().cursor = pos;
                 self.state.mode = .insert;
             },
             .visual_char => {
                 self.state.mode = .visual_char;
-                self.visual_anchor = self.cursor;
+                self.visual_anchor = self.cur().cursor;
             },
             .visual_line => {
                 self.state.mode = .visual_line;
-                self.visual_anchor = self.cursor;
+                self.visual_anchor = self.cur().cursor;
             },
             .visual_block => {
                 self.state.mode = .visual_block;
-                self.visual_anchor = self.cursor;
+                self.visual_anchor = self.cur().cursor;
             },
             .delete, .change, .yank => {
                 // multi-cursor: d deletes the selected word at every cursor
                 if (self.mc_active and action == .delete) {
-                    const w = self.mc.wordRange(&self.pt, self.mc.cursors.items[self.mc.main]);
+                    const w = self.mc.wordRange(&self.cur().pt, self.mc.cursors.items[self.mc.main]);
                     if (w.end > w.start) {
-                        _ = try self.mc.applyDelete(&self.pt, w.end - w.start);
+                        _ = try self.mc.applyDelete(&self.cur().pt, w.end - w.start);
                     }
                     self.mc.clear();
                     self.mc_active = false;
@@ -1216,12 +1306,14 @@ const App = struct {
                 // visual mode: the operator acts on the selection directly
                 if (self.isVisual()) {
                     if (self.visual_anchor) |anchor| {
-                        try self.applyOpRangeEx(action, anchor, self.cursor, false, .inclusive_cursor);
+                        try self.applyOpRangeEx(action, anchor, self.cur().cursor, false, .inclusive_cursor);
                     }
                     self.exitVisual();
                 }
             },
             .mc_add => try self.mcSelectNext(),
+            .next_buffer => try self.switchBuffer(1),
+            .prev_buffer => try self.switchBuffer(-1),
             .picker_file => try self.openPicker(),
             .picker_grep => try self.openGrepPicker(),
             .filetree_toggle => try self.toggleFiletree(),
@@ -1247,26 +1339,33 @@ const App = struct {
             try self.setMsg(try self.alloc.dupe(u8, "E353: Nothing in register"));
             return;
         };
-        var pos = self.cursor;
+        var pos = self.cur().cursor;
         if (!before) {
             // p: after the character under the cursor (or at line end)
-            const line = self.pt.lineOf(self.cursor);
-            const line_end = self.pt.lineStart(line) + self.pt.lineLen(line);
-            if (self.cursor < line_end) {
-                var i = self.cursor + 1;
-                while (i < line_end and (self.pt.byteAt(i) & 0xC0) == 0x80) : (i += 1) {}
+            const line = self.cur().pt.lineOf(self.cur().cursor);
+            const line_end = self.cur().pt.lineStart(line) + self.cur().pt.lineLen(line);
+            if (self.cur().cursor < line_end) {
+                var i = self.cur().cursor + 1;
+                while (i < line_end and (self.cur().pt.byteAt(i) & 0xC0) == 0x80) : (i += 1) {}
                 pos = i;
             }
         }
-        self.history.beginGroup();
-        try self.history.record(&self.pt, pos, 0, buf);
-        self.history.endGroup();
-        self.cursor = pos + @as(u32, @intCast(buf.len));
+        self.cur().history.beginGroup();
+        try self.cur().history.record(&self.cur().pt, pos, 0, buf);
+        self.cur().history.endGroup();
+        self.cur().cursor = pos + @as(u32, @intCast(buf.len));
     }
 
     // ---- rendering ----
 
     const filetree_width: u32 = 24;
+    const tab_bar_rows: u32 = 1;
+
+    /// Row where the editor content starts (below the tab bar).
+    fn contentTop(self: *const App) u32 {
+        _ = self;
+        return tab_bar_rows;
+    }
 
     fn contentCol(self: *const App) u32 {
         return if (self.filetree_active) filetree_width else 0;
@@ -1286,8 +1385,30 @@ const App = struct {
         if (height <= status_row_count) return;
         const content_rows = height - status_row_count;
 
-        const cursor_line = self.pt.lineOf(self.cursor);
-        const line_count = self.pt.lineCount();
+        const cursor_line = self.cur().pt.lineOf(self.cur().cursor);
+        const line_count = self.cur().pt.lineCount();
+
+        // tab bar: one entry per buffer, current highlighted, + dirty marker
+        {
+            var tab_i: usize = 0;
+            var col: u16 = 0;
+            while (tab_i < self.buffers.items.len) : (tab_i += 1) {
+                const buf = &self.buffers.items[tab_i];
+                const name = if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
+                const dirty = if (buf.dirty) "\u{25cf}" else " ";
+                const label = try std.fmt.allocPrint(a, " {s}{s} ", .{ name, dirty });
+                const seg = [_]vaxis.Segment{.{
+                    .text = label,
+                    .style = if (tab_i == self.current)
+                        .{ .fg = .{ .rgb = .{ 250, 189, 47 } }, .bold = true }
+                    else
+                        .{ .fg = .{ .rgb = .{ 86, 95, 137 } } },
+                }};
+                _ = win.print(&seg, .{ .row_offset = 0, .col_offset = col, .wrap = .none });
+                col +|= @intCast(label.len);
+                if (col >= win.width) break;
+            }
+        }
 
         // dashboard (no file open): title + recent files + hints
         if (self.isDashboard()) {
@@ -1295,12 +1416,12 @@ const App = struct {
                 .text = " oz  ",
                 .style = .{ .fg = .{ .rgb = .{ 250, 189, 47 } }, .bold = true },
             }};
-            _ = win.print(&title_seg, .{ .row_offset = 2, .col_offset = 2, .wrap = .none });
+            _ = win.print(&title_seg, .{ .row_offset = @intCast(self.contentTop() + 2), .col_offset = 2, .wrap = .none });
             const sub_seg = [_]vaxis.Segment{.{
                 .text = " 终端文本编辑器  —  j/k 选择 · Enter 打开 · <leader>sf 找文件 · :e 打开 · :q 退出",
                 .style = .{ .fg = .{ .rgb = .{ 86, 95, 137 } } },
             }};
-            _ = win.print(&sub_seg, .{ .row_offset = 3, .col_offset = 2, .wrap = .none });
+            _ = win.print(&sub_seg, .{ .row_offset = @intCast(self.contentTop() + 3), .col_offset = 2, .wrap = .none });
             var ri: usize = 0;
             while (ri < @min(self.recent_files.items.len, 8)) : (ri += 1) {
                 const fname = self.recent_files.items[ri];
@@ -1312,10 +1433,10 @@ const App = struct {
                     else
                         .{ .fg = .{ .rgb = .{ 122, 162, 247 } } },
                 }};
-                _ = win.print(&seg, .{ .row_offset = @intCast(row), .col_offset = 2, .wrap = .none });
+                _ = win.print(&seg, .{ .row_offset = @intCast(self.contentTop() + row), .col_offset = 2, .wrap = .none });
             }
             self.vx.screen.cursor = .{
-                .row = @intCast(5 + @as(u32, @intCast(@min(self.recent_sel, 7)))),
+                .row = @intCast(self.contentTop() + 5 + @as(u32, @intCast(@min(self.recent_sel, 7)))),
                 .col = 2,
             };
             self.vx.screen.cursor_shape = .block;
@@ -1324,19 +1445,19 @@ const App = struct {
         }
 
         // keep cursor line visible, centered-ish
-        if (self.cursor < self.pt.lineStart(self.view_top)) {
-            self.view_top = cursor_line;
+        if (self.cur().cursor < self.cur().pt.lineStart(self.cur().view_top)) {
+            self.cur().view_top = cursor_line;
         }
-        const view_bottom = self.view_top + content_rows;
+        const view_bottom = self.cur().view_top + content_rows;
         if (cursor_line >= view_bottom) {
-            self.view_top = cursor_line - content_rows + 1;
+            self.cur().view_top = cursor_line - content_rows + 1;
         }
-        if (self.view_top + content_rows > line_count and line_count > content_rows) {
-            self.view_top = line_count - content_rows;
+        if (self.cur().view_top + content_rows > line_count and line_count > content_rows) {
+            self.cur().view_top = line_count - content_rows;
         }
 
         var row: u32 = 0;
-        var line = self.view_top;
+        var line = self.cur().view_top;
         while (row < content_rows and line < line_count) : ({
             line += 1;
             row += 1;
@@ -1349,11 +1470,11 @@ const App = struct {
                 cursor_line - line;
             const num_str = try std.fmt.allocPrint(a, "{d:>4} ", .{rel});
 
-            const line_len = self.pt.lineLen(line);
-            const line_start = self.pt.lineStart(line);
+            const line_len = self.cur().pt.lineLen(line);
+            const line_start = self.cur().pt.lineStart(line);
             const n: u32 = @min(line_len, win.width);
             const text = try a.alloc(u8, n);
-            self.pt.copyRange(line_start, text);
+            self.cur().pt.copyRange(line_start, text);
 
             // visual selection highlight (M1: char-wise range; line/block
             // kinds reuse the char range)
@@ -1362,8 +1483,8 @@ const App = struct {
             segs[nseg] = .{ .text = num_str };
             nseg += 1;
             if (self.visual_anchor) |anchor| {
-                const sel_start = @min(anchor, self.cursor);
-                const sel_end = @max(anchor, self.cursor);
+                const sel_start = @min(anchor, self.cur().cursor);
+                const sel_end = @max(anchor, self.cur().cursor);
                 const line_end = line_start + line_len;
                 if (sel_start < line_end and sel_end > line_start) {
                     const s = @max(sel_start, line_start) - line_start;
@@ -1422,21 +1543,21 @@ const App = struct {
         // multi-cursor word highlights (overlay)
         if (self.mc_active) {
             for (self.mc.cursors.items) |cpos| {
-                const w = self.mc.wordRange(&self.pt, cpos);
+                const w = self.mc.wordRange(&self.cur().pt, cpos);
                 if (w.end <= w.start) continue;
-                const wline = self.pt.lineOf(w.start);
-                if (wline < self.view_top or wline >= self.view_top + content_rows) continue;
-                const ls = self.pt.lineStart(wline);
+                const wline = self.cur().pt.lineOf(w.start);
+                if (wline < self.cur().view_top or wline >= self.cur().view_top + content_rows) continue;
+                const ls = self.cur().pt.lineStart(wline);
                 var p = w.start;
                 while (p < w.end) {
                     const col = p - ls;
                     if (col >= win.width - 5) break;
                     var clen: u32 = 1;
-                    while (p + clen < w.end and (self.pt.byteAt(p + clen) & 0xC0) == 0x80) : (clen += 1) {}
+                    while (p + clen < w.end and (self.cur().pt.byteAt(p + clen) & 0xC0) == 0x80) : (clen += 1) {}
                     var char_buf: [4]u8 = undefined;
-                    self.pt.copyRange(p, char_buf[0..clen]);
+                    self.cur().pt.copyRange(p, char_buf[0..clen]);
                     const g = try a.dupe(u8, char_buf[0..clen]);
-                    win.writeCell(@intCast(self.contentCol() + 5 + col), @intCast(wline - self.view_top), .{
+                    win.writeCell(@intCast(self.contentCol() + 5 + col), @intCast(self.contentTop() + wline - self.cur().view_top), .{
                         .char = .{ .grapheme = g, .width = 1 },
                         .style = .{ .bg = .{ .rgb = .{ 54, 74, 130 } } },
                     });
@@ -1448,11 +1569,11 @@ const App = struct {
         // easymotion labels: overwrite the matched cells with jump labels
         if (self.em_labels) {
             for (self.em_matches) |m| {
-                const mline = self.pt.lineOf(m.pos);
-                if (mline < self.view_top or mline >= self.view_top + content_rows) continue;
-                const col_in_line = m.pos - self.pt.lineStart(mline);
+                const mline = self.cur().pt.lineOf(m.pos);
+                if (mline < self.cur().view_top or mline >= self.cur().view_top + content_rows) continue;
+                const col_in_line = m.pos - self.cur().pt.lineStart(mline);
                 const label = try a.dupe(u8, &[_]u8{m.label});
-                win.writeCell(@intCast(self.contentCol() + 5 + col_in_line), @intCast(mline - self.view_top), .{
+                win.writeCell(@intCast(self.contentCol() + 5 + col_in_line), @intCast(self.contentTop() + mline - self.cur().view_top), .{
                     .char = .{ .grapheme = label, .width = 1 },
                     .style = .{ .fg = .{ .rgb = .{ 250, 189, 47 } }, .bg = .{ .rgb = .{ 54, 74, 130 } } },
                 });
@@ -1521,13 +1642,13 @@ const App = struct {
             try std.fmt.allocPrint(
                 a,
                 "{s} line {d}/{d} col {d}  {s}",
-                .{ mode_str, cursor_line + 1, line_count, self.cursor - self.pt.lineStart(cursor_line), m },
+                .{ mode_str, cursor_line + 1, line_count, self.cur().cursor - self.cur().pt.lineStart(cursor_line), m },
             )
         else
             try std.fmt.allocPrint(
                 a,
                 "{s} line {d}/{d} col {d}",
-                .{ mode_str, cursor_line + 1, line_count, self.cursor - self.pt.lineStart(cursor_line) },
+                .{ mode_str, cursor_line + 1, line_count, self.cur().cursor - self.cur().pt.lineStart(cursor_line) },
             );
         const status_seg = [_]vaxis.Segment{.{
             .text = status,
@@ -1536,8 +1657,8 @@ const App = struct {
         _ = win.print(&status_seg, .{ .row_offset = @intCast(height - 1), .wrap = .none });
 
         // cursor position
-        const cursor_col = self.cursor - self.pt.lineStart(cursor_line);
-        const cursor_row = cursor_line - self.view_top;
+        const cursor_col = self.cur().cursor - self.cur().pt.lineStart(cursor_line);
+        const cursor_row = cursor_line - self.cur().view_top;
         self.vx.screen.cursor = .{
             .row = @intCast(cursor_row),
             .col = @intCast(self.contentCol() + 5 + cursor_col), // gutter offset
@@ -1636,16 +1757,16 @@ pub fn main(init: std.process.Init) !void {
             const bytes = try app.alloc.alloc(u8, @intCast(size));
             defer app.alloc.free(bytes);
             _ = try file.readPositionalAll(app.io, bytes, 0);
-            app.pt.deinit();
-            app.pt = try buffer.PieceTable.init(app.alloc, bytes);
-            if (app.file_path) |p| app.alloc.free(p);
-            app.file_path = try app.alloc.dupe(u8, file_path);
+            app.cur().pt.deinit();
+            app.cur().pt = try buffer.PieceTable.init(app.alloc, bytes);
+            if (app.cur().path) |p| app.alloc.free(p);
+            app.cur().path = try app.alloc.dupe(u8, file_path);
             try app.addRecent(file_path);
         }
         break; // M0: first file only
     }
     if (target_line > 0) {
-        app.cursor = app.pt.lineStart(@min(target_line - 1, app.pt.lineCount() - 1));
+        app.cur().cursor = app.cur().pt.lineStart(@min(target_line - 1, app.cur().pt.lineCount() - 1));
     }
 
     try app.loadRecent();

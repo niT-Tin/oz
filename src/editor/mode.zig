@@ -344,6 +344,9 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
             'g' => return emitMotion(state, .first_line, .{}),
             // ge = end of previous word
             'e' => return emitMotion(state, .word_prev_end, .{}),
+            // gt / gT — next / previous buffer
+            't' => return emitAction(state, .next_buffer),
+            'T' => return emitAction(state, .prev_buffer),
             // gcc / gc — comment sequences
             'c' => {
                 state.pending_gc = true;
@@ -531,6 +534,8 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .picker_grep => emitAction(state, .picker_grep),
         .filetree_toggle => emitAction(state, .filetree_toggle),
         .filetree_locate => emitAction(state, .filetree_locate),
+        .next_buffer => emitAction(state, .next_buffer),
+        .prev_buffer => emitAction(state, .prev_buffer),
         .leader => blk: {
             state.pending_leader = true;
             break :blk .pending;

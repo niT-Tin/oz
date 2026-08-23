@@ -75,6 +75,8 @@ pub const ActionId = enum {
     picker_grep, // <leader>st — grep picker
     filetree_toggle, // <leader>e — toggle file tree
     filetree_locate, // <leader>E — locate current file in tree
+    next_buffer, // gt — next tab
+    prev_buffer, // gT — previous tab
     enter_command_mode, // :
     normal_mode, // esc / ctrl-c
     insert_exit, // jk special-cased by Mode
