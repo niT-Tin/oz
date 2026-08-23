@@ -290,6 +290,8 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         }
         switch (key.codepoint) {
             'f' => return emitAction(state, .leader_find), // <leader>f easymotion
+            'e' => return emitAction(state, .filetree_toggle), // <leader>e tree
+            'E' => return emitAction(state, .filetree_locate), // <leader>E locate
             's' => {
                 state.pending_leader_s = true;
                 return .pending;
@@ -527,6 +529,8 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .mc_add => emitAction(state, .mc_add),
         .picker_file => emitAction(state, .picker_file),
         .picker_grep => emitAction(state, .picker_grep),
+        .filetree_toggle => emitAction(state, .filetree_toggle),
+        .filetree_locate => emitAction(state, .filetree_locate),
         .leader => blk: {
             state.pending_leader = true;
             break :blk .pending;

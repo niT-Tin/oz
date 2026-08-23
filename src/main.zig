@@ -65,6 +65,11 @@ const App = struct {
     recent_files: std.ArrayList([]u8) = .empty,
     recent_sel: usize = 0,
 
+    // file tree (<leader>e)
+    filetree_active: bool = false,
+    filetree_sel: usize = 0,
+    filetree_files: std.ArrayList([]u8) = .empty,
+
     // fuzzy picker (<leader>sf / <leader>st)
     picker_mode: enum { files, grep } = .files,
     picker_active: bool = false,
@@ -143,6 +148,8 @@ const App = struct {
         if (self.yank_buffer) |b| self.alloc.free(b);
         if (self.em_matches.len > 0) self.alloc.free(self.em_matches);
         self.mc.deinit();
+        for (self.filetree_files.items) |f| self.alloc.free(f);
+        self.filetree_files.deinit(self.alloc);
         for (self.recent_files.items) |f| self.alloc.free(f);
         self.recent_files.deinit(self.alloc);
         for (self.picker_files.items) |f| self.alloc.free(f);
@@ -159,6 +166,11 @@ const App = struct {
     // ---- input ----
 
     fn handleKey(self: *App, key: vaxis.Key) !void {
+        // File tree navigation (j/k/Enter/Esc); other keys fall through
+        if (self.filetree_active) {
+            if (try self.filetreeKey(key)) return;
+        }
+
         // Dashboard (no file open): j/k/Enter navigate recent files
         if (self.isDashboard()) {
             if (try self.dashboardKey(key)) return;
@@ -773,6 +785,68 @@ const App = struct {
         }
     }
 
+    // ---- file tree (<leader>e / <leader>E) ----
+
+    fn toggleFiletree(self: *App) !void {
+        if (self.filetree_active) {
+            self.filetree_active = false;
+            return;
+        }
+        if (self.filetree_files.items.len == 0) {
+            var root = try std.Io.Dir.cwd().openDir(self.io, ".", .{ .iterate = true });
+            defer root.close(self.io);
+            try self.walkInto(root, "", &self.filetree_files);
+            std.mem.sort([]u8, self.filetree_files.items, {}, struct {
+                fn lt(_: void, a: []u8, b: []u8) bool {
+                    return std.mem.lessThan(u8, a, b);
+                }
+            }.lt);
+        }
+        self.filetree_active = true;
+    }
+
+    fn locateInFiletree(self: *App) !void {
+        if (self.filetree_files.items.len == 0) {
+            try self.toggleFiletree();
+        }
+        if (self.file_path) |p| {
+            for (self.filetree_files.items, 0..) |f, i| {
+                if (std.mem.eql(u8, f, p)) {
+                    self.filetree_sel = i;
+                    break;
+                }
+            }
+        }
+        self.filetree_active = true;
+    }
+
+    /// j/k/Enter/Esc for the tree; returns true if consumed.
+    fn filetreeKey(self: *App, key: vaxis.Key) !bool {
+        switch (key.codepoint) {
+            'j', vaxis.Key.down => {
+                if (self.filetree_sel + 1 < self.filetree_files.items.len) self.filetree_sel += 1;
+                return true;
+            },
+            'k', vaxis.Key.up => {
+                if (self.filetree_sel > 0) self.filetree_sel -= 1;
+                return true;
+            },
+            vaxis.Key.enter => {
+                if (self.filetree_files.items.len > 0) {
+                    const f = self.filetree_files.items[self.filetree_sel];
+                    self.filetree_active = false;
+                    try self.openFile(f);
+                }
+                return true;
+            },
+            vaxis.Key.escape => {
+                self.filetree_active = false;
+                return true;
+            },
+            else => return false,
+        }
+    }
+
     // ---- fuzzy picker (<leader>sf) ----
 
     fn openPicker(self: *App) !void {
@@ -798,7 +872,7 @@ const App = struct {
         while (try it.next(self.io)) |entry| {
             const name = entry.name;
             if (name.len == 0 or name[0] == '.') continue;
-            if (std.mem.eql(u8, name, "zig-out") or std.mem.eql(u8, name, "node_modules")) continue;
+            if (std.mem.eql(u8, name, "zig-out") or std.mem.eql(u8, name, "zig-pkg") or std.mem.eql(u8, name, "node_modules")) continue;
             const path = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ prefix, name });
             switch (entry.kind) {
                 .directory => {
@@ -1150,6 +1224,8 @@ const App = struct {
             .mc_add => try self.mcSelectNext(),
             .picker_file => try self.openPicker(),
             .picker_grep => try self.openGrepPicker(),
+            .filetree_toggle => try self.toggleFiletree(),
+            .filetree_locate => try self.locateInFiletree(),
             .paste => try self.pasteBuffer(false),
             .paste_before => try self.pasteBuffer(true),
             .toggle_comment_line => try self.toggleCommentLine(),
@@ -1189,6 +1265,12 @@ const App = struct {
     }
 
     // ---- rendering ----
+
+    const filetree_width: u32 = 24;
+
+    fn contentCol(self: *const App) u32 {
+        return if (self.filetree_active) filetree_width else 0;
+    }
 
     fn render(self: *App) !void {
         // vaxis cells reference the text slices passed to print, so all text
@@ -1310,9 +1392,31 @@ const App = struct {
 
             _ = win.print(segs[0..nseg], .{
                 .row_offset = @intCast(row),
-                .col_offset = 0,
+                .col_offset = @intCast(self.contentCol()),
                 .wrap = .none,
             });
+        }
+
+        // file tree sidebar
+        if (self.filetree_active) {
+            const title_seg = [_]vaxis.Segment{.{
+                .text = " files ",
+                .style = .{ .fg = .{ .rgb = .{ 250, 189, 47 } }, .bold = true },
+            }};
+            _ = win.print(&title_seg, .{ .row_offset = 0, .col_offset = 0, .wrap = .none });
+            var ri: usize = 0;
+            while (ri < @min(self.filetree_files.items.len, @as(usize, content_rows))) : (ri += 1) {
+                const f = self.filetree_files.items[ri];
+                const label = if (f.len > filetree_width) f[f.len - filetree_width ..] else f;
+                const seg = [_]vaxis.Segment{.{
+                    .text = label,
+                    .style = if (ri == self.filetree_sel)
+                        .{ .bg = .{ .rgb = .{ 54, 74, 130 } } }
+                    else
+                        .{ .fg = .{ .rgb = .{ 122, 162, 247 } } },
+                }};
+                _ = win.print(&seg, .{ .row_offset = @intCast(1 + ri), .col_offset = 0, .wrap = .none });
+            }
         }
 
         // multi-cursor word highlights (overlay)
@@ -1332,7 +1436,7 @@ const App = struct {
                     var char_buf: [4]u8 = undefined;
                     self.pt.copyRange(p, char_buf[0..clen]);
                     const g = try a.dupe(u8, char_buf[0..clen]);
-                    win.writeCell(@intCast(5 + col), @intCast(wline - self.view_top), .{
+                    win.writeCell(@intCast(self.contentCol() + 5 + col), @intCast(wline - self.view_top), .{
                         .char = .{ .grapheme = g, .width = 1 },
                         .style = .{ .bg = .{ .rgb = .{ 54, 74, 130 } } },
                     });
@@ -1348,7 +1452,7 @@ const App = struct {
                 if (mline < self.view_top or mline >= self.view_top + content_rows) continue;
                 const col_in_line = m.pos - self.pt.lineStart(mline);
                 const label = try a.dupe(u8, &[_]u8{m.label});
-                win.writeCell(@intCast(5 + col_in_line), @intCast(mline - self.view_top), .{
+                win.writeCell(@intCast(self.contentCol() + 5 + col_in_line), @intCast(mline - self.view_top), .{
                     .char = .{ .grapheme = label, .width = 1 },
                     .style = .{ .fg = .{ .rgb = .{ 250, 189, 47 } }, .bg = .{ .rgb = .{ 54, 74, 130 } } },
                 });
@@ -1436,7 +1540,7 @@ const App = struct {
         const cursor_row = cursor_line - self.view_top;
         self.vx.screen.cursor = .{
             .row = @intCast(cursor_row),
-            .col = @intCast(5 + cursor_col), // 4-digit number + space gutter
+            .col = @intCast(self.contentCol() + 5 + cursor_col), // gutter offset
         };
         self.vx.screen.cursor_shape = if (self.state.mode == .insert) .beam else .block;
 

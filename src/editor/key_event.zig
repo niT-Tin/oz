@@ -73,6 +73,8 @@ pub const ActionId = enum {
     mc_add, // Ctrl+n — multi-cursor: select word / add next match
     picker_file, // <leader>sf — fuzzy file picker
     picker_grep, // <leader>st — grep picker
+    filetree_toggle, // <leader>e — toggle file tree
+    filetree_locate, // <leader>E — locate current file in tree
     enter_command_mode, // :
     normal_mode, // esc / ctrl-c
     insert_exit, // jk special-cased by Mode
