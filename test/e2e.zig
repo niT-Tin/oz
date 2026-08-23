@@ -5470,3 +5470,231 @@ test "windows: :sp splits stacked; each window scrolls independently" {
     if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
+
+test "TMP: split/close cycles + Ctrl-w navigation" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, "build.zig" });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    // random window ops fuzz (fixed seed): should never panic the tree
+    // invariant nor leak on exit
+    const actions = [_][]const u8{
+        ":vs\r", ":sp\r", "\x17h", "\x17l", "\x17j", "\x17k", ":q\r",
+    };
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    var i: usize = 0;
+    while (i < 60) : (i += 1) {
+        const act = actions[prng.random().uintLessThan(usize, actions.len)];
+        try sess.send(act);
+        // drain whatever renders (short)
+        var d: i32 = 0;
+        while (d < 400) {
+            const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
+            if (n == 0) {
+                d += 50;
+                if (d >= 400) break;
+                continue;
+            }
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+    }
+    const code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), code);
+    // drain post-exit output: DebugAllocator leak reports land on stderr
+    // (dup2'd into the pty) — assert none
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) break;
+        sess.used += n;
+    }
+    const all = sess.out[0..sess.used];
+    try std.testing.expect(std.mem.indexOf(u8, all, "leaked") == null);
+}
+
+test "windows: :vs keeps the old window left; Ctrl-w h/l + :e target the focused one" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var na_buf: [128:0]u8 = undefined;
+    const na = try std.fmt.bufPrintZ(&na_buf, "/tmp/oz_e2e_{d}_{d}wla.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, na, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "AAA\n");
+    }
+    var nb_buf: [128:0]u8 = undefined;
+    const nb = try std.fmt.bufPrintZ(&nb_buf, "/tmp/oz_e2e_{d}_{d}wlb.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, nb) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, nb, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "BBB\n");
+    }
+    var nc_buf: [128:0]u8 = undefined;
+    const nc = try std.fmt.bufPrintZ(&nc_buf, "/tmp/oz_e2e_{d}_{d}wlc.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, nc) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, nc, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "CCC\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, na });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // :vs → both halves show AAA; the old window stays LEFT, new right
+    try sess.send(":vs\r");
+    waited = 0;
+    var both = false;
+    while (!both) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        const row = grid.rowText(1);
+        const first = std.mem.indexOf(u8, row, "AAA");
+        const second = if (first) |f| std.mem.indexOfPos(u8, row, f + 1, "AAA") else null;
+        both = first != null and second != null;
+    }
+    try std.testing.expect(both);
+
+    // Ctrl-w h → LEFT window; :e b.txt puts BBB in the LEFT half
+    try sess.send("\x17h");
+    waited = 0;
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 2000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        break;
+    }
+    try sess.send(":e ");
+    try sess.send(nb);
+    try sess.send("\r");
+    waited = 0;
+    var swapped = false;
+    while (!swapped) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        const row = grid.rowText(1);
+        const left_b = std.mem.indexOf(u8, row[0..40], "BBB") != null;
+        const right_a = std.mem.indexOf(u8, row[40..80], "AAA") != null;
+        swapped = left_b and right_a;
+    }
+    if (!swapped) {
+        std.debug.print("after Ctrl-w h + :e b.txt:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(swapped);
+
+    // Ctrl-w l → RIGHT window; :e c.txt puts CCC in the RIGHT half
+    try sess.send("\x17l");
+    waited = 0;
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 2000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        break;
+    }
+    try sess.send(":e ");
+    try sess.send(nc);
+    try sess.send("\r");
+    waited = 0;
+    var right_c = false;
+    while (!right_c) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        const row = grid.rowText(1);
+        right_c = std.mem.indexOf(u8, row[40..80], "CCC") != null and std.mem.indexOf(u8, row[0..40], "BBB") != null;
+    }
+    if (!right_c) {
+        std.debug.print("after Ctrl-w l + :e c.txt:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(right_c);
+
+    // :q closes the focused (right) window → only BBB (left) remains
+    try sess.send(":q\r");
+    waited = 0;
+    var only_b = false;
+    while (!only_b) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        const row = grid.rowText(1);
+        const has_b = std.mem.indexOf(u8, row, "BBB") != null;
+        const has_c = std.mem.indexOf(u8, row, "CCC") != null;
+        only_b = has_b and !has_c;
+    }
+    try std.testing.expect(only_b);
+
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}

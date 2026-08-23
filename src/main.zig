@@ -178,6 +178,39 @@ const App = struct {
         }
     }
 
+    /// Debug invariant: every window index appears exactly once as a leaf and
+    /// all leaves are in range. Call after any tree mutation.
+    fn winTreeSanity(self: *App) void {
+        const root = self.win_root orelse return;
+        var count: usize = 0;
+        var stack: [128]*WinNode = undefined;
+        var sp: usize = 0;
+        stack[sp] = root;
+        sp += 1;
+        var seen = std.AutoHashMap(usize, void).init(self.alloc);
+        defer seen.deinit();
+        while (sp > 0) {
+            sp -= 1;
+            const n = stack[sp];
+            switch (n.*) {
+                .leaf => |i| {
+                    count += 1;
+                    if (i >= self.windows.items.len) std.debug.panic("leaf {d} out of range (windows {d})", .{ i, self.windows.items.len });
+                    if (seen.contains(i)) std.debug.panic("duplicate leaf {d}", .{i});
+                    seen.put(i, {}) catch {};
+                },
+                .split => |*s| {
+                    if (sp + 2 >= stack.len) std.debug.panic("window tree too deep", .{});
+                    stack[sp] = s.a;
+                    sp += 1;
+                    stack[sp] = s.b;
+                    sp += 1;
+                },
+            }
+        }
+        if (count != self.windows.items.len) std.debug.panic("tree leaves {d} != windows {d}", .{ count, self.windows.items.len });
+    }
+
     // ---- split windows (:vs / :sp / :q / Ctrl-w) ----
 
     /// Split the focused window in `dir`; the new window shows the same
@@ -194,6 +227,7 @@ const App = struct {
         const root = self.win_root orelse return;
         try self.replaceLeaf(root, cur_win, dir, new_idx);
         self.current_win = new_idx;
+        self.winTreeSanity();
     }
 
     /// Replace the leaf `leaf_idx` under `node` with a split of it and a new
@@ -219,15 +253,27 @@ const App = struct {
 
     /// Remove the leaf `leaf_idx` from the tree rooted at `root`. Returns the
     /// replacement subtree for `root` (a promoted sibling when the removed
-    /// leaf was a direct child), freeing the removed split node.
+    /// leaf was a direct child), freeing the removed leaf and split nodes.
+    /// A lone root leaf is never passed here (single window goes through
+    /// closeSingleWindow).
     fn removeWindow(self: *App, root: *WinNode, leaf_idx: usize) ?*WinNode {
         switch (root.*) {
-            .leaf => |i| return if (i == leaf_idx) null else root,
+            .leaf => |i| {
+                // The removed leaf itself: free it (the caller promotes a
+                // sibling). Only reachable for a non-root leaf; a matching
+                // root leaf means single-window, handled before this call.
+                if (i == leaf_idx) {
+                    self.alloc.destroy(root);
+                    return null;
+                }
+                return root;
+            },
             .split => |*s| {
                 if (self.removeWindow(s.a, leaf_idx)) |na| {
                     s.a = na;
                 } else {
-                    // left subtree vanished → right sibling takes its place
+                    // s.a (a matching leaf) was freed by the recursion; its
+                    // sibling takes this split's place
                     const promoted = s.b;
                     self.alloc.destroy(root);
                     return promoted;
@@ -322,6 +368,7 @@ const App = struct {
         _ = self.windows.orderedRemove(cur_win);
         self.adjustLeafIndices(self.win_root.?, cur_win);
         self.current_win = self.firstLeaf(self.win_root.?);
+        self.winTreeSanity();
         // sync the current buffer/highlighter with the surviving window
         const b = self.windows.items[self.current_win].buf;
         if (b != self.current) {
@@ -2388,6 +2435,7 @@ const App = struct {
                 w.buf = self.current;
             }
         }
+        self.winTreeSanity();
         self.state.mode = .normal;
         // closing the buffer also discards a visual selection anchored in it
         self.visual_anchor = null;
