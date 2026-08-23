@@ -192,7 +192,7 @@ const App = struct {
                 // visual mode: the operator acts on the selection
                 if (self.isVisual()) {
                     if (self.visual_anchor) |anchor| {
-                        try self.applyOpRange(m.op, anchor, self.cursor, false);
+                        try self.applyOpRangeEx(m.op, anchor, self.cursor, false, .inclusive_cursor);
                     }
                     self.exitVisual();
                     return;
@@ -433,57 +433,52 @@ const App = struct {
         self.cursor += @intCast(text.len);
     }
 
-    fn deleteRange(self: *App, from: u32, to: u32, exclusive: bool) !void {
-        const start = @min(from, to);
-        var end = @max(from, to);
-        if (exclusive and end > start) end -= 1;
-        if (end <= start) return;
-        self.history.beginGroup();
-        try self.history.record(&self.pt, start, end - start, "");
-        self.history.endGroup();
-        self.cursor = start;
-    }
+    /// Visual-selection end semantics: vim's character-wise selection includes
+    /// the character under the cursor.
+    const SelEnd = enum { exclusive_cursor, inclusive_cursor };
 
     /// Apply an operator (d/c/y) over a range. `exclusive` trims the end char
     /// (vim exclusive motions); text objects and selections pass false with an
     /// already-exact range.
     fn applyOpRange(self: *App, op: editor.KeyEvent.ActionId, from: u32, to: u32, exclusive: bool) !void {
-        switch (op) {
-            .delete => try self.deleteRange(from, to, exclusive),
-            .change => try self.changeRange(from, to, exclusive),
-            .yank => try self.yankRange(from, to, exclusive),
-            else => {},
-        }
+        try self.applyOpRangeEx(op, from, to, exclusive, .exclusive_cursor);
     }
 
-    /// c{motion} / c{motion} / visual-c: delete the range and enter insert
-    /// mode; the deletion and the typed replacement share one undo group.
-    fn changeRange(self: *App, from: u32, to: u32, exclusive: bool) !void {
+    fn applyOpRangeEx(self: *App, op: editor.KeyEvent.ActionId, from: u32, to: u32, exclusive: bool, sel: SelEnd) !void {
         const start = @min(from, to);
         var end = @max(from, to);
         if (exclusive and end > start) end -= 1;
-        self.cursor = start;
+        if (sel == .inclusive_cursor and end < self.pt.len()) end += 1;
         if (end <= start) {
-            self.state.mode = .insert;
-            self.in_insert = true; // empty change: open group so typing stays undoable
+            if (op == .change) {
+                self.state.mode = .insert;
+                self.in_insert = true;
+            }
             return;
         }
-        self.history.beginGroup();
-        try self.history.record(&self.pt, start, end - start, "");
-        self.state.mode = .insert;
-        self.in_insert = true; // keep the group open; exitInsert closes it
-    }
-
-    /// y{motion} / visual-y: copy the range into the yank buffer.
-    fn yankRange(self: *App, from: u32, to: u32, exclusive: bool) !void {
-        const start = @min(from, to);
-        var end = @max(from, to);
-        if (exclusive and end > start) end -= 1;
-        if (self.yank_buffer) |b| self.alloc.free(b);
-        const buf = try self.alloc.alloc(u8, end - start);
-        self.pt.copyRange(start, buf);
-        self.yank_buffer = buf;
-        try self.setMsg(try std.fmt.allocPrint(self.alloc, "yanked {d} bytes", .{buf.len}));
+        switch (op) {
+            .delete => {
+                self.history.beginGroup();
+                try self.history.record(&self.pt, start, end - start, "");
+                self.history.endGroup();
+                self.cursor = start;
+            },
+            .change => {
+                self.cursor = start;
+                self.history.beginGroup();
+                try self.history.record(&self.pt, start, end - start, "");
+                self.state.mode = .insert;
+                self.in_insert = true; // keep the group open; exitInsert closes it
+            },
+            .yank => {
+                if (self.yank_buffer) |b| self.alloc.free(b);
+                const buf = try self.alloc.alloc(u8, end - start);
+                self.pt.copyRange(start, buf);
+                self.yank_buffer = buf;
+                try self.setMsg(try std.fmt.allocPrint(self.alloc, "yanked {d} bytes", .{buf.len}));
+            },
+            else => {},
+        }
     }
 
     fn isVisual(self: *const App) bool {
@@ -581,7 +576,7 @@ const App = struct {
                 // visual mode: the operator acts on the selection directly
                 if (self.isVisual()) {
                     if (self.visual_anchor) |anchor| {
-                        try self.applyOpRange(action, anchor, self.cursor, false);
+                        try self.applyOpRangeEx(action, anchor, self.cursor, false, .inclusive_cursor);
                     }
                     self.exitVisual();
                 }

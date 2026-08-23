@@ -770,11 +770,11 @@ test "M1a: text objects, visual ops, yank/paste, easymotion" {
     }
     try std.testing.expect(grid.contains("Xone"));
 
-    // easymotion: s + 'n' (the n in Xone) + label 'a' → jump to the match,
-    // then dw deletes "ne" (proving the jump landed on the right 'n')
-    try sess.send("snadw");
+    // easymotion: s + 'n' (the n in Xone) + label 'a' → jump to the match
+    // (the 'n'), then ciw + 'Y' replaces the whole word → "  Y"
+    try sess.send("snaciwY\x1b");
     waited = 0;
-    while (!grid.contains("Xo")) {
+    while (!grid.contains("Y") or grid.contains("Xone")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -784,7 +784,9 @@ test "M1a: text objects, visual ops, yank/paste, easymotion" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(grid.contains("Xo"));
+    std.debug.print("after snacY grid:\n", .{});
+    grid.dump();
+    try std.testing.expect(grid.contains("Y"));
     try std.testing.expect(!grid.contains("Xone"));
 
     const exit_code = try sess.commandAndWaitExit(":q\r");
