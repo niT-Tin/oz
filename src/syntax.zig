@@ -113,12 +113,18 @@ pub fn captureStyle(name: []const u8) Style {
 /// A parsed+queried buffer for one language. Owns the tree-sitter parser,
 /// the compiled highlight query and the last parse tree.
 pub const Highlighter = struct {
+    allocator: std.mem.Allocator,
     parser: *treez.Parser,
     query: *treez.Query,
     /// Language name ("zig", "rust", …) — used by tests and deinit.
     lang_name: []const u8,
     /// Last parsed tree (null before the first parse).
     tree: ?*treez.Tree = null,
+    /// The text the current tree was parsed from (owned). tree.edit() needs
+    /// the OLD text's line/column to place the edit points correctly — zero
+    /// points corrupt tree-sitter's internal position metadata and can drift
+    /// the highlight spans after a burst of edits.
+    prev_text: ?[]u8 = null,
 
     /// Grammars with a bundled query file (src/syntax/queries/<lang>.scm).
     const LANGUAGES = [_][]const u8{
@@ -137,7 +143,6 @@ pub const Highlighter = struct {
     }
 
     fn initLang(allocator: std.mem.Allocator, comptime lang: []const u8) !Highlighter {
-        _ = allocator;
         const language = try treez.Language.get(lang);
         var parser = try treez.Parser.create();
         errdefer parser.destroy();
@@ -145,6 +150,7 @@ pub const Highlighter = struct {
         var error_offset: u32 = 0;
         const query = try treez.Query.create(language, @embedFile("syntax/queries/" ++ lang ++ ".scm"), &error_offset);
         return .{
+            .allocator = allocator,
             .parser = parser,
             .query = query,
             .lang_name = lang,
@@ -152,6 +158,7 @@ pub const Highlighter = struct {
     }
 
     pub fn deinit(self: *Highlighter) void {
+        if (self.prev_text) |t| self.allocator.free(t);
         if (self.tree) |t| t.destroy();
         self.query.destroy();
         self.parser.destroy();
@@ -167,6 +174,12 @@ pub const Highlighter = struct {
         const new_tree = try self.parser.parseString(null, text);
         if (self.tree) |old| old.destroy();
         self.tree = new_tree;
+        try self.setPrevText(text);
+    }
+
+    fn setPrevText(self: *Highlighter, text: []const u8) !void {
+        if (self.prev_text) |t| self.allocator.free(t);
+        self.prev_text = try self.allocator.dupe(u8, text);
     }
 
     /// Incremental reparse: record a single edit [pos, old_end) → [pos,
@@ -176,17 +189,33 @@ pub const Highlighter = struct {
     /// read.
     pub fn reparseEdit(self: *Highlighter, pos: u32, old_end: u32, new_end: u32, text: []const u8) !void {
         if (self.tree) |t| {
-            const zero = treez.Point{ .row = 0, .column = 0 };
+            const old_text = self.prev_text orelse "";
             t.edit(&.{
                 .start_byte = pos,
                 .old_end_byte = old_end,
                 .new_end_byte = new_end,
-                .start_point = zero,
-                .old_end_point = zero,
-                .new_end_point = zero,
+                .start_point = pointAt(old_text, pos),
+                .old_end_point = pointAt(old_text, @min(old_end, @as(u32, @intCast(old_text.len)))),
+                .new_end_point = pointAt(text, new_end),
             });
         }
         try self.reparse(text);
+    }
+
+    /// Line/column of a byte offset (tree-sitter Point).
+    fn pointAt(text: []const u8, byte: u32) treez.Point {
+        var row: u32 = 0;
+        var col: u32 = 0;
+        const b = @min(byte, @as(u32, @intCast(text.len)));
+        for (text[0..b]) |c| {
+            if (c == '\n') {
+                row += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        return .{ .row = row, .column = col };
     }
 
     /// Run the highlight query over [start_byte, end_byte) and append spans
