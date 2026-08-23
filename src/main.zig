@@ -303,6 +303,14 @@ const App = struct {
                     return;
                 }
             }
+            if (key.codepoint == vaxis.Key.enter) {
+                try self.insertNewline();
+                return;
+            }
+            if (key.codepoint == 'k' and key.mods.ctrl) {
+                try self.deleteToEol();
+                return;
+            }
             if (key.codepoint == vaxis.Key.backspace) {
                 try self.deleteBeforeCursor();
                 return;
@@ -310,6 +318,22 @@ const App = struct {
             if (key.codepoint == 'w' and key.mods.ctrl) {
                 try self.deleteWordBefore();
                 return;
+            }
+            // Alt+b / Alt+f: emacs word motion. Pure cursor movement — no
+            // text change, and prev_insert_key stays untouched (the jk exit
+            // and backspace paths must not see these). vaxis parses ESC+b/f
+            // as codepoint 'b'/'f' with mods.alt.
+            if (key.mods.alt and !key.mods.ctrl and !key.mods.super) {
+                if (key.codepoint == 'b') {
+                    self.cur().cursor = buffer.ops.wordStartBefore(&self.cur().pt, self.cur().cursor);
+                    return;
+                }
+                if (key.codepoint == 'f') {
+                    var c = self.cur().cursor;
+                    editor.Motion.apply(&self.cur().pt, .word_next_end, .{}, &c, 1);
+                    self.cur().cursor = c;
+                    return;
+                }
             }
             self.prev_insert_key = key;
             if (key.text) |text| {
@@ -459,6 +483,13 @@ const App = struct {
                 return;
             }
         }
+        // Enter at every cursor: insert a newline at each one. (No
+        // indentation carry-over — M1 keeps the multi-cursor path simple.
+        // Ctrl+k / Alt+b / Alt+f are intentionally not handled here.)
+        if (key.codepoint == vaxis.Key.enter) {
+            try self.mcInsertText("\n");
+            return;
+        }
         if (key.codepoint == vaxis.Key.backspace) {
             try self.mcBackspace();
             return;
@@ -604,6 +635,7 @@ const App = struct {
         const start = buffer.ops.prevCharStart(&self.cur().pt, self.cur().cursor);
         try self.cur().history.record(&self.cur().pt, start, self.cur().cursor - start, "");
         self.cur().cursor = start;
+        self.markDirty();
     }
 
     /// Delete the word before the cursor (Ctrl-w). Vim semantics: walk back
@@ -614,6 +646,53 @@ const App = struct {
         if (start == self.cur().cursor) return;
         try self.cur().history.record(&self.cur().pt, start, self.cur().cursor - start, "");
         self.cur().cursor = start;
+        self.markDirty();
+    }
+
+    /// Enter in insert mode (vim semantics): split the current line at the
+    /// cursor and carry the original line's leading indentation (the run of
+    /// spaces/tabs before the cursor) over to the new line. The cursor lands
+    /// right after the carried indentation (insertText advances it). Done as
+    /// one edit so it is a single undo step.
+    fn insertNewline(self: *App) !void {
+        const pt = &self.cur().pt;
+        const cursor = self.cur().cursor;
+        const line = pt.lineOf(cursor);
+        const line_start = pt.lineStart(line);
+        const col = cursor - line_start;
+        // leading indentation of the original line, capped at the cursor
+        var indent_end: u32 = 0;
+        while (indent_end < col) : (indent_end += 1) {
+            const b = pt.byteAt(line_start + indent_end);
+            if (b != ' ' and b != '\t') break;
+        }
+        const indent = try self.alloc.alloc(u8, @intCast(indent_end));
+        defer self.alloc.free(indent);
+        pt.copyRange(line_start, indent);
+        const text = try std.fmt.allocPrint(self.alloc, "\n{s}", .{indent});
+        defer self.alloc.free(text);
+        try self.insertText(text);
+    }
+
+    /// Ctrl+k in insert mode (emacs kill-line): delete from the cursor to the
+    /// end of the line. When the cursor is already at the end of the line,
+    /// delete the trailing newline instead, joining the next line (no-op on
+    /// the last line).
+    fn deleteToEol(self: *App) !void {
+        const pt = &self.cur().pt;
+        const cursor = self.cur().cursor;
+        const line = pt.lineOf(cursor);
+        const line_start = pt.lineStart(line);
+        const line_end = line_start + pt.lineLen(line);
+        if (cursor < line_end) {
+            try self.cur().history.record(pt, cursor, line_end - cursor, "");
+        } else if (line_end < pt.len()) {
+            // at end of line: swallow the trailing newline (joins next line)
+            try self.cur().history.record(pt, line_end, 1, "");
+        } else {
+            return; // last line, nothing to delete
+        }
+        self.markDirty();
     }
 
     // ---- command line (':') ----
