@@ -3865,3 +3865,575 @@ test "e2e: visual Ctrl+a increments every number in the selection" {
     _ = try f.readPositionalAll(io, buf, 0);
     try std.testing.expectEqualStrings("2 3 4\n", buf);
 }
+
+test "gutter: relative line numbers never overlap content on deep files" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    // 15000 lines: the relative number at the bottom is 15000 — one digit
+    // wider than the old fixed 4-digit gutter (5 digits + space = 6 cells).
+    // (piece_table: every '\n' starts a line, so 14999 × "x\n" + "x" = 15000)
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}gutter.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        var i: usize = 0;
+        while (i < 14999) : (i += 1) {
+            try f.writeStreamingAll(io, "x\n");
+        }
+        try f.writeStreamingAll(io, "x"); // last line, no trailing newline
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // G jumps to the last line (15000); the view scrolls to the bottom and
+    // the cursor row (content row 22) shows the 5-digit number "15000 ".
+    try sess.send("G");
+    waited = 0;
+    while (!std.mem.eql(u8, grid.rowText(22)[0..6], "15000 ")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!std.mem.eql(u8, grid.rowText(22)[0..6], "15000 ")) {
+        std.debug.print("gutter at the bottom:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(std.mem.eql(u8, grid.rowText(22)[0..6], "15000 "));
+
+    // every visible content row: the first content cell is at the dynamic
+    // gutter width (column 6, preceded by the trailing space) — line
+    // numbers never run into the text
+    var r: usize = 1;
+    while (r < 23) : (r += 1) {
+        try std.testing.expect(grid.buf[r * 80 + 6] == 'x');
+        try std.testing.expect(grid.buf[r * 80 + 5] == ' ');
+    }
+
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    // cwd is the project root: open a real .zig file, hop through the file
+    // tree (zig → md → zig, the flow that rebuilds the highlighter via
+    // ensureSyntax) and assert the last buffer re-highlights correctly.
+    var sess = try Session.spawn(io, &.{ oz_exe_path, "build.zig" });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+    // build.zig is highlighted (gold keyword) before any switch
+    try std.testing.expect(grid.containsFg("const", packRgb(224, 175, 104)));
+
+    // <leader>e: alphabetical tree — DESIGN.md is the first entry (row 1)
+    try sess.send(" e");
+    waited = 0;
+    while (std.mem.indexOf(u8, grid.rowText(1), "DESIGN.md") == null) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(1), "DESIGN.md") != null);
+
+    // j × 1 → README.md, Enter opens it (markdown has no zig grammar)
+    try sess.send("j\r");
+    waited = 0;
+    while (grid.contains("files")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(0), "README.md") != null);
+
+    // reopen the tree; the selection keeps its position (README.md, idx 1).
+    // Step j one at a time until the highlighted row shows the ops.zig entry
+    // (idx 6 — src/buffer/ops.zig, before piece_table.zig etc.), then Enter.
+    try sess.send(" e");
+    waited = 0;
+    while (std.mem.indexOf(u8, grid.rowText(1), "DESIGN.md") == null) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    const sel_bg = packRgb(54, 74, 130);
+    var ops_selected = false;
+    var tries: usize = 0;
+    while (!ops_selected and tries < 30) : (tries += 1) {
+        var rr: usize = 1;
+        while (rr < grid.rows) : (rr += 1) {
+            if (grid.rowHasBg(rr, sel_bg) and std.mem.indexOf(u8, grid.rowText(rr), "ops.zig") != null) {
+                ops_selected = true;
+                break;
+            }
+        }
+        if (ops_selected) break;
+        try sess.send("j");
+        // drain the render for this keypress so the grid is current before
+        // the next check (one j at a time so we never overshoot)
+        while (true) {
+            const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
+            if (n == 0) break;
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+    }
+    if (!ops_selected) {
+        std.debug.print("ops.zig not selected in the file tree:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(ops_selected);
+
+    try sess.send("\r");
+    waited = 0;
+    while (!grid.containsFg("pub", packRgb(224, 175, 104))) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!grid.containsFg("pub", packRgb(224, 175, 104))) {
+        std.debug.print("ops.zig after zig->md->zig switch:\n", .{});
+        grid.dump();
+    }
+    // the last buffer is ops.zig: "pub" is a gold keyword, not comment gray
+    try std.testing.expect(grid.containsFg("pub", packRgb(224, 175, 104)));
+    try std.testing.expect(!grid.containsFg("pub", packRgb(116, 127, 148)));
+
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "e2e: insert undo — delete-first session (backspace then typing) reverts with one u" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}ud1.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "abc\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // $ (end) then a: cursor sits after 'c'; backspace (0x7f) deletes 'c',
+    // then typing "XYZ" continues the same insert session. jk exits.
+    try sess.send("$a\x7fXYZjk");
+    waited = 0;
+    while (!grid.contains("abXYZ")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("abXYZ"));
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    // one u must revert the whole insert session (the deletion AND the typing)
+    try sess.send("u");
+    waited = 0;
+    while (!grid.contains("abc") or grid.contains("abXYZ")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("abc"));
+    try std.testing.expect(!grid.contains("abXYZ"));
+
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    const f = try std.Io.Dir.cwd().openFile(io, name, .{ .mode = .read_only });
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    try std.testing.expectEqualStrings("abc\n", buf);
+}
+
+test "e2e: insert undo — type-then-delete session reverts with one u" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}ud2.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "abc\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // $a then typing "XY" then backspace: the deletion joins the already-open
+    // typing group. jk exits; one u reverts everything.
+    try sess.send("$aXY\x7fjk");
+    waited = 0;
+    while (!grid.contains("abcX")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("abcX"));
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    try sess.send("u");
+    waited = 0;
+    while (!grid.contains("abc") or grid.contains("abcX")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("abc"));
+    try std.testing.expect(!grid.contains("abcX"));
+
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    const f = try std.Io.Dir.cwd().openFile(io, name, .{ .mode = .read_only });
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    try std.testing.expectEqualStrings("abc\n", buf);
+}
+
+test "e2e: dd deletes the whole line under the cursor" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}dd.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "aaa\nbbb\nccc\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // j → line 2; dd must delete the whole line including its trailing '\n'
+    // (the linewise sentinel path), so "ccc" moves up to row 2.
+    try sess.send("jdd");
+    waited = 0;
+    while (!rowContains(&grid, 2, "ccc") or grid.contains("bbb")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(rowContains(&grid, 2, "ccc"));
+    try std.testing.expect(!grid.contains("bbb"));
+
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    const f = try std.Io.Dir.cwd().openFile(io, name, .{ .mode = .read_only });
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    try std.testing.expectEqualStrings("aaa\nccc\n", buf);
+}
+
+test "e2e: 2dd deletes two whole lines" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}2dd.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "aaa\nbbb\nccc\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // 2dd from line 1 deletes lines 1-2; "ccc" becomes row 1.
+    try sess.send("2dd");
+    waited = 0;
+    while (!rowContains(&grid, 1, "ccc") or grid.contains("bbb")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(rowContains(&grid, 1, "ccc"));
+    try std.testing.expect(!grid.contains("bbb"));
+
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    const f = try std.Io.Dir.cwd().openFile(io, name, .{ .mode = .read_only });
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    try std.testing.expectEqualStrings("ccc\n", buf);
+}
+
+test "e2e: cc replaces the whole line and enters insert" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}cc.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "aaa\nbbb\nccc\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // jj → last line (no trailing '\n'); cc deletes the whole line and enters
+    // insert, typing "X" replaces it (row 3 becomes "X"). jk exits.
+    try sess.send("jjccXjk");
+    waited = 0;
+    while (grid.contains("Xccc") or !rowContains(&grid, 3, "X")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("Xccc"));
+    try std.testing.expect(rowContains(&grid, 3, "X"));
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    const f = try std.Io.Dir.cwd().openFile(io, name, .{ .mode = .read_only });
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    try std.testing.expectEqualStrings("aaa\nbbb\nX", buf);
+}

@@ -379,6 +379,21 @@ const App = struct {
                 self.cur().cursor = new_cursor;
             },
             .op_motion => |m| {
+                // dd / cc / yy: motion == .line_start + exclusive_end == false is
+                // the whole-line sentinel (see mode.zig Result docs; d^ is
+                // .line_start with exclusive_end == true, so unambiguous). Must
+                // delete/change/yank `count` whole lines, not [cursor, line start).
+                if (m.motion == .line_start and !m.exclusive_end) {
+                    const line = self.cur().pt.lineOf(self.cur().cursor);
+                    const n = @max(m.count, 1);
+                    const start_line = @min(line, self.cur().pt.lineCount() - 1);
+                    const end_line = @min(start_line + n - 1, self.cur().pt.lineCount() - 1);
+                    const start = self.cur().pt.lineStart(start_line);
+                    var end = self.cur().pt.lineStart(end_line) + self.cur().pt.lineLen(end_line);
+                    if (end_line + 1 < self.cur().pt.lineCount()) end += 1; // include trailing '\n'
+                    try self.applyOpRange(m.op, start, end, false);
+                    return;
+                }
                 // text object (diw / ci( / yaw …): resolve at the cursor
                 if (m.text_object) |kind| {
                     const rng = editor.TextObject.range(&self.cur().pt, kind, self.cur().cursor);
@@ -470,7 +485,10 @@ const App = struct {
         self.mc_active = true;
         self.visual_anchor = null; // the selection is consumed by I/A
         self.state.mode = .insert;
-        self.in_insert = false; // the first insertText opens the undo group
+        // open the undo group immediately: the first key (backspace or
+        // typing) must join the same session group
+        self.cur().history.beginGroup();
+        self.in_insert = true;
         self.prev_insert_key = null;
         self.mcSyncCursor();
     }
@@ -550,6 +568,11 @@ const App = struct {
     /// each cursor (right-to-left); cursors at/after a deletion shift back,
     /// ones inside its range clamp to its start.
     fn mcBackspace(self: *App) !void {
+        // safety net: the deletion must join the insert-session group
+        if (!self.in_insert) {
+            self.cur().history.beginGroup();
+            self.in_insert = true;
+        }
         var i = self.mc.cursors.items.len;
         while (i > 0) {
             i -= 1;
@@ -571,6 +594,11 @@ const App = struct {
     /// Ctrl-w at every visual-block cursor: delete the word before each
     /// cursor (right-to-left); cursors shift like backspace.
     fn mcDeleteWordBefore(self: *App) !void {
+        // safety net: the deletion must join the insert-session group
+        if (!self.in_insert) {
+            self.cur().history.beginGroup();
+            self.in_insert = true;
+        }
         var i = self.mc.cursors.items.len;
         while (i > 0) {
             i -= 1;
@@ -653,6 +681,13 @@ const App = struct {
     /// the open insert undo group so it stays part of the insert session.
     fn deleteBeforeCursor(self: *App) !void {
         if (self.cur().cursor == 0) return;
+        // safety net: make sure the insert-session group is open even if a
+        // future entry path forgets to open it (backspace is a deletion, and
+        // history.record would otherwise auto-open/close its own group)
+        if (!self.in_insert) {
+            self.cur().history.beginGroup();
+            self.in_insert = true;
+        }
         const start = buffer.ops.prevCharStart(&self.cur().pt, self.cur().cursor);
         try self.cur().history.record(&self.cur().pt, start, self.cur().cursor - start, "");
         self.cur().cursor = start;
@@ -665,6 +700,10 @@ const App = struct {
         if (self.cur().cursor == 0) return;
         const start = buffer.ops.wordStartBefore(&self.cur().pt, self.cur().cursor);
         if (start == self.cur().cursor) return;
+        if (!self.in_insert) {
+            self.cur().history.beginGroup();
+            self.in_insert = true;
+        }
         try self.cur().history.record(&self.cur().pt, start, self.cur().cursor - start, "");
         self.cur().cursor = start;
         self.markDirty();
@@ -676,6 +715,11 @@ const App = struct {
     /// right after the carried indentation (insertText advances it). Done as
     /// one edit so it is a single undo step.
     fn insertNewline(self: *App) !void {
+        // safety net: the '\n' insertion must join the insert-session group
+        if (!self.in_insert) {
+            self.cur().history.beginGroup();
+            self.in_insert = true;
+        }
         const pt = &self.cur().pt;
         const cursor = self.cur().cursor;
         const line = pt.lineOf(cursor);
@@ -700,6 +744,11 @@ const App = struct {
     /// delete the trailing newline instead, joining the next line (no-op on
     /// the last line).
     fn deleteToEol(self: *App) !void {
+        // safety net: the kill must join the insert-session group
+        if (!self.in_insert) {
+            self.cur().history.beginGroup();
+            self.in_insert = true;
+        }
         const pt = &self.cur().pt;
         const cursor = self.cur().cursor;
         const line = pt.lineOf(cursor);
@@ -985,6 +1034,9 @@ const App = struct {
         if (sel == .inclusive_cursor and end < self.cur().pt.len()) end += 1;
         if (end <= start) {
             if (op == .change) {
+                // empty range (e.g. cc on an empty line): enter insert with
+                // the undo group already open so typing joins one session
+                self.cur().history.beginGroup();
                 self.state.mode = .insert;
                 self.in_insert = true;
             }
@@ -1181,7 +1233,11 @@ const App = struct {
         self.cur().history.endGroup();
         self.mc_active = true; // stays active: the insert session is synchronized
         self.state.mode = .insert;
-        self.in_insert = false; // the first insertText opens the undo group
+        // open the insert-session group immediately (deletes or typing first);
+        // the word deletions above are their own group (undo reverts typing
+        // first, then the deletions — same as before)
+        self.cur().history.beginGroup();
+        self.in_insert = true;
         self.prev_insert_key = null;
         self.mcSyncCursor();
         self.markDirty();
@@ -1783,7 +1839,13 @@ const App = struct {
                 self.cur().cursor = @min(self.cur().cursor, self.cur().pt.len());
                 self.syntax_dirty = true;
             },
-            .insert_mode => self.state.mode = .insert,
+            .insert_mode => {
+                // open the undo group immediately so the whole insert session
+                // (deletes first or not) is one undo step
+                self.cur().history.beginGroup();
+                self.in_insert = true;
+                self.state.mode = .insert;
+            },
             .append => {
                 // a: insert after the character under the cursor
                 const line = self.cur().pt.lineOf(self.cur().cursor);
@@ -1793,6 +1855,8 @@ const App = struct {
                     while (i < end and (self.cur().pt.byteAt(i) & 0xC0) == 0x80) : (i += 1) {}
                     self.cur().cursor = i;
                 }
+                self.cur().history.beginGroup();
+                self.in_insert = true;
                 self.state.mode = .insert;
             },
             .insert_before => {
@@ -1807,32 +1871,38 @@ const App = struct {
                     pos += 1;
                 }
                 self.cur().cursor = pos;
+                self.cur().history.beginGroup();
+                self.in_insert = true;
                 self.state.mode = .insert;
             },
             .append_end => {
                 // A: end of the line
                 const line = self.cur().pt.lineOf(self.cur().cursor);
                 self.cur().cursor = self.cur().pt.lineStart(line) + self.cur().pt.lineLen(line);
+                self.cur().history.beginGroup();
+                self.in_insert = true;
                 self.state.mode = .insert;
             },
             .insert_line_after => {
-                // o: new line below, cursor on it
+                // o: new line below, cursor on it. The inserted '\n' joins the
+                // insert-session undo group (left open until exitInsert), so
+                // one undo reverts the whole o+typing session.
                 const line = self.cur().pt.lineOf(self.cur().cursor);
                 const pos = self.cur().pt.lineStart(line) + self.cur().pt.lineLen(line);
                 self.cur().history.beginGroup();
                 try self.cur().history.record(&self.cur().pt, pos, 0, "\n");
-                self.cur().history.endGroup();
                 self.cur().cursor = pos + 1;
+                self.in_insert = true;
                 self.state.mode = .insert;
             },
             .insert_line_before => {
-                // O: new line above, cursor on it
+                // O: new line above, cursor on it (same open-group semantics)
                 const line = self.cur().pt.lineOf(self.cur().cursor);
                 const pos = self.cur().pt.lineStart(line);
                 self.cur().history.beginGroup();
                 try self.cur().history.record(&self.cur().pt, pos, 0, "\n");
-                self.cur().history.endGroup();
                 self.cur().cursor = pos;
+                self.in_insert = true;
                 self.state.mode = .insert;
             },
             .visual_char => {
@@ -2125,6 +2195,18 @@ const App = struct {
         return if (self.filetree_active) filetree_width else 0;
     }
 
+    /// Width of the relative-line-number gutter in cells: digits of the
+    /// largest possible relative number (≤ the file's line count, since a
+    /// relative number is a line offset) + one trailing space, with a
+    /// minimum of 3 digits so small files keep a stable gutter.
+    fn gutterWidth(self: *const App, line_count: u32) u32 {
+        _ = self;
+        var digits: u32 = 1;
+        var n: u32 = line_count;
+        while (n >= 10) : (n /= 10) digits += 1;
+        return @max(3, digits) + 1;
+    }
+
     fn render(self: *App) !void {
         // vaxis cells reference the text slices passed to print, so all text
         // must stay alive until vx.render(); a per-frame arena handles that.
@@ -2142,6 +2224,10 @@ const App = struct {
 
         const cursor_line = self.cur().pt.lineOf(self.cur().cursor);
         const line_count = self.cur().pt.lineCount();
+        // relative-number gutter: computed once per frame, reused by the
+        // line loop, cursor offset, mc highlight and easymotion labels
+        const gutter = self.gutterWidth(line_count);
+        const gutter_digits = gutter - 1;
 
         // tab bar: one entry per buffer, current highlighted, + dirty marker
         {
@@ -2227,7 +2313,13 @@ const App = struct {
                 line - cursor_line
             else
                 cursor_line - line;
-            const num_str = try std.fmt.allocPrint(a, "{d:>4} ", .{rel});
+            // allocPrint's width is comptime-only, so pad by hand: digits
+            // right-aligned in the numeric field plus one trailing space
+            const num_raw = try std.fmt.allocPrint(a, "{d}", .{rel});
+            const num_str = try a.alloc(u8, gutter);
+            @memset(num_str[0..gutter], ' ');
+            @memcpy(num_str[gutter_digits - num_raw.len .. gutter_digits], num_raw);
+            num_str[gutter - 1] = ' ';
 
             const line_len = self.cur().pt.lineLen(line);
             const line_start = self.cur().pt.lineStart(line);
@@ -2338,13 +2430,13 @@ const App = struct {
                 var p = w.start;
                 while (p < w.end) {
                     const col = p - ls;
-                    if (col >= win.width - 5) break;
+                    if (col >= @as(u32, win.width) - gutter) break;
                     var clen: u32 = 1;
                     while (p + clen < w.end and (self.cur().pt.byteAt(p + clen) & 0xC0) == 0x80) : (clen += 1) {}
                     var char_buf: [4]u8 = undefined;
                     self.cur().pt.copyRange(p, char_buf[0..clen]);
                     const g = try a.dupe(u8, char_buf[0..clen]);
-                    win.writeCell(@intCast(self.contentCol() + 5 + col), @intCast(self.contentTop() + wline - self.cur().view_top), .{
+                    win.writeCell(@intCast(self.contentCol() + gutter + col), @intCast(self.contentTop() + wline - self.cur().view_top), .{
                         .char = .{ .grapheme = g, .width = 1 },
                         .style = .{ .bg = .{ .rgb = .{ 54, 74, 130 } } },
                     });
@@ -2360,7 +2452,7 @@ const App = struct {
                 if (mline < self.cur().view_top or mline >= self.cur().view_top + content_rows) continue;
                 const col_in_line = m.pos - self.cur().pt.lineStart(mline);
                 const label = try a.dupe(u8, &[_]u8{m.label});
-                win.writeCell(@intCast(self.contentCol() + 5 + col_in_line), @intCast(self.contentTop() + mline - self.cur().view_top), .{
+                win.writeCell(@intCast(self.contentCol() + gutter + col_in_line), @intCast(self.contentTop() + mline - self.cur().view_top), .{
                     .char = .{ .grapheme = label, .width = 1 },
                     .style = .{ .fg = .{ .rgb = .{ 250, 189, 47 } }, .bg = .{ .rgb = .{ 54, 74, 130 } } },
                 });
@@ -2466,7 +2558,7 @@ const App = struct {
         const cursor_row = cursor_line - self.cur().view_top + self.contentTop();
         self.vx.screen.cursor = .{
             .row = @intCast(cursor_row),
-            .col = @intCast(self.contentCol() + 5 + cursor_col), // gutter offset
+            .col = @intCast(self.contentCol() + gutter + cursor_col), // gutter offset
         };
         self.vx.screen.cursor_vis = true;
         self.vx.screen.cursor_shape = if (self.state.mode == .insert) .beam else .block;
