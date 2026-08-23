@@ -66,6 +66,9 @@ pub const ActionId = enum {
     repeat_last, // .
     paste, // p
     paste_before, // P
+    easymotion, // s — EasyMotion jump (DESIGN.md §1.2)
+    leader_find, // <leader>f — EasyMotion across windows (M1: same as s)
+    leader, // space — leader prefix
     enter_command_mode, // :
     normal_mode, // esc / ctrl-c
     insert_exit, // jk special-cased by Mode

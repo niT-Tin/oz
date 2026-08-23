@@ -47,6 +47,12 @@ const App = struct {
     // yank buffer (M0: in-memory; OSC52 system clipboard is a later step)
     yank_buffer: ?[]u8 = null,
 
+    // easymotion (s / <leader>f) state
+    em_active: bool = false,
+    em_query: u8 = 0, // single-char query (M1: 1-char only)
+    em_labels: bool = false, // matches computed, labels shown
+    em_matches: []editor.easymotion.Match = &.{},
+
     fn create(init: std.process.Init) !*App {
         const self = try init.gpa.create(App);
         errdefer init.gpa.destroy(self);
@@ -108,11 +114,18 @@ const App = struct {
         if (self.file_path) |p| self.alloc.free(p);
         if (self.msg) |m| self.alloc.free(m);
         if (self.yank_buffer) |b| self.alloc.free(b);
+        if (self.em_matches.len > 0) self.alloc.free(self.em_matches);
     }
 
     // ---- input ----
 
     fn handleKey(self: *App, key: vaxis.Key) !void {
+        // EasyMotion capture: query char, then a label to jump to
+        if (self.em_active) {
+            try self.handleEasyMotionKey(key);
+            return;
+        }
+
         // Command mode: the ':' command line
         if (self.state.mode == .command) {
             try self.handleCommandKey(key);
@@ -209,6 +222,47 @@ const App = struct {
         self.history.endGroup();
         self.in_insert = false;
         self.prev_insert_key = null;
+    }
+
+    // ---- easymotion (s / <leader>f) ----
+
+    fn handleEasyMotionKey(self: *App, key: vaxis.Key) !void {
+        if (key.codepoint == vaxis.Key.escape or (key.codepoint == 'c' and key.mods.ctrl)) {
+            self.endEasyMotion();
+            return;
+        }
+        if (!self.em_labels) {
+            // first key = the 1-char query
+            if (key.codepoint >= 0x20 and key.codepoint <= 0xFF and
+                !key.mods.ctrl and !key.mods.alt and !key.mods.super)
+            {
+                self.em_query = @intCast(key.codepoint);
+                if (self.em_matches.len > 0) self.alloc.free(self.em_matches);
+                const q = [1]u8{self.em_query};
+                self.em_matches = try editor.easymotion.find(self.alloc, &self.pt, &q);
+                self.em_labels = true;
+            }
+            return;
+        }
+        // label key: jump to the match carrying this label
+        const ch = key.codepoint;
+        if ((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z')) {
+            for (self.em_matches) |m| {
+                if (m.label == ch) {
+                    self.cursor = m.pos;
+                    break;
+                }
+            }
+        }
+        self.endEasyMotion();
+    }
+
+    fn endEasyMotion(self: *App) void {
+        if (self.em_matches.len > 0) self.alloc.free(self.em_matches);
+        self.em_matches = &.{};
+        self.em_active = false;
+        self.em_labels = false;
+        self.em_query = 0;
     }
 
     /// Delete the character before the cursor (backspace). The edit lands in
@@ -534,6 +588,12 @@ const App = struct {
             },
             .paste => try self.pasteBuffer(false),
             .paste_before => try self.pasteBuffer(true),
+            .easymotion, .leader_find => {
+                // start the EasyMotion capture flow
+                self.em_active = true;
+                self.em_labels = false;
+                self.em_query = 0;
+            },
             .enter_command_mode => {},
             else => {},
         }
@@ -654,6 +714,20 @@ const App = struct {
                 .col_offset = 0,
                 .wrap = .none,
             });
+        }
+
+        // easymotion labels: overwrite the matched cells with jump labels
+        if (self.em_labels) {
+            for (self.em_matches) |m| {
+                const mline = self.pt.lineOf(m.pos);
+                if (mline < self.view_top or mline >= self.view_top + content_rows) continue;
+                const col_in_line = m.pos - self.pt.lineStart(mline);
+                const label = try a.dupe(u8, &[_]u8{m.label});
+                win.writeCell(@intCast(5 + col_in_line), @intCast(mline - self.view_top), .{
+                    .char = .{ .grapheme = label, .width = 1 },
+                    .style = .{ .fg = .{ .rgb = .{ 250, 189, 47 } }, .bg = .{ .rgb = .{ 54, 74, 130 } } },
+                });
+            }
         }
 
         // status bar (or command line in command mode)

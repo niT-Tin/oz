@@ -103,6 +103,8 @@ pub const State = struct {
     /// operator + 'i'/'a' seen (text-object inner/around), awaiting the target
     /// char (w ( ) [ { < ' " `); stores 'i' or 'a'
     pending_text_object: ?u8 = null,
+    /// leader (Space) seen, awaiting the next key (<leader>f etc.)
+    pending_leader: bool = false,
 
     /// backing storage for count_digits. The slice points into this buffer,
     /// so State must not be copied by value while a count is pending.
@@ -130,6 +132,22 @@ pub fn handle(
 }
 
 fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
+    // 0b) leader (Space) pending — next key picks the <leader> action.
+    if (state.pending_leader) {
+        state.pending_leader = false;
+        if (isEscape(key)) {
+            resetPending(state);
+            return .pending;
+        }
+        switch (key.codepoint) {
+            'f' => return emitAction(state, .leader_find), // <leader>f easymotion
+            else => {
+                resetPending(state);
+                return .pending;
+            },
+        }
+    }
+
     // 0) operator + text object (diw / ci( / yaw …): 'i'/'a' seen, awaiting
     //    the target character.
     if (state.pending_text_object) |inner| {
@@ -330,6 +348,12 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .repeat_last => emitAction(state, .repeat_last),
         .paste => emitAction(state, .paste),
         .paste_before => emitAction(state, .paste_before),
+        .easymotion => emitAction(state, .easymotion),
+        .leader_find => emitAction(state, .leader_find),
+        .leader => blk: {
+            state.pending_leader = true;
+            break :blk .pending;
+        },
         // never produced by the keymap tables
         .insert_char, .insert_exit, .noop => .pending,
     };

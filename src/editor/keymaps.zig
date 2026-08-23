@@ -45,6 +45,8 @@ pub const normal: KeyMap = &.{
     act(.{ .codepoint = 'O' }, .insert_line_before),
     act(.{ .codepoint = 'v' }, .visual_char),
     act(.{ .codepoint = 'V' }, .visual_line),
+    act(.{ .codepoint = 's' }, .easymotion),
+    act(.{ .codepoint = ' ' }, .leader),
     act(.{ .codepoint = ':' }, .enter_command_mode),
     act(.{ .codepoint = vaxis.Key.escape }, .normal_mode),
     // editing
