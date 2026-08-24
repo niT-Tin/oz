@@ -2079,6 +2079,18 @@ const App = struct {
         self.msg = owned;
     }
 
+    /// Resolve `path` (possibly relative to the process cwd) into an absolute
+    /// path. Returns a heap copy; the caller owns it. Falls back to a plain
+    /// dupe on failure so file opening never breaks on a resolution error.
+    fn absolutePath(self: *App, path: []const u8) ![]u8 {
+        if (path.len > 0 and path[0] == '/') return self.alloc.dupe(u8, path);
+        var cwd_buf: [4096]u8 = undefined;
+        const cwd_len = std.os.linux.getcwd(&cwd_buf, cwd_buf.len);
+        if (cwd_len == 0) return self.alloc.dupe(u8, path);
+        return std.Io.Dir.path.resolve(self.alloc, &.{ cwd_buf[0..cwd_len], path }) catch
+            self.alloc.dupe(u8, path);
+    }
+
     fn writeBuffer(self: *App) !void {
         const path = self.cur().path orelse {
             try self.setMsg(try self.alloc.dupe(u8, "E32: No file name"));
@@ -3103,7 +3115,7 @@ const App = struct {
         }
         if (ft.len == 0) return;
         const path = self.cur().path orelse return;
-        if (path.len == 0 or path[0] != '/') return; // only absolute paths
+        if (path.len == 0) return;
         const uri = lsp_types.pathToFileUri(self.alloc, path) catch return;
         defer self.alloc.free(uri);
         const text = self.curText() catch return;
@@ -4461,7 +4473,10 @@ pub fn main(init: std.process.Init) !void {
             app.cur().pt.deinit();
             app.cur().pt = try buffer.PieceTable.init(app.alloc, bytes);
             if (app.cur().path) |p| app.alloc.free(p);
-            app.cur().path = try app.alloc.dupe(u8, file_path);
+            // Store an absolute path so LSP (uri building, server matching)
+            // works for relative CLI args like `oz build.zig` — filetypeOf
+            // and ensureLsp both consume this.
+            app.cur().path = try app.absolutePath(file_path);
             try app.addRecent(file_path);
         }
         break; // M0: first file only
