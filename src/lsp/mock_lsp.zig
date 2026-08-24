@@ -342,8 +342,12 @@ fn buildCompletionResult(a: std.mem.Allocator) !std.json.Value {
     var item = try std.json.ObjectMap.init(a, &.{}, &.{});
     try item.put(a, "label", .{ .string = "mockItem" });
     try item.put(a, "kind", .{ .integer = 6 }); // CompletionItemKind.Function
+    var item2 = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try item2.put(a, "label", .{ .string = "mockAlpha" });
+    try item2.put(a, "kind", .{ .integer = 5 }); // CompletionItemKind.Field
     var items = std.json.Array.init(a);
     try items.append(.{ .object = item });
+    try items.append(.{ .object = item2 });
     var result = try std.json.ObjectMap.init(a, &.{}, &.{});
     try result.put(a, "items", .{ .array = items });
     return .{ .object = result };

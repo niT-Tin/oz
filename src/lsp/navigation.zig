@@ -132,6 +132,45 @@ pub fn parseSignature(alloc: std.mem.Allocator, result: std.json.Value) !?[]u8 {
     return null;
 }
 
+/// Parse a textDocument/completion response (CompletionList | CompletionItem[])
+/// into owned label strings appended to `out`. The label (or insertText /
+/// textEdit.newText when present) is what an accept would insert.
+pub fn parseCompletionItems(alloc: std.mem.Allocator, result: std.json.Value, out: *std.ArrayList([]u8)) !void {
+    // result may be {items:[...]} (CompletionList) or [...]
+    const items: std.json.Value = if (result == .object)
+        (result.object.get("items") orelse return)
+    else
+        result;
+    if (items != .array) return;
+    for (items.array.items) |item| {
+        if (item != .object) continue;
+        // prefer insertText / textEdit.newText, fall back to label
+        var text: ?[]const u8 = null;
+        if (item.object.get("textEdit")) |te| {
+            if (te == .object) {
+                if (te.object.get("newText")) |nt| {
+                    if (nt == .string) text = nt.string;
+                }
+            }
+        }
+        if (text == null) {
+            if (item.object.get("insertText")) |it| {
+                if (it == .string) text = it.string;
+            }
+        }
+        if (text == null) {
+            if (item.object.get("label")) |lb| {
+                if (lb == .string) text = lb.string;
+            }
+        }
+        const t = text orelse continue;
+        if (t.len == 0) continue;
+        const copy = try alloc.dupe(u8, t);
+        errdefer alloc.free(copy);
+        try out.append(alloc, copy);
+    }
+}
+
 test "navigation: textDocument/position params round-trip" {
     const alloc = std.testing.allocator;
     var v = try buildTextDocPositionParams(alloc, "file:///a.zig", 3, 7);
@@ -197,4 +236,35 @@ test "navigation: signature label extraction" {
     const s = (try parseSignature(alloc, p.value)).?;
     defer alloc.free(s);
     try std.testing.expectEqualStrings("foo(x: i32)", s);
+}
+
+test "navigation: completion items from CompletionList and raw array" {
+    const alloc = std.testing.allocator;
+    // CompletionList: {items:[{label,kind},{textEdit:{newText}}]}
+    const j1 = "{\"items\":[{\"label\":\"alpha\",\"kind\":5},{\"label\":\"beta\",\"insertText\":\"betaFn\"}]}";
+    var p1 = try std.json.parseFromSlice(std.json.Value, alloc, j1, .{ .allocate = .alloc_always });
+    defer p1.deinit();
+    var out1 = std.ArrayList([]u8).empty;
+    defer {
+        for (out1.items) |w| alloc.free(w);
+        out1.deinit(alloc);
+    }
+    try parseCompletionItems(alloc, p1.value, &out1);
+    try std.testing.expectEqual(@as(usize, 2), out1.items.len);
+    try std.testing.expectEqualStrings("alpha", out1.items[0]);
+    try std.testing.expectEqualStrings("betaFn", out1.items[1]);
+
+    // raw array form
+    const j2 = "[{\"label\":\"x\"},{\"textEdit\":{\"newText\":\"y\"}}]";
+    var p2 = try std.json.parseFromSlice(std.json.Value, alloc, j2, .{ .allocate = .alloc_always });
+    defer p2.deinit();
+    var out2 = std.ArrayList([]u8).empty;
+    defer {
+        for (out2.items) |w| alloc.free(w);
+        out2.deinit(alloc);
+    }
+    try parseCompletionItems(alloc, p2.value, &out2);
+    try std.testing.expectEqual(@as(usize, 2), out2.items.len);
+    try std.testing.expectEqualStrings("x", out2.items[0]);
+    try std.testing.expectEqualStrings("y", out2.items[1]);
 }

@@ -176,6 +176,9 @@ const App = struct {
     /// Start of the word being typed when the menu opened; Enter replaces
     /// [completion_pos, cursor) with the selected word.
     completion_pos: u32 = 0,
+    /// LSP textDocument/completion response slot (filled by drain); consumed
+    /// by processCompletion. Local word completion is the fallback.
+    completion_slot: ?std.json.Value = null,
 
     /// The active buffer (the focused window's buffer; per-buffer document
     /// state lives here, per-window cursor/viewport in `windows`).
@@ -575,6 +578,7 @@ const App = struct {
         if (self.nav_hover_text) |t| self.alloc.free(t);
         for (self.nav_locations.items) |*l| self.alloc.free(l.uri);
         self.nav_locations.deinit(self.alloc);
+        if (self.completion_slot) |*v| json_rpc.freeValue(self.alloc, v);
         for (self.completion_words.items) |w| self.alloc.free(w);
         self.completion_words.deinit(self.alloc);
     }
@@ -1290,11 +1294,49 @@ const App = struct {
         if (self.completion_active) return;
         if (self.curCursor().* == 0) return;
         if (!isWordByte(self.cur().pt.byteAt(self.curCursor().* - 1))) return;
+        // LSP completion first: ask the language server for candidates at the
+        // cursor; the response lands in completion_slot and processCompletion
+        // opens the menu. Without a client we fall back to buffer words.
+        if (self.lsp_client) |c| {
+            // remember the start of the word being typed so acceptCompletion
+            // replaces just [completion_pos, cursor) with the chosen item
+            var pos = self.curCursor().*;
+            while (pos > 0 and isWordByte(self.cur().pt.byteAt(pos - 1))) pos -= 1;
+            if (pos == self.curCursor().*) return;
+            self.completion_pos = pos;
+            const uri = lsp_types.pathToFileUri(self.alloc, self.cur().path orelse return) catch return;
+            defer self.alloc.free(uri);
+            const line = self.cur().pt.lineOf(self.curCursor().*);
+            const col = self.curCursor().* - self.cur().pt.lineStart(line);
+            var params = lsp_nav.buildTextDocPositionParams(self.alloc, uri, line, col) catch return;
+            defer lsp_nav.freeTextDocPositionParams(self.alloc, &params);
+            c.request("textDocument/completion", params, &self.completion_slot) catch return;
+            return;
+        }
         try self.collectCompletionWords();
         if (self.completion_words.items.len > 0) {
             self.completion_active = true;
             self.completion_sel = 0;
         }
+    }
+
+    /// Consume a completed LSP completion response (called after drain each
+    /// frame): fill completion_words and open the menu. Returns true when a
+    /// response was consumed (caller renders immediately).
+    fn processCompletion(self: *App) bool {
+        var result = self.completion_slot orelse return false;
+        defer {
+            json_rpc.freeValue(self.alloc, &result);
+            self.completion_slot = null;
+        }
+        for (self.completion_words.items) |w| self.alloc.free(w);
+        self.completion_words.clearRetainingCapacity();
+        lsp_nav.parseCompletionItems(self.alloc, result, &self.completion_words) catch {};
+        if (self.completion_words.items.len > 0) {
+            self.completion_active = true;
+            self.completion_sel = 0;
+        }
+        return true;
     }
 
     /// Scan the whole buffer for words and fill completion_words with the
@@ -3896,14 +3938,12 @@ const App = struct {
             // reach the handler before the frame renders; then consume any
             // completed navigation request before the frame is drawn.
             if (self.lsp_client) |c| c.drain(self, App.lspHandler);
-            if (self.processNav()) {
-                // A navigation response was consumed: render it immediately.
-                // Without this, the loop would block in pollEvent below
-                // before the new hover window / location list is drawn.
-                try self.render();
-                continue;
-            }
-            if (self.processNav()) {
+            // Consume async LSP responses (navigation, completion) and render
+            // immediately — otherwise the loop would block in pollEvent below
+            // before the new hover window / completion menu is drawn.
+            const nav_ready = self.processNav();
+            const comp_ready = self.processCompletion();
+            if (nav_ready or comp_ready) {
                 try self.render();
                 continue;
             }
