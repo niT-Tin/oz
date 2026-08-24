@@ -3834,6 +3834,137 @@ test "visual line V selects whole lines from mid-line" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+test "visual line: V + d/c deletes ALL selected lines (incl. the last one)" {
+    // Regression: visual_line d/c used anchor..cursor bytes, so a selection
+    // ending on the last line left that line's tail (or the whole line)
+    // behind. The range must span whole lines: anchor-line start through
+    // cursor-line end + its newline.
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}vld.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "aaa\nbbb\nccc\nddd\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // -- d: select lines 2..4 (last line) from mid-line 2, delete them all --
+    // j to line 2, l to mid-line, V, jj (cursor on line 4 = last), d
+    try sess.send("jlVjjd");
+    waited = 0;
+    while (!(!rowContains(&grid, 2, "bbb") and !rowContains(&grid, 3, "ccc") and !rowContains(&grid, 4, "ddd"))) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    // only "aaa" remains on row 1; rows 2..4 are empty
+    try std.testing.expect(rowContains(&grid, 1, "aaa"));
+    try std.testing.expect(!rowContains(&grid, 2, "bbb"));
+    try std.testing.expect(!rowContains(&grid, 3, "ccc"));
+    try std.testing.expect(!rowContains(&grid, 4, "ddd"));
+
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "visual line: V + c consumes ALL selected lines (incl. the last one)" {
+    // Regression: visual_line change used anchor..cursor bytes, leaving the
+    // last selected line's tail behind. c must consume every whole line.
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}vlc.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "aaa\nbbb\nccc\nddd\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // select lines 2..4 (last line) from mid-line 2: j, l, V, jj, c
+    try sess.send("jlVjjc");
+    waited = 0;
+    while (!grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("INSERT"));
+    // Esc back to normal: only "aaa" remains, bbb/ccc/ddd all consumed
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(rowContains(&grid, 1, "aaa"));
+    try std.testing.expect(!rowContains(&grid, 2, "bbb"));
+    try std.testing.expect(!rowContains(&grid, 3, "ccc"));
+
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
 test "e2e: Ctrl+a / Ctrl+x increment and decrement the number at the cursor" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;

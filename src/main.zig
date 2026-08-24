@@ -1542,14 +1542,18 @@ const App = struct {
     /// Consume an inlayHint response: collect (line, character, label) hints
     /// for inline rendering. Returns true when a response was consumed.
     fn processInlay(self: *App) bool {
-        var result = self.inlay_slot orelse return false;
+        var result = self.inlay_slot orelse {
+            return false;
+        };
         defer {
             json_rpc.freeValue(self.alloc, &result);
             self.inlay_slot = null;
         }
         for (self.inlay_hints.items) |*h| self.alloc.free(h.label);
         self.inlay_hints.clearRetainingCapacity();
-        if (result != .array) return true;
+        if (result != .array) {
+            return true;
+        }
         for (result.array.items) |hint| {
             if (hint != .object) continue;
             const label = hint.object.get("label") orelse continue;
@@ -3398,6 +3402,21 @@ const App = struct {
                     if (self.visual_anchor) |anchor| {
                         if (self.state.mode == .visual_block) {
                             try self.applyBlockOp(action);
+                        } else if (self.state.mode == .visual_line) {
+                            // V selects whole lines: the range spans from the
+                            // anchor line's start to the cursor line's end
+                            // (including the trailing newline when present),
+                            // not just anchor..cursor bytes — otherwise the
+                            // last selected line survives a d/c.
+                            const pt = &self.cur().pt;
+                            const al = pt.lineOf(anchor);
+                            const cl = pt.lineOf(self.curCursor().*);
+                            const start = pt.lineStart(al);
+                            var end = pt.lineStart(cl) + pt.lineLen(cl);
+                            if (end < pt.len()) end += 1; // include the newline
+                            // exclusive_cursor: the range already ends exactly
+                            // after the last selected line's newline.
+                            try self.applyOpRangeEx(action, start, end, false, .exclusive_cursor);
                         } else {
                             try self.applyOpRangeEx(action, anchor, self.curCursor().*, false, .inclusive_cursor);
                         }
@@ -3858,7 +3877,9 @@ const App = struct {
                 var hint_col = hint.character;
                 const hint_line_len: u32 = buf.pt.lineLen(line);
                 if (hint_col < hint_line_len) hint_col = hint_line_len;
-                if (hint_col + hint.label.len >= @as(u32, win.width)) continue;
+                if (hint_col + hint.label.len >= @as(u32, win.width)) {
+                    continue;
+                }
                 const seg = [_]vaxis.Segment{.{
                     .text = hint.label,
                     .style = .{ .dim = true, .fg = .{ .rgb = .{ 122, 124, 135 } } },
