@@ -19,9 +19,11 @@
 //! Design: everything except the stdio loop is a pure function
 //! (`handleMessage`: one parsed Message in -> zero or more outgoing frame
 //! bodies out), so the response logic is unit-tested without spawning a
-//! process. The frame reader/writer below are local copies of the pattern in
+//! process. The frame transport below follows the pattern in
 //! src/lsp/client.zig (`readFrameFromFile` / `writeFrameToStdin`, which are
-//! not exported from that file); credit the reference for the original.
+//! not exported from that file), but the reader is buffered (`FrameReader`)
+//! so frames that coalesce into one OS read — or arrive in tiny chunks —
+//! are still delivered one by one without losing bytes.
 //!
 //! The mock never writes to stdout except well-formed JSON-RPC frames, and
 //! never uses `std.debug.print`; `--verbose` diagnostics go to stderr.
@@ -157,52 +159,127 @@ pub fn handleMessage(
 }
 
 // ---------------------------------------------------------------------------
-// Frame transport (adapted from src/lsp/client.zig)
+// Frame transport (pattern adapted from src/lsp/client.zig)
 // ---------------------------------------------------------------------------
 
-/// Read one JSON-RPC frame (Content-Length header + body) from a pipe/file.
-/// Returns null on a clean EOF at a message boundary. `content` is allocated
-/// with `alloc` and owned by the caller. See src/lsp/client.zig
-/// `readFrameFromFile` (not exported there) for the original.
-pub fn readFrameFromFile(alloc: std.mem.Allocator, file: std.Io.File, io: std.Io) !?[]u8 {
-    var hdr: [8192]u8 = undefined;
-    var hdr_len: usize = 0;
-    while (true) {
-        const n = try file.readStreaming(io, &.{hdr[hdr_len..]});
-        if (n == 0) return if (hdr_len == 0) null else error.UnexpectedEof;
-        hdr_len += n;
-        if (std.mem.indexOf(u8, hdr[0..hdr_len], "\r\n\r\n")) |sep| {
-            const header = hdr[0..sep];
-            var cl: ?usize = null;
-            var it = std.mem.splitScalar(u8, header, '\n');
-            while (it.next()) |line_raw| {
-                const line = std.mem.trim(u8, line_raw, " \t\r");
-                if (line.len == 0) continue;
-                const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-                const name = std.mem.trim(u8, line[0..colon], " \t");
-                const val = std.mem.trim(u8, line[colon + 1 ..], " \t");
-                if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-                    if (cl != null) return error.InvalidHeader;
-                    cl = std.fmt.parseInt(usize, val, 10) catch return error.InvalidContentLength;
+/// Streaming reader for Content-Length framed messages with an internal
+/// buffer. A single OS read may deliver several frames (or a partial frame);
+/// a stateless reader that copies only `Content-Length` bytes out of one
+/// read loses the excess. (The stateless reader in src/lsp/client.zig does
+/// exactly that — see its `readFrameFromFile` — which is fine there until
+/// frames coalesce; this one keeps every excess byte for the next `next()`.)
+///
+/// EOF surfaces as `null` at a clean frame boundary and
+/// `error.UnexpectedEof` when a frame is cut short. Each returned body is
+/// allocated with `alloc` and owned by the caller.
+pub const FrameReader = struct {
+    alloc: std.mem.Allocator,
+    file: std.Io.File,
+    io: std.Io,
+    /// Bytes read from `file` but not yet consumed by a frame (owned).
+    pending: std.ArrayList(u8) = .empty,
+
+    /// A header block bigger than this (without finding "\r\n\r\n") is
+    /// garbage, not a frame; guards against unbounded buffering.
+    const max_header_len = 1 << 20;
+
+    pub fn init(alloc: std.mem.Allocator, file: std.Io.File, io: std.Io) FrameReader {
+        return .{ .alloc = alloc, .file = file, .io = io };
+    }
+
+    pub fn deinit(self: *FrameReader) void {
+        self.pending.deinit(self.alloc);
+    }
+
+    pub fn next(self: *FrameReader) !?[]u8 {
+        // 1. Fill until a complete header block ("...\r\n\r\n") is buffered.
+        while (std.mem.indexOf(u8, self.pending.items, "\r\n\r\n") == null) {
+            if (self.pending.items.len >= max_header_len) return error.InvalidHeader;
+            const got = try self.fillMore();
+            if (got == 0) {
+                if (self.pending.items.len == 0) return null; // clean EOF
+                return error.UnexpectedEof; // EOF inside a header
+            }
+        }
+
+        // 2. Skip blank-line padding between frames (an empty header block).
+        while (self.pending.items.len >= 4 and
+            std.mem.eql(u8, self.pending.items[0..4], "\r\n\r\n"))
+        {
+            self.drop(4);
+            while (std.mem.indexOf(u8, self.pending.items, "\r\n\r\n") == null) {
+                if (self.pending.items.len >= max_header_len) return error.InvalidHeader;
+                const got = try self.fillMore();
+                if (got == 0) {
+                    if (self.pending.items.len == 0) return null;
+                    return error.UnexpectedEof;
                 }
             }
-            const clen = cl orelse return error.MissingContentLength;
-            const body = try alloc.alloc(u8, clen);
-            errdefer alloc.free(body);
-            const have = hdr_len - (sep + 4);
-            const take = @min(have, clen);
-            @memcpy(body[0..take], hdr[sep + 4 .. sep + 4 + take]);
-            var got = take;
-            while (got < clen) {
-                const m = try file.readStreaming(io, &.{body[got..]});
-                if (m == 0) return error.UnexpectedEof;
-                got += m;
-            }
-            return body;
         }
-        if (hdr_len >= hdr.len) return error.InvalidHeader;
+
+        // 3. Parse Content-Length from the header.
+        const sep = std.mem.indexOf(u8, self.pending.items, "\r\n\r\n").?;
+        const header = self.pending.items[0..sep];
+        var cl: ?usize = null;
+        var it = std.mem.splitScalar(u8, header, '\n');
+        while (it.next()) |line_raw| {
+            const line = std.mem.trim(u8, line_raw, " \t\r");
+            if (line.len == 0) continue;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const name = std.mem.trim(u8, line[0..colon], " \t");
+            const val = std.mem.trim(u8, line[colon + 1 ..], " \t");
+            if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+                if (cl != null) return error.InvalidHeader;
+                cl = std.fmt.parseInt(usize, val, 10) catch return error.InvalidContentLength;
+            }
+        }
+        const clen = cl orelse return error.MissingContentLength;
+
+        // 4. Fill until the whole body is buffered.
+        const body_start = sep + 4;
+        while (self.pending.items.len < body_start + clen) {
+            const got = try self.fillMore();
+            if (got == 0) return error.UnexpectedEof; // EOF inside a body
+        }
+
+        // 5. Copy the frame out and drop header + body from the buffer.
+        const body = try self.alloc.dupe(u8, self.pending.items[body_start .. body_start + clen]);
+        errdefer self.alloc.free(body);
+        const consumed = body_start + clen;
+        if (consumed == self.pending.items.len) {
+            self.pending.clearRetainingCapacity();
+        } else {
+            const rest = self.pending.items[consumed..];
+            std.mem.copyForwards(u8, self.pending.items[0..rest.len], rest);
+            self.pending.shrinkRetainingCapacity(rest.len);
+        }
+        return body;
     }
-}
+
+    /// Read up to 8192 more bytes into `pending`; returns the number of
+    /// bytes added, or 0 on EOF (mapped from both `error.EndOfStream` and a
+    /// zero-length read, depending on the io implementation).
+    fn fillMore(self: *FrameReader) !usize {
+        var buf: [8192]u8 = undefined;
+        const n = self.file.readStreaming(self.io, &.{buf[0..]}) catch |e| switch (e) {
+            error.EndOfStream => return 0,
+            else => return e,
+        };
+        if (n == 0) return 0;
+        try self.pending.appendSlice(self.alloc, buf[0..n]);
+        return n;
+    }
+
+    fn drop(self: *FrameReader, n: usize) void {
+        if (n == self.pending.items.len) {
+            self.pending.clearRetainingCapacity();
+            return;
+        }
+        const rest = self.pending.items[n..];
+        std.mem.copyForwards(u8, self.pending.items[0..rest.len], rest);
+        self.pending.shrinkRetainingCapacity(rest.len);
+    }
+};
 
 /// Write `Content-Length: N\r\n\r\n` followed by `content` to `file`
 /// (blocking). Same framing as src/lsp/client.zig `writeFrameToStdin`.
@@ -408,16 +485,17 @@ pub fn main(init: std.process.Init) !void {
 
     const stdin = std.Io.File.stdin();
     const stdout = std.Io.File.stdout();
+    var reader = FrameReader.init(gpa, stdin, io);
+    defer reader.deinit();
 
     logVerbose(io, verbose, "mock_lsp: script={s} ready\n", .{@tagName(script)});
 
     var running = true;
     while (running) {
-        const content = readFrameFromFile(gpa, stdin, io) catch |e| {
+        const body = reader.next() catch |e| {
             logVerbose(io, verbose, "mock_lsp: stdin closed or read error: {s}\n", .{@errorName(e)});
             break;
-        };
-        const body = content orelse break; // clean EOF at a frame boundary
+        } orelse break; // clean EOF at a frame boundary
         defer gpa.free(body);
 
         var msg = json_rpc.parseMessage(gpa, body) catch |e| {
@@ -472,25 +550,78 @@ test "frame read/write round-trip over a pipe" {
     const io = testing.io;
     const fds = try std.Io.Threaded.pipe2(.{});
     const read_end = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
-    const write_end = std.Io.File{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+    var write_end = std.Io.File{ .handle = fds[1], .flags = .{ .nonblocking = false } };
     defer std.Io.File.close(read_end, io);
-    errdefer std.Io.File.close(write_end, io);
+    defer if (write_end.handle != -1) std.Io.File.close(write_end, io);
+
+    var reader = FrameReader.init(alloc, read_end, io);
+    defer reader.deinit();
 
     const c1 = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}";
     const c2 = "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}";
     try writeFrameToFile(write_end, io, c1);
     try writeFrameToFile(write_end, io, c2);
     std.Io.File.close(write_end, io); // reader now sees clean EOF after c2
+    write_end.handle = -1; // mark closed so the defer no-ops
 
-    const r1 = (try readFrameFromFile(alloc, read_end, io)).?;
+    const r1 = (try reader.next()).?;
     defer alloc.free(r1);
     try testing.expectEqualStrings(c1, r1);
 
-    const r2 = (try readFrameFromFile(alloc, read_end, io)).?;
+    const r2 = (try reader.next()).?;
     defer alloc.free(r2);
     try testing.expectEqualStrings(c2, r2);
 
-    try testing.expectEqual(@as(?[]u8, null), try readFrameFromFile(alloc, read_end, io));
+    try testing.expectEqual(@as(?[]u8, null), try reader.next());
+}
+
+test "frame reader survives coalesced and chunked delivery" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    const fds = try std.Io.Threaded.pipe2(.{});
+    const read_end = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+    var write_end = std.Io.File{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+    defer std.Io.File.close(read_end, io);
+    defer if (write_end.handle != -1) std.Io.File.close(write_end, io);
+
+    var reader = FrameReader.init(alloc, read_end, io);
+    defer reader.deinit();
+
+    const c1 = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}";
+    const c2 = "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}";
+
+    // Coalescing: both complete frames written in one shot, so a single OS
+    // read delivers them together; the reader must not drop the second.
+    var both_buf: [512]u8 = undefined;
+    const both = try std.fmt.bufPrint(&both_buf, "Content-Length: {d}\r\n\r\n{s}Content-Length: {d}\r\n\r\n{s}", .{ c1.len, c1, c2.len, c2 });
+    try std.Io.File.writeStreamingAll(write_end, io, both);
+
+    // Chunked: dribble the bytes of a third frame in 3-byte pieces so header
+    // and body arrive across many reads.
+    const c3 = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/hover\",\"params\":{}}";
+    var framed: [512]u8 = undefined;
+    const all3 = try std.fmt.bufPrint(&framed, "Content-Length: {d}\r\n\r\n{s}", .{ c3.len, c3 });
+    var i: usize = 0;
+    while (i < all3.len) : (i += 3) {
+        const chunk = all3[@min(i, all3.len)..@min(i + 3, all3.len)];
+        try std.Io.File.writeStreamingAll(write_end, io, chunk);
+    }
+    std.Io.File.close(write_end, io);
+    write_end.handle = -1; // mark closed so the defer no-ops
+
+    const r1 = (try reader.next()).?;
+    defer alloc.free(r1);
+    try testing.expectEqualStrings(c1, r1);
+
+    const r2 = (try reader.next()).?;
+    defer alloc.free(r2);
+    try testing.expectEqualStrings(c2, r2);
+
+    const r3 = (try reader.next()).?;
+    defer alloc.free(r3);
+    try testing.expectEqualStrings(c3, r3);
+
+    try testing.expectEqual(@as(?[]u8, null), try reader.next());
 }
 
 test "hello: initialize responds with capabilities" {
@@ -669,7 +800,9 @@ test "full message cycle through frame functions and handleMessage" {
 
     const req_content = "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"textDocument/hover\",\"params\":{}}";
     try writeFrameToFile(write_end, io, req_content);
-    const got = (try readFrameFromFile(alloc, read_end, io)).?;
+    var reader = FrameReader.init(alloc, read_end, io);
+    defer reader.deinit();
+    const got = (try reader.next()).?;
     defer alloc.free(got);
     try testing.expectEqualStrings(req_content, got);
 
@@ -682,7 +815,7 @@ test "full message cycle through frame functions and handleMessage" {
     try testing.expectEqual(@as(usize, 1), out.frames.items.len);
 
     try writeFrameToFile(write_end, io, out.frames.items[0]);
-    const resp = (try readFrameFromFile(alloc, read_end, io)).?;
+    const resp = (try reader.next()).?;
     defer alloc.free(resp);
     var rmsg = try json_rpc.parseMessage(alloc, resp);
     defer rmsg.deinit(alloc);

@@ -296,8 +296,10 @@ pub const Client = struct {
 
     fn readerMain(self: *Client) void {
         const stdout = self.proc.stdout orelse return;
+        var reader = FrameReader.init(self.alloc, stdout, self.io);
+        defer reader.deinit();
         while (!self.stop.load(.acquire)) {
-            const content = readFrameFromFile(self.alloc, stdout, self.io) catch break;
+            const content = reader.next() catch break;
             if (content) |c| {
                 self.queue.push(self.alloc, c) catch {
                     self.alloc.free(c);
@@ -324,48 +326,103 @@ pub const Client = struct {
     }
 };
 
-/// Read one JSON-RPC frame (Content-Length header + body) from a pipe/file.
-/// Returns null on a clean EOF at a message boundary. `json_rpc.readFrame`
-/// targets in-memory readers; pipes need explicit streaming reads.
-fn readFrameFromFile(alloc: std.mem.Allocator, file: std.Io.File, io: std.Io) !?[]u8 {
-    var hdr: [8192]u8 = undefined;
-    var hdr_len: usize = 0;
-    while (true) {
-        const n = try file.readStreaming(io, &.{hdr[hdr_len..]});
-        if (n == 0) return if (hdr_len == 0) null else error.UnexpectedEof;
-        hdr_len += n;
-        if (std.mem.indexOf(u8, hdr[0..hdr_len], "\r\n\r\n")) |sep| {
-            const header = hdr[0..sep];
-            var cl: ?usize = null;
-            var it = std.mem.splitScalar(u8, header, '\n');
-            while (it.next()) |line_raw| {
-                const line = std.mem.trim(u8, line_raw, " \t\r");
-                if (line.len == 0) continue;
-                const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-                const name = std.mem.trim(u8, line[0..colon], " \t");
-                const val = std.mem.trim(u8, line[colon + 1 ..], " \t");
-                if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-                    if (cl != null) return error.InvalidHeader;
-                    cl = std.fmt.parseInt(usize, val, 10) catch return error.InvalidContentLength;
+/// Buffered JSON-RPC frame reader for pipes. A single OS read can coalesce
+/// several frames (or split one); the buffer holds leftovers for the next
+/// `next()`, so back-to-back messages (e.g. the initialize response followed
+/// immediately by a publishDiagnostics) are never lost.
+pub const FrameReader = struct {
+    alloc: std.mem.Allocator,
+    file: std.Io.File,
+    io: std.Io,
+    pending: std.ArrayList(u8) = .empty,
+
+    const max_header_len = 1 << 20;
+
+    pub fn init(alloc: std.mem.Allocator, file: std.Io.File, io: std.Io) FrameReader {
+        return .{ .alloc = alloc, .file = file, .io = io };
+    }
+
+    pub fn deinit(self: *FrameReader) void {
+        self.pending.deinit(self.alloc);
+    }
+
+    pub fn next(self: *FrameReader) !?[]u8 {
+        while (std.mem.indexOf(u8, self.pending.items, "\r\n\r\n") == null) {
+            if (self.pending.items.len >= max_header_len) return error.InvalidHeader;
+            const got = try self.fillMore();
+            if (got == 0) {
+                if (self.pending.items.len == 0) return null;
+                return error.UnexpectedEof;
+            }
+        }
+        while (self.pending.items.len >= 4 and
+            std.mem.eql(u8, self.pending.items[0..4], "\r\n\r\n"))
+        {
+            self.drop(4);
+            while (std.mem.indexOf(u8, self.pending.items, "\r\n\r\n") == null) {
+                if (self.pending.items.len >= max_header_len) return error.InvalidHeader;
+                const got = try self.fillMore();
+                if (got == 0) {
+                    if (self.pending.items.len == 0) return null;
+                    return error.UnexpectedEof;
                 }
             }
-            const clen = cl orelse return error.MissingContentLength;
-            const body = try alloc.alloc(u8, clen);
-            errdefer alloc.free(body);
-            const have = hdr_len - (sep + 4);
-            const take = @min(have, clen);
-            @memcpy(body[0..take], hdr[sep + 4 .. sep + 4 + take]);
-            var got = take;
-            while (got < clen) {
-                const m = try file.readStreaming(io, &.{body[got..]});
-                if (m == 0) return error.UnexpectedEof;
-                got += m;
-            }
-            return body;
         }
-        if (hdr_len >= hdr.len) return error.InvalidHeader;
+        const sep = std.mem.indexOf(u8, self.pending.items, "\r\n\r\n").?;
+        const header = self.pending.items[0..sep];
+        var cl: ?usize = null;
+        var it = std.mem.splitScalar(u8, header, '\n');
+        while (it.next()) |line_raw| {
+            const line = std.mem.trim(u8, line_raw, " \t\r");
+            if (line.len == 0) continue;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const name = std.mem.trim(u8, line[0..colon], " \t");
+            const val = std.mem.trim(u8, line[colon + 1 ..], " \t");
+            if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+                if (cl != null) return error.InvalidHeader;
+                cl = std.fmt.parseInt(usize, val, 10) catch return error.InvalidContentLength;
+            }
+        }
+        const clen = cl orelse return error.MissingContentLength;
+        const body_start = sep + 4;
+        while (self.pending.items.len < body_start + clen) {
+            const got = try self.fillMore();
+            if (got == 0) return error.UnexpectedEof;
+        }
+        const body = try self.alloc.dupe(u8, self.pending.items[body_start .. body_start + clen]);
+        errdefer self.alloc.free(body);
+        const consumed = body_start + clen;
+        if (consumed == self.pending.items.len) {
+            self.pending.clearRetainingCapacity();
+        } else {
+            const rest = self.pending.items[consumed..];
+            std.mem.copyForwards(u8, self.pending.items[0..rest.len], rest);
+            self.pending.shrinkRetainingCapacity(rest.len);
+        }
+        return body;
     }
-}
+
+    fn fillMore(self: *FrameReader) !usize {
+        var buf: [8192]u8 = undefined;
+        const n = self.file.readStreaming(self.io, &.{buf[0..]}) catch |e| switch (e) {
+            error.EndOfStream => return 0,
+            else => return e,
+        };
+        if (n == 0) return 0;
+        try self.pending.appendSlice(self.alloc, buf[0..n]);
+        return n;
+    }
+
+    fn drop(self: *FrameReader, n: usize) void {
+        if (n == self.pending.items.len) {
+            self.pending.clearRetainingCapacity();
+            return;
+        }
+        const rest = self.pending.items[n..];
+        std.mem.copyForwards(u8, self.pending.items[0..rest.len], rest);
+        self.pending.shrinkRetainingCapacity(rest.len);
+    }
+};
 
 test "queue: push/pop/popTimeout round-trip" {
     const alloc = std.testing.allocator;
