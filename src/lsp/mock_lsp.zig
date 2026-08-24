@@ -144,6 +144,17 @@ pub fn handleMessage(
             try pushResponse(alloc, &out, id, .{ .array = locs });
         } else if (std.mem.eql(u8, method, "textDocument/signatureHelp")) {
             try pushResponse(alloc, &out, id, try buildSignatureResult(a));
+        } else if (std.mem.eql(u8, method, "textDocument/formatting")) {
+            // Format the whole doc: replace everything with a canonical form
+            try pushResponse(alloc, &out, id, try buildFormatResult(a, state));
+        } else if (std.mem.eql(u8, method, "textDocument/rename")) {
+            // Rename: replace the symbol at the cursor (line 0) everywhere.
+            // The mock replaces the whole document with a fixed rename edit.
+            try pushResponse(alloc, &out, id, try buildRenameResult(a, state));
+        } else if (std.mem.eql(u8, method, "textDocument/inlayHint")) {
+            try pushResponse(alloc, &out, id, try buildInlayResult(a));
+        } else if (std.mem.eql(u8, method, "textDocument/documentSymbol")) {
+            try pushResponse(alloc, &out, id, try buildSymbolResult(a));
         } else {
             // Any other request (shutdown, ...) gets a null result.
             try pushResponse(alloc, &out, id, .null);
@@ -360,6 +371,87 @@ fn buildHoverResult(a: std.mem.Allocator) !std.json.Value {
     var result = try std.json.ObjectMap.init(a, &.{}, &.{});
     try result.put(a, "contents", .{ .object = contents });
     return .{ .object = result };
+}
+
+fn buildFormatResult(a: std.mem.Allocator, state: *State) !std.json.Value {
+    // Replace the whole document with its current text (a no-op format), so
+    // the editor exercises the TextEdit apply path without changing content.
+    const doc = if (state.changed.items.len > 0) state.changed.items[0].text else "";
+    var start = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try start.put(a, "line", .{ .integer = 0 });
+    try start.put(a, "character", .{ .integer = 0 });
+    var end = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try end.put(a, "line", .{ .integer = 999 });
+    try end.put(a, "character", .{ .integer = 0 });
+    var range = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try range.put(a, "start", .{ .object = start });
+    try range.put(a, "end", .{ .object = end });
+    var edit = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try edit.put(a, "range", .{ .object = range });
+    try edit.put(a, "newText", .{ .string = doc });
+    var edits = std.json.Array.init(a);
+    try edits.append(.{ .object = edit });
+    return .{ .array = edits };
+}
+
+fn buildRenameResult(a: std.mem.Allocator, state: *State) !std.json.Value {
+    // WorkspaceEdit {changes: {uri: [TextEdit]}} — replace the first word of
+    // the first line with "renamedSymbol" (deterministic for the e2e test).
+    const uri = if (state.changed.items.len > 0) state.changed.items[0].uri else "file:///mock.zig";
+    var start = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try start.put(a, "line", .{ .integer = 0 });
+    try start.put(a, "character", .{ .integer = 0 });
+    var end = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try end.put(a, "line", .{ .integer = 0 });
+    try end.put(a, "character", .{ .integer = 4 });
+    var range = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try range.put(a, "start", .{ .object = start });
+    try range.put(a, "end", .{ .object = end });
+    var edit = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try edit.put(a, "range", .{ .object = range });
+    try edit.put(a, "newText", .{ .string = "renamedSymbol" });
+    var edits = std.json.Array.init(a);
+    try edits.append(.{ .object = edit });
+    var changes = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try changes.put(a, uri, .{ .array = edits });
+    var result = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try result.put(a, "changes", .{ .object = changes });
+    return .{ .object = result };
+}
+
+fn buildInlayResult(a: std.mem.Allocator) !std.json.Value {
+    var hint = try std.json.ObjectMap.init(a, &.{}, &.{});
+    var pos = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try pos.put(a, "line", .{ .integer = 0 });
+    try pos.put(a, "character", .{ .integer = 0 });
+    try hint.put(a, "position", .{ .object = pos });
+    try hint.put(a, "label", .{ .string = ": i32" });
+    var hints = std.json.Array.init(a);
+    try hints.append(.{ .object = hint });
+    return .{ .array = hints };
+}
+
+fn buildSymbolResult(a: std.mem.Allocator) !std.json.Value {
+    var sym = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try sym.put(a, "name", .{ .string = "mockFn" });
+    try sym.put(a, "kind", .{ .integer = 12 }); // Function
+    var start = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try start.put(a, "line", .{ .integer = 0 });
+    try start.put(a, "character", .{ .integer = 0 });
+    var end = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try end.put(a, "line", .{ .integer = 0 });
+    try end.put(a, "character", .{ .integer = 4 });
+    var range = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try range.put(a, "start", .{ .object = start });
+    try range.put(a, "end", .{ .object = end });
+    try sym.put(a, "range", .{ .object = range });
+    var selection = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try selection.put(a, "start", .{ .object = start });
+    try selection.put(a, "end", .{ .object = end });
+    try sym.put(a, "selectionRange", .{ .object = selection });
+    var syms = std.json.Array.init(a);
+    try syms.append(.{ .object = sym });
+    return .{ .array = syms };
 }
 
 fn buildDiagnosticsParams(a: std.mem.Allocator, uri: []const u8) !std.json.Value {

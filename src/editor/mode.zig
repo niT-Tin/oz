@@ -169,6 +169,9 @@ pub const State = struct {
     pending_leader_s: bool = false,
     /// <leader>b seen (buffer family), awaiting b/n/j/k
     pending_leader_b: bool = false,
+    pending_leader_r: bool = false,
+    pending_leader_l: bool = false,
+    pending_leader_t: bool = false,
     /// surround sequence (ys/ds/cs) in progress
     pending_surround: ?SurroundPending = null,
     /// 'g' + 'c' seen (comment sequence), awaiting 'c' (line) — gc in visual
@@ -288,6 +291,54 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         }
     }
 
+    // 0a3) <leader>r pending: rn — LSP rename symbol
+    if (state.pending_leader_r) {
+        state.pending_leader_r = false;
+        if (isEscape(key)) {
+            resetPending(state);
+            return .pending;
+        }
+        switch (key.codepoint) {
+            'n' => return emitAction(state, .rename_symbol), // <leader>rn rename
+            else => {
+                resetPending(state);
+                return .pending;
+            },
+        }
+    }
+
+    // 0a3) <leader>l pending: lf — LSP format document
+    if (state.pending_leader_l) {
+        state.pending_leader_l = false;
+        if (isEscape(key)) {
+            resetPending(state);
+            return .pending;
+        }
+        switch (key.codepoint) {
+            'f' => return emitAction(state, .format_document), // <leader>lf format
+            else => {
+                resetPending(state);
+                return .pending;
+            },
+        }
+    }
+
+    // 0a3) <leader>t pending: ti — LSP inlay hints
+    if (state.pending_leader_t) {
+        state.pending_leader_t = false;
+        if (isEscape(key)) {
+            resetPending(state);
+            return .pending;
+        }
+        switch (key.codepoint) {
+            'i' => return emitAction(state, .inlay_hints), // <leader>ti inlay hints
+            else => {
+                resetPending(state);
+                return .pending;
+            },
+        }
+    }
+
     // 0a3) <leader>b pending (buffer family): bb prev / bn next / bj pick /
     //     bk close.
     if (state.pending_leader_b) {
@@ -347,6 +398,19 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
                 state.pending_leader_b = true;
                 return .pending;
             },
+            'r' => {
+                state.pending_leader_r = true;
+                return .pending;
+            },
+            'l' => {
+                state.pending_leader_l = true;
+                return .pending;
+            },
+            't' => {
+                state.pending_leader_t = true;
+                return .pending;
+            },
+            'o' => return emitAction(state, .document_outline), // <leader>o outline
             else => {
                 resetPending(state);
                 return .pending;
@@ -624,6 +688,10 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .references => emitAction(state, .references),
         .implementation => emitAction(state, .implementation),
         .signature_help => emitAction(state, .signature_help),
+        .rename_symbol => emitAction(state, .rename_symbol),
+        .format_document => emitAction(state, .format_document),
+        .inlay_hints => emitAction(state, .inlay_hints),
+        .document_outline => emitAction(state, .document_outline),
         .filetree_locate => emitAction(state, .filetree_locate),
         .next_buffer => emitAction(state, .next_buffer),
         .prev_buffer => emitAction(state, .prev_buffer),

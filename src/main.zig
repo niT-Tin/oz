@@ -179,6 +179,16 @@ const App = struct {
     /// LSP textDocument/completion response slot (filled by drain); consumed
     /// by processCompletion. Local word completion is the fallback.
     completion_slot: ?std.json.Value = null,
+    /// LSP textDocument/formatting response slot (TextEdit[]).
+    format_slot: ?std.json.Value = null,
+    /// LSP textDocument/inlayHint response slot.
+    inlay_slot: ?std.json.Value = null,
+    /// LSP textDocument/documentSymbol response slot (outline list).
+    outline_slot: ?std.json.Value = null,
+    /// <leader>rn: cmdline is collecting the new name; Enter sends rename.
+    pending_rename: bool = false,
+    /// Owned inlay hint labels for the current line (rendered dim inline).
+    inlay_labels: std.ArrayList([]u8) = .empty,
 
     /// The active buffer (the focused window's buffer; per-buffer document
     /// state lives here, per-window cursor/viewport in `windows`).
@@ -579,6 +589,11 @@ const App = struct {
         for (self.nav_locations.items) |*l| self.alloc.free(l.uri);
         self.nav_locations.deinit(self.alloc);
         if (self.completion_slot) |*v| json_rpc.freeValue(self.alloc, v);
+        if (self.format_slot) |*v| json_rpc.freeValue(self.alloc, v);
+        if (self.inlay_slot) |*v| json_rpc.freeValue(self.alloc, v);
+        if (self.outline_slot) |*v| json_rpc.freeValue(self.alloc, v);
+        for (self.inlay_labels.items) |w| self.alloc.free(w);
+        self.inlay_labels.deinit(self.alloc);
         for (self.completion_words.items) |w| self.alloc.free(w);
         self.completion_words.deinit(self.alloc);
     }
@@ -1346,6 +1361,273 @@ const App = struct {
         return true;
     }
 
+    // ---- LSP editing (<leader>rn / <leader>lf / <leader>ti / <leader>o) ----
+
+    /// <leader>rn: open the command line prefilled with the word under the
+    /// cursor; Enter sends textDocument/rename with the edited name.
+    fn requestRename(self: *App) !void {
+        if (self.lsp_client == null) {
+            try self.setMsg(try self.alloc.dupe(u8, "no language server"));
+            return;
+        }
+        const cursor = self.curCursor().*;
+        if (cursor == 0 or !isWordByte(self.cur().pt.byteAt(cursor - 1))) {
+            try self.setMsg(try self.alloc.dupe(u8, "no symbol under cursor"));
+            return;
+        }
+        var start = cursor;
+        while (start > 0 and isWordByte(self.cur().pt.byteAt(start - 1))) start -= 1;
+        var end = cursor;
+        while (end < self.cur().pt.len() and isWordByte(self.cur().pt.byteAt(end))) end += 1;
+        self.cmdline.clearRetainingCapacity();
+        const wlen = end - start;
+        const wbuf = self.alloc.alloc(u8, wlen) catch return;
+        defer self.alloc.free(wbuf);
+        self.cur().pt.copyRange(start, wbuf);
+        try self.cmdline.appendSlice(self.alloc, wbuf);
+        self.cmd_hist_idx = null;
+        try self.setMsg(try self.alloc.dupe(u8, ""));
+        self.state.mode = .command;
+        self.pending_rename = true;
+    }
+
+    /// Execute the pending rename with the command line's text.
+    fn execRename(self: *App) !void {
+        self.pending_rename = false;
+        const client = self.lsp_client orelse return;
+        const new_name = self.cmdline.items;
+        if (new_name.len == 0) return;
+        const uri = lsp_types.pathToFileUri(self.alloc, self.cur().path orelse return) catch return;
+        defer self.alloc.free(uri);
+        const line = self.cur().pt.lineOf(self.curCursor().*);
+        const col = self.curCursor().* - self.cur().pt.lineStart(line);
+        var params = lsp_nav.buildTextDocPositionParams(self.alloc, uri, line, col) catch return;
+        defer lsp_nav.freeTextDocPositionParams(self.alloc, &params);
+        const name_copy = try self.alloc.dupe(u8, new_name);
+        errdefer self.alloc.free(name_copy);
+        try params.object.put(self.alloc, "newName", .{ .string = name_copy });
+        client.request("textDocument/rename", params, &self.format_slot) catch return;
+        // freeTextDocPositionParams frees the uri + structures but not the
+        // newName dupe — free it explicitly (put succeeded, so it is ours).
+        self.alloc.free(name_copy);
+    }
+
+    /// Free a manually-built {textDocument:{uri(dupe)}, ...} params object
+    /// (used by format/inlay/outline; json_rpc.encodeRequest only
+    /// serializes — it does not free the params).
+    fn freeSimpleDocParams(self: *App, v: *std.json.Value) void {
+        if (v.object.getPtr("textDocument")) |td| {
+            if (td.object.getPtr("uri")) |u| {
+                if (u.* == .string) self.alloc.free(u.string);
+            }
+            td.object.deinit(self.alloc);
+        }
+        if (v.object.getPtr("options")) |o| o.object.deinit(self.alloc);
+        if (v.object.getPtr("range")) |r| {
+            if (r.object.getPtr("start")) |st| st.object.deinit(self.alloc);
+            if (r.object.getPtr("end")) |en| en.object.deinit(self.alloc);
+            r.object.deinit(self.alloc);
+        }
+        v.object.deinit(self.alloc);
+    }
+
+    /// <leader>lf: request textDocument/formatting; the TextEdit[] response
+    /// is applied in processFormat.
+    fn requestFormat(self: *App) !void {
+        const client = self.lsp_client orelse return;
+        const uri = lsp_types.pathToFileUri(self.alloc, self.cur().path orelse return) catch return;
+        defer self.alloc.free(uri);
+        var td = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer td.deinit(self.alloc);
+        const uri_copy = try self.alloc.dupe(u8, uri);
+        errdefer self.alloc.free(uri_copy);
+        try td.put(self.alloc, "uri", .{ .string = uri_copy });
+        var options = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer options.deinit(self.alloc);
+        try options.put(self.alloc, "tabSize", .{ .integer = 4 });
+        try options.put(self.alloc, "insertSpaces", .{ .bool = true });
+        var params = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer params.deinit(self.alloc);
+        try params.put(self.alloc, "textDocument", .{ .object = td });
+        try params.put(self.alloc, "options", .{ .object = options });
+        var params_value = std.json.Value{ .object = params };
+        defer self.freeSimpleDocParams(&params_value);
+        client.request("textDocument/formatting", params_value, &self.format_slot) catch return;
+    }
+
+    /// Consume a formatting/rename response (TextEdit[]) and apply the edits
+    /// right-to-left so earlier offsets stay valid. Returns true when a
+    /// response was consumed.
+    fn processFormat(self: *App) bool {
+        var result = self.format_slot orelse return false;
+        defer {
+            json_rpc.freeValue(self.alloc, &result);
+            self.format_slot = null;
+        }
+        var edits = std.ArrayList(lsp_nav.TextEdit).empty;
+        defer {
+            for (edits.items) |*e| self.alloc.free(e.new_text);
+            edits.deinit(self.alloc);
+        }
+        // formatting → TextEdit[]; rename → WorkspaceEdit {changes:{uri:[edits]}}
+        const edits_value: ?std.json.Value = if (result == .array)
+            result
+        else if (result == .object) blk: {
+            const changes = result.object.get("changes") orelse break :blk null;
+            if (changes != .object) break :blk null;
+            var it = changes.object.iterator();
+            break :blk if (it.next()) |e| e.value_ptr.* else null;
+        } else null;
+        if (edits_value) |ev| {
+            lsp_nav.parseTextEdits(self.alloc, ev, &self.cur().pt, &edits) catch return true;
+        }
+        if (edits.items.len == 0) return true;
+        self.cur().history.beginGroup();
+        var i = edits.items.len;
+        while (i > 0) {
+            i -= 1;
+            const e = edits.items[i];
+            if (e.end < e.start) continue;
+            self.cur().history.record(&self.cur().pt, e.start, e.end - e.start, e.new_text) catch {};
+        }
+        self.cur().history.endGroup();
+        self.curCursor().* = @min(self.curCursor().*, self.cur().pt.len());
+        self.markDirty();
+        self.cur().syntax_revision = std.math.maxInt(u64);
+        return true;
+    }
+
+    /// <leader>ti: request inlay hints for the current line.
+    fn requestInlayHints(self: *App) !void {
+        const client = self.lsp_client orelse return;
+        const uri = lsp_types.pathToFileUri(self.alloc, self.cur().path orelse return) catch return;
+        defer self.alloc.free(uri);
+        const line = self.cur().pt.lineOf(self.curCursor().*);
+        var td = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer td.deinit(self.alloc);
+        const uri_copy = try self.alloc.dupe(u8, uri);
+        errdefer self.alloc.free(uri_copy);
+        try td.put(self.alloc, "uri", .{ .string = uri_copy });
+        var range = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer range.deinit(self.alloc);
+        var start = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer start.deinit(self.alloc);
+        try start.put(self.alloc, "line", .{ .integer = line });
+        try start.put(self.alloc, "character", .{ .integer = 0 });
+        var end = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer end.deinit(self.alloc);
+        try end.put(self.alloc, "line", .{ .integer = line });
+        try end.put(self.alloc, "character", .{ .integer = 1000 });
+        try range.put(self.alloc, "start", .{ .object = start });
+        try range.put(self.alloc, "end", .{ .object = end });
+        var params = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer params.deinit(self.alloc);
+        try params.put(self.alloc, "textDocument", .{ .object = td });
+        try params.put(self.alloc, "range", .{ .object = range });
+        var params_value = std.json.Value{ .object = params };
+        defer self.freeSimpleDocParams(&params_value);
+        client.request("textDocument/inlayHint", params_value, &self.inlay_slot) catch return;
+    }
+
+    /// Consume an inlayHint response: collect labels for inline rendering.
+    fn processInlay(self: *App) bool {
+        var result = self.inlay_slot orelse return false;
+        defer {
+            json_rpc.freeValue(self.alloc, &result);
+            self.inlay_slot = null;
+        }
+        for (self.inlay_labels.items) |w| self.alloc.free(w);
+        self.inlay_labels.clearRetainingCapacity();
+        if (result != .array) return true;
+        for (result.array.items) |hint| {
+            if (hint != .object) continue;
+            const label = hint.object.get("label") orelse continue;
+            const text: ?[]const u8 = switch (label) {
+                .string => |str| str,
+                .array => blk: {
+                    var out = std.ArrayList(u8).empty;
+                    defer out.deinit(self.alloc);
+                    for (label.array.items) |part| {
+                        if (part == .object) {
+                            if (part.object.get("value")) |val| {
+                                if (val == .string) out.appendSlice(self.alloc, val.string) catch {};
+                            }
+                        }
+                    }
+                    if (out.items.len == 0) break :blk null;
+                    break :blk out.items;
+                },
+                else => null,
+            };
+            const t = text orelse continue;
+            if (t.len == 0) continue;
+            const copy = self.alloc.dupe(u8, t) catch continue;
+            self.inlay_labels.append(self.alloc, copy) catch {
+                self.alloc.free(copy);
+                continue;
+            };
+        }
+        return true;
+    }
+
+    /// <leader>o: request document symbols; the response fills the outline
+    /// list overlay (reuses the navigation location list UI).
+    fn requestOutline(self: *App) !void {
+        const client = self.lsp_client orelse return;
+        const uri = lsp_types.pathToFileUri(self.alloc, self.cur().path orelse return) catch return;
+        defer self.alloc.free(uri);
+        var td = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer td.deinit(self.alloc);
+        const uri_copy = try self.alloc.dupe(u8, uri);
+        errdefer self.alloc.free(uri_copy);
+        try td.put(self.alloc, "uri", .{ .string = uri_copy });
+        var params = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer params.deinit(self.alloc);
+        try params.put(self.alloc, "textDocument", .{ .object = td });
+        var params_value = std.json.Value{ .object = params };
+        defer self.freeSimpleDocParams(&params_value);
+        client.request("textDocument/documentSymbol", params_value, &self.outline_slot) catch return;
+    }
+
+    /// Consume a documentSymbol response: flatten into the outline list
+    /// (reuses nav_locations for the overlay; the label rides in a packed
+    /// "label\x00line" uri slot so the list shows it and Enter jumps).
+    fn processOutline(self: *App) bool {
+        var result = self.outline_slot orelse return false;
+        defer {
+            json_rpc.freeValue(self.alloc, &result);
+            self.outline_slot = null;
+        }
+        for (self.nav_locations.items) |*l| self.alloc.free(l.uri);
+        self.nav_locations.clearRetainingCapacity();
+        self.nav_list_sel = 0;
+        self.nav_loc_top = 0;
+        if (result == .array) {
+            for (result.array.items) |item| {
+                if (item != .object) continue;
+                var name: ?[]const u8 = null;
+                if (item.object.get("name")) |nm| {
+                    if (nm == .string) name = nm.string;
+                }
+                const rng = if (item.object.get("range")) |r| r else blk: {
+                    const loc = item.object.get("location") orelse continue;
+                    break :blk if (loc.object.get("range")) |rr| rr else continue;
+                };
+                if (rng != .object) continue;
+                const start = rng.object.get("start") orelse continue;
+                const line = lsp_nav.posLine(start) orelse continue;
+                const nm = name orelse continue;
+                const packed_uri = std.fmt.allocPrint(self.alloc, "{s}\x00{d}", .{ nm, line }) catch continue;
+                self.nav_locations.append(self.alloc, .{ .uri = packed_uri, .line = line, .character = 0 }) catch {
+                    self.alloc.free(packed_uri);
+                    continue;
+                };
+            }
+        }
+        self.nav_list_active = self.nav_locations.items.len > 0;
+        return true;
+    }
+
     /// Scan the whole buffer for words and fill completion_words with the
     /// most frequent ones (ties broken alphabetically), capped at 20. The
     /// word currently being typed (from completion_pos to the cursor) is
@@ -1564,6 +1846,7 @@ const App = struct {
             // Esc cancelling ':' from visual mode must drop the anchor too
             // (it was kept so :'<,'>s could resolve the range on Enter).
             self.visual_anchor = null;
+            self.pending_rename = false;
             self.cmdline.clearRetainingCapacity();
             self.cmd_hist_idx = null;
             return;
@@ -1571,6 +1854,14 @@ const App = struct {
         switch (key.codepoint) {
             vaxis.Key.enter => {
                 const from_visual = self.visual_anchor != null;
+                if (self.pending_rename) {
+                    // <leader>rn collected the new name — send the rename
+                    self.state.mode = .normal;
+                    self.cmd_hist_idx = null;
+                    try self.execRename();
+                    self.cmdline.clearRetainingCapacity();
+                    return;
+                }
                 const line = self.cmdline.items;
                 const cmd = editor.ex_command.parse(line);
                 if (cmd != .empty) try self.pushHistory(line);
@@ -3135,6 +3426,10 @@ const App = struct {
             .references => try self.requestNav("textDocument/references", .references),
             .implementation => try self.requestNav("textDocument/implementation", .implementation),
             .signature_help => try self.requestNav("textDocument/signatureHelp", .signature),
+            .rename_symbol => try self.requestRename(),
+            .format_document => try self.requestFormat(),
+            .inlay_hints => try self.requestInlayHints(),
+            .document_outline => try self.requestOutline(),
             .close_buffer => self.closeCurrentBuffer(),
             .filetree_toggle => try self.toggleFiletree(),
             .filetree_locate => try self.locateInFiletree(),
@@ -3822,7 +4117,10 @@ const App = struct {
             while (k < list_rows) : (k += 1) {
                 const ri = ntop + k;
                 const loc = self.nav_locations.items[ri];
-                const label = try std.fmt.allocPrint(a, "{d}: {s}", .{ loc.line + 1, std.fs.path.basename(loc.uri) });
+                const label = if (std.mem.indexOfScalar(u8, loc.uri, 0)) |z|
+                    try std.fmt.allocPrint(a, "{d}: {s}", .{ loc.line + 1, loc.uri[0..z] })
+                else
+                    try std.fmt.allocPrint(a, "{d}: {s}", .{ loc.line + 1, std.fs.path.basename(loc.uri) });
                 const seg = [_]vaxis.Segment{.{
                     .text = label,
                     .style = if (ri == self.nav_list_sel)
@@ -3888,6 +4186,29 @@ const App = struct {
                             });
                         }
                     }
+                }
+            }
+        }
+
+        // LSP inlay hints (<leader>ti): dim labels appended after the current
+        // line's content (a simple trailing hint; the positions are ignored).
+        if (self.inlay_labels.items.len > 0) {
+            const il_line = self.cur().pt.lineOf(self.curCursor().*);
+            if (il_line >= self.curViewTop().* and il_line < self.curViewTop().* + content_rows) {
+                const il_row = il_line - self.curViewTop().* + cur_rect.row;
+                var col_off: u32 = self.cur().pt.lineLen(il_line);
+                for (self.inlay_labels.items) |label| {
+                    if (col_off + label.len >= win.width) break;
+                    const seg = [_]vaxis.Segment{.{
+                        .text = label,
+                        .style = .{ .dim = true, .fg = .{ .rgb = .{ 122, 124, 135 } } },
+                    }};
+                    _ = win.print(&seg, .{
+                        .row_offset = @intCast(il_row),
+                        .col_offset = @intCast(cur_rect.col + gutter + col_off),
+                        .wrap = .none,
+                    });
+                    col_off += @intCast(label.len);
                 }
             }
         }
@@ -3976,7 +4297,10 @@ const App = struct {
             // before the new hover window / completion menu is drawn.
             const nav_ready = self.processNav();
             const comp_ready = self.processCompletion();
-            if (nav_ready or comp_ready) {
+            const fmt_ready = self.processFormat();
+            const inlay_ready = self.processInlay();
+            const outline_ready = self.processOutline();
+            if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready) {
                 try self.render();
                 continue;
             }

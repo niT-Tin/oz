@@ -6542,3 +6542,149 @@ test "lsp: signature help — typing ( shows the callee signature" {
     }
     try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
 }
+test "lsp: editing — rename, format, inlay hints, outline" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}edit.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const foo = 1;\nconst bar = 2;\n");
+    }
+
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{"OZ_LSP_CMD=zig-out/bin/mock_lsp"});
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // <leader>o — outline list shows the mock symbol
+    try sess.send(" o");
+    waited = 0;
+    var listed = false;
+    while (!listed) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains("mockFn")) listed = true;
+    }
+    if (!listed) {
+        std.debug.print("outline list missing:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(listed);
+    try sess.send("\x1b"); // Esc closes the list
+    waited = 0;
+    while (grid.contains("mockFn")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("mockFn"));
+
+    // <leader>lf — format (mock returns a no-op whole-doc edit; content stays)
+    try sess.send(" lf");
+    waited = 0;
+    while (!grid.contains("NORMAL") or grid.contains("COMMAND")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains("NORMAL") and !grid.contains("COMMAND")) break;
+    }
+    try std.testing.expect(grid.contains("const foo = 1;"));
+
+    // <leader>ti — inlay hint label rendered dim
+    try sess.send(" ti");
+    waited = 0;
+    while (!grid.contains(": i32")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains(": i32")) break;
+    }
+    if (!grid.contains(": i32")) {
+        std.debug.print("inlay hint missing:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains(": i32"));
+
+    // <leader>rn — cursor to "foo" (word end), rename to "renamedSymbol" via
+    // the prefilled command line (mock replaces [0,4) with renamedSymbol)
+    try sess.send("e rn");
+    waited = 0;
+    while (!grid.contains("COMMAND") or !grid.contains("foo")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains("COMMAND")) break;
+    }
+    try sess.send("\r");
+    waited = 0;
+    while (!grid.contains("renamedSymbol")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains("renamedSymbol")) break;
+    }
+    if (!grid.contains("renamedSymbol")) {
+        std.debug.print("rename result missing:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("renamedSymbol"));
+
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) break;
+        sess.used += n;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
+}

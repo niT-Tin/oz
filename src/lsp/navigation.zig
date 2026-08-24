@@ -120,6 +120,68 @@ fn intField(v: std.json.Value, name: []const u8) ?u32 {
     };
 }
 
+/// A text edit: replace [start, end) with `new_text` (owned).
+pub const TextEdit = struct {
+    start: u32,
+    end: u32,
+    new_text: []u8, // owned
+};
+
+/// Parse a TextEdit[] response (formatting, rename changes) into `out`.
+/// Each edit's range is {start:{line,character}, end:{line,character}} and
+/// newText replaces that span. Caller frees each new_text.
+pub fn parseTextEdits(alloc: std.mem.Allocator, result: std.json.Value, pt: anytype, out: *std.ArrayList(TextEdit)) !void {
+    if (result != .array) return;
+    for (result.array.items) |item| {
+        if (item != .object) continue;
+        const range = item.object.get("range") orelse continue;
+        const new_text = item.object.get("newText") orelse continue;
+        if (new_text != .string) continue;
+        const start = rangeStart(range) orelse continue;
+        const end = rangeEnd(range) orelse continue;
+        const start_pos = offsetAt(pt, start) orelse continue;
+        const end_pos = offsetAt(pt, end) orelse continue;
+        const copy = try alloc.dupe(u8, new_text.string);
+        errdefer alloc.free(copy);
+        try out.append(alloc, .{ .start = start_pos, .end = end_pos, .new_text = copy });
+    }
+}
+
+const Pos = struct { line: u32, character: u32 };
+
+fn rangeStart(range: std.json.Value) ?Pos {
+    const s = range.object.get("start") orelse return null;
+    return posFrom(s);
+}
+
+fn rangeEnd(range: std.json.Value) ?Pos {
+    const e = range.object.get("end") orelse return null;
+    return posFrom(e);
+}
+
+fn posFrom(v: std.json.Value) ?Pos {
+    if (v != .object) return null;
+    const line = intField(v, "line") orelse return null;
+    const character = intField(v, "character") orelse return null;
+    return .{ .line = line, .character = character };
+}
+
+/// Convert a {line,character} position to a byte offset. The pt must expose
+/// lineStart/lineLen (buffer.PieceTable does).
+fn offsetAt(pt: anytype, pos: Pos) ?u32 {
+    if (pos.line >= pt.lineCount()) return null;
+    const start = pt.lineStart(pos.line);
+    const len = pt.lineLen(pos.line);
+    if (pos.character > len) return null;
+    return start + pos.character;
+}
+
+/// Extract the line from a {line,character} position value (for outline).
+pub fn posLine(v: std.json.Value) ?u32 {
+    if (v != .object) return null;
+    return intField(v, "line");
+}
+
 /// Extract the first signature label from a signatureHelp response.
 pub fn parseSignature(alloc: std.mem.Allocator, result: std.json.Value) !?[]u8 {
     if (result != .object) return null;
@@ -236,6 +298,27 @@ test "navigation: signature label extraction" {
     const s = (try parseSignature(alloc, p.value)).?;
     defer alloc.free(s);
     try std.testing.expectEqualStrings("foo(x: i32)", s);
+}
+
+test "navigation: text edits parse and map to offsets" {
+    const alloc = std.testing.allocator;
+    const buffer = @import("../buffer/root.zig");
+    var pt = try buffer.PieceTable.init(alloc, "aaa\nbbb\nccc");
+    defer pt.deinit();
+    // replace line 1 (bbb) with "BBB"
+    const j = "[{\"range\":{\"start\":{\"line\":1,\"character\":0},\"end\":{\"line\":1,\"character\":3}},\"newText\":\"BBB\"}]";
+    var p = try std.json.parseFromSlice(std.json.Value, alloc, j, .{ .allocate = .alloc_always });
+    defer p.deinit();
+    var out = std.ArrayList(TextEdit).empty;
+    defer {
+        for (out.items) |*e| alloc.free(e.new_text);
+        out.deinit(alloc);
+    }
+    try parseTextEdits(alloc, p.value, &pt, &out);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqual(@as(u32, 4), out.items[0].start);
+    try std.testing.expectEqual(@as(u32, 7), out.items[0].end);
+    try std.testing.expectEqualStrings("BBB", out.items[0].new_text);
 }
 
 test "navigation: completion items from CompletionList and raw array" {

@@ -93,6 +93,10 @@ pub const ActionId = enum {
     references, // gr — references
     implementation, // gI — implementations
     signature_help, // gs — signature help
+    rename_symbol, // <leader>rn — LSP rename symbol
+    format_document, // <leader>lf — LSP format document
+    inlay_hints, // <leader>ti — LSP inlay hints
+    document_outline, // <leader>o — LSP document symbols outline
     filetree_locate, // <leader>E — locate current file in tree
     next_buffer, // gt — next tab
     prev_buffer, // gT — previous tab
