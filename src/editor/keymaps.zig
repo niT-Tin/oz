@@ -64,6 +64,7 @@ pub const normal: KeyMap = &.{
     act(.{ .codepoint = 't' }, .till_char),
     act(.{ .codepoint = 'T' }, .till_char_back),
     act(.{ .codepoint = 'r' }, .noop),
+    act(.{ .codepoint = 'K' }, .hover), // K — LSP hover
     // ctrl keys
     act(.{ .codepoint = 'u', .mods = .{ .ctrl = true } }, .half_page_up),
     act(.{ .codepoint = 'd', .mods = .{ .ctrl = true } }, .half_page_down),

@@ -13,6 +13,7 @@ const syntax = @import("syntax.zig");
 const lsp = @import("lsp/client.zig");
 const lsp_types = @import("lsp/types.zig");
 const lsp_diag = @import("lsp/diagnostics.zig");
+const lsp_nav = @import("lsp/navigation.zig");
 const json_rpc = @import("util/json_rpc.zig");
 
 // Silence vaxis's per-frame debug logging (pollutes the tty byte stream and
@@ -23,6 +24,9 @@ pub const std_options: std.Options = .{
 };
 
 const status_row_count: u32 = 1;
+
+/// LSP navigation request kinds (K / gd / gD / gr / gI / gs).
+const NavAction = enum { none, hover, definition, declaration, references, implementation, signature };
 
 const App = struct {
     /// One open document. `pt`/`history` own their allocations; the struct is
@@ -152,6 +156,18 @@ const App = struct {
     diag_list_active: bool = false,
     diag_list_sel: usize = 0,
     diag_list_top: usize = 0,
+
+    // M2 LSP navigation (K / gd / gD / gr / gI / gs): one in-flight request
+    // at a time; the response lands in nav_slot and processNav() consumes it.
+    nav_slot: ?std.json.Value = null,
+    nav_action: NavAction = .none,
+    /// Owned hover/signature text shown in a floating window (or null).
+    nav_hover_text: ?[]u8 = null,
+    /// Owned location list for gr/gI (uri strings owned per item).
+    nav_locations: std.ArrayList(lsp_nav.NavLocation) = .empty,
+    nav_list_active: bool = false,
+    nav_list_sel: usize = 0,
+    nav_loc_top: usize = 0,
 
     // insert-mode keyword completion (Ctrl+n)
     completion_active: bool = false,
@@ -555,6 +571,10 @@ const App = struct {
         if (self.lsp_client) |c| c.deinit();
         for (self.lsp_diagnostics.items) |*d| self.alloc.free(d.message);
         self.lsp_diagnostics.deinit(self.alloc);
+        if (self.nav_slot) |*v| json_rpc.freeValue(self.alloc, v);
+        if (self.nav_hover_text) |t| self.alloc.free(t);
+        for (self.nav_locations.items) |*l| self.alloc.free(l.uri);
+        self.nav_locations.deinit(self.alloc);
         for (self.completion_words.items) |w| self.alloc.free(w);
         self.completion_words.deinit(self.alloc);
     }
@@ -581,6 +601,10 @@ const App = struct {
         // Diagnostics list overlay (<leader>sd)
         if (self.diag_list_active) {
             if (self.diagnosticsListKey(key)) return;
+        }
+        // Navigation location list overlay (gr / gI)
+        if (self.nav_list_active) {
+            if (self.navListKey(key)) return;
         }
 
         // Ctrl-w window commands: switch keyboard focus between split windows
@@ -2141,7 +2165,12 @@ const App = struct {
             .stdout = .pipe,
             .stderr = .ignore,
         }) catch return;
-        defer _ = child.wait(self.io) catch {};
+        // Child.kill cleans up and nulls child.id, so wait() after a kill
+        // would trip its `child.id != null` assert — track that.
+        var child_killed = false;
+        defer {
+            if (!child_killed) _ = child.wait(self.io) catch {};
+        }
 
         // Read ALL of rg's output until EOF — stopping early deadlocks: the
         // kernel pipe buffer fills, rg blocks writing, and wait() never
@@ -2156,6 +2185,7 @@ const App = struct {
         }
         if (out.items.len >= 1024 * 1024) {
             _ = child.kill(self.io);
+            child_killed = true;
         }
         var it = std.mem.splitScalar(u8, out.items, '\n');
         while (it.next()) |line| {
@@ -2577,6 +2607,129 @@ const App = struct {
         }
     }
 
+    // ---- LSP navigation (K / gd / gD / gr / gI / gs) ----
+
+    /// Send a textDocument request for the cursor position. The response
+    /// lands in `nav_slot`; `processNav` (called every frame after drain)
+    /// consumes it. No-op when the client is absent.
+    fn requestNav(self: *App, method: []const u8, action: NavAction) !void {
+        const client = self.lsp_client orelse {
+            return;
+        };
+        if (self.nav_slot != null) {
+            return;
+        }
+        // A new navigation request replaces any stale overlay (hover window,
+        // location list) from a previous request.
+        self.clearNavOverlays();
+        const uri = lsp_types.pathToFileUri(self.alloc, self.cur().path orelse return) catch return;
+        defer self.alloc.free(uri);
+        const line = self.cur().pt.lineOf(self.curCursor().*);
+        const col = self.curCursor().* - self.cur().pt.lineStart(line);
+        var params = lsp_nav.buildTextDocPositionParams(self.alloc, uri, line, col) catch return;
+        defer lsp_nav.freeTextDocPositionParams(self.alloc, &params);
+        client.request(method, params, &self.nav_slot) catch return;
+        self.nav_action = action;
+    }
+
+    /// Consume a completed navigation response (called after drain each
+    /// frame). Frees the slot either way. Returns true when a response was
+    /// consumed (caller renders immediately — the event loop may otherwise
+    /// block in pollEvent before the new hover/list can be drawn).
+    fn processNav(self: *App) bool {
+        var result = self.nav_slot orelse return false;
+        defer {
+            json_rpc.freeValue(self.alloc, &result);
+            self.nav_slot = null;
+            self.nav_action = .none;
+        }
+        switch (self.nav_action) {
+            .hover, .signature => {
+                const text = if (self.nav_action == .hover)
+                    lsp_nav.parseHoverText(self.alloc, result) catch null
+                else
+                    lsp_nav.parseSignature(self.alloc, result) catch null;
+                if (self.nav_hover_text) |t| self.alloc.free(t);
+                self.nav_hover_text = text;
+            },
+            .definition, .declaration => {
+                self.clearNavOverlays();
+                var locs = std.ArrayList(lsp_nav.NavLocation).empty;
+                defer {
+                    for (locs.items) |*l| self.alloc.free(l.uri);
+                    locs.deinit(self.alloc);
+                }
+                lsp_nav.parseLocations(self.alloc, result, &locs) catch {};
+                if (locs.items.len > 0) self.jumpToLocation(locs.items[0]);
+            },
+            .references, .implementation => {
+                self.clearNavOverlays();
+                for (self.nav_locations.items) |*l| self.alloc.free(l.uri);
+                self.nav_locations.clearRetainingCapacity();
+                lsp_nav.parseLocations(self.alloc, result, &self.nav_locations) catch {};
+                self.nav_list_sel = 0;
+                self.nav_loc_top = 0;
+                self.nav_list_active = self.nav_locations.items.len > 0;
+            },
+            .none => {},
+        }
+        return true;
+    }
+
+    /// Drop the hover window and location-list overlay (used when starting a
+    /// new navigation request or jumping).
+    fn clearNavOverlays(self: *App) void {
+        if (self.nav_hover_text) |t| self.alloc.free(t);
+        self.nav_hover_text = null;
+        self.nav_list_active = false;
+    }
+
+    /// Move to a nav location: jump within the current buffer, or open the
+    /// file (new buffer) when the URI points elsewhere.
+    fn jumpToLocation(self: *App, loc: lsp_nav.NavLocation) void {
+        const path = lsp_types.fileUriToPath(self.alloc, loc.uri) catch {
+            self.curCursor().* = self.cur().pt.lineStart(@min(loc.line, self.cur().pt.lineCount() - 1));
+            return;
+        };
+        defer self.alloc.free(path);
+        const current = self.cur().path orelse {
+            self.openInBuffer(path) catch return;
+            self.curCursor().* = self.cur().pt.lineStart(@min(loc.line, self.cur().pt.lineCount() - 1));
+            return;
+        };
+        if (!std.mem.eql(u8, current, path)) {
+            self.openInBuffer(path) catch return;
+        }
+        self.curCursor().* = self.cur().pt.lineStart(@min(loc.line, self.cur().pt.lineCount() - 1));
+    }
+
+    /// Keys while the gr/gI location list is open. Returns true when consumed.
+    fn navListKey(self: *App, key: vaxis.Key) bool {
+        switch (key.codepoint) {
+            vaxis.Key.escape => {
+                self.nav_list_active = false;
+                return true;
+            },
+            'j', vaxis.Key.down => {
+                if (self.nav_list_sel + 1 < self.nav_locations.items.len) self.nav_list_sel += 1;
+                return true;
+            },
+            'k', vaxis.Key.up => {
+                if (self.nav_list_sel > 0) self.nav_list_sel -= 1;
+                return true;
+            },
+            vaxis.Key.enter => {
+                if (self.nav_list_sel < self.nav_locations.items.len) {
+                    const loc = self.nav_locations.items[self.nav_list_sel];
+                    self.jumpToLocation(loc);
+                    self.nav_list_active = false;
+                }
+                return true;
+            },
+            else => return false,
+        }
+    }
+
     // ---- LSP (M2) ----
 
     /// Lazily (re)start the LSP client for the current buffer's filetype.
@@ -2599,6 +2752,22 @@ const App = struct {
         defer self.alloc.free(text);
         const start_result = lsp.Client.start(self.alloc, self.io, self.env_map, ft, uri, text);
         self.lsp_client = start_result catch null;
+        // Wire the reader thread's wake callback to our event loop: any
+        // incoming LSP message posts an event so the main loop (blocked in
+        // pollEvent) wakes up and drains it without waiting for a keypress.
+        if (self.lsp_client) |c| {
+            c.wake_ctx = self;
+            c.wake_fn = lspWake;
+        }
+    }
+
+    /// Called from the LSP reader thread when a message arrives: post a
+    /// (harmless) event so pollEvent wakes up. Only thread-safe state is
+    /// touched; the event is consumed as `else => {}` by the main loop.
+    fn lspWake(ctx: *anyopaque) void {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        const r = app.loop.tryPostEvent(.focus_in) catch false;
+        _ = r;
     }
 
     /// Current buffer text (owned copy) — for didOpen/didChange payloads.
@@ -2911,6 +3080,12 @@ const App = struct {
             .diagnostic_prev => self.gotoDiagnostic(false),
             .diagnostic_line => self.showLineDiagnostics(),
             .diagnostics_list => self.toggleDiagnosticsList(),
+            .hover => try self.requestNav("textDocument/hover", .hover),
+            .definition => try self.requestNav("textDocument/definition", .definition),
+            .declaration => try self.requestNav("textDocument/declaration", .declaration),
+            .references => try self.requestNav("textDocument/references", .references),
+            .implementation => try self.requestNav("textDocument/implementation", .implementation),
+            .signature_help => try self.requestNav("textDocument/signatureHelp", .signature),
             .close_buffer => self.closeCurrentBuffer(),
             .filetree_toggle => try self.toggleFiletree(),
             .filetree_locate => try self.locateInFiletree(),
@@ -3582,6 +3757,34 @@ const App = struct {
             }
         }
 
+        // LSP navigation location list overlay (gr / gI): same bottom list
+        // style as the diagnostics list.
+        if (self.nav_list_active) {
+            const total = self.nav_locations.items.len;
+            const list_rows = @min(@as(usize, 8), total);
+            if (total > list_rows) {
+                if (self.nav_loc_top + list_rows > total) self.nav_loc_top = total - list_rows;
+                if (self.nav_list_sel < self.nav_loc_top) self.nav_loc_top = self.nav_list_sel;
+                if (self.nav_list_sel >= self.nav_loc_top + list_rows) self.nav_loc_top = self.nav_list_sel - list_rows + 1;
+            } else self.nav_loc_top = 0;
+            const ntop = self.nav_loc_top;
+            const start_row = height - 1 - @as(u32, @intCast(list_rows)) - 1;
+            var k: usize = 0;
+            while (k < list_rows) : (k += 1) {
+                const ri = ntop + k;
+                const loc = self.nav_locations.items[ri];
+                const label = try std.fmt.allocPrint(a, "{d}: {s}", .{ loc.line + 1, std.fs.path.basename(loc.uri) });
+                const seg = [_]vaxis.Segment{.{
+                    .text = label,
+                    .style = if (ri == self.nav_list_sel)
+                        .{ .bg = .{ .rgb = .{ 54, 74, 130 } } }
+                    else
+                        .{},
+                }};
+                _ = win.print(&seg, .{ .row_offset = @intCast(start_row + k), .wrap = .none });
+            }
+        }
+
         // insert-mode completion menu (Ctrl+n): a vim-style list directly
         // below the cursor line; the selected row is highlighted like the
         // fuzzy picker's selection. The buffer cursor is left untouched.
@@ -3609,6 +3812,29 @@ const App = struct {
                 _ = win.print(&seg, .{
                     .row_offset = @intCast(start_row + k),
                     .col_offset = @intCast(cur_rect.col + gutter + c_col),
+                    .wrap = .none,
+                });
+            }
+        }
+
+        // LSP hover / signature floating window: a small box below the
+        // cursor line (≤6 rows, ≤60 cols) showing nav_hover_text.
+        if (self.nav_hover_text) |htext| {
+            if (htext.len > 0) {
+                const h_line = self.cur().pt.lineOf(self.curCursor().*);
+                var start_row = h_line - self.curViewTop().* + cur_rect.row + 1;
+                const hcols: u32 = @min(@as(u32, @intCast(htext.len)), 60);
+                const hrows: u32 = 1;
+                if (start_row + hrows >= height) {
+                    start_row = h_line - self.curViewTop().* + cur_rect.row - hrows;
+                }
+                const seg = [_]vaxis.Segment{.{
+                    .text = htext[0..@min(htext.len, hcols)],
+                    .style = .{ .bg = .{ .rgb = .{ 29, 32, 47 } }, .fg = .{ .rgb = .{ 192, 202, 245 } } },
+                }};
+                _ = win.print(&seg, .{
+                    .row_offset = @intCast(start_row),
+                    .col_offset = @intCast(cur_rect.col + gutter + 1),
                     .wrap = .none,
                 });
             }
@@ -3667,20 +3893,37 @@ const App = struct {
 
         while (!self.quit) {
             // LSP messages first: responses fill request slots, notifications
-            // reach the handler before the frame renders.
+            // reach the handler before the frame renders; then consume any
+            // completed navigation request before the frame is drawn.
             if (self.lsp_client) |c| c.drain(self, App.lspHandler);
-            const event = try self.loop.nextEvent();
-            switch (event) {
-                .key_press => |key| try self.handleKey(key),
-                .paste => |text| {
-                    if (self.state.mode == .insert) {
-                        if (self.mc_active) try self.mcInsertText(text) else try self.insertText(text);
-                    }
-                },
-                .winsize => |ws| {
-                    try self.vx.resize(self.alloc, self.tty.writer(), ws);
-                },
-                else => {},
+            if (self.processNav()) {
+                // A navigation response was consumed: render it immediately.
+                // Without this, the loop would block in pollEvent below
+                // before the new hover window / location list is drawn.
+                try self.render();
+                continue;
+            }
+            if (self.processNav()) {
+                try self.render();
+                continue;
+            }
+            // poll + drain: block until an event arrives (keypress OR an
+            // LSP wake posted by the reader thread), then handle the whole
+            // batch and render once.
+            try self.loop.pollEvent();
+            while (try self.loop.tryEvent()) |event| {
+                switch (event) {
+                    .key_press => |key| try self.handleKey(key),
+                    .paste => |text| {
+                        if (self.state.mode == .insert) {
+                            if (self.mc_active) try self.mcInsertText(text) else try self.insertText(text);
+                        }
+                    },
+                    .winsize => |ws| {
+                        try self.vx.resize(self.alloc, self.tty.writer(), ws);
+                    },
+                    else => {},
+                }
             }
             try self.render();
         }

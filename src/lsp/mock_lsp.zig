@@ -127,9 +127,25 @@ pub fn handleMessage(
             try pushResponse(alloc, &out, id, try buildCompletionResult(a));
         } else if (std.mem.eql(u8, method, "textDocument/hover")) {
             try pushResponse(alloc, &out, id, try buildHoverResult(a));
+        } else if (std.mem.eql(u8, method, "textDocument/definition") or
+            std.mem.eql(u8, method, "textDocument/declaration"))
+        {
+            // a fixed location in the FIRST opened document (line 1, col 0)
+            try pushResponse(alloc, &out, id, try buildLocationResult(a, state, 1, 0));
+        } else if (std.mem.eql(u8, method, "textDocument/references") or
+            std.mem.eql(u8, method, "textDocument/implementation"))
+        {
+            // two locations: line 1 and line 2 of the first opened document
+            var locs = std.json.Array.init(a);
+            const l1 = try buildLocationValue(a, state, 1, 0);
+            const l2 = try buildLocationValue(a, state, 2, 0);
+            try locs.append(l1);
+            try locs.append(l2);
+            try pushResponse(alloc, &out, id, .{ .array = locs });
+        } else if (std.mem.eql(u8, method, "textDocument/signatureHelp")) {
+            try pushResponse(alloc, &out, id, try buildSignatureResult(a));
         } else {
-            // Any other request (definition, references, shutdown, ...) gets
-            // a null result, per the mock contract.
+            // Any other request (shutdown, ...) gets a null result.
             try pushResponse(alloc, &out, id, .null);
         }
         return out;
@@ -540,6 +556,39 @@ fn handleContent(alloc: std.mem.Allocator, script: Script, state: *State, conten
     return handleMessage(alloc, script, state, &msg);
 }
 
+/// A Location for line `line`/col `col` in the first didOpen'd document
+/// (default_uri when none opened yet).
+fn buildLocationValue(a: std.mem.Allocator, state: *State, line: u32, col: u32) !std.json.Value {
+    const uri = if (state.opened.items.len > 0) state.opened.items[0] else default_uri;
+    var start = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try start.put(a, "line", .{ .integer = line });
+    try start.put(a, "character", .{ .integer = col });
+    var end = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try end.put(a, "line", .{ .integer = line });
+    try end.put(a, "character", .{ .integer = col + 4 });
+    var range = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try range.put(a, "start", .{ .object = start });
+    try range.put(a, "end", .{ .object = end });
+    var loc = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try loc.put(a, "uri", .{ .string = uri });
+    try loc.put(a, "range", .{ .object = range });
+    return .{ .object = loc };
+}
+
+fn buildLocationResult(a: std.mem.Allocator, state: *State, line: u32, col: u32) !std.json.Value {
+    return buildLocationValue(a, state, line, col);
+}
+
+fn buildSignatureResult(a: std.mem.Allocator) !std.json.Value {
+    var sig = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try sig.put(a, "label", .{ .string = "mockSig(x: i32)" });
+    var sigs = std.json.Array.init(a);
+    try sigs.append(.{ .object = sig });
+    var result = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try result.put(a, "signatures", .{ .array = sigs });
+    return .{ .object = result };
+}
+
 test "Script.parse" {
     try testing.expect(Script.parse("hello") == .hello);
     try testing.expect(Script.parse("silent") == .silent);
@@ -677,18 +726,31 @@ test "hello: hover returns the canned markdown" {
     try testing.expectEqualStrings("mock hover", contents.object.get("value").?.string);
 }
 
-test "hello: any other request (e.g. definition) gets a null result" {
+test "hello: definition returns a location, unknown methods still null" {
     const alloc = testing.allocator;
     var state = State{};
     defer state.deinit(alloc);
+    // a didOpen so the location references the opened document
+    const open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///a.zig\",\"version\":1},\"text\":\"x\"}}";
+    var out_open = try handleContent(alloc, .hello, &state, open);
+    defer out_open.deinit(alloc);
+
     const req = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/definition\",\"params\":{}}";
     var out = try handleContent(alloc, .hello, &state, req);
     defer out.deinit(alloc);
-
     var resp = try json_rpc.parseMessage(alloc, out.frames.items[0]);
     defer resp.deinit(alloc);
     try testing.expectEqual(@as(?u64, 4), resp.id);
-    try testing.expect(resp.result.? == .null);
+    const uri = resp.result.?.object.get("uri").?;
+    try testing.expectEqualStrings("file:///a.zig", uri.string);
+
+    // shutdown is still null
+    const req2 = "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"shutdown\",\"params\":{}}";
+    var out2 = try handleContent(alloc, .hello, &state, req2);
+    defer out2.deinit(alloc);
+    var resp2 = try json_rpc.parseMessage(alloc, out2.frames.items[0]);
+    defer resp2.deinit(alloc);
+    try testing.expect(resp2.result.? == .null);
 }
 
 test "hello: didOpen pushes one publishDiagnostics (mock error)" {

@@ -420,6 +420,12 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
             },
             // gl — diagnostics for the cursor line (LSP)
             'l' => return emitAction(state, .diagnostic_line),
+            // LSP semantic navigation: gd / gD / gr / gI / gs
+            'd' => return emitAction(state, .definition),
+            'D' => return emitAction(state, .declaration),
+            'r' => return emitAction(state, .references),
+            'I' => return emitAction(state, .implementation),
+            's' => return emitAction(state, .signature_help),
             // ga — align lines by a delimiter
             'a' => {
                 state.pending_align = if (state.mode == .visual_char or
@@ -612,6 +618,12 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .diagnostic_prev => emitAction(state, .diagnostic_prev),
         .diagnostic_line => emitAction(state, .diagnostic_line),
         .diagnostics_list => emitAction(state, .diagnostics_list),
+        .hover => emitAction(state, .hover),
+        .definition => emitAction(state, .definition),
+        .declaration => emitAction(state, .declaration),
+        .references => emitAction(state, .references),
+        .implementation => emitAction(state, .implementation),
+        .signature_help => emitAction(state, .signature_help),
         .filetree_locate => emitAction(state, .filetree_locate),
         .next_buffer => emitAction(state, .next_buffer),
         .prev_buffer => emitAction(state, .prev_buffer),

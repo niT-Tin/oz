@@ -86,6 +86,13 @@ pub const ActionId = enum {
     diagnostic_prev, // [d — previous diagnostic
     diagnostic_line, // gl — diagnostics for the cursor line
     diagnostics_list, // <leader>sd — diagnostics list
+    // M2 semantic navigation
+    hover, // K — hover docs
+    definition, // gd — go to definition
+    declaration, // gD — go to declaration
+    references, // gr — references
+    implementation, // gI — implementations
+    signature_help, // gs — signature help
     filetree_locate, // <leader>E — locate current file in tree
     next_buffer, // gt — next tab
     prev_buffer, // gT — previous tab

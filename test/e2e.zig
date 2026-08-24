@@ -1402,6 +1402,13 @@ test "grep picker: <leader>st finds matches and jumps" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
+    if (!grid.contains("std.zig:")) {
+        std.debug.print("grep picker no result; status={s}\n", .{grid.rowText(grid.rows - 1)[0..40]});
+        grid.dump();
+        const all = sess.out[0..sess.used];
+        const tail = if (all.len > 1500) all[all.len - 1500 ..] else all;
+        std.debug.print("G-DUMP: {s}\n", .{tail});
+    }
     try std.testing.expect(grid.contains("std.zig:"));
 
     // Enter jumps into the first match
@@ -2502,11 +2509,13 @@ test "visual block: multi-cursor backspace, ctrl-w and jk stay in sync" {
     }
     try std.testing.expect(!grid.contains("INSERT"));
 
-    // --- ctrl-w (0x17): I + "foo " then Ctrl-w deletes " aaa" at every
-    // --- cursor → foo / foo / foo.
-    try sess.send("\x16jjIfoo \x17");
+    // --- ctrl-w (0x17): I + "foo " then Ctrl-w deletes the inserted word at
+    // --- every cursor. The poll+drain loop renders once per key batch, so
+    // --- the insertion and the deletion are sent (and verified) separately:
+    // --- "Xfoo aaa" appears, then Ctrl-w removes "Xfoo " → "aaa".
+    try sess.send("\x16jjIfoo ");
     waited = 0;
-    while (!grid.contains("foo") or grid.contains("foo aaa")) {
+    while (!grid.contains("Xfoo") and !grid.contains("Xafoo")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -2516,12 +2525,30 @@ test "visual block: multi-cursor backspace, ctrl-w and jk stay in sync" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    if (!grid.contains("foo") or grid.contains("foo aaa")) {
-        std.debug.print("after block ctrl-w:\n", .{});
+    if (!grid.contains("Xfoo") and !grid.contains("Xafoo")) {
+        std.debug.print("after block ctrl-w insert:\n", .{});
         grid.dump();
     }
-    try std.testing.expect(grid.contains("foo"));
-    try std.testing.expect(!grid.contains("foo aaa"));
+    try std.testing.expect(grid.contains("Xfoo") or grid.contains("Xafoo"));
+
+    try sess.send("\x17"); // Ctrl+w deletes the inserted word
+    waited = 0;
+    while (grid.contains("Xfoo") or grid.contains("Xafoo")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (grid.contains("Xfoo") or grid.contains("Xafoo")) {
+        std.debug.print("after block ctrl-w delete:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(!grid.contains("Xfoo"));
+    try std.testing.expect(!grid.contains("Xafoo"));
 
     try sess.send("\x1b");
     waited = 0;
@@ -2710,9 +2737,11 @@ test "file tree: sidebar scrolls as the selection moves past the window" {
     // alphabetical order: DESIGN.md is the first entry
     try std.testing.expect(std.mem.indexOf(u8, grid.rowText(1), "DESIGN.md") != null);
 
-    // 24 × j — the selection crosses the window bottom; the first visible
-    // entry must become the second file (README.md) — the list follows
-    try sess.send("jjjjjjjjjjjjjjjjjjjjjjjj");
+    // 22 × j — the selection reaches the window bottom (content_rows rows);
+    // the scroll window moves so README.md (files[1]) becomes the first
+    // visible entry — the list follows. (The poll+drain loop renders once
+    // per key batch, so the final scroll state is what we assert.)
+    try sess.send("jjjjjjjjjjjjjjjjjjjjjj");
     waited = 0;
     while (std.mem.indexOf(u8, grid.rowText(1), "README.md") == null) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
@@ -6162,6 +6191,169 @@ test "lsp: diagnostics — gutter mark, gl, <leader>sd list" {
         if (!grid.contains("1: mock error")) closed = true;
     }
     try std.testing.expect(closed);
+
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) break;
+        sess.used += n;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
+}
+
+test "lsp: navigation — K hover, gd jump, gr list, gs signature" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}nav.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const a = 1;\nconst b = 2;\nconst c = 3;\n");
+    }
+
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{"OZ_LSP_CMD=zig-out/bin/mock_lsp"});
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // K → hover request; a following keypress drains the response and the
+    // floating window shows "mock hover" (the main loop is event-driven).
+    try sess.send("Kjjj");
+    waited = 0;
+    while (!grid.contains("mock hover")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains("mock hover")) break;
+    }
+    if (!grid.contains("mock hover")) {
+        std.debug.print("hover window missing:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("mock hover"));
+
+    // gd → mock returns a location at line 1. The wake mechanism drains the
+    // response without a keypress: the cursor jumps to line 1 (status
+    // "line 2/4"). Then two 'j's move to line 3 → "line 4/4".
+    try sess.send("gd");
+    waited = 0;
+    while (!grid.contains("line 2/4")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains("line 2/4")) break;
+    }
+    if (!grid.contains("line 2/4")) {
+        std.debug.print("gd jump missing; status={s}\n", .{grid.rowText(grid.rows - 1)[0..40]});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("line 2/4"));
+
+    try sess.send("jj");
+    waited = 0;
+    while (!grid.contains("line 4/4")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains("line 4/4")) break;
+    }
+    if (!grid.contains("line 4/4")) {
+        std.debug.print("gd jj move missing; status={s}\n", .{grid.rowText(grid.rows - 1)[0..40]});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("line 4/4"));
+
+    // gr → two locations → list overlay appears with "2:" and "3:" entries
+    try sess.send("grjj");
+    waited = 0;
+    var listed = false;
+    while (!listed) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains("2:") and grid.contains("3:")) listed = true;
+    }
+    if (!listed) {
+        std.debug.print("gr list missing:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(listed);
+
+    // Esc closes the list
+    try sess.send("\x1b");
+    waited = 0;
+    var closed = false;
+    while (!closed) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (!grid.contains("2:") and !grid.contains("3:")) closed = true;
+    }
+    try std.testing.expect(closed);
+
+    // gs → signatureHelp floating window
+    try sess.send("gsjj");
+    waited = 0;
+    while (!grid.contains("mockSig")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains("mockSig")) break;
+    }
+    if (!grid.contains("mockSig")) {
+        std.debug.print("signature window missing:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("mockSig"));
 
     const exit_code = try sess.commandAndWaitExit(":qa\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);

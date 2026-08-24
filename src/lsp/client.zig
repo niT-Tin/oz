@@ -82,6 +82,14 @@ pub const Client = struct {
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     queue: Queue,
 
+    /// Optional wake callback invoked from the reader thread whenever a
+    /// message arrives. The editor uses it to post an event to its event
+    /// loop, so asynchronous responses (diagnostics, navigation) are drained
+    /// without waiting for a keypress. Thread-safe: the callback must only
+    /// touch thread-safe state (e.g. vaxis postEvent).
+    wake_ctx: ?*anyopaque = null,
+    wake_fn: ?*const fn (ctx: *anyopaque) void = null,
+
     /// Pending request result slots, keyed by id (main-thread only).
     pending: std.ArrayList(Pending) = .empty,
 
@@ -372,6 +380,11 @@ pub const Client = struct {
                     break;
                 };
                 self.alloc.free(c);
+                // Wake the editor's event loop so it drains this message
+                // promptly (async responses don't wait for a keypress).
+                if (self.wake_fn) |w| {
+                    if (self.wake_ctx) |ctx| w(ctx);
+                }
             } else {
                 break; // clean EOF
             }

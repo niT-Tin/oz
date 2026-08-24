@@ -29,6 +29,7 @@ pub const lsp_types = @import("lsp/types.zig");
 pub const lsp_client = @import("lsp/client.zig");
 pub const lsp_mock = @import("lsp/mock_lsp.zig");
 pub const lsp_diagnostics = @import("lsp/diagnostics.zig");
+pub const lsp_navigation = @import("lsp/navigation.zig");
 
 test {
     std.testing.refAllDecls(@This());
