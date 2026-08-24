@@ -182,6 +182,12 @@ pub fn posLine(v: std.json.Value) ?u32 {
     return intField(v, "line");
 }
 
+/// Extract the character from a {line,character} position value.
+pub fn posCharacter(v: std.json.Value) ?u32 {
+    if (v != .object) return null;
+    return intField(v, "character");
+}
+
 /// Extract the first signature label from a signatureHelp response.
 pub fn parseSignature(alloc: std.mem.Allocator, result: std.json.Value) !?[]u8 {
     if (result != .object) return null;

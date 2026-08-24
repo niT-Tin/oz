@@ -28,6 +28,9 @@ const status_row_count: u32 = 1;
 /// LSP navigation request kinds (K / gd / gD / gr / gI / gs).
 const NavAction = enum { none, hover, definition, declaration, references, implementation, signature };
 
+/// An inlay hint: dim label shown inline at (line, character).
+const InlayHint = struct { line: u32, character: u32, label: []u8 };
+
 const App = struct {
     /// One open document. `pt`/`history` own their allocations; the struct is
     /// moved between the list and the active slots (never copied-and-deinit'd).
@@ -187,8 +190,10 @@ const App = struct {
     outline_slot: ?std.json.Value = null,
     /// <leader>rn: cmdline is collecting the new name; Enter sends rename.
     pending_rename: bool = false,
-    /// Owned inlay hint labels for the current line (rendered dim inline).
-    inlay_labels: std.ArrayList([]u8) = .empty,
+    /// Owned inlay hints (line/character + label) rendered dim inline.
+    /// Auto-requested for the visible range whenever the view scrolls.
+    inlay_hints: std.ArrayList(InlayHint) = .empty,
+    inlay_view_top: ?u32 = null,
 
     /// The active buffer (the focused window's buffer; per-buffer document
     /// state lives here, per-window cursor/viewport in `windows`).
@@ -592,8 +597,8 @@ const App = struct {
         if (self.format_slot) |*v| json_rpc.freeValue(self.alloc, v);
         if (self.inlay_slot) |*v| json_rpc.freeValue(self.alloc, v);
         if (self.outline_slot) |*v| json_rpc.freeValue(self.alloc, v);
-        for (self.inlay_labels.items) |w| self.alloc.free(w);
-        self.inlay_labels.deinit(self.alloc);
+        for (self.inlay_hints.items) |*h| self.alloc.free(h.label);
+        self.inlay_hints.deinit(self.alloc);
         for (self.completion_words.items) |w| self.alloc.free(w);
         self.completion_words.deinit(self.alloc);
     }
@@ -1502,7 +1507,9 @@ const App = struct {
         const client = self.lsp_client orelse return;
         const uri = lsp_types.pathToFileUri(self.alloc, self.cur().path orelse return) catch return;
         defer self.alloc.free(uri);
-        const line = self.cur().pt.lineOf(self.curCursor().*);
+        // request the visible line range (view_top .. view_top + height)
+        const top = self.curViewTop().*;
+        const bottom = @min(top + 24, self.cur().pt.lineCount());
         var td = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer td.deinit(self.alloc);
         const uri_copy = try self.alloc.dupe(u8, uri);
@@ -1512,12 +1519,12 @@ const App = struct {
         errdefer range.deinit(self.alloc);
         var start = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer start.deinit(self.alloc);
-        try start.put(self.alloc, "line", .{ .integer = line });
+        try start.put(self.alloc, "line", .{ .integer = top });
         try start.put(self.alloc, "character", .{ .integer = 0 });
         var end = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer end.deinit(self.alloc);
-        try end.put(self.alloc, "line", .{ .integer = line });
-        try end.put(self.alloc, "character", .{ .integer = 1000 });
+        try end.put(self.alloc, "line", .{ .integer = bottom });
+        try end.put(self.alloc, "character", .{ .integer = 0 });
         try range.put(self.alloc, "start", .{ .object = start });
         try range.put(self.alloc, "end", .{ .object = end });
         var params = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
@@ -1529,15 +1536,16 @@ const App = struct {
         client.request("textDocument/inlayHint", params_value, &self.inlay_slot) catch return;
     }
 
-    /// Consume an inlayHint response: collect labels for inline rendering.
+    /// Consume an inlayHint response: collect (line, character, label) hints
+    /// for inline rendering. Returns true when a response was consumed.
     fn processInlay(self: *App) bool {
         var result = self.inlay_slot orelse return false;
         defer {
             json_rpc.freeValue(self.alloc, &result);
             self.inlay_slot = null;
         }
-        for (self.inlay_labels.items) |w| self.alloc.free(w);
-        self.inlay_labels.clearRetainingCapacity();
+        for (self.inlay_hints.items) |*h| self.alloc.free(h.label);
+        self.inlay_hints.clearRetainingCapacity();
         if (result != .array) return true;
         for (result.array.items) |hint| {
             if (hint != .object) continue;
@@ -1561,8 +1569,11 @@ const App = struct {
             };
             const t = text orelse continue;
             if (t.len == 0) continue;
+            const position = hint.object.get("position") orelse continue;
+            const line = lsp_nav.posLine(position) orelse continue;
+            const character = lsp_nav.posCharacter(position) orelse continue;
             const copy = self.alloc.dupe(u8, t) catch continue;
-            self.inlay_labels.append(self.alloc, copy) catch {
+            self.inlay_hints.append(self.alloc, .{ .line = line, .character = character, .label = copy }) catch {
                 self.alloc.free(copy);
                 continue;
             };
@@ -3091,7 +3102,13 @@ const App = struct {
         const text = self.curText() catch return;
         defer self.alloc.free(text);
         const start_result = lsp.Client.start(self.alloc, self.io, self.env_map, ft, uri, text);
-        self.lsp_client = start_result catch null;
+        self.lsp_client = start_result catch |err| {
+            // Tell the user why LSP features are silent: the configured
+            // server binary is missing or failed to spawn (e.g. no zls
+            // installed for Zig files).
+            self.setMsg(std.fmt.allocPrint(self.alloc, "LSP {s}: {s}", .{ ft, @errorName(err) }) catch "") catch {};
+            return;
+        };
         // Wire the reader thread's wake callback to our event loop: any
         // incoming LSP message posts an event so the main loop (blocked in
         // pollEvent) wakes up and drains it without waiting for a keypress.
@@ -3829,6 +3846,26 @@ const App = struct {
                 .col_offset = @intCast(rect.col),
                 .wrap = .none,
             });
+            // LSP inlay hints for this line: dim labels at their character
+            // columns. A hint whose column falls inside the line's own text
+            // would overwrite it (TUI cells are fixed), so it moves to just
+            // past the line end instead — the visible text stays intact.
+            for (self.inlay_hints.items) |hint| {
+                if (hint.line != line) continue;
+                var hint_col = hint.character;
+                const hint_line_len: u32 = buf.pt.lineLen(line);
+                if (hint_col < hint_line_len) hint_col = hint_line_len;
+                if (hint_col + hint.label.len >= @as(u32, win.width)) continue;
+                const seg = [_]vaxis.Segment{.{
+                    .text = hint.label,
+                    .style = .{ .dim = true, .fg = .{ .rgb = .{ 122, 124, 135 } } },
+                }};
+                _ = win.print(&seg, .{
+                    .row_offset = @intCast(row),
+                    .col_offset = @intCast(rect.col + gutter + hint_col),
+                    .wrap = .none,
+                });
+            }
             // diagnostic mark: writeCell AFTER the line print so the glyph is
             // not overwritten by the gutter segment
             if (diag_mark != ' ') {
@@ -4190,29 +4227,6 @@ const App = struct {
             }
         }
 
-        // LSP inlay hints (<leader>ti): dim labels appended after the current
-        // line's content (a simple trailing hint; the positions are ignored).
-        if (self.inlay_labels.items.len > 0) {
-            const il_line = self.cur().pt.lineOf(self.curCursor().*);
-            if (il_line >= self.curViewTop().* and il_line < self.curViewTop().* + content_rows) {
-                const il_row = il_line - self.curViewTop().* + cur_rect.row;
-                var col_off: u32 = self.cur().pt.lineLen(il_line);
-                for (self.inlay_labels.items) |label| {
-                    if (col_off + label.len >= win.width) break;
-                    const seg = [_]vaxis.Segment{.{
-                        .text = label,
-                        .style = .{ .dim = true, .fg = .{ .rgb = .{ 122, 124, 135 } } },
-                    }};
-                    _ = win.print(&seg, .{
-                        .row_offset = @intCast(il_row),
-                        .col_offset = @intCast(cur_rect.col + gutter + col_off),
-                        .wrap = .none,
-                    });
-                    col_off += @intCast(label.len);
-                }
-            }
-        }
-
         // LSP hover / signature floating window: a small box below the
         // cursor line (≤6 rows, ≤60 cols) showing nav_hover_text.
         if (self.nav_hover_text) |htext| {
@@ -4303,6 +4317,15 @@ const App = struct {
             if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready) {
                 try self.render();
                 continue;
+            }
+            // Auto-refresh inlay hints when the view scrolls (LSP available
+            // and the visible top line changed since the last request).
+            if (self.lsp_client != null) {
+                const top = self.curViewTop().*;
+                if (self.inlay_view_top == null or self.inlay_view_top.? != top) {
+                    self.inlay_view_top = top;
+                    try self.requestInlayHints();
+                }
             }
             // poll + drain: block until an event arrives (keypress OR an
             // LSP wake posted by the reader thread), then handle the whole
