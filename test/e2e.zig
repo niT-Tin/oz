@@ -93,6 +93,12 @@ fn readAvailable(fd: std.posix.fd_t, buf: []u8, timeout_ms: i32) !usize {
 /// Fork `argv[0]` (resolved against cwd) into the pty with the slave as its
 /// controlling terminal. Returns the child pid.
 fn spawnChild(io: Io, pty: *Pty, argv: []const []const u8) !std.posix.pid_t {
+    return spawnChildEnv(io, pty, argv, null);
+}
+
+/// spawnChild with extra environment entries appended to the fixed base env
+/// (TERM/PATH/HOME) — used to inject OZ_LSP_CMD for mock-server tests.
+fn spawnChildEnv(io: Io, pty: *Pty, argv: []const []const u8, env_extra: ?[]const []const u8) !std.posix.pid_t {
     var path_buf: [std.fs.max_path_bytes:0]u8 = undefined;
     const path_len = try std.Io.Dir.cwd().realPathFile(io, argv[0], &path_buf);
     path_buf[path_len] = 0;
@@ -110,7 +116,22 @@ fn spawnChild(io: Io, pty: *Pty, argv: []const []const u8) !std.posix.pid_t {
     }
     const argv_z: [*:null]const ?[*:0]const u8 = @ptrCast(&arg_ptrs);
 
-    const env_ptrs = [4]?[*:0]const u8{ "TERM=xterm-256color", "PATH=/usr/bin:/bin:/usr/local/bin", "HOME=/tmp", null };
+    var env_bufs: [12][256:0]u8 = undefined;
+    var env_ptrs: [13]?[*:0]const u8 = .{null} ** 13;
+    var nenv: usize = 0;
+    const base_env = [_][]const u8{ "TERM=xterm-256color", "PATH=/usr/bin:/bin:/usr/local/bin", "HOME=/tmp" };
+    for (base_env) |e| {
+        const ez: [:0]u8 = try std.fmt.bufPrintZ(&env_bufs[nenv], "{s}", .{e});
+        env_ptrs[nenv] = ez.ptr;
+        nenv += 1;
+    }
+    if (env_extra) |extra| {
+        for (extra) |e| {
+            const ez: [:0]u8 = try std.fmt.bufPrintZ(&env_bufs[nenv], "{s}", .{e});
+            env_ptrs[nenv] = ez.ptr;
+            nenv += 1;
+        }
+    }
     const envp: [*:null]const ?[*:0]const u8 = @ptrCast(&env_ptrs);
 
     const rc = linux.fork();
@@ -140,9 +161,13 @@ const Session = struct {
     used: usize = 0,
 
     fn spawn(io: Io, argv: []const []const u8) !Session {
+        return spawnEnv(io, argv, null);
+    }
+
+    fn spawnEnv(io: Io, argv: []const []const u8, env_extra: ?[]const []const u8) !Session {
         var pty = try Pty.open();
         errdefer pty.close();
-        const pid = spawnChild(io, &pty, argv) catch |e| {
+        const pid = spawnChildEnv(io, &pty, argv, env_extra) catch |e| {
             pty.close();
             return e;
         };
@@ -5957,4 +5982,71 @@ test "lsp: smoke with real gopls (no crash on start/didChange)" {
     try std.testing.expect(ok);
     const exit_code = try sess.commandAndWaitExit(":qa\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "lsp: mock server handshake + didChange round-trip (OZ_LSP_CMD)" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}lspm.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const a = 1;\n");
+    }
+
+    // spawn oz with OZ_LSP_CMD pointing at the built mock server
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{"OZ_LSP_CMD=zig-out/bin/mock_lsp"});
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break; // mock handshake + diagnostics push
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // edit → didChange must reach the mock without crashing
+    try sess.send("iX\x1b");
+    waited = 0;
+    var ok = false;
+    while (!ok) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        if (grid.contains("NORMAL") and grid.contains("Xconst")) ok = true;
+    }
+    if (!ok) {
+        std.debug.print("after edit with mock lsp:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(ok);
+
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+    // drain post-exit: no DebugAllocator leak reports from the LSP client
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) break;
+        sess.used += n;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
 }

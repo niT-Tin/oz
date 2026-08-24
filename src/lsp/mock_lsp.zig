@@ -27,7 +27,7 @@
 //! never uses `std.debug.print`; `--verbose` diagnostics go to stderr.
 
 const std = @import("std");
-const json_rpc = @import("../src/util/json_rpc.zig");
+const json_rpc = @import("../util/json_rpc.zig");
 
 /// URI used for the proactive publishDiagnostics when no document has been
 /// opened yet (which is the normal case: LSP sends `initialized` before any
@@ -293,24 +293,24 @@ fn buildDiagnosticsParams(a: std.mem.Allocator, uri: []const u8) !std.json.Value
 // didOpen / didChange recording
 // ---------------------------------------------------------------------------
 
-fn extractUri(alloc: std.mem.Allocator, params: ?std.json.Value) !?[]u8 {
-    const p = params orelse return null;
-    if (p != .object) return null;
-    const td = p.object.get("textDocument") orelse return null;
-    if (td != .object) return null;
-    const uri = td.object.get("uri") orelse return null;
-    if (uri != .string) return null;
+fn extractUri(alloc: std.mem.Allocator, params: ?std.json.Value) ![]u8 {
+    const p = params orelse return error.MissingParams;
+    if (p != .object) return error.BadParams;
+    const td = p.object.get("textDocument") orelse return error.MissingTextDocument;
+    if (td != .object) return error.BadParams;
+    const uri = td.object.get("uri") orelse return error.MissingUri;
+    if (uri != .string) return error.BadParams;
     return alloc.dupe(u8, uri.string);
 }
 
 fn recordDidOpen(alloc: std.mem.Allocator, state: *State, params: ?std.json.Value) !void {
-    const uri = try extractUri(alloc, params) orelse return;
+    const uri = extractUri(alloc, params) catch return;
     errdefer alloc.free(uri);
     try state.opened.append(alloc, uri);
 }
 
 fn recordDidChange(alloc: std.mem.Allocator, state: *State, params: ?std.json.Value) !void {
-    const uri = try extractUri(alloc, params) orelse return;
+    const uri = extractUri(alloc, params) catch return;
     errdefer alloc.free(uri);
     var text: []const u8 = "";
     if (params) |p| {
@@ -381,7 +381,7 @@ pub fn main(init: std.process.Init) !void {
     var script_set = false;
     var verbose = false;
 
-    var it = init.minimal.args.iterator();
+    var it = std.process.Args.Iterator.init(init.minimal.args);
     _ = it.next(); // argv[0]: program name
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--verbose")) {

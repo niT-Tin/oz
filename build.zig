@@ -46,6 +46,17 @@ pub fn build(b: *std.Build) void {
     exe.root_module.link_libc = true;
     b.installArtifact(exe);
 
+    // ---- mock LSP server (e2e injects it via OZ_LSP_CMD) ----
+    const mock = b.addExecutable(.{
+        .name = "mock_lsp",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mock_root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(mock);
+
     // ---- run step ----
     const run_step = b.step("run", "Run oz");
     const run_cmd = b.addRunArtifact(exe);
