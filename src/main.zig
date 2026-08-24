@@ -2508,7 +2508,7 @@ const App = struct {
         defer self.alloc.free(uri);
         const text = self.curText() catch return;
         defer self.alloc.free(text);
-        self.lsp_client = lsp.Client.start(self.alloc, self.io, ft, uri, text) catch null;
+        self.lsp_client = lsp.Client.start(self.alloc, self.io, self.env_map, ft, uri, text) catch null;
     }
 
     /// Current buffer text (owned copy) — for didOpen/didChange payloads.

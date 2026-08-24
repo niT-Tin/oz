@@ -74,6 +74,9 @@ pub const Client = struct {
     proc: std.process.Child,
     stdin: std.Io.File,
     next_id: u64 = 1,
+    /// Heap-held argv when the server command came from OZ_LSP_CMD (freed on
+    /// deinit); null when argv points at the static server_config table.
+    argv_override: ?[]const []const u8 = null,
 
     thread: ?std.Thread = null,
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -91,11 +94,24 @@ pub const Client = struct {
     pub fn start(
         alloc: std.mem.Allocator,
         io: std.Io,
+        env_map: *std.process.Environ.Map,
         lang: []const u8,
         uri: []const u8,
         text: []const u8,
     ) !*Client {
-        const argv = server_config.commandFor(lang) orelse return error.NoLspServer;
+        var argv = server_config.commandFor(lang) orelse return error.NoLspServer;
+        // Test hook: OZ_LSP_CMD overrides the server command (e2e injects the
+        // mock server this way). The env string is borrowed (env_map lives for
+        // the whole process); only the argv array is heap-held (stored on the
+        // Client once it exists).
+        var argv_override: ?[]const []const u8 = null;
+        if (env_map.get("OZ_LSP_CMD")) |cmd| {
+            const arr = try alloc.alloc([]const u8, 1);
+            errdefer alloc.free(arr);
+            arr[0] = cmd;
+            argv = arr;
+            argv_override = arr;
+        }
         var proc = try std.process.spawn(io, .{
             .argv = argv,
             .stdin = .pipe,
@@ -116,6 +132,7 @@ pub const Client = struct {
             .proc = proc,
             .stdin = proc.stdin orelse return error.NoStdin,
             .queue = .{ .io = io },
+            .argv_override = argv_override,
         };
         errdefer self.alloc.free(self.uri);
 
@@ -156,6 +173,7 @@ pub const Client = struct {
         _ = self.proc.wait(self.io) catch {};
         self.queue.deinit(self.alloc);
         self.pending.deinit(self.alloc);
+        if (self.argv_override) |a| self.alloc.free(a);
         self.alloc.free(self.uri);
         self.alloc.destroy(self);
     }
