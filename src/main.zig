@@ -835,6 +835,13 @@ const App = struct {
             self.prev_insert_key = key;
             if (key.text) |text| {
                 try self.insertText(text);
+                // Signature help: typing '(' asks the language server for
+                // the callee's signature and shows it in the floating window
+                // (LSP signatureHelp; the response arrives via the wake
+                // mechanism and renders without a keypress).
+                if (key.codepoint == '(' and !key.mods.ctrl and !key.mods.alt) {
+                    try self.requestNav("textDocument/signatureHelp", .signature);
+                }
                 return;
             }
             return;
@@ -3856,6 +3863,32 @@ const App = struct {
                     .col_offset = @intCast(cur_rect.col + gutter + c_col),
                     .wrap = .none,
                 });
+            }
+
+            // Ghost text: the suffix of the selected item beyond the typed
+            // prefix, shown dimmed right after the cursor (VS Code style).
+            // Only when the item actually extends the typed prefix.
+            if (self.state.mode == .insert and self.completion_sel < total) {
+                const item = self.completion_words.items[self.completion_sel];
+                const typed_len = self.curCursor().* - self.completion_pos;
+                if (item.len > typed_len and typed_len > 0 and typed_len < 256) {
+                    var prefix_buf: [256]u8 = undefined;
+                    self.cur().pt.copyRange(self.completion_pos, prefix_buf[0..typed_len]);
+                    if (std.mem.startsWith(u8, item, prefix_buf[0..typed_len])) {
+                        const ghost = item[typed_len..];
+                        if (ghost.len > 0 and c_col + typed_len + ghost.len < win.width) {
+                            const seg = [_]vaxis.Segment{.{
+                                .text = ghost,
+                                .style = .{ .dim = true },
+                            }};
+                            _ = win.print(&seg, .{
+                                .row_offset = @intCast(c_line - self.curViewTop().* + cur_rect.row),
+                                .col_offset = @intCast(cur_rect.col + gutter + c_col + typed_len),
+                                .wrap = .none,
+                            });
+                        }
+                    }
+                }
             }
         }
 
