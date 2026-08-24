@@ -4200,6 +4200,90 @@ test "e2e: multi-cursor n extends the selection; c changes words synchronously" 
     try std.testing.expectEqualStrings("bar bar bar\n", buf);
 }
 
+test "e2e: multi-cursor Ctrl+n moves the main cursor and scrolls the viewport" {
+    // Regression: Ctrl+n added the next match to the cursor list but never
+    // moved the main cursor, so the screen cursor stayed put and a match
+    // beyond the visible area was never scrolled into view.
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}mcscroll.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        var i: usize = 0;
+        while (i < 30) : (i += 1) {
+            try f.writeStreamingAll(io, "foo\n");
+        }
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // Walk 12 matches with Ctrl+n (0x0e): the cursor must move far below the
+    // initial line (line 1), past the ~10-row viewport, scrolling the text.
+    try sess.send("\x0e\x0e\x0e\x0e\x0e\x0e\x0e\x0e\x0e\x0e\x0e\x0e");
+    waited = 0;
+    var cursor_past = false;
+    while (!cursor_past) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        // status shows "line N/31"; N must be well past 1
+        var row: usize = 0;
+        while (row < grid.rows) : (row += 1) {
+            const txt = grid.rowText(row);
+            if (std.mem.indexOf(u8, txt, "line ") != null and std.mem.indexOf(u8, txt, "/31") != null) {
+                if (std.mem.indexOf(u8, txt, "line 1/") == null) {
+                    cursor_past = true;
+                }
+                break;
+            }
+        }
+    }
+    try std.testing.expect(cursor_past);
+    // The viewport must have scrolled: the cursorline row is not the first
+    // content row (the cursor line is now ~13, far below the top).
+    var r: usize = 1;
+    var cursorline_row: ?usize = null;
+    const cursorline_bg = packRgb(40, 48, 68);
+    while (r < 24) : (r += 1) {
+        if (grid.rowHasBg(r, cursorline_bg)) {
+            cursorline_row = r;
+            break;
+        }
+    }
+    try std.testing.expect(cursorline_row != null);
+    try std.testing.expect(cursorline_row.? > 1); // scrolled off the top
+
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
 test "e2e: visual Ctrl+a increments every number in the selection" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -6368,7 +6452,11 @@ test "lsp: navigation — K hover, gd jump, gr list, gs signature" {
 
     // K → hover request; a following keypress drains the response and the
     // floating window shows "mock hover" (the main loop is event-driven).
-    try sess.send("Kjjj");
+    // K → hover request; a following keypress drains the response and the
+    // floating window shows "mock hover" (the main loop is event-driven).
+    // Cursor motion dismisses the hover (nvim behavior) — asserted below via
+    // the 'j' that also advances to line 2 for the gd step.
+    try sess.send("Kj");
     waited = 0;
     while (!grid.contains("mock hover")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);

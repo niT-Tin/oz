@@ -759,7 +759,9 @@ const App = struct {
             // Ctrl+n: next candidate when the menu is open; otherwise collect
             // candidates and open the menu — but only when the cursor is
             // inside a word. Without a word prefix the key is swallowed.
-            if (key.codepoint == 'n' and key.mods.ctrl and !key.mods.alt and !key.mods.super) {
+            // (Insert-mode completion only; in normal mode the keymap routes
+            // Ctrl+n to multi-cursor .mc_add instead.)
+            if (self.state.mode == .insert and key.codepoint == 'n' and key.mods.ctrl and !key.mods.alt and !key.mods.super) {
                 if (self.completion_active) {
                     const n = self.completion_words.items.len;
                     if (n > 0) self.completion_sel = (self.completion_sel + 1) % n;
@@ -879,6 +881,11 @@ const App = struct {
             .motion => |m| {
                 var new_cursor = self.curCursor().*;
                 editor.Motion.apply(&self.cur().pt, m.motion, m.args, &new_cursor, m.count);
+                if (new_cursor != self.curCursor().*) {
+                    // The cursor moved: nvim-style hover windows vanish once
+                    // the cursor leaves the annotated token.
+                    self.clearHover();
+                }
                 self.curCursor().* = new_cursor;
             },
             .op_motion => |m| {
@@ -2079,6 +2086,23 @@ const App = struct {
         self.msg = owned;
     }
 
+    /// Inlay hints for one line, sorted by insertion column (ascending), as
+    /// arena slices so they live for the frame. Hints with a character inside
+    /// the line's text are kept at that column — the renderer splices them in.
+    fn lineHints(self: *App, a: std.mem.Allocator, line: u32) ![]InlayHint {
+        var out = std.ArrayList(InlayHint).empty;
+        for (self.inlay_hints.items) |hint| {
+            if (hint.line != line) continue;
+            try out.append(a, hint);
+        }
+        std.mem.sort(InlayHint, out.items, {}, struct {
+            fn lt(_: void, x: InlayHint, y: InlayHint) bool {
+                return x.character < y.character;
+            }
+        }.lt);
+        return out.toOwnedSlice(a);
+    }
+
     /// Resolve `path` (possibly relative to the process cwd) into an absolute
     /// path. Returns a heap copy; the caller owns it. Falls back to a plain
     /// dupe on failure so file opening never breaks on a resolution error.
@@ -2324,7 +2348,15 @@ const App = struct {
             _ = try self.mc.add(self.curCursor().*);
             self.mc_active = true;
         } else {
-            _ = try self.mc.addNextMatch(&self.cur().pt);
+            const added = try self.mc.addNextMatch(&self.cur().pt);
+            if (added) {
+                // The main cursor follows the newest match (vim's multi-cursor
+                // moves the cursor to each new selection as you press n); the
+                // render pass keeps the cursor line on screen. `main` stays at
+                // the FIRST cursor (the original word), so the newest match is
+                // always the last slot.
+                self.curCursor().* = self.mc.cursors.items[self.mc.cursors.items.len - 1];
+            }
         }
     }
 
@@ -2990,7 +3022,8 @@ const App = struct {
             return;
         }
         // A new navigation request replaces any stale overlay (hover window,
-        // location list) from a previous request.
+        // location list) from a previous request. Concurrent requests share
+        // nav_slot; the client's drain frees a stale slot value on overwrite.
         self.clearNavOverlays();
         const uri = lsp_types.pathToFileUri(self.alloc, self.cur().path orelse return) catch return;
         defer self.alloc.free(uri);
@@ -3049,9 +3082,16 @@ const App = struct {
     /// Drop the hover window and location-list overlay (used when starting a
     /// new navigation request or jumping).
     fn clearNavOverlays(self: *App) void {
+        self.clearHover();
+        self.nav_list_active = false;
+    }
+
+    /// Drop only the hover/signature floating window — used when the cursor
+    /// moves (nvim hides the hover window as soon as the cursor leaves the
+    /// annotated token).
+    fn clearHover(self: *App) void {
         if (self.nav_hover_text) |t| self.alloc.free(t);
         self.nav_hover_text = null;
-        self.nav_list_active = false;
     }
 
     /// Move to a nav location: jump within the current buffer, or open the
@@ -3850,8 +3890,26 @@ const App = struct {
             const cursorline_style: vaxis.Style = if (is_cur_line) .{ .bg = .{ .rgb = .{ 40, 48, 68 } } } else .{};
             try segs.append(a, .{ .text = num_str[0 .. gutter - 1], .style = cursorline_style });
             try segs.append(a, .{ .text = num_str[gutter - 1 .. gutter], .style = cursorline_style });
+            // Inlay hints for this line, sorted by insertion column: each hint
+            // is spliced into the text at its character offset (the token it
+            // annotates ends there), so `const x = foo()` renders as
+            // `const x: i32 = foo()` like nvim — not moved to end of line.
+            const line_hints = try self.lineHints(a, line);
+            var hint_i: usize = 0;
             var col: u32 = 0;
             while (col < n) {
+                // emit any hint whose insertion column is at/just passed col
+                // (before the next text segment, so it reads token+hint)
+                while (hint_i < line_hints.len and line_hints[hint_i].character <= col) {
+                    const hint = line_hints[hint_i];
+                    if (hint.label.len > 0) {
+                        try segs.append(a, .{
+                            .text = hint.label,
+                            .style = .{ .dim = true, .fg = .{ .rgb = .{ 122, 124, 135 } } },
+                        });
+                    }
+                    hint_i += 1;
+                }
                 while (span_i < merged.len and merged[span_i].end <= line_start + col) span_i += 1;
                 var next: u32 = n;
                 var fg: ?vaxis.Style = null;
@@ -3866,6 +3924,12 @@ const App = struct {
                 }
                 if (sel_s > col and sel_s < next) next = sel_s;
                 if (sel_e > col and sel_e < next) next = sel_e;
+                // stop the text segment at the next hint's insertion column so
+                // the hint is spliced between tokens (hints sorted ascending)
+                if (hint_i < line_hints.len) {
+                    const hc = line_hints[hint_i].character;
+                    if (hc > col and hc < next) next = hc;
+                }
                 const in_sel = col >= sel_s and col < sel_e;
                 var style: vaxis.Style = .{};
                 if (is_cur_line) style.bg = .{ .rgb = .{ 40, 48, 68 } };
@@ -3874,34 +3938,23 @@ const App = struct {
                 try segs.append(a, .{ .text = text[col..next], .style = style });
                 col = next;
             }
+            // trailing hints past the visible text (still inside the line)
+            while (hint_i < line_hints.len) {
+                const hint = line_hints[hint_i];
+                if (hint.label.len > 0) {
+                    try segs.append(a, .{
+                        .text = hint.label,
+                        .style = .{ .dim = true, .fg = .{ .rgb = .{ 122, 124, 135 } } },
+                    });
+                }
+                hint_i += 1;
+            }
 
             _ = win.print(segs.items, .{
                 .row_offset = @intCast(row),
                 .col_offset = @intCast(rect.col),
                 .wrap = .none,
             });
-            // LSP inlay hints for this line: dim labels at their character
-            // columns. A hint whose column falls inside the line's own text
-            // would overwrite it (TUI cells are fixed), so it moves to just
-            // past the line end instead — the visible text stays intact.
-            for (self.inlay_hints.items) |hint| {
-                if (hint.line != line) continue;
-                var hint_col = hint.character;
-                const hint_line_len: u32 = buf.pt.lineLen(line);
-                if (hint_col < hint_line_len) hint_col = hint_line_len;
-                if (hint_col + hint.label.len >= @as(u32, win.width)) {
-                    continue;
-                }
-                const seg = [_]vaxis.Segment{.{
-                    .text = hint.label,
-                    .style = .{ .dim = true, .fg = .{ .rgb = .{ 122, 124, 135 } } },
-                }};
-                _ = win.print(&seg, .{
-                    .row_offset = @intCast(row),
-                    .col_offset = @intCast(rect.col + gutter + hint_col),
-                    .wrap = .none,
-                });
-            }
             // diagnostic mark: writeCell AFTER the line print so the glyph is
             // not overwritten by the gutter segment
             if (diag_mark != ' ') {

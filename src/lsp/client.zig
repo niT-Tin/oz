@@ -80,6 +80,9 @@ pub const Client = struct {
     /// Heap-held argv when the server command came from OZ_LSP_CMD (freed on
     /// deinit); null when argv points at the static server_config table.
     argv_override: ?[]const []const u8 = null,
+    /// Whether argv_override[0] is a heap-owned copy (resolveServerBinary's
+    /// dupe) that deinit must free; OZ_LSP_CMD's entry is a borrowed env slice.
+    argv_override_first_owned: bool = false,
 
     thread: ?std.Thread = null,
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -144,6 +147,7 @@ pub const Client = struct {
         // the whole process); only the argv array is heap-held (stored on the
         // Client once it exists).
         var argv_override: ?[]const []const u8 = null;
+        var argv_first_owned = false;
         if (env_map.get("OZ_LSP_CMD")) |cmd| {
             const arr = try alloc.alloc([]const u8, 1);
             errdefer alloc.free(arr);
@@ -159,12 +163,22 @@ pub const Client = struct {
             arr[0] = path;
             argv = arr;
             argv_override = arr;
+            argv_first_owned = true;
         }
-        var proc = try std.process.spawn(io, .{
+        // Spawn failure: free the heap-held argv (including the resolved
+        // binary path). `proc` is only valid after a successful spawn, so the
+        // cleanup cannot live in an errdefer that also touches proc.
+        var proc = std.process.spawn(io, .{
             .argv = argv,
             .stdin = .pipe,
             .stdout = .pipe,
-        });
+        }) catch |e| {
+            if (argv_override) |arr| {
+                if (argv_first_owned) alloc.free(arr[0]);
+                alloc.free(arr);
+            }
+            return e;
+        };
         errdefer {
             _ = proc.kill(io);
             _ = proc.wait(io) catch {};
@@ -181,8 +195,17 @@ pub const Client = struct {
             .stdin = proc.stdin orelse return error.NoStdin,
             .queue = .{ .io = io },
             .argv_override = argv_override,
+            .argv_override_first_owned = argv_first_owned,
         };
         errdefer self.alloc.free(self.uri);
+        // Handshake failures after this point must free the argv too (the
+        // errdefer above only covers spawn failure).
+        errdefer {
+            if (self.argv_override) |arr| {
+                if (self.argv_override_first_owned) self.alloc.free(arr[0]);
+                self.alloc.free(arr);
+            }
+        }
 
         // Reader thread first: the initialize response arrives through it.
         self.thread = try std.Thread.spawn(.{}, readerMain, .{self});
@@ -247,9 +270,15 @@ pub const Client = struct {
         // up (id → null), so no wait() afterwards — it would assert.
         _ = self.proc.kill(self.io);
         if (self.thread) |t| t.join();
+        // Leftover queue frames are freed here; unreceived response VALUES
+        // live in the caller's slots (the App frees nav_slot etc. in its own
+        // deinit), so the pending array itself is all we own.
         self.queue.deinit(self.alloc);
         self.pending.deinit(self.alloc);
-        if (self.argv_override) |a| self.alloc.free(a);
+        if (self.argv_override) |arr| {
+            if (self.argv_override_first_owned) self.alloc.free(arr[0]);
+            self.alloc.free(arr);
+        }
         self.alloc.free(self.uri);
         self.alloc.destroy(self);
     }
@@ -406,10 +435,16 @@ pub const Client = struct {
             defer self.alloc.free(content);
             var msg = json_rpc.parseMessage(self.alloc, content) catch continue;
             if (msg.id) |id| {
-                // response → pending slot
+                // response → pending slot. A slot may already hold an
+                // un-consumed response if two requests shared it (e.g. the
+                // App's single nav_slot): free the stale value first so the
+                // earlier result is not leaked by the overwrite.
                 var i: usize = 0;
                 while (i < self.pending.items.len) : (i += 1) {
                     if (self.pending.items[i].id == id) {
+                        if (self.pending.items[i].slot.*) |*old| {
+                            json_rpc.freeValue(self.alloc, old);
+                        }
                         self.pending.items[i].slot.* = msg.result;
                         msg.result = null; // ownership moved
                         _ = self.pending.orderedRemove(i);
