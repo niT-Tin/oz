@@ -6050,3 +6050,125 @@ test "lsp: mock server handshake + didChange round-trip (OZ_LSP_CMD)" {
     }
     try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
 }
+
+test "lsp: diagnostics — gutter mark, gl, <leader>sd list" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}diag.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const a = 1;\nconst b = 2;\nconst c = 3;\n");
+    }
+
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{"OZ_LSP_CMD=zig-out/bin/mock_lsp"});
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // gl is the first keypress: it drains the LSP queue (diagnostics arrive)
+    // and shows the cursor line's diagnostics — line 0 has the mock's error.
+    try sess.send("gl");
+    waited = 0;
+    while (!grid.contains("mock error")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!grid.contains("mock error")) {
+        std.debug.print("gl did not show:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("mock error"));
+
+    // diagnostics arrived; the gutter's last column of row 1 (file line 0)
+    // must show 'E'
+    waited = 0;
+    var mark = false;
+    while (!mark) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.buf[1 * grid.cols + 1] == 'E') mark = true; // gutter col 1 on screen row 1
+    }
+    if (!mark) {
+        std.debug.print("no gutter E mark; col1={x} col2={x}\n", .{ grid.buf[1 * grid.cols + 1], grid.buf[1 * grid.cols + 2] });
+        grid.dump();
+    }
+    try std.testing.expect(mark);
+
+    // <leader>sd → diagnostics list with "1: mock error"
+    try sess.send(" sd");
+    waited = 0;
+    var listed = false;
+    while (!listed) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        if (grid.contains("1: mock error")) listed = true;
+    }
+    if (!listed) {
+        std.debug.print("leader sd list missing:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(listed);
+
+    // Esc closes the list
+    try sess.send("\x1b");
+    waited = 0;
+    var closed = false;
+    while (!closed) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (!grid.contains("1: mock error")) closed = true;
+    }
+    try std.testing.expect(closed);
+
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) break;
+        sess.used += n;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
+}

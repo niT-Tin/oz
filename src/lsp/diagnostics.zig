@@ -46,20 +46,24 @@ fn intField(v: std.json.Value, name: []const u8) ?u32 {
     const f = v.object.get(name) orelse return null;
     return switch (f) {
         .integer => |n| if (n >= 0) @intCast(n) else null,
+        // json_rpc.parseMessage keeps numbers as .number_string
+        .number_string => |str| std.fmt.parseInt(u32, str, 10) catch null,
         else => null,
     };
 }
 
 fn parseSeverity(v: ?std.json.Value) types.Severity {
     const sv = v orelse return .err;
-    return switch (sv) {
-        .integer => |n| switch (n) {
-            1 => .err,
-            2 => .warning,
-            3 => .info,
-            else => .hint,
-        },
-        else => .err,
+    const n: i64 = switch (sv) {
+        .integer => |iv| iv,
+        .number_string => |str| std.fmt.parseInt(i64, str, 10) catch return .err,
+        else => return .err,
+    };
+    return switch (n) {
+        1 => .err,
+        2 => .warning,
+        3 => .info,
+        else => .hint,
     };
 }
 

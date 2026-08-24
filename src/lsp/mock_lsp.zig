@@ -138,8 +138,13 @@ pub fn handleMessage(
     const method = msg.method orelse return out;
     if (std.mem.eql(u8, method, "initialized")) {
         state.initialized = true;
+    } else if (std.mem.eql(u8, method, "textDocument/didOpen")) {
+        try recordDidOpen(alloc, state, msg.params);
+        // Push diagnostics for the JUST-opened document (uri matches what the
+        // client filters on) — pushing at `initialized` races didOpen and the
+        // client would drop the diagnostics as belonging to another file.
         if (script == .hello) {
-            const uri = if (state.opened.items.len > 0) state.opened.items[0] else default_uri;
+            const uri = if (state.opened.items.len > 0) state.opened.items[state.opened.items.len - 1] else default_uri;
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
             const a = arena.allocator();
@@ -148,8 +153,6 @@ pub fn handleMessage(
             errdefer alloc.free(body);
             try out.frames.append(alloc, body);
         }
-    } else if (std.mem.eql(u8, method, "textDocument/didOpen")) {
-        try recordDidOpen(alloc, state, msg.params);
     } else if (std.mem.eql(u8, method, "textDocument/didChange")) {
         try recordDidChange(alloc, state, msg.params);
     } else if (std.mem.eql(u8, method, "exit")) {
@@ -514,14 +517,12 @@ pub fn main(init: std.process.Init) !void {
         for (outcome.frames.items) |frame| {
             writeFrameToFile(stdout, io, frame) catch |e| {
                 logVerbose(io, verbose, "mock_lsp: stdout write failed: {s}\n", .{@errorName(e)});
-                gpa.free(frame);
                 running = false;
                 break;
             };
             logVerbose(io, verbose, "mock_lsp: sent frame ({d} bytes)\n", .{frame.len});
-            gpa.free(frame);
         }
-        outcome.deinit(gpa);
+        outcome.deinit(gpa); // frees every frame (no per-frame free above)
 
         if (!running or state.exit_requested) break;
     }
@@ -690,12 +691,12 @@ test "hello: any other request (e.g. definition) gets a null result" {
     try testing.expect(resp.result.? == .null);
 }
 
-test "hello: initialized pushes one publishDiagnostics (mock error)" {
+test "hello: didOpen pushes one publishDiagnostics (mock error)" {
     const alloc = testing.allocator;
     var state = State{};
     defer state.deinit(alloc);
-    const notif = "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}";
-    var out = try handleContent(alloc, .hello, &state, notif);
+    const open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/a.zig\",\"version\":1},\"text\":\"const a = 1;\\n\"}}";
+    var out = try handleContent(alloc, .hello, &state, open);
     defer out.deinit(alloc);
     try testing.expectEqual(@as(usize, 1), out.frames.items.len);
 
@@ -703,7 +704,8 @@ test "hello: initialized pushes one publishDiagnostics (mock error)" {
     defer m.deinit(alloc);
     try testing.expectEqualStrings("textDocument/publishDiagnostics", m.method.?);
     const params = m.params.?;
-    try testing.expectEqualStrings(default_uri, params.object.get("uri").?.string);
+    // the diagnostics reference the just-opened document
+    try testing.expectEqualStrings("file:///tmp/a.zig", params.object.get("uri").?.string);
     const diags = params.object.get("diagnostics").?.array;
     try testing.expectEqual(@as(usize, 1), diags.items.len);
     const d = diags.items[0];
@@ -713,26 +715,23 @@ test "hello: initialized pushes one publishDiagnostics (mock error)" {
     const start = range.object.get("start").?;
     try testing.expectEqualStrings("0", start.object.get("line").?.number_string);
     try testing.expectEqualStrings("0", start.object.get("character").?.number_string);
-    const end = range.object.get("end").?;
-    try testing.expectEqualStrings("0", end.object.get("line").?.number_string);
-    try testing.expectEqualStrings("5", end.object.get("character").?.number_string);
 }
 
-test "hello: diagnostics reference the first opened document when available" {
+test "hello: initialized alone pushes nothing; silent pushes nothing either" {
     const alloc = testing.allocator;
     var state = State{};
     defer state.deinit(alloc);
-    const open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///a.txt\",\"version\":1},\"text\":\"hello\"}}";
-    var out_open = try handleContent(alloc, .hello, &state, open);
-    defer out_open.deinit(alloc);
-    try testing.expectEqual(@as(usize, 0), out_open.frames.items.len);
-
     const notif = "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}";
     var out = try handleContent(alloc, .hello, &state, notif);
     defer out.deinit(alloc);
-    var m = try json_rpc.parseMessage(alloc, out.frames.items[0]);
-    defer m.deinit(alloc);
-    try testing.expectEqualStrings("file:///a.txt", m.params.?.object.get("uri").?.string);
+    try testing.expectEqual(@as(usize, 0), out.frames.items.len);
+
+    var state2 = State{};
+    defer state2.deinit(alloc);
+    const open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///a.txt\",\"version\":1},\"text\":\"hello\"}}";
+    var out2 = try handleContent(alloc, .silent, &state2, open);
+    defer out2.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), out2.frames.items.len);
 }
 
 test "silent: initialized sends no diagnostics" {

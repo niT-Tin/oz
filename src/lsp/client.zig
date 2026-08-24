@@ -145,11 +145,17 @@ pub const Client = struct {
         const init_id = self.next_id;
         self.next_id += 1;
         {
-            var init_params = try initParams(self);
-            defer json_rpc.freeValue(self.alloc, &init_params);
-            const content = try json_rpc.encodeRequest(self.alloc, init_id, "initialize", init_params);
+            var init_params = initParams(self) catch |e| {
+                return e;
+            };
+            defer self.freeInitParams(&init_params);
+            const content = json_rpc.encodeRequest(self.alloc, init_id, "initialize", init_params) catch |e| {
+                return e;
+            };
             defer self.alloc.free(content);
-            try self.writeFrameToStdin(content);
+            self.writeFrameToStdin(content) catch |e| {
+                return e;
+            };
         }
         var init_msg = try self.waitResponse(init_id);
         defer init_msg.deinit(self.alloc);
@@ -168,9 +174,12 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         self.stop.store(true, .release);
-        if (self.thread) |t| t.join();
+        // Kill the server FIRST: the reader thread blocks in readStreaming
+        // until stdout EOF, so joining before the kill would deadlock on a
+        // server that never closes its pipe. NOTE: Child.kill already cleans
+        // up (id → null), so no wait() afterwards — it would assert.
         _ = self.proc.kill(self.io);
-        _ = self.proc.wait(self.io) catch {};
+        if (self.thread) |t| t.join();
         self.queue.deinit(self.alloc);
         self.pending.deinit(self.alloc);
         if (self.argv_override) |a| self.alloc.free(a);
@@ -178,19 +187,68 @@ pub const Client = struct {
         self.alloc.destroy(self);
     }
 
+    // ---- params lifetime ----
+    // json_rpc.freeValue frees every key/string it finds, but this module's
+    // manually built params use comptime literal keys — freeing those crashes.
+    // These per-shape helpers free the dupe'd strings and deinit the maps.
+
+    fn freeDidOpenParams(self: *Client, v: *std.json.Value) void {
+        const params = &v.object;
+        var td = params.get("textDocument").?;
+        self.alloc.free(td.object.get("uri").?.string);
+        td.object.deinit(self.alloc);
+        self.alloc.free(params.get("text").?.string);
+        params.deinit(self.alloc);
+    }
+
+    fn freeDidChangeParams(self: *Client, v: *std.json.Value) void {
+        const params = &v.object;
+        var td = params.get("textDocument").?;
+        self.alloc.free(td.object.get("uri").?.string);
+        td.object.deinit(self.alloc);
+        var changes = params.get("contentChanges").?;
+        const change = &changes.array.items[0].object;
+        self.alloc.free(change.get("text").?.string);
+        change.deinit(self.alloc);
+        changes.array.deinit();
+        params.deinit(self.alloc);
+    }
+
+    fn freeDidCloseParams(self: *Client, v: *std.json.Value) void {
+        const params = &v.object;
+        var td = params.get("textDocument").?;
+        self.alloc.free(td.object.get("uri").?.string);
+        td.object.deinit(self.alloc);
+        params.deinit(self.alloc);
+    }
+
+    fn freeInitParams(self: *Client, v: *std.json.Value) void {
+        var cap = &v.object;
+        self.alloc.free(cap.get("rootUri").?.string);
+        var inner = cap.get("capabilities").?;
+        inner.object.deinit(self.alloc);
+        cap.deinit(self.alloc);
+    }
+
     // ---- text sync ----
 
     fn didOpen(self: *Client, text: []const u8) !void {
         var td = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer td.deinit(self.alloc);
-        try td.put(self.alloc, "uri", .{ .string = self.uri });
+        // freeValue frees every .string it finds, so every string must be a
+        // heap copy (dupe) — borrowed slices would be freed and crash.
+        const uri_copy = try self.alloc.dupe(u8, self.uri);
+        errdefer self.alloc.free(uri_copy);
+        try td.put(self.alloc, "uri", .{ .string = uri_copy });
         try td.put(self.alloc, "version", .{ .integer = 1 });
+        const text_copy = try self.alloc.dupe(u8, text);
+        errdefer self.alloc.free(text_copy);
         var params = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer params.deinit(self.alloc);
         try params.put(self.alloc, "textDocument", .{ .object = td });
-        try params.put(self.alloc, "text", .{ .string = text });
+        try params.put(self.alloc, "text", .{ .string = text_copy });
         var v = std.json.Value{ .object = params };
-        defer json_rpc.freeValue(self.alloc, &v);
+        defer self.freeDidOpenParams(&v);
         try self.notify("textDocument/didOpen", v);
     }
 
@@ -198,11 +256,15 @@ pub const Client = struct {
         self.version += 1;
         var td = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer td.deinit(self.alloc);
-        try td.put(self.alloc, "uri", .{ .string = self.uri });
+        const uri_copy = try self.alloc.dupe(u8, self.uri);
+        errdefer self.alloc.free(uri_copy);
+        try td.put(self.alloc, "uri", .{ .string = uri_copy });
         try td.put(self.alloc, "version", .{ .integer = self.version });
         var change = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer change.deinit(self.alloc);
-        try change.put(self.alloc, "text", .{ .string = text });
+        const text_copy = try self.alloc.dupe(u8, text);
+        errdefer self.alloc.free(text_copy);
+        try change.put(self.alloc, "text", .{ .string = text_copy });
         var changes = std.json.Array.init(self.alloc);
         errdefer changes.deinit();
         try changes.append(.{ .object = change });
@@ -211,19 +273,21 @@ pub const Client = struct {
         try params.put(self.alloc, "textDocument", .{ .object = td });
         try params.put(self.alloc, "contentChanges", .{ .array = changes });
         var v = std.json.Value{ .object = params };
-        defer json_rpc.freeValue(self.alloc, &v);
+        defer self.freeDidChangeParams(&v);
         try self.notify("textDocument/didChange", v);
     }
 
     pub fn didClose(self: *Client) !void {
         var td = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer td.deinit(self.alloc);
-        try td.put(self.alloc, "uri", .{ .string = self.uri });
+        const uri_copy = try self.alloc.dupe(u8, self.uri);
+        errdefer self.alloc.free(uri_copy);
+        try td.put(self.alloc, "uri", .{ .string = uri_copy });
         var params = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer params.deinit(self.alloc);
         try params.put(self.alloc, "textDocument", .{ .object = td });
         var v = std.json.Value{ .object = params };
-        defer json_rpc.freeValue(self.alloc, &v);
+        defer self.freeDidCloseParams(&v);
         try self.notify("textDocument/didClose", v);
     }
 
@@ -301,10 +365,13 @@ pub const Client = struct {
         while (!self.stop.load(.acquire)) {
             const content = reader.next() catch break;
             if (content) |c| {
+                // push dupes again into the queue; the frame body itself is
+                // ours to free here
                 self.queue.push(self.alloc, c) catch {
                     self.alloc.free(c);
                     break;
                 };
+                self.alloc.free(c);
             } else {
                 break; // clean EOF
             }
@@ -320,7 +387,9 @@ pub const Client = struct {
         var cap = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer cap.deinit(self.alloc);
         try cap.put(self.alloc, "processId", .{ .integer = @intCast(std.os.linux.getpid()) });
-        try cap.put(self.alloc, "rootUri", .{ .string = "file:///" });
+        const root_copy = try self.alloc.dupe(u8, "file:///");
+        errdefer self.alloc.free(root_copy);
+        try cap.put(self.alloc, "rootUri", .{ .string = root_copy });
         try cap.put(self.alloc, "capabilities", .{ .object = inner });
         return .{ .object = cap };
     }

@@ -81,6 +81,11 @@ pub const ActionId = enum {
     picker_recent, // <leader>sr — recent files picker
     close_buffer, // <leader>bk — close current buffer
     filetree_toggle, // <leader>e — toggle file tree
+    // M2 LSP actions
+    diagnostic_next, // ]d — next diagnostic
+    diagnostic_prev, // [d — previous diagnostic
+    diagnostic_line, // gl — diagnostics for the cursor line
+    diagnostics_list, // <leader>sd — diagnostics list
     filetree_locate, // <leader>E — locate current file in tree
     next_buffer, // gt — next tab
     prev_buffer, // gT — previous tab

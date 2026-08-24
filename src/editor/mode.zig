@@ -156,6 +156,8 @@ pub const State = struct {
     // ---- internal sequence state (extended beyond the skeleton) ----
     /// 'g' seen, awaiting the second key (gg → first_line, ge → word_prev_end)
     pending_g: bool = false,
+    /// '[' or ']' seen (diagnostic navigation prefix), awaiting 'd'.
+    pending_bracket: ?u8 = null,
     /// f/F/t/T seen, awaiting the target char (stores the find action)
     pending_find: ?KeyEvent.ActionId = null,
     /// operator + 'i'/'a' seen (text-object inner/around), awaiting the target
@@ -278,6 +280,7 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
             't' => return emitAction(state, .picker_grep), // <leader>st grep
             'b' => return emitAction(state, .picker_buffers), // <leader>sb buffers
             'r' => return emitAction(state, .picker_recent), // <leader>sr recent files
+            'd' => return emitAction(state, .diagnostics_list), // <leader>sd diagnostics
             else => {
                 resetPending(state);
                 return .pending;
@@ -302,6 +305,26 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
                 resetPending(state);
                 return .pending;
             },
+        }
+    }
+
+    // 0a4) ] or [ pending (diagnostic navigation prefix): awaiting d
+    if (state.pending_bracket) |b| {
+        state.pending_bracket = null;
+        if (isEscape(key)) {
+            resetPending(state);
+            return .pending;
+        }
+        if (key.codepoint == 'd' and !key.mods.ctrl and !key.mods.alt) {
+            return emitAction(state, if (b == ']') .diagnostic_next else .diagnostic_prev);
+        }
+        return .pending;
+    }
+    // 0a5) ] / [ start the diagnostic-navigation prefix
+    if (isPlain(key)) {
+        if (key.codepoint == ']' or key.codepoint == '[') {
+            state.pending_bracket = @intCast(key.codepoint);
+            return .pending;
         }
     }
 
@@ -395,6 +418,8 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
                 state.pending_gc = true;
                 return .pending;
             },
+            // gl — diagnostics for the cursor line (LSP)
+            'l' => return emitAction(state, .diagnostic_line),
             // ga — align lines by a delimiter
             'a' => {
                 state.pending_align = if (state.mode == .visual_char or
@@ -583,6 +608,10 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .picker_recent => emitAction(state, .picker_recent),
         .close_buffer => emitAction(state, .close_buffer),
         .filetree_toggle => emitAction(state, .filetree_toggle),
+        .diagnostic_next => emitAction(state, .diagnostic_next),
+        .diagnostic_prev => emitAction(state, .diagnostic_prev),
+        .diagnostic_line => emitAction(state, .diagnostic_line),
+        .diagnostics_list => emitAction(state, .diagnostics_list),
         .filetree_locate => emitAction(state, .filetree_locate),
         .next_buffer => emitAction(state, .next_buffer),
         .prev_buffer => emitAction(state, .prev_buffer),

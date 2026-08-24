@@ -12,6 +12,7 @@ const util = @import("util/root.zig");
 const syntax = @import("syntax.zig");
 const lsp = @import("lsp/client.zig");
 const lsp_types = @import("lsp/types.zig");
+const lsp_diag = @import("lsp/diagnostics.zig");
 const json_rpc = @import("util/json_rpc.zig");
 
 // Silence vaxis's per-frame debug logging (pollutes the tty byte stream and
@@ -146,6 +147,11 @@ const App = struct {
     picker_top: usize = 0,
     // grep mode: one result per line from rg
     grep_results: std.ArrayList(GrepResult) = .empty,
+
+    // M2 diagnostics list overlay (<leader>sd)
+    diag_list_active: bool = false,
+    diag_list_sel: usize = 0,
+    diag_list_top: usize = 0,
 
     // insert-mode keyword completion (Ctrl+n)
     completion_active: bool = false,
@@ -570,6 +576,11 @@ const App = struct {
         if (self.picker_active) {
             try self.handlePickerKey(key);
             return;
+        }
+
+        // Diagnostics list overlay (<leader>sd)
+        if (self.diag_list_active) {
+            if (self.diagnosticsListKey(key)) return;
         }
 
         // Ctrl-w window commands: switch keyboard focus between split windows
@@ -2488,6 +2499,84 @@ const App = struct {
         }
     }
 
+    // ---- M2 diagnostics UI ----
+
+    /// ]d / [d: jump to the next/previous diagnostic line (current file).
+    fn gotoDiagnostic(self: *App, next: bool) void {
+        if (self.lsp_diagnostics.items.len == 0) return;
+        const cursor_line = self.cur().pt.lineOf(self.curCursor().*);
+        const idx: ?usize = if (next)
+            lsp_diag.nextAtOrAfter(self.lsp_diagnostics.items, cursor_line + 1)
+        else
+            lsp_diag.prevAtOrBefore(self.lsp_diagnostics.items, cursor_line -| 1);
+        const i = idx orelse return;
+        const target_line = self.lsp_diagnostics.items[i].range.start.line;
+        self.curCursor().* = self.cur().pt.lineStart(@min(target_line, self.cur().pt.lineCount() - 1));
+    }
+
+    /// gl: show the cursor line's diagnostics in the status bar.
+    fn showLineDiagnostics(self: *App) void {
+        const line = self.cur().pt.lineOf(self.curCursor().*);
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(self.alloc);
+        for (self.lsp_diagnostics.items) |d| {
+            if (d.range.start.line != line) continue;
+            if (buf.items.len > 0) buf.append(self.alloc, ';') catch return;
+            buf.appendSlice(self.alloc, d.message) catch return;
+        }
+        if (buf.items.len == 0) {
+            const m = self.alloc.dupe(u8, "no diagnostics on this line") catch return;
+            self.setMsg(m) catch return;
+            return;
+        }
+        const m = buf.toOwnedSlice(self.alloc) catch return;
+        self.setMsg(m) catch return;
+    }
+
+    /// <leader>sd: toggle the diagnostics list overlay.
+    fn toggleDiagnosticsList(self: *App) void {
+        if (self.diag_list_active) {
+            self.diag_list_active = false;
+            return;
+        }
+        if (self.lsp_diagnostics.items.len == 0) {
+            const m = self.alloc.dupe(u8, "no diagnostics") catch return;
+            self.setMsg(m) catch return;
+            return;
+        }
+        self.diag_list_active = true;
+        self.diag_list_sel = 0;
+        self.diag_list_top = 0;
+    }
+
+    /// j/k/Enter/Esc while the diagnostics list is open; returns true if
+    /// consumed.
+    fn diagnosticsListKey(self: *App, key: vaxis.Key) bool {
+        switch (key.codepoint) {
+            vaxis.Key.escape => {
+                self.diag_list_active = false;
+                return true;
+            },
+            'j', vaxis.Key.down => {
+                if (self.diag_list_sel + 1 < self.lsp_diagnostics.items.len) self.diag_list_sel += 1;
+                return true;
+            },
+            'k', vaxis.Key.up => {
+                if (self.diag_list_sel > 0) self.diag_list_sel -= 1;
+                return true;
+            },
+            vaxis.Key.enter => {
+                if (self.diag_list_sel < self.lsp_diagnostics.items.len) {
+                    const line = self.lsp_diagnostics.items[self.diag_list_sel].range.start.line;
+                    self.curCursor().* = self.cur().pt.lineStart(@min(line, self.cur().pt.lineCount() - 1));
+                    self.diag_list_active = false;
+                }
+                return true;
+            },
+            else => return false,
+        }
+    }
+
     // ---- LSP (M2) ----
 
     /// Lazily (re)start the LSP client for the current buffer's filetype.
@@ -2508,7 +2597,8 @@ const App = struct {
         defer self.alloc.free(uri);
         const text = self.curText() catch return;
         defer self.alloc.free(text);
-        self.lsp_client = lsp.Client.start(self.alloc, self.io, self.env_map, ft, uri, text) catch null;
+        const start_result = lsp.Client.start(self.alloc, self.io, self.env_map, ft, uri, text);
+        self.lsp_client = start_result catch null;
     }
 
     /// Current buffer text (owned copy) — for didOpen/didChange payloads.
@@ -2526,12 +2616,16 @@ const App = struct {
         const method = msg.method orelse return;
         if (std.mem.eql(u8, method, "textDocument/publishDiagnostics")) {
             if (msg.params) |params| {
-                // Minimal M2 sink: clear previous diagnostics and remember the
-                // message text count. The diagnostics UI (gutter/]d/[d) is a
-                // later task — this keeps the pipeline alive and testable.
+                // Parse diagnostics for the CURRENT file into lsp_diagnostics
+                // (sorted by line). Diagnostics for other documents are
+                // dropped — the editor tracks one buffer at a time.
                 for (self.lsp_diagnostics.items) |*d| self.alloc.free(d.message);
                 self.lsp_diagnostics.clearRetainingCapacity();
-                _ = params;
+                const path = self.cur().path orelse return;
+                const uri = lsp_types.pathToFileUri(self.alloc, path) catch return;
+                defer self.alloc.free(uri);
+                lsp_diag.parseDiagnostics(self.alloc, params, uri, &self.lsp_diagnostics) catch {};
+                lsp_diag.sortByLine(self.lsp_diagnostics.items);
             }
         }
     }
@@ -2813,6 +2907,10 @@ const App = struct {
             .picker_grep => try self.openGrepPicker(),
             .picker_buffers => try self.openBufferPicker(),
             .picker_recent => try self.openRecentPicker(),
+            .diagnostic_next => self.gotoDiagnostic(true),
+            .diagnostic_prev => self.gotoDiagnostic(false),
+            .diagnostic_line => self.showLineDiagnostics(),
+            .diagnostics_list => self.toggleDiagnosticsList(),
             .close_buffer => self.closeCurrentBuffer(),
             .filetree_toggle => try self.toggleFiletree(),
             .filetree_locate => try self.locateInFiletree(),
@@ -3111,6 +3209,28 @@ const App = struct {
             @memcpy(num_str[gutter_digits - num_raw.len .. gutter_digits], num_raw);
             num_str[gutter - 1] = ' ';
 
+            // LSP diagnostic mark in the gutter's last column (this window
+            // shows the current buffer → marks the current file's diagnostics)
+            var diag_mark: u8 = ' ';
+            var diag_mark_fg: ?vaxis.Style = null;
+            if (w.buf == self.current and self.lsp_diagnostics.items.len > 0) {
+                for (self.lsp_diagnostics.items) |d| {
+                    if (d.range.start.line == line) {
+                        diag_mark = switch (d.severity) {
+                            .err => 'E',
+                            .warning => 'W',
+                            else => 'I',
+                        };
+                        diag_mark_fg = switch (d.severity) {
+                            .err => .{ .fg = .{ .rgb = .{ 210, 126, 139 } } },
+                            .warning => .{ .fg = .{ .rgb = .{ 224, 175, 104 } } },
+                            else => .{ .fg = .{ .rgb = .{ 122, 162, 247 } } },
+                        };
+                        break;
+                    }
+                }
+            }
+
             const line_len = buf.pt.lineLen(line);
             const line_start = buf.pt.lineStart(line);
             var n: u32 = @min(line_len, rect.width);
@@ -3157,10 +3277,9 @@ const App = struct {
             // spans, cursorline bg on the cursor's row, selection bg wins
             const is_cur_line = line == cursor_line;
             var segs = std.ArrayList(vaxis.Segment).empty;
-            try segs.append(a, .{
-                .text = num_str,
-                .style = if (is_cur_line) .{ .bg = .{ .rgb = .{ 40, 48, 68 } } } else .{},
-            });
+            const cursorline_style: vaxis.Style = if (is_cur_line) .{ .bg = .{ .rgb = .{ 40, 48, 68 } } } else .{};
+            try segs.append(a, .{ .text = num_str[0 .. gutter - 1], .style = cursorline_style });
+            try segs.append(a, .{ .text = num_str[gutter - 1 .. gutter], .style = cursorline_style });
             var col: u32 = 0;
             while (col < n) {
                 while (span_i < merged.len and merged[span_i].end <= line_start + col) span_i += 1;
@@ -3191,6 +3310,17 @@ const App = struct {
                 .col_offset = @intCast(rect.col),
                 .wrap = .none,
             });
+            // diagnostic mark: writeCell AFTER the line print so the glyph is
+            // not overwritten by the gutter segment
+            if (diag_mark != ' ') {
+                const mark_str = try a.dupe(u8, &[_]u8{diag_mark});
+                var mark_style = cursorline_style;
+                if (diag_mark_fg) |f| mark_style.fg = f.fg;
+                win.writeCell(@intCast(rect.col + gutter - 1), @intCast(row), .{
+                    .char = .{ .grapheme = mark_str, .width = 1 },
+                    .style = mark_style,
+                });
+            }
         }
     }
 
@@ -3425,6 +3555,33 @@ const App = struct {
             return;
         }
 
+        // diagnostics list overlay (<leader>sd): bottom list like the picker
+        if (self.diag_list_active) {
+            const total = self.lsp_diagnostics.items.len;
+            const list_rows = @min(@as(usize, 8), total);
+            if (total > list_rows) {
+                if (self.diag_list_top + list_rows > total) self.diag_list_top = total - list_rows;
+                if (self.diag_list_sel < self.diag_list_top) self.diag_list_top = self.diag_list_sel;
+                if (self.diag_list_sel >= self.diag_list_top + list_rows) self.diag_list_top = self.diag_list_sel - list_rows + 1;
+            } else self.diag_list_top = 0;
+            const dtop = self.diag_list_top;
+            const start_row = height - 1 - @as(u32, @intCast(list_rows)) - 1;
+            var k: usize = 0;
+            while (k < list_rows) : (k += 1) {
+                const ri = dtop + k;
+                const d = self.lsp_diagnostics.items[ri];
+                const label = try std.fmt.allocPrint(a, "{d}: {s}", .{ d.range.start.line + 1, d.message });
+                const seg = [_]vaxis.Segment{.{
+                    .text = label,
+                    .style = if (ri == self.diag_list_sel)
+                        .{ .bg = .{ .rgb = .{ 54, 74, 130 } } }
+                    else
+                        .{},
+                }};
+                _ = win.print(&seg, .{ .row_offset = @intCast(start_row + k), .wrap = .none });
+            }
+        }
+
         // insert-mode completion menu (Ctrl+n): a vim-style list directly
         // below the cursor line; the selected row is highlighted like the
         // fuzzy picker's selection. The buffer cursor is left untouched.
@@ -3626,6 +3783,9 @@ pub fn main(init: std.process.Init) !void {
         app.curCursor().* = app.cur().pt.lineStart(@min(target_line - 1, app.cur().pt.lineCount() - 1));
     }
 
+    // the CLI arg path edits cur() directly (no openInBuffer/switchTo), so
+    // kick the LSP client for the opened filetype here.
+    app.ensureLsp();
     try app.loadRecent();
     defer app.saveRecent() catch {};
     try app.run();
