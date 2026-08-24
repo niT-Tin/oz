@@ -111,7 +111,7 @@ pub const Message = struct {
 /// `parseMessage`, with `parse_numbers = false` so numbers stay reachable as
 /// `.number_string`): every string/key/number is an individual allocation,
 /// arrays and object maps own their backing storage.
-fn freeValue(allocator: std.mem.Allocator, value: *std.json.Value) void {
+pub fn freeValue(allocator: std.mem.Allocator, value: *std.json.Value) void {
     switch (value.*) {
         .string => |s| allocator.free(s),
         .number_string => |s| allocator.free(s),

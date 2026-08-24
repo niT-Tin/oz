@@ -24,6 +24,9 @@ pub const align_text = @import("editor/align.zig");
 pub const multicursor = @import("editor/multicursor.zig");
 pub const easymotion = @import("editor/easymotion.zig");
 pub const syntax = @import("syntax.zig");
+pub const lsp_server_config = @import("lsp/server_config.zig");
+pub const lsp_types = @import("lsp/types.zig");
+pub const lsp_client = @import("lsp/client.zig");
 
 test {
     std.testing.refAllDecls(@This());

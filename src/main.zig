@@ -10,6 +10,9 @@ const buffer = @import("buffer/root.zig");
 const editor = @import("editor/root.zig");
 const util = @import("util/root.zig");
 const syntax = @import("syntax.zig");
+const lsp = @import("lsp/client.zig");
+const lsp_types = @import("lsp/types.zig");
+const json_rpc = @import("util/json_rpc.zig");
 
 // Silence vaxis's per-frame debug logging (pollutes the tty byte stream and
 // interferes with e2e screen reconstruction).
@@ -106,6 +109,12 @@ const App = struct {
     // recent files (dashboard)
     recent_files: std.ArrayList([]u8) = .empty,
     recent_sel: usize = 0,
+
+    // LSP: the current buffer's client (null when the filetype has no
+    // server / spawn failed — silent degrade). Diagnostics received are
+    // stashed here until the M2 diagnostics UI lands.
+    lsp_client: ?*lsp.Client = null,
+    lsp_diagnostics: std.ArrayList(lsp_types.Diagnostic) = .empty,
 
     // file tree (<leader>e)
     filetree_active: bool = false,
@@ -537,6 +546,9 @@ const App = struct {
         self.grep_results.deinit(self.alloc);
         self.picker_input.deinit(self.alloc);
         self.picker_matches.deinit(self.alloc);
+        if (self.lsp_client) |c| c.deinit();
+        for (self.lsp_diagnostics.items) |*d| self.alloc.free(d.message);
+        self.lsp_diagnostics.deinit(self.alloc);
         for (self.completion_words.items) |w| self.alloc.free(w);
         self.completion_words.deinit(self.alloc);
     }
@@ -2352,6 +2364,7 @@ const App = struct {
     fn switchTo(self: *App, i: usize) void {
         if (self.buffers.items.len == 0) return;
         self.current = i % self.buffers.items.len;
+        self.ensureLsp();
         // the focused window follows the switch; other split windows keep
         // showing whatever buffer they had
         self.windows.items[self.current_win].buf = self.current;
@@ -2408,6 +2421,10 @@ const App = struct {
     /// :q path.
     fn closeBufferAt(self: *App, buf_idx: usize) void {
         if (self.buffers.items.len <= 1) return;
+        if (self.lsp_client) |c| {
+            c.deinit();
+            self.lsp_client = null;
+        }
         var buf = self.buffers.orderedRemove(buf_idx);
         buf.history.deinit();
         buf.pt.deinit();
@@ -2471,8 +2488,63 @@ const App = struct {
         }
     }
 
+    // ---- LSP (M2) ----
+
+    /// Lazily (re)start the LSP client for the current buffer's filetype.
+    /// Returns without action when the filetype has no configured server or
+    /// the spawn/handshake failed — LSP is strictly optional.
+    fn ensureLsp(self: *App) void {
+        const ft = filetypeOf(self.cur().path);
+        if (self.lsp_client) |c| {
+            if (std.mem.eql(u8, c.lang, ft)) return;
+            // filetype changed: close the old server
+            c.deinit();
+            self.lsp_client = null;
+        }
+        if (ft.len == 0) return;
+        const path = self.cur().path orelse return;
+        if (path.len == 0 or path[0] != '/') return; // only absolute paths
+        const uri = lsp_types.pathToFileUri(self.alloc, path) catch return;
+        defer self.alloc.free(uri);
+        const text = self.curText() catch return;
+        defer self.alloc.free(text);
+        self.lsp_client = lsp.Client.start(self.alloc, self.io, ft, uri, text) catch null;
+    }
+
+    /// Current buffer text (owned copy) — for didOpen/didChange payloads.
+    fn curText(self: *App) ![]u8 {
+        const len = self.cur().pt.len();
+        const buf = try self.alloc.alloc(u8, len);
+        errdefer self.alloc.free(buf);
+        self.cur().pt.copyRange(0, buf);
+        return buf;
+    }
+
+    /// LSP notification handler (main thread, called from drain each frame).
+    fn lspHandler(self: *App, client: *lsp.Client, msg: *json_rpc.Message) void {
+        _ = client;
+        const method = msg.method orelse return;
+        if (std.mem.eql(u8, method, "textDocument/publishDiagnostics")) {
+            if (msg.params) |params| {
+                // Minimal M2 sink: clear previous diagnostics and remember the
+                // message text count. The diagnostics UI (gutter/]d/[d) is a
+                // later task — this keeps the pipeline alive and testable.
+                for (self.lsp_diagnostics.items) |*d| self.alloc.free(d.message);
+                self.lsp_diagnostics.clearRetainingCapacity();
+                _ = params;
+            }
+        }
+    }
+
     fn markDirty(self: *App) void {
         self.cur().dirty = true;
+        // LSP text sync: push the new document content to the server. Cheap
+        // enough per keystroke for now (debounce lands with the M2 UI work).
+        if (self.lsp_client) |c| {
+            const text = self.curText() catch return;
+            defer self.alloc.free(text);
+            c.didChange(text) catch {};
+        }
     }
 
     // ---- tree-sitter syntax highlighting ----
@@ -3437,6 +3509,9 @@ const App = struct {
         defer self.loop.stop();
 
         while (!self.quit) {
+            // LSP messages first: responses fill request slots, notifications
+            // reach the handler before the frame renders.
+            if (self.lsp_client) |c| c.drain(self, App.lspHandler);
             const event = try self.loop.nextEvent();
             switch (event) {
                 .key_press => |key| try self.handleKey(key),
