@@ -1505,11 +1505,14 @@ const App = struct {
     /// <leader>ti: request inlay hints for the current line.
     fn requestInlayHints(self: *App) !void {
         const client = self.lsp_client orelse return;
+        if (!client.caps_inlay) return; // server doesn't support inlay hints
         const uri = lsp_types.pathToFileUri(self.alloc, self.cur().path orelse return) catch return;
         defer self.alloc.free(uri);
-        // request the visible line range (view_top .. view_top + height)
+        // request the visible line range; clamp the end to a real line so
+        // strict servers (zls) don't stall on an out-of-range end line
         const top = self.curViewTop().*;
-        const bottom = @min(top + 24, self.cur().pt.lineCount());
+        const line_count = self.cur().pt.lineCount();
+        const bottom = if (line_count == 0) 0 else @min(top + 24, line_count) - 1;
         var td = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer td.deinit(self.alloc);
         const uri_copy = try self.alloc.dupe(u8, uri);

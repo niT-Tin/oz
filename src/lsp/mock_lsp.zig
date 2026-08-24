@@ -343,6 +343,7 @@ fn buildInitializeResult(a: std.mem.Allocator) !std.json.Value {
 
     try caps.put(a, "hoverProvider", .{ .bool = true });
     try caps.put(a, "definitionProvider", .{ .bool = true });
+    try caps.put(a, "inlayHintProvider", .{ .bool = true });
 
     var result = try std.json.ObjectMap.init(a, &.{}, &.{});
     try result.put(a, "capabilities", .{ .object = caps });

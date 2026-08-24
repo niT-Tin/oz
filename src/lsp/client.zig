@@ -70,6 +70,9 @@ pub const Client = struct {
     uri: []u8,
     /// Incremented on every didChange (LSP version).
     version: i32 = 0,
+    /// Whether the server advertised inlayHintProvider (from initialize).
+    /// When false the editor skips inlayHint requests entirely.
+    caps_inlay: bool = false,
 
     proc: std.process.Child,
     stdin: std.Io.File,
@@ -98,6 +101,34 @@ pub const Client = struct {
         slot: *?std.json.Value, // filled on the matching response
     };
 
+    /// Resolve a language server binary that is not on PATH by checking common
+    /// install directories (nvim-mason, standalone mason, user local bin). The
+    /// returned path is owned by the caller. null when nothing is found — spawn
+    /// then falls back to execvp's PATH search (and may fail, which the App
+    /// reports in the status bar).
+    fn resolveServerBinary(
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        env_map: *std.process.Environ.Map,
+        name: []const u8,
+    ) ?[]u8 {
+        const home = env_map.get("HOME") orelse return null;
+        const dirs = [_][]const u8{
+            ".local/share/nvim/mason/bin",
+            ".local/share/mason/bin",
+            ".local/bin",
+            ".cargo/bin",
+        };
+        for (dirs) |dir| {
+            const path = std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ home, dir, name }) catch continue;
+            defer alloc.free(path);
+            const f = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch continue;
+            f.close(io);
+            return alloc.dupe(u8, path) catch null;
+        }
+        return null;
+    }
+
     /// Spawn the server for `lang`, handshake, and open `uri` with `text`.
     pub fn start(
         alloc: std.mem.Allocator,
@@ -117,6 +148,15 @@ pub const Client = struct {
             const arr = try alloc.alloc([]const u8, 1);
             errdefer alloc.free(arr);
             arr[0] = cmd;
+            argv = arr;
+            argv_override = arr;
+        } else if (resolveServerBinary(alloc, io, env_map, argv[0])) |path| {
+            // The server name is not on PATH (e.g. nvim-mason installs under
+            // ~/.local/share/nvim/mason/bin): point spawn at the resolved
+            // absolute path instead of relying on execvp's PATH search.
+            const arr = try alloc.alloc([]const u8, 1);
+            errdefer alloc.free(arr);
+            arr[0] = path;
             argv = arr;
             argv_override = arr;
         }
@@ -167,6 +207,25 @@ pub const Client = struct {
         }
         var init_msg = try self.waitResponse(init_id);
         defer init_msg.deinit(self.alloc);
+        // Record server capabilities the editor feature gates on
+        // (e.g. inlayHintProvider=false ⇒ don't send inlayHint requests).
+        if (init_msg.result) |res| {
+            if (res == .object) {
+                if (res.object.get("capabilities")) |caps| {
+                    if (caps == .object) {
+                        if (caps.object.get("inlayHintProvider")) |p| {
+                            // servers declare it as `true` or as an object
+                            // {resolveProvider: bool}
+                            self.caps_inlay = switch (p) {
+                                .bool => |b| b,
+                                .object => true,
+                                else => false,
+                            };
+                        }
+                    }
+                }
+            }
+        }
 
         // empty initialized notification
         {
@@ -204,8 +263,9 @@ pub const Client = struct {
         const params = &v.object;
         var td = params.get("textDocument").?;
         self.alloc.free(td.object.get("uri").?.string);
+        self.alloc.free(td.object.get("languageId").?.string);
+        self.alloc.free(td.object.get("text").?.string);
         td.object.deinit(self.alloc);
-        self.alloc.free(params.get("text").?.string);
         params.deinit(self.alloc);
     }
 
@@ -234,6 +294,11 @@ pub const Client = struct {
         var cap = &v.object;
         self.alloc.free(cap.get("rootUri").?.string);
         var inner = cap.get("capabilities").?;
+        if (inner.object.getPtr("textDocument")) |td| {
+            if (td.object.getPtr("inlayHint")) |ih| ih.object.deinit(self.alloc);
+            if (td.object.getPtr("publishDiagnostics")) |pd| pd.object.deinit(self.alloc);
+            td.object.deinit(self.alloc);
+        }
         inner.object.deinit(self.alloc);
         cap.deinit(self.alloc);
     }
@@ -249,12 +314,19 @@ pub const Client = struct {
         errdefer self.alloc.free(uri_copy);
         try td.put(self.alloc, "uri", .{ .string = uri_copy });
         try td.put(self.alloc, "version", .{ .integer = 1 });
+        // languageId is required by the LSP textDocumentItem schema; servers
+        // (clangd) refuse to add a document without it.
+        const lang_copy = try self.alloc.dupe(u8, self.lang);
+        errdefer self.alloc.free(lang_copy);
+        try td.put(self.alloc, "languageId", .{ .string = lang_copy });
+        // text lives INSIDE textDocument (TextDocumentItem); putting it at the
+        // top level makes strict servers (zls) fail to parse the notification.
         const text_copy = try self.alloc.dupe(u8, text);
         errdefer self.alloc.free(text_copy);
+        try td.put(self.alloc, "text", .{ .string = text_copy });
         var params = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer params.deinit(self.alloc);
         try params.put(self.alloc, "textDocument", .{ .object = td });
-        try params.put(self.alloc, "text", .{ .string = text_copy });
         var v = std.json.Value{ .object = params };
         defer self.freeDidOpenParams(&v);
         try self.notify("textDocument/didOpen", v);
@@ -395,8 +467,23 @@ pub const Client = struct {
     // ---- params builders ----
 
     fn initParams(self: *Client) !std.json.Value {
+        // client capabilities: advertise the features the editor consumes so
+        // strict servers (clangd/zls/rust-analyzer) provide them instead of
+        // staying silent — inlayHint, publishDiagnostics (gutter markers),
+        // hover, definition/references (navigation).
+        var hint_cap = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer hint_cap.deinit(self.alloc);
+        try hint_cap.put(self.alloc, "dynamicRegistration", .{ .bool = false });
+        var diag_cap = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer diag_cap.deinit(self.alloc);
+        try diag_cap.put(self.alloc, "relatedInformation", .{ .bool = true });
+        var td_cap = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer td_cap.deinit(self.alloc);
+        try td_cap.put(self.alloc, "inlayHint", .{ .object = hint_cap });
+        try td_cap.put(self.alloc, "publishDiagnostics", .{ .object = diag_cap });
         var inner = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer inner.deinit(self.alloc);
+        try inner.put(self.alloc, "textDocument", .{ .object = td_cap });
         var cap = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer cap.deinit(self.alloc);
         try cap.put(self.alloc, "processId", .{ .integer = @intCast(std.os.linux.getpid()) });
