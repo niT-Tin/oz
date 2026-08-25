@@ -14,7 +14,8 @@ pub const Theme = struct {
     name: []const u8,
     // background shades
     bg: Rgb, // editor background (main text area)
-    bg_alt: Rgb, // gutter / inactive / cursorline
+    bg_alt: Rgb, // gutter / inactive line numbers (distinct from bg_curline
+    // so the cursor line pops and row-bg tests can tell them apart)
     bg_float: Rgb, // hover / completion / picker popups
     bg_status: Rgb, // status bar
     bg_sel: Rgb, // selection / highlighted list row
@@ -48,7 +49,7 @@ pub fn rgb(r: u8, g: u8, b: u8) Rgb {
 const kanagawa_wave = Theme{
     .name = "kanagawa-wave",
     .bg = rgb(0x1F, 0x1F, 0x28), // sumiInk3
-    .bg_alt = rgb(0x2A, 0x2A, 0x37), // sumiInk4
+    .bg_alt = rgb(0x24, 0x24, 0x30), // between sumiInk3 and sumiInk4
     .bg_float = rgb(0x22, 0x32, 0x49), // waveBlue1
     .bg_status = rgb(0x2A, 0x2A, 0x37), // sumiInk4
     .bg_sel = rgb(0x2D, 0x4F, 0x67), // waveBlue2
@@ -75,7 +76,7 @@ const kanagawa_wave = Theme{
 const catppuccin_macchiato = Theme{
     .name = "catppuccin-macchiato",
     .bg = rgb(0x24, 0x27, 0x3A), // base
-    .bg_alt = rgb(0x30, 0x34, 0x46), // mantle
+    .bg_alt = rgb(0x2B, 0x2E, 0x40), // between base and mantle
     .bg_float = rgb(0x1E, 0x20, 0x30), // crust
     .bg_status = rgb(0x30, 0x34, 0x46), // mantle
     .bg_sel = rgb(0x49, 0x4D, 0x64), // surface2
@@ -102,7 +103,7 @@ const catppuccin_macchiato = Theme{
 const tokyonight_moon = Theme{
     .name = "tokyonight-moon",
     .bg = rgb(0x1E, 0x20, 0x32), // bg
-    .bg_alt = rgb(0x2A, 0x2E, 0x48), // bg_dark
+    .bg_alt = rgb(0x25, 0x29, 0x41), // between bg and bg_dark
     .bg_float = rgb(0x16, 0x18, 0x28), // bg_float
     .bg_status = rgb(0x2A, 0x2E, 0x48), // bg_dark
     .bg_sel = rgb(0x33, 0x41, 0x5E), // bg_highlight

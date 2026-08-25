@@ -3972,20 +3972,20 @@ const App = struct {
             // spans, cursorline bg on the cursor's row, selection bg wins
             const is_cur_line = line == cursor_line;
             var segs = std.ArrayList(vaxis.Segment).empty;
-            const cursorline_style: vaxis.Style = if (is_cur_line) .{ .bg = .{ .rgb = self.theme.bg_curline } } else .{};
+            // gutter: always painted (bg_alt), cursor line slightly brighter
+            const cursorline_style: vaxis.Style = if (is_cur_line)
+                .{ .bg = .{ .rgb = self.theme.bg_curline }, .fg = .{ .rgb = self.theme.fg } }
+            else
+                .{ .bg = .{ .rgb = self.theme.bg_alt }, .fg = .{ .rgb = self.theme.fg_faint } };
             try segs.append(a, .{ .text = num_str[0 .. gutter - 1], .style = cursorline_style });
             try segs.append(a, .{ .text = num_str[gutter - 1 .. gutter], .style = cursorline_style });
             // Inlay hints for this line, sorted by insertion column: each hint
             // is spliced into the text at its character offset (the token it
             // annotates ends there), so `const x = foo()` renders as
             // `const x: i32 = foo()` like nvim — not moved to end of line.
-            // Suppressed while inserting: the half-typed line's hint offsets
-            // are stale (an o newline already invalidated them) and would
-            // render at the wrong column next to the cursor.
-            const line_hints = if (self.state.mode == .insert)
-                try a.alloc(InlayHint, 0)
-            else
-                try self.lineHints(a, line);
+            // Hints render in insert mode too; edits invalidate them (see
+            // invalidateInlayHints) so stale offsets never show.
+            const line_hints = try self.lineHints(a, line);
             var hint_i: usize = 0;
             var col: u32 = 0;
             while (col < n) {
@@ -3996,7 +3996,7 @@ const App = struct {
                     if (hint.label.len > 0) {
                         try segs.append(a, .{
                             .text = hint.label,
-                            .style = .{ .dim = true, .fg = .{ .rgb = self.theme.fg_dim } },
+                            .style = .{ .dim = true, .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg } },
                         });
                     }
                     hint_i += 1;
@@ -4022,7 +4022,7 @@ const App = struct {
                     if (hc > col and hc < next) next = hc;
                 }
                 const in_sel = col >= sel_s and col < sel_e;
-                var style: vaxis.Style = .{};
+                var style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg } };
                 if (is_cur_line) style.bg = .{ .rgb = self.theme.bg_curline };
                 if (in_sel) style.bg = .{ .rgb = self.theme.bg_sel };
                 if (fg) |f| style.fg = f.fg;
@@ -4035,7 +4035,7 @@ const App = struct {
                 if (hint.label.len > 0) {
                     try segs.append(a, .{
                         .text = hint.label,
-                        .style = .{ .dim = true, .fg = .{ .rgb = self.theme.fg_dim } },
+                        .style = .{ .dim = true, .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg } },
                     });
                 }
                 hint_i += 1;
@@ -4413,6 +4413,7 @@ const App = struct {
         // LSP hover / signature floating window: a small box below the
         // cursor line (≤6 rows, ≤60 cols) showing nav_hover_text, wrapping
         // on newlines so multi-line hover (markdown blocks etc.) is readable.
+        // Styled like nvim's floating windows: rounded border, title bar.
         if (self.nav_hover_text) |htext| {
             if (htext.len > 0) {
                 const h_line = self.cur().pt.lineOf(self.curCursor().*);
@@ -4422,27 +4423,89 @@ const App = struct {
                 if (start_row + hrows >= height) {
                     start_row = h_line - self.curViewTop().* + cur_rect.row - hrows;
                 }
+                const col0 = cur_rect.col + gutter + 1;
+                const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint } };
+                const bg_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } };
+                const border = "│";
+                const tl = "╭";
+                const tr = "╮";
+                const bl = "╰";
+                const br = "╯";
+                // top border
+                {
+                    const seg = [_]vaxis.Segment{
+                        .{ .text = tl, .style = border_style },
+                        .{ .text = " " ** 0, .style = border_style },
+                    };
+                    _ = win.print(&seg, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(col0), .wrap = .none });
+                    var cx: u32 = 1;
+                    while (cx <= hcols) : (cx += 1) {
+                        const hseg = [_]vaxis.Segment{.{
+                            .text = "─",
+                            .style = border_style,
+                        }};
+                        _ = win.print(&hseg, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(col0 + cx), .wrap = .none });
+                    }
+                    const rseg = [_]vaxis.Segment{.{
+                        .text = tr,
+                        .style = border_style,
+                    }};
+                    _ = win.print(&rseg, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(col0 + hcols + 1), .wrap = .none });
+                }
                 // split the text into up to hrows lines of ≤hcols chars
                 var remaining = htext;
                 var r: u32 = 0;
                 while (r < hrows and remaining.len > 0) : (r += 1) {
+                    // left border
+                    const lseg = [_]vaxis.Segment{.{
+                        .text = border,
+                        .style = border_style,
+                    }};
+                    _ = win.print(&lseg, .{ .row_offset = @intCast(start_row + 1 + r), .col_offset = @intCast(col0), .wrap = .none });
                     const nl = std.mem.indexOfScalar(u8, remaining, '\n');
                     const line_len = if (nl) |i| i else remaining.len;
                     const shown = @min(line_len, hcols);
                     const seg = [_]vaxis.Segment{.{
                         .text = remaining[0..shown],
-                        .style = .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } },
+                        .style = bg_style,
                     }};
                     _ = win.print(&seg, .{
-                        .row_offset = @intCast(start_row + r),
-                        .col_offset = @intCast(cur_rect.col + gutter + 1),
+                        .row_offset = @intCast(start_row + 1 + r),
+                        .col_offset = @intCast(col0 + 1),
                         .wrap = .none,
                     });
+                    // right border
+                    const rseg = [_]vaxis.Segment{.{
+                        .text = border,
+                        .style = border_style,
+                    }};
+                    _ = win.print(&rseg, .{ .row_offset = @intCast(start_row + 1 + r), .col_offset = @intCast(col0 + hcols + 1), .wrap = .none });
                     if (nl) |i| {
                         remaining = remaining[@min(i + 1, remaining.len)..];
                     } else {
                         remaining = remaining[remaining.len..];
                     }
+                }
+                // bottom border
+                {
+                    const bseg = [_]vaxis.Segment{.{
+                        .text = bl,
+                        .style = border_style,
+                    }};
+                    _ = win.print(&bseg, .{ .row_offset = @intCast(start_row + 1 + hrows), .col_offset = @intCast(col0), .wrap = .none });
+                    var cx: u32 = 1;
+                    while (cx <= hcols) : (cx += 1) {
+                        const hseg = [_]vaxis.Segment{.{
+                            .text = "─",
+                            .style = border_style,
+                        }};
+                        _ = win.print(&hseg, .{ .row_offset = @intCast(start_row + 1 + hrows), .col_offset = @intCast(col0 + cx), .wrap = .none });
+                    }
+                    const rseg = [_]vaxis.Segment{.{
+                        .text = br,
+                        .style = border_style,
+                    }};
+                    _ = win.print(&rseg, .{ .row_offset = @intCast(start_row + 1 + hrows), .col_offset = @intCast(col0 + hcols + 1), .wrap = .none });
                 }
             }
         }
@@ -4517,9 +4580,7 @@ const App = struct {
             }
             // Auto-refresh inlay hints when the view scrolls (LSP available
             // and the visible top line changed since the last request).
-            // Skipped in insert mode: hints would sit on the half-typed line
-            // and any edit after o already invalidated them.
-            if (self.lsp_client != null and self.state.mode != .insert) {
+            if (self.lsp_client != null) {
                 const top = self.curViewTop().*;
                 if (self.inlay_view_top == null or self.inlay_view_top.? != top) {
                     self.inlay_view_top = top;
