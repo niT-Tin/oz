@@ -4793,14 +4793,19 @@ const App = struct {
                     self.cur().pt.copyRange(self.completion_pos, prefix_buf[0..typed_len]);
                     if (std.mem.startsWith(u8, item, prefix_buf[0..typed_len])) {
                         const ghost = item[typed_len..];
-                        if (ghost.len > 0 and ghost_col + typed_len + ghost.len < win.width) {
+                        // the ghost starts right after the cursor (which sits
+                        // after the typed prefix) — NOT offset by typed_len,
+                        // which would push it away from the word when the
+                        // word has a prefix like "b." (b.stand + ghost had a
+                        // gap that made the completion look broken)
+                        if (ghost.len > 0 and ghost_col + ghost.len < win.width) {
                             const seg = [_]vaxis.Segment{.{
                                 .text = ghost,
                                 .style = .{ .dim = true },
                             }};
                             _ = win.print(&seg, .{
                                 .row_offset = @intCast(ghost_line - self.curViewTop().* + cur_rect.row),
-                                .col_offset = @intCast(cur_rect.col + gutter + ghost_col + typed_len),
+                                .col_offset = @intCast(cur_rect.col + gutter + ghost_col),
                                 .wrap = .none,
                             });
                         }
