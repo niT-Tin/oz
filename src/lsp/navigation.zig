@@ -200,10 +200,18 @@ pub fn parseSignature(alloc: std.mem.Allocator, result: std.json.Value) !?[]u8 {
     return null;
 }
 
+/// A completion candidate: the text an accept would insert plus the LSP
+/// CompletionItemKind (0 = unknown / buffer-word fallback), used for the
+/// kind icon in the menu.
+pub const CompletionItem = struct {
+    text: []u8, // owned
+    kind: u8,
+};
+
 /// Parse a textDocument/completion response (CompletionList | CompletionItem[])
-/// into owned label strings appended to `out`. The label (or insertText /
+/// into owned items appended to `out`. The label (or insertText /
 /// textEdit.newText when present) is what an accept would insert.
-pub fn parseCompletionItems(alloc: std.mem.Allocator, result: std.json.Value, out: *std.ArrayList([]u8)) !void {
+pub fn parseCompletionItems(alloc: std.mem.Allocator, result: std.json.Value, out: *std.ArrayList(CompletionItem)) !void {
     // result may be {items:[...]} (CompletionList) or [...]
     const items: std.json.Value = if (result == .object)
         (result.object.get("items") orelse return)
@@ -233,9 +241,22 @@ pub fn parseCompletionItems(alloc: std.mem.Allocator, result: std.json.Value, ou
         }
         const t = text orelse continue;
         if (t.len == 0) continue;
+        var kind: u8 = 0;
+        if (item.object.get("kind")) |k| {
+            // zig's json parser may surface integers as .integer or
+            // .number_string depending on magnitude/source
+            const kint: ?i64 = switch (k) {
+                .integer => |n| n,
+                .number_string => |s| std.fmt.parseInt(i64, s, 10) catch null,
+                else => null,
+            };
+            if (kint) |n| {
+                if (n >= 1 and n <= 255) kind = @intCast(n);
+            }
+        }
         const copy = try alloc.dupe(u8, t);
         errdefer alloc.free(copy);
-        try out.append(alloc, copy);
+        try out.append(alloc, .{ .text = copy, .kind = kind });
     }
 }
 
@@ -333,27 +354,29 @@ test "navigation: completion items from CompletionList and raw array" {
     const j1 = "{\"items\":[{\"label\":\"alpha\",\"kind\":5},{\"label\":\"beta\",\"insertText\":\"betaFn\"}]}";
     var p1 = try std.json.parseFromSlice(std.json.Value, alloc, j1, .{ .allocate = .alloc_always });
     defer p1.deinit();
-    var out1 = std.ArrayList([]u8).empty;
+    var out1 = std.ArrayList(CompletionItem).empty;
     defer {
-        for (out1.items) |w| alloc.free(w);
+        for (out1.items) |it| alloc.free(it.text);
         out1.deinit(alloc);
     }
     try parseCompletionItems(alloc, p1.value, &out1);
     try std.testing.expectEqual(@as(usize, 2), out1.items.len);
-    try std.testing.expectEqualStrings("alpha", out1.items[0]);
-    try std.testing.expectEqualStrings("betaFn", out1.items[1]);
+    try std.testing.expectEqualStrings("alpha", out1.items[0].text);
+    try std.testing.expectEqual(@as(u8, 5), out1.items[0].kind); // Field
+    try std.testing.expectEqualStrings("betaFn", out1.items[1].text);
+    try std.testing.expectEqual(@as(u8, 0), out1.items[1].kind); // no kind → 0
 
     // raw array form
     const j2 = "[{\"label\":\"x\"},{\"textEdit\":{\"newText\":\"y\"}}]";
     var p2 = try std.json.parseFromSlice(std.json.Value, alloc, j2, .{ .allocate = .alloc_always });
     defer p2.deinit();
-    var out2 = std.ArrayList([]u8).empty;
+    var out2 = std.ArrayList(CompletionItem).empty;
     defer {
-        for (out2.items) |w| alloc.free(w);
+        for (out2.items) |it| alloc.free(it.text);
         out2.deinit(alloc);
     }
     try parseCompletionItems(alloc, p2.value, &out2);
     try std.testing.expectEqual(@as(usize, 2), out2.items.len);
-    try std.testing.expectEqualStrings("x", out2.items[0]);
-    try std.testing.expectEqualStrings("y", out2.items[1]);
+    try std.testing.expectEqualStrings("x", out2.items[0].text);
+    try std.testing.expectEqualStrings("y", out2.items[1].text);
 }

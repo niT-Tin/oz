@@ -130,14 +130,16 @@ pub fn handleMessage(
         } else if (std.mem.eql(u8, method, "textDocument/definition") or
             std.mem.eql(u8, method, "textDocument/declaration"))
         {
-            // a fixed location in the FIRST opened document (line 1, col 0)
-            try pushResponse(alloc, &out, id, try buildLocationResult(a, state, 1, 0));
+            // a fixed location in the FIRST opened document (line 1, col 6 —
+            // col 6 is the identifier in "const a = 1;", so gd lands on the
+            // definition token, not the line start)
+            try pushResponse(alloc, &out, id, try buildLocationResult(a, state, 1, 6));
         } else if (std.mem.eql(u8, method, "textDocument/references") or
             std.mem.eql(u8, method, "textDocument/implementation"))
         {
             // two locations: line 1 and line 2 of the first opened document
             var locs = std.json.Array.init(a);
-            const l1 = try buildLocationValue(a, state, 1, 0);
+            const l1 = try buildLocationValue(a, state, 1, 6);
             const l2 = try buildLocationValue(a, state, 2, 0);
             try locs.append(l1);
             try locs.append(l2);

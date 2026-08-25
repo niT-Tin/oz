@@ -582,7 +582,9 @@ test "insert text in insert mode, esc back to normal" {
     }
     try std.testing.expect(grid.contains("NORMAL"));
 
-    // i HELLO <esc>: chars must land in the document, then back to NORMAL
+    // i HELLO <esc>: chars must land in the document, then back to NORMAL.
+    // A single Esc exits: buffer-word auto-suggest excludes the word being
+    // typed, so typing HELLO into "base" opens no menu.
     try sess.send("iHELLO");
     waited = 0;
     while (!grid.contains("HELLObase")) {
@@ -669,7 +671,8 @@ test ":wq writes the buffer to disk and exits" {
     try std.testing.expect(grid.contains("HELLObase"));
 
     // esc back to normal (sent alone: ESC immediately followed by ':' would
-    // be parsed as Alt+':')
+    // be parsed as Alt+':'). Single Esc: buffer auto-suggest excludes the
+    // word being typed, so typing HELLO into "base" opens no menu.
     try sess.send("\x1b");
     waited = 0;
     while (grid.contains("INSERT")) {
@@ -6297,8 +6300,11 @@ test "lsp: smoke with real gopls (no crash on start/didChange)" {
     }
     try std.testing.expect(grid.contains("NORMAL"));
 
-    // edit → didChange path must not crash
-    try sess.send("iX\x1b");
+    // edit → didChange path must not crash. Typing 'X' may auto-open the
+    // completion menu (the LSP answers fast), so Ctrl+e (\x05) hides any
+    // menu and Esc exits insert. A lone "\x1b\x1b" would be misparsed as an
+    // escape sequence, and "\x05" is unambiguous.
+    try sess.send("iX\x05\x1b");
     waited = 0;
     var ok = false;
     while (!ok) {
@@ -6351,8 +6357,10 @@ test "lsp: mock server handshake + didChange round-trip (OZ_LSP_CMD)" {
     }
     try std.testing.expect(grid.contains("NORMAL"));
 
-    // edit → didChange must reach the mock without crashing
-    try sess.send("iX\x1b");
+    // edit → didChange must reach the mock without crashing. Typing 'X'
+    // auto-opens the completion menu (the mock answers any request), so
+    // Ctrl+e (\x05) hides it and Esc exits insert.
+    try sess.send("iX\x05\x1b");
     waited = 0;
     var ok = false;
     while (!ok) {
@@ -6584,12 +6592,14 @@ test "lsp: navigation — K hover, gd jump, gr list, gs signature" {
     try std.testing.expect(grid.contains("second line"));
     try std.testing.expect(grid.contains("third line"));
 
-    // gd → mock returns a location at line 1. The wake mechanism drains the
-    // response without a keypress: the cursor jumps to line 1 (status
-    // "line 2/4"). Then two 'j's move to line 3 → "line 4/4".
+    // gd → mock returns a location at line 1 col 6 (the identifier in
+    // "const a = 1;"). The wake mechanism drains the response without a
+    // keypress: the cursor jumps to line 1 col 6 (status "line 2/4 col 6"),
+    // landing on the definition token — not the line start. Then two 'j's
+    // move to line 3 → "line 4/4".
     try sess.send("gd");
     waited = 0;
-    while (!grid.contains("line 2/4")) {
+    while (!grid.contains("line 2/4 col 6")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -6598,13 +6608,13 @@ test "lsp: navigation — K hover, gd jump, gr list, gs signature" {
             sess.used += n;
             grid.feed(sess.out[sess.used - n .. sess.used]);
         }
-        if (grid.contains("line 2/4")) break;
+        if (grid.contains("line 2/4 col 6")) break;
     }
-    if (!grid.contains("line 2/4")) {
+    if (!grid.contains("line 2/4 col 6")) {
         std.debug.print("gd jump missing; status={s}\n", .{grid.rowText(grid.rows - 1)[0..40]});
         grid.dump();
     }
-    try std.testing.expect(grid.contains("line 2/4"));
+    try std.testing.expect(grid.contains("line 2/4 col 6"));
 
     try sess.send("jj");
     waited = 0;
@@ -6792,6 +6802,109 @@ test "lsp: completion — Ctrl+n lists server items, Enter accepts" {
     }
     try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
 }
+
+test "lsp: auto-suggest — typing a word char opens the menu (blink style)" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}auto.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const a = 1;\nconst b = 2;\nmo");
+    }
+
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{"OZ_LSP_CMD=zig-out/bin/mock_lsp"});
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // Just typing a word character ('x' after "mo") must open the menu —
+    // no Ctrl+n. The mock answers mockItem / mockAlpha for any prefix.
+    try sess.send("jjAx");
+    waited = 0;
+    var listed = false;
+    while (!listed) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains("mockItem") and grid.contains("mockAlpha")) listed = true;
+    }
+    if (!listed) {
+        std.debug.print("auto-suggest menu missing:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(listed);
+    // the menu is a floating window: rounded corner (╭) + kind icons
+    // (mockItem kind 6 = Variable , mockAlpha kind 5 = Field )
+    try std.testing.expect(grid.contains("\xe2\x95\xad")); // ╭
+    try std.testing.expect(grid.contains("\xee\xaa\x88")); // Variable icon
+    try std.testing.expect(grid.contains("\xee\xad\x9f")); // Field icon
+
+    // Ctrl+e hides the menu (blink mapping), insert continues.
+    try sess.send("\x05");
+    waited = 0;
+    var hidden = false;
+    while (!hidden) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (!grid.contains("mockItem")) hidden = true;
+    }
+    try std.testing.expect(hidden);
+
+    // Esc exits insert; :qa quits. No allocator leaks from the discard paths.
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) break;
+        sess.used += n;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
+}
+
 test "lsp: signature help — typing ( shows the callee signature" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -6972,6 +7085,44 @@ test "lsp: editing — rename, format, inlay hints, outline" {
         grid.dump();
     }
     try std.testing.expect(grid.contains(": i32"));
+
+    // The hint stays visible while typing in insert mode: the jitter fix
+    // shifts hints in place per edit instead of clearing + re-requesting
+    // them on every keystroke (which made the view flicker).
+    try sess.send("A.");
+    waited = 0;
+    var hint_kept = false;
+    while (!hint_kept) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        if (grid.contains(": i32")) hint_kept = true;
+    }
+    if (!hint_kept) {
+        std.debug.print("inlay hint vanished while typing in insert mode:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(hint_kept);
+    // back to normal for the rename step below ('.' is not a word char, so
+    // no completion menu is open and a single Esc exits insert)
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
 
     // <leader>rn — cursor to "foo" (word end), rename to "renamedSymbol" via
     // the prefilled command line (mock replaces [0,4) with renamedSymbol)

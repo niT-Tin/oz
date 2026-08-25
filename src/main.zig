@@ -175,9 +175,10 @@ const App = struct {
     nav_list_sel: usize = 0,
     nav_loc_top: usize = 0,
 
-    // insert-mode keyword completion (Ctrl+n)
+    // insert-mode completion (Ctrl+n and auto-suggest on word chars)
     completion_active: bool = false,
-    completion_words: std.ArrayList([]u8) = .empty, // owned candidate words
+    /// Owned candidate items (text + LSP kind for the menu icon).
+    completion_words: std.ArrayList(lsp_nav.CompletionItem) = .empty,
     completion_sel: usize = 0,
     /// Start of the word being typed when the menu opened; Enter replaces
     /// [completion_pos, cursor) with the selected word.
@@ -197,6 +198,15 @@ const App = struct {
     /// Auto-requested for the visible range whenever the view scrolls.
     inlay_hints: std.ArrayList(InlayHint) = .empty,
     inlay_view_top: ?u32 = null,
+    /// Monotonic edit counter: bumped by every text edit. LSP responses that
+    /// arrive after newer edits (fast typing) are discarded as stale, and
+    /// inlay hints are re-requested only when the text is quiescent — this is
+    /// what keeps insert mode from flickering on every keystroke.
+    edit_seq: u64 = 0,
+    /// edit_seq at the moment the in-flight inlayHint request was sent.
+    inlay_req_seq: u64 = 0,
+    /// edit_seq at the moment the in-flight completion request was sent.
+    completion_req_seq: u64 = 0,
 
     /// The active buffer (the focused window's buffer; per-buffer document
     /// state lives here, per-window cursor/viewport in `windows`).
@@ -603,7 +613,7 @@ const App = struct {
         if (self.outline_slot) |*v| json_rpc.freeValue(self.alloc, v);
         for (self.inlay_hints.items) |*h| self.alloc.free(h.label);
         self.inlay_hints.deinit(self.alloc);
-        for (self.completion_words.items) |w| self.alloc.free(w);
+        for (self.completion_words.items) |it| self.alloc.free(it.text);
         self.completion_words.deinit(self.alloc);
     }
 
@@ -753,10 +763,15 @@ const App = struct {
                 try self.handleMcInsertKey(key);
                 return;
             }
-            // ---- insert-mode keyword completion (Ctrl+n) ----
+            // ---- insert-mode completion (Ctrl+n and auto-suggest) ----
             // Esc while the menu is open only dismisses it (stays in insert);
             // a second Esc exits the insert session as usual.
             if (self.completion_active and key.codepoint == vaxis.Key.escape) {
+                self.closeCompletion();
+                return;
+            }
+            // Ctrl+e: hide the menu (blink.cmp mapping), stay in insert.
+            if (self.completion_active and key.codepoint == 'e' and key.mods.ctrl and !key.mods.alt and !key.mods.super) {
                 self.closeCompletion();
                 return;
             }
@@ -788,16 +803,21 @@ const App = struct {
                     if (n > 0) self.completion_sel = (self.completion_sel + 1) % n;
                     return;
                 }
-                // Enter / Tab: accept the selected word (replaces the typed
-                // prefix), overriding the default newline / tab insert.
-                if (key.codepoint == vaxis.Key.enter or key.codepoint == vaxis.Key.tab) {
+                // Enter accepts the selected word (replaces the typed prefix).
+                // Matches the user's nvim: Enter is the only accept key; Tab
+                // always inserts literal spaces.
+                if (key.codepoint == vaxis.Key.enter) {
                     try self.acceptCompletion();
                     return;
                 }
-                // anything else (typing, backspace, Ctrl+w, j/k, Ctrl+c…):
-                // dismiss the menu, then fall through to the normal insert
+                // Word-char input keeps the menu open — the prefix grows and
+                // maybeAutoComplete below re-requests with the new prefix.
+                // Anything else (space, backspace, Ctrl+w, j/k, Ctrl+c…)
+                // dismisses the menu, then falls through to the normal insert
                 // handling so jk exit, Esc exit and text entry behave as usual.
-                self.closeCompletion();
+                const is_word_input = key.text != null and key.text.?.len > 0 and
+                    isWordByte(key.text.?[0]) and !key.mods.ctrl and !key.mods.alt and !key.mods.super;
+                if (!is_word_input) self.closeCompletion();
             }
             if (key.codepoint == vaxis.Key.escape or (key.codepoint == 'c' and key.mods.ctrl)) {
                 self.exitInsert();
@@ -867,6 +887,12 @@ const App = struct {
                 // mechanism and renders without a keypress).
                 if (key.codepoint == '(' and !key.mods.ctrl and !key.mods.alt) {
                     try self.requestNav("textDocument/signatureHelp", .signature);
+                }
+                // Auto-suggest: typing a word character asks the LSP for
+                // candidates (or opens buffer-word completion on small
+                // non-LSP files). The menu appears when the response lands.
+                if (isWordByte(text[0]) and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
+                    try self.maybeAutoComplete();
                 }
                 return;
             }
@@ -962,12 +988,16 @@ const App = struct {
         self.cur().history.endGroup();
         self.in_insert = false;
         self.prev_insert_key = null;
+        self.closeCompletion();
         self.endInsertSession();
         // Force a full reparse on the next render: incremental edits during
         // the insert session may have drifted the highlight tree (the "some
         // characters turn comment-gray after jk" bug). A full reparse on
         // every insert exit guarantees correct colors once back in normal.
         self.cur().syntax_revision = std.math.maxInt(u64);
+        // The session's inlay hints were kept aligned in place (no per-keystroke
+        // flicker); now that typing stopped, fetch exact hints for the new text.
+        self.invalidateInlayHints();
     }
 
     // ---- visual-block multi-cursor insert (<C-v> block then I/A) ----
@@ -1293,8 +1323,15 @@ const App = struct {
             self.in_insert = true;
         }
         const start = buffer.ops.prevCharStart(&self.cur().pt, self.curCursor().*);
-        try self.cur().history.record(&self.cur().pt, start, self.curCursor().* - start, "");
+        const cursor = self.curCursor().*;
+        const line = self.cur().pt.lineOf(start);
+        const col = start - self.cur().pt.lineStart(line);
+        var deleted: [16]u8 = undefined;
+        const del_len: usize = @intCast(cursor - start);
+        self.cur().pt.copyRange(start, deleted[0..del_len]);
+        try self.cur().history.record(&self.cur().pt, start, cursor - start, "");
         self.curCursor().* = start;
+        self.adjustInlayHintsDelete(line, col, deleted[0..del_len]);
         self.markDirty();
     }
 
@@ -1308,8 +1345,16 @@ const App = struct {
             self.cur().history.beginGroup();
             self.in_insert = true;
         }
-        try self.cur().history.record(&self.cur().pt, start, self.curCursor().* - start, "");
+        const cursor = self.curCursor().*;
+        const line = self.cur().pt.lineOf(start);
+        const col = start - self.cur().pt.lineStart(line);
+        const del_len: usize = @intCast(cursor - start);
+        const deleted = try self.alloc.alloc(u8, del_len);
+        defer self.alloc.free(deleted);
+        self.cur().pt.copyRange(start, deleted);
+        try self.cur().history.record(&self.cur().pt, start, cursor - start, "");
         self.curCursor().* = start;
+        self.adjustInlayHintsDelete(line, col, deleted);
         self.markDirty();
     }
 
@@ -1325,6 +1370,33 @@ const App = struct {
             b >= 0x80;
     }
 
+    /// Nerd Font glyph for an LSP CompletionItemKind (1-25); " " for unknown.
+    /// Mirrors the user's nvim icons (AstroNvim style) so the completion menu
+    /// looks like blink.cmp.
+    fn kindGlyph(kind: u8) []const u8 {
+        return switch (kind) {
+            2, 3, 4 => "", // Method / Function / Constructor
+            5, 10, 20 => "", // Field / Property / EnumMember
+            6 => "", // Variable
+            7 => "", // Class
+            8 => "", // Interface
+            9, 19 => "", // Module / Folder
+            11 => "", // Unit
+            12, 1, 18 => "", // Value / Text / Reference
+            13 => "", // Enum
+            14 => "", // Keyword
+            15 => "", // Snippet
+            16 => "", // Color
+            17 => "", // File
+            21 => "", // Constant
+            22 => "", // Struct
+            23 => "", // Event
+            24 => "", // Operator
+            25 => "", // TypeParameter
+            else => " ",
+        };
+    }
+
     /// Ctrl+n in insert mode with the cursor inside a word: collect keyword
     /// candidates from the whole buffer and open the completion menu. Without
     /// a word prefix the key is swallowed (no candidates, no side effect).
@@ -1336,25 +1408,52 @@ const App = struct {
         // cursor; the response lands in completion_slot and processCompletion
         // opens the menu. Without a client we fall back to buffer words.
         if (self.lsp_client) |c| {
-            // remember the start of the word being typed so acceptCompletion
-            // replaces just [completion_pos, cursor) with the chosen item
-            var pos = self.curCursor().*;
-            while (pos > 0 and isWordByte(self.cur().pt.byteAt(pos - 1))) pos -= 1;
-            if (pos == self.curCursor().*) return;
-            self.completion_pos = pos;
-            const uri = lsp_types.pathToFileUri(self.alloc, self.cur().path orelse return) catch return;
-            defer self.alloc.free(uri);
-            const line = self.cur().pt.lineOf(self.curCursor().*);
-            const col = self.curCursor().* - self.cur().pt.lineStart(line);
-            var params = lsp_nav.buildTextDocPositionParams(self.alloc, uri, line, col) catch return;
-            defer lsp_nav.freeTextDocPositionParams(self.alloc, &params);
-            c.request("textDocument/completion", params, &self.completion_slot) catch return;
+            try self.requestLspCompletion(c);
             return;
         }
-        try self.collectCompletionWords();
+        try self.collectCompletionWords(false);
         if (self.completion_words.items.len > 0) {
             self.completion_active = true;
-            self.completion_sel = 0;
+        }
+    }
+
+    /// Send a textDocument/completion request at the cursor (the menu opens
+    /// when the response lands in processCompletion). Shared by Ctrl+n and
+    /// the insert-mode auto-suggest.
+    fn requestLspCompletion(self: *App, c: anytype) !void {
+        // remember the start of the word being typed so acceptCompletion
+        // replaces just [completion_pos, cursor) with the chosen item
+        var pos = self.curCursor().*;
+        while (pos > 0 and isWordByte(self.cur().pt.byteAt(pos - 1))) pos -= 1;
+        if (pos == self.curCursor().*) return;
+        self.completion_pos = pos;
+        const uri = lsp_types.pathToFileUri(self.alloc, self.cur().path orelse return) catch return;
+        defer self.alloc.free(uri);
+        const line = self.cur().pt.lineOf(self.curCursor().*);
+        const col = self.curCursor().* - self.cur().pt.lineStart(line);
+        var params = lsp_nav.buildTextDocPositionParams(self.alloc, uri, line, col) catch return;
+        defer lsp_nav.freeTextDocPositionParams(self.alloc, &params);
+        c.request("textDocument/completion", params, &self.completion_slot) catch return;
+        self.completion_req_seq = self.edit_seq;
+    }
+
+    /// Insert-mode auto-suggest: after typing a word character, ask the LSP
+    /// for completion candidates at the cursor (the response opens/updates the
+    /// menu; stale responses are discarded in processCompletion). Without an
+    /// LSP, buffer-word completion is triggered only for small documents — a
+    /// full-buffer scan per keystroke on a huge file would jitter.
+    fn maybeAutoComplete(self: *App) !void {
+        if (self.curCursor().* == 0) return;
+        if (!isWordByte(self.cur().pt.byteAt(self.curCursor().* - 1))) return;
+        if (self.lsp_client) |c| {
+            try self.requestLspCompletion(c);
+            return;
+        }
+        if (self.cur().pt.len() > 16 * 1024) return;
+        const was_active = self.completion_active;
+        try self.collectCompletionWords(was_active);
+        if (self.completion_words.items.len > 0) {
+            self.completion_active = true;
         }
     }
 
@@ -1367,12 +1466,17 @@ const App = struct {
             json_rpc.freeValue(self.alloc, &result);
             self.completion_slot = null;
         }
-        for (self.completion_words.items) |w| self.alloc.free(w);
+        // Stale: the text changed after the request (fast typing) or the
+        // user left insert mode (e.g. Esc before the response landed). Keep
+        // the current items — the next keystroke sends a fresh request.
+        if (self.edit_seq != self.completion_req_seq or self.state.mode != .insert) return true;
+        for (self.completion_words.items) |it| self.alloc.free(it.text);
         self.completion_words.clearRetainingCapacity();
         lsp_nav.parseCompletionItems(self.alloc, result, &self.completion_words) catch {};
         if (self.completion_words.items.len > 0) {
             self.completion_active = true;
-            self.completion_sel = 0;
+            // keep the user's selection when the list refreshed while typing
+            if (self.completion_sel >= self.completion_words.items.len) self.completion_sel = 0;
         }
         return true;
     }
@@ -1548,6 +1652,7 @@ const App = struct {
         var params_value = std.json.Value{ .object = params };
         defer self.freeSimpleDocParams(&params_value);
         client.request("textDocument/inlayHint", params_value, &self.inlay_slot) catch return;
+        self.inlay_req_seq = self.edit_seq;
     }
 
     /// Consume an inlayHint response: collect (line, character, label) hints
@@ -1560,6 +1665,11 @@ const App = struct {
             json_rpc.freeValue(self.alloc, &result);
             self.inlay_slot = null;
         }
+        // Stale response: the document changed after this request was sent
+        // (fast typing in insert mode). Discard it — the in-place adjusted
+        // hints stay rendered, and the next quiescent request replaces them.
+        // Applying it would jump the hints to pre-edit positions (flicker).
+        if (self.edit_seq != self.inlay_req_seq) return true;
         for (self.inlay_hints.items) |*h| self.alloc.free(h.label);
         self.inlay_hints.clearRetainingCapacity();
         if (result != .array) {
@@ -1676,7 +1786,7 @@ const App = struct {
     /// most frequent ones (ties broken alphabetically), capped at 20. The
     /// word currently being typed (from completion_pos to the cursor) is
     /// excluded from the candidates.
-    fn collectCompletionWords(self: *App) !void {
+    fn collectCompletionWords(self: *App, keep_sel: bool) !void {
         const pt = &self.cur().pt;
         const cursor = self.curCursor().*;
         // start of the word under/behind the cursor — the replacement anchor
@@ -1698,9 +1808,14 @@ const App = struct {
 
         // Scan the document in chunks, stitching words that straddle a chunk
         // boundary: the word bytes are accumulated in `pending` until a
-        // non-word byte ends them.
+        // non-word byte ends them. `pending_start` tracks the absolute start
+        // of the word being assembled so the word currently being typed (the
+        // one starting at completion_pos — it spans the cursor and continues
+        // past it, e.g. "HELLObase" while typing HELLO into "base") is
+        // excluded, exactly like blink.cmp skips the word under the cursor.
         var pending = std.ArrayList(u8).empty;
         defer pending.deinit(self.alloc);
+        var pending_start: u32 = 0;
         var chunk: [4096]u8 = undefined;
         var off: u32 = 0;
         const doc_len = pt.len();
@@ -1712,14 +1827,15 @@ const App = struct {
                 if (isWordByte(chunk[i])) {
                     var j = i;
                     while (j < n and isWordByte(chunk[j])) j += 1;
+                    if (pending.items.len == 0) pending_start = off + @as(u32, @intCast(i));
                     try pending.appendSlice(self.alloc, chunk[i..j]);
                     if (j == n) break; // may continue on the next chunk
-                    try self.countCompletionWord(&counts, pending.items, typed);
+                    try self.countCompletionWord(&counts, pending.items, typed, pending_start == self.completion_pos);
                     pending.clearRetainingCapacity();
                     i = j;
                 } else {
                     if (pending.items.len > 0) {
-                        try self.countCompletionWord(&counts, pending.items, typed);
+                        try self.countCompletionWord(&counts, pending.items, typed, pending_start == self.completion_pos);
                         pending.clearRetainingCapacity();
                     }
                     i += 1;
@@ -1729,7 +1845,7 @@ const App = struct {
         }
         // a word running to the end of the document
         if (pending.items.len > 0) {
-            try self.countCompletionWord(&counts, pending.items, typed);
+            try self.countCompletionWord(&counts, pending.items, typed, pending_start == self.completion_pos);
             pending.clearRetainingCapacity();
         }
 
@@ -1754,22 +1870,25 @@ const App = struct {
         const limit = @min(max_words, pairs.items.len);
         try self.completion_words.ensureTotalCapacity(self.alloc, limit);
         errdefer {
-            for (self.completion_words.items) |owned| self.alloc.free(owned);
+            for (self.completion_words.items) |it| self.alloc.free(it.text);
             self.completion_words.clearRetainingCapacity();
         }
         var k: usize = 0;
         while (k < limit) : (k += 1) {
             const w = try self.alloc.dupe(u8, pairs.items[k].word);
-            try self.completion_words.append(self.alloc, w);
+            try self.completion_words.append(self.alloc, .{ .text = w, .kind = 0 });
         }
-        self.completion_sel = 0;
+        if (!keep_sel) self.completion_sel = 0;
     }
 
     /// Count one occurrence of `word` (skipping the word currently being
     /// typed). StringHashMap does not copy keys, and the scan buffers are
     /// reused, so keys are duplicated — the pending buffer can be overwritten
     /// by the very next word.
-    fn countCompletionWord(self: *App, counts: *std.StringHashMap(u32), word: []const u8, typed: []const u8) !void {
+    fn countCompletionWord(self: *App, counts: *std.StringHashMap(u32), word: []const u8, typed: []const u8, is_current: bool) !void {
+        // the word currently being typed (spans the cursor) is not a
+        // candidate — blink skips it too
+        if (is_current) return;
         // prefix filter: only words starting with the typed prefix are
         // candidates (vim C-n keyword completion); the exact typed word is
         // excluded
@@ -1791,16 +1910,17 @@ const App = struct {
         }
     }
 
-    /// Enter/Tab while the menu is open: replace the typed prefix
+    /// Enter while the menu is open: replace the typed prefix
     /// [completion_pos, cursor) with the selected word — one edit inside the
     /// open insert-session undo group — then close the menu (insert stays
-    /// active, the session continues).
+    /// active, the session continues). Matches the user's nvim (blink.cmp):
+    /// Enter is the only accept key; Tab always inserts literal spaces.
     fn acceptCompletion(self: *App) !void {
         if (self.completion_words.items.len == 0 or self.completion_sel >= self.completion_words.items.len) {
             self.closeCompletion();
             return;
         }
-        const word = self.completion_words.items[self.completion_sel];
+        const word = self.completion_words.items[self.completion_sel].text;
         const pt = &self.cur().pt;
         const cursor = self.curCursor().*;
         const pos = @min(self.completion_pos, cursor);
@@ -1818,7 +1938,7 @@ const App = struct {
     /// its capacity for the next trigger).
     fn closeCompletion(self: *App) void {
         if (!self.completion_active and self.completion_words.items.len == 0) return;
-        for (self.completion_words.items) |w| self.alloc.free(w);
+        for (self.completion_words.items) |it| self.alloc.free(it.text);
         self.completion_words.clearRetainingCapacity();
         self.completion_active = false;
         self.completion_sel = 0;
@@ -1870,11 +1990,18 @@ const App = struct {
         const line = pt.lineOf(cursor);
         const line_start = pt.lineStart(line);
         const line_end = line_start + pt.lineLen(line);
+        const col = cursor - line_start;
         if (cursor < line_end) {
+            const del_len: usize = @intCast(line_end - cursor);
+            const deleted = try self.alloc.alloc(u8, del_len);
+            defer self.alloc.free(deleted);
+            pt.copyRange(cursor, deleted);
             try self.cur().history.record(pt, cursor, line_end - cursor, "");
+            self.adjustInlayHintsDelete(line, col, deleted);
         } else if (line_end < pt.len()) {
             // at end of line: swallow the trailing newline (joins next line)
             try self.cur().history.record(pt, line_end, 1, "");
+            self.adjustInlayHintsDelete(line, col, "\n");
         } else {
             return; // last line, nothing to delete
         }
@@ -2154,6 +2281,90 @@ const App = struct {
         self.inlay_view_top = null;
     }
 
+    /// Shift inlay hints after inserting `text` at the pre-edit position
+    /// (line, col). Same-line inserts shift later hints right; newline
+    /// inserts push hints below down a line (and re-anchor those past the
+    /// split point onto the new line). Kept hints stay aligned while typing,
+    /// which is what keeps the insert-mode view from flickering.
+    fn adjustInlayHintsInsert(self: *App, line: u32, col: u32, text: []const u8) void {
+        if (self.inlay_hints.items.len == 0) return;
+        const nl = std.mem.count(u8, text, "\n");
+        if (nl == 0) {
+            for (self.inlay_hints.items) |*h| {
+                if (h.line == line and h.character >= col) {
+                    h.character += @intCast(text.len);
+                }
+            }
+            return;
+        }
+        // text contains newline(s): the tail after the last '\n' stays on the
+        // current line past the split point
+        const tail = text.len - (std.mem.lastIndexOfScalar(u8, text, '\n') orelse return) - 1;
+        const tail_u32: u32 = @intCast(tail);
+        for (self.inlay_hints.items) |*h| {
+            if (h.line > line) {
+                h.line += @intCast(nl);
+            } else if (h.line == line and h.character >= col) {
+                h.line += @intCast(nl);
+                h.character = h.character - col + tail_u32;
+            }
+        }
+    }
+
+    /// Shift inlay hints after deleting `deleted` (the pre-edit bytes) from
+    /// (line, col). Hints inside the deleted span are dropped; same-line
+    /// deletes shift later hints left; multi-line deletes pull hints below up.
+    fn adjustInlayHintsDelete(self: *App, line: u32, col: u32, deleted: []const u8) void {
+        if (self.inlay_hints.items.len == 0) return;
+        const nl = std.mem.count(u8, deleted, "\n");
+        if (nl == 0) {
+            // same-line delete: drop hints inside [col, col+len), shift the
+            // rest left
+            var write: usize = 0;
+            for (self.inlay_hints.items) |*h| {
+                if (h.line != line or h.character < col or h.character >= col + deleted.len) {
+                    if (h.line == line and h.character >= col) h.character -= @intCast(deleted.len);
+                    self.inlay_hints.items[write] = h.*;
+                    write += 1;
+                } else {
+                    self.alloc.free(h.label); // inside the deleted span
+                }
+            }
+            self.inlay_hints.shrinkRetainingCapacity(write);
+            return;
+        }
+        // multi-line delete: the span covers the tail of `line` from `col`,
+        // all of lines (line, line+nl), and the head of line (line+nl) up to
+        // its end column E. Middle lines are dropped entirely; the last
+        // line's surviving tail re-anchors onto `line` at col + offset.
+        const last_nl = std.mem.lastIndexOfScalar(u8, deleted, '\n') orelse return;
+        const end_col: u32 = @intCast(deleted.len - last_nl - 1);
+        const last_line = line + nl;
+        var write: usize = 0;
+        for (self.inlay_hints.items) |*h| {
+            if (h.line < line or (h.line == line and h.character < col)) {
+                self.inlay_hints.items[write] = h.*;
+                write += 1;
+                continue;
+            }
+            if (h.line == last_line and h.character >= end_col) {
+                h.line = line;
+                h.character = col + (h.character - end_col);
+                self.inlay_hints.items[write] = h.*;
+                write += 1;
+                continue;
+            }
+            if (h.line > last_line) {
+                h.line -= @intCast(nl);
+                self.inlay_hints.items[write] = h.*;
+                write += 1;
+                continue;
+            }
+            self.alloc.free(h.label); // inside the deleted span
+        }
+        self.inlay_hints.shrinkRetainingCapacity(write);
+    }
+
     /// Inlay hints for one line, sorted by insertion column (ascending), as
     /// arena slices so they live for the frame. Hints with a character inside
     /// the line's text are kept at that column — the renderer splices them in.
@@ -2216,9 +2427,15 @@ const App = struct {
             self.cur().history.beginGroup();
             self.in_insert = true;
         }
+        const pos = self.curCursor().*;
+        const line = self.cur().pt.lineOf(pos);
+        const col = pos - self.cur().pt.lineStart(line);
         // record() snapshots the pre-edit state and applies the edit itself
-        try self.cur().history.record(&self.cur().pt, self.curCursor().*, 0, text);
+        try self.cur().history.record(&self.cur().pt, pos, 0, text);
         self.curCursor().* += @intCast(text.len);
+        // keep inlay hints aligned instead of clearing them (insert mode:
+        // clearing + re-requesting on every keystroke makes the view flicker)
+        self.adjustInlayHintsInsert(line, col, text);
         self.markDirty();
     }
 
@@ -3163,22 +3380,28 @@ const App = struct {
     }
 
     /// Move to a nav location: jump within the current buffer, or open the
-    /// file (new buffer) when the URI points elsewhere.
+    /// file (new buffer) when the URI points elsewhere. Lands on the exact
+    /// definition column (clamped to the line length), like nvim's gd —
+    /// not the line start.
     fn jumpToLocation(self: *App, loc: lsp_nav.NavLocation) void {
+        const pt = &self.cur().pt;
+        const line = @min(loc.line, pt.lineCount() -| 1);
+        const line_start = pt.lineStart(line);
+        const target = line_start + @min(loc.character, pt.lineLen(line));
         const path = lsp_types.fileUriToPath(self.alloc, loc.uri) catch {
-            self.curCursor().* = self.cur().pt.lineStart(@min(loc.line, self.cur().pt.lineCount() - 1));
+            self.curCursor().* = target;
             return;
         };
         defer self.alloc.free(path);
         const current = self.cur().path orelse {
             self.openInBuffer(path) catch return;
-            self.curCursor().* = self.cur().pt.lineStart(@min(loc.line, self.cur().pt.lineCount() - 1));
+            self.curCursor().* = target;
             return;
         };
         if (!std.mem.eql(u8, current, path)) {
             self.openInBuffer(path) catch return;
         }
-        self.curCursor().* = self.cur().pt.lineStart(@min(loc.line, self.cur().pt.lineCount() - 1));
+        self.curCursor().* = target;
     }
 
     /// Keys while the gr/gI location list is open. Returns true when consumed.
@@ -3285,11 +3508,14 @@ const App = struct {
 
     fn markDirty(self: *App) void {
         self.cur().dirty = true;
-        // Editing invalidates inlay hints: their line/column offsets refer to
-        // the pre-edit text, so a stale hint would render at the wrong spot
-        // (e.g. an inserted line pushes every hint down by one). Drop them and
-        // let the auto-refresh re-request for the new viewport.
-        self.invalidateInlayHints();
+        self.edit_seq += 1;
+        // Editing normally invalidates inlay hints: their offsets refer to the
+        // pre-edit text. During an insert session we skip that and instead
+        // shift the hints for the edit (see adjustInlayHintsInsert/Delete) so
+        // the screen doesn't flicker on every keystroke; exitInsert forces a
+        // fresh request once the session ends. One-shot normal-mode ops
+        // (dd, x, o…) still invalidate here and let the auto-refresh re-request.
+        if (!self.in_insert) self.invalidateInlayHints();
         // LSP text sync: push the new document content to the server. Cheap
         // enough per keystroke for now (debounce lands with the M2 UI work).
         if (self.lsp_client) |c| {
@@ -3473,6 +3699,7 @@ const App = struct {
                 // one undo reverts the whole o+typing session.
                 const line = self.cur().pt.lineOf(self.curCursor().*);
                 const pos = self.cur().pt.lineStart(line) + self.cur().pt.lineLen(line);
+                const col = pos - self.cur().pt.lineStart(line);
                 self.beginInsertSession();
                 self.cur().history.beginGroup();
                 try self.cur().history.record(&self.cur().pt, pos, 0, "\n");
@@ -3484,12 +3711,14 @@ const App = struct {
                 self.curCursor().* = pos + 1 + @as(u32, @intCast(indent.len));
                 self.in_insert = true;
                 self.state.mode = .insert;
+                // keep inlay hints aligned (the newline + indent shift lines)
+                self.adjustInlayHintsInsert(line, col, "\n");
+                self.adjustInlayHintsInsert(line + 1, 0, indent);
                 // structural edit (newline): force a full reparse next frame —
                 // incremental parsing of a newline is where highlight drift
                 // shows up ("o then type then jk leaves gray chars")
                 self.cur().syntax_revision = std.math.maxInt(u64);
-                // Notify LSP (the new line + indent changed the document) and
-                // drop stale inlay hints so the next request matches the text.
+                // Notify LSP (the new line + indent changed the document).
                 self.markDirty();
             },
             .insert_line_before => {
@@ -3505,6 +3734,9 @@ const App = struct {
                 self.curCursor().* = pos + @as(u32, @intCast(indent.len));
                 self.in_insert = true;
                 self.state.mode = .insert;
+                // keep inlay hints aligned (a line was inserted above)
+                self.adjustInlayHintsInsert(line, 0, "\n");
+                self.adjustInlayHintsInsert(line, 0, indent);
                 // structural edit (newline): force a full reparse next frame
                 self.cur().syntax_revision = std.math.maxInt(u64);
                 self.markDirty();
@@ -4352,56 +4584,102 @@ const App = struct {
             }
         }
 
-        // insert-mode completion menu (Ctrl+n): a vim-style list directly
-        // below the cursor line; the selected row is highlighted like the
-        // fuzzy picker's selection. The buffer cursor is left untouched.
+        // insert-mode completion menu (Ctrl+n / auto-suggest): a floating
+        // window like nvim's blink.cmp — rounded border, solid bg_float
+        // panel, selected row in bg_sel with a Nerd Font kind icon column.
+        // The buffer cursor is left untouched.
         if (self.completion_active) {
             const total = self.completion_words.items.len;
-            const list_rows = @min(@as(usize, 8), total);
-            var top: usize = 0;
-            if (self.completion_sel >= list_rows) top = self.completion_sel - list_rows + 1;
-            const c_line = self.cur().pt.lineOf(self.curCursor().*);
-            const c_col = self.curCursor().* - self.cur().pt.lineStart(c_line);
-            var start_row = c_line - self.curViewTop().* + cur_rect.row + 1;
-            if (start_row + list_rows > height) {
-                // near the bottom: show the menu above the cursor instead
-                start_row = c_line - self.curViewTop().* + cur_rect.row - list_rows;
-            }
-            var k: usize = 0;
-            while (k < list_rows) : (k += 1) {
-                const seg = [_]vaxis.Segment{.{
-                    .text = self.completion_words.items[top + k],
-                    .style = if (top + k == self.completion_sel)
-                        .{ .bg = .{ .rgb = self.theme.bg_sel } }
-                    else
-                        .{},
-                }};
-                _ = win.print(&seg, .{
-                    .row_offset = @intCast(start_row + k),
-                    .col_offset = @intCast(cur_rect.col + gutter + c_col),
-                    .wrap = .none,
-                });
+            if (total > 0) {
+                const list_rows = @min(@as(usize, 8), total);
+                var top: usize = 0;
+                if (self.completion_sel >= list_rows) top = self.completion_sel - list_rows + 1;
+                const c_line = self.cur().pt.lineOf(self.curCursor().*);
+                const c_col = self.curCursor().* - self.cur().pt.lineStart(c_line);
+                // box width in cells: borders + icon + pad + longest label
+                var max_label: usize = 0;
+                var k: usize = 0;
+                while (k < list_rows) : (k += 1) {
+                    max_label = @max(max_label, self.completion_words.items[top + k].text.len);
+                }
+                max_label = @min(max_label, 46);
+                const inner_cells: u32 = @intCast(2 + max_label);
+                const box_w = inner_cells + 2;
+                var start_row = c_line - self.curViewTop().* + cur_rect.row + 1;
+                if (start_row + list_rows + 2 > height) {
+                    // near the bottom: show the menu above the cursor instead
+                    start_row = c_line - self.curViewTop().* + cur_rect.row - (list_rows + 2);
+                }
+                var box_col: u32 = @intCast(cur_rect.col + gutter + @min(c_col, 2));
+                if (box_col + box_w > win.width) box_col = win.width -| box_w;
+                const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
+                const sel_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_sel }, .fg = .{ .rgb = self.theme.fg } };
+                const row_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } };
+                // top border ╭───╮
+                {
+                    var segs = std.ArrayList(vaxis.Segment).empty;
+                    try segs.append(a, .{ .text = "╭", .style = border_style });
+                    try segs.append(a, .{ .text = "─", .style = border_style });
+                    // the remaining top edge (inner_cells - 1 cells)
+                    var cx: u32 = 1;
+                    while (cx < inner_cells) : (cx += 1) {
+                        try segs.append(a, .{ .text = "─", .style = border_style });
+                    }
+                    try segs.append(a, .{ .text = "╮", .style = border_style });
+                    _ = win.print(segs.items, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(box_col), .wrap = .none });
+                }
+                k = 0;
+                while (k < list_rows) : (k += 1) {
+                    const item = self.completion_words.items[top + k];
+                    const style = if (top + k == self.completion_sel) sel_style else row_style;
+                    const icon = if (item.kind != 0) kindGlyph(item.kind) else " ";
+                    const shown = @min(item.text.len, max_label);
+                    // byte layout: icon(≤3) + ' ' pad + label + spaces to fill
+                    const row = try a.alloc(u8, inner_cells + 2);
+                    @memset(row, ' ');
+                    @memcpy(row[0..icon.len], icon);
+                    if (shown > 0) @memcpy(row[icon.len + 1 .. icon.len + 1 + shown], item.text[0..shown]);
+                    const segs = [_]vaxis.Segment{
+                        .{ .text = "│", .style = border_style },
+                        .{ .text = row, .style = style },
+                        .{ .text = "│", .style = border_style },
+                    };
+                    _ = win.print(&segs, .{ .row_offset = @intCast(start_row + 1 + k), .col_offset = @intCast(box_col), .wrap = .none });
+                }
+                // bottom border ╰───╯
+                {
+                    var segs = std.ArrayList(vaxis.Segment).empty;
+                    try segs.append(a, .{ .text = "╰", .style = border_style });
+                    var cx: u32 = 0;
+                    while (cx < inner_cells) : (cx += 1) {
+                        try segs.append(a, .{ .text = "─", .style = border_style });
+                    }
+                    try segs.append(a, .{ .text = "╯", .style = border_style });
+                    _ = win.print(segs.items, .{ .row_offset = @intCast(start_row + 1 + list_rows), .col_offset = @intCast(box_col), .wrap = .none });
+                }
             }
 
             // Ghost text: the suffix of the selected item beyond the typed
             // prefix, shown dimmed right after the cursor (VS Code style).
             // Only when the item actually extends the typed prefix.
             if (self.state.mode == .insert and self.completion_sel < total) {
-                const item = self.completion_words.items[self.completion_sel];
+                const item = self.completion_words.items[self.completion_sel].text;
                 const typed_len = self.curCursor().* - self.completion_pos;
+                const ghost_line = self.cur().pt.lineOf(self.curCursor().*);
+                const ghost_col = self.curCursor().* - self.cur().pt.lineStart(ghost_line);
                 if (item.len > typed_len and typed_len > 0 and typed_len < 256) {
                     var prefix_buf: [256]u8 = undefined;
                     self.cur().pt.copyRange(self.completion_pos, prefix_buf[0..typed_len]);
                     if (std.mem.startsWith(u8, item, prefix_buf[0..typed_len])) {
                         const ghost = item[typed_len..];
-                        if (ghost.len > 0 and c_col + typed_len + ghost.len < win.width) {
+                        if (ghost.len > 0 and ghost_col + typed_len + ghost.len < win.width) {
                             const seg = [_]vaxis.Segment{.{
                                 .text = ghost,
                                 .style = .{ .dim = true },
                             }};
                             _ = win.print(&seg, .{
-                                .row_offset = @intCast(c_line - self.curViewTop().* + cur_rect.row),
-                                .col_offset = @intCast(cur_rect.col + gutter + c_col + typed_len),
+                                .row_offset = @intCast(ghost_line - self.curViewTop().* + cur_rect.row),
+                                .col_offset = @intCast(cur_rect.col + gutter + ghost_col + typed_len),
                                 .wrap = .none,
                             });
                         }
