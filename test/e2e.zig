@@ -698,6 +698,95 @@ test ":wq writes the buffer to disk and exits" {
     try std.testing.expectEqualStrings("HELLObase\n", buf);
 }
 
+test ":theme lists themes, switches colors, rejects unknown names" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}th.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const a = 1;\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // default theme is kanagawa-wave: bg 0x1F1F28
+    const kanagawa_bg = packRgb(0x1F, 0x1F, 0x28);
+    try std.testing.expect(grid.rowHasBg(1, kanagawa_bg));
+
+    // :theme with no arg lists the available themes in the status bar
+    try sess.send(":theme\r");
+    waited = 0;
+    while (!grid.contains("themes: ")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("themes: kanagawa-wave"));
+    try std.testing.expect(grid.contains("tokyonight"));
+
+    // switch to tokyonight-moon: bg becomes 0x1E2032
+    try sess.send(":theme tokyonight-moon\r");
+    waited = 0;
+    const moon_bg = packRgb(0x1E, 0x20, 0x32);
+    while (!grid.rowHasBg(1, moon_bg)) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.rowHasBg(1, moon_bg));
+    try std.testing.expect(!grid.rowHasBg(1, kanagawa_bg));
+
+    // unknown theme → status message
+    try sess.send(":theme bogus\r");
+    waited = 0;
+    while (!grid.contains("unknown theme")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("unknown theme"));
+
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
 test "insert mode: jk leaves no chars, backspace and ctrl-w delete" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -2015,8 +2104,8 @@ test "tree-sitter: zig keywords/comments/strings get syntax colors" {
     // kanagawa palette (src/main.zig syntaxStyle): keyword gold,
     // comment faded gray, string green. Assert on the packed fg of the
     // first character of each token.
-    try std.testing.expect(grid.containsFg("const", packRgb(224, 175, 104)));
-    try std.testing.expect(grid.containsFg("// note", packRgb(116, 127, 148)));
+    try std.testing.expect(grid.containsFg("const", packRgb(149, 127, 184)));
+    try std.testing.expect(grid.containsFg("// note", packRgb(114, 113, 105)));
 
     const exit_code = try sess.commandAndWaitExit(":q\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
@@ -2059,7 +2148,7 @@ test "tree-sitter: files over the size limit get no highlight pass" {
     }
     try std.testing.expect(grid.contains("NORMAL"));
     // no gold anywhere: the pass was skipped, text renders in default fg
-    try std.testing.expect(!grid.containsFg("const", packRgb(224, 175, 104)));
+    try std.testing.expect(!grid.containsFg("const", packRgb(149, 127, 184)));
 
     const exit_code = try sess.commandAndWaitExit(":q\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
@@ -2253,7 +2342,7 @@ test "visual block: rectangle semantics — highlight and d delete per column" {
     }
     try std.testing.expect(grid.contains("NORMAL"));
 
-    const sel_bg = packRgb(54, 74, 130);
+    const sel_bg = packRgb(45, 79, 103);
     // cursor → col 1, Ctrl+v (anchor col 1), j j → cursor line 2 col 1.
     // Screen layout: row 0 = tab bar, content col 0 = gutter (2 wide for a
     // 3-line file), so file line n sits on screen row n+1 and its byte col 1
@@ -2809,7 +2898,7 @@ test "picker: list scrolls with the selection; the highlighted row stays visible
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    const sel_bg = packRgb(54, 74, 130);
+    const sel_bg = packRgb(45, 79, 103);
     const list_top: usize = 24 - 1 - 10 - 1; // the picker list window
     // the selection starts on the first window row
     try std.testing.expect(grid.rowHasBg(list_top, sel_bg));
@@ -2893,7 +2982,7 @@ test "visual line: Esc exits and clears the stale selection highlight" {
     }
     try std.testing.expect(grid.contains("NORMAL"));
 
-    const sel_bg = packRgb(54, 74, 130);
+    const sel_bg = packRgb(45, 79, 103);
 
     // V (visual line) then j — the selection spans the first two lines
     try sess.send("Vj");
@@ -3031,7 +3120,7 @@ test "picker: keys win over the file tree while both are open" {
     }
     try std.testing.expect(grid.contains("NORMAL"));
 
-    const sel_bg = packRgb(54, 74, 130);
+    const sel_bg = packRgb(45, 79, 103);
 
     // <leader>e — file tree sidebar
     try sess.send(" e");
@@ -3196,7 +3285,7 @@ test "visual line: gt buffer switch drops the selection highlight" {
     }
     try std.testing.expect(grid.contains("BBB"));
 
-    const sel_bg = packRgb(54, 74, 130);
+    const sel_bg = packRgb(45, 79, 103);
 
     // V then j — a visible selection on buffer b.txt (V alone renders no
     // highlight because anchor == cursor)
@@ -3775,7 +3864,7 @@ test "visual line V selects whole lines from mid-line" {
 
     // 'l' puts the cursor mid-line (col 1), V + j selects both whole lines:
     // the selection must include the first column of row 1 (line 1's start)
-    const sel_bg = packRgb(54, 74, 130);
+    const sel_bg = packRgb(45, 79, 103);
     try sess.send("lVj");
     waited = 0;
     // wait for j to actually land on line 2 (VISUAL + status "line 2/"), so
@@ -4270,7 +4359,7 @@ test "e2e: multi-cursor Ctrl+n moves the main cursor and scrolls the viewport" {
     // content row (the cursor line is now ~13, far below the top).
     var r: usize = 1;
     var cursorline_row: ?usize = null;
-    const cursorline_bg = packRgb(40, 48, 68);
+    const cursorline_bg = packRgb(42, 42, 55);
     while (r < 24) : (r += 1) {
         if (grid.rowHasBg(r, cursorline_bg)) {
             cursorline_row = r;
@@ -4448,7 +4537,7 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
     }
     try std.testing.expect(grid.contains("NORMAL"));
     // build.zig is highlighted (gold keyword) before any switch
-    try std.testing.expect(grid.containsFg("const", packRgb(224, 175, 104)));
+    try std.testing.expect(grid.containsFg("const", packRgb(149, 127, 184)));
 
     // <leader>e: alphabetical tree — DESIGN.md is the first entry (row 1)
     try sess.send(" e");
@@ -4500,7 +4589,7 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
         break;
     }
-    const sel_bg = packRgb(54, 74, 130);
+    const sel_bg = packRgb(45, 79, 103);
     var ops_selected = false;
     var tries: usize = 0;
     while (!ops_selected and tries < 30) : (tries += 1) {
@@ -4530,7 +4619,7 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
 
     try sess.send("\r");
     waited = 0;
-    while (!grid.containsFg("pub", packRgb(224, 175, 104))) {
+    while (!grid.containsFg("pub", packRgb(149, 127, 184))) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -4540,13 +4629,13 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    if (!grid.containsFg("pub", packRgb(224, 175, 104))) {
+    if (!grid.containsFg("pub", packRgb(149, 127, 184))) {
         std.debug.print("ops.zig after zig->md->zig switch:\n", .{});
         grid.dump();
     }
     // the last buffer is ops.zig: "pub" is a gold keyword, not comment gray
-    try std.testing.expect(grid.containsFg("pub", packRgb(224, 175, 104)));
-    try std.testing.expect(!grid.containsFg("pub", packRgb(116, 127, 148)));
+    try std.testing.expect(grid.containsFg("pub", packRgb(149, 127, 184)));
+    try std.testing.expect(!grid.containsFg("pub", packRgb(114, 113, 105)));
 
     const exit_code = try sess.commandAndWaitExit(":q\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
@@ -4957,7 +5046,7 @@ test "file tree: Ctrl-w h/l switches focus between sidebar and buffer" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    const sel_bg = packRgb(54, 74, 130);
+    const sel_bg = packRgb(45, 79, 103);
 
     // open file tree; default focus is the sidebar
     try sess.send(" e");
@@ -5115,7 +5204,7 @@ test "insert Ctrl+n: keyword completion inserts the top candidate" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(grid.contains("NORMAL"));
-    const sel_bg = packRgb(54, 74, 130);
+    const sel_bg = packRgb(45, 79, 103);
 
     // jj → last (empty) line, i → insert, type "al", Ctrl+n (\x0e). The menu
     // shows the whole-buffer words by frequency: alpha (2×) first; the typed
@@ -5227,7 +5316,7 @@ test "insert Ctrl+n: Esc dismisses the menu and stays in insert" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(grid.contains("NORMAL"));
-    const sel_bg = packRgb(54, 74, 130);
+    const sel_bg = packRgb(45, 79, 103);
 
     try sess.send("jji" ++ "al" ++ "\x0e");
     waited = 0;
@@ -5353,7 +5442,7 @@ test "insert Ctrl+n: no candidates when the cursor is not inside a word" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(grid.contains("NORMAL"));
-    const sel_bg = packRgb(54, 74, 130);
+    const sel_bg = packRgb(45, 79, 103);
 
     // Cursor on the empty last line (byte before it is '\n', not a word
     // byte): Ctrl+n is swallowed — no menu, insert continues untouched.
@@ -5454,15 +5543,15 @@ test "insert: typing 'j' at end of a line keeps the next line's first word color
     try std.testing.expect(grid.contains("NORMAL"));
     // quick probe: is ANY "const" gold on the initial render of a multi-line
     // zig file (regression check for the j-typing report)
-    const any_gold = grid.containsFg("const", packRgb(224, 175, 104));
+    const any_gold = grid.containsFg("const", packRgb(149, 127, 184));
     if (!any_gold) {
         std.debug.print("no gold 'const' anywhere on initial render:\n", .{});
         grid.dump();
     }
     try std.testing.expect(any_gold);
 
-    const gold = packRgb(224, 175, 104);
-    const cursorline_bg = packRgb(40, 48, 68);
+    const gold = packRgb(149, 127, 184);
+    const cursorline_bg = packRgb(42, 42, 55);
     // rows: 0 = tab bar, 1.. = file lines. Move the cursor down two lines
     // (file line 2 = "    const x = 1;"), waiting on the cursorline highlight
     // so the motions have actually been processed (a content-only wait is
@@ -6086,7 +6175,7 @@ test "windows: both splits keep highlighting when showing different buffers" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(grid.contains("NORMAL"));
-    const gold = packRgb(224, 175, 104);
+    const gold = packRgb(149, 127, 184);
 
     // :vs — the focused (right) window shows build.zig, both halves gold
     try sess.send(":vs\r");

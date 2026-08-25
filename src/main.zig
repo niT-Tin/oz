@@ -15,6 +15,7 @@ const lsp_types = @import("lsp/types.zig");
 const lsp_diag = @import("lsp/diagnostics.zig");
 const lsp_nav = @import("lsp/navigation.zig");
 const json_rpc = @import("util/json_rpc.zig");
+const theme = @import("theme.zig");
 
 // Silence vaxis's per-frame debug logging (pollutes the tty byte stream and
 // interferes with e2e screen reconstruction).
@@ -77,6 +78,8 @@ const App = struct {
     io: std.Io,
     alloc: std.mem.Allocator,
     env_map: *std.process.Environ.Map,
+    /// Active color theme (from OZ_THEME, switchable at runtime).
+    theme: theme.Theme,
     vx: vaxis.Vaxis,
     tty: vaxis.Tty,
     tty_buffer: []u8,
@@ -517,6 +520,7 @@ const App = struct {
             .io = init.io,
             .alloc = init.gpa,
             .env_map = init.environ_map,
+            .theme = theme.fromEnv(init.environ_map),
             .vx = vx,
             .tty = tty,
             .tty_buffer = tty_buffer,
@@ -2030,9 +2034,32 @@ const App = struct {
             .buffer_list => try self.listBuffers(),
             .noh => try self.setMsg(try self.alloc.dupe(u8, "")),
             .set => |opt| try self.setMsg(try std.fmt.allocPrint(self.alloc, "set {s} (M0: accepted, no-op)", .{opt})),
+            .theme => |name| try self.execTheme(name),
             .substitute => |sub| try self.execSubstitute(sub),
             .unknown => try self.setMsg(try self.alloc.dupe(u8, "E492: Not an editor command")),
         }
+    }
+
+    /// :theme [name] — switch the color theme. With no argument, list the
+    /// available themes (Tab in the command line cycles suggestions).
+    fn execTheme(self: *App, name: []const u8) !void {
+        if (name.len == 0) {
+            var out = std.ArrayList(u8).empty;
+            defer out.deinit(self.alloc);
+            try out.appendSlice(self.alloc, "themes: ");
+            for (theme.themes, 0..) |t, i| {
+                if (i > 0) try out.appendSlice(self.alloc, ", ");
+                try out.appendSlice(self.alloc, t.name);
+            }
+            try self.setMsg(try out.toOwnedSlice(self.alloc));
+            return;
+        }
+        const t = theme.byName(name) orelse {
+            try self.setMsg(try std.fmt.allocPrint(self.alloc, "unknown theme: {s} (see :theme)", .{name}));
+            return;
+        };
+        self.theme = t;
+        try self.setMsg(try std.fmt.allocPrint(self.alloc, "theme: {s}", .{t.name}));
     }
 
     /// :s/pat/rep[/g] — literal substitution on the current line, the whole
@@ -3890,9 +3917,9 @@ const App = struct {
                             else => 'I',
                         };
                         diag_mark_fg = switch (d.severity) {
-                            .err => .{ .fg = .{ .rgb = .{ 210, 126, 139 } } },
-                            .warning => .{ .fg = .{ .rgb = .{ 224, 175, 104 } } },
-                            else => .{ .fg = .{ .rgb = .{ 122, 162, 247 } } },
+                            .err => .{ .fg = .{ .rgb = self.theme.diag_error } },
+                            .warning => .{ .fg = .{ .rgb = self.theme.diag_warn } },
+                            else => .{ .fg = .{ .rgb = self.theme.diag_info } },
                         };
                         break;
                     }
@@ -3945,7 +3972,7 @@ const App = struct {
             // spans, cursorline bg on the cursor's row, selection bg wins
             const is_cur_line = line == cursor_line;
             var segs = std.ArrayList(vaxis.Segment).empty;
-            const cursorline_style: vaxis.Style = if (is_cur_line) .{ .bg = .{ .rgb = .{ 40, 48, 68 } } } else .{};
+            const cursorline_style: vaxis.Style = if (is_cur_line) .{ .bg = .{ .rgb = self.theme.bg_curline } } else .{};
             try segs.append(a, .{ .text = num_str[0 .. gutter - 1], .style = cursorline_style });
             try segs.append(a, .{ .text = num_str[gutter - 1 .. gutter], .style = cursorline_style });
             // Inlay hints for this line, sorted by insertion column: each hint
@@ -3969,7 +3996,7 @@ const App = struct {
                     if (hint.label.len > 0) {
                         try segs.append(a, .{
                             .text = hint.label,
-                            .style = .{ .dim = true, .fg = .{ .rgb = .{ 122, 124, 135 } } },
+                            .style = .{ .dim = true, .fg = .{ .rgb = self.theme.fg_dim } },
                         });
                     }
                     hint_i += 1;
@@ -3980,7 +4007,7 @@ const App = struct {
                 if (span_i < merged.len) {
                     const sp = merged[span_i];
                     if (sp.start < line_start + n and sp.end > line_start + col) {
-                        fg = syntaxStyle(sp.style);
+                        fg = syntaxStyle(sp.style, self.theme);
                         const sp_start: u32 = if (sp.start > line_start) sp.start - line_start else 0;
                         const sp_end: u32 = if (sp.end < line_start + n) sp.end - line_start else n;
                         next = if (sp_start > col) sp_start else sp_end;
@@ -3996,8 +4023,8 @@ const App = struct {
                 }
                 const in_sel = col >= sel_s and col < sel_e;
                 var style: vaxis.Style = .{};
-                if (is_cur_line) style.bg = .{ .rgb = .{ 40, 48, 68 } };
-                if (in_sel) style.bg = .{ .rgb = .{ 54, 74, 130 } };
+                if (is_cur_line) style.bg = .{ .rgb = self.theme.bg_curline };
+                if (in_sel) style.bg = .{ .rgb = self.theme.bg_sel };
                 if (fg) |f| style.fg = f.fg;
                 try segs.append(a, .{ .text = text[col..next], .style = style });
                 col = next;
@@ -4008,7 +4035,7 @@ const App = struct {
                 if (hint.label.len > 0) {
                     try segs.append(a, .{
                         .text = hint.label,
-                        .style = .{ .dim = true, .fg = .{ .rgb = .{ 122, 124, 135 } } },
+                        .style = .{ .dim = true, .fg = .{ .rgb = self.theme.fg_dim } },
                     });
                 }
                 hint_i += 1;
@@ -4042,6 +4069,9 @@ const App = struct {
 
         const win = self.vx.window();
         win.clear();
+        // Editor background: paint the whole screen with the theme's bg so
+        // the palette is consistent (like nvim), not terminal-transparent.
+        win.fill(.{ .style = .{ .bg = .{ .rgb = self.theme.bg } } });
 
         const height: u32 = win.height;
         if (height <= status_row_count) return;
@@ -4066,9 +4096,9 @@ const App = struct {
                 const seg = [_]vaxis.Segment{.{
                     .text = label,
                     .style = if (tab_i == self.current)
-                        .{ .fg = .{ .rgb = .{ 250, 189, 47 } }, .bold = true }
+                        .{ .fg = .{ .rgb = self.theme.accent }, .bold = true }
                     else
-                        .{ .fg = .{ .rgb = .{ 86, 95, 137 } } },
+                        .{ .fg = .{ .rgb = self.theme.fg_faint } },
                 }};
                 _ = win.print(&seg, .{ .row_offset = 0, .col_offset = col, .wrap = .none });
                 col +|= @intCast(label.len);
@@ -4080,12 +4110,12 @@ const App = struct {
         if (self.isDashboard()) {
             const title_seg = [_]vaxis.Segment{.{
                 .text = " oz  ",
-                .style = .{ .fg = .{ .rgb = .{ 250, 189, 47 } }, .bold = true },
+                .style = .{ .fg = .{ .rgb = self.theme.accent }, .bold = true },
             }};
             _ = win.print(&title_seg, .{ .row_offset = @intCast(self.contentTop() + 2), .col_offset = 2, .wrap = .none });
             const sub_seg = [_]vaxis.Segment{.{
                 .text = " 终端文本编辑器  —  j/k 选择 · Enter 打开 · <leader>sf 找文件 · :e 打开 · :q 退出",
-                .style = .{ .fg = .{ .rgb = .{ 86, 95, 137 } } },
+                .style = .{ .fg = .{ .rgb = self.theme.fg_faint } },
             }};
             _ = win.print(&sub_seg, .{ .row_offset = @intCast(self.contentTop() + 3), .col_offset = 2, .wrap = .none });
             var ri: usize = 0;
@@ -4095,9 +4125,9 @@ const App = struct {
                 const seg = [_]vaxis.Segment{.{
                     .text = fname,
                     .style = if (ri == self.recent_sel)
-                        .{ .bg = .{ .rgb = .{ 54, 74, 130 } } }
+                        .{ .bg = .{ .rgb = self.theme.bg_sel } }
                     else
-                        .{ .fg = .{ .rgb = .{ 122, 162, 247 } } },
+                        .{ .fg = .{ .rgb = self.theme.function } },
                 }};
                 _ = win.print(&seg, .{ .row_offset = @intCast(self.contentTop() + row), .col_offset = 2, .wrap = .none });
             }
@@ -4126,7 +4156,7 @@ const App = struct {
         if (self.filetree_active) {
             const title_seg = [_]vaxis.Segment{.{
                 .text = " files ",
-                .style = .{ .fg = .{ .rgb = .{ 250, 189, 47 } }, .bold = true },
+                .style = .{ .fg = .{ .rgb = self.theme.accent }, .bold = true },
             }};
             _ = win.print(&title_seg, .{ .row_offset = 0, .col_offset = 0, .wrap = .none });
             // vim-style scroll window (same semantics as the picker)
@@ -4146,9 +4176,9 @@ const App = struct {
                 const seg = [_]vaxis.Segment{.{
                     .text = label,
                     .style = if (ri == self.filetree_sel)
-                        .{ .bg = .{ .rgb = .{ 54, 74, 130 } } }
+                        .{ .bg = .{ .rgb = self.theme.bg_sel } }
                     else
-                        .{ .fg = .{ .rgb = .{ 122, 162, 247 } } },
+                        .{ .fg = .{ .rgb = self.theme.function } },
                 }};
                 _ = win.print(&seg, .{ .row_offset = @intCast(1 + k), .col_offset = 0, .wrap = .none });
             }
@@ -4173,7 +4203,7 @@ const App = struct {
                     const g = try a.dupe(u8, char_buf[0..clen]);
                     win.writeCell(@intCast(cur_rect.col + gutter + col), @intCast(cur_rect.row + wline - self.curViewTop().*), .{
                         .char = .{ .grapheme = g, .width = 1 },
-                        .style = .{ .bg = .{ .rgb = .{ 54, 74, 130 } } },
+                        .style = .{ .bg = .{ .rgb = self.theme.bg_sel } },
                     });
                     p += clen;
                 }
@@ -4189,7 +4219,7 @@ const App = struct {
                 const label = try a.dupe(u8, &[_]u8{m.label});
                 win.writeCell(@intCast(cur_rect.col + gutter + col_in_line), @intCast(cur_rect.row + mline - self.curViewTop().*), .{
                     .char = .{ .grapheme = label, .width = 1 },
-                    .style = .{ .fg = .{ .rgb = .{ 250, 189, 47 } }, .bg = .{ .rgb = .{ 54, 74, 130 } } },
+                    .style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_sel } },
                 });
             }
         }
@@ -4224,7 +4254,7 @@ const App = struct {
                 const seg = [_]vaxis.Segment{.{
                     .text = label,
                     .style = if (ri == self.picker_sel)
-                        .{ .bg = .{ .rgb = .{ 54, 74, 130 } } }
+                        .{ .bg = .{ .rgb = self.theme.bg_sel } }
                     else
                         .{},
                 }};
@@ -4233,7 +4263,7 @@ const App = struct {
             const prompt = try std.fmt.allocPrint(a, "> {s}", .{self.picker_input.items});
             const prompt_seg = [_]vaxis.Segment{.{
                 .text = prompt,
-                .style = .{ .fg = .{ .rgb = .{ 192, 202, 245 } }, .bg = .{ .rgb = .{ 41, 46, 66 } } },
+                .style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_status } },
             }};
             _ = win.print(&prompt_seg, .{ .row_offset = @intCast(height - 1), .wrap = .none });
             self.vx.screen.cursor = .{
@@ -4251,7 +4281,7 @@ const App = struct {
             const prompt = try std.fmt.allocPrint(a, ":{s}", .{self.cmdline.items});
             const cmd_seg = [_]vaxis.Segment{.{
                 .text = prompt,
-                .style = .{ .fg = .{ .rgb = .{ 192, 202, 245 } }, .bg = .{ .rgb = .{ 41, 46, 66 } } },
+                .style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_status } },
             }};
             _ = win.print(&cmd_seg, .{ .row_offset = @intCast(height - 1), .wrap = .none });
             self.vx.screen.cursor = .{
@@ -4283,7 +4313,7 @@ const App = struct {
                 const seg = [_]vaxis.Segment{.{
                     .text = label,
                     .style = if (ri == self.diag_list_sel)
-                        .{ .bg = .{ .rgb = .{ 54, 74, 130 } } }
+                        .{ .bg = .{ .rgb = self.theme.bg_sel } }
                     else
                         .{},
                 }};
@@ -4314,7 +4344,7 @@ const App = struct {
                 const seg = [_]vaxis.Segment{.{
                     .text = label,
                     .style = if (ri == self.nav_list_sel)
-                        .{ .bg = .{ .rgb = .{ 54, 74, 130 } } }
+                        .{ .bg = .{ .rgb = self.theme.bg_sel } }
                     else
                         .{},
                 }};
@@ -4342,7 +4372,7 @@ const App = struct {
                 const seg = [_]vaxis.Segment{.{
                     .text = self.completion_words.items[top + k],
                     .style = if (top + k == self.completion_sel)
-                        .{ .bg = .{ .rgb = .{ 54, 74, 130 } } }
+                        .{ .bg = .{ .rgb = self.theme.bg_sel } }
                     else
                         .{},
                 }};
@@ -4401,7 +4431,7 @@ const App = struct {
                     const shown = @min(line_len, hcols);
                     const seg = [_]vaxis.Segment{.{
                         .text = remaining[0..shown],
-                        .style = .{ .bg = .{ .rgb = .{ 29, 32, 47 } }, .fg = .{ .rgb = .{ 192, 202, 245 } } },
+                        .style = .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } },
                     }};
                     _ = win.print(&seg, .{
                         .row_offset = @intCast(start_row + r),
@@ -4437,7 +4467,7 @@ const App = struct {
             );
         const status_seg = [_]vaxis.Segment{.{
             .text = status,
-            .style = .{ .fg = .{ .rgb = .{ 192, 202, 245 } }, .bg = .{ .rgb = .{ 41, 46, 66 } } },
+            .style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_status } },
         }};
         _ = win.print(&status_seg, .{ .row_offset = @intCast(height - 1), .wrap = .none });
 
@@ -4559,18 +4589,18 @@ fn filetypeOf(path: ?[]const u8) []const u8 {
 
 /// Kanagawa-wave-flavored palette for the tree-sitter capture groups
 /// (src/syntax.zig Style). Background 41,46,66; fg 192,202,245.
-fn syntaxStyle(style: syntax.Style) vaxis.Style {
+fn syntaxStyle(style: syntax.Style, t: theme.Theme) vaxis.Style {
     return switch (style) {
-        .default => .{},
-        .comment => .{ .fg = .{ .rgb = .{ 116, 127, 148 } } },
-        .keyword => .{ .fg = .{ .rgb = .{ 224, 175, 104 } } }, // gold
-        .string => .{ .fg = .{ .rgb = .{ 152, 195, 121 } } }, // green
-        .number, .constant, .boolean, .character => .{ .fg = .{ .rgb = .{ 210, 126, 139 } } }, // red
-        .function, .tag, .namespace => .{ .fg = .{ .rgb = .{ 122, 162, 247 } } }, // blue
-        .type, .constructor, .label => .{ .fg = .{ .rgb = .{ 124, 199, 199 } } }, // cyan
-        .operator, .variable, .parameter, .property => .{ .fg = .{ .rgb = .{ 192, 202, 245 } } },
-        .attribute, .builtin => .{ .fg = .{ .rgb = .{ 224, 175, 104 } } },
-        .punctuation => .{ .fg = .{ .rgb = .{ 122, 124, 135 } } },
+        .default => .{ .fg = .{ .rgb = t.fg } },
+        .comment => .{ .fg = .{ .rgb = t.comment } },
+        .keyword => .{ .fg = .{ .rgb = t.keyword } }, // gold
+        .string => .{ .fg = .{ .rgb = t.string } }, // green
+        .number, .constant, .boolean, .character => .{ .fg = .{ .rgb = t.number } }, // red
+        .function, .tag, .namespace => .{ .fg = .{ .rgb = t.function } }, // blue
+        .type, .constructor, .label => .{ .fg = .{ .rgb = t.type } }, // cyan
+        .operator, .variable, .parameter, .property => .{ .fg = .{ .rgb = t.fg } },
+        .attribute, .builtin => .{ .fg = .{ .rgb = t.keyword } },
+        .punctuation => .{ .fg = .{ .rgb = t.fg_dim } },
     };
 }
 

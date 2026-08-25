@@ -30,6 +30,8 @@ pub const Command = union(enum) {
     noh,
     /// :set <option> — M0: accepted, applied if recognized, else ignored.
     set: []const u8,
+    /// :theme [name] — switch color theme (no arg lists available themes).
+    theme: []const u8,
     /// :s/pat/rep[/g] — substitute on the current line; :%s for the whole
     /// file; :'<,'>s for the visual selection. M1: literal substring
     /// matching (no regex).
@@ -99,6 +101,7 @@ pub fn parse(line: []const u8) Command {
     if (std.mem.eql(u8, word, "bd") or std.mem.eql(u8, word, "bdelete")) return .buffer_delete;
     if (std.mem.eql(u8, word, "noh") or std.mem.eql(u8, word, "nohlsearch")) return .noh;
     if (std.mem.eql(u8, word, "set")) return .{ .set = args };
+    if (std.mem.eql(u8, word, "theme") or std.mem.eql(u8, word, "colorscheme")) return .{ .theme = args };
 
     // :s/pat/rep/g and :%s/pat/rep/g
     if (t[0] == 's' or (t.len >= 2 and t[0] == '%' and t[1] == 's')) {
