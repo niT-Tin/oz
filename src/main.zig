@@ -4152,6 +4152,32 @@ const App = struct {
         return digits + 1;
     }
 
+    /// Display column (in cells) of `byte_pos` within `line`. vaxis renders a
+    /// multi-byte grapheme as one or two cells, so anything positioned from a
+    /// byte offset (the text cursor, the completion menu, ghost text) must be
+    /// converted — otherwise the cursor appears stuck mid-text on lines that
+    /// contain non-ASCII characters (e.g. after accepting a suggestion that
+    /// inserted text before/after CJK characters).
+    fn lineCellCol(self: *App, win: vaxis.Window, line: u32, byte_pos: u32) u32 {
+        const pt = &self.cur().pt;
+        const line_start = pt.lineStart(line);
+        var p = line_start;
+        var col: u32 = 0;
+        while (p < byte_pos) {
+            const b = pt.byteAt(p);
+            const seq_len: usize = if (b < 0x80)
+                1
+            else
+                (std.unicode.utf8ByteSequenceLength(b) catch 1);
+            const avail = @min(seq_len, @as(usize, @intCast(byte_pos - p)));
+            var ch_buf: [4]u8 = undefined;
+            pt.copyRange(p, ch_buf[0..avail]);
+            col += win.gwidth(ch_buf[0..avail]);
+            p += @intCast(avail);
+        }
+        return col;
+    }
+
     /// Render one split window's lines into `rect` (content-area coordinates).
     /// The highlighter is bound to the current buffer, so only the focused
     /// window gets syntax highlighting and the (single) visual selection.
@@ -4669,7 +4695,7 @@ const App = struct {
                 var top: usize = 0;
                 if (self.completion_sel >= list_rows) top = self.completion_sel - list_rows + 1;
                 const c_line = self.cur().pt.lineOf(self.curCursor().*);
-                const c_col = self.curCursor().* - self.cur().pt.lineStart(c_line);
+                const c_col = self.lineCellCol(win, c_line, self.curCursor().*);
                 // box width in cells: borders + icon + pad + longest label
                 var max_label: usize = 0;
                 var k: usize = 0;
@@ -4740,7 +4766,7 @@ const App = struct {
                 const item = self.completion_words.items[self.completion_sel].text;
                 const typed_len = self.curCursor().* - self.completion_pos;
                 const ghost_line = self.cur().pt.lineOf(self.curCursor().*);
-                const ghost_col = self.curCursor().* - self.cur().pt.lineStart(ghost_line);
+                const ghost_col = self.lineCellCol(win, ghost_line, self.curCursor().*);
                 if (item.len > typed_len and typed_len > 0 and typed_len < 256) {
                     var prefix_buf: [256]u8 = undefined;
                     self.cur().pt.copyRange(self.completion_pos, prefix_buf[0..typed_len]);
@@ -4868,17 +4894,18 @@ const App = struct {
             .visual_char, .visual_line, .visual_block => " VISUAL ",
             .command => " COMMAND ",
         };
+        const status_col = self.lineCellCol(win, cursor_line, self.curCursor().*);
         const status = if (self.msg) |m|
             try std.fmt.allocPrint(
                 a,
                 "{s} line {d}/{d} col {d}  {s}",
-                .{ mode_str, cursor_line + 1, line_count, self.curCursor().* - self.cur().pt.lineStart(cursor_line), m },
+                .{ mode_str, cursor_line + 1, line_count, status_col, m },
             )
         else
             try std.fmt.allocPrint(
                 a,
                 "{s} line {d}/{d} col {d}",
-                .{ mode_str, cursor_line + 1, line_count, self.curCursor().* - self.cur().pt.lineStart(cursor_line) },
+                .{ mode_str, cursor_line + 1, line_count, status_col },
             );
         const status_seg = [_]vaxis.Segment{.{
             .text = status,
@@ -4895,7 +4922,7 @@ const App = struct {
                 .col = 0,
             };
         } else {
-            const cursor_col = self.curCursor().* - self.cur().pt.lineStart(cursor_line);
+            const cursor_col = self.lineCellCol(win, cursor_line, self.curCursor().*);
             const cursor_row = cursor_line - self.curViewTop().* + cur_rect.row;
             self.vx.screen.cursor = .{
                 .row = @intCast(cursor_row),
