@@ -7241,6 +7241,143 @@ test "lsp: accepting a snippet candidate inserts its clean label" {
     try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
 }
 
+test "lsp: user flow — b. Ctrl+n stand Enter jk A keeps the cursor at EOL" {
+    // The exact reproduction from the user report: open build.zig, 14j, o,
+    // tab, type "const target = b.", Ctrl+n, type "stand", Enter (accept),
+    // jk (exit insert), A. After all of that the cursor must sit at the end
+    // of the line (after the accepted completion), not stranded mid-line or
+    // on a stray newline.
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}flow.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\const std = @import("std");
+            \\
+            \\pub fn build(b: *std.Build) void {
+            \\    const t1 = b.standardTargetOptions(.{});
+            \\    const t2 = b.standardOptimizeOption(.{});
+            \\    _ = t1;
+            \\    _ = t2;
+            \\    const exe = b.addExecutable(.{ .name = "x", .root_module = b.createModule(.{ .root_source_file = b.path("src/main.zig") }) });
+            \\    b.installArtifact(exe);
+            \\    const rc = b.addRunArtifact(exe);
+            \\    const ts = b.step("test", "run");
+            \\    ts.dependOn(&rc.step);
+            \\    _ = ts;
+            \\}
+            \\
+        );
+    }
+
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{"OZ_LSP_CMD=zig-out/bin/mock_lsp"});
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // the exact user key sequence, staged so the completion has time to open
+    try sess.send("14jo\tconst target = b.");
+    waited = 0;
+    var menu = false;
+    while (!menu) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        if (grid.contains("mockItem")) menu = true; // b. trigger menu open
+    }
+    if (!menu) {
+        std.debug.print("b. menu did not open:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(menu);
+
+    try sess.send("\x0estand"); // Ctrl+n then type stand
+    waited = 0;
+    var filtered = false;
+    while (!filtered) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        if (grid.contains("mockAlphastand")) filtered = true; // filtered list
+    }
+    try std.testing.expect(filtered);
+
+    try sess.send("\rjkA"); // accept, exit insert, append
+    waited = 0;
+    var ok = false;
+    while (!ok) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 10000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        // accepted completion on the new line + cursor at EOL in the status bar
+        if (grid.contains("mockAlphastand") and grid.contains("col 35")) ok = true;
+    }
+    if (!ok) {
+        std.debug.print("user flow failed:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(ok);
+
+    // A left us in insert mode; exit before :qa
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) break;
+        sess.used += n;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
+}
+
 test "lsp: signature help — typing ( shows the callee signature" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;

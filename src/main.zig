@@ -188,6 +188,11 @@ const App = struct {
     /// silent "no candidates" doesn't get mistaken for a completed accept
     /// (whose Enter would otherwise insert a newline).
     completion_manual: bool = false,
+    /// Set by Ctrl+n and cleared when its response is consumed: while it is
+    /// set and no menu is open, Enter must NOT insert a newline (zls can take
+    /// many seconds on build.zig) — it shows "completion pending…" instead,
+    /// so the completion isn't silently swallowed by an early Enter.
+    completion_waiting_enter: bool = false,
     /// LSP textDocument/completion response slot (filled by drain); consumed
     /// by processCompletion. Local word completion is the fallback.
     completion_slot: ?std.json.Value = null,
@@ -851,6 +856,16 @@ const App = struct {
                 }
             }
             if (key.codepoint == vaxis.Key.enter) {
+                // A manual Ctrl+n asked the server for candidates but the
+                // response hasn't arrived (zls on build.zig can take many
+                // seconds). A blind Enter here would insert a newline and the
+                // completion would look ignored — the cursor ends up on the
+                // wrong line. Wait instead: tell the user, and let the next
+                // Enter accept once the menu opens.
+                if (self.completion_waiting_enter and !self.completion_active) {
+                    try self.setMsg(try self.alloc.dupe(u8, "completion pending…"));
+                    return;
+                }
                 try self.insertNewline();
                 return;
             }
@@ -1441,6 +1456,7 @@ const App = struct {
         // opens the menu. Without a client we fall back to buffer words.
         if (self.lsp_client) |c| {
             self.completion_manual = true;
+            self.completion_waiting_enter = true;
             try self.requestLspCompletion(c, false);
             return;
         }
@@ -1573,6 +1589,9 @@ const App = struct {
                 self.setMsg(self.alloc.dupe(u8, "no candidates") catch return true) catch {};
             }
         }
+        // the manual request's response has been consumed: Enter is free
+        // again (accept if the menu opened, newline otherwise)
+        self.completion_waiting_enter = false;
         return true;
     }
 
