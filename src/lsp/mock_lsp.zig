@@ -124,7 +124,48 @@ pub fn handleMessage(
         if (std.mem.eql(u8, method, "initialize")) {
             try pushResponse(alloc, &out, id, try buildInitializeResult(a));
         } else if (std.mem.eql(u8, method, "textDocument/completion")) {
-            try pushResponse(alloc, &out, id, try buildCompletionResult(a));
+            // echo the typed prefix in the labels ("mockItemmo") so tests can
+            // verify the client filters suggestions as the user types
+            var col: u32 = 0;
+            var line: u32 = 0;
+            var uri: ?[]const u8 = null;
+            if (msg.params) |params| {
+                if (params == .object) {
+                    if (params.object.get("position")) |pos| {
+                        if (pos == .object) {
+                            if (pos.object.get("line")) |ln| {
+                                const lval: ?i64 = switch (ln) {
+                                    .integer => |n| n,
+                                    .number_string => |s| std.fmt.parseInt(i64, s, 10) catch null,
+                                    else => null,
+                                };
+                                if (lval) |lv| {
+                                    if (lv >= 0) line = @intCast(lv);
+                                }
+                            }
+                            if (pos.object.get("character")) |ch| {
+                                const cval: ?i64 = switch (ch) {
+                                    .integer => |n| n,
+                                    .number_string => |s| std.fmt.parseInt(i64, s, 10) catch null,
+                                    else => null,
+                                };
+                                if (cval) |cv| {
+                                    if (cv >= 0) col = @intCast(cv);
+                                }
+                            }
+                        }
+                    }
+                    if (params.object.get("textDocument")) |td| {
+                        if (td == .object) {
+                            if (td.object.get("uri")) |u| {
+                                if (u == .string) uri = u.string;
+                            }
+                        }
+                    }
+                }
+            }
+            const prefix = completionPrefix(a, state, uri, line, col);
+            try pushResponse(alloc, &out, id, try buildCompletionResult(a, prefix));
         } else if (std.mem.eql(u8, method, "textDocument/hover")) {
             try pushResponse(alloc, &out, id, try buildHoverResult(a));
         } else if (std.mem.eql(u8, method, "textDocument/definition") or
@@ -352,12 +393,48 @@ fn buildInitializeResult(a: std.mem.Allocator) !std.json.Value {
     return .{ .object = result };
 }
 
-fn buildCompletionResult(a: std.mem.Allocator) !std.json.Value {
+/// Word chars in the document at the request position, walked back from the
+/// cursor column (what the client will filter by). Owned copy.
+fn completionPrefix(a: std.mem.Allocator, state: *State, uri: ?[]const u8, line: u32, col: u32) []const u8 {
+    const u = uri orelse return a.dupe(u8, "") catch return "";
+    var i: usize = state.changed.items.len;
+    while (i > 0) {
+        i -= 1;
+        const rec = &state.changed.items[i];
+        if (!std.mem.eql(u8, rec.uri, u)) continue;
+        const text = rec.text;
+        // advance to the requested line
+        var line_i: u32 = 0;
+        var pos: usize = 0;
+        while (line_i < line and pos < text.len) : (line_i += 1) {
+            const nl = std.mem.indexOfScalarPos(u8, text, pos, '\n') orelse text.len;
+            pos = @min(nl + 1, text.len);
+        }
+        const line_len = blk: {
+            const nl = std.mem.indexOfScalarPos(u8, text, pos, '\n') orelse text.len;
+            break :blk nl - pos;
+        };
+        var end = pos + @min(col, @as(u32, @intCast(line_len)));
+        while (end > pos) {
+            const b = text[end - 1];
+            const is_word = (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or
+                (b >= '0' and b <= '9') or b == '_' or b >= 0x80;
+            if (!is_word) break;
+            end -= 1;
+        }
+        return a.dupe(u8, text[end .. pos + @min(col, @as(u32, @intCast(line_len)))]) catch "";
+    }
+    return a.dupe(u8, "") catch return "";
+}
+
+fn buildCompletionResult(a: std.mem.Allocator, prefix: []const u8) !std.json.Value {
     var item = try std.json.ObjectMap.init(a, &.{}, &.{});
-    try item.put(a, "label", .{ .string = "mockItem" });
+    const item_label = try std.fmt.allocPrint(a, "mockItem{s}", .{prefix});
+    try item.put(a, "label", .{ .string = item_label });
     try item.put(a, "kind", .{ .integer = 6 }); // CompletionItemKind.Function
     var item2 = try std.json.ObjectMap.init(a, &.{}, &.{});
-    try item2.put(a, "label", .{ .string = "mockAlpha" });
+    const item2_label = try std.fmt.allocPrint(a, "mockAlpha{s}", .{prefix});
+    try item2.put(a, "label", .{ .string = item2_label });
     try item2.put(a, "kind", .{ .integer = 5 }); // CompletionItemKind.Field
     var items = std.json.Array.init(a);
     try items.append(.{ .object = item });

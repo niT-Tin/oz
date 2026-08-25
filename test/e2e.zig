@@ -286,17 +286,22 @@ fn packRgb(r: u8, g: u8, b: u8) u32 {
 const Grid = struct {
     rows: usize = 24,
     cols: usize = 80,
-    buf: []u8, // rows*cols
+    /// rows*cols*4: one UTF-8-capable slot per cell (a Nerd Font icon is 3
+    /// bytes but ONE cell, so columns must count characters, not bytes —
+    /// otherwise vaxis's diff updates land in the wrong column).
+    buf: []u8,
     fg_buf: []u32, // rows*cols packed RGB (0 = default)
     bg_buf: []u32, // rows*cols packed RGB (0 = default)
     row: usize = 0,
     col: usize = 0,
     fg: u32 = 0, // current fg color (packed RGB, 0 = default)
     bg: u32 = 0, // current bg color (packed RGB, 0 = default)
+    /// Scratch buffer for rowText (one row of compressed cells).
+    row_text_buf: [80 * 4]u8 = undefined,
 
     fn init(alloc: std.mem.Allocator) !Grid {
-        const buf = try alloc.alloc(u8, 24 * 80);
-        @memset(buf, ' ');
+        const buf = try alloc.alloc(u8, 24 * 80 * 4);
+        @memset(buf, 0);
         const fg_buf = try alloc.alloc(u32, 24 * 80);
         @memset(fg_buf, 0);
         const bg_buf = try alloc.alloc(u32, 24 * 80);
@@ -310,8 +315,9 @@ const Grid = struct {
         alloc.free(self.bg_buf);
     }
 
-    fn cell(self: *Grid, row: usize, col: usize) *u8 {
-        return &self.buf[row * self.cols + col];
+    /// The 4-byte slot for one screen cell.
+    fn cell(self: *Grid, row: usize, col: usize) *[4]u8 {
+        return self.buf[(row * self.cols + col) * 4 ..][0..4];
     }
 
     fn feed(self: *Grid, bytes: []const u8) void {
@@ -384,13 +390,21 @@ const Grid = struct {
                         i += 1;
                         continue;
                     }
+                    // one UTF-8 character = one cell (icons are 3 bytes)
+                    var ln: usize = 1;
+                    if (b >= 0xC0) {
+                        ln = if (b < 0xE0) 2 else (if (b < 0xF0) 3 else 4);
+                    }
                     if (self.row < self.rows and self.col < self.cols) {
-                        self.cell(self.row, self.col).* = b;
+                        const slot = self.cell(self.row, self.col);
+                        @memset(slot, 0);
+                        const avail = @min(ln, bytes.len - i);
+                        @memcpy(slot[0..avail], bytes[i .. i + avail]);
                         self.fg_buf[self.row * self.cols + self.col] = self.fg;
                         self.bg_buf[self.row * self.cols + self.col] = self.bg;
                     }
                     self.col += 1;
-                    i += 1;
+                    i += ln;
                 },
             }
         }
@@ -447,7 +461,7 @@ const Grid = struct {
     fn contains(self: *Grid, needle: []const u8) bool {
         var r: usize = 0;
         while (r < self.rows) : (r += 1) {
-            const row_text = self.buf[r * self.cols .. (r + 1) * self.cols];
+            const row_text = self.rowText(r);
             if (std.mem.indexOf(u8, row_text, needle) != null) return true;
         }
         return false;
@@ -458,7 +472,7 @@ const Grid = struct {
     fn containsFg(self: *Grid, needle: []const u8, fg: u32) bool {
         var r: usize = 0;
         while (r < self.rows) : (r += 1) {
-            const row_text = self.buf[r * self.cols .. (r + 1) * self.cols];
+            const row_text = self.rowText(r);
             var c: usize = 0;
             while (c + needle.len <= self.cols) : (c += 1) {
                 if (std.mem.eql(u8, row_text[c .. c + needle.len], needle)) {
@@ -469,9 +483,21 @@ const Grid = struct {
         return false;
     }
 
-    /// Raw text of one row (may contain trailing spaces).
+    /// Text of one row, compressed from the per-cell slots (each UTF-8 char
+    /// occupies one slot; the slot's bytes up to the first NUL form the char).
     fn rowText(self: *Grid, r: usize) []const u8 {
-        return self.buf[r * self.cols .. (r + 1) * self.cols];
+        const base = r * self.cols * 4;
+        var w: usize = 0;
+        var c: usize = 0;
+        while (c < self.cols and w < self.row_text_buf.len) : (c += 1) {
+            const slot = self.buf[base + c * 4 ..][0..4];
+            var k: usize = 0;
+            while (k < 4 and slot[k] != 0 and w + k < self.row_text_buf.len) : (k += 1) {
+                self.row_text_buf[w + k] = slot[k];
+            }
+            w += k;
+        }
+        return self.row_text_buf[0..w];
     }
 
     /// true if any cell on row `r` has the given packed bg color (selection
@@ -487,7 +513,7 @@ const Grid = struct {
     fn dump(self: *Grid) void {
         var r: usize = 0;
         while (r < self.rows) : (r += 1) {
-            std.debug.print("|{s}|\n", .{self.buf[r * self.cols .. (r + 1) * self.cols]});
+            std.debug.print("|{s}|\n", .{self.rowText(r)});
         }
     }
 };
@@ -4506,8 +4532,8 @@ test "gutter: relative line numbers never overlap content on deep files" {
     // numbers never run into the text
     var r: usize = 1;
     while (r < 23) : (r += 1) {
-        try std.testing.expect(grid.buf[r * 80 + 6] == 'x');
-        try std.testing.expect(grid.buf[r * 80 + 5] == ' ');
+        try std.testing.expect(grid.buf[(r * 80 + 6) * 4] == 'x');
+        try std.testing.expect(grid.buf[(r * 80 + 5) * 4] == ' ');
     }
 
     const exit_code = try sess.commandAndWaitExit(":q\r");
@@ -6458,10 +6484,10 @@ test "lsp: diagnostics — gutter mark, gl, <leader>sd list" {
             sess.used += n;
             grid.feed(sess.out[sess.used - n .. sess.used]);
         }
-        if (grid.buf[1 * grid.cols + 1] == 'E') mark = true; // gutter col 1 on screen row 1
+        if (grid.buf[(1 * grid.cols + 1) * 4] == 'E') mark = true; // gutter col 1 on screen row 1
     }
     if (!mark) {
-        std.debug.print("no gutter E mark; col1={x} col2={x}\n", .{ grid.buf[1 * grid.cols + 1], grid.buf[1 * grid.cols + 2] });
+        std.debug.print("no gutter E mark; col1={x} col2={x}\n", .{ grid.buf[(1 * grid.cols + 1) * 4], grid.buf[(1 * grid.cols + 2) * 4] });
         grid.dump();
     }
     try std.testing.expect(mark);
@@ -6982,6 +7008,113 @@ test "lsp: auto-suggest fires on '.' (trigger character, e.g. 'b.')" {
     }
     try std.testing.expect(rowContains(&grid, 1, "mockItem"));
     try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) break;
+        sess.used += n;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
+}
+
+test "lsp: auto-suggest updates the menu as you type (dynamic)" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}dyn.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const b = 1;\n");
+    }
+
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{"OZ_LSP_CMD=zig-out/bin/mock_lsp"});
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // The mock echoes the typed prefix in its labels ("mockItema"), so a
+    // changing menu proves each keystroke triggers a fresh completion request
+    // whose response is applied (not discarded as stale) AND that the client
+    // filters the server's full candidate set by the prefix (zls returns
+    // everything unfiltered — the editor must filter, like blink/nvim).
+    // "const b = 1;" is 12 chars: 'A' puts the cursor at col 12, typing 'a'
+    // → prefix "a" → "mockItema".
+    try sess.send("Aa");
+    waited = 0;
+    var first = false;
+    while (!first) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains("mockItema")) first = true;
+    }
+    if (!first) {
+        std.debug.print("first suggestion missing:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(first);
+
+    // typing 'b' → prefix "ab": the menu must show mockItemab (the
+    // suggestions follow the input, not a frozen list)
+    try sess.send("b");
+    waited = 0;
+    var updated = false;
+    while (!updated) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains("mockItemab")) updated = true;
+    }
+    if (!updated) {
+        std.debug.print("menu did not update after typing:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(updated);
+
+    // exit insert (Ctrl+e hides the still-open menu, Esc exits), then :qa
+    try sess.send("\x05\x1b");
     waited = 0;
     while (grid.contains("INSERT")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);

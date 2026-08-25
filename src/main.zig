@@ -893,8 +893,11 @@ const App = struct {
                 // Auto-suggest: typing a word character asks the LSP for
                 // candidates, and typing a trigger character (".", "::", …)
                 // asks it to resolve the context ("b." member access). The
-                // menu appears when the response lands.
+                // menu appears when the response lands. 'j' is excluded:
+                // jk is the insert-exit shortcut, and asking the server on
+                // the 'j' alone makes the menu flash between 'j' and 'k'.
                 if (!key.mods.ctrl and !key.mods.alt and !key.mods.super and
+                    key.codepoint != 'j' and
                     (isWordByte(text[0]) or self.isCompletionTriggerText(text)))
                 {
                     try self.maybeAutoComplete(text);
@@ -1375,6 +1378,18 @@ const App = struct {
             b >= 0x80;
     }
 
+    /// Case-insensitive substring match (completion filtering — loose, like
+    /// blink's fuzzy matching).
+    fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+        if (needle.len == 0) return true;
+        if (needle.len > haystack.len) return false;
+        var i: usize = 0;
+        while (i + needle.len <= haystack.len) : (i += 1) {
+            if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+        }
+        return false;
+    }
+
     /// Nerd Font glyph for an LSP CompletionItemKind (1-25); " " for unknown.
     /// Mirrors the user's nvim icons (AstroNvim style) so the completion menu
     /// looks like blink.cmp.
@@ -1505,10 +1520,37 @@ const App = struct {
         for (self.completion_words.items) |it| self.alloc.free(it.text);
         self.completion_words.clearRetainingCapacity();
         lsp_nav.parseCompletionItems(self.alloc, result, &self.completion_words) catch {};
+        // Client-side filter: servers like zls return the FULL candidate set
+        // and leave matching to the client (blink/nvim do the same via
+        // filterText/label). Substring match, case-insensitive — loose like
+        // fuzzy matching; without this the menu would show the same
+        // unfiltered list no matter what you type.
+        if (self.completion_words.items.len > 0 and self.completion_pos < self.curCursor().*) {
+            const typed_len = self.curCursor().* - self.completion_pos;
+            var typed_buf: [256]u8 = undefined;
+            if (typed_len <= 256) {
+                self.cur().pt.copyRange(self.completion_pos, typed_buf[0..typed_len]);
+                const typed = typed_buf[0..typed_len];
+                var write: usize = 0;
+                for (self.completion_words.items) |*it| {
+                    if (containsIgnoreCase(it.text, typed)) {
+                        self.completion_words.items[write] = it.*;
+                        write += 1;
+                    } else {
+                        self.alloc.free(it.text);
+                    }
+                }
+                self.completion_words.shrinkRetainingCapacity(write);
+            }
+        }
         if (self.completion_words.items.len > 0) {
             self.completion_active = true;
             // keep the user's selection when the list refreshed while typing
             if (self.completion_sel >= self.completion_words.items.len) self.completion_sel = 0;
+        } else {
+            // nothing matches the typed prefix: keep typing clean
+            self.completion_active = false;
+            self.completion_sel = 0;
         }
         return true;
     }
