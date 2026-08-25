@@ -183,6 +183,11 @@ const App = struct {
     /// Start of the word being typed when the menu opened; Enter replaces
     /// [completion_pos, cursor) with the selected word.
     completion_pos: u32 = 0,
+    /// True when the last completion request came from Ctrl+n (vs the
+    /// automatic suggest): an empty result then shows a status-bar hint so a
+    /// silent "no candidates" doesn't get mistaken for a completed accept
+    /// (whose Enter would otherwise insert a newline).
+    completion_manual: bool = false,
     /// LSP textDocument/completion response slot (filled by drain); consumed
     /// by processCompletion. Local word completion is the fallback.
     completion_slot: ?std.json.Value = null,
@@ -643,6 +648,13 @@ const App = struct {
         // Navigation location list overlay (gr / gI)
         if (self.nav_list_active) {
             if (self.navListKey(key)) return;
+        }
+
+        // A status message (e.g. "no candidates") lives until the next
+        // keystroke, like vim's message line.
+        if (self.msg) |m| {
+            self.alloc.free(m);
+            self.msg = null;
         }
 
         // Ctrl-w window commands: switch keyboard focus between split windows
@@ -1428,6 +1440,7 @@ const App = struct {
         // cursor; the response lands in completion_slot and processCompletion
         // opens the menu. Without a client we fall back to buffer words.
         if (self.lsp_client) |c| {
+            self.completion_manual = true;
             try self.requestLspCompletion(c, false);
             return;
         }
@@ -1483,6 +1496,7 @@ const App = struct {
     /// keystroke on a huge file would jitter.
     fn maybeAutoComplete(self: *App, text: []const u8) !void {
         if (self.curCursor().* == 0) return;
+        self.completion_manual = false; // auto-suggest: silent on empty
         const trigger = !isWordByte(text[0]) and self.isCompletionTriggerText(text);
         if (self.lsp_client) |c| {
             if (trigger) {
@@ -1548,9 +1562,16 @@ const App = struct {
             // keep the user's selection when the list refreshed while typing
             if (self.completion_sel >= self.completion_words.items.len) self.completion_sel = 0;
         } else {
-            // nothing matches the typed prefix: keep typing clean
+            // nothing matches the typed prefix: keep typing clean. A manual
+            // Ctrl+n with zero matches gets a status hint — otherwise the
+            // user can't tell the accept never happened and Enter quietly
+            // inserts a newline (the classic "cursor is not after the
+            // semicolon" confusion).
             self.completion_active = false;
             self.completion_sel = 0;
+            if (self.completion_manual) {
+                self.setMsg(self.alloc.dupe(u8, "no candidates") catch return true) catch {};
+            }
         }
         return true;
     }
