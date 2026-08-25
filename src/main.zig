@@ -4921,7 +4921,17 @@ const App = struct {
             .command => " COMMAND ",
         };
         const status_col = self.lineCellCol(win, cursor_line, self.curCursor().*);
-        const status = if (self.msg) |m|
+        // a completion request is in flight (zls can take many seconds on
+        // build.zig while its build_runner analyses the project) — show "…"
+        // so a slow response isn't mistaken for a dead completion that
+        // silently turns the next Enter into a newline.
+        const status = if (self.completion_slot != null)
+            try std.fmt.allocPrint(
+                a,
+                "{s} line {d}/{d} col {d}  …",
+                .{ mode_str, cursor_line + 1, line_count, status_col },
+            )
+        else if (self.msg) |m|
             try std.fmt.allocPrint(
                 a,
                 "{s} line {d}/{d} col {d}  {s}",
