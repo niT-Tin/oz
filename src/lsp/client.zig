@@ -73,6 +73,10 @@ pub const Client = struct {
     /// Whether the server advertised inlayHintProvider (from initialize).
     /// When false the editor skips inlayHint requests entirely.
     caps_inlay: bool = false,
+    /// Completion trigger characters declared by the server (e.g. "." for
+    /// member access) — auto-suggest fires on these too, like blink.cmp's
+    /// show_on_trigger_character. Owned strings; empty when undeclared.
+    completion_triggers: std.ArrayList([]u8) = .empty,
 
     proc: std.process.Child,
     stdin: std.Io.File,
@@ -250,6 +254,24 @@ pub const Client = struct {
                                 else => false,
                             };
                         }
+                        // completion trigger characters: auto-suggest fires
+                        // on these too ("b." member access, "::", …)
+                        if (caps.object.get("completionProvider")) |cp| {
+                            if (cp == .object) {
+                                if (cp.object.get("triggerCharacters")) |tc| {
+                                    if (tc == .array) {
+                                        for (tc.array.items) |ch| {
+                                            if (ch != .string) continue;
+                                            if (ch.string.len == 0) continue;
+                                            const copy = alloc.dupe(u8, ch.string) catch continue;
+                                            self.completion_triggers.append(alloc, copy) catch {
+                                                alloc.free(copy);
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -280,12 +302,25 @@ pub const Client = struct {
         // deinit), so the pending array itself is all we own.
         self.queue.deinit(self.alloc);
         self.pending.deinit(self.alloc);
+        for (self.completion_triggers.items) |t| self.alloc.free(t);
+        self.completion_triggers.deinit(self.alloc);
         if (self.argv_override) |arr| {
             if (self.argv_override_first_owned) self.alloc.free(arr[0]);
             self.alloc.free(arr);
         }
         self.alloc.free(self.uri);
         self.alloc.destroy(self);
+    }
+
+    /// True when `text` is one of the server's completion trigger characters.
+    /// Servers that support completion but declared no triggerCharacters get
+    /// the lenient "." default (member access) so `b.` still auto-suggests.
+    pub fn isCompletionTrigger(self: *const Client, text: []const u8) bool {
+        for (self.completion_triggers.items) |t| {
+            if (std.mem.eql(u8, t, text)) return true;
+        }
+        if (self.completion_triggers.items.len == 0 and std.mem.eql(u8, text, ".")) return true;
+        return false;
     }
 
     // ---- params lifetime ----

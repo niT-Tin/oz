@@ -810,14 +810,16 @@ const App = struct {
                     try self.acceptCompletion();
                     return;
                 }
-                // Word-char input keeps the menu open — the prefix grows and
-                // maybeAutoComplete below re-requests with the new prefix.
-                // Anything else (space, backspace, Ctrl+w, j/k, Ctrl+c…)
-                // dismisses the menu, then falls through to the normal insert
-                // handling so jk exit, Esc exit and text entry behave as usual.
-                const is_word_input = key.text != null and key.text.?.len > 0 and
-                    isWordByte(key.text.?[0]) and !key.mods.ctrl and !key.mods.alt and !key.mods.super;
-                if (!is_word_input) self.closeCompletion();
+                // Word-char or trigger-char input keeps the menu open — the
+                // prefix grows / the trigger context changes and
+                // maybeAutoComplete below re-requests. Anything else (space,
+                // backspace, Ctrl+w, j/k, Ctrl+c…) dismisses the menu, then
+                // falls through to the normal insert handling so jk exit,
+                // Esc exit and text entry behave as usual.
+                const is_comp_input = key.text != null and key.text.?.len > 0 and
+                    !key.mods.ctrl and !key.mods.alt and !key.mods.super and
+                    (isWordByte(key.text.?[0]) or self.isCompletionTriggerText(key.text.?));
+                if (!is_comp_input) self.closeCompletion();
             }
             if (key.codepoint == vaxis.Key.escape or (key.codepoint == 'c' and key.mods.ctrl)) {
                 self.exitInsert();
@@ -889,10 +891,13 @@ const App = struct {
                     try self.requestNav("textDocument/signatureHelp", .signature);
                 }
                 // Auto-suggest: typing a word character asks the LSP for
-                // candidates (or opens buffer-word completion on small
-                // non-LSP files). The menu appears when the response lands.
-                if (isWordByte(text[0]) and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
-                    try self.maybeAutoComplete();
+                // candidates, and typing a trigger character (".", "::", …)
+                // asks it to resolve the context ("b." member access). The
+                // menu appears when the response lands.
+                if (!key.mods.ctrl and !key.mods.alt and !key.mods.super and
+                    (isWordByte(text[0]) or self.isCompletionTriggerText(text)))
+                {
+                    try self.maybeAutoComplete(text);
                 }
                 return;
             }
@@ -1408,7 +1413,7 @@ const App = struct {
         // cursor; the response lands in completion_slot and processCompletion
         // opens the menu. Without a client we fall back to buffer words.
         if (self.lsp_client) |c| {
-            try self.requestLspCompletion(c);
+            try self.requestLspCompletion(c, false);
             return;
         }
         try self.collectCompletionWords(false);
@@ -1419,13 +1424,17 @@ const App = struct {
 
     /// Send a textDocument/completion request at the cursor (the menu opens
     /// when the response lands in processCompletion). Shared by Ctrl+n and
-    /// the insert-mode auto-suggest.
-    fn requestLspCompletion(self: *App, c: anytype) !void {
+    /// the insert-mode auto-suggest. `no_prefix` is true after a trigger
+    /// character ("b."): there is no word prefix — completion_pos is the
+    /// cursor and accept inserts at it (the server resolves members etc.).
+    fn requestLspCompletion(self: *App, c: anytype, no_prefix: bool) !void {
         // remember the start of the word being typed so acceptCompletion
         // replaces just [completion_pos, cursor) with the chosen item
         var pos = self.curCursor().*;
-        while (pos > 0 and isWordByte(self.cur().pt.byteAt(pos - 1))) pos -= 1;
-        if (pos == self.curCursor().*) return;
+        if (!no_prefix) {
+            while (pos > 0 and isWordByte(self.cur().pt.byteAt(pos - 1))) pos -= 1;
+            if (pos == self.curCursor().*) return;
+        }
         self.completion_pos = pos;
         const uri = lsp_types.pathToFileUri(self.alloc, self.cur().path orelse return) catch return;
         defer self.alloc.free(uri);
@@ -1437,18 +1446,41 @@ const App = struct {
         self.completion_req_seq = self.edit_seq;
     }
 
-    /// Insert-mode auto-suggest: after typing a word character, ask the LSP
-    /// for completion candidates at the cursor (the response opens/updates the
-    /// menu; stale responses are discarded in processCompletion). Without an
-    /// LSP, buffer-word completion is triggered only for small documents — a
-    /// full-buffer scan per keystroke on a huge file would jitter.
-    fn maybeAutoComplete(self: *App) !void {
+    /// True when the just-typed `text` is one of the server's completion
+    /// trigger characters (e.g. "." after "b" → "b." member access), or the
+    /// tail of a multi-char trigger ("-" + ">" → "->"). No LSP → false.
+    fn isCompletionTriggerText(self: *App, text: []const u8) bool {
+        const c = self.lsp_client orelse return false;
+        if (c.isCompletionTrigger(text)) return true;
+        if (text.len == 1 and self.curCursor().* >= 2) {
+            var two: [2]u8 = undefined;
+            self.cur().pt.copyRange(self.curCursor().* - 2, two[0..2]);
+            if (c.isCompletionTrigger(two[0..2])) return true;
+        }
+        return false;
+    }
+
+    /// Insert-mode auto-suggest: after typing a word character or a trigger
+    /// character (".", "::", …), ask the LSP for candidates at the cursor
+    /// (the response opens/updates the menu; stale responses are discarded in
+    /// processCompletion). Without an LSP, buffer-word completion is triggered
+    /// only for word prefixes on small documents — a full-buffer scan per
+    /// keystroke on a huge file would jitter.
+    fn maybeAutoComplete(self: *App, text: []const u8) !void {
         if (self.curCursor().* == 0) return;
-        if (!isWordByte(self.cur().pt.byteAt(self.curCursor().* - 1))) return;
+        const trigger = !isWordByte(text[0]) and self.isCompletionTriggerText(text);
         if (self.lsp_client) |c| {
-            try self.requestLspCompletion(c);
+            if (trigger) {
+                // no word prefix: the server resolves the trigger context
+                self.completion_pos = self.curCursor().*;
+                try self.requestLspCompletion(c, true);
+                return;
+            }
+            if (!isWordByte(self.cur().pt.byteAt(self.curCursor().* - 1))) return;
+            try self.requestLspCompletion(c, false);
             return;
         }
+        if (trigger) return; // buffer words need a prefix
         if (self.cur().pt.len() > 16 * 1024) return;
         const was_active = self.completion_active;
         try self.collectCompletionWords(was_active);

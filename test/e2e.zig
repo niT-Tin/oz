@@ -6905,6 +6905,106 @@ test "lsp: auto-suggest — typing a word char opens the menu (blink style)" {
     try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
 }
 
+test "lsp: auto-suggest fires on '.' (trigger character, e.g. 'b.')" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}trig.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const b = 1;\n");
+    }
+
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{"OZ_LSP_CMD=zig-out/bin/mock_lsp"});
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // 'A' then '.' — no word character is typed in this session, so the only
+    // way the menu can open is the trigger-character path (the mock declares
+    // triggerCharacters ["."]; the client asks the server after "b.").
+    try sess.send("A.");
+    waited = 0;
+    var listed = false;
+    while (!listed) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains("mockItem")) listed = true;
+    }
+    if (!listed) {
+        std.debug.print("trigger-char menu missing:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(listed);
+
+    // Enter accepts (inserts at the cursor, after the '.'); Esc exits insert
+    // (the menu is closed by accept, so one Esc suffices), then :qa.
+    try sess.send("\r");
+    waited = 0;
+    while (!rowContains(&grid, 1, "mockItem")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (rowContains(&grid, 1, "mockItem")) break;
+    }
+    if (!rowContains(&grid, 1, "mockItem")) {
+        std.debug.print("trigger accept failed:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(rowContains(&grid, 1, "mockItem"));
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) break;
+        sess.used += n;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
+}
+
 test "lsp: signature help — typing ( shows the callee signature" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -7108,9 +7208,10 @@ test "lsp: editing — rename, format, inlay hints, outline" {
         grid.dump();
     }
     try std.testing.expect(hint_kept);
-    // back to normal for the rename step below ('.' is not a word char, so
-    // no completion menu is open and a single Esc exits insert)
-    try sess.send("\x1b");
+    // back to normal for the rename step below. '.' is a completion trigger
+    // (the mock declares triggerCharacters ["."]), so the menu opened — Ctrl+e
+    // hides it, then Esc exits insert.
+    try sess.send("\x05\x1b");
     waited = 0;
     while (grid.contains("INSERT")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
