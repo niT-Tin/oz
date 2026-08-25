@@ -368,7 +368,8 @@ fn buildCompletionResult(a: std.mem.Allocator) !std.json.Value {
 fn buildHoverResult(a: std.mem.Allocator) !std.json.Value {
     var contents = try std.json.ObjectMap.init(a, &.{}, &.{});
     try contents.put(a, "kind", .{ .string = "markdown" });
-    try contents.put(a, "value", .{ .string = "mock hover" });
+    // Multi-line hover: exercises the floating window's row wrapping.
+    try contents.put(a, "value", .{ .string = "mock hover\nsecond line\nthird line" });
     var result = try std.json.ObjectMap.init(a, &.{}, &.{});
     try result.put(a, "contents", .{ .object = contents });
     return .{ .object = result };
@@ -820,7 +821,7 @@ test "hello: hover returns the canned markdown" {
     try testing.expectEqual(@as(?u64, 3), resp.id);
     const contents = resp.result.?.object.get("contents").?;
     try testing.expectEqualStrings("markdown", contents.object.get("kind").?.string);
-    try testing.expectEqualStrings("mock hover", contents.object.get("value").?.string);
+    try testing.expectEqualStrings("mock hover\nsecond line\nthird line", contents.object.get("value").?.string);
 }
 
 test "hello: definition returns a location, unknown methods still null" {
@@ -980,5 +981,5 @@ test "full message cycle through frame functions and handleMessage" {
     try testing.expectEqual(@as(?u64, 9), rmsg.id);
     const contents = rmsg.result.?.object.get("contents").?;
     try testing.expectEqualStrings("markdown", contents.object.get("kind").?.string);
-    try testing.expectEqualStrings("mock hover", contents.object.get("value").?.string);
+    try testing.expectEqualStrings("mock hover\nsecond line\nthird line", contents.object.get("value").?.string);
 }

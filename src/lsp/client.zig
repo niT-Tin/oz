@@ -172,6 +172,11 @@ pub const Client = struct {
             .argv = argv,
             .stdin = .pipe,
             .stdout = .pipe,
+            // Server stderr must NOT leak onto the editor's terminal: clangd
+            // logs its indexing to stderr, which would otherwise interleave
+            // with the TUI frames (and its own exit message would print over
+            // the screen).
+            .stderr = .ignore,
         }) catch |e| {
             if (argv_override) |arr| {
                 if (argv_first_owned) alloc.free(arr[0]);

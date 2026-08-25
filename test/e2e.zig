@@ -6456,7 +6456,7 @@ test "lsp: navigation — K hover, gd jump, gr list, gs signature" {
     // floating window shows "mock hover" (the main loop is event-driven).
     // Cursor motion dismisses the hover (nvim behavior) — asserted below via
     // the 'j' that also advances to line 2 for the gd step.
-    try sess.send("Kj");
+    try sess.send("K");
     waited = 0;
     while (!grid.contains("mock hover")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
@@ -6474,6 +6474,26 @@ test "lsp: navigation — K hover, gd jump, gr list, gs signature" {
         grid.dump();
     }
     try std.testing.expect(grid.contains("mock hover"));
+    // Multi-line hover: the floating window must show all rows (the mock
+    // returns "mock hover\nsecond line\nthird line"), not just the first.
+    waited = 0;
+    while (!grid.contains("second line")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains("second line")) break;
+    }
+    if (!grid.contains("second line")) {
+        std.debug.print("hover second line missing:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("second line"));
+    try std.testing.expect(grid.contains("third line"));
 
     // gd → mock returns a location at line 1. The wake mechanism drains the
     // response without a keypress: the cursor jumps to line 1 (status

@@ -29,7 +29,7 @@ const status_row_count: u32 = 1;
 const NavAction = enum { none, hover, definition, declaration, references, implementation, signature };
 
 /// An inlay hint: dim label shown inline at (line, character).
-const InlayHint = struct { line: u32, character: u32, label: []u8 };
+const InlayHint = struct { line: u32, character: u32, label: []const u8 };
 
 const App = struct {
     /// One open document. `pt`/`history` own their allocations; the struct is
@@ -1567,8 +1567,11 @@ const App = struct {
             const text: ?[]const u8 = switch (label) {
                 .string => |str| str,
                 .array => blk: {
+                    // InlayHintPart[] — concatenate the `value` strings. Must
+                    // transfer ownership (toOwnedSlice) — returning out.items
+                    // and letting a defer deinit free the buffer would leave a
+                    // dangling slice (rendered as 0xAA garbage).
                     var out = std.ArrayList(u8).empty;
-                    defer out.deinit(self.alloc);
                     for (label.array.items) |part| {
                         if (part == .object) {
                             if (part.object.get("value")) |val| {
@@ -1576,8 +1579,14 @@ const App = struct {
                             }
                         }
                     }
-                    if (out.items.len == 0) break :blk null;
-                    break :blk out.items;
+                    if (out.items.len == 0) {
+                        out.deinit(self.alloc);
+                        break :blk null;
+                    }
+                    break :blk out.toOwnedSlice(self.alloc) catch {
+                        out.deinit(self.alloc);
+                        break :blk null;
+                    };
                 },
                 else => null,
             };
@@ -1586,7 +1595,13 @@ const App = struct {
             const position = hint.object.get("position") orelse continue;
             const line = lsp_nav.posLine(position) orelse continue;
             const character = lsp_nav.posCharacter(position) orelse continue;
-            const copy = self.alloc.dupe(u8, t) catch continue;
+            // The array branch owns its slice (toOwnedSlice); the string
+            // branch borrows from `result` (freed below), so only that one
+            // needs a copy.
+            const copy = switch (label) {
+                .array => t,
+                else => self.alloc.dupe(u8, t) catch continue,
+            };
             self.inlay_hints.append(self.alloc, .{ .line = line, .character = character, .label = copy }) catch {
                 self.alloc.free(copy);
                 continue;
@@ -2084,6 +2099,32 @@ const App = struct {
     fn setMsg(self: *App, owned: []u8) !void {
         if (self.msg) |m| self.alloc.free(m);
         self.msg = owned;
+    }
+
+    /// Leading spaces/tabs of `line` (owned copy) — used to auto-indent new
+    /// lines opened with o/O.
+    fn leadingIndent(self: *App, line: u32) ![]u8 {
+        const pt = &self.cur().pt;
+        const start = pt.lineStart(line);
+        const len = pt.lineLen(line);
+        var n: usize = 0;
+        while (n < len) : (n += 1) {
+            const c = pt.byteAt(start + @as(u32, @intCast(n)));
+            if (c != ' ' and c != '\t') break;
+        }
+        const out = try self.alloc.alloc(u8, n);
+        pt.copyRange(start, out);
+        return out;
+    }
+
+    /// Drop stale inlay hints after any edit: their line/column offsets refer
+    /// to the pre-edit text, so a leftover hint would render at the wrong spot
+    /// (an inserted line pushes every hint down by one). The auto-refresh in
+    /// the run loop re-requests hints for the new viewport.
+    fn invalidateInlayHints(self: *App) void {
+        for (self.inlay_hints.items) |*h| self.alloc.free(h.label);
+        self.inlay_hints.clearRetainingCapacity();
+        self.inlay_view_top = null;
     }
 
     /// Inlay hints for one line, sorted by insertion column (ascending), as
@@ -3217,6 +3258,11 @@ const App = struct {
 
     fn markDirty(self: *App) void {
         self.cur().dirty = true;
+        // Editing invalidates inlay hints: their line/column offsets refer to
+        // the pre-edit text, so a stale hint would render at the wrong spot
+        // (e.g. an inserted line pushes every hint down by one). Drop them and
+        // let the auto-refresh re-request for the new viewport.
+        self.invalidateInlayHints();
         // LSP text sync: push the new document content to the server. Cheap
         // enough per keystroke for now (debounce lands with the M2 UI work).
         if (self.lsp_client) |c| {
@@ -3403,13 +3449,21 @@ const App = struct {
                 self.beginInsertSession();
                 self.cur().history.beginGroup();
                 try self.cur().history.record(&self.cur().pt, pos, 0, "\n");
-                self.curCursor().* = pos + 1;
+                // Auto-indent: copy the current line's leading whitespace onto
+                // the new line so typing continues at the same indent level.
+                const indent = try self.leadingIndent(line);
+                defer self.alloc.free(indent);
+                try self.cur().history.record(&self.cur().pt, pos + 1, 0, indent);
+                self.curCursor().* = pos + 1 + @as(u32, @intCast(indent.len));
                 self.in_insert = true;
                 self.state.mode = .insert;
                 // structural edit (newline): force a full reparse next frame —
                 // incremental parsing of a newline is where highlight drift
                 // shows up ("o then type then jk leaves gray chars")
                 self.cur().syntax_revision = std.math.maxInt(u64);
+                // Notify LSP (the new line + indent changed the document) and
+                // drop stale inlay hints so the next request matches the text.
+                self.markDirty();
             },
             .insert_line_before => {
                 // O: new line above, cursor on it (same open-group semantics)
@@ -3418,11 +3472,15 @@ const App = struct {
                 self.beginInsertSession();
                 self.cur().history.beginGroup();
                 try self.cur().history.record(&self.cur().pt, pos, 0, "\n");
-                self.curCursor().* = pos;
+                const indent = try self.leadingIndent(line);
+                defer self.alloc.free(indent);
+                try self.cur().history.record(&self.cur().pt, pos, 0, indent);
+                self.curCursor().* = pos + @as(u32, @intCast(indent.len));
                 self.in_insert = true;
                 self.state.mode = .insert;
                 // structural edit (newline): force a full reparse next frame
                 self.cur().syntax_revision = std.math.maxInt(u64);
+                self.markDirty();
             },
             .visual_char => {
                 self.state.mode = .visual_char;
@@ -3894,7 +3952,13 @@ const App = struct {
             // is spliced into the text at its character offset (the token it
             // annotates ends there), so `const x = foo()` renders as
             // `const x: i32 = foo()` like nvim — not moved to end of line.
-            const line_hints = try self.lineHints(a, line);
+            // Suppressed while inserting: the half-typed line's hint offsets
+            // are stale (an o newline already invalidated them) and would
+            // render at the wrong column next to the cursor.
+            const line_hints = if (self.state.mode == .insert)
+                try a.alloc(InlayHint, 0)
+            else
+                try self.lineHints(a, line);
             var hint_i: usize = 0;
             var col: u32 = 0;
             while (col < n) {
@@ -4317,25 +4381,39 @@ const App = struct {
         }
 
         // LSP hover / signature floating window: a small box below the
-        // cursor line (≤6 rows, ≤60 cols) showing nav_hover_text.
+        // cursor line (≤6 rows, ≤60 cols) showing nav_hover_text, wrapping
+        // on newlines so multi-line hover (markdown blocks etc.) is readable.
         if (self.nav_hover_text) |htext| {
             if (htext.len > 0) {
                 const h_line = self.cur().pt.lineOf(self.curCursor().*);
+                const hcols: u32 = 60;
+                const hrows: u32 = 6;
                 var start_row = h_line - self.curViewTop().* + cur_rect.row + 1;
-                const hcols: u32 = @min(@as(u32, @intCast(htext.len)), 60);
-                const hrows: u32 = 1;
                 if (start_row + hrows >= height) {
                     start_row = h_line - self.curViewTop().* + cur_rect.row - hrows;
                 }
-                const seg = [_]vaxis.Segment{.{
-                    .text = htext[0..@min(htext.len, hcols)],
-                    .style = .{ .bg = .{ .rgb = .{ 29, 32, 47 } }, .fg = .{ .rgb = .{ 192, 202, 245 } } },
-                }};
-                _ = win.print(&seg, .{
-                    .row_offset = @intCast(start_row),
-                    .col_offset = @intCast(cur_rect.col + gutter + 1),
-                    .wrap = .none,
-                });
+                // split the text into up to hrows lines of ≤hcols chars
+                var remaining = htext;
+                var r: u32 = 0;
+                while (r < hrows and remaining.len > 0) : (r += 1) {
+                    const nl = std.mem.indexOfScalar(u8, remaining, '\n');
+                    const line_len = if (nl) |i| i else remaining.len;
+                    const shown = @min(line_len, hcols);
+                    const seg = [_]vaxis.Segment{.{
+                        .text = remaining[0..shown],
+                        .style = .{ .bg = .{ .rgb = .{ 29, 32, 47 } }, .fg = .{ .rgb = .{ 192, 202, 245 } } },
+                    }};
+                    _ = win.print(&seg, .{
+                        .row_offset = @intCast(start_row + r),
+                        .col_offset = @intCast(cur_rect.col + gutter + 1),
+                        .wrap = .none,
+                    });
+                    if (nl) |i| {
+                        remaining = remaining[@min(i + 1, remaining.len)..];
+                    } else {
+                        remaining = remaining[remaining.len..];
+                    }
+                }
             }
         }
 
@@ -4409,7 +4487,9 @@ const App = struct {
             }
             // Auto-refresh inlay hints when the view scrolls (LSP available
             // and the visible top line changed since the last request).
-            if (self.lsp_client != null) {
+            // Skipped in insert mode: hints would sit on the half-typed line
+            // and any edit after o already invalidated them.
+            if (self.lsp_client != null and self.state.mode != .insert) {
                 const top = self.curViewTop().*;
                 if (self.inlay_view_top == null or self.inlay_view_top.? != top) {
                     self.inlay_view_top = top;
