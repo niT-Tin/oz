@@ -7138,6 +7138,109 @@ test "lsp: auto-suggest updates the menu as you type (dynamic)" {
     try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
 }
 
+test "lsp: accepting a snippet candidate inserts its clean label" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}snp.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const a = 1;\nmo");
+    }
+
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{"OZ_LSP_CMD=zig-out/bin/mock_lsp"});
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // Ctrl+n at "mo" shows three items; the third (mockSnippet) is a snippet
+    // candidate whose textEdit.newText embeds ${1:args} placeholders. The
+    // editor must degrade it to its plain label on accept — otherwise the
+    // text would be corrupted with placeholder syntax.
+    try sess.send("jjA\x0e");
+    waited = 0;
+    var listed = false;
+    while (!listed) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains("mockSnippet")) listed = true;
+    }
+    if (!listed) {
+        std.debug.print("snippet candidate missing:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(listed);
+
+    // ↓↓ → third item → Enter accepts "mockSnippet" (clean label, no ${1:)
+    try sess.send("\x1b[B\x1b[B\r");
+    waited = 0;
+    while (!rowContains(&grid, 2, "mockSnippet")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (rowContains(&grid, 2, "mockSnippet")) break;
+    }
+    if (!rowContains(&grid, 2, "mockSnippet") or grid.contains("${1:")) {
+        std.debug.print("snippet accept corrupted the text:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(rowContains(&grid, 2, "mockSnippet"));
+    try std.testing.expect(!grid.contains("${1:")); // no placeholder garbage
+
+    // exit insert, then :qa
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) break;
+        sess.used += n;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
+}
+
 test "lsp: signature help — typing ( shows the callee signature" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;

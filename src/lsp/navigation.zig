@@ -220,18 +220,35 @@ pub fn parseCompletionItems(alloc: std.mem.Allocator, result: std.json.Value, ou
     if (items != .array) return;
     for (items.array.items) |item| {
         if (item != .object) continue;
+        // Snippet candidates (insertTextFormat=2) embed ${n:...} placeholder
+        // syntax this editor cannot expand; inserting it verbatim would
+        // corrupt the text and leave the cursor stranded mid-word (zls's
+        // standardTargetOptions is such a snippet). Fall back to the plain
+        // label so the accept inserts clean text and the cursor lands after
+        // it.
+        const is_snippet: bool = blk: {
+            const f = item.object.get("insertTextFormat") orelse break :blk false;
+            const fv: ?i64 = switch (f) {
+                .integer => |n| n,
+                .number_string => |s| std.fmt.parseInt(i64, s, 10) catch null,
+                else => null,
+            };
+            break :blk fv == 2;
+        };
         // prefer insertText / textEdit.newText, fall back to label
         var text: ?[]const u8 = null;
-        if (item.object.get("textEdit")) |te| {
-            if (te == .object) {
-                if (te.object.get("newText")) |nt| {
-                    if (nt == .string) text = nt.string;
+        if (!is_snippet) {
+            if (item.object.get("textEdit")) |te| {
+                if (te == .object) {
+                    if (te.object.get("newText")) |nt| {
+                        if (nt == .string) text = nt.string;
+                    }
                 }
             }
-        }
-        if (text == null) {
-            if (item.object.get("insertText")) |it| {
-                if (it == .string) text = it.string;
+            if (text == null) {
+                if (item.object.get("insertText")) |it| {
+                    if (it == .string) text = it.string;
+                }
             }
         }
         if (text == null) {
@@ -379,4 +396,25 @@ test "navigation: completion items from CompletionList and raw array" {
     try std.testing.expectEqual(@as(usize, 2), out2.items.len);
     try std.testing.expectEqualStrings("x", out2.items[0].text);
     try std.testing.expectEqualStrings("y", out2.items[1].text);
+}
+
+test "navigation: snippet completion items degrade to their label" {
+    const alloc = std.testing.allocator;
+    // insertTextFormat=2 (Snippet): the newText embeds ${n:...} placeholders
+    // this editor can't expand — the accept must insert the plain label
+    // instead, or the text gets corrupted and the cursor stranded mid-word.
+    const j = "{\"items\":[{\"label\":\"standardTargetOptions\",\"insertTextFormat\":2,\"textEdit\":{\"newText\":\"standardTargetOptions(${1:args: StandardTargetOptionsArgs})\"}},{\"label\":\"plain\",\"insertTextFormat\":2,\"insertText\":\"plain(${1:x})\"}]}";
+    var p = try std.json.parseFromSlice(std.json.Value, alloc, j, .{ .allocate = .alloc_always });
+    defer p.deinit();
+    var out = std.ArrayList(CompletionItem).empty;
+    defer {
+        for (out.items) |it| alloc.free(it.text);
+        out.deinit(alloc);
+    }
+    try parseCompletionItems(alloc, p.value, &out);
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    // snippet with textEdit: label wins over the placeholder-laden newText
+    try std.testing.expectEqualStrings("standardTargetOptions", out.items[0].text);
+    // snippet without textEdit: label wins over insertText too
+    try std.testing.expectEqualStrings("plain", out.items[1].text);
 }

@@ -436,9 +436,19 @@ fn buildCompletionResult(a: std.mem.Allocator, prefix: []const u8) !std.json.Val
     const item2_label = try std.fmt.allocPrint(a, "mockAlpha{s}", .{prefix});
     try item2.put(a, "label", .{ .string = item2_label });
     try item2.put(a, "kind", .{ .integer = 5 }); // CompletionItemKind.Field
+    // a snippet candidate: insertTextFormat=2 with ${n:...} placeholder text.
+    // The client must degrade to the plain label on accept.
+    var item3 = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try item3.put(a, "label", .{ .string = "mockSnippet" });
+    try item3.put(a, "kind", .{ .integer = 15 }); // CompletionItemKind.Snippet
+    try item3.put(a, "insertTextFormat", .{ .integer = 2 });
+    var edit = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try edit.put(a, "newText", .{ .string = "mockSnippet(${1:args})" });
+    try item3.put(a, "textEdit", .{ .object = edit });
     var items = std.json.Array.init(a);
     try items.append(.{ .object = item });
     try items.append(.{ .object = item2 });
+    try items.append(.{ .object = item3 });
     var result = try std.json.ObjectMap.init(a, &.{}, &.{});
     try result.put(a, "items", .{ .array = items });
     return .{ .object = result };
