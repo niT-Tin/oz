@@ -1027,13 +1027,22 @@ const App = struct {
         self.prev_insert_key = null;
         self.closeCompletion();
         self.endInsertSession();
-        // Force a full reparse on the next render: incremental edits during
-        // the insert session may have drifted the highlight tree (the "some
-        // characters turn comment-gray after jk" bug). A full reparse on
-        // every insert exit guarantees correct colors once back in normal.
-        self.cur().syntax_revision = std.math.maxInt(u64);
-        // The session's inlay hints were kept aligned in place (no per-keystroke
-        // flicker); now that typing stopped, fetch exact hints for the new text.
+        // The old code forced a full reparse here (syntax_revision = maxInt)
+        // to avoid the "chars turn comment-gray after jk" drift. That guard
+        // was belt-and-suspenders: the drift comes from multi-edit structural
+        // ops (o/O insert a newline AND indentation as two records in one
+        // frame), and THOSE sites already force a full reparse themselves.
+        // A plain typing session (including jk's trailing 'j' deletion) is a
+        // sequence of single-record edits — the incremental path is exact for
+        // them, and forcing a full reparse on every insert exit made large
+        // files visibly flash/stutter the frame after jk. Leave the revision
+        // alone; visibleSpansFor takes the incremental path when it can.
+        // Fetch exact hints for the new text: the session's in-place shifts
+        // are only approximations, and a stale hint from the pre-edit text
+        // would render at a wrong column (mock inlay responses land mid-
+        // insert and race the shifts). Clear and let the run loop re-request;
+        // on a local LSP the reply lands within a frame, so this does not
+        // visibly flash (the old full-reparse on every exit did).
         self.invalidateInlayHints();
     }
 
@@ -5443,28 +5452,48 @@ const App = struct {
         // cursor line (≤6 rows, ≤60 cols) showing nav_hover_text, wrapping
         // on newlines so multi-line hover (markdown blocks etc.) is readable.
         // Styled like nvim's floating windows: rounded border, title bar.
+        // Every cell inside the box carries bg_float (including the border
+        // and the padding after short lines) so the panel is a solid,
+        // theme-colored block — never gaps of the editor background.
         if (self.nav_hover_text) |htext| {
             if (htext.len > 0) {
                 const h_line = self.cur().pt.lineOf(self.curCursor().*);
                 const hcols: u32 = 60;
-                const hrows: u32 = 6;
+                // the box hugs the text: its height is the number of wrapped
+                // lines, capped at 6 so a huge hover never covers the buffer
+                var hrows: u32 = 1;
+                for (htext) |c| {
+                    if (c == '\n') hrows += 1;
+                }
+                hrows = @min(hrows, 6);
                 var start_row = h_line - self.curViewTop().* + cur_rect.row + 1;
                 if (start_row + hrows >= height) {
                     start_row = (h_line - self.curViewTop().* + cur_rect.row) -| hrows;
                 }
                 const col0 = cur_rect.col + gutter + 1;
-                const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint } };
+                const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
                 const bg_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } };
                 const border = "│";
                 const tl = "╭";
                 const tr = "╮";
                 const bl = "╰";
                 const br = "╯";
+                // one full interior row: `text` (≤ hcols cells) right-padded
+                // with bg_float so the panel background is continuous
+                const full_row = struct {
+                    fn build(a2: std.mem.Allocator, text: []const u8, cols: u32) ![]u8 {
+                        const row = try a2.alloc(u8, cols);
+                        @memset(row, ' ');
+                        const n = @min(text.len, @as(usize, @intCast(cols)));
+                        @memcpy(row[0..n], text[0..n]);
+                        return row;
+                    }
+                };
                 // top border
                 {
                     const seg = [_]vaxis.Segment{
                         .{ .text = tl, .style = border_style },
-                        .{ .text = " " ** 0, .style = border_style },
+                        .{ .text = "─", .style = border_style },
                     };
                     _ = win.print(&seg, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(col0), .wrap = .none });
                     var cx: u32 = 1;
@@ -5481,34 +5510,22 @@ const App = struct {
                     }};
                     _ = win.print(&rseg, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(col0 + hcols + 1), .wrap = .none });
                 }
-                // split the text into up to hrows lines of ≤hcols chars
+                // split the text into up to hrows lines of ≤hcols chars; lines
+                // that run past the box are clipped, and leftover rows (when
+                // the text is shorter than the box) stay filled with bg_float
                 var remaining = htext;
                 var r: u32 = 0;
-                while (r < hrows and remaining.len > 0) : (r += 1) {
-                    // left border
-                    const lseg = [_]vaxis.Segment{.{
-                        .text = border,
-                        .style = border_style,
-                    }};
-                    _ = win.print(&lseg, .{ .row_offset = @intCast(start_row + 1 + r), .col_offset = @intCast(col0), .wrap = .none });
+                while (r < hrows) : (r += 1) {
                     const nl = std.mem.indexOfScalar(u8, remaining, '\n');
                     const line_len = if (nl) |i| i else remaining.len;
-                    const shown = @min(line_len, hcols);
-                    const seg = [_]vaxis.Segment{.{
-                        .text = remaining[0..shown],
-                        .style = bg_style,
-                    }};
-                    _ = win.print(&seg, .{
-                        .row_offset = @intCast(start_row + 1 + r),
-                        .col_offset = @intCast(col0 + 1),
-                        .wrap = .none,
-                    });
-                    // right border
-                    const rseg = [_]vaxis.Segment{.{
-                        .text = border,
-                        .style = border_style,
-                    }};
-                    _ = win.print(&rseg, .{ .row_offset = @intCast(start_row + 1 + r), .col_offset = @intCast(col0 + hcols + 1), .wrap = .none });
+                    const shown = @min(line_len, @as(usize, @intCast(hcols)));
+                    const row = try full_row.build(a, remaining[0..shown], hcols);
+                    const seg = [_]vaxis.Segment{
+                        .{ .text = border, .style = border_style },
+                        .{ .text = row, .style = bg_style },
+                        .{ .text = border, .style = border_style },
+                    };
+                    _ = win.print(&seg, .{ .row_offset = @intCast(start_row + 1 + r), .col_offset = @intCast(col0), .wrap = .none });
                     if (nl) |i| {
                         remaining = remaining[@min(i + 1, remaining.len)..];
                     } else {

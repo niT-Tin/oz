@@ -510,6 +510,17 @@ const Grid = struct {
         return false;
     }
 
+    /// true if EVERY cell on row `r` has the given bg — used to assert a
+    /// floating window's panel is a solid theme-colored block (no gaps of
+    /// editor background at the row's right edge).
+    fn rowAllBg(self: *Grid, r: usize, bg: u32) bool {
+        var c: usize = 0;
+        while (c < self.cols) : (c += 1) {
+            if (self.bg_buf[r * self.cols + c] != bg) return false;
+        }
+        return true;
+    }
+
     fn dump(self: *Grid) void {
         var r: usize = 0;
         while (r < self.rows) : (r += 1) {
@@ -2562,6 +2573,80 @@ test "tree-sitter: zig keywords/comments/strings get syntax colors" {
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "tree-sitter: colors stay correct after o + typing + jk exit" {
+    // Regression for the "chars turn comment-gray after jk" drift: after an
+    // 'o' (structural edit) + typing + jk exit, the incremental reparse must
+    // still color a keyword gold. exitInsert no longer forces a full reparse
+    // on every insert exit (that made the frame after jk flash on large
+    // files); the structural-op sites still force one.
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}drift.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const x = 1;\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // o opens a line, type a keyword, then jk exits insert (removing the 'j')
+    try sess.send("ofn main\n");
+    waited = 0;
+    while (!grid.contains("fn main")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("fn main"));
+    // jk: the 'k' removes the just-typed 'j' and exits to normal
+    try sess.send("jk");
+    waited = 0;
+    while (grid.contains("INSERT")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("INSERT"));
+    // the new line's "fn" keyword must still be gold, not drifted to comment
+    // gray (kanagawa keyword fg 149,127,184)
+    try std.testing.expect(grid.containsFg("fn", packRgb(149, 127, 184)));
+
+    const exit_code2 = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code2);
 }
 
 test "tree-sitter: files over the size limit get no highlight pass" {
@@ -7041,6 +7126,43 @@ test "lsp: navigation — K hover, gd jump, gr list, gs signature" {
     }
     try std.testing.expect(grid.contains("second line"));
     try std.testing.expect(grid.contains("third line"));
+    // The panel must be a solid theme-colored block: the row holding
+    // "second line" (short text, 11 chars) has its padding cells past the
+    // text filled with bg_float (0x223249), not the editor background —
+    // the "edge not covered by the theme" bug. Check the region between the
+    // two │ borders of that hover row.
+    {
+        var r: usize = 0;
+        var found_row: ?usize = null;
+        while (r < grid.rows) : (r += 1) {
+            if (std.mem.indexOf(u8, grid.rowText(r), "second line") != null) {
+                found_row = r;
+                break;
+            }
+        }
+        if (found_row) |fr| {
+            // The hover row is "│" + 60 content cells + "│". Locate the left
+            // border: rowText is ASCII up to it (gutter digits), so its byte
+            // offset is the box's first cell.
+            const row_text = grid.rowText(fr);
+            const left = std.mem.indexOf(u8, row_text, "│") orelse {
+                std.debug.print("hover row has no left border:\n", .{});
+                grid.dump();
+                return error.TestUnexpectedResult;
+            };
+            // Every cell of the box (borders + text + padding after a short
+            // line) must be bg_float — no editor-background gap at the edge.
+            const hline_fg: u32 = packRgb(0x22, 0x32, 0x49);
+            var c: usize = left;
+            while (c < left + 62) : (c += 1) {
+                if (grid.bg_buf[fr * grid.cols + c] != hline_fg) {
+                    std.debug.print("hover row cell {d} not bg_float (bg={x})\n", .{ c, grid.bg_buf[fr * grid.cols + c] });
+                    grid.dump();
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+    }
 
     // gd → mock returns a location at line 1 col 6 (the identifier in
     // "const a = 1;"). The wake mechanism drains the response without a
