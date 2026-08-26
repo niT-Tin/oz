@@ -17,6 +17,11 @@ const lsp_nav = @import("lsp/navigation.zig");
 const json_rpc = @import("util/json_rpc.zig");
 const theme = @import("theme.zig");
 
+/// Cells a '\t' occupies on screen (vim's shiftwidth-style expansion). The
+/// renderer expands tabs to this many spaces; every width computation that
+/// positions the cursor/ghost/menu must use the same value or columns drift.
+const tab_width: u32 = 4;
+
 // Silence vaxis's per-frame debug logging (pollutes the tty byte stream and
 // interferes with e2e screen reconstruction).
 pub const std_options: std.Options = .{
@@ -1055,13 +1060,15 @@ const App = struct {
     }
 
     /// Byte length of the UTF-8 character starting at `pos` (1 for ASCII,
-    /// 2-4 for sequences; malformed bytes count as 1).
+    /// 2-4 for sequences; malformed bytes — stray continuation bytes and
+    /// invalid leads 0xF8..0xFF — count as 1, matching motion.zig).
     fn charLenAt(self: *App, pt: *const buffer.PieceTable, pos: u32) u32 {
         _ = self;
         if (pos >= pt.len()) return 0;
         const b = pt.byteAt(pos);
         if (b < 0x80) return 1;
-        const n: u32 = if (b < 0xE0) 2 else if (b < 0xF0) 3 else 4;
+        if (b < 0xC0) return 1; // stray continuation byte: its own char
+        const n: u32 = if (b < 0xE0) 2 else if (b < 0xF0) 3 else if (b < 0xF8) 4 else 1;
         return @min(n, pt.len() - pos);
     }
 
@@ -3359,6 +3366,12 @@ const App = struct {
         };
         defer file.close(self.io);
         const size = (try file.stat(self.io)).size;
+        // u32-addressed piece table: refuse >= 4 GiB instead of panicking on
+        // the @intCast below (see main()'s CLI open for the same guard).
+        if (size >= std.math.maxInt(u32)) {
+            try self.setMsg(try self.alloc.dupe(u8, "file too large (>4GiB)"));
+            return;
+        }
         const bytes = try self.alloc.alloc(u8, @intCast(size));
         defer self.alloc.free(bytes);
         _ = try file.readPositionalAll(self.io, bytes, 0);
@@ -4668,6 +4681,14 @@ const App = struct {
         var col: u32 = 0;
         while (p < byte_pos) {
             const b = pt.byteAt(p);
+            // A tab occupies `tab_width` cells (the renderer expands it), not
+            // the 0 vaxis reports — otherwise cursor/ghost/menu columns would
+            // disagree with the drawn line on files containing tabs.
+            if (b == '\t') {
+                col += tab_width;
+                p += 1;
+                continue;
+            }
             const seq_len: usize = if (b < 0x80)
                 1
             else
@@ -4691,6 +4712,11 @@ const App = struct {
         var p: usize = 0;
         while (p < text.len) {
             const b = text[p];
+            if (b == '\t') {
+                col += tab_width;
+                p += 1;
+                continue;
+            }
             const seq_len: usize = if (b < 0x80) 1 else (std.unicode.utf8ByteSequenceLength(b) catch 1);
             const avail = @min(seq_len, text.len - p);
             col += win.gwidth(text[p .. p + avail]);
@@ -4938,7 +4964,25 @@ const App = struct {
                 if (is_cur_line) style.bg = .{ .rgb = self.theme.bg_curline };
                 if (in_sel) style.bg = .{ .rgb = self.theme.bg_sel };
                 if (fg) |f| style.fg = f.fg;
-                try segs.append(a, .{ .text = text[col..next], .style = style });
+                const seg_text = text[col..next];
+                if (std.mem.indexOfScalar(u8, seg_text, '\t') != null) {
+                    // Expand tabs to `tab_width` spaces so they render (vaxis
+                    // skips 0-width chars) and their drawn width matches
+                    // lineCellCol/textWidth — otherwise the cursor column and
+                    // the visible line disagree on tab-containing files.
+                    var expanded = std.ArrayList(u8).empty;
+                    for (seg_text) |b| {
+                        if (b == '\t') {
+                            var k: u32 = 0;
+                            while (k < tab_width) : (k += 1) try expanded.append(a, ' ');
+                        } else {
+                            try expanded.append(a, b);
+                        }
+                    }
+                    try segs.append(a, .{ .text = expanded.items, .style = style });
+                } else {
+                    try segs.append(a, .{ .text = seg_text, .style = style });
+                }
                 col = next;
             }
             // trailing hints past the visible text (still inside the line)
@@ -5688,6 +5732,15 @@ pub fn main(init: std.process.Init) !void {
             var file = std.Io.Dir.cwd().openFile(app.io, file_path, .{ .mode = .read_only }) catch continue;
             defer file.close(app.io);
             const size = (try file.stat(app.io)).size;
+            // The piece table addresses the document with u32 offsets; a file
+            // at/over 4 GiB would overflow (@intCast panics). Refuse it
+            // cleanly instead of crashing: syntax highlighting already
+            // degrades past SIZE_LIMIT, and editing multi-GiB files with a
+            // u32-based buffer is unsupported.
+            if (size >= std.math.maxInt(u32)) {
+                try app.setMsg(try app.alloc.dupe(u8, "file too large (>4GiB)"));
+                continue;
+            }
             const bytes = try app.alloc.alloc(u8, @intCast(size));
             defer app.alloc.free(bytes);
             _ = try file.readPositionalAll(app.io, bytes, 0);
