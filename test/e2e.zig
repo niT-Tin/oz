@@ -570,7 +570,7 @@ test "smoke: spawn oz, render a file, quit cleanly" {
     try std.testing.expect(grid.contains("line three"));
 
     // quit via command mode
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
@@ -644,7 +644,7 @@ test "insert text in insert mode, esc back to normal" {
     }
     try std.testing.expect(!grid.contains("INSERT"));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -912,7 +912,7 @@ test "insert mode: jk leaves no chars, backspace and ctrl-w delete" {
     }
     try std.testing.expect(!grid.contains("INSERT"));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1027,7 +1027,7 @@ test "M1a: text objects, visual ops, yank/paste, easymotion" {
     try std.testing.expect(grid.contains("Y"));
     try std.testing.expect(!grid.contains("Xone"));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1121,7 +1121,7 @@ test "surround: ysw' wraps, ds( deletes, cs(->[ changes" {
     }
     try std.testing.expect(grid.contains("hello world"));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1215,7 +1215,7 @@ test "gcc toggles line comments; Ctrl+n multi-cursor deletes words" {
     }
     try std.testing.expect(!grid.contains("x = 1;"));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1268,7 +1268,7 @@ test "visual ga= aligns delimiter columns" {
     try std.testing.expect(grid.contains("long = 22"));
     try std.testing.expect(grid.contains("ccc  = 333"));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1340,7 +1340,7 @@ test "picker: <leader>sf fuzzy-finds and opens a file" {
     }
     try std.testing.expect(grid.contains("const std = @import"));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1393,7 +1393,7 @@ test ":%s substitutes across the file, :s on the current line" {
     try std.testing.expect(grid.contains("X X"));
     try std.testing.expect(!grid.contains("foo"));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1430,7 +1430,7 @@ test "dashboard shows recent files; Enter reopens" {
             grid.feed(sess.out[sess.used - n .. sess.used]);
         }
         try std.testing.expect(grid.contains("recent file content"));
-        const code = try sess.commandAndWaitExit(":q\r");
+        const code = try sess.commandAndWaitExit(":q!\r");
         try std.testing.expectEqual(@as(u32, 0), code);
     }
 
@@ -1469,7 +1469,7 @@ test "dashboard shows recent files; Enter reopens" {
         }
         try std.testing.expect(grid.contains("recent file content"));
 
-        const code = try sess.commandAndWaitExit(":q\r");
+        const code = try sess.commandAndWaitExit(":q!\r");
         try std.testing.expectEqual(@as(u32, 0), code);
     }
 }
@@ -1544,7 +1544,7 @@ test "grep picker: <leader>st finds matches and jumps" {
     }
     try std.testing.expect(grid.contains("NORMAL"));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1631,7 +1631,7 @@ test "file tree: <leader>e shows files, Enter opens one" {
     try std.testing.expect(!grid.contains(" files "));
     try std.testing.expect(grid.contains("# oz"));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1726,7 +1726,7 @@ test "multi-buffer: :e opens a tab, gt/:bn switch, :bd closes" {
     try std.testing.expect(grid.contains("BBB"));
     try std.testing.expect(!grid.contains("AAA"));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1828,7 +1828,7 @@ test "buffer picker: <leader>sb lists open buffers, Enter switches" {
     }
     try std.testing.expect(grid.contains("AAA"));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1922,7 +1922,7 @@ test "buffer keys: <leader>bn switches, <leader>bk closes" {
     try std.testing.expect(grid.contains("BBB"));
     try std.testing.expect(!grid.contains("AAA"));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -2093,7 +2093,7 @@ test "recent picker: <leader>sr lists and reopens a recent file" {
     }
     try std.testing.expect(grid.contains("BBB"));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -2136,7 +2136,7 @@ test "tree-sitter: zig keywords/comments/strings get syntax colors" {
     try std.testing.expect(grid.containsFg("const", packRgb(149, 127, 184)));
     try std.testing.expect(grid.containsFg("// note", packRgb(114, 113, 105)));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -2179,7 +2179,7 @@ test "tree-sitter: files over the size limit get no highlight pass" {
     // no gold anywhere: the pass was skipped, text renders in default fg
     try std.testing.expect(!grid.containsFg("const", packRgb(149, 127, 184)));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -2329,7 +2329,7 @@ test "visual block: <C-v> block + I/A inserts on every line" {
     try std.testing.expect(grid.contains("bbb"));
     try std.testing.expect(grid.contains("ccc"));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
@@ -2682,7 +2682,7 @@ test "visual block: multi-cursor backspace, ctrl-w and jk stay in sync" {
     }
     try std.testing.expect(!grid.contains("INSERT"));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
@@ -2877,7 +2877,7 @@ test "file tree: sidebar scrolls as the selection moves past the window" {
     }
     try std.testing.expect(std.mem.indexOf(u8, grid.rowText(1), "README.md") != null);
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -2974,7 +2974,7 @@ test "picker: list scrolls with the selection; the highlighted row stays visible
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -3112,7 +3112,7 @@ test "visual line: Esc exits and clears the stale selection highlight" {
     }
     try std.testing.expect(sel_cleared);
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -3233,7 +3233,7 @@ test "picker: keys win over the file tree while both are open" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -3365,7 +3365,7 @@ test "visual line: gt buffer switch drops the selection highlight" {
     }
     try std.testing.expect(sel_cleared);
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -3756,7 +3756,7 @@ test "insert Alt-b/Alt-f: emacs word motion moves the cursor" {
     }
     try std.testing.expect(!grid.contains("INSERT"));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -3855,7 +3855,7 @@ test "picker confirm leaves file-tree mode; j/k control the buffer" {
     }
     try std.testing.expect(line2_seen);
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -3948,7 +3948,7 @@ test "visual line V selects whole lines from mid-line" {
     }
     try std.testing.expect(!grid.rowHasBg(1, sel_bg));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -4009,7 +4009,7 @@ test "visual line: V + d/c deletes ALL selected lines (incl. the last one)" {
     try std.testing.expect(!rowContains(&grid, 3, "ccc"));
     try std.testing.expect(!rowContains(&grid, 4, "ddd"));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -4079,7 +4079,7 @@ test "visual line: V + c consumes ALL selected lines (incl. the last one)" {
     try std.testing.expect(!rowContains(&grid, 2, "bbb"));
     try std.testing.expect(!rowContains(&grid, 3, "ccc"));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -4398,7 +4398,7 @@ test "e2e: multi-cursor Ctrl+n moves the main cursor and scrolls the viewport" {
     try std.testing.expect(cursorline_row != null);
     try std.testing.expect(cursorline_row.? > 1); // scrolled off the top
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -4536,7 +4536,7 @@ test "gutter: relative line numbers never overlap content on deep files" {
         try std.testing.expect(grid.buf[(r * 80 + 5) * 4] == ' ');
     }
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -4666,7 +4666,7 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
     try std.testing.expect(grid.containsFg("pub", packRgb(149, 127, 184)));
     try std.testing.expect(!grid.containsFg("pub", packRgb(114, 113, 105)));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -5197,7 +5197,7 @@ test "file tree: Ctrl-w h/l switches focus between sidebar and buffer" {
     }
     try std.testing.expect(!grid.contains("files"));
 
-    const exit_code = try sess.commandAndWaitExit(":q\r");
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -5752,7 +5752,7 @@ test "windows: :vs splits side-by-side; Ctrl-w l/h switch; :q closes one; :qa qu
     try std.testing.expect(grid.contains("line 1/7"));
 
     // :q closes the focused (right) window → single window again
-    try sess.send(":q\r");
+    try sess.send(":q!\r");
     waited = 0;
     var single = false;
     while (!single) {
@@ -5882,7 +5882,7 @@ test "TMP: split/close cycles + Ctrl-w navigation" {
     // random window ops fuzz (fixed seed): should never panic the tree
     // invariant nor leak on exit
     const actions = [_][]const u8{
-        ":vs\r", ":sp\r", "\x17h", "\x17l", "\x17j", "\x17k", ":q\r",
+        ":vs\r", ":sp\r", "\x17h", "\x17l", "\x17j", "\x17k", ":q!\r",
     };
     var prng = std.Random.DefaultPrng.init(0xC0FFEE);
     var i: usize = 0;
@@ -6063,7 +6063,7 @@ test "windows: :vs keeps the old window left; Ctrl-w h/l + :e target the focused
     try std.testing.expect(right_c);
 
     // :q closes the focused (right) window → only BBB (left) remains
-    try sess.send(":q\r");
+    try sess.send(":q!\r");
     waited = 0;
     var only_b = false;
     while (!only_b) {

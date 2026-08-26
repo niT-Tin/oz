@@ -188,10 +188,23 @@ pub const Client = struct {
             }
             return e;
         };
+        // From here on the heap-held argv (if any) is owned by this cleanup
+        // chain — covering failures of alloc.create/dupe before `self` fully
+        // exists, which the self-based errdefers below cannot see.
         errdefer {
-            _ = proc.kill(io);
-            _ = proc.wait(io) catch {};
+            if (argv_override) |arr| {
+                if (argv_first_owned) alloc.free(arr[0]);
+                alloc.free(arr);
+            }
         }
+        // Failures after a successful spawn must terminate the child.
+        // kill() reaps it (id → null — a wait() after kill() would assert).
+        // This covers failures before the reader thread exists; once the
+        // thread is spawned its own errdefer (declared last, so it runs
+        // FIRST) kills the server and joins the thread before `self` is
+        // destroyed, flipping cleanup_proc so the child is never killed twice.
+        var cleanup_proc = true;
+        errdefer if (cleanup_proc) proc.kill(io);
 
         const self = try alloc.create(Client);
         errdefer alloc.destroy(self);
@@ -207,18 +220,19 @@ pub const Client = struct {
             .argv_override_first_owned = argv_first_owned,
         };
         errdefer self.alloc.free(self.uri);
-        // Handshake failures after this point must free the argv too (the
-        // errdefer above only covers spawn failure).
-        errdefer {
-            if (self.argv_override) |arr| {
-                if (self.argv_override_first_owned) self.alloc.free(arr[0]);
-                self.alloc.free(arr);
-            }
-        }
 
         // Reader thread first: the initialize response arrives through it.
         self.thread = try std.Thread.spawn(.{}, readerMain, .{self});
-        errdefer self.thread.?.join();
+        // Declared last so it runs FIRST on handshake failure (errdefers are
+        // LIFO): the reader thread touches `self` (`stop.store` on exit), so
+        // it must be joined before `self` is destroyed. kill FIRST — the
+        // child's death EOFs the thread's blocking read — then join; joining
+        // a live server would deadlock.
+        errdefer {
+            self.proc.kill(self.io);
+            cleanup_proc = false;
+            self.thread.?.join();
+        }
 
         // initialize request (synchronous handshake, 5s cap). The response
         // (capabilities) is discarded for now — future features consume it.
@@ -382,7 +396,10 @@ pub const Client = struct {
         const uri_copy = try self.alloc.dupe(u8, self.uri);
         errdefer self.alloc.free(uri_copy);
         try td.put(self.alloc, "uri", .{ .string = uri_copy });
-        try td.put(self.alloc, "version", .{ .integer = 1 });
+        // The version counter covers didOpen too: versions must strictly
+        // increase across the document's whole lifetime (1, 2, 3, ...).
+        self.version += 1;
+        try td.put(self.alloc, "version", .{ .integer = self.version });
         // languageId is required by the LSP textDocumentItem schema; servers
         // (clangd) refuse to add a document without it.
         const lang_copy = try self.alloc.dupe(u8, self.lang);
@@ -440,6 +457,18 @@ pub const Client = struct {
         try self.notify("textDocument/didClose", v);
     }
 
+    /// Switch the client to a new document of the same filetype (the editor
+    /// switched buffers): close the old document, retarget `uri`, open the
+    /// new one. Versions keep increasing across the client's lifetime, which
+    /// LSP requires.
+    pub fn switchDocument(self: *Client, new_uri: []const u8, text: []const u8) !void {
+        try self.didClose();
+        const copy = try self.alloc.dupe(u8, new_uri);
+        self.alloc.free(self.uri);
+        self.uri = copy;
+        try self.didOpen(text);
+    }
+
     // ---- requests / notifications ----
 
     /// Send a request; the response result lands in `slot` when `drain`
@@ -474,7 +503,19 @@ pub const Client = struct {
         while (self.queue.pop()) |content| {
             defer self.alloc.free(content);
             var msg = json_rpc.parseMessage(self.alloc, content) catch continue;
-            if (msg.id) |id| {
+            if (msg.method != null) {
+                if (msg.id) |id| {
+                    // Server→client REQUEST (id + method), not a response:
+                    // server id counters collide with ours (both count from
+                    // small integers), so routing it to `pending` would
+                    // silently consume a client request's slot. Answer with
+                    // MethodNotFound instead, or servers that await a reply
+                    // (rust-analyzer's workspace/configuration) stall.
+                    self.answerServerRequest(id) catch {};
+                } else {
+                    handler(ctx, self, &msg);
+                }
+            } else if (msg.id) |id| {
                 // response → pending slot. A slot may already hold an
                 // un-consumed response if two requests shared it (e.g. the
                 // App's single nav_slot): free the stale value first so the
@@ -491,8 +532,6 @@ pub const Client = struct {
                         break;
                     }
                 }
-            } else if (msg.method) |_| {
-                handler(ctx, self, &msg);
             }
             msg.deinit(self.alloc);
         }
@@ -503,12 +542,22 @@ pub const Client = struct {
         while (self.queue.popTimeout(5 * std.time.ns_per_s)) |content| {
             defer self.alloc.free(content);
             var msg = json_rpc.parseMessage(self.alloc, content) catch continue;
+            // Only a bare response (id, no method) matches: a server→client
+            // request may reuse the same id value (separate id space).
             if (msg.id) |id| {
-                if (id == want_id) return msg;
+                if (id == want_id and msg.method == null) return msg;
             }
             msg.deinit(self.alloc);
         }
         return error.LspHandshakeTimeout;
+    }
+
+    /// Answer a server→client request we don't implement with a
+    /// MethodNotFound error response (the spec-sanctioned "unsupported").
+    fn answerServerRequest(self: *Client, id: u64) !void {
+        const content = try json_rpc.encodeError(self.alloc, id, -32601, "method not found");
+        defer self.alloc.free(content);
+        try self.writeFrameToStdin(content);
     }
 
     // ---- reader thread ----
@@ -691,4 +740,170 @@ test "queue: popTimeout returns null on timeout" {
     const item = q.popTimeout(20 * std.time.ns_per_ms);
     try std.testing.expect(item == null);
     try std.testing.expect(std.Io.Timestamp.now(std.testing.io, .real).nanoseconds - start < std.time.ns_per_s);
+}
+
+// ---------------------------------------------------------------------------
+// Client state-machine tests (hand-built Client over pipes, no subprocess)
+// ---------------------------------------------------------------------------
+
+/// A Client whose stdin is a pipe's write end, with no spawned process and
+/// no reader thread; tests drive the queue by hand. Call cleanupClient (not
+/// deinit — there is no proc to kill and no thread to join).
+fn testClient(alloc: std.mem.Allocator, io: std.Io, stdin: std.Io.File) !Client {
+    return .{
+        .alloc = alloc,
+        .io = io,
+        .lang = "mock",
+        .uri = try alloc.dupe(u8, "file:///t.zig"),
+        .proc = undefined,
+        .stdin = stdin,
+        .queue = .{ .io = io },
+    };
+}
+
+fn cleanupClient(alloc: std.mem.Allocator, c: *Client) void {
+    c.queue.deinit(alloc);
+    c.pending.deinit(alloc);
+    alloc.free(c.uri);
+}
+
+test "didOpen/didChange: document version is monotonic (1, 2, 3, ...)" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const fds = try std.Io.Threaded.pipe2(.{});
+    const read_end = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+    const write_end = std.Io.File{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+    defer std.Io.File.close(read_end, io);
+    defer std.Io.File.close(write_end, io);
+
+    var client = try testClient(alloc, io, write_end);
+    defer cleanupClient(alloc, &client);
+
+    try client.didOpen("hello");
+    try client.didChange("hello!");
+    try client.didChange("hello!!");
+
+    var reader = FrameReader.init(alloc, read_end, io);
+    defer reader.deinit();
+    const versions = [_][]const u8{ "1", "2", "3" };
+    for (versions) |want| {
+        const body = (try reader.next()).?;
+        defer alloc.free(body);
+        var msg = try json_rpc.parseMessage(alloc, body);
+        defer msg.deinit(alloc);
+        const td = msg.params.?.object.get("textDocument").?;
+        try std.testing.expectEqualStrings(want, td.object.get("version").?.number_string);
+    }
+}
+
+test "waitResponse: a server request with the same id is not the response" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var client = try testClient(alloc, io, undefined);
+    defer cleanupClient(alloc, &client);
+
+    // A server→client request (id + method) whose id collides with the
+    // handshake id, followed by the actual initialize response.
+    try client.queue.push(alloc, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"workspace/configuration\",\"params\":{\"items\":[]}}");
+    try client.queue.push(alloc, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{}}}");
+
+    var msg = try client.waitResponse(1);
+    defer msg.deinit(alloc);
+    try std.testing.expect(msg.method == null);
+    try std.testing.expect(msg.result != null);
+}
+
+test "drain: server requests are answered, never fill pending slots" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const fds = try std.Io.Threaded.pipe2(.{});
+    const read_end = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+    const write_end = std.Io.File{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+    defer std.Io.File.close(read_end, io);
+    defer std.Io.File.close(write_end, io);
+
+    var client = try testClient(alloc, io, write_end);
+    defer cleanupClient(alloc, &client);
+
+    var slot: ?std.json.Value = null;
+    defer if (slot) |*v| json_rpc.freeValue(alloc, v);
+    try client.pending.append(alloc, .{ .id = 1, .slot = &slot });
+
+    // A server→client request with an id that COLLIDES with the pending
+    // client request id (both sides count from small integers).
+    try client.queue.push(alloc, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"workspace/configuration\",\"params\":{\"items\":[]}}");
+    // A notification for the handler.
+    try client.queue.push(alloc, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}");
+
+    const Recorder = struct {
+        methods: std.ArrayList([]u8) = .empty,
+    };
+    var rec = Recorder{};
+    defer {
+        for (rec.methods.items) |m| alloc.free(m);
+        rec.methods.deinit(alloc);
+    }
+    const handler = struct {
+        fn handle(ctx: *Recorder, c: *Client, msg: *json_rpc.Message) void {
+            const m = msg.method orelse return;
+            const copy = c.alloc.dupe(u8, m) catch return;
+            ctx.methods.append(c.alloc, copy) catch c.alloc.free(copy);
+        }
+    }.handle;
+    client.drain(&rec, handler);
+
+    // The pending request must survive; the slot must stay empty.
+    try std.testing.expectEqual(@as(usize, 1), client.pending.items.len);
+    try std.testing.expect(slot == null);
+    // The notification reached the handler.
+    try std.testing.expectEqual(@as(usize, 1), rec.methods.items.len);
+    try std.testing.expectEqualStrings("initialized", rec.methods.items[0]);
+    // The server request got an error response (so the server doesn't stall).
+    var pfd = [_]std.posix.pollfd{.{ .fd = read_end.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    try std.testing.expect(try std.posix.poll(&pfd, 1000) == 1);
+    var reader = FrameReader.init(alloc, read_end, io);
+    defer reader.deinit();
+    const body = (try reader.next()).?;
+    defer alloc.free(body);
+    var reply = try json_rpc.parseMessage(alloc, body);
+    defer reply.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 1), reply.id);
+    try std.testing.expect(reply.method == null);
+    try std.testing.expectEqual(@as(i64, -32601), reply.err.?.code);
+
+    // The real response still resolves the pending request.
+    try client.queue.push(alloc, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}");
+    client.drain(&rec, handler);
+    try std.testing.expectEqual(@as(usize, 0), client.pending.items.len);
+    try std.testing.expect(slot != null);
+    try std.testing.expectEqual(true, slot.?.object.get("ok").?.bool);
+}
+
+test "start: every failure point after spawn cleans up (no hang, no crash)" {
+    const base = std.testing.allocator;
+    const io = std.testing.io;
+
+    // OZ_LSP_CMD=/bin/cat: cat echoes our initialize request back, but with
+    // method set it is never mistaken for the response — a run that reaches
+    // the handshake wait ends in error.LspHandshakeTimeout (the 5s cap), so
+    // the loop stops there: all earlier failure indices were already tested.
+    var env_map = std.process.Environ.Map.init(base);
+    defer env_map.deinit();
+    try env_map.put("OZ_LSP_CMD", "/bin/cat");
+
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(base, .{ .fail_index = fail_index });
+        const result = Client.start(failing.allocator(), io, &env_map, "zig", "file:///t.zig", "hello");
+        if (result) |client| {
+            // /bin/cat never answers a valid initialize response, so a
+            // successful start would itself be a bug.
+            client.deinit();
+            return error.TestUnexpectedResult;
+        } else |e| {
+            if (e == error.LspHandshakeTimeout) break; // past the alloc paths
+            try std.testing.expect(e == error.OutOfMemory);
+        }
+    }
+    try std.testing.expect(fail_index > 0);
 }

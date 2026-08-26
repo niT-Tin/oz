@@ -140,13 +140,24 @@ fn wordRange(pt: *const PieceTable, include: bool, pos_in: u32) Range {
             word_start = s;
             word_end = e;
         } else {
-            word_start = p; // punctuation: a one-character word
-            word_end = p + 1;
+            // Punctuation run: a run of punctuation is one word (vim, and
+            // matches motion.zig's w/e/b/ge) — expand to the whole run so
+            // diw on "a->b" deletes "->", not a single byte.
+            var s = p;
+            while (s > 0 and !isWordByte(pt.byteAt(s - 1)) and !isBlankByte(pt.byteAt(s - 1))) : (s -= 1) {}
+            var e = p + 1;
+            while (e < len and !isWordByte(pt.byteAt(e)) and !isBlankByte(pt.byteAt(e))) : (e += 1) {}
+            word_start = s;
+            word_end = e;
         }
     } else {
-        // Punctuation under the cursor: it is its own one-character word.
-        word_start = pos;
-        word_end = pos + 1;
+        // Punctuation run under the cursor: the whole run is one word.
+        var s = pos;
+        while (s > 0 and !isWordByte(pt.byteAt(s - 1)) and !isBlankByte(pt.byteAt(s - 1))) : (s -= 1) {}
+        var e = pos + 1;
+        while (e < len and !isWordByte(pt.byteAt(e)) and !isBlankByte(pt.byteAt(e))) : (e += 1) {}
+        word_start = s;
+        word_end = e;
     }
 
     if (!include) return .{ .start = word_start, .end = word_end };

@@ -1546,7 +1546,13 @@ const App = struct {
         // Stale: the text changed after the request (fast typing) or the
         // user left insert mode (e.g. Esc before the response landed). Keep
         // the current items — the next keystroke sends a fresh request.
-        if (self.edit_seq != self.completion_req_seq or self.state.mode != .insert) return true;
+        // The manual request's response is still consumed, so Enter must be
+        // unblocked (otherwise it would stay stuck on "completion pending…"
+        // forever with no menu to open).
+        if (self.edit_seq != self.completion_req_seq or self.state.mode != .insert) {
+            self.completion_waiting_enter = false;
+            return true;
+        }
         for (self.completion_words.items) |it| self.alloc.free(it.text);
         self.completion_words.clearRetainingCapacity();
         lsp_nav.parseCompletionItems(self.alloc, result, &self.completion_words) catch {};
@@ -1820,12 +1826,22 @@ const App = struct {
             };
             const t = text orelse continue;
             if (t.len == 0) continue;
-            const position = hint.object.get("position") orelse continue;
-            const line = lsp_nav.posLine(position) orelse continue;
-            const character = lsp_nav.posCharacter(position) orelse continue;
             // The array branch owns its slice (toOwnedSlice); the string
-            // branch borrows from `result` (freed below), so only that one
-            // needs a copy.
+            // branch borrows from `result` (freed below). A malformed hint
+            // that fails the position parse below must release the owned
+            // slice — otherwise every such response leaks the label.
+            const position = hint.object.get("position") orelse {
+                if (label == .array) self.alloc.free(t);
+                continue;
+            };
+            const line = lsp_nav.posLine(position) orelse {
+                if (label == .array) self.alloc.free(t);
+                continue;
+            };
+            const character = lsp_nav.posCharacter(position) orelse {
+                if (label == .array) self.alloc.free(t);
+                continue;
+            };
             const copy = switch (label) {
                 .array => t,
                 else => self.alloc.dupe(u8, t) catch continue,
@@ -2258,15 +2274,23 @@ const App = struct {
     fn execCommand(self: *App, cmd: editor.ex_command.Command) !void {
         switch (cmd) {
             .empty => {},
-            .write => try self.writeBuffer(),
-            .quit => self.closeWindow(), // :q closes the focused window (or its buffer when it is the last window)
+            .write => _ = try self.writeBuffer(),
+            .quit => {
+                // vim E37: refuse to quit when the current buffer has
+                // unsaved changes — data loss is worse than a message.
+                if (self.cur().dirty) {
+                    try self.setMsg(try self.alloc.dupe(u8, "E37: No write since last change (add ! to override)"));
+                    return;
+                }
+                self.closeWindow(); // :q closes the focused window (or its buffer when it is the last window)
+            },
             .quit_force => self.closeWindow(),
             .quit_all => self.quit = true,
             .vsplit => try self.splitWindow(.vertical),
             .split => try self.splitWindow(.horizontal),
             .write_quit => {
-                try self.writeBuffer();
-                self.quit = true;
+                // only quit when the write actually succeeded
+                if (try self.writeBuffer()) self.quit = true;
             },
             .edit => |path| try self.openFile(path),
             .buffer_next => try self.switchBuffer(1),
@@ -2508,17 +2532,21 @@ const App = struct {
             self.alloc.dupe(u8, path);
     }
 
-    fn writeBuffer(self: *App) !void {
+    /// :w — write the current buffer. Returns false (with a status message)
+    /// when there is no file name or the write fails, so callers like :wq
+    /// must NOT proceed to quit on failure.
+    fn writeBuffer(self: *App) !bool {
         const path = self.cur().path orelse {
             try self.setMsg(try self.alloc.dupe(u8, "E32: No file name"));
-            return;
+            return false;
         };
         self.saveFile(path) catch |e| {
             try self.setMsg(try std.fmt.allocPrint(self.alloc, "write failed: {s}", .{@errorName(e)}));
-            return;
+            return false;
         };
         self.cur().dirty = false;
         try self.setMsg(try std.fmt.allocPrint(self.alloc, "written: {s}", .{path}));
+        return true;
     }
 
     fn saveFile(self: *App, path: []const u8) !void {
@@ -3217,6 +3245,15 @@ const App = struct {
         self.visual_anchor = null;
         self.in_insert = false;
         self.curCursor().* = @min(self.curCursor().*, self.cur().pt.len());
+        // per-buffer state from the previous buffer must not leak onto the
+        // new one: stale inlay hints would render at wrong positions, stale
+        // diagnostics would point at wrong files, hover/nav/completion would
+        // linger.
+        self.invalidateInlayHints();
+        self.lsp_diagnostics.clearRetainingCapacity();
+        self.clearHover();
+        self.nav_list_active = false;
+        self.closeCompletion();
     }
 
     /// Move `delta` buffers (wrapping). gt / gT.
@@ -3287,6 +3324,10 @@ const App = struct {
         // closing the buffer also discards a visual selection anchored in it
         self.visual_anchor = null;
         self.in_insert = false;
+        // the surviving buffer may need its own server (or a retarget)
+        self.invalidateInlayHints();
+        self.lsp_diagnostics.clearRetainingCapacity();
+        self.ensureLsp();
     }
 
     /// :bd — close the focused window's buffer; the window shows the next one.
@@ -3498,24 +3539,25 @@ const App = struct {
     /// definition column (clamped to the line length), like nvim's gd —
     /// not the line start.
     fn jumpToLocation(self: *App, loc: lsp_nav.NavLocation) void {
-        const pt = &self.cur().pt;
-        const line = @min(loc.line, pt.lineCount() -| 1);
-        const line_start = pt.lineStart(line);
-        const target = line_start + @min(loc.character, pt.lineLen(line));
         const path = lsp_types.fileUriToPath(self.alloc, loc.uri) catch {
-            self.curCursor().* = target;
+            // URI unparseable: fall back to a clamped position in the
+            // current buffer
+            const pt = &self.cur().pt;
+            const line = @min(loc.line, pt.lineCount() -| 1);
+            self.curCursor().* = pt.lineStart(line) + @min(loc.character, pt.lineLen(line));
             return;
         };
         defer self.alloc.free(path);
-        const current = self.cur().path orelse {
-            self.openInBuffer(path) catch return;
-            self.curCursor().* = target;
-            return;
-        };
-        if (!std.mem.eql(u8, current, path)) {
+        const current = self.cur().path;
+        if (current == null or !std.mem.eql(u8, current.?, path)) {
+            // switching buffers: the target must be computed on the NEW
+            // buffer, whose lengths differ (a stale offset from the old
+            // buffer could exceed it and crash the next render)
             self.openInBuffer(path) catch return;
         }
-        self.curCursor().* = target;
+        const pt = &self.cur().pt;
+        const line = @min(loc.line, pt.lineCount() -| 1);
+        self.curCursor().* = pt.lineStart(line) + @min(loc.character, pt.lineLen(line));
     }
 
     /// Keys while the gr/gI location list is open. Returns true when consumed.
@@ -3553,7 +3595,20 @@ const App = struct {
     fn ensureLsp(self: *App) void {
         const ft = filetypeOf(self.cur().path);
         if (self.lsp_client) |c| {
-            if (std.mem.eql(u8, c.lang, ft)) return;
+            if (std.mem.eql(u8, c.lang, ft)) {
+                // Same filetype but a different document (buffer switch):
+                // retarget the client, or every request would carry the
+                // stale URI — hover/gd/completion/diagnostics silently die.
+                const path = self.cur().path orelse return;
+                const uri = lsp_types.pathToFileUri(self.alloc, path) catch return;
+                defer self.alloc.free(uri);
+                if (!std.mem.eql(u8, c.uri, uri)) {
+                    const text = self.curText() catch return;
+                    defer self.alloc.free(text);
+                    c.switchDocument(uri, text) catch {};
+                }
+                return;
+            }
             // filetype changed: close the old server
             c.deinit();
             self.lsp_client = null;
@@ -3754,10 +3809,15 @@ const App = struct {
                 }
                 _ = self.cur().history.undo(&self.cur().pt);
                 self.curCursor().* = @min(self.curCursor().*, self.cur().pt.len());
+                // the document changed: keep LSP/inlay in sync (markDirty
+                // also touches the dirty flag — acceptable for undo, vim
+                // marks the buffer modified after an undo too)
+                self.markDirty();
             },
             .redo => {
                 _ = self.cur().history.redo(&self.cur().pt);
                 self.curCursor().* = @min(self.curCursor().*, self.cur().pt.len());
+                self.markDirty();
             },
             .insert_mode => {
                 // open the undo group immediately so the whole insert session
@@ -4163,6 +4223,10 @@ const App = struct {
         try self.cur().history.record(&self.cur().pt, pos, 0, buf);
         self.cur().history.endGroup();
         self.curCursor().* = pos + @as(u32, @intCast(buf.len));
+        // markDirty is the single entry point for dirty flag / edit_seq /
+        // LSP didChange / inlay invalidation — paste must go through it or
+        // the server keeps an outdated document and hints stay stale.
+        self.markDirty();
     }
 
     // ---- rendering ----
@@ -4331,7 +4395,10 @@ const App = struct {
 
             const line_len = buf.pt.lineLen(line);
             const line_start = buf.pt.lineStart(line);
-            var n: u32 = @min(line_len, rect.width);
+            // the row also carries the gutter (rect.col + gutter), so the
+            // content width is rect.width minus the gutter — otherwise long
+            // lines are clipped on the right by the gutter width
+            var n: u32 = @min(line_len, rect.width -| gutter);
             // don't cut a multibyte char in half at the line end — a lone
             // UTF-8 continuation byte renders as U+FFFD ("box with ?")
             while (n > 0 and n < line_len and (buf.pt.byteAt(line_start + n) & 0xC0) == 0x80) {
@@ -4481,6 +4548,15 @@ const App = struct {
         // Content area rows: below the tab bar, above the status bar.
         const content_rows = height - status_row_count - tab_bar_rows;
 
+        // Clamp the focused window's cursor/viewport BEFORE any lineOf /
+        // column math below: switching windows or buffers can leave a stale
+        // cursor past the end of the current buffer (e.g. both splits show
+        // the same buffer and the other window deleted everything), and
+        // piece_table.lineOf asserts pos <= len in Debug builds.
+        const fw = &self.windows.items[self.current_win];
+        if (fw.cursor > self.cur().pt.len()) fw.cursor = self.cur().pt.len();
+        if (fw.view_top > self.cur().pt.lineCount() -| 1) fw.view_top = self.cur().pt.lineCount() -| 1;
+
         const cursor_line = self.cur().pt.lineOf(self.curCursor().*);
         const line_count = self.cur().pt.lineCount();
         // relative-number gutter: computed once per frame, reused by the
@@ -4594,10 +4670,10 @@ const App = struct {
                 if (w.end <= w.start) continue;
                 const wline = self.cur().pt.lineOf(w.start);
                 if (wline < self.curViewTop().* or wline >= self.curViewTop().* + content_rows) continue;
-                const ls = self.cur().pt.lineStart(wline);
                 var p = w.start;
                 while (p < w.end) {
-                    const col = p - ls;
+                    // byte offset -> cell column (CJK word = 3 bytes/2 cells)
+                    const col = self.lineCellCol(win, wline, p);
                     if (col >= @as(u32, win.width) - gutter) break;
                     var clen: u32 = 1;
                     while (p + clen < w.end and (self.cur().pt.byteAt(p + clen) & 0xC0) == 0x80) : (clen += 1) {}
@@ -4618,7 +4694,10 @@ const App = struct {
             for (self.em_matches) |m| {
                 const mline = self.cur().pt.lineOf(m.pos);
                 if (mline < self.curViewTop().* or mline >= self.curViewTop().* + content_rows) continue;
-                const col_in_line = m.pos - self.cur().pt.lineStart(mline);
+                // byte offset -> cell column: a CJK char before the match is
+                // 3 bytes but 2 cells, so a raw byte column would paint the
+                // label on the wrong cell
+                const col_in_line = self.lineCellCol(win, mline, m.pos);
                 const label = try a.dupe(u8, &[_]u8{m.label});
                 win.writeCell(@intCast(cur_rect.col + gutter + col_in_line), @intCast(cur_rect.row + mline - self.curViewTop().*), .{
                     .char = .{ .grapheme = label, .width = 1 },
@@ -4778,10 +4857,13 @@ const App = struct {
                 const box_w = inner_cells + 2;
                 var start_row = c_line - self.curViewTop().* + cur_rect.row + 1;
                 if (start_row + list_rows + 2 > height) {
-                    // near the bottom: show the menu above the cursor instead
-                    start_row = c_line - self.curViewTop().* + cur_rect.row - (list_rows + 2);
+                    // near the bottom: show the menu above the cursor; the
+                    // saturating minus keeps short terminals from underflowing
+                    // (a 4.29e9 row would draw the menu off-screen silently)
+                    start_row = (c_line - self.curViewTop().* + cur_rect.row) -| (list_rows + 2);
                 }
-                var box_col: u32 = @intCast(cur_rect.col + gutter + @min(c_col, 2));
+                // anchor the menu at the cursor column (not pinned left)
+                var box_col = cur_rect.col + gutter + c_col;
                 if (box_col + box_w > win.width) box_col = win.width -| box_w;
                 const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
                 const sel_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_sel }, .fg = .{ .rgb = self.theme.fg } };
@@ -4875,7 +4957,7 @@ const App = struct {
                 const hrows: u32 = 6;
                 var start_row = h_line - self.curViewTop().* + cur_rect.row + 1;
                 if (start_row + hrows >= height) {
-                    start_row = h_line - self.curViewTop().* + cur_rect.row - hrows;
+                    start_row = (h_line - self.curViewTop().* + cur_rect.row) -| hrows;
                 }
                 const col0 = cur_rect.col + gutter + 1;
                 const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint } };

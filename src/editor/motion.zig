@@ -192,9 +192,11 @@ fn moveRight(pt: *const PieceTable, pos: u32) u32 {
     const line = pt.lineOf(pos);
     const start = pt.lineStart(line);
     const line_len = pt.lineLen(line);
-    const col = pos - start;
-    // At the last char, on the '\n', or past the line end: stay.
-    if (col + 1 >= line_len) return pos;
+    // At the last char (multibyte-aware), on the '\n', or past the line
+    // end: stay. The byte-based col+1 check would treat a CJK continuation
+    // byte as a normal column and walk past the line end.
+    const last = lastCharStart(pt, start, line_len);
+    if (pos >= last) return pos;
     return nextCharBoundary(pt, pos);
 }
 
@@ -214,7 +216,7 @@ fn moveVert(pt: *const PieceTable, pos: u32, dir: i8) u32 {
     const t_start = pt.lineStart(target_line);
     const t_len = pt.lineLen(target_line);
     var t_col = col;
-    if (t_col >= t_len) t_col = if (t_len == 0) 0 else t_len - 1;
+    if (t_col >= t_len) t_col = if (t_len == 0) 0 else lastCharStart(pt, t_start, t_len) - t_start;
     return t_start + t_col;
 }
 
@@ -243,8 +245,17 @@ fn byteOrSpace(pt: *const PieceTable, pos: u32) u8 {
     return pt.byteAt(pos);
 }
 
+/// The start of the last character in the line segment [start, start+line_len).
+/// Multibyte-safe: lineEnd/$/j/k/}/e must land on a character boundary, not
+/// the last byte (a CJK char's continuation byte would corrupt the cursor).
+fn lastCharStart(pt: *const PieceTable, start: u32, line_len: u32) u32 {
+    if (line_len == 0) return start;
+    return prevCharBoundary(pt, start + line_len);
+}
+
 /// w — start of the next word (crosses newlines; each punctuation char is a
-/// word of its own).
+/// word of its own). With no next word, vim lands on the last character of
+/// the buffer; `lastCharOfDoc` computes that position.
 fn wordNext(pt: *const PieceTable, pos: u32) u32 {
     const len = pt.len();
     if (pos >= len) return pos;
@@ -254,19 +265,32 @@ fn wordNext(pt: *const PieceTable, pos: u32) u32 {
         var p = pos;
         while (p < len and isWordByte(pt.byteAt(p))) : (p += 1) {}
         while (p < len and isBlankByte(pt.byteAt(p))) : (p += 1) {}
-        return if (p >= len) pos else p;
+        return if (p >= len) wordEndFallback(pt, pos) else p;
     }
     if (isBlankByte(c)) {
         var p = pos;
         while (p < len and isBlankByte(pt.byteAt(p))) : (p += 1) {}
-        return if (p >= len) pos else p;
+        return if (p >= len) wordEndFallback(pt, pos) else p;
     }
     // On punctuation: a run of punctuation is one word (vim: "..." is one
     // word). Skip the whole run, then blanks, landing on the next word.
     var p = pos;
     while (p < len and !isWordByte(pt.byteAt(p)) and !isBlankByte(pt.byteAt(p))) : (p += 1) {}
     while (p < len and isBlankByte(pt.byteAt(p))) : (p += 1) {}
-    return if (p >= len) pos else p;
+    return if (p >= len) wordEndFallback(pt, pos) else p;
+}
+
+/// vim `w` with no word ahead: the last character of the buffer — the last
+/// line's last char. A trailing '\n' only terminates the last content line,
+/// so an empty artificial last line is skipped. Never moves the cursor
+/// backward (already at/past it: stay).
+fn wordEndFallback(pt: *const PieceTable, pos: u32) u32 {
+    var last = pt.lineCount() - 1;
+    if (last > 0 and pt.lineLen(last) == 0) last -= 1;
+    const start = pt.lineStart(last);
+    const l = pt.lineLen(last);
+    const end_pos = lastCharStart(pt, start, l);
+    return if (end_pos > pos) end_pos else pos;
 }
 
 /// e — end of the next word (end of the current word when mid-word).
@@ -279,7 +303,7 @@ fn wordNextEnd(pt: *const PieceTable, pos: u32) u32 {
             // Mid-word: end of the current word.
             var p = pos + 1;
             while (p < len and isWordByte(pt.byteAt(p))) : (p += 1) {}
-            return p - 1;
+            return prevCharBoundary(pt, p);
         }
         // On the last char of a word: end of the NEXT word.
         var p = pos + 1;
@@ -287,11 +311,11 @@ fn wordNextEnd(pt: *const PieceTable, pos: u32) u32 {
         if (p >= len) return pos;
         if (isWordByte(pt.byteAt(p))) {
             while (p < len and isWordByte(pt.byteAt(p))) : (p += 1) {}
-            return p - 1;
+            return prevCharBoundary(pt, p);
         }
         // punctuation run: e lands on its last char (vim: "..." -> last dot)
         while (p < len and !isWordByte(pt.byteAt(p)) and !isBlankByte(pt.byteAt(p))) : (p += 1) {}
-        return p - 1;
+        return prevCharBoundary(pt, p);
     }
     if (isBlankByte(c)) {
         var p = pos;
@@ -299,10 +323,10 @@ fn wordNextEnd(pt: *const PieceTable, pos: u32) u32 {
         if (p >= len) return pos;
         if (isWordByte(pt.byteAt(p))) {
             while (p < len and isWordByte(pt.byteAt(p))) : (p += 1) {}
-            return p - 1;
+            return prevCharBoundary(pt, p);
         }
         while (p < len and !isWordByte(pt.byteAt(p)) and !isBlankByte(pt.byteAt(p))) : (p += 1) {}
-        return p - 1;
+        return prevCharBoundary(pt, p);
     }
     // On punctuation: end of the next punctuation run (vim: e over "..."
     // stops on the last dot), skipping any blanks after the run.
@@ -311,95 +335,54 @@ fn wordNextEnd(pt: *const PieceTable, pos: u32) u32 {
     if (p >= len) return pos;
     if (isWordByte(pt.byteAt(p))) {
         while (p < len and isWordByte(pt.byteAt(p))) : (p += 1) {}
-        return p - 1;
+        return prevCharBoundary(pt, p);
     }
     // punctuation run: land on its last character
     while (p < len and !isWordByte(pt.byteAt(p)) and !isBlankByte(pt.byteAt(p))) : (p += 1) {}
-    return p - 1;
+    return prevCharBoundary(pt, p);
 }
 
-/// b — start of the previous word (start of the current word when mid-word).
+/// b — start of the word the byte before the cursor belongs to (skipping
+/// blanks). Mid-word (or mid punctuation run) this is the current word's
+/// start; at a word start it is the previous word's start — a run of
+/// punctuation is one word, same as `w` (vim semantics).
 fn wordPrev(pt: *const PieceTable, pos: u32) u32 {
     if (pos == 0) return 0;
-    const c = byteOrSpace(pt, pos);
-    if (isWordByte(c)) {
-        if (pos > 0 and isWordByte(pt.byteAt(pos - 1))) {
-            // Mid-word: start of the current word.
-            var p = pos;
-            while (p > 0 and isWordByte(pt.byteAt(p - 1))) : (p -= 1) {}
-            return p;
-        }
-        // At the start of a word: start of the previous word.
-        var p = pos;
-        while (p > 0 and isBlankByte(pt.byteAt(p - 1))) : (p -= 1) {}
-        if (p == 0) return pos;
-        if (isWordByte(pt.byteAt(p - 1))) {
-            while (p > 0 and isWordByte(pt.byteAt(p - 1))) : (p -= 1) {}
-            return p;
-        }
-        // punctuation run: b lands on its first char (vim: "->" -> '-')
-        while (p > 0 and !isWordByte(pt.byteAt(p - 1)) and !isBlankByte(pt.byteAt(p - 1))) : (p -= 1) {}
-        return p;
+    var p = pos - 1;
+    // Skip blanks backwards; if only blanks precede the cursor, land on the
+    // first byte of the document.
+    while (p > 0 and isBlankByte(pt.byteAt(p))) : (p -= 1) {}
+    if (isBlankByte(pt.byteAt(p))) return 0;
+    // Land on the start of the word/punctuation run containing p.
+    const word_run = isWordByte(pt.byteAt(p));
+    while (p > 0) : (p -= 1) {
+        const b = pt.byteAt(p - 1);
+        if (isBlankByte(b) or isWordByte(b) != word_run) break;
     }
-    if (isBlankByte(c)) {
-        var p = pos;
-        while (p > 0 and isBlankByte(pt.byteAt(p - 1))) : (p -= 1) {}
-        if (p == 0) return 0;
-        if (isWordByte(pt.byteAt(p - 1))) {
-            while (p > 0 and isWordByte(pt.byteAt(p - 1))) : (p -= 1) {}
-            return p;
-        }
-        while (p > 0 and !isWordByte(pt.byteAt(p - 1)) and !isBlankByte(pt.byteAt(p - 1))) : (p -= 1) {}
-        return p;
-    }
-    // On punctuation: start of the previous word.
-    var p = pos;
-    if (p > 0 and isWordByte(pt.byteAt(p - 1))) {
-        while (p > 0 and isWordByte(pt.byteAt(p - 1))) : (p -= 1) {}
-        return p;
-    }
-    if (p > 0 and isBlankByte(pt.byteAt(p - 1))) {
-        while (p > 0 and isBlankByte(pt.byteAt(p - 1))) : (p -= 1) {}
-        if (p == 0) return 0;
-        if (isWordByte(pt.byteAt(p - 1))) {
-            while (p > 0 and isWordByte(pt.byteAt(p - 1))) : (p -= 1) {}
-            return p;
-        }
-        return p - 1;
-    }
-    return p - 1; // the char before is punctuation: its own word
+    return p;
 }
 
-/// ge — end of the previous word (end of the current word when mid-word).
+/// ge — end of the word strictly before the cursor (vim semantics): the
+/// nearest position p < pos whose byte is non-blank and whose right neighbor
+/// is blank, of the other class (word vs punctuation), or past the document
+/// end. With no word end before the cursor (inside/at the first word), vim
+/// lands on the first byte of the buffer.
 fn wordPrevEnd(pt: *const PieceTable, pos: u32) u32 {
-    const len = pt.len();
-    if (pos == 0) return 0;
-    const c = byteOrSpace(pt, pos);
-    if (isWordByte(c)) {
-        if (pos > 0 and isWordByte(pt.byteAt(pos - 1))) {
-            // Mid-word: end of the current word.
-            var p = pos;
-            while (p < len and isWordByte(pt.byteAt(p))) : (p += 1) {}
-            return p - 1;
-        }
-        // At the start of a word: end of the previous word.
-        var p = pos;
-        while (p > 0 and isBlankByte(pt.byteAt(p - 1))) : (p -= 1) {}
-        if (p == 0) return pos;
-        return p - 1; // last char of the previous word/punct
-    }
-    if (isBlankByte(c)) {
-        var p = pos;
-        while (p > 0 and isBlankByte(pt.byteAt(p - 1))) : (p -= 1) {}
-        if (p == 0) return 0;
-        return p - 1;
-    }
-    // On punctuation: end of the previous word (skip the whole punct run,
-    // then land on the char before it — vim: ge over "->" stops at 'a').
     var p = pos;
-    while (p > 0 and !isWordByte(pt.byteAt(p - 1)) and !isBlankByte(pt.byteAt(p - 1))) : (p -= 1) {}
-    if (p == 0) return 0;
-    return p - 1;
+    while (p > 0) {
+        p = prevCharBoundary(pt, p); // previous character's start
+        const c = pt.byteAt(p);
+        if (isBlankByte(c)) continue;
+        // p is a word's last character iff the next character starts a
+        // different class (word/blank/punct) or p is the doc's last char.
+        // Multibyte-safe: walking char-by-char (not byte-by-byte) so CJK
+        // words don't fall through to 0.
+        const next = nextCharBoundary(pt, p);
+        if (next >= pt.len()) return p;
+        const nc = pt.byteAt(next);
+        if (isBlankByte(nc) or isWordByte(nc) != isWordByte(c)) return p;
+    }
+    return 0;
 }
 
 // ------------------------------ line motions --------------------------------
@@ -426,19 +409,23 @@ fn lineEnd(pt: *const PieceTable, pos: u32) u32 {
     const start = pt.lineStart(line);
     const line_len = pt.lineLen(line);
     if (line_len == 0) return pos;
-    return start + line_len - 1;
+    return lastCharStart(pt, start, line_len);
 }
 
 // ----------------------------- paragraph motions ----------------------------
 
 /// { / } — jump to the previous/next empty line. A run of consecutive empty
 /// lines is a single paragraph boundary, so starting inside a run skips past
-/// it. With no empty line found: first/last line. Lands on the first
-/// non-blank of the target line (== line start for an empty line).
+/// it. With no empty line found: the first/last line. Landing column (vim):
+/// { always lands on column 0; } lands on column 0 of the empty line it
+/// found, or on the last character of the last line when no boundary exists.
 fn paragraph(pt: *const PieceTable, pos: u32, dir: i8) u32 {
     const line = pt.lineOf(pos);
     const target_line = paragraphTarget(pt, line, dir);
-    return lineFirstNonBlank(pt, pt.lineStart(target_line));
+    const start = pt.lineStart(target_line);
+    const len = pt.lineLen(target_line);
+    if (dir < 0 or len == 0) return start;
+    return lastCharStart(pt, start, len);
 }
 
 fn lineIsEmpty(pt: *const PieceTable, line: u32) bool {
@@ -446,7 +433,10 @@ fn lineIsEmpty(pt: *const PieceTable, line: u32) bool {
 }
 
 fn paragraphTarget(pt: *const PieceTable, line: u32, dir: i8) u32 {
-    const line_count = pt.lineCount();
+    // The piece table counts a trailing '\n' as an extra empty line; vim has
+    // no such line, so it is neither a paragraph boundary nor a target.
+    var line_count = pt.lineCount();
+    if (line_count > 1 and lineIsEmpty(pt, line_count - 1)) line_count -= 1;
     if (dir > 0) {
         var l = line;
         if (lineIsEmpty(pt, l)) {
@@ -705,7 +695,7 @@ test "word motions w/e/b/ge: punctuation, underscore, blank lines, cross-line" {
     try check(&pt, .word_next, args, 8, 1, 9); // space -> b
     try check(&pt, .word_next, args, 11, 1, 14); // z -> q, crossing the blank line
     try check(&pt, .word_next, args, 12, 1, 14); // on '\n' -> q
-    try check(&pt, .word_next, args, 14, 1, 14); // last word: stay
+    try check(&pt, .word_next, args, 14, 1, 16); // last word -> last char (vim)
     try check(&pt, .word_next, args, 16, 1, 16); // last char: stay
     try check(&pt, .word_next, args, 0, 2, 9); // count: foo_bar -> , -> b
 
@@ -728,15 +718,15 @@ test "word motions w/e/b/ge: punctuation, underscore, blank lines, cross-line" {
     try check(&pt, .word_prev, args, 0, 1, 0); // first char: stay
     try check(&pt, .word_prev, args, 16, 2, 9); // count: q -> b
 
-    // ge: end of current word when mid-word, end of previous word otherwise.
-    try check(&pt, .word_prev_end, args, 16, 1, 16); // mid "qux" -> x (end of current word)
-    try check(&pt, .word_prev_end, args, 14, 1, 11); // at word start -> z (end of baz)
-    try check(&pt, .word_prev_end, args, 11, 1, 11); // at word end: stay
+    // ge: end of the PREVIOUS word (vim), even from mid-word or a word end.
+    try check(&pt, .word_prev_end, args, 16, 1, 11); // on "qux" -> z (end of baz)
+    try check(&pt, .word_prev_end, args, 14, 1, 11); // at word start -> z
+    try check(&pt, .word_prev_end, args, 11, 1, 7); // at word end -> ','
     try check(&pt, .word_prev_end, args, 9, 1, 7); // at word start -> ,
     try check(&pt, .word_prev_end, args, 7, 1, 6); // , -> r (end of foo_bar)
-    try check(&pt, .word_prev_end, args, 3, 1, 6); // mid "foo_bar" -> r
+    try check(&pt, .word_prev_end, args, 3, 1, 0); // mid "foo_bar": no word end before -> buffer start
     try check(&pt, .word_prev_end, args, 0, 1, 0); // first char: stay
-    try check(&pt, .word_prev_end, args, 14, 2, 11); // count: z -> z (stay)
+    try check(&pt, .word_prev_end, args, 14, 2, 7); // count: z -> ,
 }
 
 test "word motions: w/e/b edge cases" {
@@ -768,6 +758,82 @@ test "word motions: w/e/b edge cases" {
     try check(&pt3, .word_prev, args, 0, 1, 0);
     try check(&pt3, .word_next_end, args, 0, 1, 0);
     try check(&pt3, .word_prev_end, args, 0, 1, 0);
+}
+
+test "ge: end of the previous word, even mid-word or at a word end (vim)" {
+    // "foo bar": f0 o1 o2 ' '3 b4 a5 r6. All positions verified against vim.
+    var pt = try PieceTable.init(testing.allocator, "foo bar");
+    defer pt.deinit();
+    const args = Args{};
+    try check(&pt, .word_prev_end, args, 6, 1, 2); // at end of "bar" -> 'o'
+    try check(&pt, .word_prev_end, args, 5, 1, 2); // mid "bar" -> 'o'
+    try check(&pt, .word_prev_end, args, 4, 1, 2); // at start of "bar" -> 'o'
+    try check(&pt, .word_prev_end, args, 3, 1, 2); // on the blank -> 'o'
+    // No word end before the cursor: vim lands on the first byte of the
+    // buffer (even when that byte is a blank).
+    try check(&pt, .word_prev_end, args, 2, 1, 0); // end of the first word -> 0
+
+    var pt2 = try PieceTable.init(testing.allocator, "foo");
+    defer pt2.deinit();
+    try check(&pt2, .word_prev_end, args, 2, 1, 0);
+    try check(&pt2, .word_prev_end, args, 1, 1, 0);
+    try check(&pt2, .word_prev_end, args, 0, 1, 0);
+
+    // "  foo": ' '0 ' '1 f2 o3 o4 — the fallback lands on byte 0 (a blank).
+    var pt3 = try PieceTable.init(testing.allocator, "  foo");
+    defer pt3.deinit();
+    try check(&pt3, .word_prev_end, args, 3, 1, 0);
+
+    // punctuation runs have word ends too: "foo.bar" f0 o1 o2 .3 b4 a5 r6
+    var pt4 = try PieceTable.init(testing.allocator, "foo.bar");
+    defer pt4.deinit();
+    try check(&pt4, .word_prev_end, args, 4, 1, 3); // 'b' -> '.'
+    try check(&pt4, .word_prev_end, args, 6, 1, 3); // 'r' -> '.'
+}
+
+test "b: from inside/after a punctuation run goes to the run start (vim)" {
+    // "a==>b": a0 =1 =2 >3 b4. "==>" is one word; b from anywhere past its
+    // start lands on the first '=' (verified against vim).
+    var pt = try PieceTable.init(testing.allocator, "a==>b");
+    defer pt.deinit();
+    const args = Args{};
+    try check(&pt, .word_prev, args, 4, 1, 1); // b -> start of "==>"
+    try check(&pt, .word_prev, args, 3, 1, 1); // > (run end) -> start
+    try check(&pt, .word_prev, args, 2, 1, 1); // mid-run -> start
+    try check(&pt, .word_prev, args, 1, 1, 0); // run start -> a
+
+    // "a--  .b": a0 -1 -2 ' '3 ' '4 .5 b6. From '.' the previous word is the
+    // "--" run starting at 1 (vim), not the run's last char.
+    var pt2 = try PieceTable.init(testing.allocator, "a--  .b");
+    defer pt2.deinit();
+    try check(&pt2, .word_prev, args, 5, 1, 1);
+}
+
+test "w: no next word lands on the last character of the buffer (vim)" {
+    // "abc def": a0 b1 c2 ' '3 d4 e5 f6. w from the last word -> 'f' (vim),
+    // not a stay.
+    var pt = try PieceTable.init(testing.allocator, "abc def");
+    defer pt.deinit();
+    const args = Args{};
+    try check(&pt, .word_next, args, 4, 1, 6); // 'd' -> 'f'
+    try check(&pt, .word_next, args, 6, 1, 6); // already there: stay
+    try check(&pt, .word_next, args, 0, 1, 4); // a next word still wins
+
+    // single-word document: w -> last char
+    var pt2 = try PieceTable.init(testing.allocator, "abc");
+    defer pt2.deinit();
+    try check(&pt2, .word_next, args, 0, 1, 2);
+    try check(&pt2, .word_next, args, 1, 1, 2);
+
+    // trailing newline: the artificial empty last line is not a target
+    var pt3 = try PieceTable.init(testing.allocator, "abc\n");
+    defer pt3.deinit();
+    try check(&pt3, .word_next, args, 0, 1, 2); // -> 'c', not the empty line
+
+    // "abc\n\n": vim lands on the (first) empty line after "abc"
+    var pt4 = try PieceTable.init(testing.allocator, "abc\n\n");
+    defer pt4.deinit();
+    try check(&pt4, .word_next, args, 0, 1, 4);
 }
 
 test "word motions: consecutive punctuation is one word (a->b)" {
@@ -870,12 +936,43 @@ test "paragraph motions { } with consecutive empty lines" {
     try check(&pt, .paragraph_prev, args, 0, 1, 0); // first line: stay
     try check(&pt, .paragraph_prev, args, 5, 1, 3); // on '\n' of line 3 -> empty line 2
 
-    // single-line doc: no empty line anywhere — both land on the first
-    // non-blank of the (only) line, i.e. col 0 (vim fwd/bwd_paragraph).
+    // single-line doc: no empty line anywhere — { lands on column 0, } on
+    // the last character (vim fwd/bwd_paragraph).
     var pt2 = try PieceTable.init(testing.allocator, "abc");
     defer pt2.deinit();
-    try check(&pt2, .paragraph_next, args, 1, 1, 0);
+    try check(&pt2, .paragraph_next, args, 1, 1, 2);
     try check(&pt2, .paragraph_prev, args, 1, 1, 0);
+}
+
+test "paragraph: } at the document end lands on the last char, { on column 0 (vim)" {
+    const args = Args{};
+
+    // "abc": single line, no empty line anywhere. vim: } -> last char of the
+    // line, { -> column 0.
+    var pt = try PieceTable.init(testing.allocator, "abc");
+    defer pt.deinit();
+    try check(&pt, .paragraph_next, args, 1, 1, 2);
+    try check(&pt, .paragraph_prev, args, 1, 1, 0);
+
+    // "  abc\ndef": { lands on column 0 even when the first line is indented
+    // (vim), not on the first non-blank.
+    var pt2 = try PieceTable.init(testing.allocator, "  abc\ndef");
+    defer pt2.deinit();
+    try check(&pt2, .paragraph_prev, args, 7, 1, 0);
+
+    // "abc\ndef\n": a trailing '\n' only terminates "def" — it is not an
+    // extra empty line for vim. } from line 0 finds no boundary -> last char
+    // of "def" (f at 6).
+    var pt3 = try PieceTable.init(testing.allocator, "abc\ndef\n");
+    defer pt3.deinit();
+    try check(&pt3, .paragraph_next, args, 0, 1, 6);
+
+    // "abc\n\ndef\n": } -> the real empty line (4); from there, no further
+    // boundary -> last char of "def" (7).
+    var pt4 = try PieceTable.init(testing.allocator, "abc\n\ndef\n");
+    defer pt4.deinit();
+    try check(&pt4, .paragraph_next, args, 0, 1, 4);
+    try check(&pt4, .paragraph_next, args, 4, 1, 7);
 }
 
 test "page motions: fixed rows with clamping (M0)" {
@@ -990,7 +1087,7 @@ test "count: repeated motions clamp to the document edges" {
     const args = Args{};
 
     try check(&pt, .word_next, args, 0, 2, 8); // d -> g
-    try check(&pt, .word_next, args, 0, 5, 8); // no word after g: stays
+    try check(&pt, .word_next, args, 0, 5, 10); // no word after ghi: -> last char (vim)
     try check(&pt, .left, args, 10, 3, 8); // i -> h -> g -> stays at col 0 of line 2 (h doesn't wrap)
     try check(&pt, .left, args, 10, 20, 8); // clamps at the first line-start reached
     try check(&pt, .right, args, 0, 3, 2); // a -> b -> c -> clamp at line end
