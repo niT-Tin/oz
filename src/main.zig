@@ -1666,13 +1666,13 @@ const App = struct {
         var params = lsp_nav.buildTextDocPositionParams(self.alloc, uri, line, col) catch return;
         defer lsp_nav.freeTextDocPositionParams(self.alloc, &params);
         const name_copy = try self.alloc.dupe(u8, new_name);
-        errdefer self.alloc.free(name_copy);
+        // Always freed exactly once, on every exit path (put failure, request
+        // failure, success): params never frees it, so defer is safe and no
+        // path leaks it.
+        defer self.alloc.free(name_copy);
         try params.object.put(self.alloc, "newName", .{ .string = name_copy });
         client.request("textDocument/rename", params, &self.format_slot) catch return;
         self.format_req_seq = self.edit_seq;
-        // freeTextDocPositionParams frees the uri + structures but not the
-        // newName dupe — free it explicitly (put succeeded, so it is ours).
-        self.alloc.free(name_copy);
     }
 
     /// Free a manually-built {textDocument:{uri(dupe)}, ...} params object

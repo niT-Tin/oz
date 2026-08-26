@@ -126,7 +126,10 @@ fn appendLocation(alloc: std.mem.Allocator, loc: std.json.Value, out: *std.Array
 fn intField(v: std.json.Value, name: []const u8) ?u32 {
     const f = v.object.get(name) orelse return null;
     return switch (f) {
-        .integer => |n| if (n >= 0) @intCast(n) else null,
+        // @intCast panics (Debug) on values above u32 max — saturate by
+        // returning null instead: an out-of-range position is treated as
+        // invalid by the callers, never a crash.
+        .integer => |n| if (n >= 0 and n <= std.math.maxInt(u32)) @intCast(n) else null,
         .number_string => |s| std.fmt.parseInt(u32, s, 10) catch null,
         else => null,
     };

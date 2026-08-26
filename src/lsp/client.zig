@@ -671,6 +671,10 @@ pub const FrameReader = struct {
     pending: std.ArrayList(u8) = .empty,
 
     const max_header_len = 1 << 20;
+    /// Cap on a single JSON-RPC frame body. A malicious/broken server could
+    /// claim a giant Content-Length and make us buffer forever; LSP payloads
+    /// (diagnostics dumps) are large but far below this.
+    const max_body_len = 1 << 26; // 64 MiB
 
     pub fn init(alloc: std.mem.Allocator, file: std.Io.File, io: std.Io) FrameReader {
         return .{ .alloc = alloc, .file = file, .io = io };
@@ -718,8 +722,11 @@ pub const FrameReader = struct {
             }
         }
         const clen = cl orelse return error.MissingContentLength;
+        if (clen > max_body_len) return error.InvalidContentLength;
         const body_start = sep + 4;
-        while (self.pending.items.len < body_start + clen) {
+        // guard against overflow of the size math when the server lies
+        const need = std.math.add(usize, body_start, clen) catch return error.InvalidContentLength;
+        while (self.pending.items.len < need) {
             const got = try self.fillMore();
             if (got == 0) return error.UnexpectedEof;
         }
