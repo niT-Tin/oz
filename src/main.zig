@@ -987,9 +987,15 @@ const App = struct {
                     self.exitVisualAfterOp(m.op);
                     return;
                 }
-                // normal mode: d/c/y over [cursor, target)
-                const target_pos = editor.Motion.target(&self.cur().pt, m.motion, m.args, self.curCursor().*, m.count);
-                try self.applyOpRange(m.op, self.curCursor().*, target_pos, m.exclusive_end);
+                // normal mode: d/c/y over [cursor, target). vim semantics:
+                // naturally-exclusive motions (w/b/h/l/t/^) yield a half-open
+                // range [cursor, target) as-is; inclusive motions ($/e/f/%)
+                // include the character at the target (add one). We therefore
+                // pass exclusive=false and pre-adjust the target, instead of
+                // the old unconditional end-=1 that broke dl/dh/d$/de/dw.
+                var target_pos = editor.Motion.target(&self.cur().pt, m.motion, m.args, self.curCursor().*, m.count);
+                if (m.inclusive and target_pos < self.cur().pt.len()) target_pos += 1;
+                try self.applyOpRange(m.op, self.curCursor().*, target_pos, false);
             },
             .surround => |s| try self.execSurround(s),
             .align_lines => |a| try self.execAlign(a),
@@ -1503,7 +1509,7 @@ const App = struct {
         const uri = lsp_types.pathToFileUri(self.alloc, self.cur().path orelse return) catch return;
         defer self.alloc.free(uri);
         const line = self.cur().pt.lineOf(self.curCursor().*);
-        const col = self.curCursor().* - self.cur().pt.lineStart(line);
+        const col = self.utf16Column(line, self.curCursor().* - self.cur().pt.lineStart(line));
         var params = lsp_nav.buildTextDocPositionParams(self.alloc, uri, line, col) catch return;
         defer lsp_nav.freeTextDocPositionParams(self.alloc, &params);
         c.request("textDocument/completion", params, &self.completion_slot) catch return;
@@ -1660,7 +1666,7 @@ const App = struct {
         const uri = lsp_types.pathToFileUri(self.alloc, self.cur().path orelse return) catch return;
         defer self.alloc.free(uri);
         const line = self.cur().pt.lineOf(self.curCursor().*);
-        const col = self.curCursor().* - self.cur().pt.lineStart(line);
+        const col = self.utf16Column(line, self.curCursor().* - self.cur().pt.lineStart(line));
         var params = lsp_nav.buildTextDocPositionParams(self.alloc, uri, line, col) catch return;
         defer lsp_nav.freeTextDocPositionParams(self.alloc, &params);
         const name_copy = try self.alloc.dupe(u8, new_name);
@@ -3488,7 +3494,7 @@ const App = struct {
         const uri = lsp_types.pathToFileUri(self.alloc, self.cur().path orelse return) catch return;
         defer self.alloc.free(uri);
         const line = self.cur().pt.lineOf(self.curCursor().*);
-        const col = self.curCursor().* - self.cur().pt.lineStart(line);
+        const col = self.utf16Column(line, self.curCursor().* - self.cur().pt.lineStart(line));
         var params = lsp_nav.buildTextDocPositionParams(self.alloc, uri, line, col) catch return;
         defer lsp_nav.freeTextDocPositionParams(self.alloc, &params);
         client.request(method, params, &self.nav_slot) catch return;
@@ -4333,6 +4339,24 @@ const App = struct {
             p += avail;
         }
         return col;
+    }
+
+    /// LSP positions are in UTF-16 code units, not bytes. Convert a byte
+    /// column within `line` (BMP chars = 1 unit, supplementary = 2). Without
+    /// this, hover/gd/completion/rename land at the wrong column on any line
+    /// containing CJK/emoji before the cursor.
+    fn utf16Column(self: *App, line: u32, byte_col: u32) u32 {
+        const pt = &self.cur().pt;
+        const ls = pt.lineStart(line);
+        var p = ls;
+        var units: u32 = 0;
+        while (p < ls + byte_col) {
+            const b = pt.byteAt(p);
+            const seq_len: usize = if (b < 0x80) 1 else (std.unicode.utf8ByteSequenceLength(b) catch 1);
+            units += if (seq_len >= 4) 2 else 1;
+            p += @intCast(seq_len);
+        }
+        return units;
     }
 
     /// On-screen cell column of `byte_pos` within `line`: the text column

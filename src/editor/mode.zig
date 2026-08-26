@@ -60,6 +60,10 @@ pub const Result = union(enum) {
         args: Motion.Args,
         count: u32,
         exclusive_end: bool,
+        /// vim inclusive motions ($, e, ge, f, F, %): the operator target
+        /// INCLUDES the character at the target. Natural-exclusive motions
+        /// (w/b/h/l/t/^/0) stay half-open [start, target).
+        inclusive: bool = false,
     },
     /// Operator + motion combo (d{motion}): apply operator over the range.
     /// Whole-line ops (dd/cc/yy) come back with motion == .line_start and
@@ -74,6 +78,8 @@ pub const Result = union(enum) {
         args: Motion.Args,
         count: u32,
         exclusive_end: bool,
+        /// vim inclusive motions include the target character (see motion).
+        inclusive: bool = false,
         text_object: ?TextObject.Kind = null,
     },
     /// Enter command mode (from ':'), with the leading char already consumed.
@@ -371,13 +377,6 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         }
         return .pending;
     }
-    // 0a5) ] / [ start the diagnostic-navigation prefix
-    if (isPlain(key)) {
-        if (key.codepoint == ']' or key.codepoint == '[') {
-            state.pending_bracket = @intCast(key.codepoint);
-            return .pending;
-        }
-    }
 
     // 0b) leader (Space) pending — next key picks the <leader> action.
     if (state.pending_leader) {
@@ -583,7 +582,16 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
     }
 
     // 6) plain keymap lookup.
-    const action = KeyEvent.lookup(keymap, key) orelse return .pending;
+    const action = KeyEvent.lookup(keymap, key) orelse {
+        // Unbound ']' / '[' start the diagnostic-navigation prefix. Arming it
+        // here — after every pending-sequence handler — keeps ']'/'[' usable
+        // as find targets (f]) and lets an invalid key cancel a pending
+        // operator (d]) like vim.
+        if (isPlain(key) and (key.codepoint == ']' or key.codepoint == '[')) {
+            state.pending_bracket = @intCast(key.codepoint);
+        }
+        return .pending;
+    };
     return dispatchNormal(state, action);
 }
 
@@ -765,6 +773,7 @@ fn handleCommand(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result 
 fn emitMotion(state: *State, motion: Motion.Motion, args: Motion.Args) Result {
     const count = countValue(state);
     const exclusive_end = !isLinewise(motion);
+    const inclusive = isInclusive(motion);
     resetCount(state);
     if (state.pending_op) |op| {
         state.pending_op = null;
@@ -776,6 +785,7 @@ fn emitMotion(state: *State, motion: Motion.Motion, args: Motion.Args) Result {
             .args = args,
             .count = count,
             .exclusive_end = exclusive_end,
+            .inclusive = inclusive,
         } };
     }
     return .{ .motion = .{
@@ -783,7 +793,24 @@ fn emitMotion(state: *State, motion: Motion.Motion, args: Motion.Args) Result {
         .args = args,
         .count = count,
         .exclusive_end = exclusive_end,
+        .inclusive = inclusive,
     } };
+}
+
+/// vim motions whose operator range INCLUDES the character at the target
+/// (d$ keeps the last char, de keeps the word end, dfx keeps x, d% keeps
+/// the matching bracket). All others are naturally exclusive (half-open).
+fn isInclusive(motion: Motion.Motion) bool {
+    return switch (motion) {
+        .word_next_end, // e
+        .word_prev_end, // ge
+        .line_end, // $
+        .find, // f
+        .find_back, // F
+        .match_pair, // %
+        => true,
+        else => false,
+    };
 }
 
 /// Operator + text object (diw / ci( / yaw …). The caller resolves the
@@ -1301,6 +1328,48 @@ test "dfx: operator + find motion" {
     try testing.expectEqual(.op_motion, tag(r));
     try testing.expectEqual(Motion.Motion.find, r.op_motion.motion);
     try testing.expectEqual(@as(u8, 'x'), r.op_motion.args.ch);
+}
+
+test "f] / f[ take the bracket as the find target (not the ]d diagnostic prefix)" {
+    var s = State.init();
+    _ = handle(&s, press('f'), Keymaps.normal);
+    const r = handle(&s, press(']'), Keymaps.normal);
+    try testing.expectEqual(.motion, tag(r));
+    try testing.expectEqual(Motion.Motion.find, r.motion.motion);
+    try testing.expectEqual(@as(u8, ']'), r.motion.args.ch);
+
+    var s2 = State.init();
+    _ = handle(&s2, press('t'), Keymaps.normal);
+    const r2 = handle(&s2, press('['), Keymaps.normal);
+    try testing.expectEqual(.motion, tag(r2));
+    try testing.expectEqual(Motion.Motion.till, r2.motion.motion);
+    try testing.expectEqual(@as(u8, '['), r2.motion.args.ch);
+}
+
+test "d] cancels the pending operator instead of arming the diagnostic prefix" {
+    // vim: ']' is not a motion, so the pending 'd' is cancelled; the next
+    // 'w' is a plain motion, not a delete.
+    var s = State.init();
+    _ = handle(&s, press('d'), Keymaps.normal);
+    _ = handle(&s, press(']'), Keymaps.normal);
+    _ = handle(&s, press('j'), Keymaps.normal);
+    const r = handle(&s, press('w'), Keymaps.normal);
+    try testing.expectEqual(.motion, tag(r));
+    try testing.expectEqual(Motion.Motion.word_next, r.motion.motion);
+}
+
+test "]d / [d still emit diagnostic navigation from a clean state" {
+    var s = State.init();
+    _ = handle(&s, press(']'), Keymaps.normal);
+    const r = handle(&s, press('d'), Keymaps.normal);
+    try testing.expectEqual(.action, tag(r));
+    try testing.expectEqual(KeyEvent.ActionId.diagnostic_next, r.action.action);
+
+    var s2 = State.init();
+    _ = handle(&s2, press('['), Keymaps.normal);
+    const r2 = handle(&s2, press('d'), Keymaps.normal);
+    try testing.expectEqual(.action, tag(r2));
+    try testing.expectEqual(KeyEvent.ActionId.diagnostic_prev, r2.action.action);
 }
 
 test "gg → goto_first_line; ge → word_prev_end; G → goto_last_line" {

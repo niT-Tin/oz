@@ -99,14 +99,26 @@ pub fn parseLocations(alloc: std.mem.Allocator, result: std.json.Value, out: *st
 
 fn appendLocation(alloc: std.mem.Allocator, loc: std.json.Value, out: *std.ArrayList(NavLocation)) !void {
     if (loc != .object) return;
-    const uri = loc.object.get("uri") orelse return;
-    if (uri != .string) return;
-    const range = loc.object.get("range") orelse return;
+    // Location: {uri, range}. LocationLink (definition/declaration responses):
+    // {targetUri, targetSelectionRange, ...} — clangd/gopls often answer with
+    // LocationLink[] and we must not silently drop them (gd/gD/gr came back
+    // empty).
+    const uri: ?[]const u8 = blk: {
+        if (loc.object.get("uri")) |u| {
+            if (u == .string) break :blk u.string;
+        }
+        if (loc.object.get("targetUri")) |u| {
+            if (u == .string) break :blk u.string;
+        }
+        break :blk null;
+    };
+    const u = uri orelse return;
+    const range = loc.object.get("range") orelse loc.object.get("targetSelectionRange") orelse return;
     if (range != .object) return;
     const start = range.object.get("start") orelse return;
     const line = intField(start, "line") orelse return;
     const character = intField(start, "character") orelse return;
-    const uri_copy = try alloc.dupe(u8, uri.string);
+    const uri_copy = try alloc.dupe(u8, u);
     errdefer alloc.free(uri_copy);
     try out.append(alloc, .{ .uri = uri_copy, .line = line, .character = character });
 }
@@ -167,13 +179,23 @@ fn posFrom(v: std.json.Value) ?Pos {
 }
 
 /// Convert a {line,character} position to a byte offset. The pt must expose
-/// lineStart/lineLen (buffer.PieceTable does).
+/// lineStart/lineLen/byteAt (buffer.PieceTable does).
+/// LSP characters are UTF-16 code units, not bytes: walk the line's UTF-8
+/// and count units (a 4-byte sequence is an astral code point = 2 units).
 fn offsetAt(pt: anytype, pos: Pos) ?u32 {
     if (pos.line >= pt.lineCount()) return null;
     const start = pt.lineStart(pos.line);
     const len = pt.lineLen(pos.line);
-    if (pos.character > len) return null;
-    return start + pos.character;
+    var units: u32 = 0;
+    var i: u32 = 0;
+    while (i < len and units < pos.character) {
+        const b = pt.byteAt(start + i);
+        const seq_len: u32 = if (b >= 0xF0) 4 else if (b >= 0xE0) 3 else if (b >= 0xC0) 2 else 1;
+        units += if (seq_len == 4) 2 else 1;
+        i += seq_len;
+    }
+    if (units < pos.character) return null; // past the line end
+    return start + i;
 }
 
 /// Extract the line from a {line,character} position value (for outline).
@@ -363,6 +385,31 @@ test "navigation: text edits parse and map to offsets" {
     try std.testing.expectEqual(@as(u32, 4), out.items[0].start);
     try std.testing.expectEqual(@as(u32, 7), out.items[0].end);
     try std.testing.expectEqualStrings("BBB", out.items[0].new_text);
+}
+
+test "navigation: text edits map UTF-16 code units to byte offsets" {
+    const alloc = std.testing.allocator;
+    const buffer = @import("../buffer/root.zig");
+    // "aé😀b\nccc": é = 2 UTF-8 bytes / 1 UTF-16 unit, 😀 = 4 bytes / 2 units.
+    // LSP character 2..4 (the 😀) is byte range 3..7.
+    var pt = try buffer.PieceTable.init(alloc, "aé😀b\nccc");
+    defer pt.deinit();
+    const j = "[{\"range\":{\"start\":{\"line\":0,\"character\":2},\"end\":{\"line\":0,\"character\":4}},\"newText\":\"X\"}," ++
+        "{\"range\":{\"start\":{\"line\":1,\"character\":1},\"end\":{\"line\":1,\"character\":3}},\"newText\":\"YY\"}]";
+    var p = try std.json.parseFromSlice(std.json.Value, alloc, j, .{ .allocate = .alloc_always });
+    defer p.deinit();
+    var out = std.ArrayList(TextEdit).empty;
+    defer {
+        for (out.items) |*e| alloc.free(e.new_text);
+        out.deinit(alloc);
+    }
+    try parseTextEdits(alloc, p.value, &pt, &out);
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try std.testing.expectEqual(@as(u32, 3), out.items[0].start);
+    try std.testing.expectEqual(@as(u32, 7), out.items[0].end);
+    try std.testing.expectEqualStrings("X", out.items[0].new_text);
+    try std.testing.expectEqual(@as(u32, 10), out.items[1].start);
+    try std.testing.expectEqual(@as(u32, 12), out.items[1].end);
 }
 
 test "navigation: completion items from CompletionList and raw array" {
