@@ -467,13 +467,27 @@ fn buildHoverResult(a: std.mem.Allocator) !std.json.Value {
 fn buildFormatResult(a: std.mem.Allocator, state: *State) !std.json.Value {
     // Replace the whole document with its current text (a no-op format), so
     // the editor exercises the TextEdit apply path without changing content.
-    const doc = if (state.changed.items.len > 0) state.changed.items[0].text else "";
+    const doc: []const u8 = if (state.changed.items.len > 0) state.changed.items[state.changed.items.len - 1].text else "";
+    // The end position must be a REAL position (line after the last '\n',
+    // column 0 / last line's length): the client drops edits whose range is
+    // out of range, so a fake end like line 999 would silently discard the
+    // whole edit and never exercise the apply path.
+    var end_line: u32 = 0;
+    var end_col: u32 = 0;
+    for (doc) |c| {
+        if (c == '\n') {
+            end_line += 1;
+            end_col = 0;
+        } else {
+            end_col += 1;
+        }
+    }
     var start = try std.json.ObjectMap.init(a, &.{}, &.{});
     try start.put(a, "line", .{ .integer = 0 });
     try start.put(a, "character", .{ .integer = 0 });
     var end = try std.json.ObjectMap.init(a, &.{}, &.{});
-    try end.put(a, "line", .{ .integer = 999 });
-    try end.put(a, "character", .{ .integer = 0 });
+    try end.put(a, "line", .{ .integer = end_line });
+    try end.put(a, "character", .{ .integer = end_col });
     var range = try std.json.ObjectMap.init(a, &.{}, &.{});
     try range.put(a, "start", .{ .object = start });
     try range.put(a, "end", .{ .object = end });
@@ -590,6 +604,25 @@ fn recordDidOpen(alloc: std.mem.Allocator, state: *State, params: ?std.json.Valu
     const uri = extractUri(alloc, params) catch return;
     errdefer alloc.free(uri);
     try state.opened.append(alloc, uri);
+    // The didOpen text is the document state until the first didChange;
+    // completion/format handlers read `changed`, so seed it here too.
+    var text: []const u8 = "";
+    if (params) |p| {
+        if (p == .object) {
+            if (p.object.get("textDocument")) |td| {
+                if (td == .object) {
+                    if (td.object.get("text")) |t| {
+                        if (t == .string) text = t.string;
+                    }
+                }
+            }
+        }
+    }
+    const text_copy = try alloc.dupe(u8, text);
+    errdefer alloc.free(text_copy);
+    const uri_copy = try alloc.dupe(u8, uri);
+    errdefer alloc.free(uri_copy);
+    try state.changed.append(alloc, .{ .uri = uri_copy, .text = text_copy });
 }
 
 fn recordDidChange(alloc: std.mem.Allocator, state: *State, params: ?std.json.Value) !void {
@@ -977,7 +1010,7 @@ test "hello: initialized alone pushes nothing; silent pushes nothing either" {
 
     var state2 = State{};
     defer state2.deinit(alloc);
-    const open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///a.txt\",\"version\":1},\"text\":\"hello\"}}";
+    const open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///a.txt\",\"version\":1,\"text\":\"hello\"}}}";
     var out2 = try handleContent(alloc, .silent, &state2, open);
     defer out2.deinit(alloc);
     try testing.expectEqual(@as(usize, 0), out2.frames.items.len);
@@ -1012,18 +1045,21 @@ test "didOpen and didChange are recorded in state" {
     const alloc = testing.allocator;
     var state = State{};
     defer state.deinit(alloc);
-    const open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///a.txt\",\"version\":1},\"text\":\"hello\"}}";
+    const open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///a.txt\",\"version\":1,\"text\":\"hello\"}}}";
     var out_open = try handleContent(alloc, .hello, &state, open);
     defer out_open.deinit(alloc);
     try testing.expectEqual(@as(usize, 1), state.opened.items.len);
     try testing.expectEqualStrings("file:///a.txt", state.opened.items[0]);
+    // didOpen also seeds the document text (the state until the first change)
+    try testing.expectEqual(@as(usize, 1), state.changed.items.len);
+    try testing.expectEqualStrings("hello", state.changed.items[0].text);
 
     const change = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///a.txt\",\"version\":2},\"contentChanges\":[{\"text\":\"world\"}]}}";
     var out_change = try handleContent(alloc, .hello, &state, change);
     defer out_change.deinit(alloc);
-    try testing.expectEqual(@as(usize, 1), state.changed.items.len);
-    try testing.expectEqualStrings("file:///a.txt", state.changed.items[0].uri);
-    try testing.expectEqualStrings("world", state.changed.items[0].text);
+    try testing.expectEqual(@as(usize, 2), state.changed.items.len);
+    try testing.expectEqualStrings("file:///a.txt", state.changed.items[1].uri);
+    try testing.expectEqualStrings("world", state.changed.items[1].text);
 }
 
 test "exit notification sets exit_requested" {
@@ -1035,6 +1071,39 @@ test "exit notification sets exit_requested" {
     defer out.deinit(alloc);
     try testing.expect(state.exit_requested);
     try testing.expectEqual(@as(usize, 0), out.frames.items.len);
+}
+
+test "format: whole-doc edit is in range and covers the real document" {
+    const alloc = testing.allocator;
+    var state = State{};
+    defer state.deinit(alloc);
+    // didOpen only (no didChange): the initial text must still be known.
+    const open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///a.zig\",\"version\":1,\"text\":\"const a = 1;\\nconst b = 2;\\n\"}}}";
+    var out_open = try handleContent(alloc, .silent, &state, open);
+    defer out_open.deinit(alloc);
+
+    const req = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/formatting\",\"params\":{}}";
+    var out = try handleContent(alloc, .silent, &state, req);
+    defer out.deinit(alloc);
+    var resp = try json_rpc.parseMessage(alloc, out.frames.items[0]);
+    defer resp.deinit(alloc);
+
+    // The edits must map onto the actual document — an out-of-range end
+    // (e.g. line 999) is dropped by the client and the edit never applies.
+    const navigation = @import("navigation.zig");
+    const buffer = @import("../buffer/root.zig");
+    var pt = try buffer.PieceTable.init(alloc, "const a = 1;\nconst b = 2;\n");
+    defer pt.deinit();
+    var edits = std.ArrayList(navigation.TextEdit).empty;
+    defer {
+        for (edits.items) |*e| alloc.free(e.new_text);
+        edits.deinit(alloc);
+    }
+    try navigation.parseTextEdits(alloc, resp.result.?, &pt, &edits);
+    try testing.expectEqual(@as(usize, 1), edits.items.len);
+    try testing.expectEqual(@as(u32, 0), edits.items[0].start);
+    try testing.expectEqual(@as(u32, 26), edits.items[0].end);
+    try testing.expectEqualStrings("const a = 1;\nconst b = 2;\n", edits.items[0].new_text);
 }
 
 test "full message cycle through frame functions and handleMessage" {
