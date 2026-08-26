@@ -225,6 +225,11 @@ const App = struct {
     /// Auto-requested for the visible range whenever the view scrolls.
     inlay_hints: std.ArrayList(InlayHint) = .empty,
     inlay_view_top: ?u32 = null,
+    /// Set when the inlay data no longer matches the document (after an
+    /// insert session ends) until a fresh response arrives: renderers hide
+    /// stale hints instead of drawing them at shifted, wrong columns, and
+    /// the exit frame never flashes a "hints vanish → reappear" pair.
+    inlay_stale: bool = false,
     /// Monotonic edit counter: bumped by every text edit. LSP responses that
     /// arrive after newer edits (fast typing) are discarded as stale, and
     /// inlay hints are re-requested only when the text is quiescent — this is
@@ -1037,13 +1042,12 @@ const App = struct {
         // them, and forcing a full reparse on every insert exit made large
         // files visibly flash/stutter the frame after jk. Leave the revision
         // alone; visibleSpansFor takes the incremental path when it can.
-        // Fetch exact hints for the new text: the session's in-place shifts
-        // are only approximations, and a stale hint from the pre-edit text
-        // would render at a wrong column (mock inlay responses land mid-
-        // insert and race the shifts). Clear and let the run loop re-request;
-        // on a local LSP the reply lands within a frame, so this does not
-        // visibly flash (the old full-reparse on every exit did).
-        self.invalidateInlayHints();
+        // The session's in-place shifts kept the hint DATA current, but its
+        // columns are approximations. Mark it stale: renderers hide hints
+        // until a fresh response lands (no wrong-column draw, no vanish/
+        // reappear flash), and the run loop re-requests right away.
+        self.inlay_view_top = null;
+        self.inlay_stale = true;
     }
 
     // ---- visual-block multi-cursor insert (<C-v> block then I/A) ----
@@ -1862,6 +1866,9 @@ const App = struct {
         // hints stay rendered, and the next quiescent request replaces them.
         // Applying it would jump the hints to pre-edit positions (flicker).
         if (self.edit_seq != self.inlay_req_seq) return true;
+        // The response matches the current document: the hints are no longer
+        // stale, so renderers may draw them again.
+        self.inlay_stale = false;
         for (self.inlay_hints.items) |*h| self.alloc.free(h.label);
         self.inlay_hints.clearRetainingCapacity();
         if (result != .array) {
@@ -2501,6 +2508,7 @@ const App = struct {
         for (self.inlay_hints.items) |*h| self.alloc.free(h.label);
         self.inlay_hints.clearRetainingCapacity();
         self.inlay_view_top = null;
+        self.inlay_stale = true;
     }
 
     /// Shift inlay hints after inserting `text` at the pre-edit position
@@ -4937,9 +4945,15 @@ const App = struct {
             // is spliced into the text at its character offset (the token it
             // annotates ends there), so `const x = foo()` renders as
             // `const x: i32 = foo()` like nvim — not moved to end of line.
-            // Hints render in insert mode too; edits invalidate them (see
-            // invalidateInlayHints) so stale offsets never show.
-            const line_hints = try self.lineHints(a, line);
+            // Hints are hidden during insert (vim behavior): showing them
+            // while typing would let a stale pre-edit hint flash at the old
+            // column, and clearing + re-requesting on exit made the frame
+            // after jk visibly flicker (hints vanish, reappear a frame later).
+            // The hint data stays shift-maintained; normal mode renders it.
+            const line_hints = if (self.state.mode == .insert or self.inlay_stale)
+                &.{}
+            else
+                try self.lineHints(a, line);
             var hint_i: usize = 0;
             var col: u32 = 0;
             while (col < n) {

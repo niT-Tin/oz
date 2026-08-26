@@ -8109,13 +8109,14 @@ test "lsp: editing — rename, format, inlay hints, outline" {
     }
     try std.testing.expect(grid.contains(": i32"));
 
-    // The hint stays visible while typing in insert mode: the jitter fix
-    // shifts hints in place per edit instead of clearing + re-requesting
-    // them on every keystroke (which made the view flicker).
+    // Inlay hints hide while typing in insert mode (vim behavior): showing
+    // the pre-edit hint at its old column while editing, then clearing it on
+    // exit, was exactly the flash users saw after jk. The hint must NOT be
+    // visible during the insert session.
     try sess.send("A.");
     waited = 0;
-    var hint_kept = false;
-    while (!hint_kept) {
+    var hint_hidden = false;
+    while (!hint_hidden) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -8124,16 +8125,17 @@ test "lsp: editing — rename, format, inlay hints, outline" {
         }
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
-        if (grid.contains(": i32")) hint_kept = true;
+        if (!grid.contains(": i32")) hint_hidden = true;
     }
-    if (!hint_kept) {
-        std.debug.print("inlay hint vanished while typing in insert mode:\n", .{});
+    if (!hint_hidden) {
+        std.debug.print("inlay hint still visible in insert mode:\n", .{});
         grid.dump();
     }
-    try std.testing.expect(hint_kept);
+    try std.testing.expect(hint_hidden);
     // back to normal for the rename step below. '.' is a completion trigger
     // (the mock declares triggerCharacters ["."]), so the menu opened — Ctrl+e
-    // hides it, then Esc exits insert.
+    // hides it, then Esc exits insert; the fresh response then restores the
+    // hint (inlay_stale cleared) for the normal-mode view.
     try sess.send("\x05\x1b");
     waited = 0;
     while (grid.contains("INSERT")) {
@@ -8191,3 +8193,4 @@ test "lsp: editing — rename, format, inlay hints, outline" {
     }
     try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
 }
+
