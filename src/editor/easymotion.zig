@@ -9,16 +9,17 @@ pub const Match = struct {
     label: u8, // label character ('a'..'z', then 'A'..'Z')
 };
 
-/// Scan the document for occurrences of `query` (1–2 bytes, case-sensitive)
-/// and assign labels in reading order (top to bottom, left to right):
-/// 'a'..'z', then 'A'..'Z'. At most 52 matches are returned (M0: labels never
-/// repeat; further matches are dropped). Matches never span a line boundary —
-/// a query containing '\n' yields no matches.
+/// Scan the document for occurrences of `query` (one UTF-8 character, 1–4
+/// bytes, case-sensitive) and assign labels in reading order (top to bottom,
+/// left to right): 'a'..'z', then 'A'..'Z'. At most 52 matches are returned
+/// (M0: labels never repeat; further matches are dropped). Matches never span
+/// a line boundary — a query containing '\n' yields no matches.
 /// Returns a slice owned by the caller (free with `allocator.free`); it may be
 /// empty (a 0-length allocation).
 pub fn find(allocator: std.mem.Allocator, pt: *const PieceTable, query: []const u8) ![]Match {
-    // M0 contract: 1–2 byte queries only. Empty or >2-byte queries match nothing.
-    if (query.len < 1 or query.len > 2) return allocator.alloc(Match, 0);
+    // Single-character queries only (1–4 bytes = one UTF-8 codepoint, incl.
+    // CJK). Empty or multi-character queries match nothing.
+    if (query.len < 1 or query.len > 4) return allocator.alloc(Match, 0);
 
     // A query containing a newline can never sit inside a single line, and
     // matches must not cross lines (M0), so reject it outright.
@@ -87,12 +88,12 @@ fn expectFind(pt: *PieceTable, query: []const u8, expected_pos: []const u32) !vo
         if (prev) |p| try t.expect(m.pos > p);
         prev = m.pos;
         // the bytes at Match.pos must be exactly `query`
-        var buf: [2]u8 = undefined;
+        var buf: [4]u8 = undefined;
         const qlen = query.len;
         pt.copyRange(m.pos, buf[0..qlen]);
         try t.expectEqualSlices(u8, query, buf[0..qlen]);
         try t.expectEqual(query[0], pt.byteAt(m.pos));
-        if (qlen == 2) try t.expectEqual(query[1], pt.byteAt(m.pos + 1));
+        if (qlen > 1) try t.expectEqualSlices(u8, query[1..], buf[1..qlen]);
     }
 }
 
@@ -115,8 +116,11 @@ test "easymotion find: Chinese doc, ASCII query matches ASCII only" {
     defer pt.deinit();
     try t.expectEqual(@as(u32, 13), pt.len());
     try expectFind(&pt, "a", &.{6});
-    // multibyte queries (>2 bytes) are rejected outright
-    try expectFind(&pt, "你", &.{});
+    // multibyte (CJK) queries are single characters now and match their
+    // own bytes: 你@0, 好@3; a two-character query (世界, 6 bytes) is
+    // still rejected (> one UTF-8 codepoint)
+    try expectFind(&pt, "你", &.{0});
+    try expectFind(&pt, "好", &.{3});
     try expectFind(&pt, "世界", &.{});
 
     // ASCII query never matches inside a UTF-8 sequence (lead/continuation
@@ -124,7 +128,7 @@ test "easymotion find: Chinese doc, ASCII query matches ASCII only" {
     var pt2 = try PieceTable.init(t.allocator, "a好b");
     defer pt2.deinit();
     try expectFind(&pt2, "ab", &.{});
-    try expectFind(&pt2, "好", &.{});
+    try expectFind(&pt2, "好", &.{1});
 
     // valid ASCII match adjacent to multibyte text
     var pt3 = try PieceTable.init(t.allocator, "ab好a");

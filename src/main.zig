@@ -99,6 +99,11 @@ const App = struct {
     cmdline: std.ArrayList(u8),
     cmd_history: std.ArrayList([]u8),
     cmd_hist_idx: ?usize = null,
+    /// Tab-completion cursor for ":e <path>" cycling. Separate from
+    /// cmd_hist_idx: the path completer must not clobber the history index
+    /// (Up/Down) or vice versa, or a Tab after an Up would jump to a
+    /// random history entry.
+    cmd_complete_idx: usize = 0,
     prev_insert_key: ?vaxis.Key = null,
     msg: ?[]u8 = null, // transient status message (owned)
 
@@ -113,7 +118,10 @@ const App = struct {
 
     // easymotion (s / <leader>f) state
     em_active: bool = false,
-    em_query: u8 = 0, // single-char query (M1: 1-char only)
+    /// The 1-char query as UTF-8 bytes (1-2 bytes; may be non-ASCII like
+    /// CJK). Kept as bytes because find() matches on bytes, not codepoints.
+    em_query: [4]u8 = .{ 0, 0, 0, 0 },
+    em_query_len: u8 = 0,
     em_labels: bool = false, // matches computed, labels shown
     em_matches: []editor.easymotion.Match = &.{},
 
@@ -985,6 +993,7 @@ const App = struct {
                 // ':' pressed: open the command line (Mode already set .command)
                 self.cmdline.clearRetainingCapacity();
                 self.cmd_hist_idx = null;
+                self.cmd_complete_idx = 0;
                 try self.setMsg(try self.alloc.dupe(u8, ""));
                 // From visual mode vim auto-types :'<,'>; :s then applies to
                 // the selection (the anchor survives until Enter).
@@ -1335,14 +1344,30 @@ const App = struct {
             return;
         }
         if (!self.em_labels) {
-            // first key = the 1-char query
-            if (key.codepoint >= 0x20 and key.codepoint <= 0xFF and
-                !key.mods.ctrl and !key.mods.alt and !key.mods.super)
-            {
-                self.em_query = @intCast(key.codepoint);
+            // first key = the query character. Use the key's UTF-8 text so
+            // non-ASCII queries (CJK etc.) work — codepoint-only matching
+            // capped the query at 0xFF and swallowed multibyte keys.
+            const text = key.text orelse {
+                // keys without text (Enter etc.): take the codepoint as a
+                // single byte when it is printable ASCII
+                if (key.codepoint >= 0x20 and key.codepoint <= 0x7F and
+                    !key.mods.ctrl and !key.mods.alt and !key.mods.super)
+                {
+                    self.em_query[0] = @intCast(key.codepoint);
+                    self.em_query_len = 1;
+                    if (self.em_matches.len > 0) self.alloc.free(self.em_matches);
+                    const q = self.em_query[0..self.em_query_len];
+                    self.em_matches = try editor.easymotion.find(self.alloc, &self.cur().pt, q);
+                    self.em_labels = true;
+                }
+                return;
+            };
+            if (text.len > 0 and text.len <= 2 and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
+                @memcpy(self.em_query[0..text.len], text);
+                self.em_query_len = @intCast(text.len);
                 if (self.em_matches.len > 0) self.alloc.free(self.em_matches);
-                const q = [1]u8{self.em_query};
-                self.em_matches = try editor.easymotion.find(self.alloc, &self.cur().pt, &q);
+                const q = self.em_query[0..self.em_query_len];
+                self.em_matches = try editor.easymotion.find(self.alloc, &self.cur().pt, q);
                 self.em_labels = true;
             }
             return;
@@ -1365,7 +1390,8 @@ const App = struct {
         self.em_matches = &.{};
         self.em_active = false;
         self.em_labels = false;
-        self.em_query = 0;
+        self.em_query = .{ 0, 0, 0, 0 };
+        self.em_query_len = 0;
     }
 
     /// Delete the character before the cursor (backspace). The edit lands in
@@ -1648,6 +1674,7 @@ const App = struct {
         self.cur().pt.copyRange(start, wbuf);
         try self.cmdline.appendSlice(self.alloc, wbuf);
         self.cmd_hist_idx = null;
+        self.cmd_complete_idx = 0;
         try self.setMsg(try self.alloc.dupe(u8, ""));
         self.state.mode = .command;
         self.pending_rename = true;
@@ -2183,6 +2210,7 @@ const App = struct {
             self.pending_rename = false;
             self.cmdline.clearRetainingCapacity();
             self.cmd_hist_idx = null;
+            self.cmd_complete_idx = 0;
             return;
         }
         switch (key.codepoint) {
@@ -2201,6 +2229,7 @@ const App = struct {
                 if (cmd != .empty) try self.pushHistory(line);
                 self.state.mode = .normal;
                 self.cmd_hist_idx = null;
+                self.cmd_complete_idx = 0;
                 // execCommand must run BEFORE clearing: Command slices borrow
                 // the cmdline buffer (pattern/replacement/edit paths)
                 try self.execCommand(cmd);
@@ -2275,10 +2304,10 @@ const App = struct {
         }
         if (matches.items.len == 0) return;
 
-        // cycle: self.cmd_hist_idx doubles as a completion cursor
-        const cycle = (self.cmd_hist_idx orelse 0) + 1;
+        // cycle: self.cmd_complete_idx is the completion cursor
+        const cycle = self.cmd_complete_idx + 1;
         const chosen = matches.items[cycle % matches.items.len];
-        self.cmd_hist_idx = cycle % matches.items.len;
+        self.cmd_complete_idx = cycle % matches.items.len;
 
         self.cmdline.clearRetainingCapacity();
         try self.cmdline.appendSlice(self.alloc, "e ");
@@ -4375,7 +4404,8 @@ const App = struct {
                 // start the EasyMotion capture flow
                 self.em_active = true;
                 self.em_labels = false;
-                self.em_query = 0;
+                self.em_query = .{ 0, 0, 0, 0 };
+                self.em_query_len = 0;
             },
             .enter_command_mode => {},
             else => {},
@@ -5668,7 +5698,10 @@ pub fn main(init: std.process.Init) !void {
             // works for relative CLI args like `oz build.zig` — filetypeOf
             // and ensureLsp both consume this.
             app.cur().path = try app.absolutePath(file_path);
-            try app.addRecent(file_path);
+            // recent history must hold the same (absolute) form every other
+            // entry uses, or the dashboard's relative entries break after a
+            // cwd change (and dedupe against absolute entries fails).
+            try app.addRecent(app.cur().path.?);
         }
         break; // M0: first file only
     }
