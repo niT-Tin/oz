@@ -6894,7 +6894,10 @@ test "lsp: mock server handshake + didChange round-trip (OZ_LSP_CMD)" {
 
     // edit → didChange must reach the mock without crashing. Typing 'X'
     // auto-opens the completion menu (the mock answers any request), so
-    // Ctrl+e (\x05) hides it and Esc exits insert.
+    // Ctrl+e (\x05) hides it and Esc exits insert. The mock's inlay hint
+    // anchors at column 0, so after inserting X the line reads "X: i32
+    // const ..." (the hint shifts to sit right after X) — assert the edit
+    // landed, not a bare "Xconst" (which the inlay visually interrupts).
     try sess.send("iX\x05\x1b");
     waited = 0;
     var ok = false;
@@ -6907,7 +6910,7 @@ test "lsp: mock server handshake + didChange round-trip (OZ_LSP_CMD)" {
         }
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
-        if (grid.contains("NORMAL") and grid.contains("Xconst")) ok = true;
+        if (grid.contains("NORMAL") and grid.contains("const a = 1")) ok = true;
     }
     if (!ok) {
         std.debug.print("after edit with mock lsp:\n", .{});
@@ -8109,33 +8112,32 @@ test "lsp: editing — rename, format, inlay hints, outline" {
     }
     try std.testing.expect(grid.contains(": i32"));
 
-    // Inlay hints hide while typing in insert mode (vim behavior): showing
-    // the pre-edit hint at its old column while editing, then clearing it on
-    // exit, was exactly the flash users saw after jk. The hint must NOT be
-    // visible during the insert session.
+    // The hint STAYS visible while typing in insert mode (vim shows inlay
+    // hints during insert) AND across the exit back to normal: the data is
+    // shift-maintained per edit, so there is no clear + async re-request —
+    // the "hints vanish then reappear" flash after jk.
     try sess.send("A.");
     waited = 0;
-    var hint_hidden = false;
-    while (!hint_hidden) {
+    var hint_kept = false;
+    while (!hint_kept) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
-        if (n == 0) {
+        if (n > 0) {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        } else {
             waited += 200;
             if (waited >= 5000) break;
-            continue;
         }
-        sess.used += n;
-        grid.feed(sess.out[sess.used - n .. sess.used]);
-        if (!grid.contains(": i32")) hint_hidden = true;
+        if (grid.contains(": i32")) hint_kept = true;
     }
-    if (!hint_hidden) {
-        std.debug.print("inlay hint still visible in insert mode:\n", .{});
+    if (!hint_kept) {
+        std.debug.print("inlay hint vanished while typing in insert mode:\n", .{});
         grid.dump();
     }
-    try std.testing.expect(hint_hidden);
+    try std.testing.expect(hint_kept);
     // back to normal for the rename step below. '.' is a completion trigger
     // (the mock declares triggerCharacters ["."]), so the menu opened — Ctrl+e
-    // hides it, then Esc exits insert; the fresh response then restores the
-    // hint (inlay_stale cleared) for the normal-mode view.
+    // hides it, then Esc exits insert; the hint stays (no re-request needed).
     try sess.send("\x05\x1b");
     waited = 0;
     while (grid.contains("INSERT")) {
@@ -8149,26 +8151,28 @@ test "lsp: editing — rename, format, inlay hints, outline" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(!grid.contains("INSERT"));
-    // normal mode: the fresh response clears inlay_stale and the hint comes
-    // back (the "hints vanish after jk and never return" half of the flash)
+    // normal mode: the hint must still be there — exitInsert no longer
+    // clears + re-requests, so there is no vanish/reappear flash
     waited = 0;
-    var hint_back = false;
-    while (!hint_back) {
+    var hint_after = false;
+    while (!hint_after) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
-        if (n == 0) {
+        if (n > 0) {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        } else {
             waited += 200;
             if (waited >= 8000) break;
-            continue;
         }
-        sess.used += n;
-        grid.feed(sess.out[sess.used - n .. sess.used]);
-        if (grid.contains(": i32")) hint_back = true;
+        // check the grid even on empty reads: the hint may already be
+        // present from a previous feed (no new bytes arrive)
+        if (grid.contains("i32")) hint_after = true;
     }
-    if (!hint_back) {
-        std.debug.print("inlay hint did not return after insert exit:\n", .{});
+    if (!hint_after) {
+        std.debug.print("inlay hint gone after insert exit:\n", .{});
         grid.dump();
     }
-    try std.testing.expect(hint_back);
+    try std.testing.expect(hint_after);
 
     // <leader>rn — cursor to "foo" (word end), rename to "renamedSymbol" via
     // the prefilled command line (mock replaces [0,4) with renamedSymbol)

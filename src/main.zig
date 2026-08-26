@@ -1042,12 +1042,12 @@ const App = struct {
         // them, and forcing a full reparse on every insert exit made large
         // files visibly flash/stutter the frame after jk. Leave the revision
         // alone; visibleSpansFor takes the incremental path when it can.
-        // The session's in-place shifts kept the hint DATA current, but its
-        // columns are approximations. Mark it stale: renderers hide hints
-        // until a fresh response lands (no wrong-column draw, no vanish/
-        // reappear flash), and the run loop re-requests right away.
-        self.inlay_view_top = null;
-        self.inlay_stale = true;
+        // The session's in-place shifts kept the hint DATA current (adjust
+        // on every edit), so hints stay rendered across the exit — no
+        // clear + async re-request, which was the "hints vanish then
+        // reappear" flash after jk. Keep inlay_view_top so the run loop
+        // does NOT immediately re-request (the shifts are exact for the
+        // typed edits); the next view scroll refreshes as usual.
     }
 
     // ---- visual-block multi-cursor insert (<C-v> block then I/A) ----
@@ -4945,12 +4945,12 @@ const App = struct {
             // is spliced into the text at its character offset (the token it
             // annotates ends there), so `const x = foo()` renders as
             // `const x: i32 = foo()` like nvim — not moved to end of line.
-            // Hints are hidden during insert (vim behavior): showing them
-            // while typing would let a stale pre-edit hint flash at the old
-            // column, and clearing + re-requesting on exit made the frame
-            // after jk visibly flicker (hints vanish, reappear a frame later).
-            // The hint data stays shift-maintained; normal mode renders it.
-            const line_hints = if (self.state.mode == .insert or self.inlay_stale)
+            // Hints render in insert mode too (vim shows them while typing);
+            // the data is shift-maintained per edit so it stays at the right
+            // column. `inlay_stale` only hides them for the brief window
+            // after a buffer switch / invalidation until a fresh response
+            // lands — NOT on insert exit (that caused the jk vanish flash).
+            const line_hints = if (self.inlay_stale)
                 &.{}
             else
                 try self.lineHints(a, line);
