@@ -727,6 +727,142 @@ test ":wq writes the buffer to disk and exits" {
     try std.testing.expectEqualStrings("HELLObase\n", buf);
 }
 
+test "relative CLI path: :w saves without BadPathName" {
+    // The e2e harness runs with cwd = project root; open the file via a
+    // relative path (e.g. `oz relsave/oz_e2e_...txt`), edit, and :w — the
+    // saved path must resolve correctly, not produce BadPathName (which
+    // happens when the stored path contains a NUL byte).
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const abs = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}rel.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    // relative path from the project root to the same file
+    var rel_path_buf: [256:0]u8 = undefined;
+    const rel_path = try std.fmt.bufPrintZ(&rel_path_buf, "../../../../tmp/{s}", .{abs["/tmp/".len..]});
+    defer std.Io.Dir.cwd().deleteFile(io, abs) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, abs, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "base\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, rel_path });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!grid.contains("NORMAL")) {
+        std.debug.print("relative-path grid after spawn:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    try sess.send("iHELLO\x1b");
+    waited = 0;
+    while (!grid.contains("HELLObase")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("HELLObase"));
+
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    // the relative path must have saved to the right file
+    const f2 = try std.Io.Dir.cwd().openFile(io, abs, .{ .mode = .read_only });
+    defer f2.close(io);
+    const size2 = (try f2.stat(io)).size;
+    const buf2 = try alloc.alloc(u8, @intCast(size2));
+    defer alloc.free(buf2);
+    _ = try f2.readPositionalAll(io, buf2, 0);
+    try std.testing.expectEqualStrings("HELLObase\n", buf2);
+}
+
+test "path with spaces: :w saves (no BadPathName)" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz e2e sp {d} {d}.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "base\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!grid.contains("NORMAL")) {
+        std.debug.print("space-path grid after spawn:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    try sess.send("iHELLO\x1b");
+    waited = 0;
+    while (!grid.contains("HELLObase")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("HELLObase"));
+
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    const f3 = try std.Io.Dir.cwd().openFile(io, name, .{ .mode = .read_only });
+    defer f3.close(io);
+    const size3 = (try f3.stat(io)).size;
+    const buf3 = try alloc.alloc(u8, @intCast(size3));
+    defer alloc.free(buf3);
+    _ = try f3.readPositionalAll(io, buf3, 0);
+    try std.testing.expectEqualStrings("HELLObase\n", buf3);
+}
+
 test ":theme lists themes, switches colors, rejects unknown names" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;

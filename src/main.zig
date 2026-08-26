@@ -2600,10 +2600,17 @@ const App = struct {
     /// dupe on failure so file opening never breaks on a resolution error.
     fn absolutePath(self: *App, path: []const u8) ![]u8 {
         if (path.len > 0 and path[0] == '/') return self.alloc.dupe(u8, path);
-        var cwd_buf: [4096]u8 = undefined;
+        var cwd_buf: [4096:0]u8 = undefined;
         const cwd_len = std.os.linux.getcwd(&cwd_buf, cwd_buf.len);
         if (cwd_len == 0) return self.alloc.dupe(u8, path);
-        return std.Io.Dir.path.resolve(self.alloc, &.{ cwd_buf[0..cwd_len], path }) catch
+        // getcwd returns the buffer length INCLUDING the terminating NUL
+        // (the raw syscall result); slicing with it embeds a \0 in the path,
+        // which later fails as BadPathName on createFile/write (openat just
+        // truncates at the NUL, so opening still works — the saved path is
+        // silently corrupt). Trim to the C-string length.
+        var n: usize = 0;
+        while (n < cwd_buf.len and cwd_buf[n] != 0) : (n += 1) {}
+        return std.Io.Dir.path.resolve(self.alloc, &.{ cwd_buf[0..n], path }) catch
             self.alloc.dupe(u8, path);
     }
 
