@@ -809,6 +809,24 @@ test "b: from inside/after a punctuation run goes to the run start (vim)" {
     try check(&pt2, .word_prev, args, 5, 1, 1);
 }
 
+test "b: leading whitespace of a line jumps to the previous line's word" {
+    // "foo\n  bar": f0 o1 o2 \n3 ' '4 ' '5 b6 a7 r8. b from the indentation
+    // (or the line start) must cross the newline and land on "foo"'s start
+    // (vim: b skips blanks including line breaks).
+    var pt = try PieceTable.init(testing.allocator, "foo\n  bar");
+    defer pt.deinit();
+    const args = Args{};
+    try check(&pt, .word_prev, args, 6, 1, 0); // on 'b' -> 'f'
+    try check(&pt, .word_prev, args, 5, 1, 0); // in the indentation -> 'f'
+    try check(&pt, .word_prev, args, 4, 1, 0); // indentation start -> 'f'
+    // a line that is entirely blank: b still crosses to the previous line
+    var pt2 = try PieceTable.init(testing.allocator, "foo\n   \nbar");
+    defer pt2.deinit();
+    // mid-word: current word's start; from that start: previous line's word
+    try check(&pt2, .word_prev, args, 9, 1, 8); // on 'a' (mid "bar") -> 'b'
+    try check(&pt2, .word_prev, args, 8, 1, 0); // on 'b' (word start) -> "foo"
+}
+
 test "w: no next word lands on the last character of the buffer (vim)" {
     // "abc def": a0 b1 c2 ' '3 d4 e5 f6. w from the last word -> 'f' (vim),
     // not a stay.
