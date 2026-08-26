@@ -90,6 +90,11 @@ pub const Client = struct {
 
     thread: ?std.Thread = null,
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set by the reader thread when the server's stdout hit EOF or a read
+    /// error — i.e. the server EXITED (or crashed) on its own. The editor
+    /// checks this after each drain: a dead server leaves pending requests
+    /// hanging forever, so it must be torn down and reported.
+    server_died: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     queue: Queue,
 
     /// Optional wake callback invoked from the reader thread whenever a
@@ -569,6 +574,13 @@ pub const Client = struct {
             if (msg.id) |id| {
                 if (id == want_id and msg.method == null) return msg;
             }
+            // A server→client request during the handshake must be answered
+            // (MethodNotFound), or a server that blocks on its reply — e.g.
+            // rust-analyzer's workspace/configuration — stalls until our 5s
+            // cap expires and the whole start fails.
+            if (msg.method != null and msg.id != null) {
+                self.answerServerRequest(msg.id.?) catch {};
+            }
             msg.deinit(self.alloc);
         }
         return error.LspHandshakeTimeout;
@@ -589,7 +601,11 @@ pub const Client = struct {
         var reader = FrameReader.init(self.alloc, stdout, self.io);
         defer reader.deinit();
         while (!self.stop.load(.acquire)) {
-            const content = reader.next() catch break;
+            const content = reader.next() catch {
+                // read error — treat the server as gone
+                self.server_died.store(true, .release);
+                break;
+            };
             if (content) |c| {
                 // push dupes again into the queue; the frame body itself is
                 // ours to free here
@@ -604,7 +620,10 @@ pub const Client = struct {
                     if (self.wake_ctx) |ctx| w(ctx);
                 }
             } else {
-                break; // clean EOF
+                // clean EOF: the server closed its stdout (exit/crash) — it
+                // is not coming back; flag it so the editor can report it.
+                self.server_died.store(true, .release);
+                break;
             }
         }
         self.stop.store(true, .release);
@@ -821,7 +840,13 @@ test "didOpen/didChange: document version is monotonic (1, 2, 3, ...)" {
 test "waitResponse: a server request with the same id is not the response" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
-    var client = try testClient(alloc, io, undefined);
+    const fds = try std.Io.Threaded.pipe2(.{});
+    const read_end = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+    const write_end = std.Io.File{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+    defer std.Io.File.close(read_end, io);
+    defer std.Io.File.close(write_end, io);
+
+    var client = try testClient(alloc, io, write_end);
     defer cleanupClient(alloc, &client);
 
     // A server→client request (id + method) whose id collides with the
@@ -833,6 +858,19 @@ test "waitResponse: a server request with the same id is not the response" {
     defer msg.deinit(alloc);
     try std.testing.expect(msg.method == null);
     try std.testing.expect(msg.result != null);
+
+    // The server→client request was answered (MethodNotFound), so a server
+    // that blocks on its reply doesn't stall the handshake.
+    var pfd = [_]std.posix.pollfd{.{ .fd = read_end.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    try std.testing.expect(try std.posix.poll(&pfd, 1000) == 1);
+    var reader = FrameReader.init(alloc, read_end, io);
+    defer reader.deinit();
+    const body = (try reader.next()).?;
+    defer alloc.free(body);
+    var reply = try json_rpc.parseMessage(alloc, body);
+    defer reply.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 1), reply.id);
+    try std.testing.expectEqual(@as(i64, -32601), reply.err.?.code);
 }
 
 test "drain: server requests are answered, never fill pending slots" {
@@ -943,6 +981,29 @@ test "request: a new request for a busy slot replaces the old pending one" {
     try std.testing.expectEqual(@as(usize, 0), client.pending.items.len);
     try std.testing.expect(slot != null);
     try std.testing.expectEqualStrings("rename", slot.?.object.get("kind").?.string);
+}
+
+test "reader: server stdout EOF sets server_died (crash detection)" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    // /bin/true exits immediately: the reader sees clean EOF on the pipe
+    // and must flag the server as gone (the editor then tears it down and
+    // tells the user instead of hanging on pending requests).
+    const proc = try std.process.spawn(io, .{
+        .argv = &.{"/bin/true"},
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    var client = try testClient(alloc, io, undefined);
+    defer cleanupClient(alloc, &client);
+    client.proc = proc;
+
+    client.readerMain(); // runs synchronously here; no reader thread
+
+    try std.testing.expect(client.server_died.load(.acquire));
+    _ = client.proc.kill(io);
 }
 
 test "start: every failure point after spawn cleans up (no hang, no crash)" {

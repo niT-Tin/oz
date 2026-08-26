@@ -1834,10 +1834,14 @@ const App = struct {
                 if (label == .array) self.alloc.free(t);
                 continue;
             };
-            const character = lsp_nav.posCharacter(position) orelse {
+            const character_utf16 = lsp_nav.posCharacter(position) orelse {
                 if (label == .array) self.alloc.free(t);
                 continue;
             };
+            // LSP positions are UTF-16 code units; store the hint at the
+            // byte column instead so adjustInlayHints* and the renderer's
+            // byte-column comparisons stay consistent on non-ASCII lines.
+            const character = self.byteColumnFromUtf16(line, character_utf16);
             const copy = switch (label) {
                 .array => t,
                 else => self.alloc.dupe(u8, t) catch continue,
@@ -3306,6 +3310,35 @@ const App = struct {
         self.switchTo(self.buffers.items.len - 1);
     }
 
+    /// Drop the LSP client and all LSP-derived state. `died` reports whether
+    /// the server exited on its own (reader EOF) — then the user is told,
+    /// because pending requests will never resolve.
+    fn teardownLsp(self: *App, died: bool) void {
+        if (self.lsp_client) |c| {
+            c.deinit();
+            self.lsp_client = null;
+        }
+        // clear every LSP response slot so stale results are not applied
+        if (self.nav_slot) |*v| json_rpc.freeValue(self.alloc, v);
+        self.nav_slot = null;
+        if (self.completion_slot) |*v| json_rpc.freeValue(self.alloc, v);
+        self.completion_slot = null;
+        if (self.format_slot) |*v| json_rpc.freeValue(self.alloc, v);
+        self.format_slot = null;
+        if (self.inlay_slot) |*v| json_rpc.freeValue(self.alloc, v);
+        self.inlay_slot = null;
+        if (self.outline_slot) |*v| json_rpc.freeValue(self.alloc, v);
+        self.outline_slot = null;
+        self.invalidateInlayHints();
+        self.lsp_diagnostics.clearRetainingCapacity();
+        self.clearHover();
+        self.closeCompletion();
+        if (died) {
+            const msg = self.alloc.dupe(u8, "LSP server exited") catch return;
+            self.setMsg(msg) catch {};
+        }
+    }
+
     /// Close the buffer at `buf_idx`; every window showing it points at the
     /// next buffer. The last buffer stays. Used by :bd and the single-window
     /// :q path.
@@ -4434,13 +4467,38 @@ const App = struct {
         return units;
     }
 
+    /// Inverse of utf16Column: the byte offset within `line` of the
+    /// character at UTF-16 column `utf16_col` (LSP positions are UTF-16
+    /// code units). Clamped to the line end when the column runs past the
+    /// text (some servers report a hint at the token end == line end).
+    fn byteColumnFromUtf16(self: *App, line: u32, utf16_col: u32) u32 {
+        const pt = &self.cur().pt;
+        const ls = pt.lineStart(line);
+        const end = ls + pt.lineLen(line);
+        var p = ls;
+        var units: u32 = 0;
+        while (p < end) {
+            if (units >= utf16_col) break;
+            const b = pt.byteAt(p);
+            const seq_len: usize = if (b < 0x80) 1 else (std.unicode.utf8ByteSequenceLength(b) catch 1);
+            units += if (seq_len >= 4) 2 else 1;
+            p += @intCast(seq_len);
+        }
+        return p - ls;
+    }
+
     /// On-screen cell column of `byte_pos` within `line`: the text column
     /// plus the width of every inlay hint spliced before it.
     fn screenCellCol(self: *App, win: vaxis.Window, line: u32, byte_pos: u32) u32 {
         const text_col = self.lineCellCol(win, line, byte_pos);
         var col = text_col;
+        // hints anchored before the cursor widen the cursor's cell column.
+        // hint.character is a byte column (see processInlay), so compare it
+        // with the cursor's byte offset within the line — not a cell column.
+        const ls = self.cur().pt.lineStart(line);
+        const in_line = if (byte_pos >= ls) byte_pos - ls else 0;
         for (self.inlay_hints.items) |hint| {
-            if (hint.line == line and hint.character <= text_col) {
+            if (hint.line == line and hint.character <= in_line) {
                 col += self.textWidth(win, hint.label);
             }
         }
@@ -5247,6 +5305,14 @@ const App = struct {
             // reach the handler before the frame renders; then consume any
             // completed navigation request before the frame is drawn.
             if (self.lsp_client) |c| c.drain(self, App.lspHandler);
+            // Server exited/crashed (stdout EOF or read error): nothing more
+            // will ever arrive — drop the dead client, clear its state and
+            // tell the user, instead of letting pending requests hang forever.
+            if (self.lsp_client) |c| {
+                if (c.server_died.load(.acquire)) {
+                    self.teardownLsp(true);
+                }
+            }
             // Consume async LSP responses (navigation, completion) and render
             // immediately — otherwise the loop would block in pollEvent below
             // before the new hover window / completion menu is drawn.
