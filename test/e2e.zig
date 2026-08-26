@@ -8149,6 +8149,26 @@ test "lsp: editing — rename, format, inlay hints, outline" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(!grid.contains("INSERT"));
+    // normal mode: the fresh response clears inlay_stale and the hint comes
+    // back (the "hints vanish after jk and never return" half of the flash)
+    waited = 0;
+    var hint_back = false;
+    while (!hint_back) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+        if (grid.contains(": i32")) hint_back = true;
+    }
+    if (!hint_back) {
+        std.debug.print("inlay hint did not return after insert exit:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(hint_back);
 
     // <leader>rn — cursor to "foo" (word end), rename to "renamedSymbol" via
     // the prefilled command line (mock replaces [0,4) with renamedSymbol)
