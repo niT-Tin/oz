@@ -6996,10 +6996,18 @@ test "lsp: diagnostics — gutter mark, gl, <leader>sd list" {
             sess.used += n;
             grid.feed(sess.out[sess.used - n .. sess.used]);
         }
-        if (grid.buf[(1 * grid.cols + 1) * 4] == 'E') mark = true; // gutter col 1 on screen row 1
+        // gutter col 1 on screen row 1: the Nerd Font ✖ (nf-fa-times_circle,
+        // U+F467 → EF 91 A7) — no longer a bare 'E'
+        if (grid.buf[(1 * grid.cols + 1) * 4] == 0xEF and
+            grid.buf[(1 * grid.cols + 1) * 4 + 1] == 0x91 and
+            grid.buf[(1 * grid.cols + 1) * 4 + 2] == 0xA7) mark = true;
     }
     if (!mark) {
-        std.debug.print("no gutter E mark; col1={x} col2={x}\n", .{ grid.buf[(1 * grid.cols + 1) * 4], grid.buf[(1 * grid.cols + 2) * 4] });
+        std.debug.print("no gutter mark; col1={x}{x}{x}\n", .{
+            grid.buf[(1 * grid.cols + 1) * 4],
+            grid.buf[(1 * grid.cols + 1) * 4 + 1],
+            grid.buf[(1 * grid.cols + 1) * 4 + 2],
+        });
         grid.dump();
     }
     try std.testing.expect(mark);

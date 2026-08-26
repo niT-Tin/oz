@@ -4864,16 +4864,19 @@ const App = struct {
             num_str[gutter - 1] = ' ';
 
             // LSP diagnostic mark in the gutter's last column (this window
-            // shows the current buffer → marks the current file's diagnostics)
-            var diag_mark: u8 = ' ';
+            // shows the current buffer → marks the current file's
+            // diagnostics). Nerd Font icons (spec: 图标体系 = Nerd Font),
+            // like nvim's diagnostic gutter: ✖ for errors, ⚠ warnings, ℹ
+            // info. A bare letter (E/W/I) read as noise/errors to users.
+            var diag_mark: []const u8 = " ";
             var diag_mark_fg: ?vaxis.Style = null;
             if (w.buf == self.current and self.lsp_diagnostics.items.len > 0) {
                 for (self.lsp_diagnostics.items) |d| {
                     if (d.range.start.line == line) {
                         diag_mark = switch (d.severity) {
-                            .err => 'E',
-                            .warning => 'W',
-                            else => 'I',
+                            .err => "\u{f467}", // nf-fa-times_circle ✖
+                            .warning => "\u{f071}", // nf-fa-warning ⚠
+                            else => "\u{f05a}", // nf-fa-info_circle ℹ
                         };
                         diag_mark_fg = switch (d.severity) {
                             .err => .{ .fg = .{ .rgb = self.theme.diag_error } },
@@ -5034,12 +5037,11 @@ const App = struct {
             });
             // diagnostic mark: writeCell AFTER the line print so the glyph is
             // not overwritten by the gutter segment
-            if (diag_mark != ' ') {
-                const mark_str = try a.dupe(u8, &[_]u8{diag_mark});
+            if (diag_mark.len > 1) { // Nerd Font icon (multi-byte); " " = none
                 var mark_style = cursorline_style;
                 if (diag_mark_fg) |f| mark_style.fg = f.fg;
                 win.writeCell(@intCast(rect.col + gutter - 1), @intCast(row), .{
-                    .char = .{ .grapheme = mark_str, .width = 1 },
+                    .char = .{ .grapheme = diag_mark, .width = 1 },
                     .style = mark_style,
                 });
             }
