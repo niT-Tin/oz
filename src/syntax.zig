@@ -208,6 +208,9 @@ pub fn captureStyle(name: []const u8) Style {
     if (std.mem.eql(u8, base, "boolean")) return .boolean;
     if (std.mem.eql(u8, base, "character")) return .character;
     if (std.mem.eql(u8, base, "namespace")) return .namespace;
+    // zig.scm captures `@module` for identifiers bound by @import
+    // ("const std = @import(...)" — the most common line in Zig code)
+    if (std.mem.eql(u8, base, "module")) return .namespace;
     if (std.mem.eql(u8, base, "constructor")) return .constructor;
     if (std.mem.eql(u8, base, "variable")) return .variable;
     if (std.mem.eql(u8, base, "parameter")) return .parameter;
@@ -357,7 +360,13 @@ pub const Highlighter = struct {
         for (errs.items) |r| {
             if (r.end <= r.start) continue;
             if (r.end > text.len) continue;
-            try fallbackLex(text[r.start..r.end], r.start, arena, out);
+            // an ERROR node can span to the end of the file (unclosed
+            // string/comment while typing); the fallback lexer must run only
+            // on the visible slice, or every frame costs O(file)
+            const lo = @max(r.start, start_byte);
+            const hi = @min(r.end, end_byte);
+            if (hi <= lo) continue;
+            try fallbackLex(text[lo..hi], lo, arena, out);
         }
         std.mem.sort(Span, out.items, {}, lessThan);
     }

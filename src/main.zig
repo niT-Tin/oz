@@ -1047,6 +1047,16 @@ const App = struct {
         right: u32,
     };
 
+    /// Align `pos` (a byte offset within [line_start, line_end)) forward to a
+    /// UTF-8 character boundary, so a visual-block column landing on a
+    /// continuation byte doesn't slice a multibyte char mid-sequence.
+    fn charBoundaryForward(self: *App, pt: *const buffer.PieceTable, pos: u32, line_end: u32) u32 {
+        _ = self;
+        var p = pos;
+        while (p < line_end and (pt.byteAt(p) & 0xC0) == 0x80) : (p += 1) {}
+        return p;
+    }
+
     fn blockRect(self: *App) ?BlockRect {
         const anchor = self.visual_anchor orelse return null;
         const pt = &self.cur().pt;
@@ -1077,8 +1087,11 @@ const App = struct {
                     const ls = pt.lineStart(line);
                     const len = pt.lineLen(line);
                     if (rect.left >= len) continue;
-                    const end = @min(rect.right + 1, len);
-                    try self.cur().history.record(pt, ls + rect.left, end - rect.left, "");
+                    const line_end = ls + len;
+                    const start = self.charBoundaryForward(pt, ls + rect.left, line_end);
+                    const end = @min(self.charBoundaryForward(pt, ls + rect.right + 1, line_end), line_end);
+                    if (end <= start) continue;
+                    try self.cur().history.record(pt, start, end - start, "");
                 }
                 self.cur().history.endGroup();
                 self.markDirty();
@@ -1101,10 +1114,13 @@ const App = struct {
                     const ls = pt.lineStart(line);
                     const len = pt.lineLen(line);
                     if (rect.left < len) {
-                        const end = @min(rect.right + 1, len);
-                        const seg = try self.alloc.alloc(u8, end - rect.left);
+                        const line_end = ls + len;
+                        const start = self.charBoundaryForward(pt, ls + rect.left, line_end);
+                        const end = @min(self.charBoundaryForward(pt, ls + rect.right + 1, line_end), line_end);
+                        if (end <= start) continue;
+                        const seg = try self.alloc.alloc(u8, end - start);
                         defer self.alloc.free(seg);
-                        pt.copyRange(ls + rect.left, seg);
+                        pt.copyRange(start, seg);
                         try buf.appendSlice(self.alloc, seg);
                     }
                     if (line < rect.bottom) try buf.append(self.alloc, '\n');
@@ -1133,19 +1149,23 @@ const App = struct {
     fn placeBlockCursors(self: *App, rect: BlockRect, append: bool) !void {
         const pt = &self.cur().pt;
         self.mc.clear();
+        const anchor_line = pt.lineStart(rect.top);
+        const anchor_end = anchor_line + pt.lineLen(rect.top);
         const anchor_col: u32 = if (append)
-            @min(rect.right + 1, pt.lineLen(rect.top))
+            @min(self.charBoundaryForward(pt, anchor_line + rect.right + 1, anchor_end), anchor_end)
         else
-            @min(rect.left, pt.lineLen(rect.top));
-        _ = try self.mc.add(pt.lineStart(rect.top) + anchor_col);
+            @min(self.charBoundaryForward(pt, anchor_line + rect.left, anchor_end), anchor_end);
+        _ = try self.mc.add(anchor_col);
         var line = rect.top;
         while (line <= rect.bottom) : (line += 1) {
             if (line == rect.top) continue;
+            const ls = pt.lineStart(line);
+            const line_end = ls + pt.lineLen(line);
             const col: u32 = if (append)
-                @min(rect.right + 1, pt.lineLen(line))
+                @min(self.charBoundaryForward(pt, ls + rect.right + 1, line_end), line_end)
             else
-                @min(rect.left, pt.lineLen(line));
-            _ = try self.mc.add(pt.lineStart(line) + col);
+                @min(self.charBoundaryForward(pt, ls + rect.left, line_end), line_end);
+            _ = try self.mc.add(col);
         }
         self.mc_active = true;
         self.visual_anchor = null; // the selection is consumed by I/A/c
@@ -3929,13 +3949,28 @@ const App = struct {
             },
             .delete, .change, .yank => {
                 // multi-cursor: d deletes the selected word at every cursor
-                if (self.mc_active and action == .delete) {
-                    const w = self.mc.wordRange(&self.cur().pt, self.mc.cursors.items[self.mc.main]);
-                    if (w.end > w.start) {
-                        _ = try self.mc.applyDelete(&self.cur().pt, w.end - w.start);
+                if (self.mc_active and action == .delete and self.state.mode == .normal) {
+                    // delete the WORD at each cursor (cursors sit on word
+                    // starts): [pos, word_end), not the bytes before the
+                    // cursor — and through history so it is undoable
+                    const pt = &self.cur().pt;
+                    self.cur().history.beginGroup();
+                    var i = self.mc.cursors.items.len;
+                    while (i > 0) {
+                        i -= 1;
+                        const pos = self.mc.cursors.items[i];
+                        const w = self.mc.wordRange(pt, pos);
+                        if (w.end <= w.start) continue;
+                        try self.cur().history.record(pt, w.start, w.end - w.start, "");
+                        for (self.mc.cursors.items, 0..) |*c, j| {
+                            if (j == i) continue;
+                            if (c.* >= w.end) c.* -= w.end - w.start;
+                        }
                     }
+                    self.cur().history.endGroup();
                     self.mc.clear();
                     self.mc_active = false;
+                    self.markDirty();
                     return;
                 }
                 // visual mode: the operator acts on the selection directly.

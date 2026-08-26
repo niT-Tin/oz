@@ -193,6 +193,23 @@ pub const MultiCursor = struct {
                 self.cursors.items[j] = if (c >= pos) c - del else start;
             }
         }
+        // overlapping deletes can clamp several cursors onto the same
+        // position — dedupe (the list stays sorted) so typed text isn't
+        // inserted multiple times at one spot.
+        if (self.cursors.items.len > 1) {
+            var write: usize = 1;
+            var prev = self.cursors.items[0];
+            var di: usize = 1;
+            while (di < self.cursors.items.len) : (di += 1) {
+                const c = self.cursors.items[di];
+                if (c != prev) {
+                    self.cursors.items[write] = c;
+                    write += 1;
+                    prev = c;
+                }
+            }
+            self.cursors.shrinkRetainingCapacity(write);
+        }
         return count;
     }
 };
