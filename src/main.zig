@@ -953,66 +953,7 @@ const App = struct {
                 }
                 self.curCursor().* = new_cursor;
             },
-            .op_motion => |m| {
-                // dd / cc / yy: motion == .line_start + exclusive_end == false is
-                // the whole-line sentinel (see mode.zig Result docs; d^ is
-                // .line_start with exclusive_end == true, so unambiguous). Must
-                // delete/change/yank `count` whole lines, not [cursor, line start).
-                if (m.motion == .line_start and !m.exclusive_end) {
-                    const line = self.cur().pt.lineOf(self.curCursor().*);
-                    const n = @max(m.count, 1);
-                    const start_line = @min(line, self.cur().pt.lineCount() - 1);
-                    const end_line = @min(start_line + n - 1, self.cur().pt.lineCount() - 1);
-                    const start = self.cur().pt.lineStart(start_line);
-                    var end = self.cur().pt.lineStart(end_line) + self.cur().pt.lineLen(end_line);
-                    if (end_line + 1 < self.cur().pt.lineCount()) end += 1; // include trailing '\n'
-                    try self.applyOpRange(m.op, start, end, false);
-                    return;
-                }
-                // text object (diw / ci( / yaw …): resolve at the cursor
-                if (m.text_object) |kind| {
-                    const rng = editor.TextObject.range(&self.cur().pt, kind, self.curCursor().*);
-                    try self.applyOpRange(m.op, rng.start, rng.end, false);
-                    return;
-                }
-                // visual mode: the operator acts on the selection
-                if (self.isVisual()) {
-                    if (self.visual_anchor) |anchor| {
-                        if (self.state.mode == .visual_block) {
-                            try self.applyBlockOp(m.op);
-                        } else {
-                            try self.applyOpRangeEx(m.op, anchor, self.curCursor().*, false, .inclusive_cursor);
-                        }
-                    }
-                    self.exitVisualAfterOp(m.op);
-                    return;
-                }
-                // linewise motions (j/k/G/gg/{/}) with an operator from
-                // mid-line: the range covers WHOLE lines from the cursor
-                // line through the target line (the dd sentinel above already
-                // handled the pure line_start case). Deleting a partial
-                // byte range across lines would shred the text.
-                if (!m.exclusive_end) {
-                    const from_line = self.cur().pt.lineOf(self.curCursor().*);
-                    const to_line = self.cur().pt.lineOf(editor.Motion.target(&self.cur().pt, m.motion, m.args, self.curCursor().*, m.count));
-                    const lo = @min(from_line, to_line);
-                    const hi = @max(from_line, to_line);
-                    const start = self.cur().pt.lineStart(lo);
-                    var end = self.cur().pt.lineStart(hi) + self.cur().pt.lineLen(hi);
-                    if (hi + 1 < self.cur().pt.lineCount()) end += 1; // include trailing '\n'
-                    try self.applyOpRange(m.op, start, end, false);
-                    return;
-                }
-                // normal mode: d/c/y over [cursor, target). vim semantics:
-                // naturally-exclusive motions (w/b/h/l/t/^) yield a half-open
-                // range [cursor, target) as-is; inclusive motions ($/e/f/%)
-                // include the character at the target (add one). We therefore
-                // pass exclusive=false and pre-adjust the target, instead of
-                // the old unconditional end-=1 that broke dl/dh/d$/de/dw.
-                var target_pos = editor.Motion.target(&self.cur().pt, m.motion, m.args, self.curCursor().*, m.count);
-                if (m.inclusive and target_pos < self.cur().pt.len()) target_pos += 1;
-                try self.applyOpRange(m.op, self.curCursor().*, target_pos, false);
-            },
+            .op_motion => |m| try self.execOpMotion(m),
             .surround => |s| try self.execSurround(s),
             .align_lines => |a| try self.execAlign(a),
             .command_mode => {
@@ -3684,8 +3625,10 @@ const App = struct {
         self.lsp_client = start_result catch |err| {
             // Tell the user why LSP features are silent: the configured
             // server binary is missing or failed to spawn (e.g. no zls
-            // installed for Zig files).
-            self.setMsg(std.fmt.allocPrint(self.alloc, "LSP {s}: {s}", .{ ft, @errorName(err) }) catch "") catch {};
+            // installed for Zig files). On OOM there is nothing to say —
+            // never hand a static "" to setMsg (it would be freed later).
+            const msg = std.fmt.allocPrint(self.alloc, "LSP {s}: {s}", .{ ft, @errorName(err) }) catch return;
+            self.setMsg(msg) catch {};
             return;
         };
         // Wire the reader thread's wake callback to our event loop: any
@@ -3860,8 +3803,83 @@ const App = struct {
         }
     }
 
+    /// Execute an operator + motion combo over the current buffer/cursor.
+    /// Shared by normal-mode dispatch and the '.' repeat (which replays the
+    /// same motion from wherever the cursor now sits).
+    fn execOpMotion(self: *App, m: editor.OpMotion) !void {
+        // dd / cc / yy: motion == .line_start + exclusive_end == false is
+        // the whole-line sentinel (see mode.zig Result docs; d^ is
+        // .line_start with exclusive_end == true, so unambiguous). Must
+        // delete/change/yank `count` whole lines, not [cursor, line start).
+        if (m.motion == .line_start and !m.exclusive_end) {
+            const line = self.cur().pt.lineOf(self.curCursor().*);
+            const n = @max(m.count, 1);
+            const start_line = @min(line, self.cur().pt.lineCount() - 1);
+            const end_line = @min(start_line + n - 1, self.cur().pt.lineCount() - 1);
+            const start = self.cur().pt.lineStart(start_line);
+            var end = self.cur().pt.lineStart(end_line) + self.cur().pt.lineLen(end_line);
+            if (end_line + 1 < self.cur().pt.lineCount()) end += 1; // include trailing '\n'
+            try self.applyOpRange(m.op, start, end, false);
+            return;
+        }
+        // text object (diw / ci( / yaw …): resolve at the cursor
+        if (m.text_object) |kind| {
+            const rng = editor.TextObject.range(&self.cur().pt, kind, self.curCursor().*);
+            try self.applyOpRange(m.op, rng.start, rng.end, false);
+            return;
+        }
+        // visual mode: the operator acts on the selection
+        if (self.isVisual()) {
+            if (self.visual_anchor) |anchor| {
+                if (self.state.mode == .visual_block) {
+                    try self.applyBlockOp(m.op);
+                } else {
+                    try self.applyOpRangeEx(m.op, anchor, self.curCursor().*, false, .inclusive_cursor);
+                }
+            }
+            self.exitVisualAfterOp(m.op);
+            return;
+        }
+        // linewise motions (j/k/G/gg/{/}) with an operator from
+        // mid-line: the range covers WHOLE lines from the cursor
+        // line through the target line (the dd sentinel above already
+        // handled the pure line_start case). Deleting a partial
+        // byte range across lines would shred the text.
+        if (!m.exclusive_end) {
+            const from_line = self.cur().pt.lineOf(self.curCursor().*);
+            const to_line = self.cur().pt.lineOf(editor.Motion.target(&self.cur().pt, m.motion, m.args, self.curCursor().*, m.count));
+            const lo = @min(from_line, to_line);
+            const hi = @max(from_line, to_line);
+            const start = self.cur().pt.lineStart(lo);
+            var end = self.cur().pt.lineStart(hi) + self.cur().pt.lineLen(hi);
+            if (hi + 1 < self.cur().pt.lineCount()) end += 1; // include trailing '\n'
+            try self.applyOpRange(m.op, start, end, false);
+            return;
+        }
+        // normal mode: d/c/y over [cursor, target). vim semantics:
+        // naturally-exclusive motions (w/b/h/l/t/^) yield a half-open
+        // range [cursor, target) as-is; inclusive motions ($/e/f/%)
+        // include the character at the target (add one). We therefore
+        // pass exclusive=false and pre-adjust the target, instead of
+        // the old unconditional end-=1 that broke dl/dh/d$/de/dw.
+        var target_pos = editor.Motion.target(&self.cur().pt, m.motion, m.args, self.curCursor().*, m.count);
+        if (m.inclusive and target_pos < self.cur().pt.len()) target_pos += 1;
+        try self.applyOpRange(m.op, self.curCursor().*, target_pos, false);
+    }
+
     fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !void {
         switch (action) {
+            .repeat_last => {
+                // '.' — replay the last repeatable edit from the current
+                // cursor. An operator+motion re-resolves its range; a plain
+                // action re-runs with its stored count. Nothing to replay
+                // (or the last edit was undo/redo) → no-op, like vim.
+                const rep = self.state.last_repeat orelse return;
+                switch (rep) {
+                    .action => |a| try self.execAction(a.action, a.count),
+                    .op => |o| try self.execOpMotion(o),
+                }
+            },
             .undo => {
                 if (self.in_insert) {
                     self.cur().history.endGroup();

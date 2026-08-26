@@ -40,6 +40,27 @@ pub const Mode = enum {
     command,
 };
 
+/// Operator + motion fields shared by Result.op_motion and the '.' repeat
+/// snapshot (a named type so both can reference the same struct).
+pub const OpMotion = struct {
+    op: KeyEvent.ActionId,
+    motion: Motion.Motion,
+    args: Motion.Args,
+    count: u32,
+    exclusive_end: bool,
+    /// vim inclusive motions include the target character (see motion).
+    inclusive: bool = false,
+    text_object: ?TextObject.Kind = null,
+};
+
+/// Snapshot of the last repeatable edit, replayed by '.'.
+pub const Repeat = union(enum) {
+    /// Plain action (x, ~, p, …) with its count.
+    action: struct { action: KeyEvent.ActionId, count: u32 },
+    /// Operator + motion (dw, dd, ci(, …) — re-resolved at the new cursor.
+    op: OpMotion,
+};
+
 /// What the caller should do after feeding one key.
 pub const Result = union(enum) {
     /// Key swallowed (pending count/operator/sequence); nothing to execute.
@@ -72,16 +93,7 @@ pub const Result = union(enum) {
     /// d^ is .line_start with exclusive_end == true).
     /// When `text_object` is set (diw / ci( / yaw …) the motion fields are
     /// unused; the caller resolves the text object at the cursor instead.
-    op_motion: struct {
-        op: KeyEvent.ActionId,
-        motion: Motion.Motion,
-        args: Motion.Args,
-        count: u32,
-        exclusive_end: bool,
-        /// vim inclusive motions include the target character (see motion).
-        inclusive: bool = false,
-        text_object: ?TextObject.Kind = null,
-    },
+    op_motion: OpMotion,
     /// Enter command mode (from ':'), with the leading char already consumed.
     command_mode,
     /// Exit insert/visual mode back to normal (jk / Esc).
@@ -156,6 +168,9 @@ pub const State = struct {
     /// last executed action for '.' repeat
     last_action: ?KeyEvent.ActionId = null,
     last_count: u32 = 1,
+    /// Full snapshot of the last repeatable edit ('.' replays it). Covers
+    /// what last_action cannot: operator + motion / text object combos.
+    last_repeat: ?Repeat = null,
     /// insert-mode key before current (for jk detection)
     prev_insert_key: ?vaxis.Key = null,
 
@@ -544,6 +559,13 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
                 resetCount(state);
                 state.last_action = op;
                 state.last_count = count;
+                state.last_repeat = .{ .op = .{
+                    .op = op,
+                    .motion = .line_start, // linewise sentinel, see Result docs
+                    .args = .{},
+                    .count = count,
+                    .exclusive_end = false,
+                } };
                 return .{
                     .op_motion = .{
                         .op = op,
@@ -790,6 +812,14 @@ fn emitMotion(state: *State, motion: Motion.Motion, args: Motion.Args) Result {
         state.pending_op = null;
         state.last_action = op; // d{motion} is repeatable via '.'
         state.last_count = count;
+        state.last_repeat = .{ .op = .{
+            .op = op,
+            .motion = motion,
+            .args = args,
+            .count = count,
+            .exclusive_end = exclusive_end,
+            .inclusive = inclusive,
+        } };
         return .{ .op_motion = .{
             .op = op,
             .motion = motion,
@@ -832,6 +862,14 @@ fn emitTextObject(state: *State, op: KeyEvent.ActionId, kind: TextObject.Kind) R
     state.pending_op = null;
     state.last_action = op;
     state.last_count = count;
+    state.last_repeat = .{ .op = .{
+        .op = op,
+        .motion = .left, // unused when text_object is set
+        .args = .{},
+        .count = count,
+        .exclusive_end = true,
+        .text_object = kind,
+    } };
     return .{
         .op_motion = .{
             .op = op,
@@ -871,6 +909,7 @@ fn emitAction(state: *State, action: KeyEvent.ActionId) Result {
         else => {
             state.last_action = action;
             state.last_count = count;
+            state.last_repeat = .{ .action = .{ .action = action, .count = count } };
         },
     }
     return .{ .action = .{ .action = action, .count = count } };
@@ -1428,6 +1467,41 @@ test ": → command_mode; u → action undo; . → repeat_last" {
     try testing.expectEqual(.action, tag(r4));
     try testing.expectEqual(KeyEvent.ActionId.insert_mode, r4.action.action);
     try testing.expectEqual(KeyEvent.ActionId.insert_mode, s3.last_action.?);
+    try testing.expectEqual(@as(std.meta.Tag(Repeat), .action), std.meta.activeTag(s3.last_repeat.?));
+    try testing.expectEqual(KeyEvent.ActionId.insert_mode, s3.last_repeat.?.action.action);
+}
+
+test "'.' repeat snapshot: operator+motion records the full combo" {
+    var s = State.init();
+    // dw — operator 'd' then motion 'w'
+    const r1 = handle(&s, press('d'), Keymaps.normal);
+    try testing.expectEqual(.pending, tag(r1));
+    const r2 = handle(&s, press('w'), Keymaps.normal);
+    try testing.expectEqual(.op_motion, tag(r2));
+    try testing.expectEqual(@as(std.meta.Tag(Repeat), .op), std.meta.activeTag(s.last_repeat.?));
+    const rep = s.last_repeat.?.op;
+    try testing.expectEqual(KeyEvent.ActionId.delete, rep.op);
+    try testing.expectEqual(Motion.Motion.word_next, rep.motion);
+    try testing.expect(rep.exclusive_end); // w is a character-wise (exclusive) motion
+    try testing.expectEqual(@as(?TextObject.Kind, null), rep.text_object);
+
+    // dd — whole-line sentinel, also repeatable
+    var s2 = State.init();
+    _ = handle(&s2, press('d'), Keymaps.normal);
+    const r3 = handle(&s2, press('d'), Keymaps.normal);
+    try testing.expectEqual(.op_motion, tag(r3));
+    try testing.expectEqual(@as(std.meta.Tag(Repeat), .op), std.meta.activeTag(s2.last_repeat.?));
+    try testing.expectEqual(Motion.Motion.line_start, s2.last_repeat.?.op.motion);
+    try testing.expect(!s2.last_repeat.?.op.exclusive_end);
+
+    // ci( — text object combo
+    var s3 = State.init();
+    _ = handle(&s3, press('c'), Keymaps.normal);
+    _ = handle(&s3, press('i'), Keymaps.normal);
+    const r4 = handle(&s3, press('('), Keymaps.normal);
+    try testing.expectEqual(.op_motion, tag(r4));
+    try testing.expectEqual(@as(std.meta.Tag(Repeat), .op), std.meta.activeTag(s3.last_repeat.?));
+    try testing.expectEqual(TextObject.Kind.inner_paren, s3.last_repeat.?.op.text_object.?);
 }
 
 test "i → insert mode; unbound insert key → insert_char" {
