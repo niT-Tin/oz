@@ -8182,6 +8182,64 @@ test "lsp: editing — rename, format, inlay hints, outline" {
     }
     try std.testing.expect(hint_after);
 
+    // Repeated insert ⇄ normal toggling via jk must NOT drift the hint's
+    // column: the 'j' is inserted (adjustInlayHintsInsert +1) and removed on
+    // 'k' — the removal must shift hints back, or each jk exit leaves them
+    // one column too far right (accumulating, as reported).
+    var i_toggle: u32 = 0;
+    var prev_col: ?usize = null;
+    while (i_toggle < 4) : (i_toggle += 1) {
+        try sess.send("ij"); // insert mode, type 'j'
+        waited = 0;
+        while (!grid.contains("INSERT")) {
+            const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+            if (n == 0) {
+                waited += 200;
+                if (waited >= 5000) break;
+            } else {
+                sess.used += n;
+                grid.feed(sess.out[sess.used - n .. sess.used]);
+            }
+            if (grid.contains("INSERT")) break;
+        }
+        try sess.send("k"); // jk → exit, removing the 'j'
+        waited = 0;
+        while (grid.contains("INSERT")) {
+            const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+            if (n == 0) {
+                waited += 200;
+                if (waited >= 5000) break;
+            } else {
+                sess.used += n;
+                grid.feed(sess.out[sess.used - n .. sess.used]);
+            }
+            if (!grid.contains("INSERT")) break;
+        }
+        // locate ": i32" in the first content row (row 1 = file line 0;
+        // row 0 is the tab bar)
+        var rr: usize = 0;
+        var pos: usize = 0;
+        var found_pos = false;
+        while (rr < grid.rows) : (rr += 1) {
+            const rt = grid.rowText(rr);
+            if (std.mem.indexOf(u8, rt, "i32")) |pp| { pos = pp; found_pos = true; break; }
+        }
+        if (!found_pos) {
+            std.debug.print("hint missing after toggle {d}:\n", .{i_toggle});
+            grid.dump();
+            return error.TestUnexpectedResult;
+        }
+        std.debug.print("jk toggle {d}: hint col {d}\n", .{ i_toggle, pos });
+        if (prev_col) |p| {
+            if (p != pos) {
+                std.debug.print("hint drifted after jk toggle {d}: col {d} -> {d}\n", .{ i_toggle, p, pos });
+                grid.dump();
+                return error.TestUnexpectedResult;
+            }
+        }
+        prev_col = pos;
+    }
+
     // <leader>rn — cursor to "foo" (word end), rename to "renamedSymbol" via
     // the prefilled command line (mock replaces [0,4) with renamedSymbol)
     try sess.send("e rn");
@@ -8225,4 +8283,6 @@ test "lsp: editing — rename, format, inlay hints, outline" {
     }
     try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
 }
+
+
 

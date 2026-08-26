@@ -891,8 +891,16 @@ const App = struct {
                     !key.mods.ctrl and !key.mods.alt and !key.mods.super)
                 {
                     if (self.curCursor().* > 0 and self.cur().pt.byteAt(self.curCursor().* - 1) == 'j') {
-                        try self.cur().history.record(&self.cur().pt, self.curCursor().* - 1, 1, "");
-                        self.curCursor().* -= 1;
+                        const pos = self.curCursor().* - 1;
+                        try self.cur().history.record(&self.cur().pt, pos, 1, "");
+                        self.curCursor().* = pos;
+                        // The 'j' was shift-adjusted INTO the hints when it
+                        // was inserted (adjustInlayHintsInsert +1); removing
+                        // it must shift them back, or every jk exit leaves the
+                        // hints one column too far right (accumulating).
+                        const line = self.cur().pt.lineOf(pos);
+                        const col = pos - self.cur().pt.lineStart(line);
+                        self.adjustInlayHintsDelete(line, col, "j");
                     }
                     self.exitInsert();
                     return;
