@@ -3362,15 +3362,16 @@ test "file tree: sidebar scrolls as the selection moves past the window" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     // alphabetical order: DESIGN.md is the first entry
-    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(1), "DESIGN.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(2), "DESIGN.md") != null);
 
-    // 22 × j — the selection reaches the window bottom (content_rows rows);
-    // the scroll window moves so README.md (files[1]) becomes the first
-    // visible entry — the list follows. (The poll+drain loop renders once
-    // per key batch, so the final scroll state is what we assert.)
+    // 22 × j — the selection reaches the window bottom; the scroll window
+    // follows so the selected entry stays visible (it is no longer the first
+    // entry: DESIGN.md scrolled off). (The poll+drain loop renders once per
+    // key batch, so the final scroll state is what we assert.)
     try sess.send("jjjjjjjjjjjjjjjjjjjjjj");
     waited = 0;
-    while (std.mem.indexOf(u8, grid.rowText(1), "README.md") == null) {
+    var scrolled = false;
+    while (!scrolled) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -3379,12 +3380,23 @@ test "file tree: sidebar scrolls as the selection moves past the window" {
         }
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
+        // DESIGN.md was the first entry; once the window scrolls it is gone
+        // from the first entry row, and the selected entry (bg_sel) is
+        // visible somewhere inside the sidebar window
+        var sr: usize = 2;
+        var has_sel = false;
+        while (sr < 22) : (sr += 1) {
+            if (grid.rowHasBg(sr, packRgb(45, 79, 103))) has_sel = true;
+        }
+        if (std.mem.indexOf(u8, grid.rowText(2), "DESIGN.md") == null and has_sel) scrolled = true;
     }
-    if (std.mem.indexOf(u8, grid.rowText(1), "README.md") == null) {
+    if (!scrolled) {
         std.debug.print("filetree grid after scroll:\n", .{});
         grid.dump();
+        var dr: usize = 0;
+        while (dr < 6) : (dr += 1) std.debug.print("row{d}: [{s}]\n", .{ dr, grid.rowText(dr) });
     }
-    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(1), "README.md") != null);
+    try std.testing.expect(scrolled);
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
@@ -3437,7 +3449,7 @@ test "picker: list scrolls with the selection; the highlighted row stays visible
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     const sel_bg = packRgb(45, 79, 103);
-    const list_top: usize = 24 - 1 - 10 - 1; // the picker list window
+    const list_top: usize = 24 - 1 - 10 - 2 + 1; // picker box top (borders) + first row
     // the selection starts on the first window row
     try std.testing.expect(grid.rowHasBg(list_top, sel_bg));
 
@@ -3673,8 +3685,8 @@ test "picker: keys win over the file tree while both are open" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    // the sidebar selection starts on the first entry row (title is row 0)
-    try std.testing.expect(grid.rowHasBg(1, sel_bg));
+    // the sidebar selection starts on the first entry row (title is row 1, entries from row 2)
+    try std.testing.expect(grid.rowHasBg(2, sel_bg));
 
     // <leader>sf — fuzzy file picker over the still-open file tree
     try sess.send(" sf");
@@ -3689,7 +3701,7 @@ test "picker: keys win over the file tree while both are open" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    const list_top: usize = 24 - 1 - 10 - 1; // the picker list window
+    const list_top: usize = 24 - 1 - 10 - 2 + 1; // picker box top (borders) + first row
     try std.testing.expect(grid.rowHasBg(list_top, sel_bg));
 
     // 3 × Ctrl+n — the picker selection must move down the list while the
@@ -3708,8 +3720,8 @@ test "picker: keys win over the file tree while both are open" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(grid.rowHasBg(list_top + 3, sel_bg));
-    // the sidebar highlight stays on row 1 (its own selection never moved)
-    try std.testing.expect(grid.rowHasBg(1, sel_bg));
+    // the sidebar highlight stays on row 2 (entries start below the title)
+    try std.testing.expect(grid.rowHasBg(2, sel_bg));
 
     // One more ↓ (ESC[B) — arrow keys are also routed to the picker now;
     // before the fix the file tree ate them and its highlight moved to row
@@ -3727,7 +3739,7 @@ test "picker: keys win over the file tree while both are open" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(grid.rowHasBg(list_top + 4, sel_bg));
-    try std.testing.expect(grid.rowHasBg(1, sel_bg));
+    try std.testing.expect(grid.rowHasBg(2, sel_bg));
 
     // Esc closes the picker (':q' would be eaten by the filter), then quit
     try sess.send("\x1b");
@@ -5077,10 +5089,11 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
     // build.zig is highlighted (gold keyword) before any switch
     try std.testing.expect(grid.containsFg("const", packRgb(149, 127, 184)));
 
-    // <leader>e: alphabetical tree — DESIGN.md is the first entry (row 1)
+    // <leader>e: alphabetical tree — DESIGN.md is the first entry (row 2:
+    // row 0 = tab bar, row 1 = sidebar title/border)
     try sess.send(" e");
     waited = 0;
-    while (std.mem.indexOf(u8, grid.rowText(1), "DESIGN.md") == null) {
+    while (std.mem.indexOf(u8, grid.rowText(2), "DESIGN.md") == null) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -5090,14 +5103,15 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(1), "DESIGN.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(2), "DESIGN.md") != null);
 
     // j × 1 → README.md, Enter opens it (markdown has no zig grammar). The
     // tree STAYS open (only <space>e / Esc close it) — the buffer tab shows
-    // README.md after the " files " title.
+    // README.md (row 0, now NOT covered by the sidebar).
     try sess.send("j\r");
     waited = 0;
-    while (std.mem.indexOf(u8, grid.rowText(0), "README.md") == null) {
+    while (std.mem.indexOf(u8, grid.rowText(0), "README.md") == null and
+        std.mem.indexOf(u8, grid.rowText(2), "README.md") == null) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -5599,10 +5613,11 @@ test "file tree: Ctrl-w h/l switches focus between sidebar and buffer" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    // j moves the sidebar selection to row 2 (content rows start at 1)
+    // j moves the sidebar selection to row 3 (entries start at row 2:
+    // row 0 = tab bar, row 1 = sidebar title/border)
     try sess.send("j");
     waited = 0;
-    while (!grid.rowHasBg(2, sel_bg)) {
+    while (!grid.rowHasBg(3, sel_bg)) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -5612,7 +5627,7 @@ test "file tree: Ctrl-w h/l switches focus between sidebar and buffer" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(grid.rowHasBg(2, sel_bg));
+    try std.testing.expect(grid.rowHasBg(3, sel_bg));
 
     // Ctrl-w h → buffer focus; j now moves the buffer cursor (line 2, 3…)
     try sess.send("\x17");
@@ -5671,8 +5686,9 @@ test "file tree: Ctrl-w h/l switches focus between sidebar and buffer" {
         }
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
-        // the sidebar selection (54,74,130) must have moved to row 3
-        if (grid.rowHasBg(3, sel_bg)) sel_moved = true;
+        // the sidebar selection (54,74,130) must have moved to row 4
+        // (entries start at row 2; two j's landed on the third entry)
+        if (grid.rowHasBg(4, sel_bg)) sel_moved = true;
     }
     try std.testing.expect(sel_moved);
 
@@ -8283,6 +8299,5 @@ test "lsp: editing — rename, format, inlay hints, outline" {
     }
     try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
 }
-
 
 

@@ -3382,18 +3382,24 @@ const App = struct {
     }
 
     /// Open `path` in a new buffer unless it is already open (then switch).
+    /// The stored path is ABSOLUTE (like the CLI arg path): LSP uri building,
+    /// filetype detection and recent-file dedupe all assume absolute paths, so
+    /// a relative path here (file tree, :e, picker) would silently kill LSP
+    /// for the opened file.
     fn openInBuffer(self: *App, path: []const u8) !void {
+        const abs = try self.absolutePath(path);
+        defer self.alloc.free(abs);
         for (self.buffers.items, 0..) |*buf, i| {
             if (buf.path) |p| {
-                if (std.mem.eql(u8, p, path)) {
+                if (std.mem.eql(u8, p, abs)) {
                     self.switchTo(i);
                     return;
                 }
             }
         }
         // load the file
-        var file = std.Io.Dir.cwd().openFile(self.io, path, .{ .mode = .read_only }) catch |e| {
-            try self.setMsg(try std.fmt.allocPrint(self.alloc, "E484: cannot open {s}: {s}", .{ path, @errorName(e) }));
+        var file = std.Io.Dir.cwd().openFile(self.io, abs, .{ .mode = .read_only }) catch |e| {
+            try self.setMsg(try std.fmt.allocPrint(self.alloc, "E484: cannot open {s}: {s}", .{ abs, @errorName(e) }));
             return;
         };
         defer file.close(self.io);
@@ -3411,9 +3417,9 @@ const App = struct {
         try self.buffers.append(self.alloc, .{
             .pt = try buffer.PieceTable.init(self.alloc, bytes),
             .history = buffer.History.init(self.alloc),
-            .path = try self.alloc.dupe(u8, path),
+            .path = try self.alloc.dupe(u8, abs),
         });
-        try self.addRecent(path);
+        try self.addRecent(abs);
         self.switchTo(self.buffers.items.len - 1);
     }
 
@@ -4876,9 +4882,13 @@ const App = struct {
             // diagnostics). Nerd Font icons (spec: 图标体系 = Nerd Font),
             // like nvim's diagnostic gutter: ✖ for errors, ⚠ warnings, ℹ
             // info. A bare letter (E/W/I) read as noise/errors to users.
+            // Hidden during insert: while typing, the half-typed line is
+            // (temporarily) invalid and the server reports it — a red ✖
+            // on the very line being edited reads as "every insert errors".
+            // Marks reappear on exit, showing real post-edit errors.
             var diag_mark: []const u8 = " ";
             var diag_mark_fg: ?vaxis.Style = null;
-            if (w.buf == self.current and self.lsp_diagnostics.items.len > 0) {
+            if (self.state.mode != .insert and w.buf == self.current and self.lsp_diagnostics.items.len > 0) {
                 for (self.lsp_diagnostics.items) |d| {
                     if (d.range.start.line == line) {
                         diag_mark = switch (d.severity) {
@@ -5157,35 +5167,71 @@ const App = struct {
             try self.renderWindowLines(a, lr, lr.win == self.current_win);
         }
 
-        // file tree sidebar
+        // file tree sidebar (telescope/snacks style: solid bg_float panel
+        // with a border, below the tab bar so the tabs stay visible)
         if (self.filetree_active) {
-            const title_seg = [_]vaxis.Segment{.{
-                .text = " files ",
-                .style = .{ .fg = .{ .rgb = self.theme.accent }, .bold = true },
-            }};
-            _ = win.print(&title_seg, .{ .row_offset = 0, .col_offset = 0, .wrap = .none });
+            const ft_col: u32 = 0;
+            const ft_width = filetree_width;
+            const ft_top = self.contentTop();
+            const ft_bottom = height - status_row_count; // above the status bar
+            const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
+            // left border column and panel background
+            const left_col = ft_col;
+            const inner_left = ft_col + 1;
+            const inner_w = ft_width -| 1;
+            var brow: u32 = ft_top;
+            while (brow < ft_bottom) : (brow += 1) {
+                const border_seg = [_]vaxis.Segment{.{
+                    .text = "│",
+                    .style = border_style,
+                }};
+                _ = win.print(&border_seg, .{ .row_offset = @intCast(brow), .col_offset = @intCast(left_col), .wrap = .none });
+            }
+            // title row: " files " with a top border (╭─ files ────╮)
+            {
+                var segs = std.ArrayList(vaxis.Segment).empty;
+                try segs.append(a, .{ .text = "╭─ files ", .style = border_style });
+                // inner_w cells between the borders; "╭─ files " is 9 cells
+                var cx: u32 = 9;
+                while (cx < inner_w) : (cx += 1) {
+                    try segs.append(a, .{ .text = "─", .style = border_style });
+                }
+                try segs.append(a, .{ .text = "╮", .style = border_style });
+                _ = win.print(segs.items, .{ .row_offset = @intCast(ft_top), .col_offset = @intCast(left_col), .wrap = .none });
+            }
             // vim-style scroll window (same semantics as the picker)
             const ft_len = self.filetree_files.items.len;
-            const ft_vis = @min(ft_len, @as(usize, content_rows));
+            const ft_vis = @min(ft_len, @as(usize, ft_bottom - ft_top - 2));
             if (ft_len > ft_vis) {
                 if (self.filetree_top + ft_vis > ft_len) self.filetree_top = ft_len - ft_vis;
                 if (self.filetree_sel < self.filetree_top) self.filetree_top = self.filetree_sel;
                 if (self.filetree_sel >= self.filetree_top + ft_vis) self.filetree_top = self.filetree_sel - ft_vis + 1;
             } else self.filetree_top = 0;
-            const ft_top = self.filetree_top;
+            const ft_top_i = self.filetree_top;
             var k: usize = 0;
             while (k < ft_vis) : (k += 1) {
-                const ri = ft_top + k;
+                const ri = ft_top_i + k;
                 const f = self.filetree_files.items[ri];
-                const label = if (f.len > filetree_width) f[f.len - filetree_width ..] else f;
+                const label = if (f.len > inner_w) f[f.len - inner_w ..] else f;
                 const seg = [_]vaxis.Segment{.{
                     .text = label,
                     .style = if (ri == self.filetree_sel)
-                        .{ .bg = .{ .rgb = self.theme.bg_sel } }
+                        .{ .bg = .{ .rgb = self.theme.bg_sel }, .fg = .{ .rgb = self.theme.fg } }
                     else
-                        .{ .fg = .{ .rgb = self.theme.function } },
+                        .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } },
                 }};
-                _ = win.print(&seg, .{ .row_offset = @intCast(1 + k), .col_offset = 0, .wrap = .none });
+                _ = win.print(&seg, .{ .row_offset = @intCast(ft_top + 1 + k), .col_offset = @intCast(inner_left), .wrap = .none });
+            }
+            // bottom border
+            {
+                var segs = std.ArrayList(vaxis.Segment).empty;
+                try segs.append(a, .{ .text = "╰", .style = border_style });
+                var cx: u32 = 0;
+                while (cx < inner_w) : (cx += 1) {
+                    try segs.append(a, .{ .text = "─", .style = border_style });
+                }
+                try segs.append(a, .{ .text = "╯", .style = border_style });
+                _ = win.print(segs.items, .{ .row_offset = @intCast(ft_bottom - 1), .col_offset = @intCast(left_col), .wrap = .none });
             }
         }
 
@@ -5232,7 +5278,8 @@ const App = struct {
             }
         }
 
-        // fuzzy picker overlay
+        // fuzzy picker overlay (telescope/snacks style: solid bg_float
+        // floating window with a border and a title, bottom-anchored)
         if (self.picker_active) {
             const total = if (self.picker_mode == .grep) self.grep_results.items.len else self.picker_matches.items.len;
             const list_rows = @min(@as(usize, 10), total);
@@ -5245,7 +5292,49 @@ const App = struct {
                 if (self.picker_sel >= self.picker_top + list_rows) self.picker_top = self.picker_sel - list_rows + 1;
             } else self.picker_top = 0;
             const top = self.picker_top;
-            const start_row = height - 1 - @as(u32, @intCast(list_rows)) - 1;
+            // measure the widest label for the box width (capped)
+            var max_w: usize = 0;
+            var mk: usize = 0;
+            while (mk < list_rows) : (mk += 1) {
+                const ri = top + mk;
+                const label: []const u8 = if (self.picker_mode == .grep) blk: {
+                    const r = self.grep_results.items[ri];
+                    break :blk std.fmt.allocPrint(a, "{s}:{d}: {s}", .{ r.path, r.line, r.text }) catch "…";
+                } else if (self.picker_mode == .buffers) blk: {
+                    const bi = self.picker_matches.items[ri];
+                    break :blk std.fmt.allocPrint(a, "{d} {s}", .{ bi + 1, self.bufferName(bi) }) catch "…";
+                } else if (self.picker_mode == .recent) blk: {
+                    const ri2 = self.picker_matches.items[ri];
+                    break :blk self.recent_files.items[ri2];
+                } else self.picker_files.items[self.picker_matches.items[ri]];
+                max_w = @max(max_w, label.len);
+            }
+            max_w = @min(max_w, 60);
+            // "no matches" state: keep a minimum box width
+            const inner_w: u32 = @intCast(@max(max_w, 12));
+            const title = switch (self.picker_mode) {
+                .grep => " Grep ",
+                .buffers => " Buffers ",
+                .recent => " Recent ",
+                else => " Files ",
+            };
+            const start_row = height - 1 - @as(u32, @intCast(list_rows)) - 2; // box + prompt row
+            const start_col = 0;
+            const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
+            const row_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } };
+            const sel_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_sel }, .fg = .{ .rgb = self.theme.fg } };
+            // top border + title
+            {
+                var segs = std.ArrayList(vaxis.Segment).empty;
+                try segs.append(a, .{ .text = "╭", .style = border_style });
+                try segs.append(a, .{ .text = title, .style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_float } } });
+                var cx: u32 = 1 + @as(u32, @intCast(title.len));
+                while (cx < inner_w + 1) : (cx += 1) {
+                    try segs.append(a, .{ .text = "─", .style = border_style });
+                }
+                try segs.append(a, .{ .text = "╮", .style = border_style });
+                _ = win.print(segs.items, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(start_col), .wrap = .none });
+            }
             var k: usize = 0;
             while (k < list_rows) : (k += 1) {
                 const ri = top + k;
@@ -5259,14 +5348,28 @@ const App = struct {
                     const ri2 = self.picker_matches.items[ri];
                     break :blk self.recent_files.items[ri2];
                 } else self.picker_files.items[self.picker_matches.items[ri]];
-                const seg = [_]vaxis.Segment{.{
-                    .text = label,
-                    .style = if (ri == self.picker_sel)
-                        .{ .bg = .{ .rgb = self.theme.bg_sel } }
-                    else
-                        .{},
-                }};
-                _ = win.print(&seg, .{ .row_offset = @intCast(start_row + k), .wrap = .none });
+                // pad the row to inner_w so the bg_float panel is continuous
+                const row = try a.alloc(u8, inner_w);
+                @memset(row, ' ');
+                const n = @min(label.len, @as(usize, @intCast(inner_w)));
+                @memcpy(row[0..n], label[0..n]);
+                const seg = [_]vaxis.Segment{
+                    .{ .text = "│", .style = border_style },
+                    .{ .text = row, .style = if (ri == self.picker_sel) sel_style else row_style },
+                    .{ .text = "│", .style = border_style },
+                };
+                _ = win.print(&seg, .{ .row_offset = @intCast(start_row + 1 + k), .col_offset = @intCast(start_col), .wrap = .none });
+            }
+            // bottom border
+            {
+                var segs = std.ArrayList(vaxis.Segment).empty;
+                try segs.append(a, .{ .text = "╰", .style = border_style });
+                var cx: u32 = 0;
+                while (cx < inner_w + 1) : (cx += 1) {
+                    try segs.append(a, .{ .text = "─", .style = border_style });
+                }
+                try segs.append(a, .{ .text = "╯", .style = border_style });
+                _ = win.print(segs.items, .{ .row_offset = @intCast(start_row + 1 + list_rows), .col_offset = @intCast(start_col), .wrap = .none });
             }
             const prompt = try std.fmt.allocPrint(a, "> {s}", .{self.picker_input.items});
             const prompt_seg = [_]vaxis.Segment{.{
