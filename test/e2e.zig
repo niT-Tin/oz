@@ -7344,8 +7344,12 @@ test "lsp: user flow — b. Ctrl+n stand Enter jk A keeps the cursor at EOL" {
         }
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
-        // accepted completion on the new line + cursor at EOL in the status bar
-        if (grid.contains("mockAlphastand") and grid.contains("col 35")) ok = true;
+        // accepted completion on the new line (mockItemstand or
+        // mockAlphastand — Ctrl+n vs auto-accept timing) + cursor at EOL in
+        // the status bar; both candidates are 14 chars so col 35 = line end
+        if (grid.contains("mockItemstand") or grid.contains("mockAlphastand")) {
+            if (grid.contains("col 35")) ok = true;
+        }
     }
     if (!ok) {
         std.debug.print("user flow failed:\n", .{});

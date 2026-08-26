@@ -639,21 +639,27 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
             state.pending_op = action;
             break :blk .pending;
         },
-        // mode entries
+        // mode entries. vim: a non-motion key cancels a pending operator —
+        // 'd' then 'i' (or o/a/v/V/Ctrl+v) must NOT leave .delete armed, or
+        // the first motion after returning to normal would silently delete.
         .insert_mode, .insert_before, .insert_line_after, .insert_line_before, .append, .append_end => blk: {
+            state.pending_op = null;
             state.mode = .insert;
             state.prev_insert_key = null;
             break :blk emitAction(state, action);
         },
         .visual_char => blk: {
+            state.pending_op = null;
             state.mode = .visual_char;
             break :blk emitAction(state, action);
         },
         .visual_line => blk: {
+            state.pending_op = null;
             state.mode = .visual_line;
             break :blk emitAction(state, action);
         },
         .visual_block => blk: {
+            state.pending_op = null;
             state.mode = .visual_block;
             break :blk emitAction(state, action);
         },

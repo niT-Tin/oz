@@ -987,6 +987,22 @@ const App = struct {
                     self.exitVisualAfterOp(m.op);
                     return;
                 }
+                // linewise motions (j/k/G/gg/{/}) with an operator from
+                // mid-line: the range covers WHOLE lines from the cursor
+                // line through the target line (the dd sentinel above already
+                // handled the pure line_start case). Deleting a partial
+                // byte range across lines would shred the text.
+                if (!m.exclusive_end) {
+                    const from_line = self.cur().pt.lineOf(self.curCursor().*);
+                    const to_line = self.cur().pt.lineOf(editor.Motion.target(&self.cur().pt, m.motion, m.args, self.curCursor().*, m.count));
+                    const lo = @min(from_line, to_line);
+                    const hi = @max(from_line, to_line);
+                    const start = self.cur().pt.lineStart(lo);
+                    var end = self.cur().pt.lineStart(hi) + self.cur().pt.lineLen(hi);
+                    if (hi + 1 < self.cur().pt.lineCount()) end += 1; // include trailing '\n'
+                    try self.applyOpRange(m.op, start, end, false);
+                    return;
+                }
                 // normal mode: d/c/y over [cursor, target). vim semantics:
                 // naturally-exclusive motions (w/b/h/l/t/^) yield a half-open
                 // range [cursor, target) as-is; inclusive motions ($/e/f/%)
@@ -1324,6 +1340,9 @@ const App = struct {
         // Force a full reparse on the next render: incremental edits during
         // the insert session may have drifted the highlight tree.
         self.cur().syntax_revision = std.math.maxInt(u64);
+        // the mc edits were not position-adjusted (unlike single-cursor
+        // insert); fetch fresh hints for the new text
+        self.invalidateInlayHints();
     }
 
     /// Keep the visible (main) cursor on the main multi-cursor's position.
@@ -2767,11 +2786,20 @@ const App = struct {
             try self.setMsg(try self.alloc.dupe(u8, "E505: No comment style for filetype"));
             return;
         };
-        const line = self.cur().pt.lineOf(self.curCursor().*);
-        const toggle = try editor.comment.toggleLines(self.alloc, &self.cur().pt, line, line, style);
+        // in visual mode the whole selection's lines are toggled; otherwise
+        // just the cursor line
+        const from_line: u32 = if (self.visual_anchor) |anchor|
+            @min(self.cur().pt.lineOf(anchor), self.cur().pt.lineOf(self.curCursor().*))
+        else
+            self.cur().pt.lineOf(self.curCursor().*);
+        const to_line: u32 = if (self.visual_anchor) |anchor|
+            @max(self.cur().pt.lineOf(anchor), self.cur().pt.lineOf(self.curCursor().*))
+        else
+            from_line;
+        const toggle = try editor.comment.toggleLines(self.alloc, &self.cur().pt, from_line, to_line, style);
         defer self.alloc.free(toggle.text);
-        const start = self.cur().pt.lineStart(line);
-        const end = start + self.cur().pt.lineLen(line); // toggleLines text excludes the trailing '\n'
+        const start = self.cur().pt.lineStart(from_line);
+        const end = self.cur().pt.lineStart(to_line) + self.cur().pt.lineLen(to_line); // toggleLines text excludes the trailing '\n'
         try self.applyEdit(start, end, toggle.text);
         self.curCursor().* = start;
     }
