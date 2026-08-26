@@ -343,12 +343,33 @@ fn takeError(allocator: std.mem.Allocator, scanner: *std.json.Scanner, max: usiz
 
 /// Build the full JSON text for a request {id, method, params}.
 /// Caller owns the returned slice (free with `allocator`).
+/// Fails only with error.OutOfMemory (see `unmapWriteFailed`).
 pub fn encodeRequest(
     allocator: std.mem.Allocator,
     id: u64,
     method: []const u8,
     params: std.json.Value,
 ) ![]u8 {
+    return unmapWriteFailed(encodeRequestImpl(allocator, id, method, params));
+}
+
+/// std.json.Stringify over an Io.Writer.Allocating reports allocation
+/// failure as error.WriteFailed (the Writer drain contract); for an
+/// in-memory encode that failure IS OutOfMemory, and callers should not
+/// have to know about the Writer plumbing to handle it.
+fn unmapWriteFailed(result: error{ OutOfMemory, WriteFailed }![]u8) error{OutOfMemory}![]u8 {
+    return result catch |e| switch (e) {
+        error.WriteFailed => error.OutOfMemory,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+fn encodeRequestImpl(
+    allocator: std.mem.Allocator,
+    id: u64,
+    method: []const u8,
+    params: std.json.Value,
+) error{ OutOfMemory, WriteFailed }![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     var s: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
@@ -369,11 +390,20 @@ pub fn encodeRequest(
 
 /// Build the full JSON text for a notification {method, params} (no id).
 /// Caller owns the returned slice (free with `allocator`).
+/// Fails only with error.OutOfMemory (see `unmapWriteFailed`).
 pub fn encodeNotification(
     allocator: std.mem.Allocator,
     method: []const u8,
     params: std.json.Value,
-) ![]u8 {
+) error{OutOfMemory}![]u8 {
+    return unmapWriteFailed(encodeNotificationImpl(allocator, method, params));
+}
+
+fn encodeNotificationImpl(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    params: std.json.Value,
+) error{ OutOfMemory, WriteFailed }![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     var s: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
@@ -392,11 +422,20 @@ pub fn encodeNotification(
 
 /// Build the full JSON text for a response {id, result}.
 /// Caller owns the returned slice (free with `allocator`).
+/// Fails only with error.OutOfMemory (see `unmapWriteFailed`).
 pub fn encodeResponse(
     allocator: std.mem.Allocator,
     id: u64,
     result: std.json.Value,
-) ![]u8 {
+) error{OutOfMemory}![]u8 {
+    return unmapWriteFailed(encodeResponseImpl(allocator, id, result));
+}
+
+fn encodeResponseImpl(
+    allocator: std.mem.Allocator,
+    id: u64,
+    result: std.json.Value,
+) error{ OutOfMemory, WriteFailed }![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     var s: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
@@ -415,12 +454,22 @@ pub fn encodeResponse(
 
 /// Build the full JSON text for an error response {id, error:{code,message}}.
 /// Caller owns the returned slice (free with `allocator`).
+/// Fails only with error.OutOfMemory (see `unmapWriteFailed`).
 pub fn encodeError(
     allocator: std.mem.Allocator,
     id: u64,
     code: i64,
     message: []const u8,
-) ![]u8 {
+) error{OutOfMemory}![]u8 {
+    return unmapWriteFailed(encodeErrorImpl(allocator, id, code, message));
+}
+
+fn encodeErrorImpl(
+    allocator: std.mem.Allocator,
+    id: u64,
+    code: i64,
+    message: []const u8,
+) error{ OutOfMemory, WriteFailed }![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     var s: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
@@ -743,4 +792,17 @@ test "encodeError -> writeFrame -> readFrame -> parseMessage roundtrip (error re
     const e = msg.err.?;
     try testing.expectEqual(@as(i64, -32601), e.code);
     try testing.expectEqualStrings("Method not found", e.message);
+}
+
+test "encode*: allocation failure surfaces as error.OutOfMemory" {
+    // The Allocating writer behind Stringify maps allocation failure to
+    // error.WriteFailed (Writer drain contract); callers of the encode*
+    // helpers must see a plain error.OutOfMemory instead.
+    const params = std.json.Value{ .object = .empty };
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const a = failing.allocator();
+    try testing.expectError(error.OutOfMemory, encodeRequest(a, 1, "m", params));
+    try testing.expectError(error.OutOfMemory, encodeNotification(a, "m", params));
+    try testing.expectError(error.OutOfMemory, encodeResponse(a, 1, params));
+    try testing.expectError(error.OutOfMemory, encodeError(a, 1, -32601, "x"));
 }

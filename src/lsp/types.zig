@@ -40,10 +40,10 @@ pub fn fileUriToPath(allocator: std.mem.Allocator, uri: []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     var i: usize = "file://".len;
-    // file:///path → /path (strip the authority slash when it is empty)
-    if (i + 1 < uri.len and uri[i] == '/' and uri[i + 1] == '/') {
-        i += 2; // file://host/... — drop host too (local files only)
-    }
+    // Skip an authority component ("file://host/path" → "/path"). Local files
+    // have an empty authority ("file:///path"): then uri[i] is already the
+    // leading '/' and nothing is skipped.
+    while (i < uri.len and uri[i] != '/') i += 1;
     while (i < uri.len) : (i += 1) {
         const c = uri[i];
         if (c == '%' and i + 2 < uri.len) {
@@ -90,17 +90,31 @@ pub fn pathToFileUri(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 /// Build a Position from a byte offset in `text` (line = newline count).
+/// LSP characters are UTF-16 code units, not bytes: a BMP code point is one
+/// unit (1-3 UTF-8 bytes), an astral one is two (a 4-byte sequence /
+/// surrogate pair). A byte offset mid-sequence rounds down to that code
+/// point's start.
 pub fn positionAt(text: []const u8, byte: usize) Position {
     var line: u32 = 0;
     var col: u32 = 0;
     const b = @min(byte, text.len);
-    for (text[0..b]) |c| {
+    var i: usize = 0;
+    while (i < b) {
+        const c = text[i];
         if (c == '\n') {
             line += 1;
             col = 0;
-        } else {
-            col += 1;
+            i += 1;
+            continue;
         }
+        if (c & 0xC0 == 0x80) {
+            i += 1; // stray continuation byte: not a code point start
+            continue;
+        }
+        const seq_len: usize = if (c >= 0xF0) 4 else if (c >= 0xE0) 3 else if (c >= 0xC0) 2 else 1;
+        if (i + seq_len > b) break; // offset falls mid-sequence: stop before it
+        col += if (seq_len == 4) 2 else 1; // astral code points = surrogate pair
+        i += seq_len;
     }
     return .{ .line = line, .character = col };
 }
@@ -117,6 +131,28 @@ test "types: file URI round-trip" {
     defer alloc.free(u);
     try std.testing.expectEqualStrings("file:///tmp/x%20y.zig", u);
     try std.testing.expectError(error.InvalidUri, fileUriToPath(alloc, "http://x"));
+}
+
+test "types: positionAt counts UTF-16 code units, not bytes" {
+    // LSP positions are UTF-16 code units: "é" is 2 UTF-8 bytes but 1 unit,
+    // "😀" is 4 UTF-8 bytes but 2 units (surrogate pair).
+    const t = "aé😀b\nxy";
+    // bytes: a=0, é=1..3, 😀=3..7, b=7, \n=8, x=9, y=10
+    try std.testing.expectEqual(Position{ .line = 0, .character = 1 }, positionAt(t, 1));
+    try std.testing.expectEqual(Position{ .line = 0, .character = 2 }, positionAt(t, 3));
+    try std.testing.expectEqual(Position{ .line = 0, .character = 4 }, positionAt(t, 7));
+    try std.testing.expectEqual(Position{ .line = 0, .character = 5 }, positionAt(t, 8));
+    try std.testing.expectEqual(Position{ .line = 1, .character = 0 }, positionAt(t, 9));
+    try std.testing.expectEqual(Position{ .line = 1, .character = 2 }, positionAt(t, t.len));
+    // a byte offset mid-sequence rounds down to the code point boundary
+    try std.testing.expectEqual(Position{ .line = 0, .character = 1 }, positionAt(t, 2));
+}
+
+test "types: fileUriToPath strips a non-empty authority" {
+    const alloc = std.testing.allocator;
+    const p = try fileUriToPath(alloc, "file://localhost/etc/passwd");
+    defer alloc.free(p);
+    try std.testing.expectEqualStrings("/etc/passwd", p);
 }
 
 test "types: positionAt counts lines and columns" {
