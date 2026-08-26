@@ -103,6 +103,7 @@ pub const ActionId = enum {
     enter_command_mode, // :
     normal_mode, // esc / ctrl-c
     insert_exit, // jk special-cased by Mode
+    flip_visual, // visual 'o': swap anchor and cursor
     noop,
 };
 

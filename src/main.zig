@@ -3970,16 +3970,29 @@ const App = struct {
                 self.markDirty();
             },
             .visual_char => {
+                // mode.zig already set state.mode, so isVisual() can't tell a
+                // fresh entry from a sub-mode switch; the anchor can: it is
+                // null on entry and non-null while a selection exists. Keep
+                // the selection when switching v -> V / Ctrl+v.
+                if (self.visual_anchor == null) self.visual_anchor = self.curCursor().*;
                 self.state.mode = .visual_char;
-                self.visual_anchor = self.curCursor().*;
             },
             .visual_line => {
+                if (self.visual_anchor == null) self.visual_anchor = self.curCursor().*;
                 self.state.mode = .visual_line;
-                self.visual_anchor = self.curCursor().*;
             },
             .visual_block => {
+                if (self.visual_anchor == null) self.visual_anchor = self.curCursor().*;
                 self.state.mode = .visual_block;
-                self.visual_anchor = self.curCursor().*;
+            },
+            // visual 'o': swap the anchor and the cursor (flip the selection
+            // end) — handled by mode.handleVisual and dispatched here
+            .flip_visual => {
+                if (self.visual_anchor) |a| {
+                    const c = self.curCursor().*;
+                    self.visual_anchor = c;
+                    self.curCursor().* = a;
+                }
             },
             .delete, .change, .yank => {
                 // multi-cursor: d deletes the selected word at every cursor

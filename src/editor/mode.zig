@@ -663,6 +663,7 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
             state.mode = .visual_block;
             break :blk emitAction(state, action);
         },
+        .flip_visual => emitAction(state, .flip_visual),
         .enter_command_mode => blk: {
             resetPending(state);
             state.mode = .command;
@@ -751,6 +752,10 @@ fn handleVisual(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         state.mode = .normal;
         resetPending(state);
         return .to_normal;
+    }
+    // visual 'o': flip the selection (swap anchor and cursor)
+    if (isPlain(key) and key.codepoint == 'o') {
+        return emitAction(state, .flip_visual);
     }
     // d/c/y act directly on the selection (vim: no motion needed after them)
     if (state.pending_op == null) {
