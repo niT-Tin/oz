@@ -1483,6 +1483,166 @@ test "'.' repeats dw and x from the current cursor" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+test "vim editing keys: x X D C S r ~ J >>" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "abcdef\n  Indented\nlast\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // x deletes the char under the cursor (cursor on 'a')
+    try sess.send("x");
+    waited = 0;
+    while (grid.contains("abcdef")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("bcdef"));
+
+    // move right one char (cursor on 'c'), X deletes the char before it
+    // ('b') → "cdef"
+    try sess.send("lX");
+    waited = 0;
+    while (grid.contains("bcdef")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("cdef"));
+
+    // rq replaces the char under the cursor (now on 'c') with 'q' ("qdef")
+    try sess.send("rq");
+    waited = 0;
+    while (!grid.contains("qdef")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("qdef"));
+
+    // ~ toggles case of the char under the cursor ('q' → 'Q')
+    try sess.send("~");
+    waited = 0;
+    while (!grid.contains("Qdef")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("Qdef"));
+
+    // D deletes to end of line ("Qdef" → "Q")
+    try sess.send("D");
+    waited = 0;
+    while (grid.contains("Qdef")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("Q"));
+    try std.testing.expect(!grid.contains("Qdef"));
+
+    // j down to line 2 ("  Indented"), S changes the whole line, type "xyz",
+    // esc → file becomes "Q\nxyz\nlast\n"
+    try sess.send("jSxyz\x1b");
+    waited = 0;
+    while (!grid.contains("xyz") or grid.contains("Indented")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("xyz"));
+    try std.testing.expect(!grid.contains("Indented"));
+
+    // J joins the next line ("xyz" + "last" → "xyz last")
+    try sess.send("J");
+    waited = 0;
+    while (!grid.contains("xyz last")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("xyz last"));
+    // >> indents the current line by 4 spaces
+    try sess.send(">>");
+    waited = 0;
+    while (!grid.contains("    xyz last")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("    xyz last"));
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
 test "dashboard shows recent files; Enter reopens" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;

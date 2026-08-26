@@ -701,6 +701,16 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .repeat_last => emitAction(state, .repeat_last),
         .paste => emitAction(state, .paste),
         .paste_before => emitAction(state, .paste_before),
+        .delete_char => emitAction(state, .delete_char),
+        .delete_char_before => emitAction(state, .delete_char_before),
+        .delete_to_eol => emitAction(state, .delete_to_eol),
+        .change_to_eol => emitAction(state, .change_to_eol),
+        .change_line => emitAction(state, .change_line),
+        .replace_char => emitAction(state, .replace_char),
+        .toggle_case => emitAction(state, .toggle_case),
+        .join_lines => emitAction(state, .join_lines),
+        .indent_line => emitAction(state, .indent_line),
+        .dedent_line => emitAction(state, .dedent_line),
         .easymotion => emitAction(state, .easymotion),
         .leader_find => emitAction(state, .leader_find),
         .toggle_comment_line => emitAction(state, .toggle_comment_line),
@@ -1016,8 +1026,13 @@ fn resetPending(state: *State) void {
     state.pending_leader = false;
     state.pending_leader_s = false;
     state.pending_leader_b = false;
+    state.pending_leader_r = false;
+    state.pending_leader_l = false;
+    state.pending_leader_t = false;
     state.pending_surround = null;
     state.pending_align = null;
+    state.pending_bracket = null;
+    state.pending_gc = false;
     resetCount(state);
 }
 

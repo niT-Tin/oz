@@ -107,6 +107,10 @@ const App = struct {
     // yank buffer (M0: in-memory; OSC52 system clipboard is a later step)
     yank_buffer: ?[]u8 = null,
 
+    /// 'r' seen; the next plain key is the replacement character (normal
+    /// mode). Cleared by execAction when 'r' is pressed / by handleKey.
+    pending_replace: ?u8 = null,
+
     // easymotion (s / <leader>f) state
     em_active: bool = false,
     em_query: u8 = 0, // single-char query (M1: 1-char only)
@@ -711,6 +715,24 @@ const App = struct {
             return;
         }
 
+        // r{char}: replace the character under the cursor. The first 'r'
+        // (execAction .replace_char) sets pending_replace; the NEXT plain
+        // key is the replacement character (normal mode only — in insert
+        // mode 'r' is just a typed character).
+        if (self.pending_replace) |_| {
+            if (self.state.mode != .insert and key.text != null and key.text.?.len > 0 and
+                !key.mods.ctrl and !key.mods.alt and !key.mods.super and
+                key.codepoint != vaxis.Key.escape)
+            {
+                const ch = key.text.?[0];
+                self.pending_replace = null;
+                try self.replaceCharAtCursor(ch);
+                return;
+            }
+            // Esc / anything else cancels the pending replace
+            self.pending_replace = null;
+        }
+
         // Esc cancels an active multi-cursor selection (word cursors). In
         // insert mode Esc exits the insert session instead (see below).
         if (self.mc_active and self.state.mode != .insert and key.codepoint == vaxis.Key.escape) {
@@ -1021,6 +1043,17 @@ const App = struct {
         var p = pos;
         while (p < line_end and (pt.byteAt(p) & 0xC0) == 0x80) : (p += 1) {}
         return p;
+    }
+
+    /// Byte length of the UTF-8 character starting at `pos` (1 for ASCII,
+    /// 2-4 for sequences; malformed bytes count as 1).
+    fn charLenAt(self: *App, pt: *const buffer.PieceTable, pos: u32) u32 {
+        _ = self;
+        if (pos >= pt.len()) return 0;
+        const b = pt.byteAt(pos);
+        if (b < 0x80) return 1;
+        const n: u32 = if (b < 0xE0) 2 else if (b < 0xF0) 3 else 4;
+        return @min(n, pt.len() - pos);
     }
 
     fn blockRect(self: *App) ?BlockRect {
@@ -4166,6 +4199,177 @@ const App = struct {
             .filetree_locate => try self.locateInFiletree(),
             .paste => try self.pasteBuffer(false),
             .paste_before => try self.pasteBuffer(true),
+            .delete_char => {
+                // x: delete the character under the cursor (vim dl). At the
+                // end of a line the newline is deleted (joining the next
+                // line), like vim; at EOF nothing happens.
+                const c = self.curCursor().*;
+                if (c >= self.cur().pt.len()) return;
+                const pt = &self.cur().pt;
+                const seq = self.charLenAt(pt, c);
+                const end = @min(c + seq, pt.len());
+                if (end <= c) return;
+                self.cur().history.beginGroup();
+                try self.cur().history.record(pt, c, end - c, "");
+                self.cur().history.endGroup();
+                self.curCursor().* = c;
+                self.markDirty();
+            },
+            .delete_char_before => {
+                // X: delete the char before the cursor (vim dh)
+                const c = self.curCursor().*;
+                if (c == 0) return;
+                const pt = &self.cur().pt;
+                // walk back to the start of the previous UTF-8 character
+                var start = c - 1;
+                while (start > 0 and (pt.byteAt(start) & 0xC0) == 0x80) start -= 1;
+                self.cur().history.beginGroup();
+                try self.cur().history.record(pt, start, c - start, "");
+                self.cur().history.endGroup();
+                self.curCursor().* = start;
+                self.markDirty();
+            },
+            .delete_to_eol => {
+                // D: delete to end of line (d$), keeping the newline so the
+                // line is emptied, not removed.
+                const c = self.curCursor().*;
+                const pt = &self.cur().pt;
+                const line = pt.lineOf(c);
+                const end = pt.lineStart(line) + pt.lineLen(line);
+                if (end > c) {
+                    self.cur().history.beginGroup();
+                    try self.cur().history.record(pt, c, end - c, "");
+                    self.cur().history.endGroup();
+                    self.curCursor().* = c;
+                    self.markDirty();
+                }
+            },
+            .change_to_eol => {
+                // C: change to end of line (c$) — delete the tail and enter
+                // insert with the undo group open, like applyOpRangeEx.
+                const c = self.curCursor().*;
+                const pt = &self.cur().pt;
+                const line = pt.lineOf(c);
+                const end = pt.lineStart(line) + pt.lineLen(line);
+                if (end > c) {
+                    self.cur().history.beginGroup();
+                    try self.cur().history.record(pt, c, end - c, "");
+                } else {
+                    self.cur().history.beginGroup();
+                }
+                self.state.mode = .insert;
+                self.in_insert = true; // group stays open until exitInsert
+                self.markDirty();
+                self.cur().syntax_revision = std.math.maxInt(u64);
+            },
+            .change_line => {
+                // S: change the whole line (cc) — delete the line's CONTENT
+                // (the newline stays, like vim cc) and enter insert with the
+                // cursor on the emptied line.
+                const pt = &self.cur().pt;
+                const line = pt.lineOf(self.curCursor().*);
+                const start = pt.lineStart(line);
+                const end = start + pt.lineLen(line);
+                self.curCursor().* = start;
+                self.cur().history.beginGroup();
+                try self.cur().history.record(pt, start, end - start, "");
+                self.state.mode = .insert;
+                self.in_insert = true;
+                self.markDirty();
+                self.cur().syntax_revision = std.math.maxInt(u64);
+            },
+            .replace_char => {
+                // r{char}: arm the pending-replace capture; the next plain
+                // key (handled before the mode dispatch) replaces the char
+                // under the cursor via replaceCharAtCursor.
+                self.pending_replace = 0;
+            },
+            .toggle_case => {
+                // ~: swap the case of the char under the cursor and advance.
+                const c = self.curCursor().*;
+                const pt = &self.cur().pt;
+                if (c >= pt.len()) return;
+                const seq = self.charLenAt(pt, c);
+                if (seq != 1) return; // multi-byte: not ASCII, leave alone
+                var buf: [1]u8 = undefined;
+                pt.copyRange(c, buf[0..1]);
+                var swapped: ?u8 = null;
+                if (buf[0] >= 'a' and buf[0] <= 'z') {
+                    swapped = buf[0] - 32;
+                } else if (buf[0] >= 'A' and buf[0] <= 'Z') {
+                    swapped = buf[0] + 32;
+                }
+                if (swapped) |ch| {
+                    self.cur().history.beginGroup();
+                    try self.cur().history.record(pt, c, 1, &.{ch});
+                    self.cur().history.endGroup();
+                    self.curCursor().* = c + seq;
+                    self.markDirty();
+                }
+            },
+            .join_lines => {
+                // J: join the current line with the next: remove the newline,
+                // trim the next line's leading whitespace to one space (vim
+                // joins with a single space when the first line is non-empty).
+                const pt = &self.cur().pt;
+                const line = pt.lineOf(self.curCursor().*);
+                if (line + 1 >= pt.lineCount()) return;
+                const cur_end = pt.lineStart(line) + pt.lineLen(line);
+                const next_start = pt.lineStart(line + 1);
+                const next_len = pt.lineLen(line + 1);
+                var next_indent: u32 = 0;
+                while (next_indent < next_len) : (next_indent += 1) {
+                    const b = pt.byteAt(next_start + next_indent);
+                    if (b != ' ' and b != '\t') break;
+                }
+                self.cur().history.beginGroup();
+                // remove the newline (cur_end, one byte)
+                try self.cur().history.record(pt, cur_end, 1, "");
+                // collapse leading whitespace of the next line
+                if (next_indent > 0) {
+                    try self.cur().history.record(pt, next_start - 1, next_indent, "");
+                }
+                // join with a single space unless the first line is empty.
+                // The next line's first char now sits at next_start - 1 (the
+                // newline is gone); inserting BEFORE it glues the lines.
+                if (cur_end > pt.lineStart(line)) {
+                    try self.cur().history.record(pt, next_start - 1, 0, " ");
+                }
+                self.cur().history.endGroup();
+                self.curCursor().* = @min(self.curCursor().*, pt.len());
+                self.markDirty();
+            },
+            .indent_line, .dedent_line => {
+                // >> / <<: add / remove one indent unit (4 spaces, matching
+                // the insert-mode tab) at the start of each line the count
+                // covers, starting at the cursor line.
+                const pt = &self.cur().pt;
+                const start_line = pt.lineOf(self.curCursor().*);
+                const n = @max(count, 1);
+                const end_line = @min(start_line + n - 1, pt.lineCount() - 1);
+                const indent = if (action == .indent_line) "    " else "";
+                self.cur().history.beginGroup();
+                var l = start_line;
+                while (l <= end_line) : (l += 1) {
+                    const ls = pt.lineStart(l);
+                    if (action == .indent_line) {
+                        try self.cur().history.record(pt, ls, 0, indent);
+                    } else {
+                        // remove up to 4 leading spaces/tabs
+                        var removed: u32 = 0;
+                        while (removed < 4) : (removed += 1) {
+                            if (ls >= pt.len()) break;
+                            const b = pt.byteAt(ls);
+                            if (b == ' ' or b == '\t') {
+                                try self.cur().history.record(pt, ls, 1, "");
+                            } else break;
+                        }
+                    }
+                }
+                self.cur().history.endGroup();
+                self.curCursor().* = @min(self.curCursor().*, pt.len());
+                self.markDirty();
+            },
             .toggle_comment_line => try self.toggleCommentLine(),
             .easymotion, .leader_find => {
                 // start the EasyMotion capture flow
@@ -4176,6 +4380,22 @@ const App = struct {
             .enter_command_mode => {},
             else => {},
         }
+    }
+
+    /// r{char}: replace the character under the cursor with `ch` (a single
+    /// byte; multi-byte replacements keep the original sequence length).
+    /// Like vim, the cursor stays on the replaced char (it does not move).
+    fn replaceCharAtCursor(self: *App, ch: u8) !void {
+        const c = self.curCursor().*;
+        const pt = &self.cur().pt;
+        if (c >= pt.len()) return;
+        const seq = self.charLenAt(pt, c);
+        if (seq != 1) return; // only replace single-byte chars
+        if (pt.byteAt(c) == ch) return;
+        self.cur().history.beginGroup();
+        try self.cur().history.record(pt, c, 1, &.{ch});
+        self.cur().history.endGroup();
+        self.markDirty();
     }
 
     // ---- number increment/decrement (Ctrl+a / Ctrl+x / g Ctrl+a / g Ctrl+x) ----

@@ -57,13 +57,22 @@ pub const normal: KeyMap = &.{
     act(.{ .codepoint = 'd' }, .delete),
     act(.{ .codepoint = 'c' }, .change),
     act(.{ .codepoint = 'y' }, .yank),
+    act(.{ .codepoint = 'x' }, .delete_char),
+    act(.{ .codepoint = 'X' }, .delete_char_before),
+    act(.{ .codepoint = 'D' }, .delete_to_eol),
+    act(.{ .codepoint = 'C' }, .change_to_eol),
+    act(.{ .codepoint = 'S' }, .change_line),
+    act(.{ .codepoint = 'r' }, .replace_char),
+    act(.{ .codepoint = '~' }, .toggle_case),
+    act(.{ .codepoint = 'J' }, .join_lines),
+    act(.{ .codepoint = '>' }, .indent_line),
+    act(.{ .codepoint = '<' }, .dedent_line),
     act(.{ .codepoint = 'g' }, .noop), // prefix: gg / ge — handled by Mode as sequence
     act(.{ .codepoint = 'G' }, .goto_last_line),
     act(.{ .codepoint = 'f' }, .find_char),
     act(.{ .codepoint = 'F' }, .find_char_back),
     act(.{ .codepoint = 't' }, .till_char),
     act(.{ .codepoint = 'T' }, .till_char_back),
-    act(.{ .codepoint = 'r' }, .noop),
     act(.{ .codepoint = 'K' }, .hover), // K — LSP hover
     // ctrl keys
     act(.{ .codepoint = 'u', .mods = .{ .ctrl = true } }, .half_page_up),
@@ -131,8 +140,18 @@ test "normal keymap covers the M0 key set" {
     try std.testing.expectEqual(.decrement, L(normal, .{ .codepoint = 'x', .mods = .{ .ctrl = true } }));
     // 'g' is the gg/ge prefix (bound to noop; Mode interprets the sequence)
     try std.testing.expectEqual(.noop, L(normal, .{ .codepoint = 'g' }));
+    // editing keys
+    try std.testing.expectEqual(.delete_char, L(normal, .{ .codepoint = 'x' }));
+    try std.testing.expectEqual(.delete_char_before, L(normal, .{ .codepoint = 'X' }));
+    try std.testing.expectEqual(.delete_to_eol, L(normal, .{ .codepoint = 'D' }));
+    try std.testing.expectEqual(.change_to_eol, L(normal, .{ .codepoint = 'C' }));
+    try std.testing.expectEqual(.change_line, L(normal, .{ .codepoint = 'S' }));
+    try std.testing.expectEqual(.replace_char, L(normal, .{ .codepoint = 'r' }));
+    try std.testing.expectEqual(.toggle_case, L(normal, .{ .codepoint = '~' }));
+    try std.testing.expectEqual(.join_lines, L(normal, .{ .codepoint = 'J' }));
+    try std.testing.expectEqual(.indent_line, L(normal, .{ .codepoint = '>' }));
+    try std.testing.expectEqual(.dedent_line, L(normal, .{ .codepoint = '<' }));
     // unbound keys / wrong modifiers → null
-    try std.testing.expectEqual(@as(?KeyEvent.ActionId, null), L(normal, .{ .codepoint = 'x' }));
     try std.testing.expectEqual(@as(?KeyEvent.ActionId, null), L(normal, .{ .codepoint = 'h', .mods = .{ .ctrl = true } }));
 }
 

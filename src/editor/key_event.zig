@@ -61,6 +61,16 @@ pub const ActionId = enum {
     delete, // d (operator)
     change, // c (operator)
     yank, // y (operator)
+    delete_char, // x — delete the character under the cursor (= dl)
+    delete_char_before, // X — delete the char before the cursor (= dh)
+    delete_to_eol, // D — delete to end of line (= d$)
+    change_to_eol, // C — change to end of line (= c$)
+    change_line, // S — change the whole line (= cc)
+    replace_char, // r — replace the char under the cursor
+    toggle_case, // ~ — toggle the case of the char under the cursor
+    join_lines, // J — join the current line with the next
+    indent_line, // >> — indent the current line
+    dedent_line, // << — dedent the current line
     undo, // u
     redo, // ctrl-r
     repeat_last, // .
