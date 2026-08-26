@@ -2394,6 +2394,12 @@ const App = struct {
 
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
+        // The parser keeps an escaped separator `\/` verbatim; restore it so
+        // literal matching sees the real slash (ex_command.unescapeSubSep).
+        const pat = try editor.ex_command.unescapeSubSep(self.alloc, sub.pattern);
+        defer self.alloc.free(pat);
+        const rep = try editor.ex_command.unescapeSubSep(self.alloc, sub.replacement);
+        defer self.alloc.free(rep);
         var changed: bool = false;
         var line = start_line;
         while (line <= end_line) : (line += 1) {
@@ -2403,7 +2409,7 @@ const App = struct {
             defer self.alloc.free(buf);
             self.cur().pt.copyRange(ls, buf);
 
-            const n = replaceLiteral(&out, self.alloc, buf, sub.pattern, sub.replacement, sub.global);
+            const n = replaceLiteral(&out, self.alloc, buf, pat, rep, sub.global);
             if (n > 0) changed = true;
             if (line < self.cur().pt.lineCount() - 1) try out.append(self.alloc, '\n');
         }

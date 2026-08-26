@@ -1355,7 +1355,7 @@ test ":%s substitutes across the file, :s on the current line" {
     {
         const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
         defer f.close(io);
-        try f.writeStreamingAll(io, "foo foo\nbar foo\n");
+        try f.writeStreamingAll(io, "foo foo\nbar foo\nhttp://x\n");
     }
 
     var sess = try Session.spawn(io, &.{ oz_exe_path, name });
@@ -1392,6 +1392,23 @@ test ":%s substitutes across the file, :s on the current line" {
     }
     try std.testing.expect(grid.contains("X X"));
     try std.testing.expect(!grid.contains("foo"));
+
+    // an escaped separator `\/` in the pattern must match a real '/' —
+    // http:\/\/x matches "http://x" and becomes DONE
+    try sess.send(":%s/http:\\/\\/x/DONE/\r");
+    waited = 0;
+    while (!grid.contains("DONE")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("DONE"));
+    try std.testing.expect(!grid.contains("http://x"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);

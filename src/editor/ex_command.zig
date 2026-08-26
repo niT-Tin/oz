@@ -135,7 +135,9 @@ pub fn parse(line: []const u8) Command {
                 break;
             }
         }
-        const flags = t[rep_end + 1 ..];
+        // flags follow the closing '/'; with none the replacement runs to
+        // the end of the line and there are no flags (":s/a/b" is valid).
+        const flags = if (rep_end < t.len) t[rep_end + 1 ..] else t[t.len..];
         const global = std.mem.indexOfScalar(u8, flags, 'g') != null;
         return .{ .substitute = .{
             .whole_file = whole_file,
@@ -147,6 +149,26 @@ pub fn parse(line: []const u8) Command {
     }
 
     return .unknown;
+}
+
+/// Restore a `/` that was escaped as `\/` inside an :s pattern/replacement.
+/// The scanner keeps the backslash so the slash doesn't terminate the field;
+/// substitute matching treats the pattern literally, so `a\/b` must mean
+/// `a/b`. Any other `\x` pair is kept verbatim (vim regex escapes, which a
+/// literal matcher does not interpret).
+pub fn unescapeSubSep(alloc: std.mem.Allocator, src: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < src.len) : (i += 1) {
+        if (src[i] == '\\' and i + 1 < src.len and src[i + 1] == '/') {
+            try out.append(alloc, '/');
+            i += 1;
+        } else {
+            try out.append(alloc, src[i]);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
 }
 
 test "parse: write/quit family" {
@@ -170,6 +192,47 @@ test "parse: edit with and without args" {
     const c = parse("e  src/main.zig  ");
     try std.testing.expect(c == .edit);
     try std.testing.expectEqualStrings("src/main.zig", c.edit);
+}
+
+test "parse: substitute without a trailing separator or flags" {
+    // ":s/a/b" (no trailing '/') is valid vim — it must not crash the parser.
+    const sub = parse("s/a/b");
+    try std.testing.expect(sub == .substitute);
+    try std.testing.expect(!sub.substitute.whole_file);
+    try std.testing.expectEqualStrings("a", sub.substitute.pattern);
+    try std.testing.expectEqualStrings("b", sub.substitute.replacement);
+    try std.testing.expect(!sub.substitute.global);
+
+    // a trailing escape in the replacement must not run the flag scan out
+    // of bounds either
+    const sub2 = parse("s/a/b\\");
+    try std.testing.expect(sub2 == .substitute);
+    try std.testing.expectEqualStrings("b\\", sub2.substitute.replacement);
+
+    const sub3 = parse("%s/x/y");
+    try std.testing.expect(sub3 == .substitute);
+    try std.testing.expect(sub3.substitute.whole_file);
+    try std.testing.expect(!sub3.substitute.global);
+}
+
+test "substitute: unescapeSubSep restores \\/ but keeps other escapes" {
+    const a = std.testing.allocator;
+    const p = try unescapeSubSep(a, "a\\/b");
+    defer a.free(p);
+    try std.testing.expectEqualStrings("a/b", p);
+
+    const q = try unescapeSubSep(a, "a\\tb\\/c");
+    defer a.free(q);
+    try std.testing.expectEqualStrings("a\\tb/c", q);
+
+    // trailing lone backslash survives untouched
+    const r = try unescapeSubSep(a, "x\\");
+    defer a.free(r);
+    try std.testing.expectEqualStrings("x\\", r);
+
+    const s = try unescapeSubSep(a, "plain");
+    defer a.free(s);
+    try std.testing.expectEqualStrings("plain", s);
 }
 
 test "parse: buffers, noh, set, unknown" {
