@@ -473,13 +473,35 @@ pub const Client = struct {
 
     /// Send a request; the response result lands in `slot` when `drain`
     /// matches it (main thread). Caller frees `slot` once set.
+    ///
+    /// At most one in-flight request per slot: a new request for a slot that
+    /// already has a pending entry REPLACES it (the old entry is dropped, so
+    /// its late response — a slot's responses may arrive out of order — finds
+    /// no pending id and is discarded instead of overwriting the newer
+    /// result). Without this, two requests sharing a slot (formatting +
+    /// rename, nav requests) could be consumed in arrival order, letting a
+    /// stale response clobber the current one.
     pub fn request(self: *Client, method: []const u8, params: std.json.Value, slot: *?std.json.Value) !void {
         const id = self.next_id;
         self.next_id += 1;
-        try self.pending.append(self.alloc, .{ .id = id, .slot = slot });
+        // encode first so a failure leaves no dangling pending entry
         const content = try json_rpc.encodeRequest(self.alloc, id, method, params);
         defer self.alloc.free(content);
-        try self.writeFrameToStdin(content);
+        // drop any older in-flight request for the same slot (see above)
+        var i: usize = 0;
+        while (i < self.pending.items.len) {
+            if (self.pending.items[i].slot == slot) {
+                _ = self.pending.orderedRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+        try self.pending.append(self.alloc, .{ .id = id, .slot = slot });
+        self.writeFrameToStdin(content) catch |e| {
+            // roll the pending entry back: a response for it will never come
+            self.pending.items.len -= 1;
+            return e;
+        };
     }
 
     /// Send a notification (no id, no response expected).
@@ -877,6 +899,50 @@ test "drain: server requests are answered, never fill pending slots" {
     try std.testing.expectEqual(@as(usize, 0), client.pending.items.len);
     try std.testing.expect(slot != null);
     try std.testing.expectEqual(true, slot.?.object.get("ok").?.bool);
+}
+
+test "request: a new request for a busy slot replaces the old pending one" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const fds = try std.Io.Threaded.pipe2(.{});
+    const read_end = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+    const write_end = std.Io.File{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+    defer std.Io.File.close(read_end, io);
+    defer std.Io.File.close(write_end, io);
+
+    var client = try testClient(alloc, io, write_end);
+    defer cleanupClient(alloc, &client);
+
+    var slot: ?std.json.Value = null;
+    defer if (slot) |*v| json_rpc.freeValue(alloc, v);
+
+    // Two requests share the slot (formatting + rename, or two nav
+    // requests). The second replaces the first's pending entry, so the
+    // first response arriving LATE must not overwrite the second's result.
+    try client.request("textDocument/formatting", .{ .object = .{} }, &slot);
+    try client.request("textDocument/rename", .{ .object = .{} }, &slot);
+    try std.testing.expectEqual(@as(usize, 1), client.pending.items.len);
+
+    // The second (newer) response arrives first, then the stale first one.
+    try client.queue.push(alloc, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"kind\":\"rename\"}}");
+    try client.queue.push(alloc, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"kind\":\"format\"}}");
+
+    const Recorder = struct {};
+    var rec = Recorder{};
+    const handler = struct {
+        fn handle(ctx: *Recorder, c: *Client, msg: *json_rpc.Message) void {
+            _ = ctx;
+            _ = c;
+            _ = msg;
+        }
+    }.handle;
+    client.drain(&rec, handler);
+
+    // The stale formatting response found no pending id 1 and was dropped;
+    // the slot holds the rename result.
+    try std.testing.expectEqual(@as(usize, 0), client.pending.items.len);
+    try std.testing.expect(slot != null);
+    try std.testing.expectEqualStrings("rename", slot.?.object.get("kind").?.string);
 }
 
 test "start: every failure point after spawn cleans up (no hang, no crash)" {

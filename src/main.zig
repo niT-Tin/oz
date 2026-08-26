@@ -217,6 +217,9 @@ const App = struct {
     inlay_req_seq: u64 = 0,
     /// edit_seq at the moment the in-flight completion request was sent.
     completion_req_seq: u64 = 0,
+    /// edit_seq at the moment the in-flight formatting/rename request was
+    /// sent (format_slot is shared by both).
+    format_req_seq: u64 = 0,
 
     /// The active buffer (the focused window's buffer; per-buffer document
     /// state lives here, per-window cursor/viewport in `windows`).
@@ -1633,6 +1636,7 @@ const App = struct {
         errdefer self.alloc.free(name_copy);
         try params.object.put(self.alloc, "newName", .{ .string = name_copy });
         client.request("textDocument/rename", params, &self.format_slot) catch return;
+        self.format_req_seq = self.edit_seq;
         // freeTextDocPositionParams frees the uri + structures but not the
         // newName dupe — free it explicitly (put succeeded, so it is ours).
         self.alloc.free(name_copy);
@@ -1679,6 +1683,7 @@ const App = struct {
         var params_value = std.json.Value{ .object = params };
         defer self.freeSimpleDocParams(&params_value);
         client.request("textDocument/formatting", params_value, &self.format_slot) catch return;
+        self.format_req_seq = self.edit_seq;
     }
 
     /// Consume a formatting/rename response (TextEdit[]) and apply the edits
@@ -1690,6 +1695,11 @@ const App = struct {
             json_rpc.freeValue(self.alloc, &result);
             self.format_slot = null;
         }
+        // Stale response: the document changed after this request was sent
+        // (edits typed between <leader>lf and the reply). The TextEdits were
+        // computed against the old text; applying them would corrupt the
+        // buffer, so drop them like the inlay-hint path does.
+        if (self.edit_seq != self.format_req_seq) return true;
         var edits = std.ArrayList(lsp_nav.TextEdit).empty;
         defer {
             for (edits.items) |*e| self.alloc.free(e.new_text);
