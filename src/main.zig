@@ -4218,6 +4218,37 @@ const App = struct {
         return col;
     }
 
+    /// Display width (cells) of `text` — the same per-grapheme gwidth the
+    /// renderer uses. Used to shift columns past inlay hints: they occupy
+    /// screen cells but no buffer bytes, so a plain text column understates
+    /// the on-screen position by their combined width.
+    fn textWidth(self: *App, win: vaxis.Window, text: []const u8) u32 {
+        _ = self;
+        var col: u32 = 0;
+        var p: usize = 0;
+        while (p < text.len) {
+            const b = text[p];
+            const seq_len: usize = if (b < 0x80) 1 else (std.unicode.utf8ByteSequenceLength(b) catch 1);
+            const avail = @min(seq_len, text.len - p);
+            col += win.gwidth(text[p .. p + avail]);
+            p += avail;
+        }
+        return col;
+    }
+
+    /// On-screen cell column of `byte_pos` within `line`: the text column
+    /// plus the width of every inlay hint spliced before it.
+    fn screenCellCol(self: *App, win: vaxis.Window, line: u32, byte_pos: u32) u32 {
+        const text_col = self.lineCellCol(win, line, byte_pos);
+        var col = text_col;
+        for (self.inlay_hints.items) |hint| {
+            if (hint.line == line and hint.character <= text_col) {
+                col += self.textWidth(win, hint.label);
+            }
+        }
+        return col;
+    }
+
     /// Render one split window's lines into `rect` (content-area coordinates).
     /// The highlighter is bound to the current buffer, so only the focused
     /// window gets syntax highlighting and the (single) visual selection.
@@ -4735,7 +4766,7 @@ const App = struct {
                 var top: usize = 0;
                 if (self.completion_sel >= list_rows) top = self.completion_sel - list_rows + 1;
                 const c_line = self.cur().pt.lineOf(self.curCursor().*);
-                const c_col = self.lineCellCol(win, c_line, self.curCursor().*);
+                const c_col = self.screenCellCol(win, c_line, self.curCursor().*);
                 // box width in cells: borders + icon + pad + longest label
                 var max_label: usize = 0;
                 var k: usize = 0;
@@ -4806,7 +4837,7 @@ const App = struct {
                 const item = self.completion_words.items[self.completion_sel].text;
                 const typed_len = self.curCursor().* - self.completion_pos;
                 const ghost_line = self.cur().pt.lineOf(self.curCursor().*);
-                const ghost_col = self.lineCellCol(win, ghost_line, self.curCursor().*);
+                const ghost_col = self.screenCellCol(win, ghost_line, self.curCursor().*);
                 if (item.len > typed_len and typed_len > 0 and typed_len < 256) {
                     var prefix_buf: [256]u8 = undefined;
                     self.cur().pt.copyRange(self.completion_pos, prefix_buf[0..typed_len]);
@@ -4939,7 +4970,7 @@ const App = struct {
             .visual_char, .visual_line, .visual_block => " VISUAL ",
             .command => " COMMAND ",
         };
-        const status_col = self.lineCellCol(win, cursor_line, self.curCursor().*);
+        const status_col = self.screenCellCol(win, cursor_line, self.curCursor().*);
         // a completion request is in flight (zls can take many seconds on
         // build.zig while its build_runner analyses the project) — show "…"
         // so a slow response isn't mistaken for a dead completion that
@@ -4977,7 +5008,7 @@ const App = struct {
                 .col = 0,
             };
         } else {
-            const cursor_col = self.lineCellCol(win, cursor_line, self.curCursor().*);
+            const cursor_col = self.screenCellCol(win, cursor_line, self.curCursor().*);
             const cursor_row = cursor_line - self.curViewTop().* + cur_rect.row;
             self.vx.screen.cursor = .{
                 .row = @intCast(cursor_row),
