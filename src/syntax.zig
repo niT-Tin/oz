@@ -292,10 +292,12 @@ pub const Highlighter = struct {
     }
 
     /// Incremental reparse: record a single edit [pos, old_end) → [pos,
-    /// new_end) on the current tree, then parse the new text. Only byte
-    /// offsets matter to our consumers — the point fields are approximated
-    /// (zero); tree-sitter needs them only for position metadata we never
-    /// read.
+    /// new_end) on the current tree, then parse the new text reusing the
+    /// old tree (tree-sitter's incremental path — the whole point of
+    /// t.edit()). Only byte offsets matter to our consumers — the point
+    /// fields are approximated; tree-sitter needs them only for position
+    /// metadata we never read. On parse failure the old tree may be left
+    /// in an unknown state, so it is dropped and a full reparse is used.
     pub fn reparseEdit(self: *Highlighter, pos: u32, old_end: u32, new_end: u32, text: []const u8) !void {
         if (self.tree) |t| {
             const old_text = self.prev_text orelse "";
@@ -308,7 +310,14 @@ pub const Highlighter = struct {
                 .new_end_point = pointAt(text, new_end),
             });
         }
-        try self.reparse(text);
+        const new_tree = self.parser.parseString(self.tree, text) catch {
+            if (self.tree) |old| old.destroy();
+            self.tree = null;
+            return self.reparse(text);
+        };
+        if (self.tree) |old| old.destroy();
+        self.tree = new_tree;
+        try self.setPrevText(text);
     }
 
     /// Line/column of a byte offset (tree-sitter Point).
