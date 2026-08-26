@@ -8301,3 +8301,100 @@ test "lsp: editing — rename, format, inlay hints, outline" {
 }
 
 
+
+test "command mode: Tab completes command names, cycles, keeps path completion" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}cmdt.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    { const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true }); defer f.close(io); try f.writeStreamingAll(io, "const a = 1;\n"); }
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) { waited += 200; if (waited >= 5000) break; continue; }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    // ":w" + Tab → ":write"
+    try sess.send(":w\t");
+    waited = 0;
+    while (!grid.contains(":write")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) { waited += 200; if (waited >= 5000) break; }
+        else { sess.used += n; grid.feed(sess.out[sess.used - n .. sess.used]); }
+        if (grid.contains(":write")) break;
+    }
+    if (!grid.contains(":write")) {
+        std.debug.print("cmd tab write failed:\n", .{});
+        grid.dump();
+        var cr: usize = 0;
+        while (cr < grid.rows) : (cr += 1) std.debug.print("R{d}: [{s}]\n", .{ cr, grid.rowText(cr) });
+    }
+    try std.testing.expect(grid.contains(":write"));
+    // Esc cancels
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("COMMAND")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) { waited += 200; if (waited >= 5000) break; }
+        else { sess.used += n; grid.feed(sess.out[sess.used - n .. sess.used]); }
+        if (!grid.contains("COMMAND")) break;
+    }
+    // ":b" + Tab cycles bnext
+    try sess.send(":b\t");
+    waited = 0;
+    while (!grid.contains(":bnext")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) { waited += 200; if (waited >= 5000) break; }
+        else { sess.used += n; grid.feed(sess.out[sess.used - n .. sess.used]); }
+        if (grid.contains(":bnext")) break;
+    }
+    try std.testing.expect(grid.contains(":bnext"));
+    // second Tab cycles to bprev
+    try sess.send("\t");
+    waited = 0;
+    while (!grid.contains(":bprev")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) { waited += 200; if (waited >= 5000) break; }
+        else { sess.used += n; grid.feed(sess.out[sess.used - n .. sess.used]); }
+        if (grid.contains(":bprev")) break;
+    }
+    try std.testing.expect(grid.contains(":bprev"));
+    // Esc, then ":e " + Tab still completes paths (build.zig in cwd)
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("COMMAND")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) { waited += 200; if (waited >= 5000) break; }
+        else { sess.used += n; grid.feed(sess.out[sess.used - n .. sess.used]); }
+        if (!grid.contains("COMMAND")) break;
+    }
+    try sess.send(":e b\t");
+    waited = 0;
+    while (!grid.contains(":e build.zig")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) { waited += 200; if (waited >= 5000) break; }
+        else { sess.used += n; grid.feed(sess.out[sess.used - n .. sess.used]); }
+        if (grid.contains(":e build.zig")) break;
+    }
+    if (!grid.contains(":e build.zig")) { std.debug.print("cmd tab path failed:\n", .{}); grid.dump(); }
+    try std.testing.expect(grid.contains(":e build.zig"));
+    // Esc alone (not Alt+:) cancels the command line, then :q! exits
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains("COMMAND")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) { waited += 200; if (waited >= 5000) break; }
+        else { sess.used += n; grid.feed(sess.out[sess.used - n .. sess.used]); }
+        if (!grid.contains("COMMAND")) break;
+    }
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}

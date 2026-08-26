@@ -104,11 +104,16 @@ const App = struct {
     cmdline: std.ArrayList(u8),
     cmd_history: std.ArrayList([]u8),
     cmd_hist_idx: ?usize = null,
-    /// Tab-completion cursor for ":e <path>" cycling. Separate from
-    /// cmd_hist_idx: the path completer must not clobber the history index
+    /// Tab-completion cursor for ":e <path>" / command-name cycling. Separate
+    /// from cmd_hist_idx: the completers must not clobber the history index
     /// (Up/Down) or vice versa, or a Tab after an Up would jump to a
     /// random history entry.
     cmd_complete_idx: usize = 0,
+    /// The command-name match list from the last Tab (owned), so repeated
+    /// Tabs cycle the ORIGINAL matches even after the line becomes a full
+    /// command name (":b" Tab → bnext, Tab → bprev, …). Cleared on any
+    /// command-line entry/exit and on path completion.
+    cmd_complete_names: std.ArrayList([]const u8) = .empty,
     prev_insert_key: ?vaxis.Key = null,
     msg: ?[]u8 = null, // transient status message (owned)
 
@@ -618,6 +623,8 @@ const App = struct {
         self.cmdline.deinit(self.alloc);
         for (self.cmd_history.items) |h| self.alloc.free(h);
         self.cmd_history.deinit(self.alloc);
+        for (self.cmd_complete_names.items) |n| self.alloc.free(n);
+        self.cmd_complete_names.deinit(self.alloc);
         if (self.msg) |m| self.alloc.free(m);
         if (self.yank_buffer) |b| self.alloc.free(b);
         if (self.em_matches.len > 0) self.alloc.free(self.em_matches);
@@ -1012,6 +1019,7 @@ const App = struct {
                 self.cmdline.clearRetainingCapacity();
                 self.cmd_hist_idx = null;
                 self.cmd_complete_idx = 0;
+                self.clearCmdCompleteNames();
                 try self.setMsg(try self.alloc.dupe(u8, ""));
                 // From visual mode vim auto-types :'<,'>; :s then applies to
                 // the selection (the anchor survives until Enter).
@@ -1703,6 +1711,7 @@ const App = struct {
         try self.cmdline.appendSlice(self.alloc, wbuf);
         self.cmd_hist_idx = null;
         self.cmd_complete_idx = 0;
+        self.clearCmdCompleteNames();
         try self.setMsg(try self.alloc.dupe(u8, ""));
         self.state.mode = .command;
         self.pending_rename = true;
@@ -2242,6 +2251,7 @@ const App = struct {
             self.cmdline.clearRetainingCapacity();
             self.cmd_hist_idx = null;
             self.cmd_complete_idx = 0;
+            self.clearCmdCompleteNames();
             return;
         }
         switch (key.codepoint) {
@@ -2261,6 +2271,7 @@ const App = struct {
                 self.state.mode = .normal;
                 self.cmd_hist_idx = null;
                 self.cmd_complete_idx = 0;
+                self.clearCmdCompleteNames();
                 // execCommand must run BEFORE clearing: Command slices borrow
                 // the cmdline buffer (pattern/replacement/edit paths)
                 try self.execCommand(cmd);
@@ -2288,9 +2299,17 @@ const App = struct {
             },
             else => {},
         }
-        // Tab: complete the file path after ":e "
+        // Tab: complete the command name (":w" → ":write") or, after
+        // ":e " / ":edit ", the file path.
         if (key.codepoint == vaxis.Key.tab) {
-            try self.completeCommandPath();
+            const line = self.cmdline.items;
+            const is_path_ctx = (line.len >= 2 and (std.mem.eql(u8, line[0..2], "e ") or
+                (line.len >= 5 and std.mem.eql(u8, line[0..5], "edit "))));
+            if (is_path_ctx) {
+                try self.completeCommandPath();
+            } else {
+                try self.completeCommandName();
+            }
             return;
         }
 
@@ -2306,13 +2325,64 @@ const App = struct {
         }
     }
 
+    /// Tab in command mode: complete the command NAME (":w" → ":write",
+    /// ":b" → cycles ":bnext/:bprev/:buffers/:bdelete", …). The prefix is
+    /// the token before the first space; repeated Tabs cycle through the
+    /// ORIGINAL match list (stored, since the line becomes a full command
+    /// name after the first Tab), advancing the completion cursor.
+    fn completeCommandName(self: *App) !void {
+        const line = self.cmdline.items;
+        // the command token is up to the first space (or the whole line)
+        var split: usize = 0;
+        while (split < line.len and line[split] != ' ') : (split += 1) {}
+        const prefix = line[0..split];
+        if (prefix.len == 0) return;
+
+        // first Tab: compute the match list for the typed prefix; later Tabs
+        // reuse the stored list so cycling keeps working after completion
+        if (self.cmd_complete_names.items.len == 0) {
+            // canonical command names, matching ex_command.zig's parser
+            const commands = [_][]const u8{
+                "write",     "quit",      "quitall",   "wq",     "edit",
+                "vsplit",    "split",     "bnext",     "bprev",  "buffers",
+                "bdelete",   "nohlsearch", "set",      "theme",  "colorscheme",
+                "noh",
+            };
+            for (commands) |c| {
+                if (std.mem.startsWith(u8, c, prefix)) {
+                    const copy = try self.alloc.dupe(u8, c);
+                    errdefer self.alloc.free(copy);
+                    try self.cmd_complete_names.append(self.alloc, copy);
+                }
+            }
+            if (self.cmd_complete_names.items.len == 0) return;
+            self.cmd_complete_idx = 0;
+        }
+        const matches = self.cmd_complete_names.items;
+        const chosen = matches[self.cmd_complete_idx % matches.len];
+        self.cmd_complete_idx += 1;
+
+        // replace the command token with the full name
+        self.cmdline.shrinkRetainingCapacity(0);
+        try self.cmdline.appendSlice(self.alloc, chosen);
+        // keep any existing argument (e.g. ":set " arg)
+        if (split < line.len) {
+            try self.cmdline.appendSlice(self.alloc, line[split..]);
+        }
+    }
+
     /// Tab in command mode: complete the path prefix after ":e ".
     /// Cycles through matches on repeated Tab.
     fn completeCommandPath(self: *App) !void {
         const line = self.cmdline.items;
-        // find the token after "e " / ":e " (the leading ':' isn't stored)
-        if (line.len < 3 or line[0] != 'e' or line[1] != ' ') return;
-        const prefix = line[2..];
+        // find the token after "e " / "edit " (the leading ':' isn't stored)
+        var skip: usize = 0;
+        if (line.len >= 2 and std.mem.eql(u8, line[0..2], "e ")) {
+            skip = 2;
+        } else if (line.len >= 5 and std.mem.eql(u8, line[0..5], "edit ")) {
+            skip = 5;
+        } else return;
+        const prefix = line[skip..];
 
         var matches = std.ArrayList([]const u8).empty;
         defer {
@@ -2336,13 +2406,24 @@ const App = struct {
         if (matches.items.len == 0) return;
 
         // cycle: self.cmd_complete_idx is the completion cursor
-        const cycle = self.cmd_complete_idx + 1;
-        const chosen = matches.items[cycle % matches.items.len];
-        self.cmd_complete_idx = cycle % matches.items.len;
+        // cycle through the matches: the FIRST Tab picks the first match,
+        // further Tabs advance (the cursor is reset on command-line entry)
+        const chosen = matches.items[self.cmd_complete_idx % matches.items.len];
+        self.cmd_complete_idx += 1;
 
+        // rebuild "e <chosen>" preserving the user's command form (e/edit)
+        self.clearCmdCompleteNames();
+        const cmd = if (line.len >= 5 and std.mem.eql(u8, line[0..5], "edit ")) "edit" else "e";
         self.cmdline.clearRetainingCapacity();
-        try self.cmdline.appendSlice(self.alloc, "e ");
+        try self.cmdline.appendSlice(self.alloc, cmd);
+        try self.cmdline.appendSlice(self.alloc, " ");
         try self.cmdline.appendSlice(self.alloc, chosen);
+    }
+
+    /// Drop the stored command-name completion matches (owned strings).
+    fn clearCmdCompleteNames(self: *App) void {
+        for (self.cmd_complete_names.items) |n| self.alloc.free(n);
+        self.cmd_complete_names.clearRetainingCapacity();
     }
 
     fn pushHistory(self: *App, line: []const u8) !void {
