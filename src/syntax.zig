@@ -44,6 +44,15 @@ pub const Style = enum(u8) {
     variable,
     parameter,
     punctuation,
+    /// Rainbow brackets: style = bracketN where N = bracket depth % 7. The
+    /// caller maps ordinals to a 7-color rainbow palette.
+    bracket0,
+    bracket1,
+    bracket2,
+    bracket3,
+    bracket4,
+    bracket5,
+    bracket6,
     builtin,
 };
 
@@ -52,6 +61,15 @@ pub const Span = struct {
     start: u32,
     end: u32, // exclusive
     style: Style,
+};
+
+/// A byte range identifying a "code block" scope for cursor-aware features
+/// (e.g. scope highlighting). `end_byte` is exclusive (tree-sitter
+/// convention) — the closing token occupies [end_byte - 1, end_byte); the
+/// caller converts both ends to line numbers as needed.
+pub const Scope = struct {
+    start_byte: u32,
+    end_byte: u32, // exclusive
 };
 
 /// A raw byte interval (ERROR-node coverage).
@@ -219,6 +237,43 @@ pub fn captureStyle(name: []const u8) Style {
     return .default;
 }
 
+/// True when a capture name is a bracket punctuation capture — base
+/// "punctuation" with a ".bracket" suffix ("@punctuation.bracket"). These get
+/// the rainbow `bracketN` styles instead of plain `.punctuation`; the check
+/// must happen BEFORE `captureStyle`, which folds the dotted suffix away.
+fn isBracketCapture(name: []const u8) bool {
+    var n = name;
+    if (n.len > 0 and n[0] == '@') n = n[1..];
+    const dot = std.mem.indexOfScalar(u8, n, '.') orelse return false;
+    if (!std.mem.eql(u8, n[0..dot], "punctuation")) return false;
+    return std.mem.endsWith(u8, n, ".bracket");
+}
+
+/// Rainbow style for a bracket at `depth`: bracket0 + depth % 7.
+fn bracketStyle(depth: u32) Style {
+    const base: u8 = @intFromEnum(Style.bracket0);
+    return @enumFromInt(base + @as(u8, @intCast(depth % 7)));
+}
+
+/// Bracket nesting depth = the number of `getParent()` steps from `node` up
+/// to the tree root. The walk stops when the parent is null (root's parent —
+/// treez's `getParent` returns a null node there, and touching any field of
+/// it segfaults in this tree-sitter build, so only `isNull()` is consulted),
+/// with an identity guard against malformed trees. The root node itself has
+/// depth 0.
+fn bracketDepth(node: treez.Node) u32 {
+    var depth: u32 = 0;
+    var cur = node;
+    while (true) {
+        const parent = cur.getParent();
+        if (parent.isNull()) break;
+        if (parent.id == cur.id) break; // defensive: self-parent would loop forever
+        cur = parent;
+        depth += 1;
+    }
+    return depth;
+}
+
 /// A parsed+queried buffer for one language. Owns the tree-sitter parser,
 /// the compiled highlight query and the last parse tree.
 pub const Highlighter = struct {
@@ -348,7 +403,14 @@ pub const Highlighter = struct {
         while (cursor.nextCapture()) |nc| {
             const match = nc[0];
             const cap = match.captures()[nc[1]];
-            const style = captureStyle(self.query.getCaptureNameForId(cap.id));
+            const name = self.query.getCaptureNameForId(cap.id);
+            // rainbow brackets: "@punctuation.bracket" spans get bracketN
+            // instead of the plain .punctuation that captureStyle() would
+            // fold them to (it collapses dotted suffixes onto the base).
+            const style: Style = if (isBracketCapture(name))
+                bracketStyle(bracketDepth(cap.node))
+            else
+                captureStyle(name);
             if (style == .default) continue;
             const s = cap.node.getStartByte();
             const e = cap.node.getEndByte();
@@ -410,7 +472,56 @@ pub const Highlighter = struct {
     fn lessThan(_: void, a: Span, b: Span) bool {
         return a.start < b.start;
     }
+
+    /// Deepest "code block" node containing `byte`, as a byte range. Starts at
+    /// the root (the whole file — the fallback scope) and drills down: while
+    /// the child containing `byte` is a block-like node, record it as the
+    /// current scope and descend into it. Stops when no child contains `byte`
+    /// or the containing child is not block-like. Cost is O(tree depth ×
+    /// children per level) — never O(file). Returns null only when there is no
+    /// tree or the file is empty; otherwise the root range is the floor.
+    pub fn scopeAt(self: *Highlighter, byte: u32) ?Scope {
+        const tree = self.tree orelse return null;
+        const root = tree.getRootNode();
+        if (root.getEndByte() == 0) return null; // empty file
+        var scope = root;
+        var current = root;
+        while (true) {
+            // find the child containing `byte` (siblings never overlap, so at
+            // most one matches)
+            var next: ?treez.Node = null;
+            var i: u32 = 0;
+            while (i < current.getChildCount()) : (i += 1) {
+                const child = current.getChild(i);
+                if (child.isNull()) continue;
+                if (child.getStartByte() <= byte and byte < child.getEndByte()) {
+                    next = child;
+                    break;
+                }
+            }
+            const child = next orelse break;
+            if (!isBlockNode(child)) break;
+            scope = child;
+            current = child;
+        }
+        return .{ .start_byte = scope.getStartByte(), .end_byte = scope.getEndByte() };
+    }
 };
+
+/// Loose "is this a code block?" check by node-type substring (zig names fn
+/// bodies `block`, fns `function_declaration`, containers `struct_declaration`
+/// etc. — lenient substring matching keeps this language-agnostic).
+fn isBlockNode(node: treez.Node) bool {
+    const ty = node.getType();
+    const needles = [_][]const u8{
+        "block", "function", "fn_", "declaration", "struct", "enum",
+        "union", "class", "interface", "impl", "module", "body", "statement",
+    };
+    for (needles) |nd| {
+        if (std.mem.indexOf(u8, ty, nd) != null) return true;
+    }
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // L1 tests (implemented alongside the real logic)
@@ -423,6 +534,125 @@ test "captureStyle: dotted names collapse to the base capture" {
     try std.testing.expect(captureStyle("@variable.builtin") == .variable);
     try std.testing.expect(captureStyle("@punctuation.bracket") == .punctuation);
     try std.testing.expect(captureStyle("@nonexistent") == .default);
+}
+
+test "isBracketCapture: only punctuation.bracket captures qualify" {
+    try std.testing.expect(isBracketCapture("@punctuation.bracket"));
+    try std.testing.expect(isBracketCapture("punctuation.bracket"));
+    try std.testing.expect(!isBracketCapture("@punctuation.delimiter"));
+    try std.testing.expect(!isBracketCapture("@punctuation"));
+    try std.testing.expect(!isBracketCapture("@keyword.bracket"));
+    try std.testing.expect(!isBracketCapture("@bracket"));
+}
+
+test "bracketStyle: depth maps into the 7-color rainbow" {
+    try std.testing.expect(bracketStyle(0) == Style.bracket0);
+    try std.testing.expect(bracketStyle(6) == Style.bracket6);
+    try std.testing.expect(bracketStyle(7) == Style.bracket0);
+    try std.testing.expect(bracketStyle(20) == Style.bracket6); // 20 % 7 == 6
+}
+
+test "highlight: rainbow brackets — inner brackets have a deeper style than outer" {
+    const alloc = std.testing.allocator;
+    // nested zig: fn params "()", fn body "{}", if-parens "(true)", if body "{}"
+    const src =
+        \\pub fn f() void {
+        \\    const y = 1;
+        \\    if (true) {}
+        \\}
+        \\
+    ;
+    var hl = try Highlighter.init(alloc, "zig");
+    defer hl.deinit();
+    try hl.reparse(src);
+    var spans = std.ArrayList(Span).empty;
+    defer spans.deinit(alloc);
+    try hl.spansInRange(0, @intCast(src.len), std.testing.allocator, &spans);
+
+    const fn_lparen = std.mem.indexOf(u8, src, "(").?; // fn params "("
+    const if_lparen = std.mem.indexOfPos(u8, src, fn_lparen + 1, "(").?; // if "("
+    const fn_lbrace = std.mem.indexOf(u8, src, "{").?; // fn body "{"
+    const if_lbrace = std.mem.indexOfPos(u8, src, fn_lbrace + 1, "{").?; // if body "{"
+    const semi = std.mem.indexOf(u8, src, ";").?; // delimiter
+
+    const fn_paren = spanAt(spans.items, @intCast(fn_lparen)).?;
+    const fn_brace = spanAt(spans.items, @intCast(fn_lbrace)).?;
+    const if_paren = spanAt(spans.items, @intCast(if_lparen)).?;
+    const if_brace = spanAt(spans.items, @intCast(if_lbrace)).?;
+
+    // all four brackets get rainbow styles (never plain .punctuation)
+    const base: u8 = @intFromEnum(Style.bracket0);
+    for ([_]Style{ fn_paren, fn_brace, if_paren, if_brace }) |st| {
+        const off = @as(u8, @intFromEnum(st)) -% base;
+        if (off > 6) {
+            dumpSpans(src, spans.items);
+            try std.testing.expect(false);
+        }
+    }
+
+    // the nesting formula: inner (deeper in the tree) ordinal > outer ordinal
+    const ord_if_paren: u8 = @intFromEnum(if_paren);
+    const ord_fn_paren: u8 = @intFromEnum(fn_paren);
+    const ord_if_brace: u8 = @intFromEnum(if_brace);
+    const ord_fn_brace: u8 = @intFromEnum(fn_brace);
+    if (!(ord_if_paren > ord_fn_paren) or !(ord_if_brace > ord_fn_brace)) {
+        dumpSpans(src, spans.items);
+    }
+    try std.testing.expect(ord_if_paren > ord_fn_paren);
+    try std.testing.expect(ord_if_brace > ord_fn_brace);
+
+    // delimiters stay plain punctuation
+    try std.testing.expectEqual(Style.punctuation, spanAt(spans.items, @intCast(semi)).?);
+}
+
+test "scopeAt: cursor in fn body returns the const-decl scope; block end covers fn brace" {
+    const alloc = std.testing.allocator;
+    const src = "pub fn main() void {\n    const x = 1;\n}\n";
+    var hl = try Highlighter.init(alloc, "zig");
+    defer hl.deinit();
+    try hl.reparse(src);
+
+    // cursor on "const x = 1;" (line 2) → deepest block-like scope is the
+    // variable_declaration: it must contain the cursor...
+    const cur = std.mem.indexOf(u8, src, "const x").?;
+    const scope = hl.scopeAt(@intCast(cur)).?;
+    try std.testing.expect(scope.start_byte <= cur and cur < scope.end_byte);
+    // ...and it is exactly the const statement's byte range
+    try std.testing.expectEqualStrings("const x = 1;", src[scope.start_byte..scope.end_byte]);
+
+    // cursor on the newline right after the statement (no deeper block there)
+    // → the fn-body block scope, whose end covers the closing brace "}"
+    const fn_rbrace = std.mem.indexOf(u8, src, "}").?;
+    const after_statement = std.mem.indexOf(u8, src, ";\n").? + 1; // the "\n" after ";"
+    const scope2 = hl.scopeAt(@intCast(after_statement)).?;
+    try std.testing.expect(scope2.start_byte <= after_statement and after_statement < scope2.end_byte);
+    try std.testing.expect(scope2.end_byte > fn_rbrace); // covers the closing brace
+}
+
+test "scopeAt: root fallback, empty file, and no-tree cases" {
+    const alloc = std.testing.allocator;
+    var hl = try Highlighter.init(alloc, "zig");
+    defer hl.deinit();
+
+    // no tree yet → null
+    try std.testing.expect(hl.scopeAt(0) == null);
+
+    // empty file → null
+    try hl.reparse("");
+    try std.testing.expect(hl.scopeAt(0) == null);
+
+    // a file whose first child is not block-like (a comment) → root fallback:
+    // the whole file range
+    const src = "// hello\nconst x = 1;\n";
+    try hl.reparse(src);
+    const scope = hl.scopeAt(0).?;
+    try std.testing.expect(scope.start_byte == 0 and scope.end_byte == src.len);
+
+    // a file starting with a const declaration → the const-decl scope
+    const src2 = "const std = @import(\"std\");\n";
+    try hl.reparse(src2);
+    const scope2 = hl.scopeAt(0).?;
+    try std.testing.expectEqualStrings("const std = @import(\"std\");", src2[scope2.start_byte..scope2.end_byte]);
 }
 
 test "languageFor: filetype to grammar" {

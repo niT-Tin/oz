@@ -5164,6 +5164,27 @@ const App = struct {
         // its own buffer's highlighter, so splits showing different buffers
         // each get real tree-sitter highlighting.
         const merged = try self.visibleSpansFor(buf, a, w.view_top, rect.height);
+
+        // scope highlight (nvim snacks.indent.scope): the byte range of the
+        // block containing this window's cursor, converted to a line range.
+        // Indent guides on those lines render with indent_scope instead of the
+        // level ramp. Skipped when the buffer has no highlighter (no grammar
+        // for the filetype / over the size limit) — scopeAt also returns null
+        // for empty files and before the first parse.
+        var scope_start_line: u32 = 0;
+        var scope_end_line: u32 = 0;
+        var has_scope = false;
+        if (buf.hl) |*hl| {
+            if (hl.scopeAt(w.cursor)) |sc| {
+                scope_start_line = buf.pt.lineOf(sc.start_byte);
+                // end_byte is exclusive — the last byte inside the scope is
+                // end_byte - 1 (lineOf maps pos == len to the last line, so
+                // either clamp would work; -| guards the empty edge case)
+                scope_end_line = buf.pt.lineOf(sc.end_byte -| 1);
+                has_scope = true;
+            }
+        }
+
         var span_i: usize = 0;
         var row: u32 = rect.row;
         var line = w.view_top;
@@ -5283,7 +5304,72 @@ const App = struct {
             else
                 try self.lineHints(a, line);
             var hint_i: usize = 0;
-            var col: u32 = 0;
+
+            // ---- indent guides (nvim snacks.indent) ----
+            // The line's leading whitespace renders as one "│" (U+2502) per
+            // 4-column indent level (tab_width), colored indent[level % 8]; the
+            // cursor's scope block (snacks.indent.scope) switches those guides
+            // to indent_scope, and the cursor line additionally underlines
+            // them. A "│" occupies exactly one cell, so the region keeps the
+            // expanded width of the whitespace it replaces (tab = tab_width
+            // cells) — byte columns, cursor placement, selection bounds and
+            // every existing row/column assertion stay unchanged. Empty lines
+            // and indent < 4 columns ("不足 4 列的部分") draw nothing (the
+            // spaces still render, just as spaces).
+            var indent_end: u32 = 0;
+            while (indent_end < n and (text[indent_end] == ' ' or text[indent_end] == '\t')) indent_end += 1;
+            if (indent_end > 0) {
+                // expanded column count of the indent region (space = 1 col,
+                // tab = tab_width cols) → complete levels = cols / tab_width
+                var indent_cols: u32 = 0;
+                var ib: u32 = 0;
+                while (ib < indent_end) : (ib += 1) indent_cols += if (text[ib] == '\t') tab_width else 1;
+                const indent_levels: u32 = indent_cols / tab_width;
+                // hints anchored at/inside the indent region render before it
+                // (normally none: hints annotate tokens, which start past the
+                // indent) — keeps the hint-before-text ordering of the main loop
+                while (hint_i < line_hints.len and line_hints[hint_i].character <= indent_end) {
+                    const hint = line_hints[hint_i];
+                    if (hint.label.len > 0) {
+                        try segs.append(a, .{
+                            .text = hint.label,
+                            .style = .{ .dim = true, .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg } },
+                        });
+                    }
+                    hint_i += 1;
+                }
+                const in_scope = has_scope and line >= scope_start_line and line <= scope_end_line;
+                var gcol: u32 = 0; // expanded column of the current indent cell
+                ib = 0;
+                while (ib < indent_end) : (ib += 1) {
+                    const cell_w: u32 = if (text[ib] == '\t') tab_width else 1;
+                    var j: u32 = 0;
+                    while (j < cell_w) : (j += 1) {
+                        const level: u32 = gcol / tab_width;
+                        const is_guide = gcol % tab_width == 0 and gcol < indent_levels * tab_width;
+                        var gstyle: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg } };
+                        if (is_cur_line) gstyle.bg = .{ .rgb = self.theme.bg_curline };
+                        if (ib >= sel_s and ib < sel_e) gstyle.bg = .{ .rgb = self.theme.bg_sel };
+                        if (is_guide) {
+                            gstyle.fg = .{ .rgb = if (in_scope) self.theme.indent_scope else self.theme.indent[level % 8] };
+                            // vaxis has no plain `.underline` field — underline
+                            // lives in ul + ul_style; the cursor line's guides
+                            // get a single underline (snacks.indent.scope's
+                            // cursor-line emphasis). The e2e grid parses SGR
+                            // colors only, so this is cosmetic, never asserted.
+                            if (is_cur_line) {
+                                gstyle.ul = .{ .rgb = self.theme.indent_scope };
+                                gstyle.ul_style = .single;
+                            }
+                            try segs.append(a, .{ .text = "│", .style = gstyle });
+                        } else {
+                            try segs.append(a, .{ .text = " ", .style = gstyle });
+                        }
+                        gcol += 1;
+                    }
+                }
+            }
+            var col: u32 = indent_end; // text starts after the indent region
             while (col < n) {
                 // emit any hint whose insertion column is at/just passed col
                 // (before the next text segment, so it reads token+hint)
@@ -5321,7 +5407,13 @@ const App = struct {
                 var style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg } };
                 if (is_cur_line) style.bg = .{ .rgb = self.theme.bg_curline };
                 if (in_sel) style.bg = .{ .rgb = self.theme.bg_sel };
-                if (fg) |f| style.fg = f.fg;
+                // syntaxStyle returns a full vaxis.Style (e.g. Boolean is
+                // bold) — merge the whole thing, not just the fg
+                if (fg) |f| {
+                    style.fg = f.fg;
+                    style.bold = f.bold;
+                    style.italic = f.italic;
+                }
                 const seg_text = text[col..next];
                 if (std.mem.indexOfScalar(u8, seg_text, '\t') != null) {
                     // Expand tabs to `tab_width` spaces so they render (vaxis
@@ -6181,20 +6273,40 @@ fn filetypeOf(path: ?[]const u8) []const u8 {
     return ext[1..];
 }
 
-/// Kanagawa-wave-flavored palette for the tree-sitter capture groups
-/// (src/syntax.zig Style). Background 41,46,66; fg 192,202,245.
+/// Theme palette for the tree-sitter capture groups (src/syntax.zig Style).
+/// One dedicated semantic color per token class (theme.Theme), so distinct
+/// token kinds no longer collapse onto a shared color — and rainbow brackets
+/// (bracket0..bracket6) map to the theme's 7-color rainbow by ordinal.
 fn syntaxStyle(style: syntax.Style, t: theme.Theme) vaxis.Style {
     return switch (style) {
         .default => .{ .fg = .{ .rgb = t.fg } },
         .comment => .{ .fg = .{ .rgb = t.comment } },
         .keyword => .{ .fg = .{ .rgb = t.keyword } }, // gold
         .string => .{ .fg = .{ .rgb = t.string } }, // green
-        .number, .constant, .boolean, .character => .{ .fg = .{ .rgb = t.number } }, // red
-        .function, .tag, .namespace => .{ .fg = .{ .rgb = t.function } }, // blue
-        .type, .constructor, .label => .{ .fg = .{ .rgb = t.type } }, // cyan
-        .operator, .variable, .parameter, .property => .{ .fg = .{ .rgb = t.fg } },
-        .attribute, .builtin => .{ .fg = .{ .rgb = t.keyword } },
-        .punctuation => .{ .fg = .{ .rgb = t.fg_dim } },
+        .number => .{ .fg = .{ .rgb = t.number } },
+        .constant => .{ .fg = .{ .rgb = t.constant } },
+        // kanagawa's Boolean links to Constant; bold sets it apart
+        .boolean => .{ .fg = .{ .rgb = t.boolean }, .bold = true },
+        .character => .{ .fg = .{ .rgb = t.character } },
+        .function => .{ .fg = .{ .rgb = t.function } },
+        .tag => .{ .fg = .{ .rgb = t.tag } },
+        .namespace => .{ .fg = .{ .rgb = t.namespace } },
+        .constructor => .{ .fg = .{ .rgb = t.constructor } },
+        .type => .{ .fg = .{ .rgb = t.type } },
+        .label => .{ .fg = .{ .rgb = t.label } },
+        .operator => .{ .fg = .{ .rgb = t.operator } },
+        .variable => .{ .fg = .{ .rgb = t.variable } },
+        .parameter => .{ .fg = .{ .rgb = t.parameter } },
+        .property => .{ .fg = .{ .rgb = t.property } },
+        .attribute => .{ .fg = .{ .rgb = t.attribute } },
+        .builtin => .{ .fg = .{ .rgb = t.builtin } },
+        .punctuation => .{ .fg = .{ .rgb = t.punctuation } },
+        // rainbow brackets: bracketN -> rainbow[N] (ordinal offset from
+        // bracket0, exactly the bracket depth % 7 the highlighter assigned)
+        .bracket0, .bracket1, .bracket2, .bracket3, .bracket4, .bracket5, .bracket6 => blk: {
+            const idx: usize = @as(usize, @intFromEnum(style)) - @as(usize, @intFromEnum(syntax.Style.bracket0));
+            break :blk .{ .fg = .{ .rgb = t.rainbow[idx] } };
+        },
     };
 }
 

@@ -483,6 +483,14 @@ const Grid = struct {
         return false;
     }
 
+    /// packed fg of the first "│" (indent guide) on row `row`, or null when
+    /// the row has no guide.
+    fn guideFg(self: *Grid, row: usize) ?u32 {
+        const row_text = self.rowText(row);
+        const idx = std.mem.indexOf(u8, row_text, "│") orelse return null;
+        return self.fg_buf[row * self.cols + idx];
+    }
+
     /// Text of one row, compressed from the per-cell slots (each UTF-8 char
     /// occupies one slot; the slot's bytes up to the first NUL form the char).
     fn rowText(self: *Grid, r: usize) []const u8 {
@@ -2018,10 +2026,12 @@ test "vim editing keys: x X D C S r ~ J >>" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(grid.contains("xyz last"));
-    // >> indents the current line by 4 spaces
+    // >> indents the current line by 4 spaces. The first space of the indent
+    // renders as the indent guide "│" (4 columns of indent = one level), so
+    // the line reads "│   xyz last" rather than four spaces.
     try sess.send(">>");
     waited = 0;
-    while (!grid.contains("    xyz last")) {
+    while (!grid.contains("│   xyz last")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -2031,7 +2041,7 @@ test "vim editing keys: x X D C S r ~ J >>" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(grid.contains("    xyz last"));
+    try std.testing.expect(grid.contains("│   xyz last"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
@@ -2894,6 +2904,118 @@ test "tree-sitter: files over the size limit get no highlight pass" {
     try std.testing.expect(!grid.containsFg("const", packRgb(149, 127, 184)));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "visual: rainbow brackets, indent guides and scope highlight" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}vis.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        // two functions: f (lines 1-4) and h (lines 5-7), both with 4-space
+        // indented bodies, so guides exist both inside and outside the
+        // cursor's scope block no matter where the cursor sits. (A bare
+        // "fn f() {" with no return type parses as one container_field, so
+        // the fn signature carries an explicit `void`.)
+        try f.writeStreamingAll(io,
+            "fn f() void {\n" ++
+                "    if (true) { return; }\n" ++
+                "    g();\n" ++
+                "}\n" ++
+                "fn h() void {\n" ++
+                "    x();\n" ++
+                "}\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // kanagawa-wave literals (src/theme.zig): the rainbow ramp is shared by
+    // all themes. The fixture's outer "(" of "fn f()" sits at bracket depth 3
+    // → rainbow[3] (boatYellow2 0xD19A66). indent[0] = rainbow[0] (0xE06C75);
+    // indent_scope = carpYellow 0xE6C384. Content rows start at grid row 1
+    // (row 0 is the tab bar), so buffer lines 1..7 → grid rows 1..7.
+    const rainbow3 = packRgb(0xD1, 0x9A, 0x66);
+    const indent0 = packRgb(0xE0, 0x6C, 0x75);
+    const indent_scope = packRgb(0xE6, 0xC3, 0x84);
+    const cursorline_bg = packRgb(42, 42, 55);
+
+    // 1. rainbow brackets: the outer "(" of "fn f()" renders with the
+    //    rainbow color of its nesting depth, not the plain punctuation gray.
+    try std.testing.expect(grid.containsFg("(", rainbow3));
+
+    // 2. indent guides: each 4-column indent level draws "│". The cursor
+    //    starts on line 1 (f's function_declaration is the scope, lines 1-4),
+    //    so f's body guides (rows 2-3) are scope-highlighted while h's
+    //    "    x();" (row 6) is out of scope and keeps the plain indent[0].
+    try std.testing.expect(grid.contains("│"));
+    try std.testing.expect(grid.containsFg("│", indent0));
+
+    // 3. scope highlight: in-scope guides use indent_scope (rows 2-3 already,
+    //    even before moving). Then move the cursor into f's body ("j" → the
+    //    "if" line): the fn-body block becomes the scope and the cursor line's
+    //    guide is scope-highlighted (plus a cosmetic underline).
+    try std.testing.expect(grid.containsFg("│", indent_scope));
+    try sess.send("j");
+    waited = 0;
+    while (!grid.rowHasBg(2, cursorline_bg)) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (grid.guideFg(2) != indent_scope) {
+        std.debug.print("after j: guideFg(2)={?} indent_scope={d}\n", .{ grid.guideFg(2), indent_scope });
+        grid.dump();
+    }
+    try std.testing.expectEqual(@as(?u32, indent_scope), grid.guideFg(2));
+
+    // the scope highlight follows the cursor: jump into h's body ("4j" →
+    // line 6). h's guides are now scope-highlighted, and f's (row 2) revert
+    // to the plain indent ramp.
+    try sess.send("4j");
+    waited = 0;
+    while (!grid.rowHasBg(6, cursorline_bg)) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expectEqual(@as(?u32, indent_scope), grid.guideFg(6));
+    try std.testing.expectEqual(@as(?u32, indent0), grid.guideFg(2));
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 

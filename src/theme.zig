@@ -35,6 +35,24 @@ pub const Theme = struct {
     type: Rgb,
     operator: Rgb,
     punctuation: Rgb,
+    // syntax — extended token slots (consumed by Phase 2 highlighting)
+    variable: Rgb, // local variables / plain identifiers (kanagawa: inherits fg)
+    parameter: Rgb, // function parameters
+    property: Rgb, // field access, struct members (kanagawa: Identifier)
+    constant: Rgb, // constants and literal-ish tokens
+    boolean: Rgb, // true/false (kanagawa: links to Constant)
+    character: Rgb, // char literals (kanagawa: links to String)
+    namespace: Rgb, // modules / namespaces
+    constructor: Rgb, // type constructors (kanagawa: special1)
+    builtin: Rgb, // builtin functions / special tokens (kanagawa: special2)
+    attribute: Rgb, // attributes / decorators
+    label: Rgb, // labels / goto targets
+    tag: Rgb, // markup tags / enum variants
+    // rainbow brackets + indent guides (visual enhancements)
+    rainbow: [7]Rgb, // rainbow bracket colors, 7 levels
+    indent: [8]Rgb, // indent guide ramp: [0..6] reuse rainbow, [7] is the dim
+    // loop-back color for level 8+ so deep nesting stays subtle
+    indent_scope: Rgb, // indent guide highlight for the cursor's scope block
     // diagnostics
     diag_error: Rgb,
     diag_warn: Rgb,
@@ -44,6 +62,18 @@ pub const Theme = struct {
 pub fn rgb(r: u8, g: u8, b: u8) Rgb {
     return .{ r, g, b };
 }
+
+/// onedark-style rainbow palette, shared by every theme (matches the user's
+/// nvim rainbow brackets defined in themes.lua).
+const onedark_rainbow = [7]Rgb{
+    rgb(0xE0, 0x6C, 0x75), // red
+    rgb(0xE5, 0xC0, 0x7B), // yellow
+    rgb(0x61, 0xAF, 0xEF), // blue
+    rgb(0xD1, 0x9A, 0x66), // orange
+    rgb(0x98, 0xC3, 0x79), // green
+    rgb(0xC6, 0x78, 0xDD), // purple
+    rgb(0x56, 0xB6, 0xC2), // cyan
+};
 
 /// kanagawa-wave — the user's nvim colorscheme.
 const kanagawa_wave = Theme{
@@ -64,9 +94,30 @@ const kanagawa_wave = Theme{
     .string = rgb(0x98, 0xBB, 0x6C), // springGreen
     .number = rgb(0xD2, 0x7E, 0x99), // sakuraPink
     .function = rgb(0x7E, 0x9C, 0xD8), // crystalBlue
-    .type = rgb(0x7F, 0xB4, 0xCA), // springBlue
-    .operator = rgb(0xC8, 0xC0, 0x93), // oldWhite
-    .punctuation = rgb(0x93, 0x8A, 0xA9), // springViolet1
+    .type = rgb(0x7A, 0xA8, 0x9F), // waveAqua2
+    .operator = rgb(0xC0, 0xA3, 0x6E), // boatYellow2
+    .punctuation = rgb(0x9C, 0xAB, 0xCA), // springViolet2
+    .variable = rgb(0xDC, 0xD7, 0xBA), // fujiWhite (Variable = none → fg)
+    .parameter = rgb(0xB8, 0xB4, 0xD0), // oniViolet2
+    .property = rgb(0xE6, 0xC3, 0x84), // carpYellow (Identifier)
+    .constant = rgb(0xFF, 0xA0, 0x66), // surimiOrange
+    .boolean = rgb(0xFF, 0xA0, 0x66), // surimiOrange (links to Constant)
+    .character = rgb(0x98, 0xBB, 0x6C), // springGreen (links to String)
+    .namespace = rgb(0x7F, 0xB4, 0xCA), // springBlue
+    .constructor = rgb(0x7F, 0xB4, 0xCA), // springBlue (special1)
+    .builtin = rgb(0xE4, 0x68, 0x76), // waveRed (special2)
+    .attribute = rgb(0xFF, 0xA0, 0x66), // surimiOrange (links to Constant)
+    .label = rgb(0x7F, 0xB4, 0xCA), // springBlue (special1)
+    .tag = rgb(0x7F, 0xB4, 0xCA), // springBlue
+    .rainbow = onedark_rainbow,
+    // indent[0..6] = rainbow ramp; indent[7] = fg_dim (fujiGray) loop-back
+    .indent = .{
+        onedark_rainbow[0], onedark_rainbow[1], onedark_rainbow[2], onedark_rainbow[3],
+        onedark_rainbow[4], onedark_rainbow[5], onedark_rainbow[6], rgb(0x72, 0x71, 0x69),
+    },
+    // carpYellow so the active block pops against the muted ramp
+    // (springBlue #7FB4CA is the calmer alternative)
+    .indent_scope = rgb(0xE6, 0xC3, 0x84), // carpYellow
     .diag_error = rgb(0xE8, 0x24, 0x24), // samuraiRed
     .diag_warn = rgb(0xFF, 0x9E, 0x3B), // roninYellow
     .diag_info = rgb(0x65, 0x85, 0x94), // dragonBlue
@@ -94,6 +145,25 @@ const catppuccin_macchiato = Theme{
     .type = rgb(0x8B, 0xD5, 0xCA), // teal
     .operator = rgb(0xCA, 0xD3, 0xF5), // text
     .punctuation = rgb(0xB7, 0xBD, 0xDF), // subtext1
+    .variable = rgb(0xCA, 0xD3, 0xF5), // text
+    .parameter = rgb(0xBA, 0xBB, 0xF1), // lavender
+    .property = rgb(0x8A, 0xAD, 0xF4), // blue
+    .constant = rgb(0xF5, 0xA9, 0x7F), // peach
+    .boolean = rgb(0xF5, 0xA9, 0x7F), // peach
+    .character = rgb(0xA6, 0xDA, 0x95), // green
+    .namespace = rgb(0x8A, 0xAD, 0xF4), // blue
+    .constructor = rgb(0x8A, 0xAD, 0xF4), // blue
+    .builtin = rgb(0xED, 0x87, 0x96), // red
+    .attribute = rgb(0xF5, 0xA9, 0x7F), // peach
+    .label = rgb(0x8B, 0xD5, 0xCA), // teal
+    .tag = rgb(0x8A, 0xAD, 0xF4), // blue
+    .rainbow = onedark_rainbow,
+    // indent[0..6] = rainbow ramp; indent[7] = overlay0 loop-back
+    .indent = .{
+        onedark_rainbow[0], onedark_rainbow[1], onedark_rainbow[2], onedark_rainbow[3],
+        onedark_rainbow[4], onedark_rainbow[5], onedark_rainbow[6], rgb(0x6C, 0x70, 0x86),
+    },
+    .indent_scope = rgb(0xF5, 0xA9, 0x7F), // peach
     .diag_error = rgb(0xED, 0x87, 0x96), // red
     .diag_warn = rgb(0xEE, 0xDA, 0x9F), // yellow
     .diag_info = rgb(0x8A, 0xAD, 0xF4), // blue
@@ -121,6 +191,25 @@ const tokyonight_moon = Theme{
     .type = rgb(0x2A, 0xC3, 0xDE), // cyan
     .operator = rgb(0xC8, 0xD3, 0xF5), // fg
     .punctuation = rgb(0x89, 0x9A, 0xCC), // fg_dark
+    .variable = rgb(0xC8, 0xD3, 0xF5), // fg
+    .parameter = rgb(0xB4, 0xC2, 0xF0), // slightly brighter than fg
+    .property = rgb(0x82, 0xAA, 0xFF), // blue
+    .constant = rgb(0xE0, 0xAF, 0x68), // orange
+    .boolean = rgb(0xE0, 0xAF, 0x68), // orange
+    .character = rgb(0x9D, 0xCD, 0x5F), // green
+    .namespace = rgb(0x82, 0xAA, 0xFF), // blue
+    .constructor = rgb(0x82, 0xAA, 0xFF), // blue
+    .builtin = rgb(0xDB, 0x4B, 0x4B), // red
+    .attribute = rgb(0xE0, 0xAF, 0x68), // orange
+    .label = rgb(0x2A, 0xC3, 0xDE), // cyan
+    .tag = rgb(0x82, 0xAA, 0xFF), // blue
+    .rainbow = onedark_rainbow,
+    // indent[0..6] = rainbow ramp; indent[7] = comment loop-back
+    .indent = .{
+        onedark_rainbow[0], onedark_rainbow[1], onedark_rainbow[2], onedark_rainbow[3],
+        onedark_rainbow[4], onedark_rainbow[5], onedark_rainbow[6], rgb(0x82, 0x8B, 0xB8),
+    },
+    .indent_scope = rgb(0xE0, 0xAF, 0x68), // orange
     .diag_error = rgb(0xDB, 0x4B, 0x4B), // red
     .diag_warn = rgb(0xE0, 0xAF, 0x68), // orange
     .diag_info = rgb(0x82, 0xAA, 0xFF), // blue
