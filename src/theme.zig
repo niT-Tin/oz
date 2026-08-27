@@ -52,7 +52,6 @@ pub const Theme = struct {
     rainbow: [7]Rgb, // rainbow bracket colors, 7 levels
     indent: [8]Rgb, // indent guide ramp: [0..6] reuse rainbow, [7] is the dim
     // loop-back color for level 8+ so deep nesting stays subtle
-    indent_scope: Rgb, // indent guide highlight for the cursor's scope block
     // diagnostics
     diag_error: Rgb,
     diag_warn: Rgb,
@@ -115,9 +114,6 @@ const kanagawa_wave = Theme{
         onedark_rainbow[0], onedark_rainbow[1], onedark_rainbow[2], onedark_rainbow[3],
         onedark_rainbow[4], onedark_rainbow[5], onedark_rainbow[6], rgb(0x72, 0x71, 0x69),
     },
-    // carpYellow so the active block pops against the muted ramp
-    // (springBlue #7FB4CA is the calmer alternative)
-    .indent_scope = rgb(0xE6, 0xC3, 0x84), // carpYellow
     .diag_error = rgb(0xE8, 0x24, 0x24), // samuraiRed
     .diag_warn = rgb(0xFF, 0x9E, 0x3B), // roninYellow
     .diag_info = rgb(0x65, 0x85, 0x94), // dragonBlue
@@ -163,7 +159,6 @@ const catppuccin_macchiato = Theme{
         onedark_rainbow[0], onedark_rainbow[1], onedark_rainbow[2], onedark_rainbow[3],
         onedark_rainbow[4], onedark_rainbow[5], onedark_rainbow[6], rgb(0x6C, 0x70, 0x86),
     },
-    .indent_scope = rgb(0xF5, 0xA9, 0x7F), // peach
     .diag_error = rgb(0xED, 0x87, 0x96), // red
     .diag_warn = rgb(0xEE, 0xDA, 0x9F), // yellow
     .diag_info = rgb(0x8A, 0xAD, 0xF4), // blue
@@ -209,7 +204,6 @@ const tokyonight_moon = Theme{
         onedark_rainbow[0], onedark_rainbow[1], onedark_rainbow[2], onedark_rainbow[3],
         onedark_rainbow[4], onedark_rainbow[5], onedark_rainbow[6], rgb(0x82, 0x8B, 0xB8),
     },
-    .indent_scope = rgb(0xE0, 0xAF, 0x68), // orange
     .diag_error = rgb(0xDB, 0x4B, 0x4B), // red
     .diag_warn = rgb(0xE0, 0xAF, 0x68), // orange
     .diag_info = rgb(0x82, 0xAA, 0xFF), // blue

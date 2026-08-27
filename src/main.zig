@@ -37,6 +37,19 @@ const NavAction = enum { none, hover, definition, declaration, references, imple
 /// An inlay hint: dim label shown inline at (line, character).
 const InlayHint = struct { line: u32, character: u32, label: []const u8 };
 
+/// Outward scope-highlight animation (snacks.indent.animate style "out"):
+/// when the focused window's scope block changes, the highlight spreads from
+/// the cursor line to the scope edges over `duration_ms` (linear, ~500ms —
+/// "slow but not too slow"). The run loop polls while active so the spread
+/// advances frame by frame without keypresses.
+const ScopeAnim = struct {
+    start_line: u32,
+    end_line: u32,
+    cursor_line: u32,
+    start_ms: i128, // monotonic clock, ms
+    const duration_ms: i128 = 500;
+};
+
 const App = struct {
     /// One open document. `pt`/`history` own their allocations; the struct is
     /// moved between the list and the active slots (never copied-and-deinit'd).
@@ -240,6 +253,9 @@ const App = struct {
     /// Auto-requested for the visible range whenever the view scrolls.
     inlay_hints: std.ArrayList(InlayHint) = .empty,
     inlay_view_top: ?u32 = null,
+    /// Scope-highlight animation state (null when idle / no scope). Restarted
+    /// whenever the focused window's scope block changes; see ScopeAnim.
+    scope_anim: ?ScopeAnim = null,
     /// Set when the inlay data no longer matches the document (after an
     /// insert session ends) until a fresh response arrives: renderers hide
     /// stale hints instead of drawing them at shifted, wrong columns, and
@@ -5167,10 +5183,9 @@ const App = struct {
 
         // scope highlight (nvim snacks.indent.scope): the byte range of the
         // block containing this window's cursor, converted to a line range.
-        // Indent guides on those lines render with indent_scope instead of the
-        // level ramp. Skipped when the buffer has no highlighter (no grammar
-        // for the filetype / over the size limit) — scopeAt also returns null
-        // for empty files and before the first parse.
+        // Skipped when the buffer has no highlighter (no grammar for the
+        // filetype / over the size limit) — scopeAt also returns null for
+        // empty files, top-level code and before the first parse.
         var scope_start_line: u32 = 0;
         var scope_end_line: u32 = 0;
         var has_scope = false;
@@ -5182,6 +5197,41 @@ const App = struct {
                 // either clamp would work; -| guards the empty edge case)
                 scope_end_line = buf.pt.lineOf(sc.end_byte -| 1);
                 has_scope = true;
+            }
+        }
+        // ---- scope highlight animation (snacks.indent.animate "out") ----
+        // The focused window's guides spread from the cursor line to the
+        // scope edges over ~500ms whenever the scope block changes; the run
+        // loop polls while animating so the frame advances on its own.
+        // Non-focused windows get the full scope immediately (no animation).
+        var anim_from: u32 = 0;
+        var anim_to: u32 = 0;
+        var scope_animating = false;
+        if (is_focused) {
+            if (!has_scope) {
+                self.scope_anim = null;
+            } else {
+                const now = @divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms);
+                if (self.scope_anim) |*anim| {
+                    if (anim.start_line != scope_start_line or anim.end_line != scope_end_line) {
+                        anim.* = .{ .start_line = scope_start_line, .end_line = scope_end_line, .cursor_line = cursor_line, .start_ms = now };
+                    }
+                } else {
+                    self.scope_anim = .{ .start_line = scope_start_line, .end_line = scope_end_line, .cursor_line = cursor_line, .start_ms = now };
+                }
+                const anim = &self.scope_anim.?;
+                const elapsed = now - anim.start_ms;
+                if (elapsed >= ScopeAnim.duration_ms) {
+                    anim_from = scope_start_line;
+                    anim_to = scope_end_line;
+                } else {
+                    scope_animating = true;
+                    const p: f64 = @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(ScopeAnim.duration_ms));
+                    const up: u32 = @intFromFloat(p * @as(f64, @floatFromInt(anim.cursor_line -| anim.start_line)));
+                    const down: u32 = @intFromFloat(p * @as(f64, @floatFromInt(anim.end_line -| anim.cursor_line)));
+                    anim_from = anim.cursor_line -| up;
+                    anim_to = anim.cursor_line + down;
+                }
             }
         }
 
@@ -5304,18 +5354,27 @@ const App = struct {
             else
                 try self.lineHints(a, line);
             var hint_i: usize = 0;
+            // scope membership for this line: focused windows use the
+            // animation spread range, others the full scope
+            const in_scope = if (is_focused)
+                has_scope and line >= anim_from and line <= anim_to
+            else
+                has_scope and line >= scope_start_line and line <= scope_end_line;
 
             // ---- indent guides (nvim snacks.indent) ----
             // The line's leading whitespace renders as one "│" (U+2502) per
-            // 4-column indent level (tab_width), colored indent[level % 8]; the
-            // cursor's scope block (snacks.indent.scope) switches those guides
-            // to indent_scope, and the cursor line additionally underlines
-            // them. A "│" occupies exactly one cell, so the region keeps the
-            // expanded width of the whitespace it replaces (tab = tab_width
-            // cells) — byte columns, cursor placement, selection bounds and
-            // every existing row/column assertion stay unchanged. Empty lines
-            // and indent < 4 columns ("不足 4 列的部分") draw nothing (the
-            // spaces still render, just as spaces).
+            // 4-column indent level (tab_width). Guides outside the cursor's
+            // scope block are dim gray (snacks links SnacksIndent to NonText);
+            // inside the scope they take the rainbow indent[level % 8] ramp
+            // (snacks' SnacksIndent1..8) — with the outwards spread animation
+            // filling the scope from the cursor line. The scope's FIRST line
+            // (its declaration/opening line) gets an underline in the text
+            // (snacks.indent.scope underline). A "│" occupies exactly one
+            // cell, so the region keeps the expanded width of the whitespace
+            // it replaces (tab = tab_width cells) — byte columns, cursor
+            // placement, selection bounds and every existing row/column
+            // assertion stay unchanged. Empty lines and indent < 4 columns
+            // ("不足 4 列的部分") draw nothing (the spaces still render).
             var indent_end: u32 = 0;
             while (indent_end < n and (text[indent_end] == ' ' or text[indent_end] == '\t')) indent_end += 1;
             if (indent_end > 0) {
@@ -5338,7 +5397,6 @@ const App = struct {
                     }
                     hint_i += 1;
                 }
-                const in_scope = has_scope and line >= scope_start_line and line <= scope_end_line;
                 var gcol: u32 = 0; // expanded column of the current indent cell
                 ib = 0;
                 while (ib < indent_end) : (ib += 1) {
@@ -5351,16 +5409,7 @@ const App = struct {
                         if (is_cur_line) gstyle.bg = .{ .rgb = self.theme.bg_curline };
                         if (ib >= sel_s and ib < sel_e) gstyle.bg = .{ .rgb = self.theme.bg_sel };
                         if (is_guide) {
-                            gstyle.fg = .{ .rgb = if (in_scope) self.theme.indent_scope else self.theme.indent[level % 8] };
-                            // vaxis has no plain `.underline` field — underline
-                            // lives in ul + ul_style; the cursor line's guides
-                            // get a single underline (snacks.indent.scope's
-                            // cursor-line emphasis). The e2e grid parses SGR
-                            // colors only, so this is cosmetic, never asserted.
-                            if (is_cur_line) {
-                                gstyle.ul = .{ .rgb = self.theme.indent_scope };
-                                gstyle.ul_style = .single;
-                            }
+                            gstyle.fg = .{ .rgb = if (in_scope) self.theme.indent[level % 8] else self.theme.fg_dim };
                             try segs.append(a, .{ .text = "│", .style = gstyle });
                         } else {
                             try segs.append(a, .{ .text = " ", .style = gstyle });
@@ -5413,6 +5462,15 @@ const App = struct {
                     style.fg = f.fg;
                     style.bold = f.bold;
                     style.italic = f.italic;
+                }
+                // snacks.indent.scope underline: the scope's FIRST line (its
+                // declaration/opening line) is underlined from the text start
+                // to end of line, once the animation spread has covered it
+                // (snacks draws it when scope.from == from). The e2e grid
+                // parses SGR colors only, so this is cosmetic, never asserted.
+                if (is_focused and in_scope and line == scope_start_line and anim_from <= scope_start_line) {
+                    style.ul = .{ .rgb = self.theme.indent[0] };
+                    style.ul_style = .single;
                 }
                 const seg_text = text[col..next];
                 if (std.mem.indexOfScalar(u8, seg_text, '\t') != null) {
@@ -6171,6 +6229,15 @@ const App = struct {
         try self.vx.render(self.tty.writer());
     }
 
+    /// True while the scope highlight animation is still spreading: the run
+    /// loop then polls instead of blocking in pollEvent, so the spread
+    /// advances frame by frame without keypresses.
+    fn scopeAnimActive(self: *App) bool {
+        const a = self.scope_anim orelse return false;
+        const now = @divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms);
+        return now - a.start_ms < ScopeAnim.duration_ms;
+    }
+
     fn run(self: *App) !void {
         try self.vx.enterAltScreen(self.tty.writer());
         try self.loop.start();
@@ -6214,8 +6281,14 @@ const App = struct {
             }
             // poll + drain: block until an event arrives (keypress OR an
             // LSP wake posted by the reader thread), then handle the whole
-            // batch and render once.
-            try self.loop.pollEvent();
+            // batch and render once. While the scope highlight is animating,
+            // poll instead of blocking so the spread advances frame by frame
+            // without keypresses (16ms ≈ 60fps; vaxis diffs the output).
+            if (self.scopeAnimActive()) {
+                std.Io.sleep(self.io, .fromMilliseconds(16), .real) catch {};
+            } else {
+                try self.loop.pollEvent();
+            }
             while (try self.loop.tryEvent()) |event| {
                 switch (event) {
                     .key_press => |key| try self.handleKey(key),

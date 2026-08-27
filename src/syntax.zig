@@ -473,18 +473,22 @@ pub const Highlighter = struct {
         return a.start < b.start;
     }
 
-    /// Deepest "code block" node containing `byte`, as a byte range. Starts at
-    /// the root (the whole file — the fallback scope) and drills down: while
-    /// the child containing `byte` is a block-like node, record it as the
-    /// current scope and descend into it. Stops when no child contains `byte`
-    /// or the containing child is not block-like. Cost is O(tree depth ×
-    /// children per level) — never O(file). Returns null only when there is no
-    /// tree or the file is empty; otherwise the root range is the floor.
+    /// Deepest multi-line "code block" node containing `byte`, as a byte
+    /// range. Starts at the root and drills down: while the child containing
+    /// `byte` is a block-like node that spans more than one line, record it
+    /// as the current scope and descend into it. Stops when no child
+    /// contains `byte`, the containing child is not block-like, or it is a
+    /// single-line node (variable_declaration, expression_statement, … —
+    /// those are not blocks, and highlighting one line reads as noise).
+    /// Returns null when there is no tree, the file is empty, or the cursor
+    /// sits in top-level code with no enclosing block. Cost is O(tree depth
+    /// × children per level) — never O(file).
     pub fn scopeAt(self: *Highlighter, byte: u32) ?Scope {
         const tree = self.tree orelse return null;
+        const text = self.prev_text orelse return null;
         const root = tree.getRootNode();
         if (root.getEndByte() == 0) return null; // empty file
-        var scope = root;
+        var scope: ?treez.Node = null;
         var current = root;
         while (true) {
             // find the child containing `byte` (siblings never overlap, so at
@@ -501,10 +505,14 @@ pub const Highlighter = struct {
             }
             const child = next orelse break;
             if (!isBlockNode(child)) break;
+            const cs = child.getStartByte();
+            const ce = child.getEndByte();
+            if (ce > cs and ce <= text.len and std.mem.indexOfScalar(u8, text[cs..ce], '\n') == null) break;
             scope = child;
             current = child;
         }
-        return .{ .start_byte = scope.getStartByte(), .end_byte = scope.getEndByte() };
+        const s = scope orelse return null;
+        return .{ .start_byte = s.getStartByte(), .end_byte = s.getEndByte() };
     }
 };
 
@@ -605,31 +613,32 @@ test "highlight: rainbow brackets — inner brackets have a deeper style than ou
     try std.testing.expectEqual(Style.punctuation, spanAt(spans.items, @intCast(semi)).?);
 }
 
-test "scopeAt: cursor in fn body returns the const-decl scope; block end covers fn brace" {
+test "scopeAt: cursor in fn body returns the fn-body block, not the one-line const" {
     const alloc = std.testing.allocator;
     const src = "pub fn main() void {\n    const x = 1;\n}\n";
     var hl = try Highlighter.init(alloc, "zig");
     defer hl.deinit();
     try hl.reparse(src);
 
-    // cursor on "const x = 1;" (line 2) → deepest block-like scope is the
-    // variable_declaration: it must contain the cursor...
+    // cursor on "const x = 1;" (line 2): the variable_declaration is a
+    // one-line node, so it is NOT a scope — the deepest multi-line block is
+    // the fn body "block" whose byte range covers "{\n    const x = 1;\n}".
     const cur = std.mem.indexOf(u8, src, "const x").?;
     const scope = hl.scopeAt(@intCast(cur)).?;
     try std.testing.expect(scope.start_byte <= cur and cur < scope.end_byte);
-    // ...and it is exactly the const statement's byte range
-    try std.testing.expectEqualStrings("const x = 1;", src[scope.start_byte..scope.end_byte]);
-
-    // cursor on the newline right after the statement (no deeper block there)
-    // → the fn-body block scope, whose end covers the closing brace "}"
+    const fn_lbrace = std.mem.indexOf(u8, src, "{").?;
     const fn_rbrace = std.mem.indexOf(u8, src, "}").?;
+    try std.testing.expectEqual(@as(u32, @intCast(fn_lbrace)), scope.start_byte);
+    try std.testing.expect(scope.end_byte > fn_rbrace); // covers the closing brace
+
+    // cursor on the newline right after the statement → same fn-body scope
     const after_statement = std.mem.indexOf(u8, src, ";\n").? + 1; // the "\n" after ";"
     const scope2 = hl.scopeAt(@intCast(after_statement)).?;
     try std.testing.expect(scope2.start_byte <= after_statement and after_statement < scope2.end_byte);
     try std.testing.expect(scope2.end_byte > fn_rbrace); // covers the closing brace
 }
 
-test "scopeAt: root fallback, empty file, and no-tree cases" {
+test "scopeAt: empty/no-tree and top-level code return null, fn returns its block" {
     const alloc = std.testing.allocator;
     var hl = try Highlighter.init(alloc, "zig");
     defer hl.deinit();
@@ -641,18 +650,23 @@ test "scopeAt: root fallback, empty file, and no-tree cases" {
     try hl.reparse("");
     try std.testing.expect(hl.scopeAt(0) == null);
 
-    // a file whose first child is not block-like (a comment) → root fallback:
-    // the whole file range
-    const src = "// hello\nconst x = 1;\n";
+    // one-line declarations (even in a multi-line file) are not scopes:
+    // top-level code has no enclosing block → null (no highlight, plain
+    // gray guides — the desired top-level look)
+    const src = "// hello\nconst x = 1;\nconst y = 2;\n";
     try hl.reparse(src);
-    const scope = hl.scopeAt(0).?;
-    try std.testing.expect(scope.start_byte == 0 and scope.end_byte == src.len);
+    try std.testing.expect(hl.scopeAt(0) == null);
+    const x_cur = std.mem.indexOf(u8, src, "const x").?;
+    try std.testing.expect(hl.scopeAt(@intCast(x_cur)) == null);
 
-    // a file starting with a const declaration → the const-decl scope
-    const src2 = "const std = @import(\"std\");\n";
+    // a multi-line function is a scope from its declaration line: cursor on
+    // the "fn" keyword still lands in the function_declaration
+    const src2 = "pub fn main() void {\n    const x = 1;\n}\n";
     try hl.reparse(src2);
-    const scope2 = hl.scopeAt(0).?;
-    try std.testing.expectEqualStrings("const std = @import(\"std\");", src2[scope2.start_byte..scope2.end_byte]);
+    const fn_scope = hl.scopeAt(0).?;
+    try std.testing.expect(fn_scope.start_byte == 0);
+    const src2_rbrace = std.mem.indexOf(u8, src2, "}").?;
+    try std.testing.expect(fn_scope.end_byte > src2_rbrace); // covers the closing brace
 }
 
 test "languageFor: filetype to grammar" {
