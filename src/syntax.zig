@@ -66,10 +66,14 @@ pub const Span = struct {
 /// A byte range identifying a "code block" scope for cursor-aware features
 /// (e.g. scope highlighting). `end_byte` is exclusive (tree-sitter
 /// convention) — the closing token occupies [end_byte - 1, end_byte); the
-/// caller converts both ends to line numbers as needed.
+/// caller converts both ends to line numbers as needed. `indent_col` is the
+/// expanded indent column of the scope's STARTING line (tabs count as
+/// tab_width = 4) — the single column where the scope's highlight line is
+/// drawn (snacks.indent: `col = indent - leftcol`).
 pub const Scope = struct {
     start_byte: u32,
     end_byte: u32, // exclusive
+    indent_col: u32,
 };
 
 /// A raw byte interval (ERROR-node coverage).
@@ -512,7 +516,11 @@ pub const Highlighter = struct {
             current = child;
         }
         const s = scope orelse return null;
-        return .{ .start_byte = s.getStartByte(), .end_byte = s.getEndByte() };
+        return .{
+            .start_byte = s.getStartByte(),
+            .end_byte = s.getEndByte(),
+            .indent_col = lineIndentCol(text, s.getStartByte()),
+        };
     }
 };
 
@@ -529,6 +537,21 @@ fn isBlockNode(node: treez.Node) bool {
         if (std.mem.indexOf(u8, ty, nd) != null) return true;
     }
     return false;
+}
+
+/// Expanded indent column (spaces, tabs = 4 columns) of the line containing
+/// `byte` — the column where that line's block's scope line is drawn
+/// (snacks.indent renders the scope guide at `scope.indent`).
+fn lineIndentCol(text: []const u8, byte: u32) u32 {
+    const b = @min(byte, @as(u32, @intCast(text.len)));
+    var ls = b;
+    while (ls > 0 and text[ls - 1] != '\n') ls -= 1;
+    var col: u32 = 0;
+    var i = ls;
+    while (i < text.len and (text[i] == ' ' or text[i] == '\t')) : (i += 1) {
+        col += if (text[i] == '\t') 4 else 1;
+    }
+    return col;
 }
 
 // ---------------------------------------------------------------------------

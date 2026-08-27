@@ -491,6 +491,24 @@ const Grid = struct {
         return self.fg_buf[row * self.cols + idx];
     }
 
+    /// packed fg of the `n`-th "│" (indent guide, 0-based) on row `row`, or
+    /// null when the row has fewer guides — distinguishes the scope's own
+    /// guide column from outer levels' guides on the same line. Scans the
+    /// per-cell slots directly so the "│" (3 UTF-8 bytes) is matched per
+    /// cell and the cell index IS the column.
+    fn guideFgAt(self: *Grid, row: usize, n: usize) ?u32 {
+        var seen: usize = 0;
+        var c: usize = 0;
+        while (c < self.cols) : (c += 1) {
+            const slot = self.buf[(row * self.cols + c) * 4 ..][0..4];
+            if (std.mem.startsWith(u8, slot, "│")) {
+                if (seen == n) return self.fg_buf[row * self.cols + c];
+                seen += 1;
+            }
+        }
+        return null;
+    }
+
     /// Text of one row, compressed from the per-cell slots (each UTF-8 char
     /// occupies one slot; the slot's bytes up to the first NUL form the char).
     fn rowText(self: *Grid, r: usize) []const u8 {
@@ -2918,14 +2936,16 @@ test "visual: rainbow brackets, indent guides and scope highlight" {
     {
         const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
         defer f.close(io);
-        // two functions: f (lines 1-4) and h (lines 5-7), both with 4-space
-        // indented bodies, so guides exist both inside and outside the
-        // cursor's scope block no matter where the cursor sits. (A bare
-        // "fn f() {" with no return type parses as one container_field, so
-        // the fn signature carries an explicit `void`.)
+        // fn f (lines 1-6) with a NESTED if-block (lines 2-4) so entering the
+        // inner scope must turn the outer scope's guide line gray again; fn h
+        // (lines 7-9) provides out-of-scope guides. (A bare "fn f() {" with no
+        // return type parses as one container_field, so the fn signature
+        // carries an explicit `void`.)
         try f.writeStreamingAll(io,
             "fn f() void {\n" ++
-                "    if (true) { return; }\n" ++
+                "    if (x) {\n" ++
+                "        y();\n" ++
+                "    }\n" ++
                 "    g();\n" ++
                 "}\n" ++
                 "fn h() void {\n" ++
@@ -2956,11 +2976,13 @@ test "visual: rainbow brackets, indent guides and scope highlight" {
     // all themes. The fixture's outer "(" of "fn f()" sits at bracket depth 3
     // → rainbow[3] (boatYellow2 0xD19A66). Guides outside the cursor's scope
     // are dim gray (fg_dim 0x727169 — snacks links SnacksIndent to NonText);
-    // in-scope guides take the indent ramp by level — the first guide column
-    // is level 0 → indent[0] (0xE06C75). Content rows start at grid row 1
-    // (row 0 is the tab bar), so buffer lines 1..7 → grid rows 1..7.
+    // ONLY the scope's own guide column takes the indent ramp: fn-level
+    // scope indent_col=0 → level 0 → indent[0] (0xE06C75); if-level scope
+    // indent_col=4 → level 1 → indent[1] (0xE5C07B). Content rows start at
+    // grid row 1 (row 0 is the tab bar), so buffer lines 1..9 → rows 1..9.
     const rainbow3 = packRgb(0xD1, 0x9A, 0x66);
     const indent0 = packRgb(0xE0, 0x6C, 0x75);
+    const indent1 = packRgb(0xE5, 0xC0, 0x7B);
     const guide_gray = packRgb(0x72, 0x71, 0x69);
     const cursorline_bg = packRgb(42, 42, 55);
 
@@ -2968,13 +2990,13 @@ test "visual: rainbow brackets, indent guides and scope highlight" {
     //    rainbow color of its nesting depth, not the plain punctuation gray.
     try std.testing.expect(grid.containsFg("(", rainbow3));
 
-    // 2. scope highlight with the "out" animation: the cursor starts on
-    //    line 1 (fn f's declaration — f is the scope, lines 1-4) and the
-    //    spread fills the scope from the cursor line over ~500ms. Wait for
-    //    f's body guides (row 2) to reach the highlighted indent[0]; h's
-    //    body (row 6) is outside the scope and stays dim gray throughout.
+    // 2. cursor on line 1 (fn f's declaration — f is the scope, lines 1-6,
+    //    indent_col=0). Wait for the "out" spread (~500ms) to fill the scope,
+    //    then: row 3 ("        y();", two guide columns) has its column-0
+    //    guide highlighted (the fn scope's line) while the column-4 guide
+    //    stays gray (not the scope's column); h's body (row 8) stays gray.
     waited = 0;
-    while (grid.guideFg(2) != indent0) {
+    while (grid.guideFgAt(3, 0) != indent0) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n > 0) {
             sess.used += n;
@@ -2984,22 +3006,22 @@ test "visual: rainbow brackets, indent guides and scope highlight" {
             if (waited >= 4000) break;
         }
     }
-    if (grid.guideFg(2) != indent0) {
-        std.debug.print("scope guide never reached indent0: guideFg(2)={?}\n", .{ grid.guideFg(2) });
+    if (grid.guideFgAt(3, 0) != indent0) {
+        std.debug.print("fn scope guide never reached indent0: row3 col0={?}\n", .{ grid.guideFgAt(3, 0) });
         grid.dump();
     }
-    try std.testing.expectEqual(@as(?u32, indent0), grid.guideFg(2));
-    try std.testing.expectEqual(@as(?u32, guide_gray), grid.guideFg(6));
+    try std.testing.expectEqual(@as(?u32, indent0), grid.guideFgAt(3, 0));
+    try std.testing.expectEqual(@as(?u32, guide_gray), grid.guideFgAt(3, 1));
+    try std.testing.expectEqual(@as(?u32, guide_gray), grid.guideFgAt(8, 0));
 
-    // 3. the highlight follows the cursor: jump into h ("5j" → line 6, the
-    //    first body line). h becomes the scope (lines 5-7); after the spread
-    //    completes h's guides are highlighted and f's revert to dim gray.
-    //    (The scope first line's underline — snacks.indent.scope underline —
-    //    is SGR underline, which the e2e grid does not parse, so it is not
-    //    asserted here.)
-    try sess.send("5j");
+    // 3. enter the nested if-block ("2j" → line 3, "        y();"). The if
+    //    body becomes the scope (lines 2-4, indent_col=4): after the spread,
+    //    the column-4 guide is highlighted (indent[1]) and the column-0
+    //    guide — the OUTER fn scope's line — reverts to gray. Only the
+    //    nearest scope stays lit.
+    try sess.send("2j");
     waited = 0;
-    while (!grid.rowHasBg(6, cursorline_bg)) {
+    while (!grid.rowHasBg(3, cursorline_bg)) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -3010,7 +3032,7 @@ test "visual: rainbow brackets, indent guides and scope highlight" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     waited = 0;
-    while (grid.guideFg(6) != indent0) {
+    while (grid.guideFgAt(3, 1) != indent1) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n > 0) {
             sess.used += n;
@@ -3020,12 +3042,49 @@ test "visual: rainbow brackets, indent guides and scope highlight" {
             if (waited >= 4000) break;
         }
     }
-    if (grid.guideFg(6) != indent0) {
-        std.debug.print("after 5j: guideFg(6)={?} expected {d}\n", .{ grid.guideFg(6), indent0 });
+    if (grid.guideFgAt(3, 1) != indent1 or grid.guideFgAt(3, 0) != guide_gray) {
+        std.debug.print("nested scope: row3 col0={?} col1={?}\n", .{ grid.guideFgAt(3, 0), grid.guideFgAt(3, 1) });
         grid.dump();
     }
-    try std.testing.expectEqual(@as(?u32, indent0), grid.guideFg(6));
-    try std.testing.expectEqual(@as(?u32, guide_gray), grid.guideFg(2));
+    try std.testing.expectEqual(@as(?u32, indent1), grid.guideFgAt(3, 1));
+    try std.testing.expectEqual(@as(?u32, guide_gray), grid.guideFgAt(3, 0));
+
+    // 4. leave the nested block ("2j" → line 5, "    g();" — fn body, no
+    //    enclosing if): the fn body block is the scope again; row 3's
+    //    column-0 guide relights and column-4 stays gray.
+    try sess.send("2j");
+    waited = 0;
+    while (!grid.rowHasBg(5, cursorline_bg)) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    waited = 0;
+    while (grid.guideFgAt(3, 0) != indent0) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n > 0) {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        } else {
+            waited += 200;
+            if (waited >= 4000) break;
+        }
+    }
+    if (grid.guideFgAt(3, 0) != indent0) {
+        std.debug.print("after leaving nested: row3 col0={?}\n", .{ grid.guideFgAt(3, 0) });
+        grid.dump();
+    }
+    try std.testing.expectEqual(@as(?u32, indent0), grid.guideFgAt(3, 0));
+    try std.testing.expectEqual(@as(?u32, guide_gray), grid.guideFgAt(3, 1));
+
+    // (The scope first line's underline — snacks.indent.scope underline — is
+    // SGR underline, which the e2e grid does not parse, so it is not
+    // asserted here.)
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});

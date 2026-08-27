@@ -5188,6 +5188,7 @@ const App = struct {
         // empty files, top-level code and before the first parse.
         var scope_start_line: u32 = 0;
         var scope_end_line: u32 = 0;
+        var scope_indent_col: u32 = 0;
         var has_scope = false;
         if (buf.hl) |*hl| {
             if (hl.scopeAt(w.cursor)) |sc| {
@@ -5196,6 +5197,10 @@ const App = struct {
                 // end_byte - 1 (lineOf maps pos == len to the last line, so
                 // either clamp would work; -| guards the empty edge case)
                 scope_end_line = buf.pt.lineOf(sc.end_byte -| 1);
+                // the scope's own guide column: the expanded indent of its
+                // starting line (snacks.indent renders the scope line at
+                // `scope.indent`)
+                scope_indent_col = sc.indent_col;
                 has_scope = true;
             }
         }
@@ -5409,7 +5414,15 @@ const App = struct {
                         if (is_cur_line) gstyle.bg = .{ .rgb = self.theme.bg_curline };
                         if (ib >= sel_s and ib < sel_e) gstyle.bg = .{ .rgb = self.theme.bg_sel };
                         if (is_guide) {
-                            gstyle.fg = .{ .rgb = if (in_scope) self.theme.indent[level % 8] else self.theme.fg_dim };
+                            // Only the scope's OWN guide column (its starting
+                            // line's indent, snacks: `i > indent` rows) is
+                            // highlighted; every other level's guides stay dim
+                            // gray — entering a nested scope must NOT keep the
+                            // outer scopes' lines lit.
+                            const is_scope_guide = in_scope and
+                                gcol == scope_indent_col and
+                                indent_cols > scope_indent_col;
+                            gstyle.fg = .{ .rgb = if (is_scope_guide) self.theme.indent[level % 8] else self.theme.fg_dim };
                             try segs.append(a, .{ .text = "│", .style = gstyle });
                         } else {
                             try segs.append(a, .{ .text = " ", .style = gstyle });
@@ -5466,10 +5479,11 @@ const App = struct {
                 // snacks.indent.scope underline: the scope's FIRST line (its
                 // declaration/opening line) is underlined from the text start
                 // to end of line, once the animation spread has covered it
-                // (snacks draws it when scope.from == from). The e2e grid
-                // parses SGR colors only, so this is cosmetic, never asserted.
+                // (snacks draws it when scope.from == from), in the scope's
+                // own guide color. The e2e grid parses SGR colors only, so
+                // this is cosmetic, never asserted.
                 if (is_focused and in_scope and line == scope_start_line and anim_from <= scope_start_line) {
-                    style.ul = .{ .rgb = self.theme.indent[0] };
+                    style.ul = .{ .rgb = self.theme.indent[(scope_indent_col / tab_width) % 8] };
                     style.ul_style = .single;
                 }
                 const seg_text = text[col..next];
