@@ -1061,9 +1061,13 @@ const App = struct {
         // The session's in-place shifts kept the hint DATA current (adjust
         // on every edit), so hints stay rendered across the exit — no
         // clear + async re-request, which was the "hints vanish then
-        // reappear" flash after jk. Keep inlay_view_top so the run loop
-        // does NOT immediately re-request (the shifts are exact for the
-        // typed edits); the next view scroll refreshes as usual.
+        // reappear" flash after jk. But code WRITTEN during the session has
+        // no hints at all until the server is asked again, so reset the
+        // request bookkeeping (NOT the displayed hints): the run loop
+        // re-requests the visible range in the background and processInlay
+        // swaps the fresh hints in atomically — no flash, and new code
+        // gets its hints.
+        self.inlay_view_top = null;
     }
 
     // ---- visual-block multi-cursor insert (<C-v> block then I/A) ----
@@ -3431,10 +3435,14 @@ const App = struct {
     fn switchTo(self: *App, i: usize) void {
         if (self.buffers.items.len == 0) return;
         self.current = i % self.buffers.items.len;
-        self.ensureLsp();
         // the focused window follows the switch; other split windows keep
-        // showing whatever buffer they had
+        // showing whatever buffer they had. This must happen BEFORE
+        // ensureLsp: cur() resolves through the window's buf index, so with
+        // the old order the server was started/retargeted against the
+        // PREVIOUS buffer — files opened via the tree / :e / the picker got
+        // no LSP session at all.
         self.windows.items[self.current_win].buf = self.current;
+        self.ensureLsp();
         self.state.mode = .normal;
         // leaving the buffer invalidates any visual selection from it
         // (gt / :bn / :e / picker-enter all land here, some without the
@@ -3447,7 +3455,7 @@ const App = struct {
         // diagnostics would point at wrong files, hover/nav/completion would
         // linger.
         self.invalidateInlayHints();
-        self.lsp_diagnostics.clearRetainingCapacity();
+        self.clearDiagnostics();
         self.clearHover();
         self.nav_list_active = false;
         self.closeCompletion();
@@ -3524,7 +3532,7 @@ const App = struct {
         if (self.outline_slot) |*v| json_rpc.freeValue(self.alloc, v);
         self.outline_slot = null;
         self.invalidateInlayHints();
-        self.lsp_diagnostics.clearRetainingCapacity();
+        self.clearDiagnostics();
         self.clearHover();
         self.closeCompletion();
         if (died) {
@@ -3564,7 +3572,7 @@ const App = struct {
         self.in_insert = false;
         // the surviving buffer may need its own server (or a retarget)
         self.invalidateInlayHints();
-        self.lsp_diagnostics.clearRetainingCapacity();
+        self.clearDiagnostics();
         self.ensureLsp();
     }
 
@@ -3895,6 +3903,13 @@ const App = struct {
         return buf;
     }
 
+    /// Free every diagnostic message and empty the list. Messages are dupe'd
+    /// in parseDiagnostics — a bare clearRetainingCapacity() leaks them.
+    fn clearDiagnostics(self: *App) void {
+        for (self.lsp_diagnostics.items) |*d| self.alloc.free(d.message);
+        self.lsp_diagnostics.clearRetainingCapacity();
+    }
+
     /// LSP notification handler (main thread, called from drain each frame).
     fn lspHandler(self: *App, client: *lsp.Client, msg: *json_rpc.Message) void {
         _ = client;
@@ -3904,8 +3919,7 @@ const App = struct {
                 // Parse diagnostics for the CURRENT file into lsp_diagnostics
                 // (sorted by line). Diagnostics for other documents are
                 // dropped — the editor tracks one buffer at a time.
-                for (self.lsp_diagnostics.items) |*d| self.alloc.free(d.message);
-                self.lsp_diagnostics.clearRetainingCapacity();
+                self.clearDiagnostics();
                 const path = self.cur().path orelse return;
                 const uri = lsp_types.pathToFileUri(self.alloc, path) catch return;
                 defer self.alloc.free(uri);
@@ -3976,7 +3990,10 @@ const App = struct {
             buf.syntax_revision = rev;
         }
         const line_count = buf.pt.lineCount();
-        const start = buf.pt.lineStart(@min(view_top, line_count));
+        // view_top comes from a (possibly unfocused) window and can exceed
+        // this buffer's line count after edits elsewhere shrank it — clamp
+        // to the last line: lineStart asserts line < lineCount.
+        const start = buf.pt.lineStart(@min(view_top, line_count -| 1));
         const vbottom = @min(view_top + content_rows, line_count);
         // lineStart has no EOF sentinel: the last visible line's end is pt.len()
         const end: u32 = if (vbottom >= line_count) buf.pt.len() else buf.pt.lineStart(vbottom);
@@ -5256,6 +5273,16 @@ const App = struct {
             const ft_top = self.contentTop();
             const ft_bottom = height - status_row_count; // above the status bar
             const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
+            // Paint the whole panel with the float background first — without
+            // this only the border columns and the text-width of each item
+            // got the bg, leaving the interior terminal-default (patchy).
+            const panel = win.child(.{
+                .x_off = @intCast(ft_col),
+                .y_off = @intCast(ft_top),
+                .width = @intCast(ft_width),
+                .height = @intCast(ft_bottom - ft_top),
+            });
+            panel.fill(.{ .style = .{ .bg = .{ .rgb = self.theme.bg_float } } });
             // left border column and panel background
             const left_col = ft_col;
             const inner_left = ft_col + 1;
@@ -5294,14 +5321,22 @@ const App = struct {
                 const ri = ft_top_i + k;
                 const f = self.filetree_files.items[ri];
                 const label = if (f.len > inner_w) f[f.len - inner_w ..] else f;
-                const seg = [_]vaxis.Segment{.{
-                    .text = label,
-                    .style = if (ri == self.filetree_sel)
-                        .{ .bg = .{ .rgb = self.theme.bg_sel }, .fg = .{ .rgb = self.theme.fg } }
-                    else
-                        .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } },
-                }};
-                _ = win.print(&seg, .{ .row_offset = @intCast(ft_top + 1 + k), .col_offset = @intCast(inner_left), .wrap = .none });
+                // Pad to the full inner width: the row background (plain and
+                // selected alike) must span the panel edge to edge. NOTE:
+                // vaxis cells REFERENCE the segment text — it must outlive
+                // vx.render() — so the padding is a comptime constant, never
+                // a stack buffer (a stack row_buf made every row render the
+                // LAST file's name).
+                const pads = " " ** (filetree_width - 1);
+                const style: vaxis.Style = if (ri == self.filetree_sel)
+                    .{ .bg = .{ .rgb = self.theme.bg_sel }, .fg = .{ .rgb = self.theme.fg } }
+                else
+                    .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } };
+                const segs = [_]vaxis.Segment{
+                    .{ .text = label, .style = style },
+                    .{ .text = pads[0 .. @as(usize, @intCast(inner_w)) -| label.len], .style = style },
+                };
+                _ = win.print(&segs, .{ .row_offset = @intCast(ft_top + 1 + k), .col_offset = @intCast(inner_left), .wrap = .none });
             }
             // bottom border
             {
@@ -5802,10 +5837,13 @@ const App = struct {
         // cursor position — in the file tree when the tree has focus,
         // otherwise in the buffer
         if (self.filetree_active and self.focus == .filetree) {
-            const sel_row: u32 = 1 + @as(u32, @intCast(self.filetree_sel -| self.filetree_top));
+            // Items render at contentTop()+1+k (below the "╭─ files" title
+            // row) with text starting at column 1 (after the left border) —
+            // the cursor must land on the same row/column as the highlight.
+            const sel_row: u32 = self.contentTop() + 1 + @as(u32, @intCast(self.filetree_sel -| self.filetree_top));
             self.vx.screen.cursor = .{
                 .row = @intCast(sel_row),
-                .col = 0,
+                .col = 1,
             };
         } else {
             const cursor_col = self.screenCellCol(win, cursor_line, self.curCursor().*);
