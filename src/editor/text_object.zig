@@ -60,18 +60,25 @@ pub const Range = struct {
 
 /// Resolve the text object at byte offset `pos` (a character boundary).
 /// Returns an empty range {pos, pos} when the object cannot be resolved.
-pub fn range(pt: *const PieceTable, kind: Kind, pos: u32) Range {
+/// `count` follows vim:
+///   - iw/aw: the range spans `count` consecutive words (aw adds the blanks
+///     after the LAST word);
+///   - i(/a( etc.: the `count`-th nesting level enclosing the cursor
+///     (1 = innermost, like vim's d2i( acting on the second level);
+///   - quotes: no nesting — count is ignored.
+pub fn range(pt: *const PieceTable, kind: Kind, pos: u32, count: u32) Range {
+    const n = @max(count, 1);
     return switch (kind) {
-        .inner_word => wordRange(pt, false, pos),
-        .around_word => wordRange(pt, true, pos),
-        .inner_paren => bracketRange(pt, '(', ')', false, pos),
-        .around_paren => bracketRange(pt, '(', ')', true, pos),
-        .inner_bracket => bracketRange(pt, '[', ']', false, pos),
-        .around_bracket => bracketRange(pt, '[', ']', true, pos),
-        .inner_brace => bracketRange(pt, '{', '}', false, pos),
-        .around_brace => bracketRange(pt, '{', '}', true, pos),
-        .inner_angle => bracketRange(pt, '<', '>', false, pos),
-        .around_angle => bracketRange(pt, '<', '>', true, pos),
+        .inner_word => wordRangeCount(pt, false, pos, n),
+        .around_word => wordRangeCount(pt, true, pos, n),
+        .inner_paren => bracketRangeCount(pt, '(', ')', false, pos, n),
+        .around_paren => bracketRangeCount(pt, '(', ')', true, pos, n),
+        .inner_bracket => bracketRangeCount(pt, '[', ']', false, pos, n),
+        .around_bracket => bracketRangeCount(pt, '[', ']', true, pos, n),
+        .inner_brace => bracketRangeCount(pt, '{', '}', false, pos, n),
+        .around_brace => bracketRangeCount(pt, '{', '}', true, pos, n),
+        .inner_angle => bracketRangeCount(pt, '<', '>', false, pos, n),
+        .around_angle => bracketRangeCount(pt, '<', '>', true, pos, n),
         .inner_quote => quoteRange(pt, '\'', false, pos),
         .around_quote => quoteRange(pt, '\'', true, pos),
         .inner_dquote => quoteRange(pt, '"', false, pos),
@@ -171,6 +178,42 @@ fn wordRange(pt: *const PieceTable, include: bool, pos_in: u32) Range {
     return .{ .start = word_start, .end = e };
 }
 
+/// iw/aw with a vim count: `count` consecutive words. The first word is
+/// resolved exactly like `wordRange`; each further word starts after the
+/// blanks following the previous one (crossing newlines like `w`), and the
+/// range extends to its end. `aw` additionally absorbs the blanks after the
+/// LAST word (up to the line end). Word classification matches wordRange:
+/// cword runs are whole words, a punctuation run is one single-char word.
+fn wordRangeCount(pt: *const PieceTable, include: bool, pos_in: u32, count: u32) Range {
+    const len = pt.len();
+    const pos = @min(pos_in, len);
+    const first = wordRange(pt, include, pos);
+    if (count <= 1 or first.start == first.end) return first;
+
+    var e = first.end;
+    var i: u32 = 1;
+    while (i < count) : (i += 1) {
+        // skip the blank run after the previous word (crossing newlines)
+        while (e < len and isBlankByte(pt.byteAt(e))) : (e += 1) {}
+        if (e >= len) break; // ran out of words
+        // word end: cword run, or a punctuation run as one single-char word
+        var we = e + 1;
+        if (isWordByte(pt.byteAt(e))) {
+            while (we < len and isWordByte(pt.byteAt(we))) : (we += 1) {}
+        } else {
+            while (we < len and !isWordByte(pt.byteAt(we)) and !isBlankByte(pt.byteAt(we))) : (we += 1) {}
+        }
+        e = we;
+    }
+    if (!include) return .{ .start = first.start, .end = e };
+    // aw: blanks after the last word, up to the end of its line
+    const line = pt.lineOf(e - 1);
+    const line_end = pt.lineStart(line) + pt.lineLen(line);
+    var ae = e;
+    while (ae < line_end and isBlankByte(pt.byteAt(ae))) : (ae += 1) {}
+    return .{ .start = first.start, .end = ae };
+}
+
 // ----------------------------- bracket objects ------------------------------
 
 /// i(/a( etc. Search order (contract + vim-compat refinement):
@@ -222,6 +265,43 @@ fn bracketRange(pt: *const PieceTable, open: u8, close: u8, include: bool, pos_i
         }
     }
     return empty;
+}
+
+/// i(/a( etc. with a vim count: the `count`-th nesting level enclosing the
+/// cursor (1 = the innermost pair, exactly like `range`). Each further level
+/// is the nearest opener before the current pair whose match ENDS after the
+/// current pair's closer — i.e. the pair enclosing it. When no enclosing
+/// pair exists (or the object cannot be resolved), the innermost result is
+/// returned.
+fn bracketRangeCount(pt: *const PieceTable, open: u8, close: u8, include: bool, pos_in: u32, count: u32) Range {
+    const pos = @min(pos_in, pt.len());
+    const inner = bracketRange(pt, open, close, false, pos); // inner pair, delimiters stripped
+    if (count <= 1 or inner.start == inner.end) return bracketRange(pt, open, close, include, pos);
+    var o = inner.start -| 1; // the inner pair's opener
+    var c = inner.end; // the inner pair's closer
+    var i: u32 = 1;
+    while (i < count) : (i += 1) {
+        var p = o;
+        var found = false;
+        while (p > 0) {
+            p -= 1;
+            if (pt.byteAt(p) == open) {
+                if (forwardMatch(pt, p, open, close)) |c2| {
+                    if (c2 > c) { // encloses the current pair
+                        o = p;
+                        c = c2;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!found) break; // no more enclosing pairs
+    }
+    return if (include)
+        .{ .start = o, .end = c + 1 }
+    else
+        .{ .start = o + 1, .end = c };
 }
 
 /// Nesting-aware scan right from an opener for its matching closer. Only
@@ -339,7 +419,7 @@ const testing = std.testing;
 /// Assert the range boundaries AND that copyRange over the range reproduces
 /// exactly `text` — every case doubles as the consistency requirement.
 fn expectRange(pt: *const PieceTable, kind: Kind, pos: u32, start: u32, end: u32, text: []const u8) !void {
-    const r = range(pt, kind, pos);
+    const r = range(pt, kind, pos, 1);
     try testing.expectEqual(start, r.start);
     try testing.expectEqual(end, r.end);
     const buf = try testing.allocator.alloc(u8, @intCast(r.end - r.start));
@@ -681,7 +761,7 @@ test "consistency: every kind at every position stays in bounds and round-trips"
     for (kinds) |k| {
         for (0..source.len + 1) |p| {
             const pos: u32 = @intCast(p);
-            const r = range(&pt, k, pos);
+            const r = range(&pt, k, pos, 1);
             try testing.expect(r.start <= r.end);
             try testing.expect(r.end <= pt.len());
             try testing.expect(r.start <= pt.len());
@@ -694,4 +774,63 @@ test "consistency: every kind at every position stays in bounds and round-trips"
             }
         }
     }
+}
+
+test "count: 2iw/2aw span two words; count past the last word clamps" {
+    // "foo bar baz": f0 o1 o2 ' '3 b4 a5 r6 ' '7 b8 a9 z10.
+    var pt = try PieceTable.init(testing.allocator, "foo bar baz");
+    defer pt.deinit();
+    // cursor in "foo": 2iw = "foo bar", 3iw = all three words
+    var r = range(&pt, .inner_word, 1, 2);
+    try testing.expectEqual(@as(u32, 0), r.start);
+    try testing.expectEqual(@as(u32, 7), r.end);
+    r = range(&pt, .inner_word, 1, 3);
+    try testing.expectEqual(@as(u32, 0), r.start);
+    try testing.expectEqual(@as(u32, 11), r.end);
+    // count beyond the available words clamps at the last word
+    r = range(&pt, .inner_word, 1, 9);
+    try testing.expectEqual(@as(u32, 0), r.start);
+    try testing.expectEqual(@as(u32, 11), r.end);
+    // 2aw = both words plus the blanks after the LAST one ("foo bar ")
+    r = range(&pt, .around_word, 1, 2);
+    try testing.expectEqual(@as(u32, 0), r.start);
+    try testing.expectEqual(@as(u32, 8), r.end);
+    // cursor on the middle word: 2iw spans "bar baz"
+    r = range(&pt, .inner_word, 5, 2);
+    try testing.expectEqual(@as(u32, 4), r.start);
+    try testing.expectEqual(@as(u32, 11), r.end);
+}
+
+test "count: 2iw crosses newlines like w" {
+    // "foo\nbar baz": \n at 3; cursor in "foo": 2iw = "foo\nbar".
+    var pt = try PieceTable.init(testing.allocator, "foo\nbar baz");
+    defer pt.deinit();
+    const r = range(&pt, .inner_word, 1, 2);
+    try testing.expectEqual(@as(u32, 0), r.start);
+    try testing.expectEqual(@as(u32, 7), r.end);
+}
+
+test "count: 2i( acts on the second nesting level; count past nesting clamps" {
+    // "outer(inner(x))": o0 u1 t2 e3 r4 (5 i6 n7 n8 e9 r10 (11 x12 )13 )14.
+    var pt = try PieceTable.init(testing.allocator, "outer(inner(x))");
+    defer pt.deinit();
+    // cursor on "x": 1i( = the innermost pair's content
+    var r = range(&pt, .inner_paren, 12, 1);
+    try testing.expectEqual(@as(u32, 12), r.start);
+    try testing.expectEqual(@as(u32, 13), r.end);
+    // 2i( = the enclosing pair: "inner(x)"
+    r = range(&pt, .inner_paren, 12, 2);
+    try testing.expectEqual(@as(u32, 6), r.start);
+    try testing.expectEqual(@as(u32, 14), r.end);
+    // no third level: clamps at the outermost pair's content
+    r = range(&pt, .inner_paren, 12, 3);
+    try testing.expectEqual(@as(u32, 6), r.start);
+    try testing.expectEqual(@as(u32, 14), r.end);
+    r = range(&pt, .inner_paren, 12, 9);
+    try testing.expectEqual(@as(u32, 6), r.start);
+    try testing.expectEqual(@as(u32, 14), r.end);
+    // 2a( includes both delimiters of the enclosing pair
+    r = range(&pt, .around_paren, 12, 2);
+    try testing.expectEqual(@as(u32, 5), r.start);
+    try testing.expectEqual(@as(u32, 15), r.end);
 }

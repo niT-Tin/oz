@@ -37,6 +37,13 @@ const NavAction = enum { none, hover, definition, declaration, references, imple
 /// An inlay hint: dim label shown inline at (line, character).
 const InlayHint = struct { line: u32, character: u32, label: []const u8 };
 
+/// Pending 'r{char}' capture: the count from '3r', the char filled when the
+/// next plain key arrives (normal mode only).
+const ReplacePending = struct {
+    count: u32 = 1,
+    ch: u8 = 0,
+};
+
 /// Outward scope-highlight animation (snacks.indent.animate style "out"):
 /// when the focused window's scope block changes, the highlight spreads from
 /// the cursor line to the scope edges over `duration_ms` (linear, ~500ms —
@@ -142,8 +149,9 @@ const App = struct {
     yank_buffer: ?[]u8 = null,
 
     /// 'r' seen; the next plain key is the replacement character (normal
-    /// mode). Cleared by execAction when 'r' is pressed / by handleKey.
-    pending_replace: ?u8 = null,
+    /// mode), applied `count` times (vim 3rx). Cleared by execAction when
+    /// 'r' is pressed / by handleKey.
+    pending_replace: ?ReplacePending = null,
 
     // easymotion (s / <leader>f) state
     em_active: bool = false,
@@ -771,14 +779,14 @@ const App = struct {
         // (execAction .replace_char) sets pending_replace; the NEXT plain
         // key is the replacement character (normal mode only — in insert
         // mode 'r' is just a typed character).
-        if (self.pending_replace) |_| {
+        if (self.pending_replace) |pr| {
             if (self.state.mode != .insert and key.text != null and key.text.?.len > 0 and
                 !key.mods.ctrl and !key.mods.alt and !key.mods.super and
                 key.codepoint != vaxis.Key.escape)
             {
                 const ch = key.text.?[0];
                 self.pending_replace = null;
-                try self.replaceCharAtCursor(ch);
+                try self.replaceCharsAtCursor(ch, pr.count);
                 return;
             }
             // Esc / anything else cancels the pending replace
@@ -917,6 +925,24 @@ const App = struct {
                     !key.mods.ctrl and !key.mods.alt and !key.mods.super and
                     (isWordByte(key.text.?[0]) or self.isCompletionTriggerText(key.text.?));
                 if (!is_comp_input) self.closeCompletion();
+            }
+            // Arrow keys move the cursor without leaving insert mode (up/down
+            // with the completion menu open select candidates, handled above).
+            // prev_insert_key is left untouched so a jk exit still works after
+            // arrow movement.
+            if (key.codepoint == vaxis.Key.left or key.codepoint == vaxis.Key.right or
+                key.codepoint == vaxis.Key.up or key.codepoint == vaxis.Key.down)
+            {
+                var c = self.curCursor().*;
+                editor.Motion.apply(&self.cur().pt, switch (key.codepoint) {
+                    vaxis.Key.left => .left,
+                    vaxis.Key.right => .right,
+                    vaxis.Key.up => .up,
+                    else => .down,
+                }, .{}, &c, 1);
+                self.curCursor().* = c;
+                self.clearHover();
+                return;
             }
             if (key.codepoint == vaxis.Key.escape or (key.codepoint == 'c' and key.mods.ctrl)) {
                 self.exitInsert();
@@ -1288,6 +1314,21 @@ const App = struct {
     /// cursor (one history.record per cursor, right-to-left so the earlier
     /// positions stay valid) and the whole session lives in one undo group.
     fn handleMcInsertKey(self: *App, key: vaxis.Key) !void {
+        // Arrow keys move the main cursor without leaving insert.
+        if (key.codepoint == vaxis.Key.left or key.codepoint == vaxis.Key.right or
+            key.codepoint == vaxis.Key.up or key.codepoint == vaxis.Key.down)
+        {
+            var c = self.curCursor().*;
+            editor.Motion.apply(&self.cur().pt, switch (key.codepoint) {
+                vaxis.Key.left => .left,
+                vaxis.Key.right => .right,
+                vaxis.Key.up => .up,
+                else => .down,
+            }, .{}, &c, 1);
+            self.curCursor().* = c;
+            self.mcSyncCursor();
+            return;
+        }
         // Esc / Ctrl-c: exit, one main cursor remains
         if (key.codepoint == vaxis.Key.escape or (key.codepoint == 'c' and key.mods.ctrl)) {
             self.exitMcInsert();
@@ -3086,7 +3127,7 @@ const App = struct {
     fn surroundRange(self: *App, motion: ?editor.Motion.Motion, args: editor.Motion.Args, count: u32, text_object: ?editor.TextObject.Kind) ?editor.TextObject.Range {
         var rng: editor.TextObject.Range = undefined;
         if (text_object) |kind| {
-            const r = editor.TextObject.range(&self.cur().pt, kind, self.curCursor().*);
+            const r = editor.TextObject.range(&self.cur().pt, kind, self.curCursor().*, count);
             rng = .{ .start = r.start, .end = r.end };
         } else if (motion) |m| {
             const target = editor.Motion.target(&self.cur().pt, m, args, self.curCursor().*, count);
@@ -3115,7 +3156,7 @@ const App = struct {
         } else {
             var rng: editor.TextObject.Range = undefined;
             if (a.text_object) |kind| {
-                const r = editor.TextObject.range(&self.cur().pt, kind, self.curCursor().*);
+                const r = editor.TextObject.range(&self.cur().pt, kind, self.curCursor().*, a.count);
                 rng = .{ .start = r.start, .end = r.end };
             } else if (a.motion) |m| {
                 const target = editor.Motion.target(&self.cur().pt, m, a.args, self.curCursor().*, a.count);
@@ -4300,9 +4341,10 @@ const App = struct {
             try self.applyOpRange(m.op, start, end, false);
             return;
         }
-        // text object (diw / ci( / yaw …): resolve at the cursor
+        // text object (diw / ci( / yaw …): resolve at the cursor; the count
+        // follows vim (2ciw = two words, 2i( = second nesting level)
         if (m.text_object) |kind| {
-            const rng = editor.TextObject.range(&self.cur().pt, kind, self.curCursor().*);
+            const rng = editor.TextObject.range(&self.cur().pt, kind, self.curCursor().*, m.count);
             try self.applyOpRange(m.op, rng.start, rng.end, false);
             return;
         }
@@ -4601,45 +4643,52 @@ const App = struct {
             .close_buffer => self.closeCurrentBuffer(),
             .filetree_toggle => try self.toggleFiletree(),
             .filetree_locate => try self.locateInFiletree(),
-            .paste => try self.pasteBuffer(false),
-            .paste_before => try self.pasteBuffer(true),
+            .paste => try self.pasteBuffer(false, count),
+            .paste_before => try self.pasteBuffer(true, count),
             .delete_char => {
-                // x: delete the character under the cursor (vim dl). At the
-                // end of a line the newline is deleted (joining the next
-                // line), like vim; at EOF nothing happens.
-                const c = self.curCursor().*;
-                if (c >= self.cur().pt.len()) return;
-                const pt = &self.cur().pt;
-                const seq = self.charLenAt(pt, c);
-                const end = @min(c + seq, pt.len());
-                if (end <= c) return;
+                // x: vim dl — delete `count` characters under the cursor. At
+                // the end of a line the newline is deleted (joining the next
+                // line), like vim; at EOF nothing happens. One undo group.
                 self.cur().history.beginGroup();
-                try self.cur().history.record(pt, c, end - c, "");
+                var i: u32 = 0;
+                while (i < @max(count, 1)) : (i += 1) {
+                    const c = self.curCursor().*;
+                    if (c >= self.cur().pt.len()) break;
+                    const pt = &self.cur().pt;
+                    const seq = self.charLenAt(pt, c);
+                    const end = @min(c + seq, pt.len());
+                    if (end <= c) break;
+                    try self.cur().history.record(pt, c, end - c, "");
+                }
                 self.cur().history.endGroup();
-                self.curCursor().* = c;
                 self.markDirty();
             },
             .delete_char_before => {
-                // X: delete the char before the cursor (vim dh)
-                const c = self.curCursor().*;
-                if (c == 0) return;
-                const pt = &self.cur().pt;
-                // walk back to the start of the previous UTF-8 character
-                var start = c - 1;
-                while (start > 0 and (pt.byteAt(start) & 0xC0) == 0x80) start -= 1;
+                // X: vim dh — delete `count` chars before the cursor
                 self.cur().history.beginGroup();
-                try self.cur().history.record(pt, start, c - start, "");
+                var i: u32 = 0;
+                while (i < @max(count, 1)) : (i += 1) {
+                    const c = self.curCursor().*;
+                    if (c == 0) break;
+                    const pt = &self.cur().pt;
+                    // walk back to the start of the previous UTF-8 character
+                    var start = c - 1;
+                    while (start > 0 and (pt.byteAt(start) & 0xC0) == 0x80) start -= 1;
+                    try self.cur().history.record(pt, start, c - start, "");
+                    self.curCursor().* = start;
+                }
                 self.cur().history.endGroup();
-                self.curCursor().* = start;
                 self.markDirty();
             },
             .delete_to_eol => {
                 // D: delete to end of line (d$), keeping the newline so the
-                // line is emptied, not removed.
+                // line is emptied, not removed. vim count: `count` lines
+                // from the cursor (3D = delete to EOL on three lines).
                 const c = self.curCursor().*;
                 const pt = &self.cur().pt;
                 const line = pt.lineOf(c);
-                const end = pt.lineStart(line) + pt.lineLen(line);
+                const end_line = @min(line + @max(count, 1) - 1, pt.lineCount() - 1);
+                const end = pt.lineStart(end_line) + pt.lineLen(end_line);
                 if (end > c) {
                     self.cur().history.beginGroup();
                     try self.cur().history.record(pt, c, end - c, "");
@@ -4649,17 +4698,17 @@ const App = struct {
                 }
             },
             .change_to_eol => {
-                // C: change to end of line (c$) — delete the tail and enter
-                // insert with the undo group open, like applyOpRangeEx.
+                // C: change to end of line (c$) — vim count: `count` lines
+                // (3C = change to EOL on three lines). Delete the tail and
+                // enter insert with the undo group open, like applyOpRangeEx.
                 const c = self.curCursor().*;
                 const pt = &self.cur().pt;
                 const line = pt.lineOf(c);
-                const end = pt.lineStart(line) + pt.lineLen(line);
+                const end_line = @min(line + @max(count, 1) - 1, pt.lineCount() - 1);
+                const end = pt.lineStart(end_line) + pt.lineLen(end_line);
+                self.cur().history.beginGroup();
                 if (end > c) {
-                    self.cur().history.beginGroup();
                     try self.cur().history.record(pt, c, end - c, "");
-                } else {
-                    self.cur().history.beginGroup();
                 }
                 self.state.mode = .insert;
                 self.in_insert = true; // group stays open until exitInsert
@@ -4685,31 +4734,38 @@ const App = struct {
             .replace_char => {
                 // r{char}: arm the pending-replace capture; the next plain
                 // key (handled before the mode dispatch) replaces the char
-                // under the cursor via replaceCharAtCursor.
-                self.pending_replace = 0;
+                // under the cursor via replaceCharsAtCursor. `count` chars
+                // are replaced (vim 3rx).
+                self.pending_replace = .{ .count = count };
             },
             .toggle_case => {
-                // ~: swap the case of the char under the cursor and advance.
-                const c = self.curCursor().*;
-                const pt = &self.cur().pt;
-                if (c >= pt.len()) return;
-                const seq = self.charLenAt(pt, c);
-                if (seq != 1) return; // multi-byte: not ASCII, leave alone
-                var buf: [1]u8 = undefined;
-                pt.copyRange(c, buf[0..1]);
-                var swapped: ?u8 = null;
-                if (buf[0] >= 'a' and buf[0] <= 'z') {
-                    swapped = buf[0] - 32;
-                } else if (buf[0] >= 'A' and buf[0] <= 'Z') {
-                    swapped = buf[0] + 32;
+                // ~: swap the case of `count` chars under the cursor,
+                // advancing (vim ~). One undo group.
+                self.cur().history.beginGroup();
+                var i: u32 = 0;
+                while (i < @max(count, 1)) : (i += 1) {
+                    const c = self.curCursor().*;
+                    const pt = &self.cur().pt;
+                    if (c >= pt.len()) break;
+                    const seq = self.charLenAt(pt, c);
+                    if (seq != 1) break; // multi-byte: not ASCII, leave alone
+                    var buf: [1]u8 = undefined;
+                    pt.copyRange(c, buf[0..1]);
+                    var swapped: ?u8 = null;
+                    if (buf[0] >= 'a' and buf[0] <= 'z') {
+                        swapped = buf[0] - 32;
+                    } else if (buf[0] >= 'A' and buf[0] <= 'Z') {
+                        swapped = buf[0] + 32;
+                    }
+                    if (swapped) |ch| {
+                        try self.cur().history.record(pt, c, 1, &.{ch});
+                        self.curCursor().* = c + seq;
+                    } else {
+                        self.curCursor().* = c + seq;
+                    }
                 }
-                if (swapped) |ch| {
-                    self.cur().history.beginGroup();
-                    try self.cur().history.record(pt, c, 1, &.{ch});
-                    self.cur().history.endGroup();
-                    self.curCursor().* = c + seq;
-                    self.markDirty();
-                }
+                self.cur().history.endGroup();
+                self.markDirty();
             },
             .join_lines => {
                 // J: join the current line with the next: remove the newline,
@@ -4790,16 +4846,25 @@ const App = struct {
     /// r{char}: replace the character under the cursor with `ch` (a single
     /// byte; multi-byte replacements keep the original sequence length).
     /// Like vim, the cursor stays on the replaced char (it does not move).
-    fn replaceCharAtCursor(self: *App, ch: u8) !void {
-        const c = self.curCursor().*;
+    /// r{char} with a vim count (3rx): replace `count` characters under the
+    /// cursor with `ch`, one undo group. The cursor stays on the LAST
+    /// replaced character (vim r: 3rx leaves it on the third replacement).
+    fn replaceCharsAtCursor(self: *App, ch: u8, count: u32) !void {
         const pt = &self.cur().pt;
-        if (c >= pt.len()) return;
-        const seq = self.charLenAt(pt, c);
-        if (seq != 1) return; // only replace single-byte chars
-        if (pt.byteAt(c) == ch) return;
         self.cur().history.beginGroup();
-        try self.cur().history.record(pt, c, 1, &.{ch});
+        var c = self.curCursor().*;
+        var i: u32 = 0;
+        while (i < @max(count, 1)) : (i += 1) {
+            if (c >= pt.len()) break;
+            const seq = self.charLenAt(pt, c);
+            if (seq != 1) break; // only replace single-byte chars
+            if (pt.byteAt(c) != ch) {
+                try self.cur().history.record(pt, c, 1, &.{ch});
+            }
+            c += 1;
+        }
         self.cur().history.endGroup();
+        self.curCursor().* = c -| 1;
         self.markDirty();
     }
 
@@ -4950,8 +5015,10 @@ const App = struct {
 
     /// Visual-mode g Ctrl+a/x (vim column increment): each selected line's
     /// FIRST number gets ±(count + line offset), the i-th selected line (i
-    /// starting at 1) getting ±i with count 1. One undo group; lines are
-    /// processed bottom-up so earlier lines keep valid offsets.
+    /// starting at 1) getting ±i with count 1. A visual-BLOCK selection
+    /// restricts the numbers to the block's column range (vim: only numbers
+    /// inside the block are touched). One undo group; lines are processed
+    /// bottom-up so earlier lines keep valid offsets.
     fn execSelectionNumberColumn(self: *App, delta: i64) !void {
         const anchor = self.visual_anchor orelse return;
         const s = @min(anchor, self.curCursor().*);
@@ -4959,12 +5026,30 @@ const App = struct {
         const pt = &self.cur().pt;
         const start_line = pt.lineOf(s);
         const end_line = pt.lineOf(e);
+        // visual block: the numbers must overlap the block's column range;
+        // other visual modes take each line's first number
+        const block_cols: ?BlockRect = if (self.state.mode == .visual_block) self.blockRect() else null;
         self.cur().history.beginGroup();
         var line = end_line;
         while (true) {
             const ls = pt.lineStart(line);
             const le = ls + pt.lineLen(line);
-            if (self.firstNumberInLine(ls, le)) |n| {
+            var num: ?Number = null;
+            if (block_cols) |br| {
+                // first number whose digits overlap the block columns
+                var p = @min(ls + br.left, le);
+                const right = @min(ls + br.right + 1, le);
+                while (p < right) {
+                    if (isDigitByte(pt.byteAt(p))) {
+                        num = self.numberAtDigit(p);
+                        break;
+                    }
+                    p += 1;
+                }
+            } else {
+                num = self.firstNumberInLine(ls, le);
+            }
+            if (num) |n| {
                 const offset: i64 = @intCast(line - start_line + 1);
                 _ = try self.replaceNumber(n, delta * offset);
             }
@@ -4977,7 +5062,9 @@ const App = struct {
 
     /// p / P: insert the yank buffer at the cursor (M1 simplification: p
     /// inserts after the current char when not at line end, P at the cursor).
-    fn pasteBuffer(self: *App, before: bool) !void {
+    /// `count` pastes the buffer that many times (vim 5p), one undo group,
+    /// cursor after the last paste.
+    fn pasteBuffer(self: *App, before: bool, count: u32) !void {
         const buf = self.yank_buffer orelse {
             try self.setMsg(try self.alloc.dupe(u8, "E353: Nothing in register"));
             return;
@@ -4994,9 +5081,13 @@ const App = struct {
             }
         }
         self.cur().history.beginGroup();
-        try self.cur().history.record(&self.cur().pt, pos, 0, buf);
+        var i: u32 = 0;
+        while (i < @max(count, 1)) : (i += 1) {
+            try self.cur().history.record(&self.cur().pt, pos, 0, buf);
+            pos += @as(u32, @intCast(buf.len));
+        }
         self.cur().history.endGroup();
-        self.curCursor().* = pos + @as(u32, @intCast(buf.len));
+        self.curCursor().* = pos;
         // markDirty is the single entry point for dirty flag / edit_seq /
         // LSP didChange / inlay invalidation — paste must go through it or
         // the server keeps an outdated document and hints stay stale.
