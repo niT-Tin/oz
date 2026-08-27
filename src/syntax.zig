@@ -214,6 +214,18 @@ pub fn captureStyle(name: []const u8) Style {
     // them as written in the query)
     var n = name;
     if (n.len > 0 and n[0] == '@') n = n[1..];
+    // dotted captures are MORE SPECIFIC than their base: @variable.parameter
+    // is a parameter, not a plain variable. Check them before folding the
+    // suffix away, or every identifier would render as a variable.
+    if (std.mem.eql(u8, n, "variable.parameter")) return .parameter;
+    if (std.mem.eql(u8, n, "variable.member")) return .property;
+    if (std.mem.eql(u8, n, "variable.builtin")) return .builtin;
+    if (std.mem.eql(u8, n, "function.builtin")) return .builtin;
+    if (std.mem.eql(u8, n, "type.builtin")) return .type;
+    if (std.mem.eql(u8, n, "constant.builtin")) return .constant;
+    if (std.mem.eql(u8, n, "module.builtin")) return .namespace;
+    if (std.mem.eql(u8, n, "string.escape")) return .string;
+    if (std.mem.eql(u8, n, "number.float")) return .number;
     const base = if (std.mem.indexOfScalar(u8, n, '.')) |dot| n[0..dot] else n;
     if (std.mem.eql(u8, base, "comment")) return .comment;
     if (std.mem.eql(u8, base, "keyword")) return .keyword;
@@ -251,6 +263,163 @@ fn isBracketCapture(name: []const u8) bool {
     const dot = std.mem.indexOfScalar(u8, n, '.') orelse return false;
     if (!std.mem.eql(u8, n[0..dot], "punctuation")) return false;
     return std.mem.endsWith(u8, n, ".bracket");
+}
+
+// ---------------------------------------------------------------------------
+// Query predicate evaluation (#eq? / #any-of? / #lua-match?)
+// ---------------------------------------------------------------------------
+// treez's CursorWithValidation only supports #eq? (and panics on #lua-match?),
+// so the highlighter evaluates the query predicates itself. Without this the
+// predicate-carrying patterns in the .scm files (e.g. `((identifier) @type
+// (#lua-match? @type "^[A-Z_]..."))`) match EVERY identifier, and the
+// catch-all `(identifier) @variable` from the same node drowns the specific
+// capture during span merging — every token ends up the variable color.
+
+/// Evaluate the predicates of `match.pattern_index` against the captured
+/// text. Returns true when the pattern has no predicates or all of them hold;
+/// false (rejecting the capture) when any predicate fails or is unsupported.
+fn matchPredicates(self: *Highlighter, match: treez.Query.Match, text: []const u8) bool {
+    const preds = self.query.getPredicatesForPattern(match.pattern_index);
+    if (preds.len == 0) return true;
+    var i: usize = 0;
+    while (i < preds.len) {
+        // each predicate: [string op] [capture|string args...] [done]
+        if (preds[i].type != .string) return false;
+        const op = self.query.getStringValueForId(preds[i].value_id);
+        i += 1;
+        var cap_id: ?u32 = null;
+        var str_values: [4][]const u8 = undefined;
+        var nstr: usize = 0;
+        while (i < preds.len and preds[i].type != .done) : (i += 1) {
+            switch (preds[i].type) {
+                .capture => cap_id = preds[i].value_id,
+                .string => {
+                    if (nstr < str_values.len) {
+                        str_values[nstr] = self.query.getStringValueForId(preds[i].value_id);
+                    }
+                    nstr += 1;
+                },
+                .done => {}, // loop condition excludes it; be exhaustive
+            }
+        }
+        i += 1; // skip .done
+        const cid = cap_id orelse return false;
+        // the captured node's text within the document
+        var value: ?[]const u8 = null;
+        for (match.captures()) |cap| {
+            if (cap.id == cid) {
+                const s = cap.node.getStartByte();
+                const e = cap.node.getEndByte();
+                if (s <= text.len and e <= text.len and s < e) value = text[s..e];
+                break;
+            }
+        }
+        const v = value orelse return false;
+        if (std.mem.eql(u8, op, "eq?")) {
+            if (nstr != 1 or !std.mem.eql(u8, v, str_values[0])) return false;
+        } else if (std.mem.eql(u8, op, "any-of?")) {
+            var ok = false;
+            for (str_values[0..nstr]) |w| {
+                if (std.mem.eql(u8, v, w)) ok = true;
+            }
+            if (!ok) return false;
+        } else if (std.mem.eql(u8, op, "lua-match?")) {
+            if (nstr != 1 or !luaMatch(v, str_values[0])) return false;
+        } else {
+            return false; // unsupported predicate: reject the match
+        }
+    }
+    return true;
+}
+
+/// Minimal `#lua-match?` evaluator for the pattern subset used in our query
+/// files: '^'/'$' anchors, literal chars, "[...]" character classes with
+/// ranges (a-z A-Z 0-9 _ and single chars), and '*', '+', '?' quantifiers.
+/// Semantics follow lua string.match (substring unless anchored with '^');
+/// the greedy quantifiers never need backtracking here because every pattern
+/// ends in the quantified class or a '$' anchor.
+fn luaMatch(text: []const u8, pattern: []const u8) bool {
+    const anchored = pattern.len > 0 and pattern[0] == '^';
+    var start: usize = 0;
+    while (true) {
+        if (matchAt(text, start, pattern, if (anchored) 1 else 0, pattern.len)) return true;
+        if (anchored or start >= text.len) return false;
+        start += 1;
+    }
+}
+
+fn matchAt(text: []const u8, ti_in: usize, pattern: []const u8, pi_in: usize, plen: usize) bool {
+    var ti = ti_in;
+    var pi = pi_in;
+    while (pi < plen) {
+        const pc = pattern[pi];
+        if (pc == '$') return ti == text.len; // end anchor
+        // parse the atom: single char or [class]
+        const atom_start = pi;
+        var pi2 = pi;
+        var is_class = false;
+        if (pc == '[') {
+            is_class = true;
+            pi2 += 1;
+            while (pi2 < plen and pattern[pi2] != ']') pi2 += 1;
+            if (pi2 >= plen) return false; // unterminated class
+            pi2 += 1; // past ']'
+        } else {
+            pi2 += 1;
+        }
+        // exclusive atom end: past ']' for classes, past the char otherwise
+        const atom_end = if (is_class) pi2 - 1 else pi2;
+        // quantifier
+        var quant: enum { one, opt, star, plus } = .one;
+        if (pi2 < plen) {
+            switch (pattern[pi2]) {
+                '?' => {
+                    quant = .opt;
+                    pi2 += 1;
+                },
+                '*' => {
+                    quant = .star;
+                    pi2 += 1;
+                },
+                '+' => {
+                    quant = .plus;
+                    pi2 += 1;
+                },
+                else => {},
+            }
+        }
+        switch (quant) {
+            .one => {
+                if (ti >= text.len or !atomMatch(text[ti], pattern[atom_start..atom_end], is_class)) return false;
+                ti += 1;
+            },
+            .opt => {
+                if (ti < text.len and atomMatch(text[ti], pattern[atom_start..atom_end], is_class)) ti += 1;
+            },
+            .star, .plus => {
+                var count: usize = 0;
+                while (ti < text.len and atomMatch(text[ti], pattern[atom_start..atom_end], is_class)) : (ti += 1) count += 1;
+                if (quant == .plus and count == 0) return false;
+            },
+        }
+        pi = pi2;
+    }
+    return true;
+}
+
+/// Does byte `c` match the atom at pattern[start..end]? (start points at '['
+/// when is_class, else at a literal char.)
+fn atomMatch(c: u8, atom: []const u8, is_class: bool) bool {
+    if (!is_class) return atom.len == 1 and c == atom[0];
+    var i: usize = 1; // skip '['
+    while (i + 2 < atom.len and atom[i + 1] == '-') {
+        if (c >= atom[i] and c <= atom[i + 2]) return true; // range a-b
+        i += 3;
+    }
+    while (i < atom.len) : (i += 1) {
+        if (c == atom[i]) return true;
+    }
+    return false;
 }
 
 /// Rainbow style for a bracket at `depth`: bracket0 + depth % 7.
@@ -400,6 +569,7 @@ pub const Highlighter = struct {
     /// query cursor is byte-range limited — the O(visible) contract.
     pub fn spansInRange(self: *Highlighter, start_byte: u32, end_byte: u32, arena: std.mem.Allocator, out: *std.ArrayList(Span)) !void {
         const tree = self.tree orelse return;
+        const text = self.prev_text orelse return;
         var cursor = try treez.Query.Cursor.create();
         defer cursor.destroy();
         cursor.setByteRange(start_byte, end_byte);
@@ -407,6 +577,12 @@ pub const Highlighter = struct {
         while (cursor.nextCapture()) |nc| {
             const match = nc[0];
             const cap = match.captures()[nc[1]];
+            // query predicates (#lua-match?/#eq?/#any-of?): the pattern only
+            // applies when they hold — treez's own validation only supports
+            // #eq? and is not wired in here, so evaluate them ourselves
+            // (see matchPredicates). Without this, "@type" with a
+            // `#lua-match? "^[A-Z_]..."` predicate matches EVERY identifier.
+            if (!matchPredicates(self, match, text)) continue;
             const name = self.query.getCaptureNameForId(cap.id);
             // rainbow brackets: "@punctuation.bracket" spans get bracketN
             // instead of the plain .punctuation that captureStyle() would
@@ -421,6 +597,31 @@ pub const Highlighter = struct {
             if (s == e) continue;
             try out.append(arena, .{ .start = s, .end = e, .style = style });
         }
+        // Same byte range can be captured by several patterns (the catch-all
+        // `(identifier) @variable` plus the specific one). Our query files
+        // list the specific captures AFTER the catch-all, so the LAST
+        // capture of a range wins — otherwise the merge in main.zig ("later
+        // spans win overlaps") picks the catch-all and every token renders
+        // as a variable. Dedup keeping the last occurrence of each range.
+        {
+            const Key = struct { start: u32, end: u32 };
+            var seen = std.AutoHashMap(Key, usize).init(arena);
+            defer seen.deinit();
+            var write: usize = 0;
+            var i: usize = 0;
+            while (i < out.items.len) : (i += 1) {
+                const sp = out.items[i];
+                const key = Key{ .start = sp.start, .end = sp.end };
+                if (seen.get(key)) |idx| {
+                    out.items[idx] = sp; // later capture wins
+                } else {
+                    seen.put(key, write) catch {};
+                    out.items[write] = sp;
+                    write += 1;
+                }
+            }
+            out.shrinkRetainingCapacity(write);
+        }
         // tree-sitter's error recovery can swallow whole regions (e.g. typing
         // "1;j" — a syntax error — makes the ERROR node cover "const y" on the
         // NEXT line, so the keyword loses its capture). Fall back to a cheap
@@ -428,7 +629,6 @@ pub const Highlighter = struct {
         // keep their colors while the text is syntactically broken. The lexer
         // runs only on ERROR ranges intersecting the visible range, so the
         // O(visible) contract holds.
-        const text = self.prev_text orelse return;
         var errs = std.ArrayList(ByteRange).empty;
         defer errs.deinit(arena);
         try self.collectErrorRanges(start_byte, end_byte, arena, &errs);
@@ -562,7 +762,12 @@ test "captureStyle: dotted names collapse to the base capture" {
     try std.testing.expect(captureStyle("@keyword") == .keyword);
     try std.testing.expect(captureStyle("@keyword.function") == .keyword);
     try std.testing.expect(captureStyle("@string.special") == .string);
-    try std.testing.expect(captureStyle("@variable.builtin") == .variable);
+    try std.testing.expect(captureStyle("@variable.builtin") == .builtin);
+    try std.testing.expect(captureStyle("@variable.parameter") == .parameter);
+    try std.testing.expect(captureStyle("@variable.member") == .property);
+    try std.testing.expect(captureStyle("@function.builtin") == .builtin);
+    try std.testing.expect(captureStyle("@type.builtin") == .type);
+    try std.testing.expect(captureStyle("@constant.builtin") == .constant);
     try std.testing.expect(captureStyle("@punctuation.bracket") == .punctuation);
     try std.testing.expect(captureStyle("@nonexistent") == .default);
 }
@@ -889,6 +1094,46 @@ test "repro: insert 'j' at end of an indented fn-body line keeps next-line keywo
     const st = spanAt(spans.items, 72);
     if (st != Style.keyword) dumpSpans(new_src, spans.items);
     try std.testing.expectEqual(Style.keyword, st);
+}
+
+
+test "build.zig style: parameter, type, module, function call get distinct styles" {
+    // Regression: the catch-all `(identifier) @variable` used to drown the
+    // specific captures (predicates were never evaluated, so `@type` with a
+    // `#lua-match?` matched every identifier; and overlapping captures of the
+    // same range merged unpredictably). b (parameter), std (module), Build
+    // (type) and standardTargetOptions (function call) must each get its own
+    // style — like the user's nvim.
+    const alloc = std.testing.allocator;
+    const src =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const target = b.standardTargetOptions(.{});
+        \\    _ = target;
+        \\}
+        \\
+    ;
+    var hl = try Highlighter.init(alloc, "zig");
+    defer hl.deinit();
+    try hl.reparse(src);
+    var spans = std.ArrayList(Span).empty;
+    defer spans.deinit(alloc);
+    try hl.spansInRange(0, @intCast(src.len), alloc, &spans);
+
+    const param = std.mem.indexOf(u8, src, "b: *std.Build").?;
+    try std.testing.expectEqual(Style.parameter, spanAt(spans.items, @intCast(param)).?);
+    const module = std.mem.indexOf(u8, src, "const std").? + 6;
+    try std.testing.expectEqual(Style.namespace, spanAt(spans.items, @intCast(module)).?);
+    // "std.Build": Build is a field_expression member → @variable.member
+    // (carpYellow in the theme — nvim-treesitter's zig query captures it the
+    // same way, so it differs from the parameter b and the call below)
+    const member_pos = std.mem.indexOf(u8, src, "Build").?;
+    try std.testing.expectEqual(Style.property, spanAt(spans.items, @intCast(member_pos)).?);
+    const call = std.mem.indexOf(u8, src, "standardTargetOptions").?;
+    try std.testing.expectEqual(Style.function, spanAt(spans.items, @intCast(call)).?);
+    // the const-declared variable stays a plain variable
+    const var_ = std.mem.indexOf(u8, src, "target = ").?;
+    try std.testing.expectEqual(Style.variable, spanAt(spans.items, @intCast(var_)).?);
 }
 
 test "full reparse of the same syntax-error text" {
