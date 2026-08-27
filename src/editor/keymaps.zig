@@ -48,6 +48,12 @@ pub const normal: KeyMap = &.{
     act(.{ .codepoint = 's' }, .easymotion),
     act(.{ .codepoint = ' ' }, .leader),
     act(.{ .codepoint = ':' }, .enter_command_mode),
+    // buffer search (cmdline variant, DESIGN.md §6.7): / forward, ? backward,
+    // n/N repeat in the same / opposite direction
+    act(.{ .codepoint = '/' }, .search_forward),
+    act(.{ .codepoint = '?' }, .search_backward),
+    act(.{ .codepoint = 'n' }, .search_next),
+    act(.{ .codepoint = 'N' }, .search_prev),
     act(.{ .codepoint = vaxis.Key.escape }, .normal_mode),
     // editing
     act(.{ .codepoint = 'u' }, .undo),

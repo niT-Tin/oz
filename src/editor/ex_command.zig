@@ -32,6 +32,8 @@ pub const Command = union(enum) {
     set: []const u8,
     /// :theme [name] — switch color theme (no arg lists available themes).
     theme: []const u8,
+    /// :<number> — jump to that line (1-based; the caller clamps).
+    goto_line: u32,
     /// :s/pat/rep[/g] — substitute on the current line; :%s for the whole
     /// file; :'<,'>s for the visual selection. M1: literal substring
     /// matching (no regex).
@@ -75,6 +77,19 @@ pub fn parse(line: []const u8) Command {
     while (split < t.len and t[split] != ' ' and t[split] != '\t') : (split += 1) {}
     const word = t[0..split];
     const args = trim(t[split..]);
+
+    // :<number> jumps to that line (vim); :0 behaves like :1 there.
+    var all_digits = true;
+    for (word) |c| {
+        if (c < '0' or c > '9') {
+            all_digits = false;
+            break;
+        }
+    }
+    if (all_digits and args.len == 0) {
+        const n = std.fmt.parseInt(u32, word, 10) catch std.math.maxInt(u32);
+        return .{ .goto_line = n };
+    }
 
     if (std.mem.eql(u8, word, "w") or std.mem.eql(u8, word, "write")) {
         return if (args.len == 0) .write else .unknown;
@@ -233,6 +248,17 @@ test "substitute: unescapeSubSep restores \\/ but keeps other escapes" {
     const s = try unescapeSubSep(a, "plain");
     defer a.free(s);
     try std.testing.expectEqualStrings("plain", s);
+}
+
+test "parse: bare number is goto-line" {
+    const c = parse("42");
+    try std.testing.expect(c == .goto_line);
+    try std.testing.expectEqual(@as(u32, 42), c.goto_line);
+    try std.testing.expect(parse("0") == .goto_line);
+    try std.testing.expect(parse("7 ") == .goto_line);
+    // digits with an argument are not a line jump
+    try std.testing.expect(parse("12 x") == .unknown);
+    try std.testing.expect(parse("1a") == .unknown);
 }
 
 test "parse: buffers, noh, set, unknown" {

@@ -96,6 +96,9 @@ pub const Result = union(enum) {
     op_motion: OpMotion,
     /// Enter command mode (from ':'), with the leading char already consumed.
     command_mode,
+    /// Enter command mode as a buffer search (from '/' or '?') — same
+    /// cmdline, different prompt and Enter semantics (DESIGN.md §6.7).
+    search_mode: enum { forward, backward },
     /// Exit insert/visual mode back to normal (jk / Esc).
     to_normal,
     /// Surround operation (ys/ds/cs, DESIGN.md §1.3). For `add` the range is
@@ -691,6 +694,17 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
             state.mode = .command;
             break :blk .command_mode;
         },
+        .search_forward => blk: {
+            resetPending(state);
+            state.mode = .command;
+            break :blk Result{ .search_mode = .forward };
+        },
+        .search_backward => blk: {
+            resetPending(state);
+            state.mode = .command;
+            break :blk Result{ .search_mode = .backward };
+        },
+        .search_next, .search_prev => emitAction(state, action),
         // Esc with nothing pending: swallow
         .normal_mode => blk: {
             resetPending(state);

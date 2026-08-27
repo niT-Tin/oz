@@ -109,6 +109,12 @@ const App = struct {
     /// (Up/Down) or vice versa, or a Tab after an Up would jump to a
     /// random history entry.
     cmd_complete_idx: usize = 0,
+    /// What the cmdline collects: an ex command (':') or a buffer search
+    /// ('/' forward, '?' backward). Same widget; Enter dispatches differently.
+    cmdline_kind: enum { ex, search_fwd, search_bwd } = .ex,
+    /// Last executed search query (owned) and its direction — for n/N.
+    last_search: ?[]u8 = null,
+    last_search_bwd: bool = false,
     /// The command-name match list from the last Tab (owned), so repeated
     /// Tabs cycle the ORIGINAL matches even after the line becomes a full
     /// command name (":b" Tab → bnext, Tab → bprev, …). Cleared on any
@@ -148,6 +154,10 @@ const App = struct {
     // stashed here until the M2 diagnostics UI lands.
     lsp_client: ?*lsp.Client = null,
     lsp_diagnostics: std.ArrayList(lsp_types.Diagnostic) = .empty,
+    /// Set by lspHandler when publishDiagnostics changed the list: the run
+    /// loop must repaint or the gutter marks go stale (a final "all clean"
+    /// push that isn't drawn leaves a phantom ✖ until the next keypress).
+    diag_dirty: bool = false,
 
     // file tree (<leader>e)
     filetree_active: bool = false,
@@ -626,6 +636,7 @@ const App = struct {
         for (self.cmd_complete_names.items) |n| self.alloc.free(n);
         self.cmd_complete_names.deinit(self.alloc);
         if (self.msg) |m| self.alloc.free(m);
+        if (self.last_search) |q| self.alloc.free(q);
         if (self.yank_buffer) |b| self.alloc.free(b);
         if (self.em_matches.len > 0) self.alloc.free(self.em_matches);
         self.mc.deinit();
@@ -781,6 +792,9 @@ const App = struct {
                     try self.cur().history.record(&self.cur().pt, pos, wlen, "");
                 }
                 self.cur().history.endGroup();
+                // LSP sync (same rule as every other edit): the server's
+                // copy must follow the deletion.
+                self.markDirty();
             }
             self.mc.clear();
             self.mc_active = false;
@@ -908,6 +922,17 @@ const App = struct {
                         const line = self.cur().pt.lineOf(pos);
                         const col = pos - self.cur().pt.lineStart(line);
                         self.adjustInlayHintsDelete(line, col, "j");
+                        // markDirty: the 'j' insertion already sent a
+                        // didChange, so the LSP server's copy still contains
+                        // the phantom 'j'. Re-sync the removal or the server
+                        // keeps analyzing text that never existed — stale
+                        // diagnostics ("expected ',' after field" at col 0)
+                        // and inlay hints computed against the wrong
+                        // document. Also bumps edit_seq so any in-flight
+                        // response is discarded as stale. (Runs before
+                        // exitInsert, so in_insert is still true and the
+                        // freshly shifted-back hints are NOT invalidated.)
+                        self.markDirty();
                     }
                     self.exitInsert();
                     return;
@@ -1025,12 +1050,23 @@ const App = struct {
                 self.cmd_hist_idx = null;
                 self.cmd_complete_idx = 0;
                 self.clearCmdCompleteNames();
+                self.cmdline_kind = .ex;
                 try self.setMsg(try self.alloc.dupe(u8, ""));
                 // From visual mode vim auto-types :'<,'>; :s then applies to
                 // the selection (the anchor survives until Enter).
                 if (self.visual_anchor != null) {
                     try self.cmdline.appendSlice(self.alloc, "'<,'>");
                 }
+            },
+            .search_mode => |dir| {
+                // '/' or '?' pressed: the command line collects the search
+                // query (Mode already set .command)
+                self.cmdline.clearRetainingCapacity();
+                self.cmd_hist_idx = null;
+                self.cmd_complete_idx = 0;
+                self.clearCmdCompleteNames();
+                self.cmdline_kind = if (dir == .forward) .search_fwd else .search_bwd;
+                try self.setMsg(try self.alloc.dupe(u8, ""));
             },
             .to_normal => {
                 self.state.mode = .normal;
@@ -1246,16 +1282,23 @@ const App = struct {
             if (p.codepoint == 'j' and key.codepoint == 'k' and
                 !key.mods.ctrl and !key.mods.alt and !key.mods.super)
             {
+                var deleted_any = false;
                 var i = self.mc.cursors.items.len;
                 while (i > 0) {
                     i -= 1;
                     const pos = self.mc.cursors.items[i];
                     if (pos > 0 and self.cur().pt.byteAt(pos - 1) == 'j') {
+                        deleted_any = true;
                         try self.cur().history.record(&self.cur().pt, pos - 1, 1, "");
                         // the deletion shifts every cursor at/after it back
                         for (self.mc.cursors.items[i..]) |*c| c.* -= 1;
                     }
                 }
+                // The 'j' insertions were synced via didChange (mcInsertText
+                // → markDirty); re-sync the removals too, or the server
+                // analyzes a document with phantom 'j's (stale diagnostics,
+                // wrong inlay positions).
+                if (deleted_any) self.markDirty();
                 self.exitMcInsert();
                 return;
             }
@@ -1327,6 +1370,9 @@ const App = struct {
             }
         }
         self.mcSyncCursor();
+        // LSP sync: the deletions changed the buffer — the server's copy
+        // must follow or diagnostics/hints are computed against stale text.
+        self.markDirty();
     }
 
     /// Ctrl-w at every visual-block cursor: delete the word before each
@@ -1354,6 +1400,9 @@ const App = struct {
             }
         }
         self.mcSyncCursor();
+        // LSP sync: the deletions changed the buffer — the server's copy
+        // must follow or diagnostics/hints are computed against stale text.
+        self.markDirty();
     }
 
     /// Exit a visual-block multi-cursor insert session: close the undo group,
@@ -2257,6 +2306,7 @@ const App = struct {
             // (it was kept so :'<,'>s could resolve the range on Enter).
             self.visual_anchor = null;
             self.pending_rename = false;
+            self.cmdline_kind = .ex;
             self.cmdline.clearRetainingCapacity();
             self.cmd_hist_idx = null;
             self.cmd_complete_idx = 0;
@@ -2275,6 +2325,22 @@ const App = struct {
                     return;
                 }
                 const line = self.cmdline.items;
+                if (self.cmdline_kind != .ex) {
+                    // '/' / '?' search: Enter jumps to the first match after
+                    // (before) the cursor, wrapping; remembers the query for
+                    // n/N. The text borrows the cmdline buffer — execSearch
+                    // dupes what it keeps.
+                    const bwd = self.cmdline_kind == .search_bwd;
+                    self.state.mode = .normal;
+                    self.cmdline_kind = .ex;
+                    self.cmd_hist_idx = null;
+                    self.cmd_complete_idx = 0;
+                    self.clearCmdCompleteNames();
+                    if (line.len > 0) try self.pushHistory(line);
+                    try self.execSearch(line, bwd);
+                    self.cmdline.clearRetainingCapacity();
+                    return;
+                }
                 const cmd = editor.ex_command.parse(line);
                 if (cmd != .empty) try self.pushHistory(line);
                 self.state.mode = .normal;
@@ -2481,6 +2547,13 @@ const App = struct {
             .buffer_delete => self.closeCurrentBuffer(),
             .buffer_list => try self.listBuffers(),
             .noh => try self.setMsg(try self.alloc.dupe(u8, "")),
+            .goto_line => |ln| {
+                // :<number> — vim: 1-based, clamped to the last line (:0
+                // and :1 both land on the first line)
+                const target = @min(ln -| 1, self.cur().pt.lineCount() - 1);
+                self.curCursor().* = self.cur().pt.lineStart(target);
+                self.clearHover();
+            },
             .set => |opt| try self.setMsg(try std.fmt.allocPrint(self.alloc, "set {s} (M0: accepted, no-op)", .{opt})),
             .theme => |name| try self.execTheme(name),
             .substitute => |sub| try self.execSubstitute(sub),
@@ -2580,6 +2653,60 @@ const App = struct {
     fn setMsg(self: *App, owned: []u8) !void {
         if (self.msg) |m| self.alloc.free(m);
         self.msg = owned;
+    }
+
+    // ---- buffer search (/ ? n N) ----
+
+    /// Execute a '/' / '?' search: plain substring (no regex, like :s), from
+    /// just after (forward) or before (backward) the cursor, wrapping around
+    /// the buffer edges like vim. The query is remembered for n/N.
+    fn execSearch(self: *App, query: []const u8, backward: bool) !void {
+        if (query.len == 0) return;
+        // remember for n/N (dupes — `query` borrows the cmdline buffer)
+        if (self.last_search) |q| self.alloc.free(q);
+        self.last_search = try self.alloc.dupe(u8, query);
+        self.last_search_bwd = backward;
+        try self.searchOnce(query, backward);
+    }
+
+    /// n / N: repeat the remembered search; `flip` inverts the direction.
+    fn repeatSearch(self: *App, flip: bool) !void {
+        const q = self.last_search orelse {
+            try self.setMsg(try self.alloc.dupe(u8, "no previous search"));
+            return;
+        };
+        try self.searchOnce(q, self.last_search_bwd != flip);
+    }
+
+    fn searchOnce(self: *App, query: []const u8, backward: bool) !void {
+        const len = self.cur().pt.len();
+        if (len == 0) return;
+        const text = try self.curText();
+        defer self.alloc.free(text);
+        const cursor = self.curCursor().*;
+        var hit: ?usize = null;
+        if (backward) {
+            // last match starting before the cursor, else wrap to the file end
+            hit = std.mem.lastIndexOf(u8, text[0..@min(cursor, len)], query);
+            if (hit == null) {
+                const from = @min(cursor + 1, len);
+                if (std.mem.lastIndexOf(u8, text[from..], query)) |i| hit = from + i;
+            }
+        } else {
+            // first match starting after the cursor, else wrap to the top
+            const from = @min(cursor + 1, len);
+            if (std.mem.indexOf(u8, text[from..], query)) |i| {
+                hit = from + i;
+            } else {
+                hit = std.mem.indexOf(u8, text[0..from], query);
+            }
+        }
+        if (hit) |h| {
+            self.curCursor().* = @intCast(h);
+            self.clearHover();
+        } else {
+            try self.setMsg(try std.fmt.allocPrint(self.alloc, "pattern not found: {s}", .{query}));
+        }
     }
 
     /// Leading spaces/tabs of `line` (owned copy) — used to auto-indent new
@@ -4000,6 +4127,7 @@ const App = struct {
                 // (sorted by line). Diagnostics for other documents are
                 // dropped — the editor tracks one buffer at a time.
                 self.clearDiagnostics();
+                self.diag_dirty = true;
                 const path = self.cur().path orelse return;
                 const uri = lsp_types.pathToFileUri(self.alloc, path) catch return;
                 defer self.alloc.free(uri);
@@ -4440,6 +4568,8 @@ const App = struct {
             .picker_recent => try self.openRecentPicker(),
             .diagnostic_next => self.gotoDiagnostic(true),
             .diagnostic_prev => self.gotoDiagnostic(false),
+            .search_next => try self.repeatSearch(false),
+            .search_prev => try self.repeatSearch(true),
             .diagnostic_line => self.showLineDiagnostics(),
             .diagnostics_list => self.toggleDiagnosticsList(),
             .hover => try self.requestNav("textDocument/hover", .hover),
@@ -5060,13 +5190,12 @@ const App = struct {
             // diagnostics). Nerd Font icons (spec: 图标体系 = Nerd Font),
             // like nvim's diagnostic gutter: ✖ for errors, ⚠ warnings, ℹ
             // info. A bare letter (E/W/I) read as noise/errors to users.
-            // Hidden during insert: while typing, the half-typed line is
-            // (temporarily) invalid and the server reports it — a red ✖
-            // on the very line being edited reads as "every insert errors".
-            // Marks reappear on exit, showing real post-edit errors.
+            // Marks render in EVERY mode (nvim behavior): hiding them during
+            // insert made a pre-existing mark "appear" on exit, which read as
+            // a bug; the diag_dirty repaint keeps them live while typing.
             var diag_mark: []const u8 = " ";
             var diag_mark_fg: ?vaxis.Style = null;
-            if (self.state.mode != .insert and w.buf == self.current and self.lsp_diagnostics.items.len > 0) {
+            if (w.buf == self.current and self.lsp_diagnostics.items.len > 0) {
                 for (self.lsp_diagnostics.items) |d| {
                     if (d.range.start.line == line) {
                         diag_mark = switch (d.severity) {
@@ -5277,7 +5406,10 @@ const App = struct {
         // cursor offset, mc highlight and easymotion labels
         const gutter = self.gutterWidth(line_count);
 
-        // tab bar: one entry per buffer, current highlighted, + dirty marker
+        // tab bar: one entry per buffer, current highlighted, + dirty marker.
+        // Each tab is a solid block (active: bg_sel, inactive: bg_float)
+        // separated by a 1-cell base-bg gap, so the tabs read as distinct
+        // segments instead of one undifferentiated line of text.
         {
             var tab_i: usize = 0;
             var col: u16 = 0;
@@ -5286,15 +5418,18 @@ const App = struct {
                 const name = if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
                 const dirty = if (buf.dirty) "\u{25cf}" else " ";
                 const label = try std.fmt.allocPrint(a, " {s}{s} ", .{ name, dirty });
-                const seg = [_]vaxis.Segment{.{
-                    .text = label,
-                    .style = if (tab_i == self.current)
-                        .{ .fg = .{ .rgb = self.theme.accent }, .bold = true }
-                    else
-                        .{ .fg = .{ .rgb = self.theme.fg_faint } },
-                }};
-                _ = win.print(&seg, .{ .row_offset = 0, .col_offset = col, .wrap = .none });
-                col +|= @intCast(label.len);
+                const tab_style: vaxis.Style = if (tab_i == self.current)
+                    // bg_status, NOT bg_sel: tests (and the eye) read bg_sel
+                    // as an editor selection — the tab bar must not emit it
+                    .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_status }, .bold = true }
+                else
+                    .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
+                const segs = [_]vaxis.Segment{
+                    .{ .text = label, .style = tab_style },
+                    .{ .text = " ", .style = .{ .bg = .{ .rgb = self.theme.bg } } },
+                };
+                _ = win.print(&segs, .{ .row_offset = 0, .col_offset = col, .wrap = .none });
+                col +|= @intCast(label.len + 1);
                 if (col >= win.width) break;
             }
         }
@@ -5585,7 +5720,12 @@ const App = struct {
 
         // status bar (or command line in command mode)
         if (self.state.mode == .command) {
-            const prompt = try std.fmt.allocPrint(a, ":{s}", .{self.cmdline.items});
+            const prompt_char: []const u8 = switch (self.cmdline_kind) {
+                .ex => ":",
+                .search_fwd => "/",
+                .search_bwd => "?",
+            };
+            const prompt = try std.fmt.allocPrint(a, "{s}{s}", .{ prompt_char, self.cmdline.items });
             const cmd_seg = [_]vaxis.Segment{.{
                 .text = prompt,
                 .style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_status } },
@@ -5965,7 +6105,9 @@ const App = struct {
             const fmt_ready = self.processFormat();
             const inlay_ready = self.processInlay();
             const outline_ready = self.processOutline();
-            if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready) {
+            const diag_changed = self.diag_dirty;
+            self.diag_dirty = false;
+            if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready or diag_changed) {
                 try self.render();
                 continue;
             }

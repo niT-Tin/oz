@@ -1151,6 +1151,123 @@ test "auto-pairs: openers close, closers skip, backspace deletes empty pair" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+test "search: / ? n N jump between matches; :<number> jumps to line" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}search.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "alpha\nbeta\ngamma\nbeta again\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // Regression guard for the original bug: typing into the search cmdline
+    // must NEVER leak into the buffer as normal-mode commands ('bg_fl' used
+    // to execute b / g / f-l / o and insert "at" into the document).
+    // /beta -> line 2
+    try sess.send("/beta\r");
+    waited = 0;
+    while (!grid.contains("line 2/5")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("line 2/5"));
+    try std.testing.expect(grid.contains("alpha")); // buffer untouched
+    try std.testing.expect(!grid.contains("betaa")); // no leaked insert
+
+    // n -> next match wraps to line 4 ("beta again")
+    try sess.send("n");
+    waited = 0;
+    while (!grid.contains("line 4/5")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("line 4/5"));
+
+    // N -> opposite direction: back to line 2
+    try sess.send("N");
+    waited = 0;
+    while (!grid.contains("line 2/5")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("line 2/5"));
+
+    // ?gamma from line 2: backward wraps to line 3
+    try sess.send("?gamma\r");
+    waited = 0;
+    while (!grid.contains("line 3/5")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("line 3/5"));
+
+    // :1 jumps to the first line (also covers :<number> parsing)
+    try sess.send(":1\r");
+    waited = 0;
+    while (!grid.contains("line 1/5")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("line 1/5"));
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
 test "M1a: text objects, visual ops, yank/paste, easymotion" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -7032,6 +7149,209 @@ test "lsp: mock server handshake + didChange round-trip (OZ_LSP_CMD)" {
         sess.used += n;
     }
     try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
+}
+
+test "lsp: diagnostics push repaints without a keypress (stale mark cleared)" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}diagc.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const a = 1;\n");
+    }
+
+    // mock pushes one error at didOpen, then an EMPTY diagnostics list on the
+    // first didChange (clear_on_change). Both transitions must repaint on
+    // their own: regression — publishDiagnostics didn't mark the frame dirty,
+    // so a final "all clean" push left a phantom ✖ until the next keypress.
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{
+        "OZ_LSP_CMD=zig-out/bin/mock_lsp",
+        "OZ_MOCK_SCRIPT=clear_on_change",
+    });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // The ✖ (nf-fa-times_circle, U+F467 → EF 91 A7) appears on the gutter of
+    // screen row 1 WITHOUT any keypress — the wake event alone must repaint.
+    waited = 0;
+    var mark = false;
+    while (!mark) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.buf[(1 * grid.cols + 1) * 4] == 0xEF and
+            grid.buf[(1 * grid.cols + 1) * 4 + 1] == 0x91 and
+            grid.buf[(1 * grid.cols + 1) * 4 + 2] == 0xA7) mark = true;
+    }
+    if (!mark) {
+        std.debug.print("diagnostics mark never appeared without a keypress:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(mark);
+
+    // Edit once (didChange → mock pushes the empty list). The mark must
+    // vanish with NO further keypress. Ctrl+e hides the completion menu the
+    // mock's answer would open; Esc leaves insert.
+    try sess.send("iX\x05\x1b");
+    waited = 0;
+    var cleared = false;
+    while (!cleared) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        const gutter = grid.buf[(1 * grid.cols + 1) * 4 ..][0..3];
+        if (!(gutter[0] == 0xEF and gutter[1] == 0x91 and gutter[2] == 0xA7)) cleared = true;
+    }
+    if (!cleared) {
+        std.debug.print("stale diagnostics mark survived the clear push:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(cleared);
+
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "lsp: jk exit re-syncs the phantom 'j' removal (no stale diagnostic)" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}jksync.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const a = 1;\n");
+    }
+
+    // jk_sync pushes an error diagnostic whenever its latest document text
+    // starts with 'j'. Regression for the reported bug: 'i' then 'j' then
+    // 'k' inserts a 'j' (didChange #1 carries the phantom) and removes it on
+    // exit — the removal must send didChange #2, or the server keeps
+    // analyzing "jconst a = 1;" forever: a phantom ✖ in the gutter (real
+    // zls reports "expected ',' after field" at col 0) and inlay hints
+    // computed against text that never existed.
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{
+        "OZ_LSP_CMD=zig-out/bin/mock_lsp",
+        "OZ_MOCK_SCRIPT=jk_sync",
+    });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // i → insert, j → type 'j'. The didChange carries the phantom and the
+    // mock answers with the "phantom j" diagnostic — WAIT for the ✖ to
+    // appear, proving the phantom round-trip works (this happens with or
+    // without the fix; the ✖ glyph is U+F467 = EF 91 A7 in UTF-8).
+    try sess.send("ij");
+    waited = 0;
+    var phantom_seen = false;
+    while (!phantom_seen) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n > 0) {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        } else {
+            waited += 200;
+            if (waited >= 8000) break;
+        }
+        var r: usize = 0;
+        while (r < grid.rows) : (r += 1) {
+            const g = grid.buf[(r * grid.cols + 1) * 4 ..][0..3];
+            if (g[0] == 0xEF and g[1] == 0x91 and g[2] == 0xA7) {
+                phantom_seen = true;
+                break;
+            }
+        }
+    }
+    if (!phantom_seen) {
+        std.debug.print("phantom j mark never appeared:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(phantom_seen);
+
+    // k → jk exit (removes the 'j'). The removal must send didChange #2
+    // ("const a = 1;") so the mock pushes an EMPTY list and the ✖ clears.
+    // Without the fix no second didChange ever arrives and the ✖ stays
+    // forever. Also assert the exit happened and the buffer is intact.
+    try sess.send("k");
+    waited = 0;
+    var phantom_gone = false;
+    while (!phantom_gone) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n > 0) {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        } else {
+            waited += 200;
+            if (waited >= 8000) break;
+        }
+        var r: usize = 0;
+        phantom_gone = true;
+        while (r < grid.rows) : (r += 1) {
+            const g = grid.buf[(r * grid.cols + 1) * 4 ..][0..3];
+            if (g[0] == 0xEF and g[1] == 0x91 and g[2] == 0xA7) {
+                phantom_gone = false;
+                break;
+            }
+        }
+    }
+    if (!phantom_gone) {
+        std.debug.print("phantom j diagnostic stayed after jk exit:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(phantom_gone);
+    try std.testing.expect(!grid.contains("INSERT"));
+    try std.testing.expect(grid.contains("const a = 1"));
+
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
 test "lsp: diagnostics — gutter mark, gl, <leader>sd list" {

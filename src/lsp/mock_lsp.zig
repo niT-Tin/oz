@@ -37,14 +37,30 @@ const json_rpc = @import("../util/json_rpc.zig");
 /// file and expect the diagnostic to surface.
 pub const default_uri = "file:///mock.txt";
 
-/// Built-in behaviors, selected by the first CLI argument.
+/// Built-in behaviors, selected by the first CLI argument (or the
+/// OZ_MOCK_SCRIPT env var when no argument is given — oz's OZ_LSP_CMD hook
+/// is a single argv element and cannot carry a script argument).
 pub const Script = enum {
     hello,
     silent,
+    /// Like `hello`, but the first didChange pushes an EMPTY
+    /// publishDiagnostics (the error is gone). Regression coverage for
+    /// "a diagnostics push must repaint without a keypress".
+    clear_on_change,
+    /// Phantom-'j' detector: after EVERY didChange, inspect the latest
+    /// recorded document text — if it starts with 'j' push an error
+    /// diagnostic at line 0 ("phantom j"), else push an empty list.
+    /// Regression coverage for the jk exit LSP-sync bug: 'i' + 'j' + 'k'
+    /// must send a didChange for BOTH the 'j' insertion and its removal,
+    /// or the server keeps analyzing "jconst …" forever (stale
+    /// diagnostics / inlay hints computed against text that never existed).
+    jk_sync,
 
     pub fn parse(name: []const u8) ?Script {
         if (std.mem.eql(u8, name, "hello")) return .hello;
         if (std.mem.eql(u8, name, "silent")) return .silent;
+        if (std.mem.eql(u8, name, "clear_on_change")) return .clear_on_change;
+        if (std.mem.eql(u8, name, "jk_sync")) return .jk_sync;
         return null;
     }
 };
@@ -59,7 +75,10 @@ pub const State = struct {
     /// URIs seen in textDocument/didOpen, in arrival order (owned).
     opened: std.ArrayList([]u8) = .empty,
     /// textDocument/didChange records: uri + the latest full text (owned).
+    /// Seeded by didOpen, so the FIRST didChange lands at index 1.
     changed: std.ArrayList(ChangeRecord) = .empty,
+    /// clear_on_change script: the empty publishDiagnostics went out.
+    clear_pushed: bool = false,
 
     pub const ChangeRecord = struct {
         uri: []u8,
@@ -213,18 +232,52 @@ pub fn handleMessage(
         // Push diagnostics for the JUST-opened document (uri matches what the
         // client filters on) — pushing at `initialized` races didOpen and the
         // client would drop the diagnostics as belonging to another file.
-        if (script == .hello) {
+        if (script == .hello or script == .clear_on_change) {
             const uri = if (state.opened.items.len > 0) state.opened.items[state.opened.items.len - 1] else default_uri;
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
             const a = arena.allocator();
-            const params = try buildDiagnosticsParams(a, uri);
+            const params = try buildDiagnosticsParams(a, uri, "mock error");
             const body = try json_rpc.encodeNotification(alloc, "textDocument/publishDiagnostics", params);
             errdefer alloc.free(body);
             try out.frames.append(alloc, body);
         }
     } else if (std.mem.eql(u8, method, "textDocument/didChange")) {
         try recordDidChange(alloc, state, msg.params);
+        // clear_on_change: the edit fixed the document — push an empty
+        // diagnostics list so the client must clear the gutter mark (and
+        // repaint without waiting for another keypress).
+        if (script == .clear_on_change and !state.clear_pushed) {
+            state.clear_pushed = true;
+            const uri = if (state.opened.items.len > 0) state.opened.items[state.opened.items.len - 1] else default_uri;
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const params = try buildEmptyDiagnosticsParams(a, uri);
+            const body = try json_rpc.encodeNotification(alloc, "textDocument/publishDiagnostics", params);
+            errdefer alloc.free(body);
+            try out.frames.append(alloc, body);
+        }
+        // jk_sync: the server's document is whatever the LATEST didChange
+        // said. A 'j' insertion followed by a jk-exit deletion must produce
+        // two didChanges; if the deletion is never synced the text still
+        // starts with 'j' and the phantom diagnostic stays published.
+        if (script == .jk_sync) {
+            const uri = if (state.opened.items.len > 0) state.opened.items[state.opened.items.len - 1] else default_uri;
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const phantom = state.changed.items.len > 0 and
+                state.changed.items[state.changed.items.len - 1].text.len > 0 and
+                state.changed.items[state.changed.items.len - 1].text[0] == 'j';
+            const params = if (phantom)
+                try buildDiagnosticsParams(a, uri, "phantom j")
+            else
+                try buildEmptyDiagnosticsParams(a, uri);
+            const body = try json_rpc.encodeNotification(alloc, "textDocument/publishDiagnostics", params);
+            errdefer alloc.free(body);
+            try out.frames.append(alloc, body);
+        }
     } else if (std.mem.eql(u8, method, "exit")) {
         state.exit_requested = true;
     }
@@ -559,7 +612,7 @@ fn buildSymbolResult(a: std.mem.Allocator) !std.json.Value {
     return .{ .array = syms };
 }
 
-fn buildDiagnosticsParams(a: std.mem.Allocator, uri: []const u8) !std.json.Value {
+fn buildDiagnosticsParams(a: std.mem.Allocator, uri: []const u8, message: []const u8) !std.json.Value {
     var start = try std.json.ObjectMap.init(a, &.{}, &.{});
     try start.put(a, "line", .{ .integer = 0 });
     try start.put(a, "character", .{ .integer = 0 });
@@ -575,11 +628,20 @@ fn buildDiagnosticsParams(a: std.mem.Allocator, uri: []const u8) !std.json.Value
     var diag = try std.json.ObjectMap.init(a, &.{}, &.{});
     try diag.put(a, "range", .{ .object = range });
     try diag.put(a, "severity", .{ .integer = 1 }); // DiagnosticSeverity.Error
-    try diag.put(a, "message", .{ .string = "mock error" });
+    try diag.put(a, "message", .{ .string = message });
 
     var diags = std.json.Array.init(a);
     try diags.append(.{ .object = diag });
 
+    var params = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try params.put(a, "uri", .{ .string = uri });
+    try params.put(a, "diagnostics", .{ .array = diags });
+    return .{ .object = params };
+}
+
+/// publishDiagnostics params with an empty list: "all problems fixed".
+fn buildEmptyDiagnosticsParams(a: std.mem.Allocator, uri: []const u8) !std.json.Value {
+    const diags = std.json.Array.init(a);
     var params = try std.json.ObjectMap.init(a, &.{}, &.{});
     try params.put(a, "uri", .{ .string = uri });
     try params.put(a, "diagnostics", .{ .array = diags });
@@ -677,6 +739,10 @@ fn printUsage(io: std.Io) void {
         \\           answers completion/hover with canned results; all other
         \\           requests get a null result.
         \\  silent  handshake only; never pushes diagnostics proactively.
+        \\  jk_sync pushes an error diagnostic ("phantom j") whenever its
+        \\           document starts with 'j', else an empty list — detects
+        \\           a didChange for a 'j' insertion whose jk-exit removal
+        \\           was never synced.
         \\
         \\options:
         \\  --verbose  log received/sent messages to stderr
@@ -716,6 +782,16 @@ pub fn main(init: std.process.Init) !void {
             writeStderr(io, "mock_lsp: unexpected argument '{s}'\n", .{arg});
             printUsage(io);
             std.process.exit(2);
+        }
+    }
+    // env fallback: OZ_LSP_CMD injects the mock as a single argv element, so
+    // e2e passes the script via OZ_MOCK_SCRIPT instead.
+    if (!script_set) {
+        if (init.environ_map.get("OZ_MOCK_SCRIPT")) |name| {
+            script = Script.parse(name) orelse {
+                writeStderr(io, "mock_lsp: unknown OZ_MOCK_SCRIPT '{s}'\n", .{name});
+                std.process.exit(2);
+            };
         }
     }
 
@@ -1071,6 +1147,40 @@ test "exit notification sets exit_requested" {
     defer out.deinit(alloc);
     try testing.expect(state.exit_requested);
     try testing.expectEqual(@as(usize, 0), out.frames.items.len);
+}
+
+test "jk_sync: phantom 'j' in the doc pushes the error; corrected text pushes empty" {
+    const alloc = testing.allocator;
+    var state = State{};
+    defer state.deinit(alloc);
+    const open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///a.zig\",\"version\":1,\"text\":\"const a = 1;\\n\"}}}";
+    var out_open = try handleContent(alloc, .jk_sync, &state, open);
+    defer out_open.deinit(alloc);
+    // didOpen: "const a = 1;" does not start with 'j' — no push at open.
+    try testing.expectEqual(@as(usize, 0), out_open.frames.items.len);
+
+    // 'j' typed in insert mode: didChange carries the phantom.
+    const with_j = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///a.zig\",\"version\":2},\"contentChanges\":[{\"text\":\"jconst a = 1;\\n\"}]}}";
+    var out_j = try handleContent(alloc, .jk_sync, &state, with_j);
+    defer out_j.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), out_j.frames.items.len);
+    var msg_j = try json_rpc.parseMessage(alloc, out_j.frames.items[0]);
+    defer msg_j.deinit(alloc);
+    const diags_j = msg_j.params.?.object.get("diagnostics").?.array;
+    try testing.expectEqual(@as(usize, 1), diags_j.items.len);
+    try testing.expectEqualStrings("phantom j", diags_j.items[0].object.get("message").?.string);
+
+    // jk exit deleted the 'j': a second didChange with the corrected text
+    // must arrive and clear the phantom — the e2e regression asserts the
+    // editor actually sends it.
+    const fixed = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///a.zig\",\"version\":3},\"contentChanges\":[{\"text\":\"const a = 1;\\n\"}]}}";
+    var out_fixed = try handleContent(alloc, .jk_sync, &state, fixed);
+    defer out_fixed.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), out_fixed.frames.items.len);
+    var msg_fixed = try json_rpc.parseMessage(alloc, out_fixed.frames.items[0]);
+    defer msg_fixed.deinit(alloc);
+    const diags_fixed = msg_fixed.params.?.object.get("diagnostics").?.array;
+    try testing.expectEqual(@as(usize, 0), diags_fixed.items.len);
 }
 
 test "format: whole-doc edit is in range and covers the real document" {

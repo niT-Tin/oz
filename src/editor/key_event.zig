@@ -111,6 +111,10 @@ pub const ActionId = enum {
     next_buffer, // gt — next tab
     prev_buffer, // gT — previous tab
     enter_command_mode, // :
+    search_forward, // / — buffer search via the cmdline (DESIGN.md §6.7)
+    search_backward, // ?
+    search_next, // n — repeat last search in the same direction
+    search_prev, // N — repeat last search in the opposite direction
     normal_mode, // esc / ctrl-c
     insert_exit, // jk special-cased by Mode
     flip_visual, // visual 'o': swap anchor and cursor
