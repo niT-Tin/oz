@@ -932,7 +932,8 @@ const App = struct {
                 return;
             }
             if (key.codepoint == vaxis.Key.backspace) {
-                try self.deleteBeforeCursor();
+                // between an empty auto-pair, backspace deletes both sides
+                if (!try self.autoPairBackspace()) try self.deleteBeforeCursor();
                 return;
             }
             if (key.codepoint == 'w' and key.mods.ctrl) {
@@ -967,7 +968,11 @@ const App = struct {
             }
             self.prev_insert_key = key;
             if (key.text) |text| {
-                try self.insertText(text);
+                // auto-pairs: openers/quotes close themselves (cursor lands
+                // between), closers skip over an identical closer. The
+                // signature-help / auto-suggest triggers below still apply.
+                const paired = try self.autoPairInsert(text);
+                if (!paired) try self.insertText(text);
                 // Signature help: typing '(' asks the language server for
                 // the callee's signature and shows it in the floating window
                 // (LSP signatureHelp; the response arrives via the wake
@@ -2771,6 +2776,81 @@ const App = struct {
         // clearing + re-requesting on every keystroke makes the view flicker)
         self.adjustInlayHintsInsert(line, col, text);
         self.markDirty();
+    }
+
+    // ---- auto-pairs (insert mode): 括号/引号自动闭合与跳过 ----
+
+    /// Matching closer for an opener; the quote chars pair with themselves.
+    fn pairCloser(ch: u8) ?u8 {
+        return switch (ch) {
+            '(' => ')',
+            '[' => ']',
+            '{' => '}',
+            '"', '\'', '`' => ch,
+            else => null,
+        };
+    }
+
+    /// Auto-pair handling for one typed character (insert mode, single
+    /// cursor — multi-cursor edits go through handleMcInsertKey and stay
+    /// literal). Returns true when the key was handled here:
+    /// - opener: insert the pair, cursor ends up between the two
+    /// - quote: same, but not right after a word char ("don't"), and typing
+    ///   the quote again over an identical quote skips over it
+    /// - closer: when the cursor sits on that same closer, skip over it
+    ///   instead of inserting a duplicate
+    fn autoPairInsert(self: *App, text: []const u8) !bool {
+        if (text.len != 1) return false;
+        const ch = text[0];
+        const pos = self.curCursor().*;
+        const len = self.cur().pt.len();
+        switch (ch) {
+            '(', '[', '{' => {
+                try self.insertText(&[_]u8{ ch, pairCloser(ch).? });
+                self.curCursor().* = pos + 1;
+                return true;
+            },
+            '"', '\'', '`' => {
+                if (pos < len and self.cur().pt.byteAt(pos) == ch) {
+                    self.curCursor().* = pos + 1; // skip over
+                    return true;
+                }
+                if (pos > 0 and isWordByte(self.cur().pt.byteAt(pos - 1))) return false;
+                try self.insertText(&[_]u8{ ch, ch });
+                self.curCursor().* = pos + 1;
+                return true;
+            },
+            ')', ']', '}' => {
+                if (pos < len and self.cur().pt.byteAt(pos) == ch) {
+                    self.curCursor().* = pos + 1; // skip over
+                    return true;
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    /// Backspace between an empty pair (`(|)`, `"|"`, …) deletes both sides
+    /// as one undo record. Returns true when it handled the keypress.
+    fn autoPairBackspace(self: *App) !bool {
+        const pos = self.curCursor().*;
+        if (pos == 0 or pos >= self.cur().pt.len()) return false;
+        const open = self.cur().pt.byteAt(pos - 1);
+        const closer = pairCloser(open) orelse return false;
+        if (self.cur().pt.byteAt(pos) != closer) return false;
+        if (!self.in_insert) {
+            self.cur().history.beginGroup();
+            self.in_insert = true;
+        }
+        const start = pos - 1;
+        const line = self.cur().pt.lineOf(start);
+        const col = start - self.cur().pt.lineStart(line);
+        try self.cur().history.record(&self.cur().pt, start, 2, "");
+        self.curCursor().* = start;
+        self.adjustInlayHintsDelete(line, col, &[_]u8{ open, closer });
+        self.markDirty();
+        return true;
     }
 
     /// Visual-selection end semantics: vim's character-wise selection includes

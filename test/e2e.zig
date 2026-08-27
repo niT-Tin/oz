@@ -1063,6 +1063,94 @@ test "insert mode: jk leaves no chars, backspace and ctrl-w delete" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+test "auto-pairs: openers close, closers skip, backspace deletes empty pair" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "xyz\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // '(' pairs to '()' with the cursor between; typing ')' over the
+    // auto-inserted closer skips it (no duplicate).
+    try sess.send("$a(ab);");
+    waited = 0;
+    while (!grid.contains("xyz(ab);")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("xyz(ab);"));
+    try std.testing.expect(!grid.contains("xyz(ab));"));
+
+    // quotes pair too, and a second '"' skips over the auto-inserted one.
+    // (Esc twice: the first may only close an open completion menu.)
+    try sess.send("\x1b\x1bo\"ab\";");
+    waited = 0;
+    while (!grid.contains("\"ab\";")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("\"ab\";"));
+    try std.testing.expect(!grid.contains("\"ab\"\";"));
+
+    // backspace between the braces of an empty pair deletes BOTH sides
+    try sess.send("\x1b\x1bo{\x7fz;");
+    waited = 0;
+    while (!grid.contains("z;")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("z;"));
+    try std.testing.expect(!grid.contains("{z"));
+
+    try sess.send("\x1b\x1b"); // first Esc may only close the completion menu
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
 test "M1a: text objects, visual ops, yank/paste, easymotion" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
