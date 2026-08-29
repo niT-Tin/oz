@@ -34,6 +34,10 @@ pub const std_options: std.Options = .{
 
 const status_row_count: u32 = 1;
 
+/// Current-line blame CursorHold delay (ms) — nvim updatetime-style; the
+/// ghost appears this long after the cursor settles (<leader>tb).
+const blame_hold_ms: i64 = 1000;
+
 /// LSP navigation request kinds (K / gd / gD / gr / gI / gs).
 const NavAction = enum { none, hover, definition, declaration, references, implementation, signature };
 
@@ -340,6 +344,12 @@ const App = struct {
     git_blame: ?git.Blame = null,
     /// Inline blame panel visibility (<leader>tb).
     blame_active: bool = false,
+    /// Current-line blame ghost (nvim gitsigns style): the blame of the
+    /// cursor line shows as end-of-line dim text, 1s after the cursor
+    /// settles (CursorHold). Fields track the hold: the last cursor byte
+    /// offset seen by the renderer and when it changed.
+    blame_last_cursor: u32 = 0,
+    blame_move_ms: i64 = 0,
     /// Hunk preview float (<leader>hp); owned patch text.
     git_preview: ?GitPreview = null,
     /// <leader>hp hit while the diff was stale: show the preview when the
@@ -4208,7 +4218,8 @@ const App = struct {
         self.git_preview = null;
     }
 
-    /// <leader>tb — toggle the inline blame panel.
+    /// <leader>tb — toggle the current-line blame ghost (end-of-line dim
+    /// text on the cursor line, 1s CursorHold delay — nvim gitsigns style).
     fn toggleBlame(self: *App) void {
         if (self.blame_active) {
             self.blame_active = false;
@@ -8066,72 +8077,6 @@ const App = struct {
             }
         }
 
-        // Inline blame panel (<leader>tb): a right-anchored float listing
-        // each visible buffer line's "hash author" (git blame). Rows align
-        // with the text lines (folds collapse rows the same way the renderer
-        // does). A dirty buffer hides the data (blame describes the file on
-        // disk) and shows a hint instead.
-        if (self.blame_active) {
-            const bw: u32 = 28;
-            const bx = win.width -| bw;
-            const top = self.contentTop();
-            const bottom = height - status_row_count;
-            const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
-            const panel = win.child(.{
-                .x_off = @intCast(bx),
-                .y_off = @intCast(top),
-                .width = @intCast(bw),
-                .height = @intCast(bottom - top),
-            });
-            panel.fill(.{ .style = .{ .bg = .{ .rgb = self.theme.bg_float } } });
-            // left border column
-            var brow: u32 = top;
-            while (brow < bottom) : (brow += 1) {
-                const border_seg = [_]vaxis.Segment{.{
-                    .text = "│",
-                    .style = border_style,
-                }};
-                _ = win.print(&border_seg, .{ .row_offset = @intCast(brow), .col_offset = @intCast(bx), .wrap = .none });
-            }
-            const inner = bw - 2;
-            const buf = self.cur();
-            const dirty = buf.dirty;
-            var l = self.curViewTop().*;
-            var row: u32 = top;
-            while (l < buf.pt.lineCount() and row < bottom) : (row += 1) {
-                var label: []const u8 = "";
-                var accent = false;
-                if (dirty) {
-                    label = "save to refresh";
-                } else if (self.git_blame) |*bl| {
-                    if (bl.at(l)) |e| {
-                        label = std.fmt.allocPrint(a, "{s} {s}", .{ e.hash7, e.author }) catch "?";
-                        accent = true;
-                    }
-                } else {
-                    label = "loading…";
-                }
-                const fit = cellFitPrefix(win, label, inner);
-                // byte-aware: a multi-byte label ("loading…") has more bytes
-                // than cells — size the buffer for the bytes + pad cells
-                const row_buf = try a.alloc(u8, fit.slice.len + (inner -| fit.cells));
-                @memset(row_buf, ' ');
-                @memcpy(row_buf[0..fit.slice.len], fit.slice);
-                const style: vaxis.Style = if (accent)
-                    .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_float } }
-                else if (dirty or self.git_blame == null)
-                    .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } }
-                else
-                    .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg_float } };
-                const seg = [_]vaxis.Segment{.{
-                    .text = row_buf,
-                    .style = style,
-                }};
-                _ = win.print(&seg, .{ .row_offset = @intCast(row), .col_offset = @intCast(bx + 1), .wrap = .none });
-                l = foldNextLine(buf, l); // folded lines occupy no row
-            }
-        }
-
         // insert-mode completion menu (Ctrl+n / auto-suggest): a floating
         // window like nvim's blink.cmp — rounded border, solid bg_float
         // panel, selected row in bg_sel with a Nerd Font kind icon column.
@@ -8236,6 +8181,49 @@ const App = struct {
                             _ = win.print(&seg, .{
                                 .row_offset = @intCast(ghost_line - self.curViewTop().* + cur_rect.row),
                                 .col_offset = @intCast(cur_rect.col + gutter + ghost_col),
+                                .wrap = .none,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Current-line blame ghost (<leader>tb, nvim gitsigns style): the
+        // blame of the CURSOR line renders as dim end-of-line virtual
+        // text — "<author>, HH:MM - <summary>" — 1s after the cursor
+        // settles (CursorHold), hidden again while it moves. Mirrors the
+        // nvim config: current_line_blame virt_text at eol, formatter
+        // '<author>, <author_time:%R> - <summary>'.
+        {
+            const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
+            if (self.curCursor().* != self.blame_last_cursor) {
+                self.blame_last_cursor = self.curCursor().*;
+                self.blame_move_ms = now_ms;
+            }
+            if (self.blame_active and self.git_blame != null and
+                now_ms - self.blame_move_ms >= blame_hold_ms)
+            {
+                const fbuf = self.cur();
+                const blame_line = fbuf.pt.lineOf(self.curCursor().*);
+                if (self.git_blame.?.at(blame_line)) |e| {
+                    var hm_buf: [5]u8 = undefined;
+                    const hm = formatHm(&hm_buf, e.author_time);
+                    const label = try std.fmt.allocPrint(a, " {s}, {s} - {s}", .{ e.author, hm, e.summary });
+                    // anchor at the END of the line's rendered text
+                    const line_end = fbuf.pt.lineStart(blame_line) + fbuf.pt.lineLen(blame_line);
+                    const end_col = self.lineCellCol(win, blame_line, line_end);
+                    const start_col = cur_rect.col + gutter + end_col;
+                    if (start_col < win.width) {
+                        const fit = cellFitPrefix(win, label, win.width - start_col);
+                        if (fit.cells > 0) {
+                            const seg = [_]vaxis.Segment{.{
+                                .text = fit.slice,
+                                .style = .{ .dim = true },
+                            }};
+                            _ = win.print(&seg, .{
+                                .row_offset = @intCast(blame_line - self.curViewTop().* + cur_rect.row),
+                                .col_offset = @intCast(start_col),
                                 .wrap = .none,
                             });
                         }
@@ -8530,6 +8518,15 @@ const App = struct {
         try self.vx.render(self.tty.writer());
     }
 
+    /// True while the current-line blame's 1s CursorHold window is still
+    /// counting (the loop then polls instead of blocking, so the ghost
+    /// appears without a keypress).
+    fn blameHoldActive(self: *App) bool {
+        if (!self.blame_active or self.git_blame == null) return false;
+        const now: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
+        return now - self.blame_move_ms < blame_hold_ms;
+    }
+
     /// True while the scope highlight animation is still spreading: the run
     /// loop then polls instead of blocking in pollEvent, so the spread
     /// advances frame by frame without keypresses.
@@ -8595,7 +8592,7 @@ const App = struct {
             // batch and render once. While the scope highlight is animating,
             // poll instead of blocking so the spread advances frame by frame
             // without keypresses (16ms ≈ 60fps; vaxis diffs the output).
-            if (self.scopeAnimActive()) {
+            if (self.scopeAnimActive() or self.blameHoldActive()) {
                 std.Io.sleep(self.io, .fromMilliseconds(16), .real) catch {};
             } else {
                 try self.loop.pollEvent();
@@ -8779,6 +8776,17 @@ fn runApply(self: *GitJob) void {
         dupOrNull(self.alloc, if (self.op == .stage) "hunk staged" else "hunk reset")
     else
         dupOrNull(self.alloc, std.mem.trim(u8, apply_r.err orelse "", " \t\r\n"));
+}
+
+/// "HH:MM" (24h) from an epoch-seconds timestamp — the nvim formatter's
+/// author_time:%R equivalent (gitsigns current_line_blame_formatter).
+fn formatHm(buf: *[5]u8, epoch_secs: i64) []const u8 {
+    const secs: u64 = if (epoch_secs > 0) @intCast(epoch_secs) else 0;
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const ds = es.getDaySeconds();
+    const h = ds.getHoursIntoDay();
+    const m = ds.getMinutesIntoHour();
+    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}", .{ h, m }) catch "??:??";
 }
 
 /// Number of lines in a hunk patch (for the preview's scroll window).

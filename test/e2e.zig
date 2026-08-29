@@ -11015,13 +11015,16 @@ test "git: gutter signs, ]c hunk jump, hunk stage/reset, blame panel, branch" {
     defer alloc.free(staged2);
     try std.testing.expect(std.mem.indexOf(u8, staged2, "CHANGED") != null);
 
-    // <leader>tb — inline blame panel: short hash + author of HEAD
+    // <leader>tb — current-line blame as end-of-line GHOST text (nvim
+    // gitsigns style): "<author>, HH:MM - <summary>" on the cursor line,
+    // 1s after the cursor settles. The cursor sits on hunk B (it has not
+    // moved since ]c), so the ghost appears once the blame job lands.
     try sess.send(" tb");
-    try std.testing.expect(try Wait.until(&sess, &grid, head[0..7]));
-    try std.testing.expect(grid.contains("E2E Tester"));
-    // toggle off
+    try std.testing.expect(try Wait.until(&sess, &grid, "E2E Tester, "));
+    try std.testing.expect(grid.contains(" - init"));
+    // toggle off — the ghost disappears
     try sess.send(" tb");
-    try std.testing.expect(try Wait.untilGone(&sess, &grid, head[0..7]));
+    try std.testing.expect(try Wait.untilGone(&sess, &grid, "E2E Tester,"));
 
     // untracked file: every line reads as added — open b.txt, the ▎ sign
     // covers the gutter

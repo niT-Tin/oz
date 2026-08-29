@@ -333,6 +333,7 @@ pub const BlameEntry = struct {
     hash7: []u8, // first 7 chars of the commit hash (owned)
     author: []u8, // author name (owned)
     summary: []u8, // commit summary (owned)
+    author_time: i64 = 0, // epoch seconds (for the "HH:MM" ghost formatter)
 
     fn deinit(self: *BlameEntry, alloc: std.mem.Allocator) void {
         alloc.free(self.hash7);
@@ -396,6 +397,7 @@ pub fn parseBlame(alloc: std.mem.Allocator, text: []const u8) !Blame {
         }
         var author: ?[]const u8 = null;
         var summary: ?[]const u8 = null;
+        var author_time: i64 = 0;
         i += 1;
         while (i < lines.items.len) {
             const hdr = lines.items[i];
@@ -404,6 +406,8 @@ pub fn parseBlame(alloc: std.mem.Allocator, text: []const u8) !Blame {
                 author = hdr["author ".len..];
             } else if (std.mem.startsWith(u8, hdr, "summary ")) {
                 summary = hdr["summary ".len..];
+            } else if (std.mem.startsWith(u8, hdr, "author-time ")) {
+                author_time = std.fmt.parseInt(i64, hdr["author-time ".len..], 10) catch 0;
             }
             i += 1;
         }
@@ -420,6 +424,7 @@ pub fn parseBlame(alloc: std.mem.Allocator, text: []const u8) !Blame {
             .hash7 = hash_copy,
             .author = author_copy,
             .summary = summary_copy,
+            .author_time = author_time,
         });
     }
     return blame;
@@ -675,6 +680,7 @@ test "blame: line-porcelain blocks parse into per-line entries" {
     try testing.expectEqualStrings("abcdef0", e0.hash7);
     try testing.expectEqualStrings("Alice", e0.author);
     try testing.expectEqualStrings("Initial commit", e0.summary);
+    try testing.expectEqual(@as(i64, 1710000000), e0.author_time);
     const e1 = b.at(1).?;
     try testing.expectEqualStrings("0123456", e1.hash7);
     try testing.expectEqualStrings("Bob", e1.author);
