@@ -18,6 +18,7 @@ const json_rpc = @import("util/json_rpc.zig");
 const theme = @import("theme.zig");
 const icons = @import("icons.zig");
 const keymap_list = @import("editor/keymap_list.zig");
+const git = @import("git.zig");
 
 /// Cells a '\t' occupies on screen (vim's shiftwidth-style expansion). The
 /// renderer expands tabs to this many spaces; every width computation that
@@ -38,6 +39,49 @@ const NavAction = enum { none, hover, definition, declaration, references, imple
 
 /// An inlay hint: dim label shown inline at (line, character).
 const InlayHint = struct { line: u32, character: u32, label: []const u8 };
+
+// ---- M3a git: async job plumbing (types live at file scope so the worker
+// thread functions — which are NOT App methods — can reference them) ----
+
+const GitJobKind = enum { status, blame, apply };
+const GitApplyOp = enum { stage, reset };
+
+/// One async git job: the worker thread spawns git, captures stdout/stderr,
+/// fills the result fields and flips `done` (release); the main loop
+/// consumes it (acquire) and joins the thread. Result fields are written by
+/// the thread BEFORE `done.store(true)` — no locking needed. Output buffers
+/// are owned by the job and freed by finishGitJob (after the App moved out
+/// what it keeps).
+const GitJob = struct {
+    kind: GitJobKind,
+    path: []u8, // owned (relative path, as git wants it)
+    /// apply: 0-based final-file line where the target hunk STARTS (from the
+    /// user's diff view). The worker re-diffs and locates the hunk by this
+    /// line — a stale INDEX would otherwise pick the wrong hunk when the
+    /// working tree changed between the view and the apply.
+    hunk_start: u32 = 0,
+    op: GitApplyOp = .stage,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    out: ?[]u8 = null, // status: diff output; blame: blame output
+    branch: ?[]u8 = null, // status: current branch (null = not a repo)
+    untracked: bool = false, // status: file untracked ("??")
+    msg: ?[]u8 = null, // apply: result message
+    thread: ?std.Thread = null,
+    /// Wake callback invoked from the worker thread when the job lands —
+    /// posts an event so the main loop (blocked in pollEvent) wakes and
+    /// drains the job without waiting for a keypress.
+    wake_ctx: ?*anyopaque = null,
+    wake_fn: ?*const fn (ctx: *anyopaque) void = null,
+};
+
+/// Hunk preview float (<leader>hp): the raw patch text of the hunk under
+/// the cursor, shown in a floating window until Esc/Enter/q.
+const GitPreview = struct {
+    text: []u8, // owned (patch)
+    top: usize, // scroll offset
+};
 
 /// Pending 'r{char}' capture: the count from '3r', the char filled when the
 /// next plain key arrives (normal mode only).
@@ -277,6 +321,34 @@ const App = struct {
     /// on the selected row of the float.
     nav_float_row: u32 = 0,
     nav_float_col: u32 = 0,
+
+    // ---- M3a git (gutter / hunks / blame / lazygit) ----
+    /// In-flight async git job (one at a time). See GitJob.
+    git_job: ?*GitJob = null,
+    /// A status refresh was requested while a job was running: when the
+    /// current job completes, spawn another status job (keeps branch/marks
+    /// fresh across fast open/save sequences).
+    git_refresh_pending: bool = false,
+    /// Branch of the current file's repo (owned), null when not a repo.
+    git_branch: ?[]u8 = null,
+    /// Parsed diff for the current file (owned).
+    git_diff: git.FileDiff = .{},
+    /// Path the diff/branch were computed for (owned, absolute) — the marks
+    /// only render when it still matches the current buffer.
+    git_diff_path: ?[]u8 = null,
+    /// Parsed blame for the current file (owned).
+    git_blame: ?git.Blame = null,
+    /// Inline blame panel visibility (<leader>tb).
+    blame_active: bool = false,
+    /// Hunk preview float (<leader>hp); owned patch text.
+    git_preview: ?GitPreview = null,
+    /// <leader>hp hit while the diff was stale: show the preview when the
+    /// status job lands.
+    git_preview_pending: bool = false,
+    /// A non-status job (blame) requested while another job was running —
+    /// spawn it once the current job finishes (status refreshes use
+    /// git_refresh_pending instead).
+    git_queued: ?GitJobKind = null,
 
     // insert-mode completion (Ctrl+n and auto-suggest on word chars)
     completion_active: bool = false,
@@ -989,6 +1061,20 @@ const App = struct {
         self.inlay_hints.deinit(self.alloc);
         for (self.completion_words.items) |it| self.alloc.free(it.text);
         self.completion_words.deinit(self.alloc);
+        // M3a git state
+        if (self.git_job) |job| {
+            if (job.thread) |t| t.join(); // let the worker finish, then free
+            self.alloc.free(job.path);
+            if (job.out) |o| self.alloc.free(o);
+            if (job.branch) |b| self.alloc.free(b);
+            if (job.msg) |m| self.alloc.free(m);
+            self.alloc.destroy(job);
+        }
+        if (self.git_branch) |b| self.alloc.free(b);
+        if (self.git_diff_path) |p| self.alloc.free(p);
+        self.git_diff.deinit(self.alloc);
+        if (self.git_blame) |*b| b.deinit(self.alloc);
+        if (self.git_preview) |p| self.alloc.free(p.text);
     }
 
     // ---- input ----
@@ -1017,6 +1103,10 @@ const App = struct {
         // Navigation location list overlay (gr / gI)
         if (self.nav_list_active) {
             if (self.navListKey(key)) return;
+        }
+        // Hunk preview float (<leader>hp): Esc/Enter/q close, j/k scroll
+        if (self.git_preview != null) {
+            if (self.gitPreviewKey(key)) return;
         }
 
         // A status message (e.g. "no candidates") lives until the next
@@ -3280,6 +3370,8 @@ const App = struct {
             return false;
         };
         self.cur().dirty = false;
+        // the file on disk changed: refresh git marks/branch (async)
+        self.scheduleGitStatus();
         try self.setMsg(try std.fmt.allocPrint(self.alloc, "written: {s}", .{path}));
         return true;
     }
@@ -3881,6 +3973,281 @@ const App = struct {
         self.alloc.free(node.name);
         self.alloc.free(node.path);
         self.alloc.destroy(node);
+    }
+
+    // ---- M3a git (async jobs + hunk/blame/lazygit actions) ----
+
+    /// Spawn one async git job for `path`. One job at a time: when a job is
+    /// already running, a status request is remembered (git_refresh_pending)
+    /// and re-spawned after the current one lands; other kinds are dropped
+    /// (the user can retry).
+    fn spawnGitJob(self: *App, kind: GitJobKind, path: []const u8, hunk_start: u32, op: GitApplyOp) !void {
+        if (self.git_job != null) {
+            if (kind == .status) {
+                self.git_refresh_pending = true;
+            } else {
+                self.git_queued = kind; // blame etc. — retried after the job
+            }
+            return;
+        }
+        const job = try self.alloc.create(GitJob);
+        errdefer self.alloc.destroy(job);
+        job.* = .{
+            .kind = kind,
+            .path = try self.alloc.dupe(u8, path),
+            .hunk_start = hunk_start,
+            .op = op,
+            .alloc = self.alloc,
+            .io = self.io,
+        };
+        errdefer self.alloc.free(job.path);
+        job.wake_ctx = self;
+        job.wake_fn = lspWake; // same trick as the LSP reader thread
+        job.thread = try std.Thread.spawn(.{}, gitJobMain, .{job});
+        self.git_job = job;
+    }
+
+    /// Main loop: consume a finished job (join the thread first), repaint.
+    fn consumeGitJob(self: *App, job: *GitJob) void {
+        job.thread.?.join();
+        defer self.finishGitJob(job);
+        switch (job.kind) {
+            .status => {
+                // replace the diff/branch state wholesale
+                if (self.git_branch) |b| self.alloc.free(b);
+                if (self.git_diff_path) |p| self.alloc.free(p);
+                self.git_diff.deinit(self.alloc);
+                self.git_diff = .{};
+                self.git_diff_path = dupOrNull(self.alloc, job.path);
+                self.git_branch = job.branch; // thread-owned → App-owned
+                job.branch = null;
+                if (job.out) |o| {
+                    // parseDiff copies what it keeps — job.out stays owned by
+                    // the job and finishGitJob frees it below
+                    self.git_diff = git.parseDiff(self.alloc, o) catch git.FileDiff{};
+                }
+                // untracked must land even when the diff output is EMPTY
+                // (git diff prints nothing for an untracked file — without
+                // this the all-added marks never appeared)
+                self.git_diff.untracked = job.untracked;
+                if (self.git_preview_pending) {
+                    self.git_preview_pending = false;
+                    self.showHunkPreview();
+                }
+            },
+            .blame => {
+                if (self.git_blame) |*b| b.deinit(self.alloc);
+                self.git_blame = null;
+                // blame must describe the CURRENT file; a stale response
+                // (buffer switched mid-job) is dropped
+                if (job.out) |o| {
+                    if (self.cur().path) |cp| {
+                        if (std.mem.eql(u8, cp, job.path)) {
+                            self.git_blame = git.parseBlame(self.alloc, o) catch null;
+                        }
+                    }
+                    // job.out freed by finishGitJob (blame output is owned)
+                }
+                if (self.git_blame == null) self.blame_active = false;
+            },
+            .apply => {
+                if (job.msg) |m| {
+                    self.setMsg(m) catch {};
+                    job.msg = null;
+                } else if (dupOrNull(self.alloc, "git apply failed")) |m| {
+                    self.setMsg(m) catch {};
+                }
+                // the working tree changed (staged/reset): refresh the marks
+                if (self.cur().path) |p| self.spawnGitJob(.status, p, 0, .stage) catch {};
+            },
+        }
+    }
+
+    fn finishGitJob(self: *App, job: *GitJob) void {
+        self.alloc.free(job.path);
+        if (job.out) |o| self.alloc.free(o);
+        if (job.branch) |b| self.alloc.free(b);
+        if (job.msg) |m| self.alloc.free(m);
+        self.alloc.destroy(job);
+        self.git_job = null;
+        // resume work requested while the slot was busy: a stale status
+        // refresh first, then any queued non-status job (blame)
+        if (self.git_refresh_pending) {
+            self.git_refresh_pending = false;
+            if (self.cur().path) |p| self.spawnGitJob(.status, p, 0, .stage) catch {};
+        } else if (self.git_queued) |k| {
+            self.git_queued = null;
+            if (k == .blame) {
+                if (self.cur().path) |p| {
+                    self.blame_active = true;
+                    self.spawnGitJob(.blame, p, 0, .stage) catch {
+                        self.blame_active = false;
+                    };
+                }
+            }
+        }
+    }
+
+    /// Refresh branch + diff marks for the current buffer (async). Called on
+    /// file open/switch and after save. The gutter only ever shows a diff of
+    /// what's on disk — a dirty buffer hides the marks anyway.
+    fn scheduleGitStatus(self: *App) void {
+        const path = self.cur().path orelse return;
+        self.spawnGitJob(.status, path, 0, .stage) catch {};
+    }
+
+    /// ]c / [c — jump to the next/previous hunk of the current file.
+    fn gotoHunk(self: *App, forward: bool) void {
+        const path = self.cur().path orelse return;
+        if (self.cur().dirty) {
+            if (dupOrNull(self.alloc, "save first (marks describe the file on disk)")) |m| self.setMsg(m) catch {};
+            return;
+        }
+        if (self.git_diff_path == null or !std.mem.eql(u8, self.git_diff_path.?, path)) {
+            if (dupOrNull(self.alloc, "git state loading…")) |m| self.setMsg(m) catch {};
+            return;
+        }
+        const cursor_line = self.cur().pt.lineOf(self.curCursor().*);
+        const idx = if (forward)
+            self.git_diff.hunkAtOrAfter(cursor_line + 1)
+        else
+            self.git_diff.hunkBefore(cursor_line);
+        const i = idx orelse {
+            if (dupOrNull(self.alloc, if (forward) "no more hunks" else "no previous hunks")) |m| self.setMsg(m) catch {};
+            return;
+        };
+        const start = self.git_diff.hunks.items[i].start_line;
+        const pt = &self.cur().pt;
+        const line = @min(start, pt.lineCount() -| 1);
+        self.curCursor().* = pt.lineStart(line);
+        // scroll the target into view (same as the grep-picker jump)
+        self.curViewTop().* = line;
+    }
+
+    /// <leader>hs / <leader>hr — stage / reset the hunk under the cursor.
+    fn applyHunk(self: *App, op: GitApplyOp) void {
+        const path = self.cur().path orelse return;
+        if (self.cur().dirty) {
+            if (dupOrNull(self.alloc, "save first (hunk ops apply to the file on disk)")) |m| self.setMsg(m) catch {};
+            return;
+        }
+        if (self.git_diff_path == null or !std.mem.eql(u8, self.git_diff_path.?, path)) {
+            if (dupOrNull(self.alloc, "git state loading…")) |m| self.setMsg(m) catch {};
+            return;
+        }
+        const cursor_line = self.cur().pt.lineOf(self.curCursor().*);
+        const idx = self.git_diff.hunkAt(cursor_line) orelse {
+            if (self.git_diff.untracked) {
+                self.spawnGitJob(.apply, path, 0, op) catch {};
+                return;
+            }
+            if (dupOrNull(self.alloc, "cursor not in a hunk")) |m| self.setMsg(m) catch {};
+            return;
+        };
+        const start = self.git_diff.hunks.items[idx].start_line;
+        self.spawnGitJob(.apply, path, start, op) catch {};
+    }
+
+    /// <leader>hp — show the hunk under the cursor in a floating window.
+    fn previewHunk(self: *App) void {
+        const path = self.cur().path orelse return;
+        if (self.cur().dirty) {
+            if (dupOrNull(self.alloc, "save first (the preview describes the file on disk)")) |m| self.setMsg(m) catch {};
+            return;
+        }
+        if (self.git_diff_path == null or !std.mem.eql(u8, self.git_diff_path.?, path)) {
+            self.git_preview_pending = true;
+            self.spawnGitJob(.status, path, 0, .stage) catch {};
+            return;
+        }
+        self.showHunkPreview();
+    }
+
+    fn showHunkPreview(self: *App) void {
+        const path = self.cur().path orelse return;
+        if (self.git_diff_path == null or !std.mem.eql(u8, self.git_diff_path.?, path)) return;
+        if (self.git_diff.untracked) {
+            if (dupOrNull(self.alloc, "untracked file — no diff to preview")) |m| self.setMsg(m) catch {};
+            return;
+        }
+        const cursor_line = self.cur().pt.lineOf(self.curCursor().*);
+        const idx = self.git_diff.hunkAt(cursor_line) orelse {
+            if (dupOrNull(self.alloc, "cursor not in a hunk")) |m| self.setMsg(m) catch {};
+            return;
+        };
+        const patch = self.git_diff.hunks.items[idx].patch;
+        const copy = dupOrNull(self.alloc, patch) orelse return;
+        self.git_preview = .{ .text = copy, .top = 0 };
+    }
+
+    /// Keys while the hunk preview float is open. Returns true when consumed.
+    fn gitPreviewKey(self: *App, key: vaxis.Key) bool {
+        switch (key.codepoint) {
+            vaxis.Key.escape, vaxis.Key.enter, 'q' => {
+                self.closeGitPreview();
+                return true;
+            },
+            'j', vaxis.Key.down => {
+                if (self.git_preview) |*p| {
+                    if (p.top + 1 < gitPreviewLineCount(p.text)) p.top += 1;
+                }
+                return true;
+            },
+            'k', vaxis.Key.up => {
+                if (self.git_preview) |*p| {
+                    if (p.top > 0) p.top -= 1;
+                }
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    fn closeGitPreview(self: *App) void {
+        if (self.git_preview) |p| self.alloc.free(p.text);
+        self.git_preview = null;
+    }
+
+    /// <leader>tb — toggle the inline blame panel.
+    fn toggleBlame(self: *App) void {
+        if (self.blame_active) {
+            self.blame_active = false;
+            return;
+        }
+        const path = self.cur().path orelse return;
+        self.blame_active = true;
+        self.spawnGitJob(.blame, path, 0, .stage) catch {
+            self.blame_active = false;
+        };
+    }
+
+    /// <leader>lg — launch lazygit in an external terminal emulator
+    /// (design: "外部浮窗先行" — a real PTY pane is M3b). Uses $TERMINAL,
+    /// falling back to x-terminal-emulator / xterm.
+    fn launchLazygit(self: *App) void {
+        const term = self.env_map.get("TERMINAL") orelse "x-terminal-emulator";
+        var proc = std.process.spawn(self.io, .{
+            .argv = &.{ term, "-e", "lazygit" },
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        }) catch |e| {
+            const m = std.fmt.allocPrint(self.alloc, "lazygit: {s}", .{@errorName(e)}) catch return;
+            self.setMsg(m) catch {};
+            return;
+        };
+        // reap in a detached thread so a long-lived lazygit never blocks
+        // deinit (a zombie child would linger until oz exits otherwise)
+        const t = std.Thread.spawn(.{}, struct {
+            fn reap(io: std.Io, p: std.process.Child) void {
+                var c = p; // wait() needs a mutable Child
+                _ = c.wait(io) catch {};
+            }
+        }.reap, .{ self.io, proc }) catch {
+            proc.kill(self.io);
+            return;
+        };
+        t.detach();
     }
 
     // ---- fuzzy picker (<leader>sf) ----
@@ -4546,6 +4913,10 @@ const App = struct {
         self.clearHover();
         self.nav_list_active = false;
         self.closeCompletion();
+        self.closeGitPreview();
+        self.blame_active = false;
+        // git branch + diff marks describe the newly focused buffer
+        self.scheduleGitStatus();
     }
 
     /// Move `delta` buffers (wrapping). gt / gT.
@@ -5480,6 +5851,14 @@ const App = struct {
             .close_buffer => self.closeCurrentBuffer(),
             .filetree_toggle => try self.toggleFiletree(),
             .filetree_locate => try self.locateInFiletree(),
+            // M3 git
+            .hunk_next => self.gotoHunk(true),
+            .hunk_prev => self.gotoHunk(false),
+            .hunk_stage => self.applyHunk(.stage),
+            .hunk_reset => self.applyHunk(.reset),
+            .hunk_preview => self.previewHunk(),
+            .blame_toggle => self.toggleBlame(),
+            .git_lazygit => self.launchLazygit(),
             .paste => try self.pasteBuffer(false, count),
             .paste_before => try self.pasteBuffer(true, count),
             .delete_char => {
@@ -6294,6 +6673,30 @@ const App = struct {
                 }
             }
 
+            // Git sign (M3a) for the same last gutter cell, when the line
+            // carries no diagnostic mark. Only for a CLEAN buffer: the diff
+            // describes the file on disk, and while dirty the marks would
+            // lie about the visible text (they return after :w refreshes).
+            // Also only when the diff was computed for THIS buffer's path.
+            var git_mark: ?git.LineKind = null;
+            var git_mark_fg: ?vaxis.Style = null;
+            if (w.buf == self.current and !buf.dirty) {
+                if (self.git_diff_path) |dp| {
+                    if (buf.path) |cp| {
+                        if (std.mem.eql(u8, dp, cp)) {
+                            if (self.git_diff.markAt(line)) |k| {
+                                git_mark = k;
+                                git_mark_fg = switch (k) {
+                                    .added => .{ .fg = .{ .rgb = self.theme.git_add } },
+                                    .modified => .{ .fg = .{ .rgb = self.theme.git_mod } },
+                                    .removed_above, .removed_below => .{ .fg = .{ .rgb = self.theme.git_del } },
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+
             const line_len = buf.pt.lineLen(line);
             const line_start = buf.pt.lineStart(line);
             // the row also carries the gutter (rect.col + gutter), so the
@@ -6632,6 +7035,21 @@ const App = struct {
                 if (diag_mark_fg) |f| mark_style.fg = f.fg;
                 win.writeCell(@intCast(rect.col + gutter - 1), @intCast(row), .{
                     .char = .{ .grapheme = diag_mark, .width = 1 },
+                    .style = mark_style,
+                });
+            } else if (git_mark) |k| {
+                // git sign in the same cell (diagnostics win the priority).
+                // Glyphs: ▎ for added/modified, ▁/▔ half-blocks for deleted
+                // (signify-style markers on the neighbor lines).
+                var mark_style = cursorline_style;
+                if (git_mark_fg) |f| mark_style.fg = f.fg;
+                const glyph: []const u8 = switch (k) {
+                    .added, .modified => "\u{258e}", // ▎ left half block
+                    .removed_above => "\u{2581}", // ▁ lower eighth block
+                    .removed_below => "\u{2594}", // ▔ upper eighth block
+                };
+                win.writeCell(@intCast(rect.col + gutter - 1), @intCast(row), .{
+                    .char = .{ .grapheme = glyph, .width = 1 },
                     .style = mark_style,
                 });
             }
@@ -7560,6 +7978,74 @@ const App = struct {
                 // cell-truncate the label to the interior width so a long
                 // outline name never overflows the panel
                 const fit = cellFitPrefix(win, label, inner -| 1);
+                const row = try a.alloc(u8, fit.slice.len + (inner -| 1 -| fit.cells));
+                @memset(row, ' ');
+                @memcpy(row[0..fit.slice.len], fit.slice);
+                try segs.append(a, .{ .text = row, .style = rs });
+                try segs.append(a, .{ .text = "│", .style = border_style });
+                _ = win.print(segs.items, .{ .row_offset = @intCast(start_row + 1 + k), .col_offset = @intCast(start_col), .wrap = .none });
+            }
+            // bottom border
+            {
+                var segs = std.ArrayList(vaxis.Segment).empty;
+                try segs.append(a, .{ .text = "╰", .style = border_style });
+                var cx: u32 = 0;
+                while (cx < inner) : (cx += 1) {
+                    try segs.append(a, .{ .text = "─", .style = border_style });
+                }
+                try segs.append(a, .{ .text = "╯", .style = border_style });
+                _ = win.print(segs.items, .{ .row_offset = @intCast(start_row + 1 + list_rows), .col_offset = @intCast(start_col), .wrap = .none });
+            }
+        }
+
+        // Hunk preview float (<leader>hp): the hunk's raw patch in a
+        // floating window — same visual language as the pickers. '+' lines
+        // green, '-' lines red, hunk headers accent, context dim.
+        if (self.git_preview) |*pv| {
+            const total_lines = gitPreviewLineCount(pv.text);
+            const list_rows = @min(@as(usize, 12), total_lines);
+            if (pv.top + list_rows > total_lines) pv.top = total_lines -| list_rows;
+            // width: 70% of the screen like the grep panel (patch lines are
+            // long); the panel has no input row: title + rows + bottom border
+            const box_w = @min(win.width * 7 / 10, win.width -| 4);
+            const inner = box_w - 2;
+            const box_h: u32 = @as(u32, @intCast(list_rows)) + 2;
+            var start_row = (height -| box_h) / 3;
+            if (start_row < 1) start_row = 1;
+            if (start_row + box_h >= height) start_row = height -| box_h;
+            const start_col = (win.width -| box_w) / 2;
+            const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
+            const row_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } };
+            // top border + title
+            {
+                var segs = std.ArrayList(vaxis.Segment).empty;
+                try segs.append(a, .{ .text = "╭", .style = border_style });
+                try segs.append(a, .{ .text = " Hunk ", .style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_float } } });
+                var cx: u32 = 1 + 6;
+                while (cx < inner + 1) : (cx += 1) {
+                    try segs.append(a, .{ .text = "─", .style = border_style });
+                }
+                try segs.append(a, .{ .text = "╮", .style = border_style });
+                _ = win.print(segs.items, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(start_col), .wrap = .none });
+            }
+            // split the patch into lines (the stored text ends with '\n')
+            var line_it = std.mem.splitScalar(u8, pv.text, '\n');
+            var k: usize = 0;
+            while (k < list_rows) : (k += 1) {
+                var line = line_it.next() orelse "";
+                if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+                const rs: vaxis.Style = if (line.len > 0)
+                    switch (line[0]) {
+                        '+' => .{ .fg = .{ .rgb = self.theme.git_add }, .bg = .{ .rgb = self.theme.bg_float } },
+                        '-' => .{ .fg = .{ .rgb = self.theme.git_del }, .bg = .{ .rgb = self.theme.bg_float } },
+                        '@' => .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_float } },
+                        else => .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg_float } },
+                    }
+                else
+                    row_style;
+                var segs = std.ArrayList(vaxis.Segment).empty;
+                try segs.append(a, .{ .text = "│", .style = border_style });
+                const fit = cellFitPrefix(win, line, inner -| 1);
                 const row = try a.alloc(u8, @intCast(fit.cells));
                 @memset(row, ' ');
                 @memcpy(row[0..fit.slice.len], fit.slice);
@@ -7577,6 +8063,72 @@ const App = struct {
                 }
                 try segs.append(a, .{ .text = "╯", .style = border_style });
                 _ = win.print(segs.items, .{ .row_offset = @intCast(start_row + 1 + list_rows), .col_offset = @intCast(start_col), .wrap = .none });
+            }
+        }
+
+        // Inline blame panel (<leader>tb): a right-anchored float listing
+        // each visible buffer line's "hash author" (git blame). Rows align
+        // with the text lines (folds collapse rows the same way the renderer
+        // does). A dirty buffer hides the data (blame describes the file on
+        // disk) and shows a hint instead.
+        if (self.blame_active) {
+            const bw: u32 = 28;
+            const bx = win.width -| bw;
+            const top = self.contentTop();
+            const bottom = height - status_row_count;
+            const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
+            const panel = win.child(.{
+                .x_off = @intCast(bx),
+                .y_off = @intCast(top),
+                .width = @intCast(bw),
+                .height = @intCast(bottom - top),
+            });
+            panel.fill(.{ .style = .{ .bg = .{ .rgb = self.theme.bg_float } } });
+            // left border column
+            var brow: u32 = top;
+            while (brow < bottom) : (brow += 1) {
+                const border_seg = [_]vaxis.Segment{.{
+                    .text = "│",
+                    .style = border_style,
+                }};
+                _ = win.print(&border_seg, .{ .row_offset = @intCast(brow), .col_offset = @intCast(bx), .wrap = .none });
+            }
+            const inner = bw - 2;
+            const buf = self.cur();
+            const dirty = buf.dirty;
+            var l = self.curViewTop().*;
+            var row: u32 = top;
+            while (l < buf.pt.lineCount() and row < bottom) : (row += 1) {
+                var label: []const u8 = "";
+                var accent = false;
+                if (dirty) {
+                    label = "save to refresh";
+                } else if (self.git_blame) |*bl| {
+                    if (bl.at(l)) |e| {
+                        label = std.fmt.allocPrint(a, "{s} {s}", .{ e.hash7, e.author }) catch "?";
+                        accent = true;
+                    }
+                } else {
+                    label = "loading…";
+                }
+                const fit = cellFitPrefix(win, label, inner);
+                // byte-aware: a multi-byte label ("loading…") has more bytes
+                // than cells — size the buffer for the bytes + pad cells
+                const row_buf = try a.alloc(u8, fit.slice.len + (inner -| fit.cells));
+                @memset(row_buf, ' ');
+                @memcpy(row_buf[0..fit.slice.len], fit.slice);
+                const style: vaxis.Style = if (accent)
+                    .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_float } }
+                else if (dirty or self.git_blame == null)
+                    .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } }
+                else
+                    .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg_float } };
+                const seg = [_]vaxis.Segment{.{
+                    .text = row_buf,
+                    .style = style,
+                }};
+                _ = win.print(&seg, .{ .row_offset = @intCast(row), .col_offset = @intCast(bx + 1), .wrap = .none });
+                l = foldNextLine(buf, l); // folded lines occupy no row
             }
         }
 
@@ -7928,6 +8480,15 @@ const App = struct {
             .style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_status } },
         }};
         _ = win.print(&status_seg, .{ .row_offset = @intCast(height - 1), .wrap = .none });
+        // git branch (M3a): "  ⎇ main" right after the mode/message text, in
+        // the accent color — the design's StatusLine git component.
+        if (self.git_branch) |b| {
+            const branch_seg = [_]vaxis.Segment{.{
+                .text = try std.fmt.allocPrint(a, "  ⎇ {s}", .{std.mem.trim(u8, b, " \t\r\n")}),
+                .style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_status } },
+            }};
+            _ = win.print(&branch_seg, .{ .row_offset = @intCast(height - 1), .col_offset = @intCast(status.len), .wrap = .none });
+        }
 
         // cursor position — in the file tree when the tree has focus,
         // otherwise in the buffer
@@ -8006,7 +8567,17 @@ const App = struct {
             const outline_ready = self.processOutline();
             const diag_changed = self.diag_dirty;
             self.diag_dirty = false;
-            if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready or diag_changed) {
+            // Consume a completed git job (status refresh / blame / hunk
+            // apply): gutter marks, branch and floats update without a
+            // keypress, same as the LSP slots.
+            var git_ready = false;
+            if (self.git_job) |job| {
+                if (job.done.load(.acquire)) {
+                    self.consumeGitJob(job);
+                    git_ready = true;
+                }
+            }
+            if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready) {
                 try self.render();
                 continue;
             }
@@ -8049,6 +8620,175 @@ const App = struct {
         try self.vx.exitAltScreen(self.tty.writer());
     }
 };
+
+// ---- M3a git worker thread (file scope — not App methods) ----
+
+/// Worker thread entry: run the job, publish the result, then wake the main
+/// loop (which may be blocked in pollEvent).
+fn gitJobMain(job: *GitJob) void {
+    switch (job.kind) {
+        .status => runStatus(job),
+        .blame => runBlame(job),
+        .apply => runApply(job),
+    }
+    job.done.store(true, .release);
+    if (job.wake_fn) |f| {
+        if (job.wake_ctx) |ctx| f(ctx);
+    }
+}
+
+const CmdResult = struct { out: ?[]u8, err: ?[]u8, ok: bool };
+
+/// Run one git command to completion (blocking — worker thread only),
+/// capturing stdout/stderr. Returns owned buffers (null when empty or on
+/// spawn failure).
+fn runGit(self: *GitJob, argv: []const []const u8, stdin_data: ?[]const u8) CmdResult {
+    var proc = std.process.spawn(self.io, .{
+        .argv = argv,
+        .stdin = if (stdin_data != null) .pipe else .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch return .{ .out = null, .err = null, .ok = false };
+    if (stdin_data) |data| {
+        if (proc.stdin) |in| {
+            std.Io.File.writeStreamingAll(in, self.io, data) catch {};
+            // close our write end so the child sees EOF on its stdin (git
+            // apply - reads until EOF), then null the handle so wait()'s
+            // cleanup doesn't double-close it (EBADF → panic)
+            std.Io.File.close(in, self.io);
+            proc.stdin = null;
+        }
+    }
+    var out_buf = std.ArrayList(u8).empty;
+    defer out_buf.deinit(self.alloc);
+    var err_buf = std.ArrayList(u8).empty;
+    defer err_buf.deinit(self.alloc);
+    if (proc.stdout) |out| gitReadAll(self, out, &out_buf);
+    if (proc.stderr) |err| gitReadAll(self, err, &err_buf);
+    const term = proc.wait(self.io) catch return .{ .out = null, .err = null, .ok = false };
+    const ok = term == .exited and term.exited == 0;
+    return .{
+        .out = if (out_buf.items.len > 0) out_buf.toOwnedSlice(self.alloc) catch null else null,
+        .err = if (err_buf.items.len > 0) err_buf.toOwnedSlice(self.alloc) catch null else null,
+        .ok = ok,
+    };
+}
+
+/// Drain a pipe into `buf` until EOF, then close it (worker thread).
+fn gitReadAll(self: *GitJob, file: std.Io.File, buf: *std.ArrayList(u8)) void {
+    var tmp: [8192]u8 = undefined;
+    while (true) {
+        const n = file.readStreaming(self.io, &.{tmp[0..]}) catch break;
+        if (n == 0) break;
+        buf.appendSlice(self.alloc, tmp[0..n]) catch break;
+    }
+    // NOT closed here: child.wait() closes the child's pipes; closing them
+    // early makes its cleanup hit EBADF (recoverableOsBugDetected panics).
+}
+
+fn freeCmdResult(self: *GitJob, r: CmdResult) void {
+    if (r.out) |o| self.alloc.free(o);
+    if (r.err) |e| self.alloc.free(e);
+}
+
+fn dupOrNull(alloc: std.mem.Allocator, s: []const u8) ?[]u8 {
+    return alloc.dupe(u8, s) catch null;
+}
+
+/// status: branch + untracked flag + working-tree diff for `path`.
+fn runStatus(self: *GitJob) void {
+    var branch_r = runGit(self, &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" }, null);
+    defer freeCmdResult(self, branch_r);
+    if (!branch_r.ok) return; // not a git repo — everything stays empty
+    if (branch_r.out) |o| {
+        // take ownership of the original buffer (branch output is "main\n";
+        // the renderer trims). NEVER hand out a shorter slice of the
+        // allocation — DebugAllocator's free validates the size.
+        self.branch = o;
+        branch_r.out = null;
+    }
+    const status_r = runGit(self, &.{ "git", "status", "--porcelain", "--", self.path }, null);
+    defer freeCmdResult(self, status_r);
+    if (status_r.ok) {
+        if (status_r.out) |o| {
+            self.untracked = std.mem.startsWith(u8, o, "??");
+        }
+    }
+    var diff_r = runGit(self, &.{ "git", "diff", "--no-color", "--no-ext-diff", "--", self.path }, null);
+    defer freeCmdResult(self, diff_r);
+    if (diff_r.ok) {
+        self.out = diff_r.out;
+        diff_r.out = null;
+    }
+}
+
+/// blame: `git blame --line-porcelain` output for `path`.
+fn runBlame(self: *GitJob) void {
+    var r = runGit(self, &.{ "git", "blame", "--line-porcelain", "--", self.path }, null);
+    defer freeCmdResult(self, r);
+    if (r.ok) {
+        self.out = r.out;
+        r.out = null;
+    }
+}
+
+/// apply: re-diff in-thread (the user's hunk index must map onto a diff
+/// computed at apply time, or a stale index could touch the wrong hunk),
+/// then stage (git apply --cached) or reset (git apply -R) that hunk.
+/// Untracked files stage whole-file via `git add`.
+fn runApply(self: *GitJob) void {
+    const d = runGit(self, &.{ "git", "diff", "--no-color", "--no-ext-diff", "--", self.path }, null);
+    defer freeCmdResult(self, d);
+    if (!d.ok) {
+        self.msg = dupOrNull(self.alloc, "git diff failed");
+        return;
+    }
+    var diff = git.parseDiff(self.alloc, d.out orelse "") catch {
+        self.msg = dupOrNull(self.alloc, "git diff parse failed");
+        return;
+    };
+    defer diff.deinit(self.alloc);
+    if (diff.untracked) {
+        if (self.op == .stage) {
+            const add_r = runGit(self, &.{ "git", "add", "--", self.path }, null);
+            defer freeCmdResult(self, add_r);
+            self.msg = if (add_r.ok)
+                dupOrNull(self.alloc, "file staged")
+            else
+                dupOrNull(self.alloc, std.mem.trim(u8, add_r.err orelse "", " \t\r\n"));
+        } else {
+            self.msg = dupOrNull(self.alloc, "untracked: nothing to reset");
+        }
+        return;
+    }
+    const target = self.hunk_start;
+    const found = for (diff.hunks.items, 0..) |*h, i| {
+        if (h.start_line == target) break i;
+    } else null;
+    const hi = found orelse {
+        self.msg = dupOrNull(self.alloc, "hunk gone (file changed?)");
+        return;
+    };
+    const patch = diff.hunks.items[hi].patch;
+    const apply_r = if (self.op == .stage)
+        runGit(self, &.{ "git", "apply", "--cached", "-" }, patch)
+    else
+        runGit(self, &.{ "git", "apply", "-R", "-" }, patch);
+    defer freeCmdResult(self, apply_r);
+    self.msg = if (apply_r.ok)
+        dupOrNull(self.alloc, if (self.op == .stage) "hunk staged" else "hunk reset")
+    else
+        dupOrNull(self.alloc, std.mem.trim(u8, apply_r.err orelse "", " \t\r\n"));
+}
+
+/// Number of lines in a hunk patch (for the preview's scroll window).
+fn gitPreviewLineCount(text: []const u8) usize {
+    var n: usize = 1;
+    for (text) |c| {
+        if (c == '\n') n += 1;
+    }
+    return n;
+}
 
 /// Append `haystack` with every occurrence of `pat` replaced by `rep`
 /// (all if `global`, else only the first). Returns the replacement count.
@@ -8339,8 +9079,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // the CLI arg path edits cur() directly (no openInBuffer/switchTo), so
-    // kick the LSP client for the opened filetype here.
+    // kick the LSP client and the git status refresh for the opened filetype
+    // here.
     app.ensureLsp();
+    app.scheduleGitStatus();
     try app.loadRecent();
     defer app.saveRecent() catch {};
     try app.run();

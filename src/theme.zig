@@ -59,6 +59,10 @@ pub const Theme = struct {
     diag_error: Rgb,
     diag_warn: Rgb,
     diag_info: Rgb,
+    // git signs (M3a): added / modified / deleted markers in the gutter
+    git_add: Rgb,
+    git_mod: Rgb,
+    git_del: Rgb,
 };
 
 pub fn rgb(r: u8, g: u8, b: u8) Rgb {
@@ -122,6 +126,9 @@ const kanagawa_wave = Theme{
     .diag_error = rgb(0xE8, 0x24, 0x24), // samuraiRed
     .diag_warn = rgb(0xFF, 0x9E, 0x3B), // roninYellow
     .diag_info = rgb(0x65, 0x85, 0x94), // dragonBlue
+    .git_add = rgb(0x98, 0xBB, 0x6C), // springGreen (same as string)
+    .git_mod = rgb(0xC0, 0xA3, 0x6E), // boatYellow2 (same as operator)
+    .git_del = rgb(0xE4, 0x68, 0x76), // waveRed (same as builtin)
 };
 
 /// catppuccin-macchiato (user's alternative).
@@ -169,6 +176,9 @@ const catppuccin_macchiato = Theme{
     .diag_error = rgb(0xED, 0x87, 0x96), // red
     .diag_warn = rgb(0xEE, 0xDA, 0x9F), // yellow
     .diag_info = rgb(0x8A, 0xAD, 0xF4), // blue
+    .git_add = rgb(0xA6, 0xDA, 0x95), // green (same as string)
+    .git_mod = rgb(0xEE, 0xDA, 0x9F), // yellow (same as diag_warn)
+    .git_del = rgb(0xED, 0x87, 0x96), // red (same as builtin)
 };
 
 /// tokyonight-moon (user's alternative).
@@ -216,6 +226,9 @@ const tokyonight_moon = Theme{
     .diag_error = rgb(0xDB, 0x4B, 0x4B), // red
     .diag_warn = rgb(0xE0, 0xAF, 0x68), // orange
     .diag_info = rgb(0x82, 0xAA, 0xFF), // blue
+    .git_add = rgb(0x9D, 0xCD, 0x5F), // green (same as string)
+    .git_mod = rgb(0xE0, 0xAF, 0x68), // orange (same as diag_warn)
+    .git_del = rgb(0xDB, 0x4B, 0x4B), // red (same as builtin)
 };
 
 pub const themes = [_]Theme{ kanagawa_wave, catppuccin_macchiato, tokyonight_moon };

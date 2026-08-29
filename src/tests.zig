@@ -33,6 +33,7 @@ pub const lsp_mock = @import("lsp/mock_lsp.zig");
 pub const lsp_diagnostics = @import("lsp/diagnostics.zig");
 pub const lsp_navigation = @import("lsp/navigation.zig");
 pub const icons = @import("icons.zig");
+pub const git = @import("git.zig");
 
 test {
     std.testing.refAllDecls(@This());

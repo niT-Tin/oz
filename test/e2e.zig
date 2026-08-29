@@ -90,6 +90,42 @@ fn readAvailable(fd: std.posix.fd_t, buf: []u8, timeout_ms: i32) !usize {
     return std.posix.read(fd, buf);
 }
 
+/// Run a command in the TEST process (not the pty child) to completion with
+/// `cwd`, capturing stdout (owned; empty on spawn/failure). Used by the git
+/// tests to set up and inspect a temp repository.
+fn runCmdCapture(io: Io, alloc: std.mem.Allocator, argv: []const []const u8, cwd: []const u8) ![]u8 {
+    var proc = std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch return &.{};
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(alloc);
+    var tmp: [4096]u8 = undefined;
+    if (proc.stdout) |f| {
+        while (true) {
+            const n = f.readStreaming(io, &.{tmp[0..]}) catch break;
+            if (n == 0) break;
+            out.appendSlice(alloc, tmp[0..n]) catch break;
+        }
+        // NOT closed here: proc.wait() closes the child's pipes; closing them
+        // early makes its cleanup hit EBADF (recoverableOsBugDetected panics)
+    }
+    _ = proc.wait(io) catch {};
+    return out.toOwnedSlice(alloc);
+}
+
+/// Write `text` into `dir`/`name` (test-process helper for temp repos).
+fn writeTestFile(io: Io, dir: []const u8, name: []const u8, text: []const u8) !void {
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name });
+    var f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer f.close(io);
+    try f.writeStreamingAll(io, text);
+}
+
 /// Fork `argv[0]` (resolved against cwd) into the pty with the slave as its
 /// controlling terminal. Returns the child pid.
 fn spawnChild(io: Io, pty: *Pty, argv: []const []const u8) !std.posix.pid_t {
@@ -99,6 +135,12 @@ fn spawnChild(io: Io, pty: *Pty, argv: []const []const u8) !std.posix.pid_t {
 /// spawnChild with extra environment entries appended to the fixed base env
 /// (TERM/PATH/HOME) — used to inject OZ_LSP_CMD for mock-server tests.
 fn spawnChildEnv(io: Io, pty: *Pty, argv: []const []const u8, env_extra: ?[]const []const u8) !std.posix.pid_t {
+    return spawnChildEnvCwd(io, pty, argv, env_extra, null);
+}
+
+/// spawnChildEnv plus a cwd to chdir into before exec — the git tests run oz
+/// inside a temp git repo (git commands resolve the repo from the cwd).
+fn spawnChildEnvCwd(io: Io, pty: *Pty, argv: []const []const u8, env_extra: ?[]const []const u8, cwd: ?[]const u8) !std.posix.pid_t {
     var path_buf: [std.fs.max_path_bytes:0]u8 = undefined;
     const path_len = try std.Io.Dir.cwd().realPathFile(io, argv[0], &path_buf);
     path_buf[path_len] = 0;
@@ -140,6 +182,11 @@ fn spawnChildEnv(io: Io, pty: *Pty, argv: []const []const u8, env_extra: ?[]cons
         else => return error.ForkFailed,
     };
     if (pid == 0) {
+        if (cwd) |c| {
+            var cwd_buf: [256:0]u8 = undefined;
+            const cwd_z: [:0]u8 = std.fmt.bufPrintZ(&cwd_buf, "{s}", .{c}) catch linux.exit(126);
+            _ = linux.chdir(cwd_z.ptr); // raw syscall in the forked child
+        }
         _ = linux.setsid();
         _ = linux.ioctl(pty.slave, TIOCSCTTY, 0);
         _ = linux.dup2(pty.slave, 0);
@@ -173,6 +220,18 @@ const Session = struct {
         var pty = try Pty.open();
         errdefer pty.close();
         const pid = spawnChildEnv(io, &pty, argv, env_extra) catch |e| {
+            pty.close();
+            return e;
+        };
+        errdefer killPid(pid);
+        return .{ .io = io, .pty = pty, .pid = pid };
+    }
+
+    /// Spawn with a specific cwd (git tests run inside a temp repo).
+    fn spawnCwd(io: Io, argv: []const []const u8, cwd: []const u8) !Session {
+        var pty = try Pty.open();
+        errdefer pty.close();
+        const pid = spawnChildEnvCwd(io, &pty, argv, null, cwd) catch |e| {
             pty.close();
             return e;
         };
@@ -740,6 +799,11 @@ test "insert text in insert mode, esc back to normal" {
     try std.testing.expect(!grid.contains("INSERT"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1173,6 +1237,11 @@ test "theme picker: <leader>sp lists themes, previews live, Esc restores" {
     try std.testing.expect(!grid.rowHasBg(23, packRgb(0x2A, 0x2A, 0x37)));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1273,6 +1342,11 @@ test "insert mode: jk leaves no chars, backspace and ctrl-w delete" {
     try std.testing.expect(!grid.contains("INSERT"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1361,6 +1435,11 @@ test "auto-pairs: openers close, closers skip, backspace deletes empty pair" {
 
     try sess.send("\x1b\x1b"); // first Esc may only close the completion menu
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1478,6 +1557,11 @@ test "search: / ? n N jump between matches; :<number> jumps to line" {
     try std.testing.expect(grid.contains("line 1/5"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1593,6 +1677,11 @@ test "M1a: text objects, visual ops, yank/paste, easymotion" {
     try std.testing.expect(!grid.contains("Xone"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1687,6 +1776,11 @@ test "surround: ysw' wraps, ds( deletes, cs(->[ changes" {
     try std.testing.expect(grid.contains("hello world"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1781,6 +1875,11 @@ test "gcc toggles line comments; Ctrl+n multi-cursor deletes words" {
     try std.testing.expect(!grid.contains("x = 1;"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1834,6 +1933,11 @@ test "visual ga= aligns delimiter columns" {
     try std.testing.expect(grid.contains("ccc  = 333"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1906,6 +2010,11 @@ test "picker: <leader>sf fuzzy-finds and opens a file" {
     try std.testing.expect(grid.contains("const std = @import"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -1980,6 +2089,11 @@ test ":%s substitutes across the file, :s on the current line" {
     try std.testing.expect(!grid.contains("http://x"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -2049,6 +2163,11 @@ test "'.' repeats dw and x from the current cursor" {
     try std.testing.expect(grid.contains("mma delta"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -2091,6 +2210,11 @@ test "tabs render expanded; cursor column accounts for tab width" {
     try std.testing.expect(!grid.contains("ab"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -2253,6 +2377,11 @@ test "vim editing keys: x X D C S r ~ J >>" {
     try std.testing.expect(grid.contains("│   xyz last"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -2414,6 +2543,11 @@ test "grep picker: <leader>st finds matches and jumps" {
     try std.testing.expect(grid.contains("NORMAL"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -2549,6 +2683,11 @@ test "grep picker: fixed-size panel with split syntax preview" {
     try std.testing.expect(grid.contains("NORMAL"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -2673,6 +2812,11 @@ test "file tree: <leader>e shows files, Enter opens one" {
     try std.testing.expect(grid.contains("# oz"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -2743,6 +2887,11 @@ test "file tree: sidebar background matches the editor" {
     try std.testing.expect(!grid.rowHasBg(1, packRgb(0x22, 0x32, 0x49)));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -2838,6 +2987,11 @@ test "multi-buffer: :e opens a tab, gt/:bn switch, :bd closes" {
     try std.testing.expect(!grid.contains("AAA"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -2940,6 +3094,11 @@ test "buffer picker: <leader>sb lists open buffers, Enter switches" {
     try std.testing.expect(grid.contains("AAA"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -3034,6 +3193,11 @@ test "buffer keys: <leader>bn switches, <leader>bk closes" {
     try std.testing.expect(!grid.contains("AAA"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -3205,6 +3369,11 @@ test "recent picker: <leader>sr lists and reopens a recent file" {
     try std.testing.expect(grid.contains("BBB"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -3248,6 +3417,11 @@ test "tree-sitter: zig keywords/comments/strings get syntax colors" {
     try std.testing.expect(grid.containsFg("// note", packRgb(114, 113, 105)));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -3365,6 +3539,11 @@ test "tree-sitter: files over the size limit get no highlight pass" {
     try std.testing.expect(!grid.containsFg("const", packRgb(149, 127, 184)));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -4384,6 +4563,11 @@ test "file tree: sidebar scrolls as the selection moves past the window" {
     try std.testing.expect(scrolled);
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -4489,6 +4673,11 @@ test "picker: list scrolls with the selection; the highlighted row stays visible
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -4627,6 +4816,11 @@ test "visual line: Esc exits and clears the stale selection highlight" {
     try std.testing.expect(sel_cleared);
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -4750,6 +4944,11 @@ test "picker: keys win over the file tree while both are open" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -4882,6 +5081,11 @@ test "visual line: gt buffer switch drops the selection highlight" {
     try std.testing.expect(sel_cleared);
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -5273,6 +5477,11 @@ test "insert Alt-b/Alt-f: emacs word motion moves the cursor" {
     try std.testing.expect(!grid.contains("INSERT"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -5372,6 +5581,11 @@ test "picker confirm leaves file-tree mode; j/k control the buffer" {
     try std.testing.expect(line2_seen);
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -5465,6 +5679,11 @@ test "visual line V selects whole lines from mid-line" {
     try std.testing.expect(!grid.rowHasBg(1, sel_bg));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -5526,6 +5745,11 @@ test "visual line: V + d/c deletes ALL selected lines (incl. the last one)" {
     try std.testing.expect(!rowContains(&grid, 4, "ddd"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -5596,6 +5820,11 @@ test "visual line: V + c consumes ALL selected lines (incl. the last one)" {
     try std.testing.expect(!rowContains(&grid, 3, "ccc"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -5887,6 +6116,11 @@ test "e2e: visual block g Ctrl+a on 0..4 gives vim's 1,3,5,7,9 (line offset)" {
     try std.testing.expect(rowContains(&grid, 5, "9"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -6235,6 +6469,11 @@ test "e2e: multi-cursor Ctrl+n moves the main cursor and scrolls the viewport" {
     try std.testing.expect(cursorline_row.? > 1); // scrolled off the top
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -6373,6 +6612,11 @@ test "gutter: relative line numbers never overlap content on deep files" {
     }
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -6538,6 +6782,11 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
     try std.testing.expect(!grid.containsFg("pub", packRgb(114, 113, 105)));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -7073,6 +7322,11 @@ test "file tree: Ctrl-w h/l switches focus between sidebar and buffer" {
     try std.testing.expect(!grid.contains("files"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -7519,6 +7773,11 @@ test "insert: typing 'j' at end of a line keeps the next line's first word color
     try std.testing.expect(!grid.contains("INSERT"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -10029,6 +10288,11 @@ test "command mode: Tab completes command names, cycles, keeps path completion" 
         if (!grid.contains("COMMAND")) break;
     }
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -10142,6 +10406,11 @@ test "keymap picker: <leader>sk filters, token colors, Esc closes" {
     try std.testing.expect(!grid.contains(" Keymaps "));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -10229,6 +10498,11 @@ test "file tree: directory tree — folder glyphs, l expands, h folds" {
     try std.testing.expect(!grid.contains("\u{f07c}"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -10382,6 +10656,11 @@ test "nonexistent CLI file opens as an empty named buffer; :w creates it" {
     try std.testing.expectEqualStrings("hello new file", buf2);
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -10468,6 +10747,11 @@ test "H/M/L move in the viewport; zz/zt/zb scroll around the cursor" {
     try std.testing.expect(try Wait.until(&sess, &grid, "line 61/101", -1));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -10587,5 +10871,170 @@ test "folds: za toggles, zM/zR close/open all, j/k skip closed folds" {
     try std.testing.expect(grid.contains("body a1"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("GIT EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
+
+test "git: gutter signs, ]c hunk jump, hunk stage/reset, blame panel, branch" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    // ---- temp git repo: 20-line file, commit, then modify ----
+    var dir_buf: [160]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/oz_e2e_git_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().createDir(io, dir, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    _ = try runCmdCapture(io, alloc, &.{ "git", "init", "-q", "-b", "main" }, dir);
+    _ = try runCmdCapture(io, alloc, &.{ "git", "config", "user.email", "e2e@test" }, dir);
+    _ = try runCmdCapture(io, alloc, &.{ "git", "config", "user.name", "E2E Tester" }, dir);
+    var old = std.ArrayList(u8).empty;
+    defer old.deinit(alloc);
+    var n: usize = 1;
+    var line_buf: [32]u8 = undefined;
+    while (n <= 20) : (n += 1) {
+        try old.appendSlice(alloc, try std.fmt.bufPrint(&line_buf, "line{d}\n", .{n}));
+    }
+    try writeTestFile(io, dir, "a.txt", old.items);
+    _ = try runCmdCapture(io, alloc, &.{ "git", "add", "a.txt" }, dir);
+    _ = try runCmdCapture(io, alloc, &.{ "git", "commit", "-qm", "init" }, dir);
+    const head = try runCmdCapture(io, alloc, &.{ "git", "rev-parse", "HEAD" }, dir);
+    defer alloc.free(head);
+    // modify: line3 → CHANGED; insert NEW after line16; drop lines 19-20.
+    // The regions are >3 context lines apart → two separate hunks. The
+    // deleted tail must stay ON SCREEN (22 content rows) so the ▔ marker is
+    // visible: final file = 19 lines.
+    var content = std.ArrayList(u8).empty;
+    defer content.deinit(alloc);
+    n = 1;
+    while (n <= 20) : (n += 1) {
+        if (n == 3) {
+            try content.appendSlice(alloc, "CHANGED\n");
+        } else if (n == 17) {
+            try content.appendSlice(alloc, "NEW\n");
+            try content.appendSlice(alloc, "line17\n");
+        } else if (n >= 19) {
+            continue; // deleted
+        } else {
+            try content.appendSlice(alloc, try std.fmt.bufPrint(&line_buf, "line{d}\n", .{n}));
+        }
+    }
+    try writeTestFile(io, dir, "a.txt", content.items);
+    // final line count: 19 text lines + the trailing empty line after the
+    // final '\n' (piece-table lineCount = newlines + 1) = 20
+    const final_lines: usize = 20;
+
+    var sess = try Session.spawnCwd(io, &.{ oz_exe_path, "a.txt" }, dir);
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    const Wait = struct {
+        fn until(s: *Session, g: *Grid, needle: []const u8) !bool {
+            var waited: i32 = 0;
+            while (!g.contains(needle)) {
+                const nn = try readAvailable(s.pty.master, s.out[s.used..], 200);
+                if (nn == 0) {
+                    waited += 200;
+                    if (waited >= 5000) return false;
+                    continue;
+                }
+                s.used += nn;
+                g.feed(s.out[s.used - nn .. s.used]);
+            }
+            return true;
+        }
+        fn untilGone(s: *Session, g: *Grid, needle: []const u8) !bool {
+            var waited: i32 = 0;
+            while (g.contains(needle)) {
+                const nn = try readAvailable(s.pty.master, s.out[s.used..], 200);
+                if (nn == 0) {
+                    waited += 200;
+                    if (waited >= 5000) return false;
+                    continue;
+                }
+                s.used += nn;
+                g.feed(s.out[s.used - nn .. s.used]);
+            }
+            return true;
+        }
+    };
+
+    try std.testing.expect(try Wait.until(&sess, &grid, "NORMAL"));
+
+    // status bar shows the branch once the async status job lands
+    try std.testing.expect(try Wait.until(&sess, &grid, "⎇ main"));
+
+    // gutter signs: ▎ on the modified/added lines, ▔ (deleted below) marker
+    // on the line above the removed tail
+    try std.testing.expect(try Wait.until(&sess, &grid, "\u{258e}")); // ▎
+    try std.testing.expect(try Wait.until(&sess, &grid, "\u{2594}")); // ▔
+
+    // ]c jumps from line 1 to the first hunk (CHANGED at 1-based line 3)
+    try sess.send("]c");
+    const needle3 = try std.fmt.allocPrint(alloc, "line 3/{d}", .{final_lines});
+    defer alloc.free(needle3);
+    try std.testing.expect(try Wait.until(&sess, &grid, needle3));
+
+    // <leader>hs stages the hunk under the cursor (whole @@ block)
+    try sess.send(" hs");
+    var staged = try runCmdCapture(io, alloc, &.{ "git", "diff", "--cached", "--", "a.txt" }, dir);
+    defer alloc.free(staged);
+    var waited: i32 = 0;
+    while (std.mem.indexOf(u8, staged, "CHANGED") == null and waited < 5000) {
+        alloc.free(staged);
+        std.Io.sleep(io, .fromMilliseconds(100), .real) catch {};
+        waited += 100;
+        staged = try runCmdCapture(io, alloc, &.{ "git", "diff", "--cached", "--", "a.txt" }, dir);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, staged, "CHANGED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, staged, "NEW") == null); // hunk 2 NOT staged
+
+    // ]c → second hunk (NEW at 1-based line 17)
+    try sess.send("]c");
+    const needle17 = try std.fmt.allocPrint(alloc, "line 17/{d}", .{final_lines});
+    defer alloc.free(needle17);
+    try std.testing.expect(try Wait.until(&sess, &grid, needle17));
+
+    // <leader>hr resets that hunk: NEW leaves the working tree
+    try sess.send(" hr");
+    var work_diff = try runCmdCapture(io, alloc, &.{ "git", "diff", "--", "a.txt" }, dir);
+    defer alloc.free(work_diff);
+    waited = 0;
+    while (std.mem.indexOf(u8, work_diff, "NEW") != null and waited < 5000) {
+        alloc.free(work_diff);
+        std.Io.sleep(io, .fromMilliseconds(100), .real) catch {};
+        waited += 100;
+        work_diff = try runCmdCapture(io, alloc, &.{ "git", "diff", "--", "a.txt" }, dir);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, work_diff, "NEW") == null);
+    // hunk 2's reset must not touch the staged hunk 1
+    const staged2 = try runCmdCapture(io, alloc, &.{ "git", "diff", "--cached", "--", "a.txt" }, dir);
+    defer alloc.free(staged2);
+    try std.testing.expect(std.mem.indexOf(u8, staged2, "CHANGED") != null);
+
+    // <leader>tb — inline blame panel: short hash + author of HEAD
+    try sess.send(" tb");
+    try std.testing.expect(try Wait.until(&sess, &grid, head[0..7]));
+    try std.testing.expect(grid.contains("E2E Tester"));
+    // toggle off
+    try sess.send(" tb");
+    try std.testing.expect(try Wait.untilGone(&sess, &grid, head[0..7]));
+
+    // untracked file: every line reads as added — open b.txt, the ▎ sign
+    // covers the gutter
+    try writeTestFile(io, dir, "b.txt", "one\ntwo\nthree\n");
+    try sess.send(":e b.txt\r");
+    try std.testing.expect(try Wait.until(&sess, &grid, "one"));
+    // the untracked status refresh is async — wait for the added signs
+    try std.testing.expect(try Wait.until(&sess, &grid, "\u{258e}"));
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+

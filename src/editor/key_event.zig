@@ -132,6 +132,14 @@ pub const ActionId = enum {
     fold_close, // zc — close the innermost open fold under the cursor
     fold_open_all, // zR — open every fold in the buffer
     fold_close_all, // zM — close every fold in the buffer
+    // M3 git
+    hunk_next, // ]c — next git hunk
+    hunk_prev, // [c — previous git hunk
+    hunk_stage, // <leader>hs — stage the hunk under the cursor
+    hunk_reset, // <leader>hr — reset the hunk under the cursor
+    hunk_preview, // <leader>hp — preview the hunk under the cursor (float)
+    blame_toggle, // <leader>tb — toggle inline blame
+    git_lazygit, // <leader>lg — launch lazygit in an external terminal
     noop,
 };
 

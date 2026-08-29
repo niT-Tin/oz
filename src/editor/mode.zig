@@ -199,6 +199,8 @@ pub const State = struct {
     pending_leader_r: bool = false,
     pending_leader_l: bool = false,
     pending_leader_t: bool = false,
+    /// <leader>h seen (git hunk family, M3a), awaiting s/r/p
+    pending_leader_h: bool = false,
     /// surround sequence (ys/ds/cs) in progress
     pending_surround: ?SurroundPending = null,
     /// 'g' + 'c' seen (comment sequence), awaiting 'c' (line) — gc in visual
@@ -336,7 +338,7 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         }
     }
 
-    // 0a3) <leader>l pending: lf — LSP format document
+    // 0a3) <leader>l pending: lf — LSP format document, lg — lazygit.
     if (state.pending_leader_l) {
         state.pending_leader_l = false;
         if (isEscape(key)) {
@@ -345,6 +347,7 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         }
         switch (key.codepoint) {
             'f' => return emitAction(state, .format_document), // <leader>lf format
+            'g' => return emitAction(state, .git_lazygit), // <leader>lg lazygit
             else => {
                 resetPending(state);
                 return .pending;
@@ -352,7 +355,26 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         }
     }
 
-    // 0a3) <leader>t pending: ti — LSP inlay hints
+    // 0a3) <leader>h pending (git hunk family, M3a): hs — stage, hr — reset,
+    //     hp — preview.
+    if (state.pending_leader_h) {
+        state.pending_leader_h = false;
+        if (isEscape(key)) {
+            resetPending(state);
+            return .pending;
+        }
+        switch (key.codepoint) {
+            's' => return emitAction(state, .hunk_stage), // <leader>hs stage
+            'r' => return emitAction(state, .hunk_reset), // <leader>hr reset
+            'p' => return emitAction(state, .hunk_preview), // <leader>hp preview
+            else => {
+                resetPending(state);
+                return .pending;
+            },
+        }
+    }
+
+    // 0a3) <leader>t pending: ti — LSP inlay hints, tb — git blame toggle.
     if (state.pending_leader_t) {
         state.pending_leader_t = false;
         if (isEscape(key)) {
@@ -361,6 +383,7 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         }
         switch (key.codepoint) {
             'i' => return emitAction(state, .inlay_hints), // <leader>ti inlay hints
+            'b' => return emitAction(state, .blame_toggle), // <leader>tb blame
             else => {
                 resetPending(state);
                 return .pending;
@@ -388,7 +411,8 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         }
     }
 
-    // 0a4) ] or [ pending (diagnostic navigation prefix): awaiting d
+    // 0a4) ] or [ pending (diagnostic navigation prefix): awaiting d —
+    //     ]d/[d; 'c' — ]c/[c git hunk navigation (M3a).
     if (state.pending_bracket) |b| {
         state.pending_bracket = null;
         if (isEscape(key)) {
@@ -397,6 +421,9 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         }
         if (key.codepoint == 'd' and !key.mods.ctrl and !key.mods.alt) {
             return emitAction(state, if (b == ']') .diagnostic_next else .diagnostic_prev);
+        }
+        if (key.codepoint == 'c' and !key.mods.ctrl and !key.mods.alt) {
+            return emitAction(state, if (b == ']') .hunk_next else .hunk_prev);
         }
         return .pending;
     }
@@ -463,6 +490,10 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
                 return .pending;
             },
             'o' => return emitAction(state, .document_outline), // <leader>o outline
+            'h' => {
+                state.pending_leader_h = true; // <leader>h — git hunk family
+                return .pending;
+            },
             else => {
                 resetPending(state);
                 return .pending;
@@ -812,6 +843,13 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .inlay_hints => emitAction(state, .inlay_hints),
         .document_outline => emitAction(state, .document_outline),
         .filetree_locate => emitAction(state, .filetree_locate),
+        .hunk_next => emitAction(state, .hunk_next),
+        .hunk_prev => emitAction(state, .hunk_prev),
+        .hunk_stage => emitAction(state, .hunk_stage),
+        .hunk_reset => emitAction(state, .hunk_reset),
+        .hunk_preview => emitAction(state, .hunk_preview),
+        .blame_toggle => emitAction(state, .blame_toggle),
+        .git_lazygit => emitAction(state, .git_lazygit),
         .next_buffer => emitAction(state, .next_buffer),
         .prev_buffer => emitAction(state, .prev_buffer),
         .leader => blk: {
@@ -1120,6 +1158,7 @@ fn resetPending(state: *State) void {
     state.pending_leader_r = false;
     state.pending_leader_l = false;
     state.pending_leader_t = false;
+    state.pending_leader_h = false;
     state.pending_surround = null;
     state.pending_align = null;
     state.pending_bracket = null;

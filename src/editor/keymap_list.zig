@@ -141,6 +141,14 @@ pub const entries: []const Entry = &.{
     .{ .keys = "space lf", .desc = "LSP 格式化文档", .group = "Leader" },
     .{ .keys = "space ti", .desc = "LSP inlay hints 开关", .group = "Leader" },
 
+    // ---- Git ----
+    .{ .keys = "]c [c", .desc = "下一个 / 上一个 Git hunk", .group = "Git" },
+    .{ .keys = "space hs", .desc = "Stage 当前 hunk", .group = "Git" },
+    .{ .keys = "space hr", .desc = "Reset 当前 hunk", .group = "Git" },
+    .{ .keys = "space hp", .desc = "预览当前 hunk 的 diff", .group = "Git" },
+    .{ .keys = "space tb", .desc = "行内 blame 开关", .group = "Git" },
+    .{ .keys = "space lg", .desc = "外部终端启动 lazygit", .group = "Git" },
+
     // ---- 窗口 ----
     .{ .keys = "ctrl-w h l", .desc = "窗口焦点向左/右（有文件树时切换树焦点）", .group = "窗口" },
     .{ .keys = "ctrl-w j k", .desc = "窗口焦点向下/上", .group = "窗口" },
