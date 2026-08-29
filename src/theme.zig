@@ -26,6 +26,9 @@ pub const Theme = struct {
     fg_faint: Rgb, // inactive tab, secondary text
     accent: Rgb, // active tab, logo, brand (kanagawa carpYellow)
     accent_alt: Rgb, // secondary accent (springBlue / crystalBlue)
+    // window split separators (vim-style boundary lines between panes)
+    win_sep: Rgb, // inactive separator (dim)
+    win_sep_active: Rgb, // separator adjacent to the focused window
     // syntax
     comment: Rgb,
     keyword: Rgb,
@@ -88,6 +91,8 @@ const kanagawa_wave = Theme{
     .fg_faint = rgb(0x54, 0x54, 0x6D), // sumiInk6
     .accent = rgb(0xE6, 0xC3, 0x84), // carpYellow
     .accent_alt = rgb(0x7E, 0x9C, 0xD8), // crystalBlue
+    .win_sep = rgb(0x54, 0x54, 0x6D), // sumiInk6 (same as fg_faint)
+    .win_sep_active = rgb(0xE6, 0xC3, 0x84), // carpYellow (accent)
     .comment = rgb(0x72, 0x71, 0x69), // fujiGray
     .keyword = rgb(0x95, 0x7F, 0xB8), // oniViolet
     .string = rgb(0x98, 0xBB, 0x6C), // springGreen
@@ -133,6 +138,8 @@ const catppuccin_macchiato = Theme{
     .fg_faint = rgb(0x49, 0x4D, 0x64), // surface2
     .accent = rgb(0xF5, 0xE0, 0xDC), // rosewater
     .accent_alt = rgb(0x8A, 0xAD, 0xF4), // blue
+    .win_sep = rgb(0x49, 0x4D, 0x64), // surface2 (same as fg_faint)
+    .win_sep_active = rgb(0xF5, 0xE0, 0xDC), // rosewater (accent)
     .comment = rgb(0x6E, 0x73, 0x8F), // overlay1
     .keyword = rgb(0xC6, 0xA0, 0xF6), // mauve
     .string = rgb(0xA6, 0xDA, 0x95), // green
@@ -178,6 +185,8 @@ const tokyonight_moon = Theme{
     .fg_faint = rgb(0x56, 0x5F, 0x89), // comment_dark
     .accent = rgb(0xE0, 0xAF, 0x68), // orange
     .accent_alt = rgb(0x82, 0xAA, 0xFF), // blue
+    .win_sep = rgb(0x56, 0x5F, 0x89), // comment_dark (same as fg_faint)
+    .win_sep_active = rgb(0xE0, 0xAF, 0x68), // orange (accent)
     .comment = rgb(0x82, 0x8B, 0xB8), // comment
     .keyword = rgb(0xC0, 0xCA, 0xF5), // violet
     .string = rgb(0x9D, 0xCD, 0x5F), // green

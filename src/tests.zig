@@ -23,6 +23,7 @@ pub const comment = @import("editor/comment.zig");
 pub const align_text = @import("editor/align.zig");
 pub const multicursor = @import("editor/multicursor.zig");
 pub const easymotion = @import("editor/easymotion.zig");
+pub const keymap_list = @import("editor/keymap_list.zig");
 pub const syntax = @import("syntax.zig");
 pub const lsp_server_config = @import("lsp/server_config.zig");
 pub const lsp_types = @import("lsp/types.zig");
@@ -30,6 +31,7 @@ pub const lsp_client = @import("lsp/client.zig");
 pub const lsp_mock = @import("lsp/mock_lsp.zig");
 pub const lsp_diagnostics = @import("lsp/diagnostics.zig");
 pub const lsp_navigation = @import("lsp/navigation.zig");
+pub const icons = @import("icons.zig");
 
 test {
     std.testing.refAllDecls(@This());
