@@ -628,13 +628,15 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
                 resetCount(state);
                 state.last_action = op;
                 state.last_count = count;
-                state.last_repeat = .{ .op = .{
-                    .op = op,
-                    .motion = .line_start, // linewise sentinel, see Result docs
-                    .args = .{},
-                    .count = count,
-                    .exclusive_end = false,
-                } };
+                state.last_repeat = .{
+                    .op = .{
+                        .op = op,
+                        .motion = .line_start, // linewise sentinel, see Result docs
+                        .args = .{},
+                        .count = count,
+                        .exclusive_end = false,
+                    },
+                };
                 return .{
                     .op_motion = .{
                         .op = op,
@@ -983,14 +985,16 @@ fn emitTextObject(state: *State, op: KeyEvent.ActionId, kind: TextObject.Kind) R
     state.pending_op = null;
     state.last_action = op;
     state.last_count = count;
-    state.last_repeat = .{ .op = .{
-        .op = op,
-        .motion = .left, // unused when text_object is set
-        .args = .{},
-        .count = count,
-        .exclusive_end = true,
-        .text_object = kind,
-    } };
+    state.last_repeat = .{
+        .op = .{
+            .op = op,
+            .motion = .left, // unused when text_object is set
+            .args = .{},
+            .count = count,
+            .exclusive_end = true,
+            .text_object = kind,
+        },
+    };
     return .{
         .op_motion = .{
             .op = op,

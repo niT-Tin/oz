@@ -4479,7 +4479,7 @@ const App = struct {
             // header: basename (fg) + ":line" (fg_dim), then padding; widths
             // are cells (a CJK basename is 2 cells/char, 3-4 bytes)
             const base = std.fs.path.basename(r.path);
-            const line_str = try std.fmt.allocPrint(a, ":{d}", .{ r.line });
+            const line_str = try std.fmt.allocPrint(a, ":{d}", .{r.line});
             const f1 = cellFitPrefix(win, base, pw);
             try segs.append(a, .{ .text = f1.slice, .style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_float } } });
             const f2 = cellFitPrefix(win, line_str, pw -| f1.cells);
@@ -6850,79 +6850,79 @@ const App = struct {
             // closing brace) has indent_end == 0 but indent_end != n, so
             // the scope's vertical never extends onto those rows.
             if (indent_end == n) {
-                    var ctx_levels: u32 = 0;
-                    {
-                        var ctx: i64 = @as(i64, @intCast(line)) - 1;
-                        var dir: i64 = -1;
-                        var scanned: usize = 0;
-                        const lc: i64 = @as(i64, @intCast(line_count));
-                        while (scanned < 500) : (scanned += 1) {
-                            if (ctx < 0) {
-                                if (dir == -1) {
-                                    ctx = @as(i64, @intCast(line)) + 1;
-                                    dir = 1;
-                                    continue;
-                                }
-                                break;
+                var ctx_levels: u32 = 0;
+                {
+                    var ctx: i64 = @as(i64, @intCast(line)) - 1;
+                    var dir: i64 = -1;
+                    var scanned: usize = 0;
+                    const lc: i64 = @as(i64, @intCast(line_count));
+                    while (scanned < 500) : (scanned += 1) {
+                        if (ctx < 0) {
+                            if (dir == -1) {
+                                ctx = @as(i64, @intCast(line)) + 1;
+                                dir = 1;
+                                continue;
                             }
-                            if (ctx >= lc) break;
-                            const cl: u32 = @intCast(ctx);
-                            if (!self.isBlankLine(buf, cl)) {
-                                ctx_levels = self.lineIndentLevels(buf, cl);
-                                break;
-                            }
-                            ctx += dir;
+                            break;
                         }
-                    }
-                    const start_col: u32 = indent_cols;
-                    const ctx_cols: u32 = @min(ctx_levels * tab_width, rect.width -| gutter);
-                    // the scope's highlighted guide column (only when it lies
-                    // past the line's own indent — deeper whitespace-only
-                    // lines already got it from the loop above); sentinel
-                    // rect.width when absent / off-screen
-                    const scope_col: u32 = if (in_scope and scope_indent_col >= indent_cols and
-                        scope_indent_col < rect.width -| gutter)
-                        scope_indent_col
-                    else
-                        rect.width;
-                    const end_col: u32 = @max(ctx_cols, if (scope_col < rect.width) scope_col + 1 else ctx_cols);
-                    if (end_col > start_col) {
-                        const n_cells = end_col - start_col;
-                        const row_buf = try a.alloc(u8, n_cells);
-                        @memset(row_buf, ' ');
-                        var gc: u32 = start_col;
-                        while (gc < end_col) : (gc += 1) {
-                            // guide cells use a 1-byte marker; the real glyph
-                            // is the 3-byte "│", emitted per cell below
-                            if (gc % tab_width == 0 and gc != scope_col) row_buf[gc - start_col] = 0x01;
+                        if (ctx >= lc) break;
+                        const cl: u32 = @intCast(ctx);
+                        if (!self.isBlankLine(buf, cl)) {
+                            ctx_levels = self.lineIndentLevels(buf, cl);
+                            break;
                         }
-                        const gstyle: vaxis.Style = .{
-                            .bg = .{ .rgb = if (is_cur_line) self.theme.bg_curline else self.theme.bg },
-                            .fg = .{ .rgb = self.theme.fg_dim },
-                        };
-                        // emit runs, converting markers to "│", splitting
-                        // around the scope cell so it gets its own color
-                        const off = if (scope_col >= start_col and scope_col < end_col) scope_col - start_col else n_cells;
-                        var run_start: usize = 0;
-                        var k: usize = 0;
-                        while (k < n_cells) : (k += 1) {
-                            if (k == off) {
-                                if (k > run_start) try segs.append(a, .{ .text = row_buf[run_start..k], .style = gstyle });
-                                const level: u32 = scope_col / tab_width;
-                                try segs.append(a, .{ .text = "│", .style = .{
-                                    .bg = gstyle.bg,
-                                    .fg = .{ .rgb = self.theme.indent[level % 8] },
-                                } });
-                                run_start = k + 1;
-                            } else if (row_buf[k] == 0x01) {
-                                if (k > run_start) try segs.append(a, .{ .text = row_buf[run_start..k], .style = gstyle });
-                                try segs.append(a, .{ .text = "│", .style = gstyle });
-                                run_start = k + 1;
-                            }
-                        }
-                        if (run_start < n_cells) try segs.append(a, .{ .text = row_buf[run_start..], .style = gstyle });
+                        ctx += dir;
                     }
                 }
+                const start_col: u32 = indent_cols;
+                const ctx_cols: u32 = @min(ctx_levels * tab_width, rect.width -| gutter);
+                // the scope's highlighted guide column (only when it lies
+                // past the line's own indent — deeper whitespace-only
+                // lines already got it from the loop above); sentinel
+                // rect.width when absent / off-screen
+                const scope_col: u32 = if (in_scope and scope_indent_col >= indent_cols and
+                    scope_indent_col < rect.width -| gutter)
+                    scope_indent_col
+                else
+                    rect.width;
+                const end_col: u32 = @max(ctx_cols, if (scope_col < rect.width) scope_col + 1 else ctx_cols);
+                if (end_col > start_col) {
+                    const n_cells = end_col - start_col;
+                    const row_buf = try a.alloc(u8, n_cells);
+                    @memset(row_buf, ' ');
+                    var gc: u32 = start_col;
+                    while (gc < end_col) : (gc += 1) {
+                        // guide cells use a 1-byte marker; the real glyph
+                        // is the 3-byte "│", emitted per cell below
+                        if (gc % tab_width == 0 and gc != scope_col) row_buf[gc - start_col] = 0x01;
+                    }
+                    const gstyle: vaxis.Style = .{
+                        .bg = .{ .rgb = if (is_cur_line) self.theme.bg_curline else self.theme.bg },
+                        .fg = .{ .rgb = self.theme.fg_dim },
+                    };
+                    // emit runs, converting markers to "│", splitting
+                    // around the scope cell so it gets its own color
+                    const off = if (scope_col >= start_col and scope_col < end_col) scope_col - start_col else n_cells;
+                    var run_start: usize = 0;
+                    var k: usize = 0;
+                    while (k < n_cells) : (k += 1) {
+                        if (k == off) {
+                            if (k > run_start) try segs.append(a, .{ .text = row_buf[run_start..k], .style = gstyle });
+                            const level: u32 = scope_col / tab_width;
+                            try segs.append(a, .{ .text = "│", .style = .{
+                                .bg = gstyle.bg,
+                                .fg = .{ .rgb = self.theme.indent[level % 8] },
+                            } });
+                            run_start = k + 1;
+                        } else if (row_buf[k] == 0x01) {
+                            if (k > run_start) try segs.append(a, .{ .text = row_buf[run_start..k], .style = gstyle });
+                            try segs.append(a, .{ .text = "│", .style = gstyle });
+                            run_start = k + 1;
+                        }
+                    }
+                    if (run_start < n_cells) try segs.append(a, .{ .text = row_buf[run_start..], .style = gstyle });
+                }
+            }
             var col: u32 = indent_end; // text starts after the indent region
             while (col < n) {
                 // emit any hint whose insertion column is at/just passed col

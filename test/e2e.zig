@@ -10580,9 +10580,6 @@ test "picker + tab: file rows and tabs carry devicons" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
-
-
-
 test "nonexistent CLI file opens as an empty named buffer; :w creates it" {
     // vim semantics: `oz <missing-path>` must NOT land on the dashboard — it
     // opens an empty buffer whose path is the arg, and only :w creates the
@@ -11037,4 +11034,3 @@ test "git: gutter signs, ]c hunk jump, hunk stage/reset, blame panel, branch" {
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
-
