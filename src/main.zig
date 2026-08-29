@@ -16,6 +16,8 @@ const lsp_diag = @import("lsp/diagnostics.zig");
 const lsp_nav = @import("lsp/navigation.zig");
 const json_rpc = @import("util/json_rpc.zig");
 const theme = @import("theme.zig");
+const icons = @import("icons.zig");
+const keymap_list = @import("editor/keymap_list.zig");
 
 /// Cells a '\t' occupies on screen (vim's shiftwidth-style expansion). The
 /// renderer expands tabs to this many spaces; every width computation that
@@ -100,11 +102,29 @@ const App = struct {
 
     const GrepResult = struct { path: []u8, line: u32, text: []u8 };
 
+    /// One node of the lazy directory tree (snacks-explorer style). `name`
+    /// (basename) and `path` (relative, owned; dir paths carry a trailing
+    /// '/') are owned by the node. Children are populated only when a dir is
+    /// expanded; collapsed dirs keep their loaded children (cheap re-expand).
+    const TreeNode = struct {
+        name: []u8,
+        path: []u8,
+        is_dir: bool,
+        expanded: bool,
+        children: std.ArrayList(*TreeNode),
+        parent: ?*TreeNode,
+    };
+    /// One visible sidebar row: the node plus its DFS depth (for indent).
+    const FiletreeRow = struct { node: *TreeNode, depth: usize };
+
     io: std.Io,
     alloc: std.mem.Allocator,
     env_map: *std.process.Environ.Map,
     /// Active color theme (from OZ_THEME, switchable at runtime).
     theme: theme.Theme,
+    /// Theme when the theme picker opened — Esc restores it (no allocation;
+    /// value copy, nothing to free in deinit).
+    theme_saved: ?theme.Theme = null,
     vx: vaxis.Vaxis,
     tty: vaxis.Tty,
     tty_buffer: []u8,
@@ -197,10 +217,16 @@ const App = struct {
     /// all back" must not mark the buffer modified).
     insert_base_hash: u64 = 0,
     insert_was_dirty: bool = false,
-    filetree_files: std.ArrayList([]u8) = .empty,
+    /// cwd root node; its children are the first level (built on first open).
+    filetree_root: ?*TreeNode = null,
+    /// Visible rows (expanded subtree in DFS order), rebuilt whenever the
+    /// tree structure changes (open / expand / collapse / locate). The
+    /// selection indexes into this list, so it must stay in sync with the
+    /// tree — rebuild is the only mutation path.
+    filetree_rows: std.ArrayList(FiletreeRow) = .empty,
 
-    // fuzzy picker (<leader>sf / <leader>st / <leader>sb / <leader>sr)
-    picker_mode: enum { files, grep, buffers, recent } = .files,
+    // fuzzy picker (<leader>sf / <leader>st / <leader>sb / <leader>sr / <leader>sk / <leader>sp)
+    picker_mode: enum { files, grep, buffers, recent, keymaps, themes } = .files,
     picker_active: bool = false,
     picker_files: std.ArrayList([]u8) = .empty, // owned paths
     picker_input: std.ArrayList(u8) = .empty,
@@ -210,6 +236,13 @@ const App = struct {
     picker_top: usize = 0,
     // grep mode: one result per line from rg
     grep_results: std.ArrayList(GrepResult) = .empty,
+    // grep picker split preview: the selected result's file content plus its
+    // tree-sitter highlighter, rebuilt only when the selection's path changes
+    // (never per-frame). preview_text == null means unavailable (>SIZE_LIMIT
+    // or read failed) — the panel shows a "preview unavailable" hint.
+    preview_path: ?[]u8 = null,
+    preview_text: ?[]u8 = null,
+    preview_hl: ?syntax.Highlighter = null,
 
     // M2 diagnostics list overlay (<leader>sd)
     diag_list_active: bool = false,
@@ -453,33 +486,72 @@ const App = struct {
         width: u32,
     };
 
-    /// Compute each leaf window's rectangle from the split tree.
-    fn layoutWindows(self: *App, a: std.mem.Allocator, content_top: u32, content_rows: u32, content_col: u32, total_width: u32) ![]LeafRect {
-        var out = std.ArrayList(LeafRect).empty;
-        const root = self.win_root orelse return &.{};
+    /// One window separator line (vim statusline semantics): the boundary
+    /// between two panes, drawn OVER the leaf buffers so the layout math is
+    /// untouched. Horizontal splits get a full "─" row at `row`; vertical
+    /// splits a "│" column at `col`. `len` is the extent in the separator's
+    /// own direction (cells). `active` marks the separators adjacent to the
+    /// focused window (the path from the root to the current leaf), drawn
+    /// bright; the rest are dim.
+    const SepRect = struct {
+        row: u32,
+        col: u32,
+        len: u32,
+        horizontal: bool,
+        active: bool,
+    };
+
+    /// true when leaf `leaf` lives anywhere inside `node`'s subtree.
+    fn subTreeHasLeaf(self: *App, node: *WinNode, leaf: usize) bool {
+        return switch (node.*) {
+            .leaf => |i| i == leaf,
+            .split => |s| self.subTreeHasLeaf(s.a, leaf) or self.subTreeHasLeaf(s.b, leaf),
+        };
+    }
+
+    /// Compute each leaf window's rectangle from the split tree, plus the
+    /// separator lines between the panes (one per split node).
+    fn layoutWindows(self: *App, a: std.mem.Allocator, content_top: u32, content_rows: u32, content_col: u32, total_width: u32) !struct { leaves: []LeafRect, seps: []SepRect } {
+        var leaves = std.ArrayList(LeafRect).empty;
+        var seps = std.ArrayList(SepRect).empty;
+        const root = self.win_root orelse return .{ .leaves = &.{}, .seps = &.{} };
         try self.layoutNode(a, root, .{
             .win = 0,
             .row = content_top,
             .col = content_col,
             .height = content_rows,
             .width = total_width,
-        }, &out);
-        return out.toOwnedSlice(a);
+        }, &leaves, &seps);
+        return .{ .leaves = try leaves.toOwnedSlice(a), .seps = try seps.toOwnedSlice(a) };
     }
 
-    fn layoutNode(self: *App, a: std.mem.Allocator, node: *WinNode, rect: LeafRect, out: *std.ArrayList(LeafRect)) !void {
+    fn layoutNode(self: *App, a: std.mem.Allocator, node: *WinNode, rect: LeafRect, out: *std.ArrayList(LeafRect), seps: *std.ArrayList(SepRect)) !void {
         switch (node.*) {
             .leaf => |i| try out.append(a, .{ .win = i, .row = rect.row, .col = rect.col, .height = rect.height, .width = rect.width }),
             .split => |*s| switch (s.dir) {
                 .horizontal => {
                     const h1 = rect.height / 2;
-                    try self.layoutNode(a, s.a, .{ .win = 0, .row = rect.row, .col = rect.col, .height = h1, .width = rect.width }, out);
-                    try self.layoutNode(a, s.b, .{ .win = 0, .row = rect.row + h1, .col = rect.col, .height = rect.height - h1, .width = rect.width }, out);
+                    try seps.append(a, .{
+                        .row = rect.row + h1,
+                        .col = rect.col,
+                        .len = rect.width,
+                        .horizontal = true,
+                        .active = self.subTreeHasLeaf(node, self.current_win),
+                    });
+                    try self.layoutNode(a, s.a, .{ .win = 0, .row = rect.row, .col = rect.col, .height = h1, .width = rect.width }, out, seps);
+                    try self.layoutNode(a, s.b, .{ .win = 0, .row = rect.row + h1, .col = rect.col, .height = rect.height - h1, .width = rect.width }, out, seps);
                 },
                 .vertical => {
                     const w1 = rect.width / 2;
-                    try self.layoutNode(a, s.a, .{ .win = 0, .row = rect.row, .col = rect.col, .height = rect.height, .width = w1 }, out);
-                    try self.layoutNode(a, s.b, .{ .win = 0, .row = rect.row, .col = rect.col + w1, .height = rect.height, .width = rect.width - w1 }, out);
+                    try seps.append(a, .{
+                        .row = rect.row,
+                        .col = rect.col + w1,
+                        .len = rect.height,
+                        .horizontal = false,
+                        .active = self.subTreeHasLeaf(node, self.current_win),
+                    });
+                    try self.layoutNode(a, s.a, .{ .win = 0, .row = rect.row, .col = rect.col, .height = rect.height, .width = w1 }, out, seps);
+                    try self.layoutNode(a, s.b, .{ .win = 0, .row = rect.row, .col = rect.col + w1, .height = rect.height, .width = rect.width - w1 }, out, seps);
                 },
             },
         }
@@ -542,7 +614,8 @@ const App = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const leaves = self.layoutWindows(a, self.contentTop(), content_rows, self.contentCol(), self.vx.window().width) catch return;
+        const layout = self.layoutWindows(a, self.contentTop(), content_rows, self.contentCol(), self.vx.window().width) catch return;
+        const leaves = layout.leaves;
         var cur_rect: ?LeafRect = null;
         for (leaves) |lr| {
             if (lr.win == self.current_win) {
@@ -664,8 +737,8 @@ const App = struct {
         if (self.yank_buffer) |b| self.alloc.free(b);
         if (self.em_matches.len > 0) self.alloc.free(self.em_matches);
         self.mc.deinit();
-        for (self.filetree_files.items) |f| self.alloc.free(f);
-        self.filetree_files.deinit(self.alloc);
+        if (self.filetree_root) |root| self.freeFiletreeNode(root);
+        self.filetree_rows.deinit(self.alloc);
         for (self.recent_files.items) |f| self.alloc.free(f);
         self.recent_files.deinit(self.alloc);
         for (self.picker_files.items) |f| self.alloc.free(f);
@@ -675,6 +748,9 @@ const App = struct {
             self.alloc.free(g.text);
         }
         self.grep_results.deinit(self.alloc);
+        if (self.preview_hl) |*h| h.deinit();
+        if (self.preview_text) |t| self.alloc.free(t);
+        if (self.preview_path) |p| self.alloc.free(p);
         self.picker_input.deinit(self.alloc);
         self.picker_matches.deinit(self.alloc);
         if (self.lsp_client) |c| c.deinit();
@@ -740,18 +816,46 @@ const App = struct {
             self.pending_window = false;
             if (key.codepoint == vaxis.Key.escape) return;
             switch (key.codepoint) {
-                // With the file-tree sidebar open, h/l toggle its focus (the
-                // sidebar is oz's own pane, not a vim window). Without it,
-                // h/l/j/k move between split windows geometrically.
-                'h', 'l' => {
-                    if (self.filetree_active) {
-                        self.focus = if (self.focus == .filetree) .buffer else .filetree;
+                // Vim Ctrl-w hjkl geometric navigation. The file-tree
+                // sidebar is a full-height pane at column 0, so h from the
+                // leftmost buffer window (or from the tree: nothing further
+                // left) reaches it, l from the tree re-enters the buffer,
+                // and j/k always move between buffer windows (the tree spans
+                // every row; from it j/k enter the buffer). Previously h/l
+                // only toggled tree ↔ current window, stranding the other
+                // split windows unreachable.
+                'h' => {
+                    if (self.filetree_active and self.focus == .buffer) {
+                        const before = self.current_win;
+                        self.navigateWindow(.left);
+                        if (self.current_win == before) self.focus = .filetree;
+                    } else if (!self.filetree_active) {
+                        self.navigateWindow(.left);
+                    }
+                    // from the tree (tree open, focus == .filetree) there is
+                    // nothing further left
+                },
+                'l' => {
+                    if (self.filetree_active and self.focus == .filetree) {
+                        self.focus = .buffer;
                     } else {
-                        self.navigateWindow(if (key.codepoint == 'h') .left else .right);
+                        self.navigateWindow(.right);
                     }
                 },
-                'j' => if (!self.filetree_active) self.navigateWindow(.down),
-                'k' => if (!self.filetree_active) self.navigateWindow(.up),
+                'j' => {
+                    if (self.filetree_active and self.focus == .filetree) {
+                        self.focus = .buffer;
+                    } else {
+                        self.navigateWindow(.down);
+                    }
+                },
+                'k' => {
+                    if (self.filetree_active and self.focus == .filetree) {
+                        self.focus = .buffer;
+                    } else {
+                        self.navigateWindow(.up);
+                    }
+                },
                 else => {},
             }
             return;
@@ -2475,9 +2579,9 @@ const App = struct {
         if (self.cmd_complete_names.items.len == 0) {
             // canonical command names, matching ex_command.zig's parser
             const commands = [_][]const u8{
-                "write",     "quit",      "quitall",   "wq",     "edit",
-                "vsplit",    "split",     "bnext",     "bprev",  "buffers",
-                "bdelete",   "nohlsearch", "set",      "theme",  "colorscheme",
+                "write",   "quit",       "quitall", "wq",    "edit",
+                "vsplit",  "split",      "bnext",   "bprev", "buffers",
+                "bdelete", "nohlsearch", "set",     "theme", "colorscheme",
                 "noh",
             };
             for (commands) |c| {
@@ -3304,59 +3408,202 @@ const App = struct {
         self.filetree_top = 0;
         self.filetree_sel = 0;
         self.focus = .filetree;
-        if (self.filetree_files.items.len == 0) {
-            var root = try std.Io.Dir.cwd().openDir(self.io, ".", .{ .iterate = true });
-            defer root.close(self.io);
-            try self.walkInto(root, "", &self.filetree_files);
-            std.mem.sort([]u8, self.filetree_files.items, {}, struct {
-                fn lt(_: void, a: []u8, b: []u8) bool {
-                    return std.mem.lessThan(u8, a, b);
-                }
-            }.lt);
+        if (self.filetree_root == null) {
+            // Build the cwd node; only its first level is scanned — deeper
+            // directories are walked lazily when expanded (snacks style).
+            const root = try self.alloc.create(TreeNode);
+            root.* = .{
+                .name = try self.alloc.dupe(u8, ""),
+                .path = try self.alloc.dupe(u8, ""),
+                .is_dir = true,
+                .expanded = true, // the cwd's own children are visible
+                .children = .empty,
+                .parent = null,
+            };
+            var dir = try std.Io.Dir.cwd().openDir(self.io, ".", .{ .iterate = true });
+            defer dir.close(self.io);
+            try self.walkTreeLevel(dir, root);
+            self.sortTreeChildren(root);
+            self.filetree_root = root;
         }
+        try self.rebuildFiletreeRows();
         self.filetree_active = true;
     }
 
+    /// Walk one directory level into `node.children` (lazy expansion).
+    fn walkTreeLevel(self: *App, dir: std.Io.Dir, node: *TreeNode) !void {
+        var it = dir.iterate();
+        while (try it.next(self.io)) |entry| {
+            const name = entry.name;
+            if (name.len == 0 or name[0] == '.') continue;
+            if (std.mem.eql(u8, name, "zig-out") or std.mem.eql(u8, name, "zig-pkg") or std.mem.eql(u8, name, "node_modules")) continue;
+            const is_dir = (entry.kind == .directory);
+            const child_path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{ node.path, name, if (is_dir) "/" else "" });
+            errdefer self.alloc.free(child_path);
+            const child_name = try self.alloc.dupe(u8, name);
+            errdefer self.alloc.free(child_name);
+            const child = try self.alloc.create(TreeNode);
+            errdefer self.alloc.destroy(child);
+            child.* = .{
+                .name = child_name,
+                .path = child_path,
+                .is_dir = is_dir,
+                .expanded = false,
+                .children = .empty,
+                .parent = node,
+            };
+            try node.children.append(self.alloc, child);
+        }
+    }
+
+    /// Directories first, then files; each group sorted by byte order.
+    fn sortTreeChildren(self: *App, node: *TreeNode) void {
+        _ = self;
+        std.mem.sort(*TreeNode, node.children.items, {}, struct {
+            fn lt(_: void, a: *TreeNode, b: *TreeNode) bool {
+                if (a.is_dir != b.is_dir) return a.is_dir;
+                return std.mem.lessThan(u8, a.name, b.name);
+            }
+        }.lt);
+    }
+
+    fn expandDir(self: *App, node: *TreeNode) !void {
+        if (!node.is_dir or node.expanded) return;
+        var dir = try std.Io.Dir.cwd().openDir(self.io, node.path, .{ .iterate = true });
+        defer dir.close(self.io);
+        try self.walkTreeLevel(dir, node);
+        self.sortTreeChildren(node);
+        node.expanded = true;
+        try self.rebuildFiletreeRows();
+    }
+
+    /// Collapse an expanded dir; its (already loaded) children stay in the
+    /// tree but become invisible until re-expanded.
+    fn collapseDir(self: *App, node: *TreeNode) !void {
+        if (!node.is_dir or !node.expanded) return;
+        node.expanded = false;
+        try self.rebuildFiletreeRows();
+    }
+
+    /// DFS over the expanded subtree starting at the root's children.
+    fn rebuildFiletreeRows(self: *App) !void {
+        self.filetree_rows.clearRetainingCapacity();
+        const root = self.filetree_root orelse return;
+        try self.appendTreeRows(root, 0, &self.filetree_rows);
+    }
+
+    fn appendTreeRows(self: *App, node: *TreeNode, depth: usize, rows: *std.ArrayList(FiletreeRow)) !void {
+        for (node.children.items) |child| {
+            try rows.append(self.alloc, .{ .node = child, .depth = depth });
+            if (child.is_dir and child.expanded) try self.appendTreeRows(child, depth + 1, rows);
+        }
+    }
+
+    fn filetreeNodeAt(self: *App, idx: usize) ?*TreeNode {
+        if (idx < self.filetree_rows.items.len) return self.filetree_rows.items[idx].node;
+        return null;
+    }
+
+    /// Row index of `node` in the visible list, or null.
+    fn rowIndexOf(self: *App, node: *TreeNode) ?usize {
+        for (self.filetree_rows.items, 0..) |row, i| {
+            if (row.node == node) return i;
+        }
+        return null;
+    }
+
     fn locateInFiletree(self: *App) !void {
-        if (self.filetree_files.items.len == 0) {
+        if (self.filetree_root == null) {
             try self.toggleFiletree();
+        } else {
+            try self.rebuildFiletreeRows();
         }
         self.focus = .filetree;
         if (self.cur().path) |p| {
-            for (self.filetree_files.items, 0..) |f, i| {
-                if (std.mem.eql(u8, f, p)) {
+            // Reveal the file's ancestors (expanding any folded dirs on the
+            // way) and select the matching row.
+            if (try self.revealPath(p)) |node| {
+                if (self.rowIndexOf(node)) |i| {
                     self.filetree_sel = i;
                     self.filetree_top = 0;
-                    break;
                 }
             }
         }
         self.filetree_active = true;
     }
 
-    /// j/k/Enter/Esc for the tree; returns true if consumed.
+    /// Walk the tree along `path`'s components, expanding any ancestor dir,
+    /// and return the node matching the final component (or null).
+    fn revealPath(self: *App, path: []const u8) !?*TreeNode {
+        const root = self.filetree_root orelse return null;
+        var cur_node = root;
+        var rest = path;
+        while (rest.len > 0) {
+            const slash = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+            const comp = rest[0..slash];
+            var found: ?*TreeNode = null;
+            for (cur_node.children.items) |child| {
+                if (std.mem.eql(u8, child.name, comp)) {
+                    found = child;
+                    break;
+                }
+            }
+            const child = found orelse return null;
+            if (slash == rest.len) return child;
+            if (child.is_dir and !child.expanded) try self.expandDir(child);
+            cur_node = child;
+            rest = rest[slash + 1 ..];
+        }
+        return null;
+    }
+
+    /// j/k/Enter/Esc/h/l for the tree; returns true if consumed.
     fn filetreeKey(self: *App, key: vaxis.Key) !bool {
         switch (key.codepoint) {
             'j', vaxis.Key.down => {
-                if (self.filetree_sel + 1 < self.filetree_files.items.len) self.filetree_sel += 1;
+                if (self.filetree_sel + 1 < self.filetree_rows.items.len) self.filetree_sel += 1;
                 return true;
             },
             'k', vaxis.Key.up => {
                 if (self.filetree_sel > 0) self.filetree_sel -= 1;
                 return true;
             },
-            // h/l: no tree expansion/collapse in M1 — swallow so they don't
-            // fall through to the buffer (pane switching is Ctrl-w hjkl).
-            // 'h' deliberately does NOT close the tree.
-            'h', 'l', vaxis.Key.left, vaxis.Key.right => return true,
+            // h: fold the current dir; on an already-folded dir jump to its
+            // parent's row. Files swallow h (no-op) so it never reaches the
+            // buffer — pane switching is Ctrl-w hjkl.
+            'h', vaxis.Key.left => {
+                const node = self.filetreeNodeAt(self.filetree_sel) orelse return true;
+                if (node.is_dir and node.expanded) {
+                    try self.collapseDir(node);
+                } else if (node.is_dir and !node.expanded) {
+                    if (node.parent) |parent| {
+                        if (parent != self.filetree_root) {
+                            if (self.rowIndexOf(parent)) |i| self.filetree_sel = i;
+                        }
+                    }
+                }
+                return true;
+            },
+            // l: expand the current dir (swallowed on files / open dirs).
+            'l', vaxis.Key.right => {
+                const node = self.filetreeNodeAt(self.filetree_sel) orelse return true;
+                if (node.is_dir and !node.expanded) try self.expandDir(node);
+                return true;
+            },
             vaxis.Key.enter => {
-                if (self.filetree_files.items.len > 0) {
-                    const f = self.filetree_files.items[self.filetree_sel];
+                const node = self.filetreeNodeAt(self.filetree_sel) orelse return true;
+                if (node.is_dir) {
+                    if (node.expanded) {
+                        try self.collapseDir(node);
+                    } else {
+                        try self.expandDir(node);
+                    }
+                } else {
                     // open the file but keep the tree visible — only
                     // <space>e (toggleFiletree) or Esc closes it; focus moves
                     // back to the buffer so typing edits, not the tree
                     self.focus = .buffer;
-                    try self.openFile(f);
+                    try self.openFile(node.path);
                 }
                 return true;
             },
@@ -3367,6 +3614,15 @@ const App = struct {
             },
             else => return false,
         }
+    }
+
+    /// Free a node and its whole subtree (owned name/path/children).
+    fn freeFiletreeNode(self: *App, node: *TreeNode) void {
+        for (node.children.items) |child| self.freeFiletreeNode(child);
+        node.children.deinit(self.alloc);
+        self.alloc.free(node.name);
+        self.alloc.free(node.path);
+        self.alloc.destroy(node);
     }
 
     // ---- fuzzy picker (<leader>sf) ----
@@ -3430,6 +3686,28 @@ const App = struct {
         self.picker_active = true;
     }
 
+    fn openKeymapPicker(self: *App) !void {
+        self.picker_mode = .keymaps;
+        self.picker_input.clearRetainingCapacity();
+        self.picker_sel = 0;
+        self.picker_top = 0;
+        try self.pickerRefilter();
+        self.picker_active = true;
+    }
+
+    /// <leader>sp — theme picker with LIVE preview: remember the current
+    /// theme (Esc restores it), then every selection change applies the
+    /// highlighted theme to the whole UI until Enter confirms or Esc cancels.
+    fn openThemePicker(self: *App) !void {
+        self.theme_saved = self.theme;
+        self.picker_mode = .themes;
+        self.picker_input.clearRetainingCapacity();
+        self.picker_sel = 0;
+        self.picker_top = 0;
+        try self.pickerRefilter();
+        self.picker_active = true;
+    }
+
     fn bufferName(self: *const App, i: usize) []const u8 {
         const buf = &self.buffers.items[i];
         return if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
@@ -3440,7 +3718,16 @@ const App = struct {
         self.picker_input.clearRetainingCapacity();
         self.picker_sel = 0;
         self.picker_top = 0;
+        // fresh session: drop stale results (and their owned strings) from a
+        // previous grep — an empty query must show "no matches", not the
+        // last search's leftovers
+        for (self.grep_results.items) |g| {
+            self.alloc.free(g.path);
+            self.alloc.free(g.text);
+        }
+        self.grep_results.clearRetainingCapacity();
         self.picker_active = true;
+        self.refreshGrepPreview();
     }
 
     /// Run rg for the current query and store results (path:line:text).
@@ -3498,17 +3785,217 @@ const App = struct {
             if (self.grep_results.items.len >= 50) break;
         }
         if (self.picker_sel >= self.grep_results.items.len) self.picker_sel = 0;
+        self.refreshGrepPreview();
+    }
+
+    /// Drop the grep preview's file content / highlighter / path. Called on
+    /// close, on empty results and whenever the selected path changes.
+    fn freeGrepPreview(self: *App) void {
+        if (self.preview_hl) |*h| h.deinit();
+        self.preview_hl = null;
+        if (self.preview_text) |t| self.alloc.free(t);
+        self.preview_text = null;
+        if (self.preview_path) |p| self.alloc.free(p);
+        self.preview_path = null;
+    }
+
+    /// (Re)build the split-preview file + highlighter for the SELECTED grep
+    /// result. No-op while the path is unchanged — this is what keeps the
+    /// panel from re-reading files / re-parsing on every frame. Best-effort:
+    /// a failed read or a file over syntax.SIZE_LIMIT leaves preview_text
+    /// null and the renderer shows "preview unavailable".
+    fn refreshGrepPreview(self: *App) void {
+        if (self.picker_mode != .grep or !self.picker_active) return;
+        if (self.grep_results.items.len == 0) {
+            self.freeGrepPreview();
+            return;
+        }
+        const r = self.grep_results.items[self.picker_sel];
+        if (self.preview_path) |pp| {
+            if (std.mem.eql(u8, pp, r.path)) return;
+        }
+        self.freeGrepPreview();
+        self.preview_path = self.alloc.dupe(u8, r.path) catch return;
+        const text = std.Io.Dir.cwd().readFileAlloc(self.io, r.path, self.alloc, .limited(syntax.SIZE_LIMIT)) catch return;
+        self.preview_text = text;
+        const ft = filetypeOf(r.path);
+        if (syntax.languageFor(ft)) |lang| {
+            var hl = syntax.Highlighter.init(self.alloc, lang) catch return;
+            hl.reparse(text) catch {
+                hl.deinit();
+                return;
+            };
+            self.preview_hl = hl;
+        }
+    }
+
+    /// Render one preview-column row of the grep split panel (k = 0 is the
+    /// "basename:line" header; k > 0 a syntax-highlighted content line from
+    /// the selected result's file, a ±(content_rows/2) window around the
+    /// selected line). Every segment is arena-allocated so the text outlives
+    /// vx.render(). The file itself is read / reparsed only in
+    /// refreshGrepPreview — here we just run the (already built) highlighter
+    /// over the visible byte range.
+    fn renderGrepPreviewRow(
+        self: *App,
+        segs: *std.ArrayList(vaxis.Segment),
+        a: std.mem.Allocator,
+        k: usize,
+        list_rows: usize,
+        preview_w: u32,
+    ) !void {
+        const float_bg: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float } };
+        const pw: usize = @intCast(preview_w);
+        const r = self.grep_results.items[self.picker_sel];
+        if (k == 0) {
+            // header: basename (fg) + ":line" (fg_dim), then padding
+            const base = std.fs.path.basename(r.path);
+            const line_str = try std.fmt.allocPrint(a, ":{d}", .{ r.line });
+            const n1 = @min(base.len, pw);
+            try segs.append(a, .{ .text = base[0..n1], .style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_float } } });
+            const n2 = @min(line_str.len, pw -| n1);
+            if (n2 > 0) try segs.append(a, .{ .text = line_str[0..n2], .style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg_float } } });
+            if (n1 + n2 < pw) {
+                const pad = try a.alloc(u8, pw - n1 - n2);
+                @memset(pad, ' ');
+                try segs.append(a, .{ .text = pad, .style = float_bg });
+            }
+            return;
+        }
+        const text = self.preview_text orelse {
+            // unavailable (>100KB / read failed): dim hint on the first
+            // content row, blank rows below
+            if (k == 1) {
+                const hint = "preview unavailable";
+                const n = @min(hint.len, pw);
+                const ids = [_]u8{0} ** 64;
+                try appendRowSegs(segs, a, hint, n, &ids, &[_]vaxis.Style{.{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = float_bg.bg }}, preview_w, float_bg);
+            } else {
+                try appendRowSegs(segs, a, "", 0, &.{}, &[_]vaxis.Style{}, preview_w, float_bg);
+            }
+            return;
+        };
+        const sel_line: usize = r.line -| 1; // rg reports 1-based lines
+        const line_count = std.mem.count(u8, text, "\n") + @intFromBool(text.len > 0);
+        if (sel_line >= line_count) {
+            try appendRowSegs(segs, a, "", 0, &.{}, &[_]vaxis.Style{}, preview_w, float_bg);
+            return;
+        }
+        const content_rows = list_rows - 1;
+        const ci = k - 1;
+        const win_start = @min(@max(sel_line -| (content_rows / 2), 0), line_count -| content_rows);
+        const file_line = win_start + ci;
+        if (file_line >= line_count) {
+            try appendRowSegs(segs, a, "", 0, &.{}, &[_]vaxis.Style{}, preview_w, float_bg);
+            return;
+        }
+        // gutter: relative offset from the selected line ("-4".." 0".."+4");
+        // arena-allocated — Segment.text must outlive vx.render()
+        const off: i32 = @as(i32, @intCast(file_line)) - @as(i32, @intCast(sel_line));
+        const gutter = if (off < 0)
+            try std.fmt.allocPrint(a, "-{d}", .{@as(u32, @intCast(-off))})
+        else if (off > 0)
+            try std.fmt.allocPrint(a, "+{d}", .{@as(u32, @intCast(off))})
+        else
+            try std.fmt.allocPrint(a, " 0", .{});
+        const row_s = lineStartByte(text, file_line);
+        const row_e = lineEndByte(text, file_line);
+        const row_len = row_e - row_s;
+        // content width: gutter (2) + space (1) leaves the rest of the column
+        var n = @min(row_len, pw -| 3);
+        // never split a UTF-8 char at the truncation point
+        while (n > 0 and n < row_len and (text[row_s + n] & 0xC0) == 0x80) n -= 1;
+        // syntax spans for THIS line's byte range (O(visible) query; the
+        // highlighter itself is only reparsed when the selection's path
+        // changes, in refreshGrepPreview)
+        var spans = std.ArrayList(syntax.Span).empty;
+        if (self.preview_hl) |*hl| {
+            var raw = std.ArrayList(syntax.Span).empty;
+            hl.spansInRange(@intCast(row_s), @intCast(row_e), a, &raw) catch {};
+            // merge overlaps like visibleSpansFor (later spans win)
+            for (raw.items) |sp| {
+                while (spans.items.len > 0) {
+                    var last = &spans.items[spans.items.len - 1];
+                    if (sp.start >= last.end) break;
+                    if (sp.start <= last.start) {
+                        _ = spans.pop();
+                        continue;
+                    }
+                    last.end = sp.start;
+                    break;
+                }
+                try spans.append(a, sp);
+            }
+        }
+        // per-byte style ids: 0 = base fg, 1+ = syntax palette (Style ordinal
+        // + 1), so spans map straight onto a per-frame palette
+        var style_palette: [syntax_style_count]vaxis.Style = undefined;
+        for (0..style_palette.len) |i| style_palette[i] = syntaxStyle(@enumFromInt(i), self.theme);
+        const selected_line = (file_line == sel_line);
+        const base_bg: vaxis.Style = if (selected_line)
+            .{ .bg = .{ .rgb = self.theme.bg_sel } }
+        else
+            float_bg;
+        const gutter_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = base_bg.bg };
+        var ids_buf: [512]u8 = undefined;
+        @memset(ids_buf[0..n], 0);
+        for (spans.items) |sp| {
+            if (sp.end <= row_s or sp.start >= row_e) continue;
+            const cs = @max(sp.start, @as(u32, @intCast(row_s)));
+            const ce = @min(sp.end, @as(u32, @intCast(row_e)));
+            const sid: u8 = @intCast(@intFromEnum(sp.style) + 1);
+            for (cs..ce) |bi| {
+                if (bi - row_s >= n) break;
+                ids_buf[bi - row_s] = sid;
+            }
+        }
+        try segs.append(a, .{ .text = gutter, .style = gutter_style });
+        try segs.append(a, .{ .text = " ", .style = gutter_style });
+        const base_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = base_bg.bg };
+        var i: usize = 0;
+        while (i < n) {
+            const sid = ids_buf[i];
+            var j = i + 1;
+            while (j < n and ids_buf[j] == sid) : (j += 1) {}
+            const st: vaxis.Style = if (sid == 0)
+                base_style
+            else blk: {
+                var s2 = style_palette[sid - 1];
+                s2.bg = base_bg.bg;
+                break :blk s2;
+            };
+            try segs.append(a, .{ .text = text[row_s + i .. row_s + j], .style = st });
+            i = j;
+        }
+        const used = 3 + n;
+        if (used < pw) {
+            const pad = try a.alloc(u8, pw - used);
+            @memset(pad, ' ');
+            try segs.append(a, .{ .text = pad, .style = base_bg });
+        }
     }
 
     fn handlePickerKey(self: *App, key: vaxis.Key) !void {
         switch (key.codepoint) {
-            vaxis.Key.escape => self.closePicker(),
+            vaxis.Key.escape => {
+                // theme picker: Esc cancels the live preview — restore the
+                // theme that was active when the picker opened
+                if (self.picker_mode == .themes) {
+                    if (self.theme_saved) |t| self.theme = t;
+                }
+                self.closePicker();
+            },
             vaxis.Key.enter => {
                 // Confirming jumps into the target file: leave the file-tree
                 // navigation mode so j/k/↑↓ control the buffer afterwards
                 // (vim: picker confirm drops focus back to the buffer).
                 self.filetree_active = false;
                 self.focus = .buffer;
+                if (self.picker_mode == .keymaps) {
+                    // keymap search has no jump target — Enter just closes
+                    self.closePicker();
+                    return;
+                }
                 if (self.picker_mode == .grep) {
                     if (self.grep_results.items.len > 0) {
                         const r = self.grep_results.items[self.picker_sel];
@@ -3537,6 +4024,17 @@ const App = struct {
                     }
                     return;
                 }
+                if (self.picker_mode == .themes) {
+                    // Enter confirms the previewed theme: keep it, report it
+                    // and close (the preview already applied it on move).
+                    if (self.picker_matches.items.len > 0) {
+                        const ti = self.picker_matches.items[self.picker_sel];
+                        self.theme = theme.themes[ti];
+                        try self.setMsg(try std.fmt.allocPrint(self.alloc, "theme: {s}", .{theme.themes[ti].name}));
+                    }
+                    self.closePicker();
+                    return;
+                }
                 if (self.picker_matches.items.len > 0) {
                     const f = self.picker_files.items[self.picker_matches.items[self.picker_sel]];
                     self.closePicker();
@@ -3552,21 +4050,38 @@ const App = struct {
                     } else {
                         try self.pickerRefilter();
                     }
+                    if (self.picker_mode == .themes) self.applyThemePreview();
                 }
             },
             vaxis.Key.down => {
                 const n = if (self.picker_mode == .grep) self.grep_results.items.len else self.picker_matches.items.len;
-                if (self.picker_sel + 1 < n) self.picker_sel += 1;
+                if (self.picker_sel + 1 < n) {
+                    self.picker_sel += 1;
+                    if (self.picker_mode == .grep) self.refreshGrepPreview();
+                    if (self.picker_mode == .themes) self.applyThemePreview();
+                }
             },
             vaxis.Key.up => {
-                if (self.picker_sel > 0) self.picker_sel -= 1;
+                if (self.picker_sel > 0) {
+                    self.picker_sel -= 1;
+                    if (self.picker_mode == .grep) self.refreshGrepPreview();
+                    if (self.picker_mode == .themes) self.applyThemePreview();
+                }
             },
             else => {
                 if (key.codepoint == 'n' and key.mods.ctrl) {
                     const n = if (self.picker_mode == .grep) self.grep_results.items.len else self.picker_matches.items.len;
-                    if (self.picker_sel + 1 < n) self.picker_sel += 1;
+                    if (self.picker_sel + 1 < n) {
+                        self.picker_sel += 1;
+                        if (self.picker_mode == .grep) self.refreshGrepPreview();
+                        if (self.picker_mode == .themes) self.applyThemePreview();
+                    }
                 } else if (key.codepoint == 'p' and key.mods.ctrl) {
-                    if (self.picker_sel > 0) self.picker_sel -= 1;
+                    if (self.picker_sel > 0) {
+                        self.picker_sel -= 1;
+                        if (self.picker_mode == .grep) self.refreshGrepPreview();
+                        if (self.picker_mode == .themes) self.applyThemePreview();
+                    }
                 } else if (key.text) |t| {
                     try self.picker_input.appendSlice(self.alloc, t);
                     self.picker_sel = 0;
@@ -3575,13 +4090,37 @@ const App = struct {
                     } else {
                         try self.pickerRefilter();
                     }
+                    if (self.picker_mode == .themes) self.applyThemePreview();
                 }
             },
         }
     }
 
+    /// Theme picker live preview: apply the theme under the current
+    /// selection to the whole UI (the next render repaints with it).
+    fn applyThemePreview(self: *App) void {
+        if (self.picker_mode != .themes or !self.picker_active) return;
+        if (self.picker_matches.items.len == 0) return;
+        const ti = self.picker_matches.items[self.picker_sel];
+        self.theme = theme.themes[ti];
+    }
+
     fn pickerRefilter(self: *App) !void {
         self.picker_matches.clearRetainingCapacity();
+        if (self.picker_mode == .keymaps) {
+            // match against "keys desc" via fzy; matches index into
+            // keymap_list.entries (empty query hits every entry)
+            const needle = self.picker_input.items;
+            var ei: usize = 0;
+            while (ei < keymap_list.entries.len) : (ei += 1) {
+                if (try keymap_list.matches(self.alloc, keymap_list.entries[ei], needle)) {
+                    try self.picker_matches.append(self.alloc, ei);
+                    if (self.picker_matches.items.len >= 20) break;
+                }
+            }
+            if (self.picker_sel >= self.picker_matches.items.len) self.picker_sel = 0;
+            return;
+        }
         if (self.picker_mode == .recent) {
             // match against recent-file paths; matches index into recent_files
             const needle = self.picker_input.items;
@@ -3618,6 +4157,25 @@ const App = struct {
             if (self.picker_sel >= self.picker_matches.items.len) self.picker_sel = 0;
             return;
         }
+        if (self.picker_mode == .themes) {
+            // match against theme names; matches index into theme.themes
+            // (empty query hits every theme)
+            const needle = self.picker_input.items;
+            var ti: usize = 0;
+            while (ti < theme.themes.len) : (ti += 1) {
+                const tname = theme.themes[ti].name;
+                if (needle.len == 0) {
+                    try self.picker_matches.append(self.alloc, ti);
+                    continue;
+                }
+                const m = try util.fzy.match(self.alloc, tname, needle) orelse continue;
+                defer self.alloc.free(m.positions);
+                try self.picker_matches.append(self.alloc, ti);
+                if (self.picker_matches.items.len >= 20) break;
+            }
+            if (self.picker_sel >= self.picker_matches.items.len) self.picker_sel = 0;
+            return;
+        }
         const needle = self.picker_input.items;
         if (needle.len == 0) {
             const n = @min(self.picker_files.items.len, 20);
@@ -3647,6 +4205,7 @@ const App = struct {
         self.picker_active = false;
         self.picker_sel = 0;
         self.picker_mode = .files;
+        self.freeGrepPreview();
     }
 
     // ---- dashboard ----
@@ -4624,6 +5183,8 @@ const App = struct {
             .picker_grep => try self.openGrepPicker(),
             .picker_buffers => try self.openBufferPicker(),
             .picker_recent => try self.openRecentPicker(),
+            .picker_keymaps => try self.openKeymapPicker(),
+            .picker_themes => try self.openThemePicker(),
             .diagnostic_next => self.gotoDiagnostic(true),
             .diagnostic_prev => self.gotoDiagnostic(false),
             .search_next => try self.repeatSearch(false),
@@ -5234,6 +5795,37 @@ const App = struct {
         return col;
     }
 
+    /// true when buffer line `l` has no non-whitespace content.
+    fn isBlankLine(self: *App, buf: *Buffer, l: u32) bool {
+        _ = self;
+        const ls = buf.pt.lineStart(l);
+        const ll = buf.pt.lineLen(l);
+        var i: u32 = 0;
+        while (i < ll) : (i += 1) {
+            const b = buf.pt.byteAt(ls + i);
+            if (b != ' ' and b != '\t') return false;
+        }
+        return true;
+    }
+
+    /// Expanded indent levels (columns / tab_width) of buffer line `l`.
+    fn lineIndentLevels(self: *App, buf: *Buffer, l: u32) u32 {
+        _ = self;
+        const ls = buf.pt.lineStart(l);
+        const ll = buf.pt.lineLen(l);
+        var cols: u32 = 0;
+        var i: u32 = 0;
+        while (i < ll) : (i += 1) {
+            const b = buf.pt.byteAt(ls + i);
+            if (b == ' ') {
+                cols += 1;
+            } else if (b == '\t') {
+                cols += tab_width;
+            } else break;
+        }
+        return cols / tab_width;
+    }
+
     /// Render one split window's lines into `rect` (content-area coordinates).
     /// The highlighter is bound to the current buffer, so only the focused
     /// window gets syntax highlighting and the (single) visual selection.
@@ -5473,12 +6065,13 @@ const App = struct {
             // ("不足 4 列的部分") draw nothing (the spaces still render).
             var indent_end: u32 = 0;
             while (indent_end < n and (text[indent_end] == ' ' or text[indent_end] == '\t')) indent_end += 1;
+            // expanded column count of the indent region (space = 1 col,
+            // tab = tab_width cols) — also needed by the blank-line
+            // continuation below, so computed here for both paths
+            var indent_cols: u32 = 0;
+            var ib: u32 = 0;
+            while (ib < indent_end) : (ib += 1) indent_cols += if (text[ib] == '\t') tab_width else 1;
             if (indent_end > 0) {
-                // expanded column count of the indent region (space = 1 col,
-                // tab = tab_width cols) → complete levels = cols / tab_width
-                var indent_cols: u32 = 0;
-                var ib: u32 = 0;
-                while (ib < indent_end) : (ib += 1) indent_cols += if (text[ib] == '\t') tab_width else 1;
                 const indent_levels: u32 = indent_cols / tab_width;
                 // hints anchored at/inside the indent region render before it
                 // (normally none: hints annotate tokens, which start past the
@@ -5522,6 +6115,89 @@ const App = struct {
                     }
                 }
             }
+            // Blank / whitespace-only lines: the indent guides continue
+            // through them (snacks.indent draws blank rows too), so the
+            // guides never break across empty lines. The gray levels
+            // come from the nearest non-blank line (above, else below);
+            // inside the cursor's scope the scope's own guide column is
+            // highlighted (rainbow). NOTE: only ACTUALLY blank lines
+            // reach this — a content line at column 0 (fn header,
+            // closing brace) has indent_end == 0 but indent_end != n, so
+            // the scope's vertical never extends onto those rows.
+            if (indent_end == n) {
+                    var ctx_levels: u32 = 0;
+                    {
+                        var ctx: i64 = @as(i64, @intCast(line)) - 1;
+                        var dir: i64 = -1;
+                        var scanned: usize = 0;
+                        const lc: i64 = @as(i64, @intCast(line_count));
+                        while (scanned < 500) : (scanned += 1) {
+                            if (ctx < 0) {
+                                if (dir == -1) {
+                                    ctx = @as(i64, @intCast(line)) + 1;
+                                    dir = 1;
+                                    continue;
+                                }
+                                break;
+                            }
+                            if (ctx >= lc) break;
+                            const cl: u32 = @intCast(ctx);
+                            if (!self.isBlankLine(buf, cl)) {
+                                ctx_levels = self.lineIndentLevels(buf, cl);
+                                break;
+                            }
+                            ctx += dir;
+                        }
+                    }
+                    const start_col: u32 = indent_cols;
+                    const ctx_cols: u32 = @min(ctx_levels * tab_width, rect.width -| gutter);
+                    // the scope's highlighted guide column (only when it lies
+                    // past the line's own indent — deeper whitespace-only
+                    // lines already got it from the loop above); sentinel
+                    // rect.width when absent / off-screen
+                    const scope_col: u32 = if (in_scope and scope_indent_col >= indent_cols and
+                        scope_indent_col < rect.width -| gutter)
+                        scope_indent_col
+                    else
+                        rect.width;
+                    const end_col: u32 = @max(ctx_cols, if (scope_col < rect.width) scope_col + 1 else ctx_cols);
+                    if (end_col > start_col) {
+                        const n_cells = end_col - start_col;
+                        const row_buf = try a.alloc(u8, n_cells);
+                        @memset(row_buf, ' ');
+                        var gc: u32 = start_col;
+                        while (gc < end_col) : (gc += 1) {
+                            // guide cells use a 1-byte marker; the real glyph
+                            // is the 3-byte "│", emitted per cell below
+                            if (gc % tab_width == 0 and gc != scope_col) row_buf[gc - start_col] = 0x01;
+                        }
+                        const gstyle: vaxis.Style = .{
+                            .bg = .{ .rgb = if (is_cur_line) self.theme.bg_curline else self.theme.bg },
+                            .fg = .{ .rgb = self.theme.fg_dim },
+                        };
+                        // emit runs, converting markers to "│", splitting
+                        // around the scope cell so it gets its own color
+                        const off = if (scope_col >= start_col and scope_col < end_col) scope_col - start_col else n_cells;
+                        var run_start: usize = 0;
+                        var k: usize = 0;
+                        while (k < n_cells) : (k += 1) {
+                            if (k == off) {
+                                if (k > run_start) try segs.append(a, .{ .text = row_buf[run_start..k], .style = gstyle });
+                                const level: u32 = scope_col / tab_width;
+                                try segs.append(a, .{ .text = "│", .style = .{
+                                    .bg = gstyle.bg,
+                                    .fg = .{ .rgb = self.theme.indent[level % 8] },
+                                } });
+                                run_start = k + 1;
+                            } else if (row_buf[k] == 0x01) {
+                                if (k > run_start) try segs.append(a, .{ .text = row_buf[run_start..k], .style = gstyle });
+                                try segs.append(a, .{ .text = "│", .style = gstyle });
+                                run_start = k + 1;
+                            }
+                        }
+                        if (run_start < n_cells) try segs.append(a, .{ .text = row_buf[run_start..], .style = gstyle });
+                    }
+                }
             var col: u32 = indent_end; // text starts after the indent region
             while (col < n) {
                 // emit any hint whose insertion column is at/just passed col
@@ -5628,6 +6304,138 @@ const App = struct {
         }
     }
 
+    /// One fenced-code line: the fence markers (```lang / ```) render dim;
+    /// the panel stays a solid bg_float block.
+    fn hoverFenceSegs(self: *App, a: std.mem.Allocator, line: []const u8, cols: u32) ![]vaxis.Segment {
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        const style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg_float } };
+        const shown = @min(line.len, @as(usize, @intCast(cols)));
+        if (shown > 0) try segs.append(a, .{ .text = line[0..shown], .style = style });
+        if (shown < cols) {
+            const pad = try a.alloc(u8, @intCast(cols - @as(u32, @intCast(shown))));
+            @memset(pad, ' ');
+            try segs.append(a, .{ .text = pad, .style = style });
+        }
+        return segs.items;
+    }
+
+    /// One code-block row inside the hover window: token colors from the
+    /// block's merged tree-sitter spans (each span clipped to this line,
+    /// syntaxStyle fg on bg_float), then padding to `cols` so the panel
+    /// stays solid. `line_start`/`line_end` are byte offsets into `block`.
+    fn hoverCodeLineSegs(self: *App, a: std.mem.Allocator, block: []const u8, line_start: u32, line_end: u32, spans: []const syntax.Span, cols: u32) ![]vaxis.Segment {
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        const base: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } };
+        var pos = line_start;
+        var si: usize = 0;
+        var consumed: usize = 0;
+        while (si < spans.len and pos < line_end) {
+            const sp = spans[si];
+            if (sp.end <= pos) {
+                si += 1;
+                continue;
+            }
+            if (sp.start >= line_end) break;
+            if (sp.start > pos) {
+                const gap = @min(sp.start, line_end) - pos;
+                try segs.append(a, .{ .text = block[pos .. pos + gap], .style = base });
+                consumed += gap;
+                pos = sp.start;
+            }
+            const s = @max(sp.start, pos);
+            const e = @min(sp.end, line_end);
+            if (e > s) {
+                var st = syntaxStyle(sp.style, self.theme);
+                st.bg = .{ .rgb = self.theme.bg_float };
+                try segs.append(a, .{ .text = block[s..e], .style = st });
+                consumed += e - s;
+                pos = e;
+            }
+            si += 1;
+        }
+        if (pos < line_end) {
+            const tail = block[pos..line_end];
+            try segs.append(a, .{ .text = tail, .style = base });
+            consumed += line_end - pos;
+        }
+        if (consumed < cols) {
+            const pad = try a.alloc(u8, @intCast(cols - @as(u32, @intCast(consumed))));
+            @memset(pad, ' ');
+            try segs.append(a, .{ .text = pad, .style = base });
+        }
+        return segs.items;
+    }
+
+    /// Minimal markdown-ish token styling for LSP hover/signature text:
+    /// `` `code` `` spans get the string color, `**bold**` bold, `*emphasis*`
+    /// dim+italic, `#`-prefixed headings accent+bold, bare http(s) URLs the
+    /// function color; everything else stays fg. The row is padded to `cols`
+    /// with bg_float so the floating panel remains a solid block (e2e asserts
+    /// rowAllBg on hover rows). The text slices reference the caller's owned
+    /// hover buffer, and the padding is allocator-owned — both outlive the
+    /// render call.
+    fn hoverLineSegs(self: *App, a: std.mem.Allocator, line: []const u8, cols: u32) ![]vaxis.Segment {
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        const base: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } };
+        const shown = @min(line.len, @as(usize, @intCast(cols)));
+        // heading line: 1-6 '#' followed by a space
+        var heading = false;
+        if (shown >= 2 and line[0] == '#') {
+            var h: usize = 0;
+            while (h < shown and h < 6 and line[h] == '#') h += 1;
+            heading = h < shown and line[h] == ' ';
+        }
+        if (heading) {
+            const hstyle: vaxis.Style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_float }, .bold = true };
+            if (shown > 0) try segs.append(a, .{ .text = line[0..shown], .style = hstyle });
+            if (shown < cols) {
+                const pad = try a.alloc(u8, @intCast(cols - @as(u32, @intCast(shown))));
+                @memset(pad, ' ');
+                try segs.append(a, .{ .text = pad, .style = base });
+            }
+        } else {
+            var consumed: usize = 0;
+            var i: usize = 0;
+            while (i < shown) {
+                var style = base;
+                var end: usize = shown;
+                if (line[i] == '`') {
+                    // inline code span: up to the next backtick
+                    style = .{ .fg = .{ .rgb = self.theme.string }, .bg = .{ .rgb = self.theme.bg_float } };
+                    i += 1;
+                    end = if (std.mem.indexOfScalar(u8, line[i..shown], '`')) |ci| i + ci else shown;
+                } else if (line[i] == '*' and i + 1 < shown and line[i + 1] == '*') {
+                    style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_float }, .bold = true };
+                    i += 2;
+                    end = if (std.mem.indexOf(u8, line[i..shown], "**")) |ci| i + ci else shown;
+                } else if (line[i] == '*') {
+                    style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg_float }, .italic = true };
+                    i += 1;
+                    end = if (std.mem.indexOfScalar(u8, line[i..shown], '*')) |ci| i + ci else shown;
+                } else if (shown - i >= 4 and std.mem.eql(u8, line[i .. i + 4], "http")) {
+                    // bare URL: to the next whitespace / punctuation
+                    var ue = i;
+                    while (ue < shown and line[ue] != ' ' and line[ue] != '\t' and
+                        line[ue] != ',' and line[ue] != ')' and line[ue] != ']') ue += 1;
+                    end = ue;
+                    style = .{ .fg = .{ .rgb = self.theme.function }, .bg = .{ .rgb = self.theme.bg_float } };
+                }
+                if (end <= i) end = shown;
+                if (end > i) {
+                    try segs.append(a, .{ .text = line[i..end], .style = style });
+                    consumed += end - i;
+                }
+                i = end;
+            }
+            if (consumed < cols) {
+                const pad = try a.alloc(u8, @intCast(cols - @as(u32, @intCast(consumed))));
+                @memset(pad, ' ');
+                try segs.append(a, .{ .text = pad, .style = base });
+            }
+        }
+        return segs.items;
+    }
+
     fn render(self: *App) !void {
         // vaxis cells reference the text slices passed to print, so all text
         // must stay alive until vx.render(); a per-frame arena handles that.
@@ -5679,12 +6487,21 @@ const App = struct {
                     .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_status }, .bold = true }
                 else
                     .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
+                // file icon in the tab's own semantic color (devicons style);
+                // the name keeps the plain tab style
+                const icon = icons.forPath(if (buf.path) |p| p else "", false);
+                const icon_style: vaxis.Style = .{
+                    .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) },
+                    .bg = tab_style.bg,
+                    .bold = (tab_i == self.current),
+                };
                 const segs = [_]vaxis.Segment{
+                    .{ .text = icon.glyph, .style = icon_style },
                     .{ .text = label, .style = tab_style },
                     .{ .text = " ", .style = .{ .bg = .{ .rgb = self.theme.bg } } },
                 };
                 _ = win.print(&segs, .{ .row_offset = 0, .col_offset = col, .wrap = .none });
-                col +|= @intCast(label.len + 1);
+                col +|= @intCast(1 + label.len + 1);
                 if (col >= win.width) break;
             }
         }
@@ -5696,23 +6513,38 @@ const App = struct {
                 .style = .{ .fg = .{ .rgb = self.theme.accent }, .bold = true },
             }};
             _ = win.print(&title_seg, .{ .row_offset = @intCast(self.contentTop() + 2), .col_offset = 2, .wrap = .none });
-            const sub_seg = [_]vaxis.Segment{.{
-                .text = " 终端文本编辑器  —  j/k 选择 · Enter 打开 · <leader>sf 找文件 · :e 打开 · :q 退出",
-                .style = .{ .fg = .{ .rgb = self.theme.fg_faint } },
-            }};
-            _ = win.print(&sub_seg, .{ .row_offset = @intCast(self.contentTop() + 3), .col_offset = 2, .wrap = .none });
+            // key-hint line, segmented so the bindings get token colors while
+            // the prose stays faint (the text content is unchanged, so e2e
+            // `contains` assertions on the line still hold)
+            const hint_segs = [_]vaxis.Segment{
+                .{ .text = " 终端文本编辑器  —  ", .style = .{ .fg = .{ .rgb = self.theme.fg_faint } } },
+                .{ .text = "j/k", .style = .{ .fg = .{ .rgb = self.theme.keyword } } },
+                .{ .text = " 选择 · ", .style = .{ .fg = .{ .rgb = self.theme.fg_faint } } },
+                .{ .text = "Enter", .style = .{ .fg = .{ .rgb = self.theme.keyword } } },
+                .{ .text = " 打开 · ", .style = .{ .fg = .{ .rgb = self.theme.fg_faint } } },
+                .{ .text = "<leader>", .style = .{ .fg = .{ .rgb = self.theme.accent } } },
+                .{ .text = "sf", .style = .{ .fg = .{ .rgb = self.theme.keyword } } },
+                .{ .text = " 找文件 · ", .style = .{ .fg = .{ .rgb = self.theme.fg_faint } } },
+                .{ .text = ":e", .style = .{ .fg = .{ .rgb = self.theme.accent } } },
+                .{ .text = " 打开 · ", .style = .{ .fg = .{ .rgb = self.theme.fg_faint } } },
+                .{ .text = ":q", .style = .{ .fg = .{ .rgb = self.theme.accent } } },
+                .{ .text = " 退出", .style = .{ .fg = .{ .rgb = self.theme.fg_faint } } },
+            };
+            _ = win.print(&hint_segs, .{ .row_offset = @intCast(self.contentTop() + 3), .col_offset = 2, .wrap = .none });
             var ri: usize = 0;
             while (ri < @min(self.recent_files.items.len, 8)) : (ri += 1) {
                 const fname = self.recent_files.items[ri];
                 const row: u32 = 5 + @as(u32, @intCast(ri));
-                const seg = [_]vaxis.Segment{.{
-                    .text = fname,
-                    .style = if (ri == self.recent_sel)
-                        .{ .bg = .{ .rgb = self.theme.bg_sel } }
-                    else
-                        .{ .fg = .{ .rgb = self.theme.function } },
-                }};
-                _ = win.print(&seg, .{ .row_offset = @intCast(self.contentTop() + row), .col_offset = 2, .wrap = .none });
+                const sel = (ri == self.recent_sel);
+                const bg: vaxis.Color = if (sel) .{ .rgb = self.theme.bg_sel } else .default;
+                const fg: vaxis.Color = if (sel) .default else .{ .rgb = self.theme.function };
+                const icon = icons.forPath(fname, false);
+                const segs = [_]vaxis.Segment{
+                    .{ .text = icon.glyph, .style = .{ .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) }, .bg = bg } },
+                    .{ .text = " ", .style = .{ .bg = bg } },
+                    .{ .text = fname, .style = .{ .fg = fg, .bg = bg } },
+                };
+                _ = win.print(&segs, .{ .row_offset = @intCast(self.contentTop() + row), .col_offset = 2, .wrap = .none });
             }
             self.vx.screen.cursor = .{
                 .row = @intCast(self.contentTop() + 5 + @as(u32, @intCast(@min(self.recent_sel, 7)))),
@@ -5726,7 +6558,8 @@ const App = struct {
 
         // split windows: every leaf gets a rectangle and renders its buffer;
         // the focused window carries syntax highlighting and the selection
-        const leaves = try self.layoutWindows(a, self.contentTop(), content_rows, self.contentCol(), win.width);
+        const layout = try self.layoutWindows(a, self.contentTop(), content_rows, self.contentCol(), win.width);
+        const leaves = layout.leaves;
         var cur_rect: LeafRect = .{ .win = self.current_win, .row = 0, .col = 0, .height = 0, .width = 0 };
         var li: usize = 0;
         while (li < leaves.len) : (li += 1) {
@@ -5735,15 +6568,47 @@ const App = struct {
             try self.renderWindowLines(a, lr, lr.win == self.current_win);
         }
 
-        // file tree sidebar (telescope/snacks style: solid bg_float panel
-        // with a border, below the tab bar so the tabs stay visible)
+        // window separators (vim statusline semantics): one "─" row per
+        // horizontal split, one "│" column per vertical split, drawn OVER the
+        // buffers so the panes read as distinct windows without changing the
+        // layout math. The separator adjacent to the focused window (the
+        // split path from the root to the current leaf) is bright; the rest
+        // are dim. The bg is the editor background so the line fully hides
+        // whatever buffer text it covers — no ghosting from the window below.
+        for (layout.seps) |sep| {
+            const sep_style: vaxis.Style = .{
+                .fg = .{ .rgb = if (sep.active) self.theme.win_sep_active else self.theme.win_sep },
+                .bg = .{ .rgb = self.theme.bg },
+            };
+            if (sep.horizontal) {
+                var xs: u32 = 0;
+                while (xs < sep.len) : (xs += 1) {
+                    win.writeCell(@intCast(sep.col + xs), @intCast(sep.row), .{
+                        .char = .{ .grapheme = "─", .width = 1 },
+                        .style = sep_style,
+                    });
+                }
+            } else {
+                var ys: u32 = 0;
+                while (ys < sep.len) : (ys += 1) {
+                    win.writeCell(@intCast(sep.col), @intCast(sep.row + ys), .{
+                        .char = .{ .grapheme = "│", .width = 1 },
+                        .style = sep_style,
+                    });
+                }
+            }
+        }
+
+        // file tree sidebar (nvim neo-tree style: the panel shares the
+        // EDITOR background — Normal bg, not a float — so sidebar and text
+        // area read as one surface; only the fg_faint border separates them)
         if (self.filetree_active) {
             const ft_col: u32 = 0;
             const ft_width = filetree_width;
             const ft_top = self.contentTop();
             const ft_bottom = height - status_row_count; // above the status bar
-            const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
-            // Paint the whole panel with the float background first — without
+            const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg } };
+            // Paint the whole panel with the editor background first — without
             // this only the border columns and the text-width of each item
             // got the bg, leaving the interior terminal-default (patchy).
             const panel = win.child(.{
@@ -5752,7 +6617,7 @@ const App = struct {
                 .width = @intCast(ft_width),
                 .height = @intCast(ft_bottom - ft_top),
             });
-            panel.fill(.{ .style = .{ .bg = .{ .rgb = self.theme.bg_float } } });
+            panel.fill(.{ .style = .{ .bg = .{ .rgb = self.theme.bg } } });
             // left border column and panel background
             const left_col = ft_col;
             const inner_left = ft_col + 1;
@@ -5778,7 +6643,15 @@ const App = struct {
                 _ = win.print(segs.items, .{ .row_offset = @intCast(ft_top), .col_offset = @intCast(left_col), .wrap = .none });
             }
             // vim-style scroll window (same semantics as the picker)
-            const ft_len = self.filetree_files.items.len;
+            const ft_len = self.filetree_rows.items.len;
+            // clamp the selection when the tree shrank (collapse) BEFORE the
+            // scroll math, or a stale sel >= len would drive ft_top past the
+            // end of the visible list (out of bounds on the row loop below)
+            if (ft_len == 0) {
+                self.filetree_sel = 0;
+            } else if (self.filetree_sel >= ft_len) {
+                self.filetree_sel = ft_len - 1;
+            }
             const ft_vis = @min(ft_len, @as(usize, ft_bottom - ft_top - 2));
             if (ft_len > ft_vis) {
                 if (self.filetree_top + ft_vis > ft_len) self.filetree_top = ft_len - ft_vis;
@@ -5789,24 +6662,62 @@ const App = struct {
             var k: usize = 0;
             while (k < ft_vis) : (k += 1) {
                 const ri = ft_top_i + k;
-                const f = self.filetree_files.items[ri];
-                const label = if (f.len > inner_w) f[f.len - inner_w ..] else f;
-                // Pad to the full inner width: the row background (plain and
-                // selected alike) must span the panel edge to edge. NOTE:
-                // vaxis cells REFERENCE the segment text — it must outlive
-                // vx.render() — so the padding is a comptime constant, never
-                // a stack buffer (a stack row_buf made every row render the
-                // LAST file's name).
-                const pads = " " ** (filetree_width - 1);
+                const frow = self.filetree_rows.items[ri];
+                const node = frow.node;
+                const indent = frow.depth * 2;
+                // content = indent + icon (1 cell) + name; a too-wide name is
+                // truncated from the RIGHT with "…" (never head-truncated).
+                // The name budget excludes the right-border column (the last
+                // inner cell), which the border draws over afterwards.
+                const icon = if (node.is_dir) icons.folder(node.expanded) else icons.forPath(node.path, false);
+                const avail = (inner_w -| 1) -| @as(usize, indent) -| 1;
+                var name = node.name;
+                var ellipsized = false;
+                if (name.len > avail) {
+                    name = name[0..avail -| 1];
+                    ellipsized = true;
+                }
                 const style: vaxis.Style = if (ri == self.filetree_sel)
                     .{ .bg = .{ .rgb = self.theme.bg_sel }, .fg = .{ .rgb = self.theme.fg } }
                 else
-                    .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } };
-                const segs = [_]vaxis.Segment{
-                    .{ .text = label, .style = style },
-                    .{ .text = pads[0 .. @as(usize, @intCast(inner_w)) -| label.len], .style = style },
-                };
-                _ = win.print(&segs, .{ .row_offset = @intCast(ft_top + 1 + k), .col_offset = @intCast(inner_left), .wrap = .none });
+                    .{ .bg = .{ .rgb = self.theme.bg }, .fg = .{ .rgb = self.theme.fg } };
+                // Pad to the full inner width: the row background (plain and
+                // selected alike) must span the panel edge to edge. NOTE:
+                // vaxis cells REFERENCE the segment text — it must outlive
+                // vx.render() — so the padding is arena-allocated, never a
+                // stack buffer (a stack row_buf made every row render the
+                // LAST file's name).
+                var segs = std.ArrayList(vaxis.Segment).empty;
+                if (indent > 0) {
+                    const pad = try a.alloc(u8, indent);
+                    @memset(pad, ' ');
+                    try segs.append(a, .{ .text = pad, .style = style });
+                }
+                try segs.append(a, .{ .text = icon.glyph, .style = .{ .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) }, .bg = style.bg } });
+                if (name.len > 0) try segs.append(a, .{ .text = name, .style = style });
+                if (ellipsized) try segs.append(a, .{ .text = "…", .style = style });
+                // count cells: indent spaces + icon (1 cell) + name + "…"
+                const content_len = indent + 1 + name.len + @as(usize, if (ellipsized) 1 else 0);
+                const pads = try a.alloc(u8, inner_w -| @min(content_len, inner_w));
+                @memset(pads, ' ');
+                if (pads.len > 0) try segs.append(a, .{ .text = pads, .style = style });
+                _ = win.print(segs.items, .{ .row_offset = @intCast(ft_top + 1 + k), .col_offset = @intCast(inner_left), .wrap = .none });
+            }
+            // right border column — mirrors the left one so the panel is a
+            // closed box. The title row's "╮" and the bottom row's "╯"
+            // already cap the two corners, so only the interior rows need the
+            // "│" (the item rows' trailing padding is what it covers).
+            {
+                const right_col = ft_col + ft_width - 1;
+                var rrow: u32 = ft_top + 1;
+                const rlast = ft_bottom - 1; // bottom border row
+                while (rrow < rlast) : (rrow += 1) {
+                    const border_seg = [_]vaxis.Segment{.{
+                        .text = "│",
+                        .style = border_style,
+                    }};
+                    _ = win.print(&border_seg, .{ .row_offset = @intCast(rrow), .col_offset = @intCast(right_col), .wrap = .none });
+                }
             }
             // bottom border
             {
@@ -5864,11 +6775,16 @@ const App = struct {
             }
         }
 
-        // fuzzy picker overlay (telescope/snacks style: solid bg_float
-        // floating window with a border and a title, bottom-anchored)
+        // fuzzy picker overlay (telescope/snacks style: a solid bg_float
+        // floating window with a border, a title and an in-panel input row,
+        // centered on the screen instead of pinned to the bottom-left corner)
         if (self.picker_active) {
             const total = if (self.picker_mode == .grep) self.grep_results.items.len else self.picker_matches.items.len;
-            const list_rows = @min(@as(usize, 10), total);
+            // grep keeps at least one row ("no matches" hint) so the
+            // fixed-size panel never collapses to a sliver while the query
+            // has no hits yet
+            var list_rows = @min(@as(usize, 10), total);
+            if (self.picker_mode == .grep) list_rows = @max(list_rows, 1);
             // vim-style scroll window: the selection moves freely inside the
             // window; the window scrolls only when the selection crosses an
             // edge (persisted in picker_top so it doesn't jump around).
@@ -5878,37 +6794,81 @@ const App = struct {
                 if (self.picker_sel >= self.picker_top + list_rows) self.picker_top = self.picker_sel - list_rows + 1;
             } else self.picker_top = 0;
             const top = self.picker_top;
-            // measure the widest label for the box width (capped)
+            // measure the widest label for the box width (capped); file /
+            // recent / buffer rows carry a leading icon + space, keymap rows
+            // are "keys + 2 + desc". Skipped for grep: its panel is a fixed
+            // size, independent of the result set.
             var max_w: usize = 0;
-            var mk: usize = 0;
-            while (mk < list_rows) : (mk += 1) {
-                const ri = top + mk;
-                const label: []const u8 = if (self.picker_mode == .grep) blk: {
-                    const r = self.grep_results.items[ri];
-                    break :blk std.fmt.allocPrint(a, "{s}:{d}: {s}", .{ r.path, r.line, r.text }) catch "…";
-                } else if (self.picker_mode == .buffers) blk: {
-                    const bi = self.picker_matches.items[ri];
-                    break :blk std.fmt.allocPrint(a, "{d} {s}", .{ bi + 1, self.bufferName(bi) }) catch "…";
-                } else if (self.picker_mode == .recent) blk: {
-                    const ri2 = self.picker_matches.items[ri];
-                    break :blk self.recent_files.items[ri2];
-                } else self.picker_files.items[self.picker_matches.items[ri]];
-                max_w = @max(max_w, label.len);
+            if (self.picker_mode != .grep) {
+                var mk: usize = 0;
+                while (mk < list_rows) : (mk += 1) {
+                    const ri = top + mk;
+                    const label: []const u8 = if (self.picker_mode == .grep) blk: {
+                        const r = self.grep_results.items[ri];
+                        break :blk std.fmt.allocPrint(a, "{s}:{d}: {s}", .{ r.path, r.line, r.text }) catch "…";
+                    } else if (self.picker_mode == .buffers) blk: {
+                        const bi = self.picker_matches.items[ri];
+                        break :blk std.fmt.allocPrint(a, "{d} {s}", .{ bi + 1, self.bufferName(bi) }) catch "…";
+                    } else if (self.picker_mode == .recent) blk: {
+                        const ri2 = self.picker_matches.items[ri];
+                        break :blk self.recent_files.items[ri2];
+                    } else if (self.picker_mode == .keymaps) blk: {
+                        const ei = self.picker_matches.items[ri];
+                        const e = keymap_list.entries[ei];
+                        break :blk std.fmt.allocPrint(a, "{s}  {s}", .{ e.keys, e.desc }) catch "…";
+                    } else if (self.picker_mode == .themes) blk: {
+                        const ti = self.picker_matches.items[ri];
+                        break :blk theme.themes[ti].name;
+                    } else self.picker_files.items[self.picker_matches.items[ri]];
+                    const icon_len: usize = switch (self.picker_mode) {
+                        .files, .recent, .buffers => 2,
+                        // themes rows lead with a 3-cell color swatch + space
+                        .themes => 4,
+                        else => 0,
+                    };
+                    max_w = @max(max_w, label.len + icon_len);
+                }
+                max_w = @min(max_w, 60);
             }
-            max_w = @min(max_w, 60);
-            // "no matches" state: keep a minimum box width
-            const inner_w: u32 = @intCast(@max(max_w, 12));
+            var inner_w: u32 = @intCast(@max(max_w, 12));
+            var box_w: u32 = undefined;
+            if (self.picker_mode == .grep) {
+                // fixed-size panel: width is independent of the result count
+                // (no small→big pop when results arrive); 70% of the screen,
+                // min 44 inner columns (≈54 on an 80-col pty)
+                inner_w = @max(@min(win.width * 7 / 10 -| 2, 60), 44);
+                box_w = @min(inner_w + 2, win.width * 7 / 10);
+            } else {
+                // box width capped at 60% of the screen so a very wide label
+                // never spans the whole terminal (telescope/snacks feel)
+                box_w = @min(inner_w + 2, win.width * 3 / 5);
+            }
+            inner_w = box_w - 2;
             const title = switch (self.picker_mode) {
                 .grep => " Grep ",
                 .buffers => " Buffers ",
                 .recent => " Recent ",
+                .keymaps => " Keymaps ",
+                .themes => " Themes ",
                 else => " Files ",
             };
-            const start_row = height - 1 - @as(u32, @intCast(list_rows)) - 2; // box + prompt row
-            const start_col = 0;
+            // centered floating window: title + input row + list + bottom
+            // border; start_row biased slightly upward (1/3 down the screen)
+            // so the list reads closer to eye level, clamped against tiny
+            // terminals like the completion menu's overflow guard
+            const box_h: u32 = @as(u32, @intCast(list_rows)) + 3;
+            var start_row = (height -| box_h) / 3;
+            if (start_row < 1) start_row = 1;
+            if (start_row + box_h >= height) start_row = height -| box_h;
+            const start_col = (win.width -| box_w) / 2;
             const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
             const row_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } };
             const sel_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_sel }, .fg = .{ .rgb = self.theme.fg } };
+            // grep split: left = result list, 1 separator column, right =
+            // preview (inner*2/5 ≈ 21 cols on an 80-col pty, left ≈ 32)
+            const preview_w: u32 = if (self.picker_mode == .grep) inner_w * 2 / 5 else 0;
+            const left_w: u32 = inner_w -| 1 -| preview_w;
+            const sep_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.win_sep }, .bg = .{ .rgb = self.theme.bg_float } };
             // top border + title
             {
                 var segs = std.ArrayList(vaxis.Segment).empty;
@@ -5921,30 +6881,164 @@ const App = struct {
                 try segs.append(a, .{ .text = "╮", .style = border_style });
                 _ = win.print(segs.items, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(start_col), .wrap = .none });
             }
+            // input row: "❯ " prompt (accent) + the query, on the panel's
+            // own bg_float (telescope/snacks style — no status-bar row at
+            // the bottom of the screen). The whole interior row is bg_float
+            // so the panel stays a solid block.
+            {
+                const input_row = try a.alloc(u8, inner_w -| 2);
+                @memset(input_row, ' ');
+                const n = @min(self.picker_input.items.len, @as(usize, @intCast(inner_w -| 2)));
+                @memcpy(input_row[0..n], self.picker_input.items[0..n]);
+                const seg = [_]vaxis.Segment{
+                    .{ .text = "│", .style = border_style },
+                    .{ .text = "❯ ", .style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_float } } },
+                    .{ .text = input_row, .style = row_style },
+                    .{ .text = "│", .style = border_style },
+                };
+                _ = win.print(&seg, .{ .row_offset = @intCast(start_row + 1), .col_offset = @intCast(start_col), .wrap = .none });
+            }
             var k: usize = 0;
             while (k < list_rows) : (k += 1) {
                 const ri = top + k;
-                const label: []const u8 = if (self.picker_mode == .grep) blk: {
-                    const r = self.grep_results.items[ri];
-                    break :blk std.fmt.allocPrint(a, "{s}:{d}: {s}", .{ r.path, r.line, r.text }) catch "…";
-                } else if (self.picker_mode == .buffers) blk: {
-                    const bi = self.picker_matches.items[ri];
-                    break :blk std.fmt.allocPrint(a, "{d} {s}", .{ bi + 1, self.bufferName(bi) }) catch "…";
-                } else if (self.picker_mode == .recent) blk: {
-                    const ri2 = self.picker_matches.items[ri];
-                    break :blk self.recent_files.items[ri2];
-                } else self.picker_files.items[self.picker_matches.items[ri]];
-                // pad the row to inner_w so the bg_float panel is continuous
-                const row = try a.alloc(u8, inner_w);
-                @memset(row, ' ');
-                const n = @min(label.len, @as(usize, @intCast(inner_w)));
-                @memcpy(row[0..n], label[0..n]);
-                const seg = [_]vaxis.Segment{
-                    .{ .text = "│", .style = border_style },
-                    .{ .text = row, .style = if (ri == self.picker_sel) sel_style else row_style },
-                    .{ .text = "│", .style = border_style },
-                };
-                _ = win.print(&seg, .{ .row_offset = @intCast(start_row + 1 + k), .col_offset = @intCast(start_col), .wrap = .none });
+                const selected = (ri == self.picker_sel);
+                const rs: vaxis.Style = if (selected) sel_style else row_style;
+                var segs = std.ArrayList(vaxis.Segment).empty;
+                try segs.append(a, .{ .text = "│", .style = border_style });
+                if (self.picker_mode == .keymaps) {
+                    // segmented keymap row: keys tokens split on spaces —
+                    // "space" / "ctrl-*" / ":*" prefixes render accent, the
+                    // rest keyword; then "  " + desc in fg. The selected row
+                    // keeps the token colors and only swaps the bg.
+                    const ei = self.picker_matches.items[ri];
+                    const entry = keymap_list.entries[ei];
+                    var it = std.mem.splitScalar(u8, entry.keys, ' ');
+                    var first = true;
+                    while (it.next()) |tok| {
+                        if (tok.len == 0) continue;
+                        if (!first) try segs.append(a, .{ .text = " ", .style = rs });
+                        const is_prefix = first and (std.mem.eql(u8, tok, "space") or std.mem.startsWith(u8, tok, "ctrl-") or tok[0] == ':');
+                        const tok_style: vaxis.Style = if (is_prefix)
+                            .{ .fg = .{ .rgb = self.theme.accent }, .bg = rs.bg }
+                        else
+                            .{ .fg = .{ .rgb = self.theme.keyword }, .bg = rs.bg };
+                        try segs.append(a, .{ .text = tok, .style = tok_style });
+                        first = false;
+                    }
+                    try segs.append(a, .{ .text = "  ", .style = rs });
+                    try segs.append(a, .{ .text = entry.desc, .style = rs });
+                    // truncate the desc (the last segment) when the row
+                    // overflows the interior width
+                    var content_len: usize = 0;
+                    for (segs.items) |s| content_len += s.text.len;
+                    if (content_len > inner_w) {
+                        const over = content_len - inner_w;
+                        const last = &segs.items[segs.items.len - 1];
+                        if (last.text.len > over) {
+                            last.text = last.text[0 .. last.text.len - over];
+                            content_len = inner_w;
+                        }
+                    }
+                    const pad = try a.alloc(u8, inner_w -| content_len);
+                    @memset(pad, ' ');
+                    if (pad.len > 0) try segs.append(a, .{ .text = pad, .style = rs });
+                } else if (self.picker_mode == .grep) {
+                    // grep split panel: left column = the result row, then
+                    // the "│" separator, then the highlighted preview column
+                    if (self.grep_results.items.len == 0) {
+                        // "no matches" hint (dim); the preview column stays a
+                        // blank bg_float block so the panel is continuous
+                        const hint = "no matches";
+                        const n = @min(hint.len, @as(usize, @intCast(left_w)));
+                        const ids = [_]u8{0} ** 64;
+                        try appendRowSegs(&segs, a, hint, n, &ids, &[_]vaxis.Style{.{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg_float } }}, left_w, .{ .bg = .{ .rgb = self.theme.bg_float } });
+                        try segs.append(a, .{ .text = "│", .style = sep_style });
+                        try appendRowSegs(&segs, a, "", 0, &.{}, &[_]vaxis.Style{}, preview_w, .{ .bg = .{ .rgb = self.theme.bg_float } });
+                    } else {
+                        const r = self.grep_results.items[ri];
+                        // "path:line:" prefix (dim) + " text" (fg); fzy match
+                        // chars render keyword. The selected row keeps these
+                        // colors and only swaps the bg to bg_sel.
+                        const prefix = try std.fmt.allocPrint(a, "{s}:{d}:", .{ r.path, r.line });
+                        const label = try std.fmt.allocPrint(a, "{s} {s}", .{ prefix, r.text });
+                        const n = @min(label.len, @as(usize, @intCast(left_w)));
+                        var ids: [256]u8 = undefined;
+                        for (0..n) |i| ids[i] = if (i < prefix.len) 1 else 0;
+                        if (self.picker_input.items.len > 0) {
+                            if (try util.fzy.match(self.alloc, label, self.picker_input.items)) |m| {
+                                defer self.alloc.free(m.positions);
+                                for (m.positions) |p| {
+                                    if (p >= n) continue;
+                                    const cs = utf8CharStart(label, p);
+                                    if (cs >= n) continue;
+                                    const ce = @min(cs + utf8CharLenAt(label, cs), n);
+                                    for (cs..ce) |j| ids[j] = 2;
+                                }
+                            }
+                        }
+                        const styles = [_]vaxis.Style{
+                            .{ .fg = .{ .rgb = self.theme.fg }, .bg = rs.bg },
+                            .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = rs.bg },
+                            .{ .fg = .{ .rgb = self.theme.keyword }, .bg = rs.bg },
+                        };
+                        try appendRowSegs(&segs, a, label, n, &ids, &styles, left_w, .{ .bg = rs.bg });
+                        try segs.append(a, .{ .text = "│", .style = sep_style });
+                        try self.renderGrepPreviewRow(&segs, a, k, list_rows, preview_w);
+                    }
+                } else if (self.picker_mode == .themes) {
+                    // color-swatch row: 3 cells painted with the theme's OWN
+                    // bg / fg / accent — a preview of what the theme looks
+                    // like — then a space + the theme name. The swatch cells
+                    // keep the theme's own colors even on the selected row
+                    // (bg_sel must NOT cover them: the swatch IS the preview);
+                    // the name + trailing padding take the normal row style.
+                    const ti = self.picker_matches.items[ri];
+                    const t = theme.themes[ti];
+                    try segs.append(a, .{ .text = " ", .style = .{ .bg = .{ .rgb = t.bg } } });
+                    try segs.append(a, .{ .text = " ", .style = .{ .bg = .{ .rgb = t.fg } } });
+                    try segs.append(a, .{ .text = " ", .style = .{ .bg = .{ .rgb = t.accent } } });
+                    try segs.append(a, .{ .text = " ", .style = rs });
+                    try segs.append(a, .{ .text = t.name, .style = rs });
+                    const content_len = 4 + t.name.len;
+                    const pad = try a.alloc(u8, inner_w -| @min(content_len, @as(usize, @intCast(inner_w))));
+                    @memset(pad, ' ');
+                    if (pad.len > 0) try segs.append(a, .{ .text = pad, .style = rs });
+                } else {
+                    const label: []const u8 = if (self.picker_mode == .buffers) blk: {
+                        const bi = self.picker_matches.items[ri];
+                        break :blk std.fmt.allocPrint(a, "{d} {s}", .{ bi + 1, self.bufferName(bi) }) catch "…";
+                    } else if (self.picker_mode == .recent) blk: {
+                        const ri2 = self.picker_matches.items[ri];
+                        break :blk self.recent_files.items[ri2];
+                    } else self.picker_files.items[self.picker_matches.items[ri]];
+                    // file/recent/buffer rows: leading icon + space, then the
+                    // label
+                    const icon_path: ?[]const u8 = switch (self.picker_mode) {
+                        .files => self.picker_files.items[self.picker_matches.items[ri]],
+                        .recent => self.recent_files.items[self.picker_matches.items[ri]],
+                        .buffers => blk: {
+                            const bi = self.picker_matches.items[ri];
+                            break :blk if (self.buffers.items[bi].path) |p| p else "";
+                        },
+                        else => null,
+                    };
+                    const prefix_len: usize = if (icon_path != null) 2 else 0;
+                    // pad the label region to its width so the bg stays
+                    // continuous across the row (icon cell + space + label)
+                    const content_w = inner_w -| prefix_len;
+                    const row = try a.alloc(u8, content_w);
+                    @memset(row, ' ');
+                    const n = @min(label.len, @as(usize, @intCast(content_w)));
+                    @memcpy(row[0..n], label[0..n]);
+                    if (icon_path) |p| {
+                        const icon = icons.forPath(p, false);
+                        try segs.append(a, .{ .text = icon.glyph, .style = .{ .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) }, .bg = rs.bg } });
+                        try segs.append(a, .{ .text = " ", .style = rs });
+                    }
+                    try segs.append(a, .{ .text = row, .style = rs });
+                }
+                try segs.append(a, .{ .text = "│", .style = border_style });
+                _ = win.print(segs.items, .{ .row_offset = @intCast(start_row + 2 + k), .col_offset = @intCast(start_col), .wrap = .none });
             }
             // bottom border
             {
@@ -5955,17 +7049,12 @@ const App = struct {
                     try segs.append(a, .{ .text = "─", .style = border_style });
                 }
                 try segs.append(a, .{ .text = "╯", .style = border_style });
-                _ = win.print(segs.items, .{ .row_offset = @intCast(start_row + 1 + list_rows), .col_offset = @intCast(start_col), .wrap = .none });
+                _ = win.print(segs.items, .{ .row_offset = @intCast(start_row + 2 + list_rows), .col_offset = @intCast(start_col), .wrap = .none });
             }
-            const prompt = try std.fmt.allocPrint(a, "> {s}", .{self.picker_input.items});
-            const prompt_seg = [_]vaxis.Segment{.{
-                .text = prompt,
-                .style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_status } },
-            }};
-            _ = win.print(&prompt_seg, .{ .row_offset = @intCast(height - 1), .wrap = .none });
+            // the block cursor sits in the input row, right after the query
             self.vx.screen.cursor = .{
-                .row = @intCast(height - 1),
-                .col = @intCast(2 + self.picker_input.items.len),
+                .row = @intCast(start_row + 1),
+                .col = @intCast(start_col + 2 + self.picker_input.items.len),
             };
             self.vx.screen.cursor_vis = true;
             self.vx.screen.cursor_shape = .block;
@@ -6190,23 +7279,11 @@ const App = struct {
                 }
                 const col0 = cur_rect.col + gutter + 1;
                 const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
-                const bg_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } };
                 const border = "│";
                 const tl = "╭";
                 const tr = "╮";
                 const bl = "╰";
                 const br = "╯";
-                // one full interior row: `text` (≤ hcols cells) right-padded
-                // with bg_float so the panel background is continuous
-                const full_row = struct {
-                    fn build(a2: std.mem.Allocator, text: []const u8, cols: u32) ![]u8 {
-                        const row = try a2.alloc(u8, cols);
-                        @memset(row, ' ');
-                        const n = @min(text.len, @as(usize, @intCast(cols)));
-                        @memcpy(row[0..n], text[0..n]);
-                        return row;
-                    }
-                };
                 // top border
                 {
                     const seg = [_]vaxis.Segment{
@@ -6228,27 +7305,133 @@ const App = struct {
                     }};
                     _ = win.print(&rseg, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(col0 + hcols + 1), .wrap = .none });
                 }
-                // split the text into up to hrows lines of ≤hcols chars; lines
-                // that run past the box are clipped, and leftover rows (when
-                // the text is shorter than the box) stay filled with bg_float
-                var remaining = htext;
-                var r: u32 = 0;
-                while (r < hrows) : (r += 1) {
-                    const nl = std.mem.indexOfScalar(u8, remaining, '\n');
-                    const line_len = if (nl) |i| i else remaining.len;
-                    const shown = @min(line_len, @as(usize, @intCast(hcols)));
-                    const row = try full_row.build(a, remaining[0..shown], hcols);
-                    const seg = [_]vaxis.Segment{
-                        .{ .text = border, .style = border_style },
-                        .{ .text = row, .style = bg_style },
-                        .{ .text = border, .style = border_style },
-                    };
-                    _ = win.print(&seg, .{ .row_offset = @intCast(start_row + 1 + r), .col_offset = @intCast(col0), .wrap = .none });
-                    if (nl) |i| {
-                        remaining = remaining[@min(i + 1, remaining.len)..];
-                    } else {
-                        remaining = remaining[remaining.len..];
+                // Split the text into up to hrows lines; fence off ```lang
+                // code blocks and syntax-highlight their content with
+                // tree-sitter (hoverCodeLineSegs); prose lines get markdown-
+                // ish token colors (hoverLineSegs). Fence lines render dim.
+                // Every cell keeps bg_float — the panel stays a solid block.
+                const HoverBlock = struct {
+                    start: usize,
+                    end: usize, // line indices, end exclusive
+                    lang: ?[]const u8,
+                    text: []u8, // lines joined with '\n' (arena)
+                    offsets: []u32, // byte offset of each line in text
+                    spans: []syntax.Span, // merged spans over text
+                };
+                var lines = std.ArrayList([]const u8).empty;
+                var kinds = std.ArrayList(u8).empty; // 0 prose, 1 fence, 2 code
+                var blocks = std.ArrayList(HoverBlock).empty;
+                {
+                    var remaining = htext;
+                    var r: u32 = 0;
+                    var in_fence: ?[]const u8 = null;
+                    var block_start: usize = 0;
+                    while (r < hrows) : (r += 1) {
+                        const nl = std.mem.indexOfScalar(u8, remaining, '\n');
+                        const line_len = if (nl) |i| i else remaining.len;
+                        try lines.append(a, remaining[0..line_len]);
+                        if (in_fence == null) {
+                            if (isFenceLine(remaining[0..line_len])) |flang| {
+                                try kinds.append(a, 1);
+                                in_fence = flang;
+                                block_start = lines.items.len;
+                            } else {
+                                try kinds.append(a, 0);
+                            }
+                        } else {
+                            if (isFenceLine(remaining[0..line_len]) != null) {
+                                try kinds.append(a, 1);
+                                try blocks.append(a, .{ .start = block_start, .end = lines.items.len, .lang = in_fence, .text = &.{}, .offsets = &.{}, .spans = &.{} });
+                                in_fence = null;
+                            } else {
+                                try kinds.append(a, 2);
+                            }
+                        }
+                        if (nl) |i| {
+                            remaining = remaining[@min(i + 1, remaining.len)..];
+                        } else {
+                            remaining = remaining[remaining.len..];
+                        }
                     }
+                    if (in_fence != null) {
+                        try blocks.append(a, .{ .start = block_start, .end = lines.items.len, .lang = in_fence, .text = &.{}, .offsets = &.{}, .spans = &.{} });
+                    }
+                }
+                // Build each block: joined text, per-line byte offsets, and
+                // merged tree-sitter spans (all arena — the highlighter lives
+                // only for this frame). The fence language wins; a bare or
+                // unknown fence falls back to the current file's language.
+                for (blocks.items) |*blk| {
+                    if (blk.start >= blk.end) continue;
+                    var text = std.ArrayList(u8).empty;
+                    var offsets = std.ArrayList(u32).empty;
+                    var bli = blk.start;
+                    while (bli < blk.end) : (bli += 1) {
+                        try offsets.append(a, @intCast(text.items.len));
+                        try text.appendSlice(a, lines.items[bli]);
+                        try text.append(a, '\n');
+                    }
+                    blk.text = try text.toOwnedSlice(a);
+                    blk.offsets = try offsets.toOwnedSlice(a);
+                    var hl: ?syntax.Highlighter = null;
+                    if (blk.lang) |l| {
+                        if (l.len > 0) {
+                            if (syntax.languageFor(l)) |ln| hl = syntax.Highlighter.init(a, ln) catch null;
+                        }
+                    }
+                    if (hl == null) {
+                        const ft = filetypeOf(self.cur().path);
+                        if (syntax.languageFor(ft)) |ln| hl = syntax.Highlighter.init(a, ln) catch null;
+                    }
+                    if (hl) |*h| {
+                        h.reparse(blk.text) catch {};
+                        var raw = std.ArrayList(syntax.Span).empty;
+                        h.spansInRange(0, @intCast(blk.text.len), a, &raw) catch {};
+                        var merged = std.ArrayList(syntax.Span).empty;
+                        for (raw.items) |sp| {
+                            while (merged.items.len > 0) {
+                                var last = &merged.items[merged.items.len - 1];
+                                if (sp.start >= last.end) break; // disjoint
+                                if (sp.start <= last.start) {
+                                    _ = merged.pop(); // covered wholly
+                                    continue;
+                                }
+                                last.end = sp.start; // later span wins
+                                break;
+                            }
+                            try merged.append(a, sp);
+                        }
+                        blk.spans = try merged.toOwnedSlice(a);
+                    }
+                }
+                // Render each row: code lines use their block's spans, fence
+                // lines dim, prose lines the markdown tokenizer.
+                var r: u32 = 0;
+                var cur_block: usize = 0;
+                while (r < hrows) : (r += 1) {
+                    const line = lines.items[r];
+                    var inner: []vaxis.Segment = undefined;
+                    switch (kinds.items[r]) {
+                        1 => inner = try self.hoverFenceSegs(a, line, hcols),
+                        2 => {
+                            while (cur_block < blocks.items.len and blocks.items[cur_block].end <= r) cur_block += 1;
+                            if (cur_block < blocks.items.len and blocks.items[cur_block].start <= r) {
+                                const blk = &blocks.items[cur_block];
+                                const bi = r - blk.start;
+                                const ls = blk.offsets[bi];
+                                const shown = @min(line.len, @as(usize, @intCast(hcols)));
+                                inner = try self.hoverCodeLineSegs(a, blk.text, ls, ls + shown, blk.spans, hcols);
+                            } else {
+                                inner = try self.hoverLineSegs(a, line, hcols);
+                            }
+                        },
+                        else => inner = try self.hoverLineSegs(a, line, hcols),
+                    }
+                    var segs = std.ArrayList(vaxis.Segment).empty;
+                    try segs.append(a, .{ .text = border, .style = border_style });
+                    try segs.appendSlice(a, inner);
+                    try segs.append(a, .{ .text = border, .style = border_style });
+                    _ = win.print(segs.items, .{ .row_offset = @intCast(start_row + 1 + r), .col_offset = @intCast(col0), .wrap = .none });
                 }
                 // bottom border
                 {
@@ -6442,6 +7625,77 @@ fn replaceLiteral(out: *std.ArrayList(u8), allocator: std.mem.Allocator, haystac
     return count;
 }
 
+/// Number of syntax.Style variants — sizes the per-frame style palette used
+/// by the grep picker preview (styles keyed by the enum's ordinal).
+const syntax_style_count = @typeInfo(syntax.Style).@"enum".fields.len;
+
+/// Snap a byte offset back to the start of the UTF-8 char containing it.
+/// fzy match positions are byte indices that can land on a continuation byte
+/// when the query contains multi-byte chars; segment splits must only happen
+/// at char boundaries or vaxis's grapheme iterator emits garbage.
+fn utf8CharStart(s: []const u8, pos: usize) usize {
+    var p = @min(pos, s.len);
+    while (p > 0 and (s[p] & 0xC0) == 0x80) p -= 1;
+    return p;
+}
+
+/// Byte length of the UTF-8 char starting at `pos` (must be a char start).
+fn utf8CharLenAt(s: []const u8, pos: usize) usize {
+    const b = s[pos];
+    if (b < 0x80) return 1;
+    if (b < 0xE0) return 2;
+    if (b < 0xF0) return 3;
+    return 4;
+}
+
+/// Byte offset where 0-based `line` starts in `text` (text.len when the line
+/// doesn't exist).
+fn lineStartByte(text: []const u8, line: usize) usize {
+    var pos: usize = 0;
+    var l: usize = 0;
+    while (l < line) : (l += 1) {
+        const nl = std.mem.indexOfScalarPos(u8, text, pos, '\n') orelse return text.len;
+        pos = nl + 1;
+    }
+    return @min(pos, text.len);
+}
+
+/// Byte offset of 0-based `line`'s end (the '\n' position, or text.len for a
+/// final line without a trailing newline). Line content is text[start..end].
+fn lineEndByte(text: []const u8, line: usize) usize {
+    const s = lineStartByte(text, line);
+    return std.mem.indexOfScalarPos(u8, text, s, '\n') orelse text.len;
+}
+
+/// Append one picker row's colored segments: `text[0..n]` split into runs by
+/// the per-byte style ids in `ids` (`styles[id]` per run), then space-padded
+/// to `total_w` cells with `pad_style`. `text`/`ids`/`styles` must outlive
+/// vx.render() — pass arena strings (or App-owned preview_text).
+fn appendRowSegs(
+    segs: *std.ArrayList(vaxis.Segment),
+    a: std.mem.Allocator,
+    text: []const u8,
+    n: usize,
+    ids: []const u8,
+    styles: []const vaxis.Style,
+    total_w: usize,
+    pad_style: vaxis.Style,
+) !void {
+    var i: usize = 0;
+    while (i < n) {
+        const id = ids[i];
+        var j = i + 1;
+        while (j < n and ids[j] == id) : (j += 1) {}
+        try segs.append(a, .{ .text = text[i..j], .style = styles[id] });
+        i = j;
+    }
+    if (n < total_w) {
+        const pad = try a.alloc(u8, total_w - n);
+        @memset(pad, ' ');
+        try segs.append(a, .{ .text = pad, .style = pad_style });
+    }
+}
+
 /// Filetype from a file path's extension ("src/main.zig" → "zig").
 fn filetypeOf(path: ?[]const u8) []const u8 {
     const p = path orelse return "";
@@ -6449,6 +7703,20 @@ fn filetypeOf(path: ?[]const u8) []const u8 {
     const ext = std.fs.path.extension(base);
     if (ext.len <= 1) return "";
     return ext[1..];
+}
+
+/// "```" or "~~~" markdown code fence opener: returns the language after the
+/// fence ("" for a bare fence with no language); null when the line isn't a
+/// fence. Bare fences still count so the closing fence is recognized.
+fn isFenceLine(line: []const u8) ?[]const u8 {
+    if (line.len < 3) return null;
+    const c = line[0];
+    if (c != '`' and c != '~') return null;
+    if (line[1] != c or line[2] != c) return null;
+    var i: usize = 3;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
+    if (i >= line.len) return "";
+    return line[i..];
 }
 
 /// Theme palette for the tree-sitter capture groups (src/syntax.zig Style).

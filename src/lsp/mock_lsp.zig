@@ -510,8 +510,11 @@ fn buildCompletionResult(a: std.mem.Allocator, prefix: []const u8) !std.json.Val
 fn buildHoverResult(a: std.mem.Allocator) !std.json.Value {
     var contents = try std.json.ObjectMap.init(a, &.{}, &.{});
     try contents.put(a, "kind", .{ .string = "markdown" });
-    // Multi-line hover: exercises the floating window's row wrapping.
-    try contents.put(a, "value", .{ .string = "mock hover\nsecond line\nthird line" });
+    // Multi-line hover: exercises the floating window's row wrapping and
+    // its token styling — markdown inline tokens (bold, code span, URL) on
+    // the prose lines and a ```zig fenced block whose content must get real
+    // tree-sitter colors ("const" keyword, "2" number).
+    try contents.put(a, "value", .{ .string = "**mock hover**\n`second line`\n```zig\nconst b = 2;\n```\nhttp://example.com third line" });
     var result = try std.json.ObjectMap.init(a, &.{}, &.{});
     try result.put(a, "contents", .{ .object = contents });
     return .{ .object = result };
@@ -1019,7 +1022,7 @@ test "hello: hover returns the canned markdown" {
     try testing.expectEqual(@as(?u64, 3), resp.id);
     const contents = resp.result.?.object.get("contents").?;
     try testing.expectEqualStrings("markdown", contents.object.get("kind").?.string);
-    try testing.expectEqualStrings("mock hover\nsecond line\nthird line", contents.object.get("value").?.string);
+    try testing.expectEqualStrings("**mock hover**\n`second line`\n```zig\nconst b = 2;\n```\nhttp://example.com third line", contents.object.get("value").?.string);
 }
 
 test "hello: definition returns a location, unknown methods still null" {
@@ -1249,5 +1252,5 @@ test "full message cycle through frame functions and handleMessage" {
     try testing.expectEqual(@as(?u64, 9), rmsg.id);
     const contents = rmsg.result.?.object.get("contents").?;
     try testing.expectEqualStrings("markdown", contents.object.get("kind").?.string);
-    try testing.expectEqualStrings("mock hover\nsecond line\nthird line", contents.object.get("value").?.string);
+    try testing.expectEqualStrings("**mock hover**\n`second line`\n```zig\nconst b = 2;\n```\nhttp://example.com third line", contents.object.get("value").?.string);
 }
