@@ -10876,7 +10876,7 @@ test "folds: za toggles, zM/zR close/open all, j/k skip closed folds" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
-test "git: gutter signs, ]c hunk jump, hunk stage/reset, blame panel, branch" {
+test "git: gutter signs, ]c hunk jump, hunk stage/reset, blame ghost, branch" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
