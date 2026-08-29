@@ -89,6 +89,8 @@ pub const ActionId = enum {
     picker_grep, // <leader>st — grep picker
     picker_buffers, // <leader>sb — buffer picker
     picker_recent, // <leader>sr — recent files picker
+    picker_keymaps, // <leader>sk — keymap search picker
+    picker_themes, // <leader>sp — theme picker (live preview)
     close_buffer, // <leader>bk — close current buffer
     filetree_toggle, // <leader>e — toggle file tree
     // M2 LSP actions

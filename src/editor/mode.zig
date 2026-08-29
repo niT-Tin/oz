@@ -189,7 +189,7 @@ pub const State = struct {
     pending_text_object: ?u8 = null,
     /// leader (Space) seen, awaiting the next key (<leader>f etc.)
     pending_leader: bool = false,
-    /// <leader>s seen (picker family), awaiting f/t/b/r
+    /// <leader>s seen (picker family), awaiting f/t/b/r/p/k/d
     pending_leader_s: bool = false,
     /// <leader>b seen (buffer family), awaiting b/n/j/k
     pending_leader_b: bool = false,
@@ -308,6 +308,8 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
             'b' => return emitAction(state, .picker_buffers), // <leader>sb buffers
             'r' => return emitAction(state, .picker_recent), // <leader>sr recent files
             'd' => return emitAction(state, .diagnostics_list), // <leader>sd diagnostics
+            'k' => return emitAction(state, .picker_keymaps), // <leader>sk keymap search
+            'p' => return emitAction(state, .picker_themes), // <leader>sp theme picker
             else => {
                 resetPending(state);
                 return .pending;
@@ -737,6 +739,8 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .picker_grep => emitAction(state, .picker_grep),
         .picker_buffers => emitAction(state, .picker_buffers),
         .picker_recent => emitAction(state, .picker_recent),
+        .picker_keymaps => emitAction(state, .picker_keymaps),
+        .picker_themes => emitAction(state, .picker_themes),
         .close_buffer => emitAction(state, .close_buffer),
         .filetree_toggle => emitAction(state, .filetree_toggle),
         .diagnostic_next => emitAction(state, .diagnostic_next),
