@@ -76,6 +76,14 @@ const App = struct {
         /// history.revision at this buffer's last parse (incremental-parse
         /// bookkeeping; maxInt forces a full reparse).
         syntax_revision: u64 = 0,
+        /// Closed folds (indent-detected, see editor/fold.zig), sorted by
+        /// start line. Kept PER BUFFER, not per window: two splits showing
+        /// the same buffer share the fold state, so za in one split is
+        /// visible in the other (folds are a property of the document view
+        /// of the buffer, like the dirty flag). Any edit clears the set
+        /// (markDirty) — line numbers drift after edits, and re-folding is
+        /// cheap; vim-style fold carryover across edits is out of scope.
+        folds: std.ArrayList(editor.fold.Range) = .empty,
     };
 
     /// One split window: which buffer it shows plus its own cursor/viewport.
@@ -329,6 +337,209 @@ const App = struct {
     /// The focused window's viewport top (first visible line).
     fn curViewTop(self: *App) *u32 {
         return &self.windows.items[self.current_win].view_top;
+    }
+
+    /// Height (in text rows) of the focused window's leaf rect. Runs the same
+    /// layout math as render() so H/M/L and zz/zt/zb agree with what's on
+    /// screen, including splits.
+    fn focusedWinHeight(self: *App) u32 {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const win = self.vx.window();
+        const height: u32 = win.height;
+        if (height <= status_row_count) return 1;
+        const content_rows = height - status_row_count - tab_bar_rows;
+        const layout = self.layoutWindows(arena.allocator(), self.contentTop(), content_rows, self.contentCol(), win.width) catch return content_rows;
+        for (layout.leaves) |leaf| {
+            if (leaf.win == self.current_win) return leaf.height;
+        }
+        return content_rows;
+    }
+
+    /// H/M/L: resolve a viewport motion to a document LINE using the focused
+    /// window's view_top and height (the pure motion layer knows neither).
+    /// Returns null for non-viewport motions. The count is ignored, like
+    //  first_line/last_line (vim's {count}H targeting is out of scope).
+    fn viewMotionTargetLine(self: *App, motion: editor.Motion.Motion) ?u32 {
+        const w = &self.windows.items[self.current_win];
+        const buf = &self.buffers.items[w.buf];
+        const line_count = buf.pt.lineCount();
+        const height = self.focusedWinHeight();
+        const top = @min(w.view_top, line_count - 1);
+        // walk VISIBLE lines from the top: a closed fold is one screen row,
+        // so M/L can't be top + height (they'd overshoot past hidden lines)
+        const steps: u32 = switch (motion) {
+            .view_top_line => return top,
+            .view_middle_line => (height -| 1) / 2,
+            .view_bottom_line => height -| 1,
+            else => return null,
+        };
+        var line = top;
+        var i: u32 = 0;
+        while (i < steps and line + 1 < line_count) : (i += 1) {
+            line = foldNextLine(buf, line);
+        }
+        return @min(line, line_count - 1);
+    }
+
+    /// zz/zt/zb: scroll so the cursor line sits at the middle/top/bottom of
+    /// the focused window; the cursor itself does not move. Clamped like the
+    /// render loop's ensure-visible logic: no negative scroll, and never past
+    /// "last line at the window bottom".
+    fn scrollCursorTo(self: *App, where: enum { top, center, bottom }) void {
+        const w = &self.windows.items[self.current_win];
+        const buf = &self.buffers.items[w.buf];
+        const line_count = buf.pt.lineCount();
+        const height = self.focusedWinHeight();
+        const cursor_line = buf.pt.lineOf(w.cursor);
+        var top: u32 = switch (where) {
+            .top => cursor_line,
+            .center => cursor_line -| (height / 2),
+            .bottom => cursor_line -| (height -| 1),
+        };
+        if (line_count > height) {
+            top = @min(top, line_count - height);
+        } else {
+            top = 0;
+        }
+        w.view_top = top;
+    }
+
+    // ---- folds (za/zo/zc/zR/zM; detection lives in editor/fold.zig) ----
+    //
+    // A buffer's `folds` list holds the CLOSED ranges, sorted by start.
+    // j/k treat a closed fold as one line; every other motion that lands
+    // inside a hidden body snaps to the fold's header line (the cursor must
+    // never rest on a hidden line). Rendering draws the header plus a dim
+    // "… N lines" marker and skips the body.
+
+    /// The closed fold whose header is `line`, if any.
+    fn foldAt(buf: *const Buffer, line: u32) ?editor.fold.Range {
+        for (buf.folds.items) |f| {
+            if (f.start == line) return f;
+        }
+        return null;
+    }
+
+    /// The outermost closed fold whose hidden body contains `line`
+    /// (start < line <= end), if any.
+    fn foldCovering(buf: *const Buffer, line: u32) ?editor.fold.Range {
+        var best: ?editor.fold.Range = null;
+        for (buf.folds.items) |f| {
+            if (line > f.start and line <= f.end) {
+                if (best == null or f.start < best.?.start) best = f;
+            }
+        }
+        return best;
+    }
+
+    /// Next visible line after `line`: a closed fold's whole body counts as
+    /// part of its header row, so iteration jumps from header to end + 1.
+    fn foldNextLine(buf: *const Buffer, line: u32) u32 {
+        if (foldAt(buf, line)) |f| return f.end + 1;
+        return line + 1;
+    }
+
+    /// Previous visible line before `line`; lands on a fold's header, never
+    /// inside a hidden body.
+    fn foldPrevLine(buf: *const Buffer, line: u32) u32 {
+        if (line == 0) return 0;
+        var l = line - 1;
+        if (foldCovering(buf, l)) |f| l = f.start;
+        return l;
+    }
+
+    /// Snap `pos` out of a closed fold's hidden body onto the header line
+    /// (keeping the column); no-op when the line is visible.
+    fn foldSnapPos(buf: *const Buffer, pos: u32) u32 {
+        const line = buf.pt.lineOf(pos);
+        const f = foldCovering(buf, line) orelse return pos;
+        return editor.Motion.toLineKeepCol(&buf.pt, pos, f.start);
+    }
+
+    /// za/zo/zc/zR/zM. The fold set is per-buffer (shared between splits);
+    /// `range`/detection is indent-based via editor.fold.
+    fn execFold(self: *App, action: editor.KeyEvent.ActionId) !void {
+        const buf = self.cur();
+        switch (action) {
+            .fold_open_all => buf.folds.clearRetainingCapacity(),
+            .fold_close_all => {
+                buf.folds.clearRetainingCapacity();
+                const ranges = try editor.fold.allRanges(&buf.pt, self.alloc);
+                defer self.alloc.free(ranges);
+                // close outermost folds only: a nested range's body is
+                // already hidden by its parent, and keeping nested entries
+                // would make zR → re-zM behaviour surprising; one entry per
+                // hidden screen region is enough
+                for (ranges) |r| {
+                    const covered = blk: {
+                        for (buf.folds.items) |f| {
+                            if (r.start > f.start and r.end <= f.end) break :blk true;
+                        }
+                        break :blk false;
+                    };
+                    if (!covered) try buf.folds.append(self.alloc, r);
+                }
+                self.snapCursorOutOfFold();
+            },
+            .fold_toggle, .fold_open, .fold_close => {
+                const line = buf.pt.lineOf(self.curCursor().*);
+                // the innermost foldable range containing the cursor line
+                const target = try editor.fold.innermostContaining(&buf.pt, self.alloc, line);
+                if (target == null) {
+                    // not an error — zc/za on a non-foldable line is a no-op
+                    try self.setMsg(try self.alloc.dupe(u8, "该行没有可折叠的区域"));
+                    return;
+                }
+                // is any closed fold covering the cursor line (or starting
+                // exactly at it)? za/zo open the innermost such fold;
+                // otherwise (zc, or za on an open fold) close `target`.
+                var closed_hit: ?usize = null;
+                for (buf.folds.items, 0..) |f, i| {
+                    if (line >= f.start and line <= f.end) {
+                        if (closed_hit == null or f.start > buf.folds.items[closed_hit.?].start) closed_hit = i;
+                    }
+                }
+                const want_open = action == .fold_open or (action == .fold_toggle and closed_hit != null);
+                if (want_open) {
+                    const i = closed_hit orelse return; // zo/za on an open fold: no-op
+                    _ = buf.folds.orderedRemove(i);
+                } else {
+                    // zc on an already-closed inner fold walks out to the
+                    // enclosing open one; everything closed → no-op
+                    var r = target.?;
+                    while (true) {
+                        const already = blk: {
+                            for (buf.folds.items) |f| {
+                                if (f.start == r.start) break :blk true;
+                            }
+                            break :blk false;
+                        };
+                        if (!already) break;
+                        if (r.start == 0) return; // no enclosing line possible
+                        const outer = try editor.fold.innermostContaining(&buf.pt, self.alloc, r.start - 1);
+                        if (outer == null) return;
+                        r = outer.?;
+                    }
+                    try buf.folds.append(self.alloc, r);
+                    std.mem.sort(editor.fold.Range, buf.folds.items, {}, struct {
+                        fn lt(_: void, x: editor.fold.Range, y: editor.fold.Range) bool {
+                            return x.start < y.start;
+                        }
+                    }.lt);
+                    self.snapCursorOutOfFold();
+                }
+            },
+            else => unreachable,
+        }
+    }
+
+    /// After a fold closes, the focused window's cursor may sit inside the
+    /// hidden body — move it to the fold header (vim does the same).
+    fn snapCursorOutOfFold(self: *App) void {
+        const w = &self.windows.items[self.current_win];
+        const buf = &self.buffers.items[w.buf];
+        w.cursor = foldSnapPos(buf, w.cursor);
     }
 
     /// Free a window tree (recursive).
@@ -721,6 +932,7 @@ const App = struct {
         for (self.buffers.items) |*buf| {
             buf.history.deinit();
             buf.pt.deinit();
+            buf.folds.deinit(self.alloc);
             if (buf.hl) |*h| h.deinit();
             if (buf.path) |p| self.alloc.free(p);
         }
@@ -1179,7 +1391,35 @@ const App = struct {
             .action => |a| try self.execAction(a.action, a.count),
             .motion => |m| {
                 var new_cursor = self.curCursor().*;
-                editor.Motion.apply(&self.cur().pt, m.motion, m.args, &new_cursor, m.count);
+                if (self.viewMotionTargetLine(m.motion)) |line| {
+                    // H/M/L: target line resolved from the focused window's
+                    // viewport; keep the column, clamp to the line end (j/k
+                    // semantics).
+                    new_cursor = editor.Motion.toLineKeepCol(&self.cur().pt, new_cursor, line);
+                } else if (m.motion == .down or m.motion == .up) {
+                    // j/k: a closed fold counts as ONE line — walk visible
+                    // lines instead of document lines (foldNext/foldPrev
+                    // skip hidden bodies).
+                    const buf = self.cur();
+                    const line_count = buf.pt.lineCount();
+                    var line = buf.pt.lineOf(new_cursor);
+                    var i: u32 = 0;
+                    while (i < m.count) : (i += 1) {
+                        if (m.motion == .down) {
+                            if (line + 1 >= line_count) break;
+                            line = @min(foldNextLine(buf, line), line_count - 1);
+                        } else {
+                            if (line == 0) break;
+                            line = foldPrevLine(buf, line);
+                        }
+                    }
+                    new_cursor = editor.Motion.toLineKeepCol(&buf.pt, new_cursor, line);
+                } else {
+                    editor.Motion.apply(&self.cur().pt, m.motion, m.args, &new_cursor, m.count);
+                    // any other motion landing inside a closed fold snaps to
+                    // its header line — the cursor never rests on hidden text
+                    new_cursor = foldSnapPos(self.cur(), new_cursor);
+                }
                 if (new_cursor != self.curCursor().*) {
                     // The cursor moved: nvim-style hover windows vanish once
                     // the cursor leaves the annotated token.
@@ -3742,7 +3982,9 @@ const App = struct {
         if (query.len == 0) return;
 
         var child = std.process.spawn(self.io, .{
-            .argv = &.{ "rg", "--no-heading", "-n", query },
+            // -F: the query is a literal string, not a regex; "--": a query
+            // starting with '-' must not be parsed as an rg flag
+            .argv = &.{ "rg", "--no-heading", "-n", "-F", "--", query },
             .stdout = .pipe,
             .stderr = .ignore,
         }) catch return;
@@ -3840,6 +4082,7 @@ const App = struct {
         self: *App,
         segs: *std.ArrayList(vaxis.Segment),
         a: std.mem.Allocator,
+        win: vaxis.Window,
         k: usize,
         list_rows: usize,
         preview_w: u32,
@@ -3848,15 +4091,16 @@ const App = struct {
         const pw: usize = @intCast(preview_w);
         const r = self.grep_results.items[self.picker_sel];
         if (k == 0) {
-            // header: basename (fg) + ":line" (fg_dim), then padding
+            // header: basename (fg) + ":line" (fg_dim), then padding; widths
+            // are cells (a CJK basename is 2 cells/char, 3-4 bytes)
             const base = std.fs.path.basename(r.path);
             const line_str = try std.fmt.allocPrint(a, ":{d}", .{ r.line });
-            const n1 = @min(base.len, pw);
-            try segs.append(a, .{ .text = base[0..n1], .style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_float } } });
-            const n2 = @min(line_str.len, pw -| n1);
-            if (n2 > 0) try segs.append(a, .{ .text = line_str[0..n2], .style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg_float } } });
-            if (n1 + n2 < pw) {
-                const pad = try a.alloc(u8, pw - n1 - n2);
+            const f1 = cellFitPrefix(win, base, pw);
+            try segs.append(a, .{ .text = f1.slice, .style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_float } } });
+            const f2 = cellFitPrefix(win, line_str, pw -| f1.cells);
+            if (f2.slice.len > 0) try segs.append(a, .{ .text = f2.slice, .style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg_float } } });
+            if (f1.cells + f2.cells < pw) {
+                const pad = try a.alloc(u8, pw - f1.cells - f2.cells);
                 @memset(pad, ' ');
                 try segs.append(a, .{ .text = pad, .style = float_bg });
             }
@@ -3867,18 +4111,17 @@ const App = struct {
             // content row, blank rows below
             if (k == 1) {
                 const hint = "preview unavailable";
-                const n = @min(hint.len, pw);
                 const ids = [_]u8{0} ** 64;
-                try appendRowSegs(segs, a, hint, n, &ids, &[_]vaxis.Style{.{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = float_bg.bg }}, preview_w, float_bg);
+                try appendRowSegs(segs, a, win, hint, &ids, &[_]vaxis.Style{.{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = float_bg.bg }}, preview_w, float_bg);
             } else {
-                try appendRowSegs(segs, a, "", 0, &.{}, &[_]vaxis.Style{}, preview_w, float_bg);
+                try appendRowSegs(segs, a, win, "", &.{}, &[_]vaxis.Style{}, preview_w, float_bg);
             }
             return;
         };
         const sel_line: usize = r.line -| 1; // rg reports 1-based lines
         const line_count = std.mem.count(u8, text, "\n") + @intFromBool(text.len > 0);
         if (sel_line >= line_count) {
-            try appendRowSegs(segs, a, "", 0, &.{}, &[_]vaxis.Style{}, preview_w, float_bg);
+            try appendRowSegs(segs, a, win, "", &.{}, &[_]vaxis.Style{}, preview_w, float_bg);
             return;
         }
         const content_rows = list_rows - 1;
@@ -3886,7 +4129,7 @@ const App = struct {
         const win_start = @min(@max(sel_line -| (content_rows / 2), 0), line_count -| content_rows);
         const file_line = win_start + ci;
         if (file_line >= line_count) {
-            try appendRowSegs(segs, a, "", 0, &.{}, &[_]vaxis.Style{}, preview_w, float_bg);
+            try appendRowSegs(segs, a, win, "", &.{}, &[_]vaxis.Style{}, preview_w, float_bg);
             return;
         }
         // gutter: relative offset from the selected line ("-4".." 0".."+4");
@@ -3900,11 +4143,12 @@ const App = struct {
             try std.fmt.allocPrint(a, " 0", .{});
         const row_s = lineStartByte(text, file_line);
         const row_e = lineEndByte(text, file_line);
-        const row_len = row_e - row_s;
-        // content width: gutter (2) + space (1) leaves the rest of the column
-        var n = @min(row_len, pw -| 3);
-        // never split a UTF-8 char at the truncation point
-        while (n > 0 and n < row_len and (text[row_s + n] & 0xC0) == 0x80) n -= 1;
+        // content width: gutter (2) + space (1) leaves the rest of the
+        // column. Truncate in CELLS on grapheme boundaries — a byte count
+        // overflows the column on CJK (2 cells/char) and pushes the row's
+        // padding/border out of place.
+        const fit = cellFitPrefix(win, text[row_s..row_e], pw -| 3);
+        const n = fit.slice.len;
         // syntax spans for THIS line's byte range (O(visible) query; the
         // highlighter itself is only reparsed when the selection's path
         // changes, in refreshGrepPreview)
@@ -3937,8 +4181,10 @@ const App = struct {
         else
             float_bg;
         const gutter_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = base_bg.bg };
-        var ids_buf: [512]u8 = undefined;
-        @memset(ids_buf[0..n], 0);
+        // per-byte ids for the visible prefix; arena-sized (a cell-capped
+        // prefix can still be many bytes — up to ~4 per cell for CJK)
+        const ids_buf = try a.alloc(u8, n);
+        @memset(ids_buf, 0);
         for (spans.items) |sp| {
             if (sp.end <= row_s or sp.start >= row_e) continue;
             const cs = @max(sp.start, @as(u32, @intCast(row_s)));
@@ -3967,7 +4213,7 @@ const App = struct {
             try segs.append(a, .{ .text = text[row_s + i .. row_s + j], .style = st });
             i = j;
         }
-        const used = 3 + n;
+        const used = cellWidth(win, gutter) + 1 + fit.cells;
         if (used < pw) {
             const pad = try a.alloc(u8, pw - used);
             @memset(pad, ' ');
@@ -4376,6 +4622,7 @@ const App = struct {
         var buf = self.buffers.orderedRemove(buf_idx);
         buf.history.deinit();
         buf.pt.deinit();
+        buf.folds.deinit(self.alloc);
         if (buf.hl) |*h| h.deinit();
         if (buf.path) |p| self.alloc.free(p);
         if (self.current >= self.buffers.items.len) self.current = self.buffers.items.len - 1;
@@ -4756,6 +5003,11 @@ const App = struct {
     fn markDirty(self: *App) void {
         self.cur().dirty = true;
         self.edit_seq += 1;
+        // Any edit drops this buffer's fold set (all folds re-open): edit
+        // line shifts would otherwise leave the closed-fold start lines
+        // pointing at stale text, and shifting ranges per edit is not worth
+        // it — re-folding with zM costs one indent scan.
+        self.cur().folds.clearRetainingCapacity();
         // Editing normally invalidates inlay hints: their offsets refer to the
         // pre-edit text. During an insert session we skip that and instead
         // shift the hints for the edit (see adjustInlayHintsInsert/Delete) so
@@ -4926,7 +5178,12 @@ const App = struct {
         // byte range across lines would shred the text.
         if (!m.exclusive_end) {
             const from_line = self.cur().pt.lineOf(self.curCursor().*);
-            const to_line = self.cur().pt.lineOf(editor.Motion.target(&self.cur().pt, m.motion, m.args, self.curCursor().*, m.count));
+            // H/M/L are linewise viewport motions: Motion.target can't
+            // resolve them (no viewport), so take the line from the window.
+            const to_line = if (self.viewMotionTargetLine(m.motion)) |l|
+                l
+            else
+                self.cur().pt.lineOf(editor.Motion.target(&self.cur().pt, m.motion, m.args, self.curCursor().*, m.count));
             const lo = @min(from_line, to_line);
             const hi = @max(from_line, to_line);
             const start = self.cur().pt.lineStart(lo);
@@ -5400,6 +5657,12 @@ const App = struct {
                 self.em_query_len = 0;
             },
             .enter_command_mode => {},
+            // zz/zt/zb — view-only scrolls of the focused window
+            .scroll_cursor_center => self.scrollCursorTo(.center),
+            .scroll_cursor_top => self.scrollCursorTo(.top),
+            .scroll_cursor_bottom => self.scrollCursorTo(.bottom),
+            // za/zo/zc/zR/zM — buffer fold state (not edits; no markDirty)
+            .fold_toggle, .fold_open, .fold_close, .fold_open_all, .fold_close_all => try self.execFold(action),
             else => {},
         }
     }
@@ -5841,28 +6104,67 @@ const App = struct {
         if (w.cursor > buf.pt.len()) w.cursor = buf.pt.len();
         if (w.view_top > buf.pt.lineCount() -| 1) w.view_top = buf.pt.lineCount() -| 1;
 
+        // Fold backstop: the cursor must never sit on a hidden line. Every
+        // fold-aware motion snaps already; this catches the paths that don't
+        // go through them (search jumps, LSP goto, :N, splits' stale cursors).
+        w.cursor = foldSnapPos(buf, w.cursor);
+
         const cursor_line = buf.pt.lineOf(w.cursor);
         const line_count = buf.pt.lineCount();
         // relative-number gutter: computed once per frame per window
         const gutter = self.gutterWidth(line_count);
         const gutter_digits = gutter - 1;
 
-        // keep cursor line visible, centered-ish (per-window viewport)
-        if (w.cursor < buf.pt.lineStart(w.view_top)) {
+        // keep cursor line visible (per-window viewport). Fold-aware: a
+        // closed fold occupies ONE screen row, so screen distances are
+        // counted by walking visible lines, not by line-number arithmetic.
+        // view_top itself must be a visible line — snap it up out of any
+        // closed fold it fell into.
+        if (foldCovering(buf, w.view_top)) |f| w.view_top = f.start;
+        if (cursor_line < w.view_top) {
             w.view_top = cursor_line;
         }
-        const view_bottom = w.view_top + rect.height;
-        if (cursor_line >= view_bottom) {
-            w.view_top = cursor_line - rect.height + 1;
+        // rows between view_top and the cursor line (cursor inclusive of
+        // itself, view_top row counts as row 0)
+        var rows_to_cursor: u32 = 0;
+        {
+            var l = w.view_top;
+            while (l < cursor_line) : (rows_to_cursor += 1) l = foldNextLine(buf, l);
         }
-        if (w.view_top + rect.height > line_count and line_count > rect.height) {
-            w.view_top = line_count - rect.height;
+        while (rows_to_cursor >= rect.height and w.view_top < cursor_line) {
+            w.view_top = foldNextLine(buf, w.view_top);
+            rows_to_cursor -= 1;
+        }
+        // don't scroll past the end leaving blank rows: pull view_top up
+        // while fewer than `height` visible rows remain below it (without
+        // pushing the cursor off-screen)
+        {
+            var below: u32 = rows_to_cursor + 1; // + the cursor row itself
+            var l = cursor_line;
+            while (l + 1 < line_count) {
+                l = foldNextLine(buf, l);
+                below += 1;
+            }
+            while (below < rect.height and w.view_top > 0 and rows_to_cursor + 1 < rect.height) {
+                w.view_top = foldPrevLine(buf, w.view_top);
+                below += 1;
+                rows_to_cursor += 1;
+            }
         }
 
         // syntax spans covering the visible byte range — every window uses
         // its own buffer's highlighter, so splits showing different buffers
-        // each get real tree-sitter highlighting.
-        const merged = try self.visibleSpansFor(buf, a, w.view_top, rect.height);
+        // each get real tree-sitter highlighting. With closed folds the
+        // visible rows span MORE document lines than rect.height (hidden
+        // bodies are skipped), so walk the actual last visible line first.
+        var last_visible = w.view_top;
+        {
+            var vr: u32 = 1;
+            while (vr < rect.height and last_visible + 1 < line_count) : (vr += 1) {
+                last_visible = foldNextLine(buf, last_visible);
+            }
+        }
+        const merged = try self.visibleSpansFor(buf, a, w.view_top, last_visible - w.view_top + 1);
 
         // scope highlight (nvim snacks.indent.scope): the byte range of the
         // block containing this window's cursor, converted to a line range.
@@ -5927,7 +6229,8 @@ const App = struct {
         var row: u32 = rect.row;
         var line = w.view_top;
         while (row < rect.row + rect.height and line < line_count) : ({
-            line += 1;
+            // skip a closed fold's body: it shares its header's screen row
+            line = foldNextLine(buf, line);
             row += 1;
         }) {
             const rel: u32 = if (line == cursor_line)
@@ -6284,6 +6587,18 @@ const App = struct {
                     });
                 }
                 hint_i += 1;
+            }
+
+            // closed fold header: snacks-style dim "… N lines" marker after
+            // the line text; the body's rows are skipped by the loop's
+            // foldNextLine continuation
+            if (foldAt(buf, line)) |f| {
+                const marker = try std.fmt.allocPrint(a, " … {d} lines", .{f.hiddenCount()});
+                try segs.append(a, .{ .text = marker, .style = .{
+                    .dim = true,
+                    .fg = .{ .rgb = self.theme.fg_dim },
+                    .bg = .{ .rgb = if (is_cur_line) self.theme.bg_curline else self.theme.bg },
+                } });
             }
 
             _ = win.print(segs.items, .{
@@ -6836,7 +7151,7 @@ const App = struct {
                 // fixed-size panel: width is independent of the result count
                 // (no small→big pop when results arrive); 70% of the screen,
                 // min 44 inner columns (≈54 on an 80-col pty)
-                inner_w = @max(@min(win.width * 7 / 10 -| 2, 60), 44);
+                inner_w = @max(win.width * 7 / 10 -| 2, 44);
                 box_w = @min(inner_w + 2, win.width * 7 / 10);
             } else {
                 // box width capped at 60% of the screen so a very wide label
@@ -6864,11 +7179,14 @@ const App = struct {
             const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
             const row_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } };
             const sel_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_sel }, .fg = .{ .rgb = self.theme.fg } };
-            // grep split: left = result list, 1 separator column, right =
-            // preview (inner*2/5 ≈ 21 cols on an 80-col pty, left ≈ 32)
+            // grep split: left = result list, then a " │ " separator (1 cell
+            // plus a bg_float space each side so text never touches the
+            // line), right = preview (inner*2/5 ≈ 21 cols on an 80-col pty,
+            // left ≈ 30)
             const preview_w: u32 = if (self.picker_mode == .grep) inner_w * 2 / 5 else 0;
-            const left_w: u32 = inner_w -| 1 -| preview_w;
+            const left_w: u32 = inner_w -| 3 -| preview_w;
             const sep_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.win_sep }, .bg = .{ .rgb = self.theme.bg_float } };
+            const sep_pad_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float } };
             // top border + title
             {
                 var segs = std.ArrayList(vaxis.Segment).empty;
@@ -6885,11 +7203,18 @@ const App = struct {
             // own bg_float (telescope/snacks style — no status-bar row at
             // the bottom of the screen). The whole interior row is bg_float
             // so the panel stays a solid block.
+            var input_cells: usize = 0; // cells of the shown query (cursor col)
             {
-                const input_row = try a.alloc(u8, inner_w -| 2);
+                const input_cap: usize = @intCast(inner_w -| 2);
+                // cell-truncate (grapheme-aligned): a byte count can split a
+                // UTF-8 sequence or overflow the row on CJK input
+                const input_fit = cellFitPrefix(win, self.picker_input.items, input_cap);
+                input_cells = input_fit.cells;
+                // buffer size = text bytes + remaining pad CELLS (the text's
+                // byte length can exceed its cell count on CJK input)
+                const input_row = try a.alloc(u8, input_fit.slice.len + (input_cap - input_fit.cells));
                 @memset(input_row, ' ');
-                const n = @min(self.picker_input.items.len, @as(usize, @intCast(inner_w -| 2)));
-                @memcpy(input_row[0..n], self.picker_input.items[0..n]);
+                @memcpy(input_row[0..input_fit.slice.len], input_fit.slice);
                 const seg = [_]vaxis.Segment{
                     .{ .text = "│", .style = border_style },
                     .{ .text = "❯ ", .style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_float } } },
@@ -6928,50 +7253,74 @@ const App = struct {
                     try segs.append(a, .{ .text = "  ", .style = rs });
                     try segs.append(a, .{ .text = entry.desc, .style = rs });
                     // truncate the desc (the last segment) when the row
-                    // overflows the interior width
-                    var content_len: usize = 0;
-                    for (segs.items) |s| content_len += s.text.len;
-                    if (content_len > inner_w) {
-                        const over = content_len - inner_w;
+                    // overflows the interior width. Widths are CELLS (a CJK
+                    // desc is 2 cells/char), and segs[0] is the border — the
+                    // interior starts at index 1.
+                    var content_cells: usize = 0;
+                    for (segs.items[1..]) |s| content_cells += cellWidth(win, s.text);
+                    if (content_cells > inner_w) {
+                        const over = content_cells - inner_w;
                         const last = &segs.items[segs.items.len - 1];
-                        if (last.text.len > over) {
-                            last.text = last.text[0 .. last.text.len - over];
-                            content_len = inner_w;
+                        const last_cells = cellWidth(win, last.text);
+                        if (last_cells > over) {
+                            last.text = cellFitPrefix(win, last.text, last_cells - over).slice;
+                            content_cells = inner_w;
                         }
                     }
-                    const pad = try a.alloc(u8, inner_w -| content_len);
+                    const pad = try a.alloc(u8, inner_w -| content_cells);
                     @memset(pad, ' ');
                     if (pad.len > 0) try segs.append(a, .{ .text = pad, .style = rs });
                 } else if (self.picker_mode == .grep) {
                     // grep split panel: left column = the result row, then
-                    // the "│" separator, then the highlighted preview column
+                    // the " │ " separator, then the highlighted preview column
                     if (self.grep_results.items.len == 0) {
                         // "no matches" hint (dim); the preview column stays a
                         // blank bg_float block so the panel is continuous
                         const hint = "no matches";
-                        const n = @min(hint.len, @as(usize, @intCast(left_w)));
                         const ids = [_]u8{0} ** 64;
-                        try appendRowSegs(&segs, a, hint, n, &ids, &[_]vaxis.Style{.{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg_float } }}, left_w, .{ .bg = .{ .rgb = self.theme.bg_float } });
+                        try appendRowSegs(&segs, a, win, hint, &ids, &[_]vaxis.Style{.{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg_float } }}, left_w, .{ .bg = .{ .rgb = self.theme.bg_float } });
+                        try segs.append(a, .{ .text = " ", .style = sep_pad_style });
                         try segs.append(a, .{ .text = "│", .style = sep_style });
-                        try appendRowSegs(&segs, a, "", 0, &.{}, &[_]vaxis.Style{}, preview_w, .{ .bg = .{ .rgb = self.theme.bg_float } });
+                        try segs.append(a, .{ .text = " ", .style = sep_pad_style });
+                        try appendRowSegs(&segs, a, win, "", &.{}, &[_]vaxis.Style{}, preview_w, .{ .bg = .{ .rgb = self.theme.bg_float } });
                     } else {
                         const r = self.grep_results.items[ri];
                         // "path:line:" prefix (dim) + " text" (fg); fzy match
                         // chars render keyword. The selected row keeps these
-                        // colors and only swaps the bg to bg_sel.
-                        const prefix = try std.fmt.allocPrint(a, "{s}:{d}:", .{ r.path, r.line });
-                        const label = try std.fmt.allocPrint(a, "{s} {s}", .{ prefix, r.text });
-                        const n = @min(label.len, @as(usize, @intCast(left_w)));
-                        var ids: [256]u8 = undefined;
-                        for (0..n) |i| ids[i] = if (i < prefix.len) 1 else 0;
+                        // colors and only swaps the bg to bg_sel. Truncation
+                        // eats the match text's tail first (suffixed "…"),
+                        // then the path's head ("…tail" keeps the meaningful
+                        // end): path:line and the start of the match always
+                        // stay visible. Tabs in the match text expand to
+                        // spaces (tab_width, same as the renderer) so the
+                        // cell math holds.
+                        const lw: usize = @intCast(left_w);
+                        const text_exp = try std.mem.replaceOwned(u8, a, r.text, "\t", "    ");
+                        const line_tag = try std.fmt.allocPrint(a, ":{d}:", .{r.line});
+                        // the path gets what ":line:" + the separator space +
+                        // ≥1 text cell leave; overflow keeps the tail
+                        const path_cap = lw -| cellWidth(win, line_tag) -| 2;
+                        const path_disp: []const u8 = if (cellWidth(win, r.path) > path_cap)
+                            try std.fmt.allocPrint(a, "…{s}", .{cellFitSuffix(win, r.path, path_cap -| 1).slice})
+                        else
+                            r.path;
+                        const prefix = try std.fmt.allocPrint(a, "{s}{s}", .{ path_disp, line_tag });
+                        const text_cap = lw -| cellWidth(win, prefix) -| 1;
+                        const text_disp: []const u8 = if (cellWidth(win, text_exp) > text_cap)
+                            try std.fmt.allocPrint(a, "{s}…", .{cellFitPrefix(win, text_exp, text_cap -| 1).slice})
+                        else
+                            text_exp;
+                        const label = try std.fmt.allocPrint(a, "{s} {s}", .{ prefix, text_disp });
+                        const ids = try a.alloc(u8, label.len);
+                        for (0..label.len) |i| ids[i] = if (i < prefix.len) 1 else 0;
                         if (self.picker_input.items.len > 0) {
                             if (try util.fzy.match(self.alloc, label, self.picker_input.items)) |m| {
                                 defer self.alloc.free(m.positions);
                                 for (m.positions) |p| {
-                                    if (p >= n) continue;
+                                    if (p >= label.len) continue;
                                     const cs = utf8CharStart(label, p);
-                                    if (cs >= n) continue;
-                                    const ce = @min(cs + utf8CharLenAt(label, cs), n);
+                                    if (cs >= label.len) continue;
+                                    const ce = @min(cs + utf8CharLenAt(label, cs), label.len);
                                     for (cs..ce) |j| ids[j] = 2;
                                 }
                             }
@@ -6981,9 +7330,11 @@ const App = struct {
                             .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = rs.bg },
                             .{ .fg = .{ .rgb = self.theme.keyword }, .bg = rs.bg },
                         };
-                        try appendRowSegs(&segs, a, label, n, &ids, &styles, left_w, .{ .bg = rs.bg });
+                        try appendRowSegs(&segs, a, win, label, ids, &styles, left_w, .{ .bg = rs.bg });
+                        try segs.append(a, .{ .text = " ", .style = sep_pad_style });
                         try segs.append(a, .{ .text = "│", .style = sep_style });
-                        try self.renderGrepPreviewRow(&segs, a, k, list_rows, preview_w);
+                        try segs.append(a, .{ .text = " ", .style = sep_pad_style });
+                        try self.renderGrepPreviewRow(&segs, a, win, k, list_rows, preview_w);
                     }
                 } else if (self.picker_mode == .themes) {
                     // color-swatch row: 3 cells painted with the theme's OWN
@@ -7045,16 +7396,19 @@ const App = struct {
                 var segs = std.ArrayList(vaxis.Segment).empty;
                 try segs.append(a, .{ .text = "╰", .style = border_style });
                 var cx: u32 = 0;
-                while (cx < inner_w + 1) : (cx += 1) {
+                while (cx < inner_w) : (cx += 1) {
                     try segs.append(a, .{ .text = "─", .style = border_style });
                 }
                 try segs.append(a, .{ .text = "╯", .style = border_style });
                 _ = win.print(segs.items, .{ .row_offset = @intCast(start_row + 2 + list_rows), .col_offset = @intCast(start_col), .wrap = .none });
             }
-            // the block cursor sits in the input row, right after the query
+            // the block cursor sits in the input row, right after the query:
+            // 1 (left border) + 2 ("❯ " prompt) + the query's display cells
+            // (input_cells, not the byte length — that lands the cursor
+            // mid-row on CJK queries)
             self.vx.screen.cursor = .{
                 .row = @intCast(start_row + 1),
-                .col = @intCast(start_col + 2 + self.picker_input.items.len),
+                .col = @intCast(start_col + 3 + input_cells),
             };
             self.vx.screen.cursor_vis = true;
             self.vx.screen.cursor_shape = .block;
@@ -7505,7 +7859,14 @@ const App = struct {
             };
         } else {
             const cursor_col = self.screenCellCol(win, cursor_line, self.curCursor().*);
-            const cursor_row = cursor_line - self.curViewTop().* + cur_rect.row;
+            // screen row = count of VISIBLE lines between view_top and the
+            // cursor (a closed fold's hidden body occupies zero rows)
+            var cursor_row: u32 = cur_rect.row;
+            {
+                const fbuf = self.cur();
+                var l = self.curViewTop().*;
+                while (l < cursor_line) : (cursor_row += 1) l = foldNextLine(fbuf, l);
+            }
             self.vx.screen.cursor = .{
                 .row = @intCast(cursor_row),
                 .col = @intCast(cur_rect.col + gutter + cursor_col), // window offset + gutter
@@ -7667,20 +8028,74 @@ fn lineEndByte(text: []const u8, line: usize) usize {
     return std.mem.indexOfScalarPos(u8, text, s, '\n') orelse text.len;
 }
 
-/// Append one picker row's colored segments: `text[0..n]` split into runs by
-/// the per-byte style ids in `ids` (`styles[id]` per run), then space-padded
-/// to `total_w` cells with `pad_style`. `text`/`ids`/`styles` must outlive
-/// vx.render() — pass arena strings (or App-owned preview_text).
+/// Display width (terminal cells) of `text`, measured the way Window.print
+/// lays text out: per grapheme cluster via gwidth (CJK = 2 cells, combining
+/// marks and zero-width joiners = 0). A byte length is NOT a width —
+/// truncating/padding by bytes overflows the row and shifts box borders on
+/// any non-ASCII text.
+fn cellWidth(win: vaxis.Window, text: []const u8) usize {
+    var iter = vaxis.unicode.graphemeIterator(text);
+    var cells: usize = 0;
+    while (iter.next()) |g| cells += win.gwidth(g.bytes(text));
+    return cells;
+}
+
+/// A grapheme-aligned slice of a string plus its display width in cells.
+const CellFit = struct { slice: []const u8, cells: usize };
+
+/// Longest prefix of `text` whose display width fits in `max_cells` cells.
+/// Grapheme-aligned: never splits a UTF-8 sequence or cluster, and a wide
+/// grapheme that would straddle the limit is dropped whole (a half-drawn
+/// CJK char corrupts the row anyway).
+fn cellFitPrefix(win: vaxis.Window, text: []const u8, max_cells: usize) CellFit {
+    var iter = vaxis.unicode.graphemeIterator(text);
+    var cells: usize = 0;
+    var len: usize = 0;
+    while (iter.next()) |g| {
+        const w: usize = win.gwidth(g.bytes(text));
+        if (cells + w > max_cells) break;
+        cells += w;
+        len = g.start + g.len;
+    }
+    return .{ .slice = text[0..len], .cells = cells };
+}
+
+/// Shortest suffix of `text` whose display width fits in `max_cells` cells
+/// (grapheme-aligned), for left-truncated paths ("…tail" keeps the
+/// informative end).
+fn cellFitSuffix(win: vaxis.Window, text: []const u8, max_cells: usize) CellFit {
+    const total = cellWidth(win, text);
+    if (total <= max_cells) return .{ .slice = text, .cells = total };
+    var iter = vaxis.unicode.graphemeIterator(text);
+    var dropped: usize = 0;
+    var start: usize = 0;
+    while (total - dropped > max_cells) {
+        const g = iter.next() orelse break;
+        dropped += win.gwidth(g.bytes(text));
+        start = g.start + g.len;
+    }
+    return .{ .slice = text[start..], .cells = total - dropped };
+}
+
+/// Append one picker row's colored segments: `text` (truncated to `total_w`
+/// CELLS, grapheme-aligned) split into runs by the per-byte style ids in
+/// `ids` (`styles[id]` per run), then space-padded to `total_w` cells with
+/// `pad_style`. `text`/`ids`/`styles` must outlive vx.render() — pass arena
+/// strings (or App-owned preview_text). `ids` is indexed by BYTE offset and
+/// must cover the whole of `text`.
 fn appendRowSegs(
     segs: *std.ArrayList(vaxis.Segment),
     a: std.mem.Allocator,
+    win: vaxis.Window,
     text: []const u8,
-    n: usize,
     ids: []const u8,
     styles: []const vaxis.Style,
     total_w: usize,
     pad_style: vaxis.Style,
 ) !void {
+    const fit = cellFitPrefix(win, text, total_w);
+    const n = @min(fit.slice.len, ids.len);
+    const cells = if (n == fit.slice.len) fit.cells else cellWidth(win, text[0..n]);
     var i: usize = 0;
     while (i < n) {
         const id = ids[i];
@@ -7689,8 +8104,8 @@ fn appendRowSegs(
         try segs.append(a, .{ .text = text[i..j], .style = styles[id] });
         i = j;
     }
-    if (n < total_w) {
-        const pad = try a.alloc(u8, total_w - n);
+    if (cells < total_w) {
+        const pad = try a.alloc(u8, total_w - cells);
         @memset(pad, ' ');
         try segs.append(a, .{ .text = pad, .style = pad_style });
     }
@@ -7779,7 +8194,27 @@ pub fn main(init: std.process.Init) !void {
         }
         const file_path = if (parseLineArg(content) != null) content[0..std.mem.lastIndexOfScalar(u8, content, ':').?] else content;
         if (file_path.len > 0) {
-            var file = std.Io.Dir.cwd().openFile(app.io, file_path, .{ .mode = .read_only }) catch continue;
+            var file = std.Io.Dir.cwd().openFile(app.io, file_path, .{ .mode = .read_only }) catch |e| {
+                switch (e) {
+                    // vim semantics: a path that does not exist yet opens as
+                    // an empty buffer with the path set — :w creates the file
+                    // (saveFile uses createFile). No status message; this is
+                    // the normal "edit a new file" flow, not the dashboard.
+                    error.FileNotFound => {
+                        app.cur().pt.deinit();
+                        app.cur().pt = try buffer.PieceTable.init(app.alloc, "");
+                        if (app.cur().path) |p| app.alloc.free(p);
+                        app.cur().path = try app.absolutePath(file_path);
+                    },
+                    // a directory is not a file — refuse it with a message
+                    // instead of dying deep in the read path below.
+                    error.IsDir => try app.setMsg(try std.fmt.allocPrint(app.alloc, "E17: {s} is a directory", .{file_path})),
+                    // exists but unreadable (permissions etc.): say so on the
+                    // status bar, don't silently drop into the dashboard.
+                    else => try app.setMsg(try std.fmt.allocPrint(app.alloc, "E484: cannot open {s}: {s}", .{ file_path, @errorName(e) })),
+                }
+                break;
+            };
             defer file.close(app.io);
             const size = (try file.stat(app.io)).size;
             // The piece table addresses the document with u32 offsets; a file

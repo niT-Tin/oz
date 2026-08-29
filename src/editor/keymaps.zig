@@ -75,6 +75,11 @@ pub const normal: KeyMap = &.{
     act(.{ .codepoint = '<' }, .dedent_line),
     act(.{ .codepoint = 'g' }, .noop), // prefix: gg / ge — handled by Mode as sequence
     act(.{ .codepoint = 'G' }, .goto_last_line),
+    // H/M/L — viewport motions; 'z' (zz/zt/zb/…) is a Mode-level prefix like
+    // 'g', deliberately NOT bound here so the sequence stays extensible.
+    act(.{ .codepoint = 'H' }, .goto_view_top),
+    act(.{ .codepoint = 'M' }, .goto_view_middle),
+    act(.{ .codepoint = 'L' }, .goto_view_bottom),
     act(.{ .codepoint = 'f' }, .find_char),
     act(.{ .codepoint = 'F' }, .find_char_back),
     act(.{ .codepoint = 't' }, .till_char),
@@ -119,6 +124,11 @@ test "normal keymap covers the M0 key set" {
     try std.testing.expectEqual(.paragraph_next, L(normal, .{ .codepoint = '}' }));
     try std.testing.expectEqual(.match_pair, L(normal, .{ .codepoint = '%' }));
     try std.testing.expectEqual(.goto_last_line, L(normal, .{ .codepoint = 'G' }));
+    try std.testing.expectEqual(.goto_view_top, L(normal, .{ .codepoint = 'H' }));
+    try std.testing.expectEqual(.goto_view_middle, L(normal, .{ .codepoint = 'M' }));
+    try std.testing.expectEqual(.goto_view_bottom, L(normal, .{ .codepoint = 'L' }));
+    // 'z' is a Mode-level prefix (zz/zt/zb/…), intentionally unbound here
+    try std.testing.expectEqual(@as(?KeyEvent.ActionId, null), L(normal, .{ .codepoint = 'z' }));
     try std.testing.expectEqual(.find_char, L(normal, .{ .codepoint = 'f' }));
     try std.testing.expectEqual(.find_char_back, L(normal, .{ .codepoint = 'F' }));
     try std.testing.expectEqual(.till_char, L(normal, .{ .codepoint = 't' }));

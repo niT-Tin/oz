@@ -38,6 +38,15 @@ pub const Motion = enum {
     line_end, // $ (last non-newline char)
     first_line, // gg
     last_line, // G
+    // Viewport motions (H/M/L). The motion layer is pure document logic and
+    // does not know the window's view_top/height, so `apply`/`target` leave
+    // the cursor unchanged for these — the caller (main.zig) resolves the
+    // target LINE from the focused window's viewport and moves there with
+    // toLineKeepCol. They exist as Motion variants so the Mode layer can
+    // treat them like any other motion (operator support: dH/dM/dL).
+    view_top_line, // H
+    view_middle_line, // M
+    view_bottom_line, // L
     paragraph_prev, // {
     paragraph_next, // }
     page_up, // ctrl-b (full page; M0 fixed 24 lines)
@@ -122,6 +131,10 @@ fn moveOnce(pt: *const PieceTable, motion: Motion, args: Args, pos_in: u32) u32 
         .till => findInLine(pt, pos, args.ch, 1, true),
         .till_back => findInLine(pt, pos, args.ch, -1, true),
         .match_pair => matchPair(pt, pos),
+        // Viewport motions can't resolve here (no view_top/height); the
+        // caller intercepts them before calling apply/target (see the Motion
+        // enum docs). Staying put is the safe fallback.
+        .view_top_line, .view_middle_line, .view_bottom_line => pos,
     };
 }
 
@@ -215,6 +228,24 @@ fn moveVert(pt: *const PieceTable, pos: u32, dir: i8) u32 {
     if (col > line_len) col = line_len; // defensive clamp
     const t_start = pt.lineStart(target_line);
     const t_len = pt.lineLen(target_line);
+    var t_col = col;
+    if (t_col >= t_len) t_col = if (t_len == 0) 0 else lastCharStart(pt, t_start, t_len) - t_start;
+    return t_start + t_col;
+}
+
+/// Move to `target_line` (clamped to the document) preserving the byte
+/// column, with j/k's clamping rule: a shorter target line clamps to its
+/// last character (line start when empty). Used by the caller for the
+/// viewport motions H/M/L after resolving the target line from the window.
+pub fn toLineKeepCol(pt: *const PieceTable, pos: u32, target_line: u32) u32 {
+    const line = pt.lineOf(@min(pos, pt.len()));
+    const start = pt.lineStart(line);
+    var col = @min(pos, pt.len()) - start;
+    const line_len = pt.lineLen(line);
+    if (col > line_len) col = line_len; // defensive clamp
+    const tl = @min(target_line, pt.lineCount() - 1);
+    const t_start = pt.lineStart(tl);
+    const t_len = pt.lineLen(tl);
     var t_col = col;
     if (t_col >= t_len) t_col = if (t_len == 0) 0 else lastCharStart(pt, t_start, t_len) - t_start;
     return t_start + t_col;

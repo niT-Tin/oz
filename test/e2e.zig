@@ -10309,3 +10309,283 @@ test "picker + tab: file rows and tabs carry devicons" {
 
 
 
+test "nonexistent CLI file opens as an empty named buffer; :w creates it" {
+    // vim semantics: `oz <missing-path>` must NOT land on the dashboard — it
+    // opens an empty buffer whose path is the arg, and only :w creates the
+    // file on disk.
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}_newfile.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    std.Io.Dir.cwd().deleteFile(io, name) catch {}; // make sure it's missing
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+    // an empty named buffer, NOT the dashboard (its title is the giveaway)
+    try std.testing.expect(!grid.contains("终端文本编辑器"));
+    try std.testing.expect(grid.contains("line 1/1"));
+    // the file must NOT have been created just by opening it
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, name, .{ .mode = .read_only }));
+
+    // type something, :w creates the file
+    try sess.send("ihello new file\x1b");
+    waited = 0;
+    while (!grid.contains("hello new file")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try sess.send(":w\r");
+    waited = 0;
+    while (!grid.contains("written:")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("written:"));
+
+    const f2 = try std.Io.Dir.cwd().openFile(io, name, .{ .mode = .read_only });
+    defer f2.close(io);
+    const size2 = (try f2.stat(io)).size;
+    const buf2 = try alloc.alloc(u8, @intCast(size2));
+    defer alloc.free(buf2);
+    _ = try f2.readPositionalAll(io, buf2, 0);
+    try std.testing.expectEqualStrings("hello new file", buf2);
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "H/M/L move in the viewport; zz/zt/zb scroll around the cursor" {
+    // 24-row pty: content area = 24 - 1 (status) - 1 (tab bar) = 22 rows,
+    // grid rows 1..22. File: "line 001".."line 100" (plus a trailing empty
+    // line 101 from the final newline).
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}_view.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        var i: usize = 1;
+        while (i <= 100) : (i += 1) {
+            const line = try std.fmt.allocPrint(alloc, "line {d:0>3}\n", .{i});
+            defer alloc.free(line);
+            try f.writeStreamingAll(io, line);
+        }
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+
+    // feed until `needle` shows on `row` (row < 0 → anywhere in the grid)
+    const Wait = struct {
+        fn until(s: *Session, g: *Grid, needle: []const u8, row: i32) !bool {
+            var waited: i32 = 0;
+            while (true) {
+                const hit = if (row < 0) g.contains(needle) else rowContains(g, @intCast(row), needle);
+                if (hit) return true;
+                const n = try readAvailable(s.pty.master, s.out[s.used..], 200);
+                if (n == 0) {
+                    waited += 200;
+                    if (waited >= 5000) return false;
+                    continue;
+                }
+                s.used += n;
+                g.feed(s.out[s.used - n .. s.used]);
+            }
+        }
+    };
+
+    try std.testing.expect(try Wait.until(&sess, &grid, "line 1/101", -1));
+
+    // jump to line 61 (0-based line 60): ensure-visible puts view_top at 39
+    try sess.send(":61\r");
+    try std.testing.expect(try Wait.until(&sess, &grid, "line 61/101", -1));
+
+    // zz: cursor line 60 → view_top = 60 - 22/2 = 49 → first row "line 050";
+    // the cursor itself stays on line 61
+    try sess.send("zz");
+    try std.testing.expect(try Wait.until(&sess, &grid, "line 050", 1));
+    try std.testing.expect(grid.contains("line 61/101"));
+
+    // zt: cursor line at the top → first row "line 061"
+    try sess.send("zt");
+    try std.testing.expect(try Wait.until(&sess, &grid, "line 061", 1));
+    try std.testing.expect(grid.contains("line 61/101"));
+
+    // zb: cursor line at the bottom → view_top = 60 - 21 = 39 → "line 040"
+    try sess.send("zb");
+    try std.testing.expect(try Wait.until(&sess, &grid, "line 040", 1));
+    try std.testing.expect(grid.contains("line 61/101"));
+
+    // H: first visible line (view_top 39) → line 40
+    try sess.send("H");
+    try std.testing.expect(try Wait.until(&sess, &grid, "line 40/101", -1));
+
+    // M: middle visible line = 39 + (22-1)/2 = 49 → line 50
+    try sess.send("M");
+    try std.testing.expect(try Wait.until(&sess, &grid, "line 50/101", -1));
+
+    // L: last visible line = 39 + 21 = 60 → line 61
+    try sess.send("L");
+    try std.testing.expect(try Wait.until(&sess, &grid, "line 61/101", -1));
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "folds: za toggles, zM/zR close/open all, j/k skip closed folds" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    // two foldable blocks (indent-based detection) + non-foldable top line
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}fold.py", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\top
+            \\def alpha():
+            \\    body a1
+            \\    body a2
+            \\def beta():
+            \\    body b1
+            \\tail
+        );
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+
+    const Wait = struct {
+        fn until(s: *Session, g: *Grid, needle: []const u8) !bool {
+            var waited: i32 = 0;
+            while (!g.contains(needle)) {
+                const n = try readAvailable(s.pty.master, s.out[s.used..], 200);
+                if (n == 0) {
+                    waited += 200;
+                    if (waited >= 5000) return false;
+                    continue;
+                }
+                s.used += n;
+                g.feed(s.out[s.used - n .. s.used]);
+            }
+            return true;
+        }
+        fn untilGone(s: *Session, g: *Grid, needle: []const u8) !bool {
+            var waited: i32 = 0;
+            while (g.contains(needle)) {
+                const n = try readAvailable(s.pty.master, s.out[s.used..], 200);
+                if (n == 0) {
+                    waited += 200;
+                    if (waited >= 5000) return false;
+                    continue;
+                }
+                s.used += n;
+                g.feed(s.out[s.used - n .. s.used]);
+            }
+            return true;
+        }
+    };
+
+    try std.testing.expect(try Wait.until(&sess, &grid, "NORMAL"));
+    try std.testing.expect(try Wait.until(&sess, &grid, "body a1"));
+
+    // cursor onto `def alpha():` (1-based line 2)
+    try sess.send("j");
+    try std.testing.expect(try Wait.until(&sess, &grid, "line 2/7"));
+
+    // za closes the fold: the two body rows vanish, a marker appears on the
+    // header line, the cursor stays on the (visible) header
+    try sess.send("za");
+    try std.testing.expect(try Wait.until(&sess, &grid, "… 2 lines"));
+    try std.testing.expect(try Wait.untilGone(&sess, &grid, "body a1"));
+    try std.testing.expect(try Wait.untilGone(&sess, &grid, "body a2"));
+    try std.testing.expect(grid.contains("def alpha()"));
+    try std.testing.expect(grid.contains("line 2/7"));
+
+    // za again reopens the same fold
+    try sess.send("za");
+    try std.testing.expect(try Wait.until(&sess, &grid, "body a1"));
+    try std.testing.expect(grid.contains("body a2"));
+
+    // zM closes every fold in the buffer (alpha: 2 hidden lines, beta: 1)
+    try sess.send("zM");
+    try std.testing.expect(try Wait.until(&sess, &grid, "… 1 lines"));
+    try std.testing.expect(try Wait.untilGone(&sess, &grid, "body a1"));
+    try std.testing.expect(try Wait.untilGone(&sess, &grid, "body b1"));
+    try std.testing.expect(grid.contains("… 2 lines"));
+    try std.testing.expect(grid.contains("def alpha()"));
+    try std.testing.expect(grid.contains("def beta()"));
+
+    // j from the closed alpha fold lands on beta's header — the fold body
+    // counts as ONE line for vertical motion
+    try sess.send("j");
+    try std.testing.expect(try Wait.until(&sess, &grid, "line 5/7"));
+    // j again → tail (past the closed beta fold)
+    try sess.send("j");
+    try std.testing.expect(try Wait.until(&sess, &grid, "line 7/7"));
+    // k skips beta's hidden body, back to the beta header
+    try sess.send("k");
+    try std.testing.expect(try Wait.until(&sess, &grid, "line 5/7"));
+
+    // zR reopens everything
+    try sess.send("zR");
+    try std.testing.expect(try Wait.until(&sess, &grid, "body a1"));
+    try std.testing.expect(grid.contains("body b1"));
+    try std.testing.expect(try Wait.untilGone(&sess, &grid, "… 2 lines"));
+
+    // za on a non-foldable line: status hint, no crash, nothing folded
+    try sess.send("gg");
+    try std.testing.expect(try Wait.until(&sess, &grid, "line 1/7"));
+    try sess.send("za");
+    try std.testing.expect(try Wait.until(&sess, &grid, "没有可折叠"));
+    try std.testing.expect(grid.contains("body a1"));
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}

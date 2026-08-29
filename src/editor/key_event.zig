@@ -31,6 +31,9 @@ pub const ActionId = enum {
     line_end, // $ (last non-newline char)
     goto_first_line, // gg
     goto_last_line, // G
+    goto_view_top, // H — first visible line of the focused window
+    goto_view_middle, // M — middle visible line
+    goto_view_bottom, // L — last visible line
     paragraph_prev, // {
     paragraph_next, // }
     match_pair, // %
@@ -120,6 +123,15 @@ pub const ActionId = enum {
     normal_mode, // esc / ctrl-c
     insert_exit, // jk special-cased by Mode
     flip_visual, // visual 'o': swap anchor and cursor
+    scroll_cursor_center, // zz — scroll the cursor line to the window middle
+    scroll_cursor_top, // zt — scroll the cursor line to the window top
+    scroll_cursor_bottom, // zb — scroll the cursor line to the window bottom
+    // folds (indent-based, see editor/fold.zig)
+    fold_toggle, // za — toggle the fold under the cursor
+    fold_open, // zo — open the innermost closed fold under the cursor
+    fold_close, // zc — close the innermost open fold under the cursor
+    fold_open_all, // zR — open every fold in the buffer
+    fold_close_all, // zM — close every fold in the buffer
     noop,
 };
 

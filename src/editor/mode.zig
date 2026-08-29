@@ -180,6 +180,9 @@ pub const State = struct {
     // ---- internal sequence state (extended beyond the skeleton) ----
     /// 'g' seen, awaiting the second key (gg → first_line, ge → word_prev_end)
     pending_g: bool = false,
+    /// 'z' seen, awaiting the second key (zz/zt/zb scroll; the fold family
+    /// za/zo/zc/… extends this same prefix state).
+    pending_z: bool = false,
     /// '[' or ']' seen (diagnostic navigation prefix), awaiting 'd'.
     pending_bracket: ?u8 = null,
     /// f/F/t/T seen, awaiting the target char (stores the find action)
@@ -398,6 +401,36 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         return .pending;
     }
 
+    // 0a5) 'z' prefix pending: zz/zt/zb scroll the view. Extensible — the
+    // fold family (za/zo/zc/zR/…) plugs in here without touching the keymap
+    // table ('z' itself is deliberately unbound there, like 'g').
+    if (state.pending_z) {
+        state.pending_z = false;
+        if (isEscape(key)) {
+            resetPending(state);
+            return .pending;
+        }
+        if (!isPlain(key)) {
+            resetPending(state);
+            return .pending;
+        }
+        switch (key.codepoint) {
+            'z' => return emitAction(state, .scroll_cursor_center), // zz
+            't' => return emitAction(state, .scroll_cursor_top), // zt
+            'b' => return emitAction(state, .scroll_cursor_bottom), // zb
+            // fold family (view/buffer state, not edits — excluded from '.')
+            'a' => return emitAction(state, .fold_toggle), // za
+            'o' => return emitAction(state, .fold_open), // zo
+            'c' => return emitAction(state, .fold_close), // zc
+            'R' => return emitAction(state, .fold_open_all), // zR
+            'M' => return emitAction(state, .fold_close_all), // zM
+            else => {
+                resetPending(state);
+                return .pending;
+            },
+        }
+    }
+
     // 0b) leader (Space) pending — next key picks the <leader> action.
     if (state.pending_leader) {
         state.pending_leader = false;
@@ -591,6 +624,12 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
             if (actionToMotion(action)) |m| {
                 return emitMotion(state, m, .{});
             }
+            // H/M/L are viewport motions: not in actionToMotion (that table
+            // is shared with ga/ys motion capture, whose callers can't
+            // resolve viewport targets), but operators DO take them (dH…).
+            if (viewMotionOf(action)) |m| {
+                return emitMotion(state, m, .{});
+            }
         }
         if (key.codepoint == 'g') { // dgg / dge
             state.pending_g = true;
@@ -605,6 +644,13 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
     //    keymap (the table binds 'g' to .noop).
     if (key.codepoint == 'g') {
         state.pending_g = true;
+        return .pending;
+    }
+
+    // 5a) 'z' prefix (zz/zt/zb; folds like za extend it later) — same
+    //     sequence pattern as 'g'; 'z' is unbound in the keymap table.
+    if (isPlain(key) and key.codepoint == 'z') {
+        state.pending_z = true;
         return .pending;
     }
 
@@ -640,6 +686,14 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .line_end => emitMotion(state, .line_end, .{}),
         .goto_first_line => emitMotion(state, .first_line, .{}),
         .goto_last_line => emitMotion(state, .last_line, .{}),
+        // H/M/L — viewport motions; main.zig resolves the target line from
+        // the focused window (the motion layer doesn't know the viewport).
+        .goto_view_top => emitMotion(state, .view_top_line, .{}),
+        .goto_view_middle => emitMotion(state, .view_middle_line, .{}),
+        .goto_view_bottom => emitMotion(state, .view_bottom_line, .{}),
+        // zz/zt/zb arrive here only from the pending_z handler (they are
+        // actions, not motions — the cursor doesn't move)
+        .scroll_cursor_center, .scroll_cursor_top, .scroll_cursor_bottom => emitAction(state, action),
         .paragraph_prev => emitMotion(state, .paragraph_prev, .{}),
         .paragraph_next => emitMotion(state, .paragraph_next, .{}),
         .match_pair => emitMotion(state, .match_pair, .{}),
@@ -764,8 +818,9 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
             state.pending_leader = true;
             break :blk .pending;
         },
-        // never produced by the keymap tables
-        .insert_char, .insert_exit, .noop => .pending,
+        // never produced by the keymap tables (the fold actions come from
+        // the pending_z handler directly, never through dispatchNormal)
+        .insert_char, .insert_exit, .fold_toggle, .fold_open, .fold_close, .fold_open_all, .fold_close_all, .noop => .pending,
     };
 }
 
@@ -931,9 +986,11 @@ fn emitAction(state: *State, action: KeyEvent.ActionId) Result {
     resetCount(state);
     // '.' repeat snapshot (M0: emitting counts as executing). Undo/redo and
     // '.' itself are not repeatable via '.', mirroring vim; insert_char is
-    // per-key, not a top-level command.
+    // per-key, not a top-level command; the zz/zt/zb scrolls and the
+    // za/zo/zc/zR/zM fold commands are view/buffer state (no edit), so '.'
+    // must not replay them either.
     switch (action) {
-        .undo, .redo, .repeat_last, .normal_mode, .insert_char => {},
+        .undo, .redo, .repeat_last, .normal_mode, .insert_char, .scroll_cursor_center, .scroll_cursor_top, .scroll_cursor_bottom, .fold_toggle, .fold_open, .fold_close, .fold_open_all, .fold_close_all => {},
         else => {
             state.last_action = action;
             state.last_count = count;
@@ -948,7 +1005,22 @@ fn emitAction(state: *State, action: KeyEvent.ActionId) Result {
 fn isLinewise(motion: Motion.Motion) bool {
     return switch (motion) {
         .down, .up, .first_line, .last_line, .paragraph_prev, .paragraph_next, .page_up, .page_down, .half_page_up, .half_page_down => true,
+        // H/M/L are linewise in vim (dH deletes whole lines up to the first
+        // visible one)
+        .view_top_line, .view_middle_line, .view_bottom_line => true,
         else => false,
+    };
+}
+
+/// H/M/L action → viewport motion. Kept OUT of actionToMotion: that table is
+/// shared with ga/ys motion capture, whose callers (execAlign/execSurround)
+/// resolve ranges through Motion.target and can't handle viewport motions.
+fn viewMotionOf(action: KeyEvent.ActionId) ?Motion.Motion {
+    return switch (action) {
+        .goto_view_top => .view_top_line,
+        .goto_view_middle => .view_middle_line,
+        .goto_view_bottom => .view_bottom_line,
+        else => null,
     };
 }
 
@@ -1039,6 +1111,7 @@ fn countValue(state: *const State) u32 {
 fn resetPending(state: *State) void {
     state.pending_op = null;
     state.pending_g = false;
+    state.pending_z = false;
     state.pending_find = null;
     state.pending_text_object = null;
     state.pending_leader = false;
@@ -1252,6 +1325,64 @@ test "dd/yy → line-wise op_motion" {
     try testing.expectEqual(.op_motion, tag(r2));
     try testing.expectEqual(KeyEvent.ActionId.yank, r2.op_motion.op);
     try testing.expect(!r2.op_motion.exclusive_end);
+}
+
+test "H/M/L → viewport motions; dH → linewise op_motion" {
+    var s = State.init();
+    try testing.expectEqual(Motion.Motion.view_top_line, handle(&s, press('H'), Keymaps.normal).motion.motion);
+    try testing.expectEqual(Motion.Motion.view_middle_line, handle(&s, press('M'), Keymaps.normal).motion.motion);
+    try testing.expectEqual(Motion.Motion.view_bottom_line, handle(&s, press('L'), Keymaps.normal).motion.motion);
+
+    var s2 = State.init();
+    _ = handle(&s2, press('d'), Keymaps.normal);
+    const r = handle(&s2, press('H'), Keymaps.normal);
+    try testing.expectEqual(.op_motion, tag(r));
+    try testing.expectEqual(KeyEvent.ActionId.delete, r.op_motion.op);
+    try testing.expectEqual(Motion.Motion.view_top_line, r.op_motion.motion);
+    try testing.expect(!r.op_motion.exclusive_end); // linewise, like vim dH
+}
+
+test "z prefix: zz/zt/zb scroll actions; bad key cancels" {
+    var s = State.init();
+    try testing.expectEqual(.pending, tag(handle(&s, press('z'), Keymaps.normal)));
+    const r = handle(&s, press('z'), Keymaps.normal);
+    try testing.expectEqual(.action, tag(r));
+    try testing.expectEqual(KeyEvent.ActionId.scroll_cursor_center, r.action.action);
+    // scrolls are view-only: '.' must not replay them
+    try testing.expectEqual(@as(?Repeat, null), s.last_repeat);
+
+    var s2 = State.init();
+    _ = handle(&s2, press('z'), Keymaps.normal);
+    try testing.expectEqual(KeyEvent.ActionId.scroll_cursor_top, handle(&s2, press('t'), Keymaps.normal).action.action);
+
+    var s3 = State.init();
+    _ = handle(&s3, press('z'), Keymaps.normal);
+    try testing.expectEqual(KeyEvent.ActionId.scroll_cursor_bottom, handle(&s3, press('b'), Keymaps.normal).action.action);
+
+    // unknown second key: swallowed, prefix cleared
+    var s4 = State.init();
+    _ = handle(&s4, press('z'), Keymaps.normal);
+    try testing.expectEqual(.pending, tag(handle(&s4, press('q'), Keymaps.normal)));
+    try testing.expect(!s4.pending_z);
+}
+
+test "z prefix: za/zo/zc/zR/zM fold actions; not '.'-repeatable" {
+    const cases = .{
+        .{ 'a', KeyEvent.ActionId.fold_toggle },
+        .{ 'o', KeyEvent.ActionId.fold_open },
+        .{ 'c', KeyEvent.ActionId.fold_close },
+        .{ 'R', KeyEvent.ActionId.fold_open_all },
+        .{ 'M', KeyEvent.ActionId.fold_close_all },
+    };
+    inline for (cases) |c| {
+        var s = State.init();
+        try testing.expectEqual(.pending, tag(handle(&s, press('z'), Keymaps.normal)));
+        const r = handle(&s, press(c[0]), Keymaps.normal);
+        try testing.expectEqual(.action, tag(r));
+        try testing.expectEqual(c[1], r.action.action);
+        // folds are buffer/view state, not edits: '.' must not replay them
+        try testing.expectEqual(@as(?Repeat, null), s.last_repeat);
+    }
 }
 
 test "surround: ysw' adds with motion, ds( deletes, cs'\" changes" {
