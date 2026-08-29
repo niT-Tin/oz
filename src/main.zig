@@ -268,6 +268,15 @@ const App = struct {
     nav_list_active: bool = false,
     nav_list_sel: usize = 0,
     nav_loc_top: usize = 0,
+    /// Float title for the location list (" Outline " / " References " /
+    /// " Implementations " — static literal, set by whichever request filled
+    /// the list; the list renders in the same floating window as the pickers).
+    nav_list_title: []const u8 = " Locations ",
+    /// Float geometry for the location list, refreshed every render — the
+    /// cursor block (which runs after the overlays) lands the block cursor
+    /// on the selected row of the float.
+    nav_float_row: u32 = 0,
+    nav_float_col: u32 = 0,
 
     // insert-mode completion (Ctrl+n and auto-suggest on word chars)
     completion_active: bool = false,
@@ -2468,6 +2477,7 @@ const App = struct {
             }
         }
         self.nav_list_active = self.nav_locations.items.len > 0;
+        self.nav_list_title = " Outline ";
         return true;
     }
 
@@ -3709,10 +3719,18 @@ const App = struct {
 
     fn expandDir(self: *App, node: *TreeNode) !void {
         if (!node.is_dir or node.expanded) return;
-        var dir = try std.Io.Dir.cwd().openDir(self.io, node.path, .{ .iterate = true });
-        defer dir.close(self.io);
-        try self.walkTreeLevel(dir, node);
-        self.sortTreeChildren(node);
+        // Children are loaded exactly once, on first expand. A collapsed dir
+        // KEEPS its loaded children (collapseDir only flips `expanded`), so a
+        // re-expand must not walk the directory again — walkTreeLevel appends
+        // to children, and re-walking after every h/l cycle duplicated every
+        // entry (the tree grew on each toggle). Only a never-loaded dir
+        // (children still empty) hits the filesystem.
+        if (node.children.items.len == 0) {
+            var dir = try std.Io.Dir.cwd().openDir(self.io, node.path, .{ .iterate = true });
+            defer dir.close(self.io);
+            try self.walkTreeLevel(dir, node);
+            self.sortTreeChildren(node);
+        }
         node.expanded = true;
         try self.rebuildFiletreeRows();
     }
@@ -4829,6 +4847,7 @@ const App = struct {
                 self.nav_list_sel = 0;
                 self.nav_loc_top = 0;
                 self.nav_list_active = self.nav_locations.items.len > 0;
+                self.nav_list_title = if (self.nav_action == .implementation) " Implementations " else " References ";
             },
             .none => {},
         }
@@ -5920,7 +5939,7 @@ const App = struct {
 
     // ---- rendering ----
 
-    const filetree_width: u32 = 24;
+    const filetree_width: u32 = 25;
     const tab_bar_rows: u32 = 1;
 
     /// Row where the editor content starts (below the tab bar).
@@ -6980,12 +6999,15 @@ const App = struct {
                 const frow = self.filetree_rows.items[ri];
                 const node = frow.node;
                 const indent = frow.depth * 2;
-                // content = indent + icon (1 cell) + name; a too-wide name is
-                // truncated from the RIGHT with "…" (never head-truncated).
-                // The name budget excludes the right-border column (the last
-                // inner cell), which the border draws over afterwards.
+                // content = indent + icon (1 cell) + space + name; a
+                // too-wide name is truncated from the RIGHT with "…" (never
+                // head-truncated). The name budget excludes the right-border
+                // column (the last inner cell), which the border draws over
+                // afterwards, and the gap cell between icon and name — the
+                // gap keeps the glyph from crowding the text (a Nerd Font
+                // icon right against a name reads as a tiny broken glyph).
                 const icon = if (node.is_dir) icons.folder(node.expanded) else icons.forPath(node.path, false);
-                const avail = (inner_w -| 1) -| @as(usize, indent) -| 1;
+                const avail = (inner_w -| 1) -| @as(usize, indent) -| 1 -| 1;
                 var name = node.name;
                 var ellipsized = false;
                 if (name.len > avail) {
@@ -7009,10 +7031,13 @@ const App = struct {
                     try segs.append(a, .{ .text = pad, .style = style });
                 }
                 try segs.append(a, .{ .text = icon.glyph, .style = .{ .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) }, .bg = style.bg } });
-                if (name.len > 0) try segs.append(a, .{ .text = name, .style = style });
+                if (name.len > 0) {
+                    try segs.append(a, .{ .text = " ", .style = style });
+                    try segs.append(a, .{ .text = name, .style = style });
+                }
                 if (ellipsized) try segs.append(a, .{ .text = "…", .style = style });
-                // count cells: indent spaces + icon (1 cell) + name + "…"
-                const content_len = indent + 1 + name.len + @as(usize, if (ellipsized) 1 else 0);
+                // count cells: indent spaces + icon (1) + gap (1) + name + "…"
+                const content_len = indent + 2 + name.len + @as(usize, if (ellipsized) 1 else 0);
                 const pads = try a.alloc(u8, inner_w -| @min(content_len, inner_w));
                 @memset(pads, ' ');
                 if (pads.len > 0) try segs.append(a, .{ .text = pads, .style = style });
@@ -7466,18 +7491,61 @@ const App = struct {
             }
         }
 
-        // LSP navigation location list overlay (gr / gI): same bottom list
-        // style as the diagnostics list.
+        // LSP navigation location list overlay (gr / gI / <leader>o outline):
+        // a floating window in the same visual language as the pickers
+        // (solid bg_float panel, fg_faint border, accent title, bg_sel
+        // selection, centered on screen) — not a bare bottom list.
         if (self.nav_list_active) {
             const total = self.nav_locations.items.len;
-            const list_rows = @min(@as(usize, 8), total);
+            const list_rows = @min(@as(usize, 10), total);
             if (total > list_rows) {
                 if (self.nav_loc_top + list_rows > total) self.nav_loc_top = total - list_rows;
                 if (self.nav_list_sel < self.nav_loc_top) self.nav_loc_top = self.nav_list_sel;
                 if (self.nav_list_sel >= self.nav_loc_top + list_rows) self.nav_loc_top = self.nav_list_sel - list_rows + 1;
             } else self.nav_loc_top = 0;
             const ntop = self.nav_loc_top;
-            const start_row = height - 1 - @as(u32, @intCast(list_rows)) - 1;
+            // measure the widest label for the box width (capped like the
+            // picker; a huge outline name never spans the whole terminal)
+            var max_w: usize = 0;
+            {
+                var mk: usize = 0;
+                while (mk < list_rows) : (mk += 1) {
+                    const loc = self.nav_locations.items[ntop + mk];
+                    const label = if (std.mem.indexOfScalar(u8, loc.uri, 0)) |z|
+                        try std.fmt.allocPrint(a, "{d}: {s}", .{ loc.line + 1, loc.uri[0..z] })
+                    else
+                        try std.fmt.allocPrint(a, "{d}: {s}", .{ loc.line + 1, std.fs.path.basename(loc.uri) });
+                    max_w = @max(max_w, label.len);
+                }
+            }
+            max_w = @min(max_w, 60);
+            const inner_w: u32 = @intCast(@max(max_w, 12));
+            const box_w = @min(inner_w + 2, win.width * 3 / 5);
+            const inner = box_w - 2;
+            // title row + list rows + bottom border (no input row — the list
+            // is navigated with j/k, not filtered)
+            const box_h: u32 = @as(u32, @intCast(list_rows)) + 2;
+            var start_row = (height -| box_h) / 3;
+            if (start_row < 1) start_row = 1;
+            if (start_row + box_h >= height) start_row = height -| box_h;
+            const start_col = (win.width -| box_w) / 2;
+            self.nav_float_row = start_row;
+            self.nav_float_col = start_col;
+            const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
+            const row_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } };
+            const sel_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_sel }, .fg = .{ .rgb = self.theme.fg } };
+            // top border + title
+            {
+                var segs = std.ArrayList(vaxis.Segment).empty;
+                try segs.append(a, .{ .text = "╭", .style = border_style });
+                try segs.append(a, .{ .text = self.nav_list_title, .style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_float } } });
+                var cx: u32 = 1 + @as(u32, @intCast(self.nav_list_title.len));
+                while (cx < inner + 1) : (cx += 1) {
+                    try segs.append(a, .{ .text = "─", .style = border_style });
+                }
+                try segs.append(a, .{ .text = "╮", .style = border_style });
+                _ = win.print(segs.items, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(start_col), .wrap = .none });
+            }
             var k: usize = 0;
             while (k < list_rows) : (k += 1) {
                 const ri = ntop + k;
@@ -7486,14 +7554,29 @@ const App = struct {
                     try std.fmt.allocPrint(a, "{d}: {s}", .{ loc.line + 1, loc.uri[0..z] })
                 else
                     try std.fmt.allocPrint(a, "{d}: {s}", .{ loc.line + 1, std.fs.path.basename(loc.uri) });
-                const seg = [_]vaxis.Segment{.{
-                    .text = label,
-                    .style = if (ri == self.nav_list_sel)
-                        .{ .bg = .{ .rgb = self.theme.bg_sel } }
-                    else
-                        .{},
-                }};
-                _ = win.print(&seg, .{ .row_offset = @intCast(start_row + k), .wrap = .none });
+                const rs: vaxis.Style = if (ri == self.nav_list_sel) sel_style else row_style;
+                var segs = std.ArrayList(vaxis.Segment).empty;
+                try segs.append(a, .{ .text = "│", .style = border_style });
+                // cell-truncate the label to the interior width so a long
+                // outline name never overflows the panel
+                const fit = cellFitPrefix(win, label, inner -| 1);
+                const row = try a.alloc(u8, @intCast(fit.cells));
+                @memset(row, ' ');
+                @memcpy(row[0..fit.slice.len], fit.slice);
+                try segs.append(a, .{ .text = row, .style = rs });
+                try segs.append(a, .{ .text = "│", .style = border_style });
+                _ = win.print(segs.items, .{ .row_offset = @intCast(start_row + 1 + k), .col_offset = @intCast(start_col), .wrap = .none });
+            }
+            // bottom border
+            {
+                var segs = std.ArrayList(vaxis.Segment).empty;
+                try segs.append(a, .{ .text = "╰", .style = border_style });
+                var cx: u32 = 0;
+                while (cx < inner) : (cx += 1) {
+                    try segs.append(a, .{ .text = "─", .style = border_style });
+                }
+                try segs.append(a, .{ .text = "╯", .style = border_style });
+                _ = win.print(segs.items, .{ .row_offset = @intCast(start_row + 1 + list_rows), .col_offset = @intCast(start_col), .wrap = .none });
             }
         }
 
@@ -7856,6 +7939,14 @@ const App = struct {
             self.vx.screen.cursor = .{
                 .row = @intCast(sel_row),
                 .col = 1,
+            };
+        } else if (self.nav_list_active) {
+            // The location-list float (gr/gI/<leader>o) is navigated with
+            // j/k: the block cursor sits on the selected row of the float
+            // (start_col + 1 = after the left border), like the file tree.
+            self.vx.screen.cursor = .{
+                .row = @intCast(self.nav_float_row + 1 + @as(u32, @intCast(self.nav_list_sel -| self.nav_loc_top))),
+                .col = @intCast(self.nav_float_col + 1),
             };
         } else {
             const cursor_col = self.screenCellCol(win, cursor_line, self.curCursor().*);
