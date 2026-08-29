@@ -17,6 +17,7 @@
 const std = @import("std");
 const json_rpc = @import("../util/json_rpc.zig");
 const server_config = @import("server_config.zig");
+const types = @import("types.zig");
 
 /// Thread-safe FIFO of raw JSON-RPC frame contents (owned bytes). Uses the
 /// io-aware primitives from std.Io (Zig 0.16 moved Mutex/Condition there).
@@ -141,6 +142,24 @@ pub const Client = struct {
         return null;
     }
 
+    /// Open the server's stderr log file (/tmp/oz-lsp-<lang>.log) for
+    /// appending, so a server that fails to start leaves a diagnosable
+    /// trace. null when it cannot be opened — spawn then discards stderr.
+    /// Uses posix openat directly because std.Io.File exposes no
+    /// seek-to-end; O_APPEND makes the child's writes land at the end of
+    /// the existing log regardless of the shared file offset.
+    fn openServerLog(lang: []const u8) ?std.Io.File {
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/tmp/oz-lsp-{s}.log", .{lang}) catch return null;
+        const fd = std.posix.openat(
+            std.posix.AT.FDCWD,
+            path,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true },
+            0o644,
+        ) catch return null;
+        return .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    }
+
     /// Spawn the server for `lang`, handshake, and open `uri` with `text`.
     pub fn start(
         alloc: std.mem.Allocator,
@@ -174,6 +193,12 @@ pub const Client = struct {
             argv_override = arr;
             argv_first_owned = true;
         }
+        // Server stderr must NOT leak onto the editor's terminal (clangd
+        // logs its indexing there, which would interleave with the TUI
+        // frames): route it to a per-language log file instead; fall back to
+        // discarding it when the log cannot be opened.
+        const stderr_log: ?std.Io.File = openServerLog(lang);
+        defer if (stderr_log) |f| f.close(io);
         // Spawn failure: free the heap-held argv (including the resolved
         // binary path). `proc` is only valid after a successful spawn, so the
         // cleanup cannot live in an errdefer that also touches proc.
@@ -181,11 +206,7 @@ pub const Client = struct {
             .argv = argv,
             .stdin = .pipe,
             .stdout = .pipe,
-            // Server stderr must NOT leak onto the editor's terminal: clangd
-            // logs its indexing to stderr, which would otherwise interleave
-            // with the TUI frames (and its own exit message would print over
-            // the screen).
-            .stderr = .ignore,
+            .stderr = if (stderr_log) |f| .{ .file = f } else .ignore,
         }) catch |e| {
             if (argv_override) |arr| {
                 if (argv_first_owned) alloc.free(arr[0]);
@@ -239,8 +260,9 @@ pub const Client = struct {
             self.thread.?.join();
         }
 
-        // initialize request (synchronous handshake, 5s cap). The response
-        // (capabilities) is discarded for now — future features consume it.
+        // initialize request (synchronous handshake, 30s cap — rust-analyzer
+        // may need tens of seconds to load a large workspace before it can
+        // answer). The response (capabilities) is consumed below.
         const init_id = self.next_id;
         self.next_id += 1;
         {
@@ -381,6 +403,12 @@ pub const Client = struct {
     fn freeInitParams(self: *Client, v: *std.json.Value) void {
         var cap = &v.object;
         self.alloc.free(cap.get("rootUri").?.string);
+        var folders = cap.get("workspaceFolders").?;
+        const folder = &folders.array.items[0].object;
+        self.alloc.free(folder.get("uri").?.string);
+        self.alloc.free(folder.get("name").?.string);
+        folder.deinit(self.alloc);
+        folders.array.deinit();
         var inner = cap.get("capabilities").?;
         if (inner.object.getPtr("textDocument")) |td| {
             if (td.object.getPtr("inlayHint")) |ih| ih.object.deinit(self.alloc);
@@ -406,8 +434,10 @@ pub const Client = struct {
         self.version += 1;
         try td.put(self.alloc, "version", .{ .integer = self.version });
         // languageId is required by the LSP textDocumentItem schema; servers
-        // (clangd) refuse to add a document without it.
-        const lang_copy = try self.alloc.dupe(u8, self.lang);
+        // (clangd) refuse to add a document without it. Use the server's
+        // declared id when it differs from the filetype — rust-analyzer
+        // rejects the bare extension "rs" and only accepts "rust".
+        const lang_copy = try self.alloc.dupe(u8, server_config.languageIdFor(self.lang));
         errdefer self.alloc.free(lang_copy);
         try td.put(self.alloc, "languageId", .{ .string = lang_copy });
         // text lives INSIDE textDocument (TextDocumentItem); putting it at the
@@ -564,9 +594,11 @@ pub const Client = struct {
         }
     }
 
-    /// Synchronous wait for the response with `want_id` (handshake).
+    /// Synchronous wait for the response with `want_id` (handshake). Used
+    /// only for initialize; every other response arrives asynchronously via
+    /// `drain`, so the generous 30s cap applies to the handshake alone.
     fn waitResponse(self: *Client, want_id: u64) !json_rpc.Message {
-        while (self.queue.popTimeout(5 * std.time.ns_per_s)) |content| {
+        while (self.queue.popTimeout(30 * std.time.ns_per_s)) |content| {
             defer self.alloc.free(content);
             var msg = json_rpc.parseMessage(self.alloc, content) catch continue;
             // Only a bare response (id, no method) matches: a server→client
@@ -576,8 +608,8 @@ pub const Client = struct {
             }
             // A server→client request during the handshake must be answered
             // (MethodNotFound), or a server that blocks on its reply — e.g.
-            // rust-analyzer's workspace/configuration — stalls until our 5s
-            // cap expires and the whole start fails.
+            // rust-analyzer's workspace/configuration — stalls until our
+            // timeout expires and the whole start fails.
             if (msg.method != null and msg.id != null) {
                 self.answerServerRequest(msg.id.?) catch {};
             }
@@ -631,6 +663,33 @@ pub const Client = struct {
 
     // ---- params builders ----
 
+    /// Derive the workspace root directory from the open document's URI:
+    /// the nearest ancestor containing a Cargo.toml (or rust-project.json —
+    /// rust-analyzer's non-cargo project format), falling back to the
+    /// document's own directory. rust-analyzer discovers the crate graph
+    /// relative to this root; the old hardcoded "file:///" root left it
+    /// without a manifest, so nothing ever resolved. Owned result.
+    fn rootDir(self: *Client) ![]u8 {
+        const path = types.fileUriToPath(self.alloc, self.uri) catch
+            return self.alloc.dupe(u8, "/");
+        defer self.alloc.free(path);
+        const doc_dir = std.fs.path.dirname(path) orelse "/";
+        var dir: []const u8 = doc_dir;
+        while (true) {
+            for ([_][]const u8{ "Cargo.toml", "rust-project.json" }) |marker| {
+                const candidate = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ dir, marker });
+                const exists = if (std.Io.Dir.cwd().openFile(self.io, candidate, .{ .mode = .read_only })) |f| blk: {
+                    f.close(self.io);
+                    break :blk true;
+                } else |_| false;
+                self.alloc.free(candidate);
+                if (exists) return self.alloc.dupe(u8, dir);
+            }
+            dir = std.fs.path.dirname(dir) orelse break;
+        }
+        return self.alloc.dupe(u8, doc_dir);
+    }
+
     fn initParams(self: *Client) !std.json.Value {
         // client capabilities: advertise the features the editor consumes so
         // strict servers (clangd/zls/rust-analyzer) provide them instead of
@@ -652,9 +711,26 @@ pub const Client = struct {
         var cap = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer cap.deinit(self.alloc);
         try cap.put(self.alloc, "processId", .{ .integer = @intCast(std.os.linux.getpid()) });
-        const root_copy = try self.alloc.dupe(u8, "file:///");
-        errdefer self.alloc.free(root_copy);
-        try cap.put(self.alloc, "rootUri", .{ .string = root_copy });
+        const root_dir = try self.rootDir();
+        defer self.alloc.free(root_dir);
+        const root_uri = try types.pathToFileUri(self.alloc, root_dir);
+        errdefer self.alloc.free(root_uri);
+        try cap.put(self.alloc, "rootUri", .{ .string = root_uri });
+        // workspaceFolders mirrors rootUri (rust-analyzer's project
+        // discovery reads the folders list); name is the root's basename.
+        var folder = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer folder.deinit(self.alloc);
+        const folder_uri = try self.alloc.dupe(u8, root_uri);
+        errdefer self.alloc.free(folder_uri);
+        try folder.put(self.alloc, "uri", .{ .string = folder_uri });
+        const base = std.fs.path.basename(root_dir);
+        const folder_name = try self.alloc.dupe(u8, if (base.len == 0) root_dir else base);
+        errdefer self.alloc.free(folder_name);
+        try folder.put(self.alloc, "name", .{ .string = folder_name });
+        var folders = std.json.Array.init(self.alloc);
+        errdefer folders.deinit();
+        try folders.append(.{ .object = folder });
+        try cap.put(self.alloc, "workspaceFolders", .{ .array = folders });
         try cap.put(self.alloc, "capabilities", .{ .object = inner });
         return .{ .object = cap };
     }
@@ -990,6 +1066,29 @@ test "request: a new request for a busy slot replaces the old pending one" {
     try std.testing.expectEqualStrings("rename", slot.?.object.get("kind").?.string);
 }
 
+test "initParams: rootUri/workspaceFolders derive from the document" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const fds = try std.Io.Threaded.pipe2(.{});
+    const read_end = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+    const write_end = std.Io.File{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+    defer std.Io.File.close(read_end, io);
+    defer std.Io.File.close(write_end, io);
+
+    var client = try testClient(alloc, io, write_end);
+    defer cleanupClient(alloc, &client);
+
+    var params = try client.initParams();
+    defer client.freeInitParams(&params);
+    // No Cargo.toml above "/t.zig" ⇒ the root falls back to the document's
+    // own directory (the filesystem root here).
+    try std.testing.expectEqualStrings("file:///", params.object.get("rootUri").?.string);
+    const folders = params.object.get("workspaceFolders").?;
+    try std.testing.expectEqual(@as(usize, 1), folders.array.items.len);
+    const folder = folders.array.items[0].object;
+    try std.testing.expectEqualStrings("file:///", folder.get("uri").?.string);
+}
+
 test "reader: server stdout EOF sets server_died (crash detection)" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
@@ -1019,7 +1118,7 @@ test "start: every failure point after spawn cleans up (no hang, no crash)" {
 
     // OZ_LSP_CMD=/bin/cat: cat echoes our initialize request back, but with
     // method set it is never mistaken for the response — a run that reaches
-    // the handshake wait ends in error.LspHandshakeTimeout (the 5s cap), so
+    // the handshake wait ends in error.LspHandshakeTimeout (the 30s cap), so
     // the loop stops there: all earlier failure indices were already tested.
     var env_map = std.process.Environ.Map.init(base);
     defer env_map.deinit();
