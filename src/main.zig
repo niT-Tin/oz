@@ -38,6 +38,10 @@ const status_row_count: u32 = 1;
 /// ghost appears this long after the cursor settles (<leader>tb).
 const blame_hold_ms: i64 = 1000;
 
+/// Files larger than this skip current-line blame entirely (gitsigns'
+/// max_file_length — blame on huge files is slow and useless).
+const max_blame_lines: u32 = 40000;
+
 /// LSP navigation request kinds (K / gd / gD / gr / gI / gs).
 const NavAction = enum { none, hover, definition, declaration, references, implementation, signature };
 
@@ -49,6 +53,15 @@ const InlayHint = struct { line: u32, character: u32, label: []const u8 };
 
 const GitJobKind = enum { status, blame, apply };
 const GitApplyOp = enum { stage, reset };
+
+/// A git job requested while the single job slot was busy — re-spawned
+/// verbatim when the slot frees (path owned).
+const QueuedGitJob = struct {
+    kind: GitJobKind,
+    path: []u8, // owned
+    hunk_start: u32,
+    op: GitApplyOp,
+};
 
 /// One async git job: the worker thread spawns git, captures stdout/stderr,
 /// fills the result fields and flips `done` (release); the main loop
@@ -342,8 +355,14 @@ const App = struct {
     git_diff_path: ?[]u8 = null,
     /// Parsed blame for the current file (owned).
     git_blame: ?git.Blame = null,
+    /// Path the cached blame was computed for (owned, absolute) — the ghost
+    /// only renders when it still matches the current buffer.
+    git_blame_path: ?[]u8 = null,
     /// Inline blame panel visibility (<leader>tb).
-    blame_active: bool = false,
+    /// Current-line blame is ON BY DEFAULT (nvim gitsigns current_line_blame
+    /// = true): the ghost appears on the cursor line 1s after it settles.
+    /// <leader>tb toggles it.
+    blame_active: bool = true,
     /// Current-line blame ghost (nvim gitsigns style): the blame of the
     /// cursor line shows as end-of-line dim text, 1s after the cursor
     /// settles (CursorHold). Fields track the hold: the last cursor byte
@@ -355,10 +374,12 @@ const App = struct {
     /// <leader>hp hit while the diff was stale: show the preview when the
     /// status job lands.
     git_preview_pending: bool = false,
-    /// A non-status job (blame) requested while another job was running —
-    /// spawn it once the current job finishes (status refreshes use
-    /// git_refresh_pending instead).
-    git_queued: ?GitJobKind = null,
+    /// A non-status job (blame/apply) requested while another job was
+    /// running — re-spawned with these exact params once the current job
+    /// finishes (status refreshes use git_refresh_pending instead). Apply
+    /// must NOT be dropped: ` hs` pressed while a blame job runs would
+    /// otherwise silently do nothing.
+    git_queued: ?QueuedGitJob = null,
 
     // insert-mode completion (Ctrl+n and auto-suggest on word chars)
     completion_active: bool = false,
@@ -1082,8 +1103,10 @@ const App = struct {
         }
         if (self.git_branch) |b| self.alloc.free(b);
         if (self.git_diff_path) |p| self.alloc.free(p);
+        if (self.git_queued) |q| self.alloc.free(q.path);
         self.git_diff.deinit(self.alloc);
         if (self.git_blame) |*b| b.deinit(self.alloc);
+        if (self.git_blame_path) |bp| self.alloc.free(bp);
         if (self.git_preview) |p| self.alloc.free(p.text);
     }
 
@@ -3989,14 +4012,23 @@ const App = struct {
 
     /// Spawn one async git job for `path`. One job at a time: when a job is
     /// already running, a status request is remembered (git_refresh_pending)
-    /// and re-spawned after the current one lands; other kinds are dropped
-    /// (the user can retry).
+    /// and re-spawned after the current one lands; other kinds are queued
+    /// with their full params (git_queued) and retried too.
     fn spawnGitJob(self: *App, kind: GitJobKind, path: []const u8, hunk_start: u32, op: GitApplyOp) !void {
         if (self.git_job != null) {
             if (kind == .status) {
                 self.git_refresh_pending = true;
             } else {
-                self.git_queued = kind; // blame etc. — retried after the job
+                // blame/apply: keep the LATEST request (a stale queued blame
+                // is superseded by a newer one; apply keeps the user's last
+                // hunk action)
+                if (self.git_queued) |q| self.alloc.free(q.path);
+                self.git_queued = .{
+                    .kind = kind,
+                    .path = try self.alloc.dupe(u8, path),
+                    .hunk_start = hunk_start,
+                    .op = op,
+                };
             }
             return;
         }
@@ -4040,6 +4072,9 @@ const App = struct {
                 // (git diff prints nothing for an untracked file — without
                 // this the all-added marks never appeared)
                 self.git_diff.untracked = job.untracked;
+                // auto current-line blame (nvim current_line_blame=true):
+                // the repo is confirmed now — load blame for this file
+                self.maybeLoadBlame();
                 if (self.git_preview_pending) {
                     self.git_preview_pending = false;
                     self.showHunkPreview();
@@ -4054,11 +4089,12 @@ const App = struct {
                     if (self.cur().path) |cp| {
                         if (std.mem.eql(u8, cp, job.path)) {
                             self.git_blame = git.parseBlame(self.alloc, o) catch null;
+                            if (self.git_blame_path) |bp| self.alloc.free(bp);
+                            self.git_blame_path = dupOrNull(self.alloc, job.path);
                         }
                     }
                     // job.out freed by finishGitJob (blame output is owned)
                 }
-                if (self.git_blame == null) self.blame_active = false;
             },
             .apply => {
                 if (job.msg) |m| {
@@ -4069,6 +4105,14 @@ const App = struct {
                 }
                 // the working tree changed (staged/reset): refresh the marks
                 if (self.cur().path) |p| self.spawnGitJob(.status, p, 0, .stage) catch {};
+                // and the blame describes the old file — invalidate it so
+                // the status refresh reloads blame for the new content
+                if (self.blame_active) {
+                    if (self.git_blame) |*b| b.deinit(self.alloc);
+                    self.git_blame = null;
+                    if (self.git_blame_path) |bp| self.alloc.free(bp);
+                    self.git_blame_path = null;
+                }
             },
         }
     }
@@ -4081,19 +4125,19 @@ const App = struct {
         self.alloc.destroy(job);
         self.git_job = null;
         // resume work requested while the slot was busy: a stale status
-        // refresh first, then any queued non-status job (blame)
+        // refresh first, then any queued non-status job (blame/apply)
         if (self.git_refresh_pending) {
             self.git_refresh_pending = false;
             if (self.cur().path) |p| self.spawnGitJob(.status, p, 0, .stage) catch {};
-        } else if (self.git_queued) |k| {
+        } else if (self.git_queued) |q| {
             self.git_queued = null;
-            if (k == .blame) {
-                if (self.cur().path) |p| {
-                    self.blame_active = true;
-                    self.spawnGitJob(.blame, p, 0, .stage) catch {
-                        self.blame_active = false;
-                    };
-                }
+            defer self.alloc.free(q.path);
+            if (q.kind == .blame) {
+                // blame goes through the auto-loader: it re-checks
+                // blame_active and the current buffer's path/staleness
+                self.maybeLoadBlame();
+            } else {
+                self.spawnGitJob(q.kind, q.path, q.hunk_start, q.op) catch {};
             }
         }
     }
@@ -4220,16 +4264,30 @@ const App = struct {
 
     /// <leader>tb — toggle the current-line blame ghost (end-of-line dim
     /// text on the cursor line, 1s CursorHold delay — nvim gitsigns style).
+    /// ON by default, like the nvim config's current_line_blame = true.
     fn toggleBlame(self: *App) void {
         if (self.blame_active) {
             self.blame_active = false;
             return;
         }
-        const path = self.cur().path orelse return;
         self.blame_active = true;
-        self.spawnGitJob(.blame, path, 0, .stage) catch {
-            self.blame_active = false;
-        };
+        self.maybeLoadBlame();
+    }
+
+    /// Load blame for the current file when current-line blame is active,
+    /// the repo check has passed (git_branch set), the file is under the
+    /// big-file limit, and the cached blame is stale/missing. No-op
+    /// otherwise — this is the auto-behavior behind current_line_blame.
+    fn maybeLoadBlame(self: *App) void {
+        if (!self.blame_active) return;
+        if (self.git_branch == null) return; // not a repo — no blame
+        const path = self.cur().path orelse return;
+        if (self.cur().pt.lineCount() > max_blame_lines) return; // degrade
+        const stale = if (self.git_blame_path) |bp|
+            !std.mem.eql(u8, bp, path)
+        else
+            true;
+        if (stale) self.spawnGitJob(.blame, path, 0, .stage) catch {};
     }
 
     /// <leader>lg — launch lazygit in an external terminal emulator
@@ -4925,8 +4983,9 @@ const App = struct {
         self.nav_list_active = false;
         self.closeCompletion();
         self.closeGitPreview();
-        self.blame_active = false;
-        // git branch + diff marks describe the newly focused buffer
+        // git branch + diff marks describe the newly focused buffer; blame
+        // stays ON (current_line_blame) — the path check on the cached
+        // blame prevents a stale ghost from the previous buffer
         self.scheduleGitStatus();
     }
 
@@ -8201,19 +8260,31 @@ const App = struct {
                 self.blame_last_cursor = self.curCursor().*;
                 self.blame_move_ms = now_ms;
             }
-            if (self.blame_active and self.git_blame != null and
-                now_ms - self.blame_move_ms >= blame_hold_ms)
+            if (self.blame_active and self.state.mode == .normal and
+                self.git_blame != null and now_ms - self.blame_move_ms >= blame_hold_ms)
             {
                 const fbuf = self.cur();
                 const blame_line = fbuf.pt.lineOf(self.curCursor().*);
-                if (self.git_blame.?.at(blame_line)) |e| {
+                if (self.git_blame_path) |bp| {
+                    if (fbuf.path == null or !std.mem.eql(u8, bp, fbuf.path.?)) {
+                        // cached blame is for another file — no ghost
+                    } else if (self.git_blame.?.at(blame_line)) |e| {
                     var hm_buf: [5]u8 = undefined;
                     const hm = formatHm(&hm_buf, e.author_time);
                     const label = try std.fmt.allocPrint(a, " {s}, {s} - {s}", .{ e.author, hm, e.summary });
-                    // anchor at the END of the line's rendered text
+                    // anchor at the END of the line's RENDERED text:
+                    // screenCellCol (not lineCellCol) counts the inlay hints
+                    // spliced into the line — anchoring at the raw text end
+                    // would draw the ghost ON TOP of hinted text
                     const line_end = fbuf.pt.lineStart(blame_line) + fbuf.pt.lineLen(blame_line);
-                    const end_col = self.lineCellCol(win, blame_line, line_end);
-                    const start_col = cur_rect.col + gutter + end_col;
+                    const end_col = self.screenCellCol(win, blame_line, line_end);
+                    var start_col = cur_rect.col + gutter + end_col;
+                    // a closed fold's " … N lines" marker also renders after
+                    // the text — shift the ghost past it
+                    if (foldAt(fbuf, blame_line)) |f| {
+                        const marker = try std.fmt.allocPrint(a, " … {d} lines", .{f.hiddenCount()});
+                        start_col += self.textWidth(win, marker);
+                    }
                     if (start_col < win.width) {
                         const fit = cellFitPrefix(win, label, win.width - start_col);
                         if (fit.cells > 0) {
@@ -8228,6 +8299,7 @@ const App = struct {
                             });
                         }
                     }
+                }
                 }
             }
         }

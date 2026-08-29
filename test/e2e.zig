@@ -11015,16 +11015,19 @@ test "git: gutter signs, ]c hunk jump, hunk stage/reset, blame ghost, branch" {
     defer alloc.free(staged2);
     try std.testing.expect(std.mem.indexOf(u8, staged2, "CHANGED") != null);
 
-    // <leader>tb — current-line blame as end-of-line GHOST text (nvim
-    // gitsigns style): "<author>, HH:MM - <summary>" on the cursor line,
-    // 1s after the cursor settles. The cursor sits on hunk B (it has not
-    // moved since ]c), so the ghost appears once the blame job lands.
-    try sess.send(" tb");
+    // current-line blame is ON BY DEFAULT (nvim current_line_blame=true):
+    // "<author>, HH:MM - <summary>" ghost text on the cursor line, 1s
+    // after the cursor settles — no keypress needed. The cursor sits on
+    // hunk B (not moved since ]c); the hr reset invalidated and reloaded
+    // the blame, so wait for the ghost to (re)appear.
     try std.testing.expect(try Wait.until(&sess, &grid, "E2E Tester, "));
     try std.testing.expect(grid.contains(" - init"));
-    // toggle off — the ghost disappears
+    // <leader>tb toggles it off...
     try sess.send(" tb");
     try std.testing.expect(try Wait.untilGone(&sess, &grid, "E2E Tester,"));
+    // ...and back on (blame data is cached — the ghost returns)
+    try sess.send(" tb");
+    try std.testing.expect(try Wait.until(&sess, &grid, "E2E Tester, "));
 
     // untracked file: every line reads as added — open b.txt, the ▎ sign
     // covers the gutter
