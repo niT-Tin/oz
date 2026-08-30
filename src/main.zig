@@ -7455,11 +7455,14 @@ const App = struct {
         // cursor offset, mc highlight and easymotion labels
         const gutter = self.gutterWidth(line_count);
 
-        // tab bar: one entry per buffer, current highlighted, + dirty marker.
-        // Each tab is a solid block (active: bg_sel, inactive: bg_float)
-        // separated by a 1-cell base-bg gap, so the tabs read as distinct
-        // segments instead of one undifferentiated line of text.
-        {
+        // tab bar. Single window: one entry per buffer, current highlighted,
+        // + dirty marker — solid blocks separated by a 1-cell base-bg gap.
+        // Split windows: every pane lists ALL buffers clipped to its zone
+        // (a buffer not shown anywhere must not vanish), and the pane's OWN
+        // buffer carries the active style — the divider separates "which
+        // buffer is where", so a buffer moving panes (<leader>bh/bl) is
+        // visible on the tab bar.
+        if (self.windows.items.len <= 1) {
             var tab_i: usize = 0;
             // the tab bar belongs to the BUFFER area: with the file tree
             // open it starts at the content column (right of the sidebar),
@@ -7493,7 +7496,46 @@ const App = struct {
                 col +|= @intCast(1 + label.len + 1);
                 if (col >= win.width) break;
             }
-        }
+        } else if (self.layoutWindows(a, self.contentTop(), content_rows, self.contentCol(), win.width)) |tab_layout| {
+            // every pane lists ALL buffers (a buffer not shown in any pane
+            // must not vanish from the tab bar); the pane's OWN buffer
+            // carries the active style, so the divider still separates
+            // "which buffer is where" and <leader>bh/bl visibly moves it
+            for (tab_layout.leaves) |lr| {
+                const own = self.windows.items[lr.win].buf;
+                var tab_i: usize = 0;
+                var col: u32 = lr.col;
+                const pane_end = lr.col + lr.width;
+                while (tab_i < self.buffers.items.len) : (tab_i += 1) {
+                    const buf = &self.buffers.items[tab_i];
+                    const name = if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
+                    const dirty = if (buf.dirty) "\u{25cf}" else " ";
+                    const label = try std.fmt.allocPrint(a, " {s}{s} ", .{ name, dirty });
+                    const active = tab_i == own;
+                    const tab_style: vaxis.Style = if (active)
+                        .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_status }, .bold = true }
+                    else
+                        .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
+                    const icon = icons.forPath(if (buf.path) |p| p else "", false);
+                    const icon_style: vaxis.Style = .{
+                        .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) },
+                        .bg = tab_style.bg,
+                        .bold = active,
+                    };
+                    // clip to the pane: icon (1 cell) + what fits of the
+                    // label — tabs must not bleed into the neighbor's zone
+                    const fit = cellFitPrefix(win, label, pane_end -| col -| 1);
+                    if (fit.cells == 0) break;
+                    const segs = [_]vaxis.Segment{
+                        .{ .text = icon.glyph, .style = icon_style },
+                        .{ .text = fit.slice, .style = tab_style },
+                    };
+                    _ = win.print(&segs, .{ .row_offset = 0, .col_offset = @intCast(col), .wrap = .none });
+                    col += @intCast(1 + fit.cells + 1); // icon + label + gap
+                    if (col >= pane_end) break;
+                }
+            }
+        } else |_| {}
 
         // dashboard (no file open): title + recent files + hints
         if (self.isDashboard()) {
