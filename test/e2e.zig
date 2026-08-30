@@ -362,6 +362,15 @@ const Grid = struct {
     bg: u32 = 0, // current bg color (packed RGB, 0 = default)
     /// Scratch buffer for rowText (one row of compressed cells).
     row_text_buf: [80 * 4]u8 = undefined,
+    /// Allocator for the pending-tail combine (set by init).
+    alloc: std.mem.Allocator,
+    /// Truncated escape/UTF-8 sequence tail from the last feed: pty reads
+    /// split sequences at arbitrary byte boundaries, and without stashing
+    /// the tail the continuation bytes print as TEXT and corrupt the grid
+    /// (a split SGR like "ESC[48:2:42:42:5" + "5m" painted ":42:42:55m"
+    /// into the status row).
+    pending: [128]u8 = undefined,
+    pending_len: usize = 0,
 
     fn init(alloc: std.mem.Allocator) !Grid {
         const buf = try alloc.alloc(u8, 24 * 80 * 4);
@@ -370,7 +379,7 @@ const Grid = struct {
         @memset(fg_buf, 0);
         const bg_buf = try alloc.alloc(u32, 24 * 80);
         @memset(bg_buf, 0);
-        return .{ .buf = buf, .fg_buf = fg_buf, .bg_buf = bg_buf };
+        return .{ .buf = buf, .fg_buf = fg_buf, .bg_buf = bg_buf, .alloc = alloc };
     }
 
     fn deinit(self: *Grid, alloc: std.mem.Allocator) void {
@@ -384,12 +393,40 @@ const Grid = struct {
         return self.buf[(row * self.cols + col) * 4 ..][0..4];
     }
 
+    /// Save a truncated tail for the next feed (bounded; an over-long tail
+    /// is dropped rather than corrupting the grid).
+    fn stashPending(self: *Grid, tail: []const u8) void {
+        const n = @min(tail.len, self.pending.len);
+        @memcpy(self.pending[0..n], tail[0..n]);
+        self.pending_len = n;
+    }
+
     fn feed(self: *Grid, bytes: []const u8) void {
+        if (self.pending_len > 0) {
+            const combined = self.alloc.alloc(u8, self.pending_len + bytes.len) catch {
+                self.pending_len = 0;
+                self.feedBytes(bytes);
+                return;
+            };
+            defer self.alloc.free(combined);
+            @memcpy(combined[0..self.pending_len], self.pending[0..self.pending_len]);
+            @memcpy(combined[self.pending_len..], bytes);
+            self.pending_len = 0;
+            self.feedBytes(combined);
+            return;
+        }
+        self.feedBytes(bytes);
+    }
+
+    fn feedBytes(self: *Grid, bytes: []const u8) void {
         var i: usize = 0;
         while (i < bytes.len) {
             const b = bytes[i];
             if (b == 0x1b) {
-                if (i + 1 >= bytes.len) return;
+                if (i + 1 >= bytes.len) {
+                    self.stashPending(bytes[i..]);
+                    return;
+                }
                 if (bytes[i + 1] == '[') {
                     // CSI: params up to final byte 0x40-0x7e
                     var j = i + 2;
@@ -421,15 +458,21 @@ const Grid = struct {
                         }
                         j += 1;
                     } else {
-                        i = bytes.len; // unterminated CSI
-                        continue;
+                        // unterminated CSI (split across reads): stash the
+                        // tail so the continuation parses as one sequence
+                        self.stashPending(bytes[i..]);
+                        return;
                     }
                     continue;
                 }
                 if (bytes[i + 1] == ']') {
-                    // OSC: skip until BEL or ST
+                    // OSC: skip until BEL or ST; a split OSC stashes the tail
                     var k = i + 2;
                     while (k < bytes.len and bytes[k] != 0x07) k += 1;
+                    if (k >= bytes.len) {
+                        self.stashPending(bytes[i..]);
+                        return;
+                    }
                     i = k + 1;
                     continue;
                 }
@@ -459,11 +502,16 @@ const Grid = struct {
                     if (b >= 0xC0) {
                         ln = if (b < 0xE0) 2 else (if (b < 0xF0) 3 else 4);
                     }
+                    if (i + ln > bytes.len) {
+                        // truncated UTF-8 at the chunk end — stash for the
+                        // next feed (a partial memcpy renders U+FFFD junk)
+                        self.stashPending(bytes[i..]);
+                        return;
+                    }
                     if (self.row < self.rows and self.col < self.cols) {
                         const slot = self.cell(self.row, self.col);
                         @memset(slot, 0);
-                        const avail = @min(ln, bytes.len - i);
-                        @memcpy(slot[0..avail], bytes[i .. i + avail]);
+                        @memcpy(slot[0..ln], bytes[i .. i + ln]);
                         self.fg_buf[self.row * self.cols + self.col] = self.fg;
                         self.bg_buf[self.row * self.cols + self.col] = self.bg;
                     }
@@ -518,6 +566,17 @@ const Grid = struct {
                 }
             },
             else => {}, // clear (J/K), modes (h/l), etc. ignored
+            // EL (erase in line, ESC[K): clear from the cursor column to the
+            // end of the row — without it a SHORTER status bar redraw leaves
+            // the previous longer text's tail behind (stale "⎇ master")
+            'K' => {
+                var c = self.col;
+                while (c < self.cols) : (c += 1) {
+                    @memset(self.cell(self.row, c), 0);
+                    self.fg_buf[self.row * self.cols + c] = 0;
+                    self.bg_buf[self.row * self.cols + c] = 0;
+                }
+            },
         }
     }
 
@@ -5577,6 +5636,10 @@ test "picker confirm leaves file-tree mode; j/k control the buffer" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
         if (grid.contains("line 2/")) line2_seen = true;
+    }
+    if (!line2_seen) {
+        std.debug.print("PICKER FAIL DUMP:\n", .{});
+        grid.dump();
     }
     try std.testing.expect(line2_seen);
 
