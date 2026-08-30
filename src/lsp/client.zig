@@ -598,7 +598,14 @@ pub const Client = struct {
     /// only for initialize; every other response arrives asynchronously via
     /// `drain`, so the generous 30s cap applies to the handshake alone.
     fn waitResponse(self: *Client, want_id: u64) !json_rpc.Message {
-        while (self.queue.popTimeout(30 * std.time.ns_per_s)) |content| {
+        const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + 30 * std.time.ns_per_s;
+        while (std.Io.Timestamp.now(self.io, .real).nanoseconds < deadline) {
+            // A server that died before answering (bad binary, crash on
+            // startup — e.g. a rustup proxy with no default toolchain) will
+            // never respond: bail out instead of freezing the UI for the
+            // full 30s.
+            if (self.server_died.load(.acquire)) return error.LspServerDied;
+            const content = self.queue.popTimeout(100 * std.time.ns_per_ms) orelse continue;
             defer self.alloc.free(content);
             var msg = json_rpc.parseMessage(self.alloc, content) catch continue;
             // Only a bare response (id, no method) matches: a server→client
@@ -1118,8 +1125,9 @@ test "start: every failure point after spawn cleans up (no hang, no crash)" {
 
     // OZ_LSP_CMD=/bin/cat: cat echoes our initialize request back, but with
     // method set it is never mistaken for the response — a run that reaches
-    // the handshake wait ends in error.LspHandshakeTimeout (the 30s cap), so
-    // the loop stops there: all earlier failure indices were already tested.
+    // the handshake wait ends in LspHandshakeTimeout (the 30s cap) or
+    // LspServerDied (failing index hit the reader thread), so the loop stops
+    // there: all earlier failure indices were already tested.
     var env_map = std.process.Environ.Map.init(base);
     defer env_map.deinit();
     try env_map.put("OZ_LSP_CMD", "/bin/cat");
@@ -1134,7 +1142,11 @@ test "start: every failure point after spawn cleans up (no hang, no crash)" {
             client.deinit();
             return error.TestUnexpectedResult;
         } else |e| {
-            if (e == error.LspHandshakeTimeout) break; // past the alloc paths
+            // Reaching the handshake wait ends the loop: LspHandshakeTimeout
+            // (/bin/cat never answers) or LspServerDied (the failing index
+            // landed in the reader thread's own allocation) — both mean
+            // every earlier alloc-failure path was already exercised.
+            if (e == error.LspHandshakeTimeout or e == error.LspServerDied) break;
             try std.testing.expect(e == error.OutOfMemory);
         }
     }
