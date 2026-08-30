@@ -137,6 +137,8 @@ pub const entries: []const Entry = &.{
     .{ .keys = "space bn", .desc = "下一个 Buffer", .group = "Leader" },
     .{ .keys = "space bj", .desc = "挑选 Buffer", .group = "Leader" },
     .{ .keys = "space bk", .desc = "关闭当前 Buffer", .group = "Leader" },
+    .{ .keys = "space bh", .desc = "当前 Buffer 移到左边窗口", .group = "Leader" },
+    .{ .keys = "space bl", .desc = "当前 Buffer 移到右边窗口", .group = "Leader" },
     .{ .keys = "space rn", .desc = "LSP 重命名符号", .group = "Leader" },
     .{ .keys = "space lf", .desc = "LSP 格式化文档", .group = "Leader" },
     .{ .keys = "space ti", .desc = "LSP inlay hints 开关", .group = "Leader" },

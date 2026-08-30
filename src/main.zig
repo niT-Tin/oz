@@ -931,18 +931,21 @@ const App = struct {
         self.state.mode = .normal;
     }
 
-    /// Ctrl-w hjkl: move focus to the leaf window geometrically in `dir`
-    /// (vim semantics — the nearest window in that direction, preferring
-    /// windows that overlap the current one).
-    fn navigateWindow(self: *App, dir: enum { left, right, up, down }) void {
-        if (self.windows.items.len <= 1) return;
+    /// Direction for window navigation / buffer moves (Ctrl-w hjkl family).
+    const WinDir = enum { left, right, up, down };
+
+    /// The leaf window geometrically in `dir` from the focused one (nearest,
+    /// preferring windows that overlap the current one — vim's Ctrl-w hjkl
+    /// targeting). null when there is no window that way (or only one).
+    fn neighborWindow(self: *App, dir: WinDir) ?usize {
+        if (self.windows.items.len <= 1) return null;
         const height: u32 = self.vx.window().height;
-        if (height <= status_row_count) return;
+        if (height <= status_row_count) return null;
         const content_rows = height - status_row_count - tab_bar_rows;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const layout = self.layoutWindows(a, self.contentTop(), content_rows, self.contentCol(), self.vx.window().width) catch return;
+        const layout = self.layoutWindows(a, self.contentTop(), content_rows, self.contentCol(), self.vx.window().width) catch return null;
         const leaves = layout.leaves;
         var cur_rect: ?LeafRect = null;
         for (leaves) |lr| {
@@ -951,7 +954,7 @@ const App = struct {
                 break;
             }
         }
-        const cr = cur_rect orelse return;
+        const cr = cur_rect orelse return null;
         var best: ?usize = null;
         var best_score: i64 = std.math.maxInt(i64);
         for (leaves) |lr| {
@@ -976,7 +979,36 @@ const App = struct {
                 best = lr.win;
             }
         }
-        if (best) |b| self.switchWindowTo(b);
+        return best;
+    }
+
+    /// Ctrl-w hjkl: move focus to the leaf window geometrically in `dir`.
+    fn navigateWindow(self: *App, dir: WinDir) void {
+        if (self.neighborWindow(dir)) |b| self.switchWindowTo(b);
+    }
+
+    /// <leader>bh / <leader>bl — move the current buffer to the window on the
+    /// left/right (vertical splits): the neighbor window adopts the buffer;
+    /// the current window falls back to the next buffer in the list, or
+    /// closes when the moved buffer was the last one (nothing left to show).
+    fn moveBufferToWindow(self: *App, dir: WinDir) void {
+        const target = self.neighborWindow(dir) orelse return;
+        const moved = self.windows.items[self.current_win].buf;
+        // the neighbor adopts the moved buffer (its old buffer stays open in
+        // the list); its cursor is clamped to the new text
+        self.windows.items[target].buf = moved;
+        const mlen = self.buffers.items[moved].pt.len();
+        self.windows.items[target].cursor = @min(self.windows.items[target].cursor, mlen);
+        if (self.buffers.items.len <= 1) {
+            // the last buffer left this window — nothing else to show:
+            // close the window (focus moves to a surviving leaf)
+            self.closeWindow();
+            return;
+        }
+        // the current window shows the next buffer instead — switchTo does
+        // the assignment plus the per-buffer state cleanup (LSP retarget,
+        // inlay/diagnostic/hover invalidation, git status refresh)
+        self.switchTo((moved + 1) % self.buffers.items.len);
     }
     fn create(init: std.process.Init) !*App {
         const self = try init.gpa.create(App);
@@ -5955,6 +5987,8 @@ const App = struct {
             .inlay_hints => try self.requestInlayHints(),
             .document_outline => try self.requestOutline(),
             .close_buffer => self.closeCurrentBuffer(),
+            .buffer_to_left_win => self.moveBufferToWindow(.left),
+            .buffer_to_right_win => self.moveBufferToWindow(.right),
             .filetree_toggle => try self.toggleFiletree(),
             .filetree_locate => try self.locateInFiletree(),
             // M3 git

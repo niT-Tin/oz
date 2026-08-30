@@ -95,6 +95,8 @@ pub const ActionId = enum {
     picker_keymaps, // <leader>sk — keymap search picker
     picker_themes, // <leader>sp — theme picker (live preview)
     close_buffer, // <leader>bk — close current buffer
+    buffer_to_left_win, // <leader>bh — move current buffer to the left window
+    buffer_to_right_win, // <leader>bl — move current buffer to the right window
     filetree_toggle, // <leader>e — toggle file tree
     // M2 LSP actions
     diagnostic_next, // ]d — next diagnostic

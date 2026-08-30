@@ -8434,6 +8434,111 @@ test "windows: :vs keeps the old window left; Ctrl-w h/l + :e target the focused
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+test "windows: <leader>bh/bl move the buffer to the left/right window; last buffer closes the window" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var na_buf: [128:0]u8 = undefined;
+    const na = try std.fmt.bufPrintZ(&na_buf, "/tmp/oz_e2e_{d}_{d}bha.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, na, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "WAA\n");
+    }
+    var nb_buf: [128:0]u8 = undefined;
+    const nb = try std.fmt.bufPrintZ(&nb_buf, "/tmp/oz_e2e_{d}_{d}bhb.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, nb) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, nb, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "WBB\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, na });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    const Wait = struct {
+        // poll until row 1 shows `left` in the left pane and `right` in the
+        // right pane (empty `right` = no right pane at all: no separator)
+        fn panes(s: *Session, g: *Grid, left: []const u8, right: []const u8) !bool {
+            var w: i32 = 0;
+            while (true) {
+                const row = g.rowText(1);
+                const l_ok = left.len == 0 or (row.len >= 40 and std.mem.indexOf(u8, row[0..40], left) != null);
+                const r_ok = right.len == 0 or (row.len > 40 and std.mem.indexOf(u8, row[40..], right) != null);
+                const r_gone = right.len != 0 or std.mem.indexOf(u8, row, "│") == null;
+                if (l_ok and r_ok and r_gone) return true;
+                const n = try readAvailable(s.pty.master, s.out[s.used..], 200);
+                if (n == 0) {
+                    w += 200;
+                    if (w >= 5000) return false;
+                    continue;
+                }
+                s.used += n;
+                g.feed(s.out[s.used - n .. s.used]);
+            }
+        }
+    };
+
+    // :vs → both halves show WAA; :e b.txt puts WBB in the focused (right) half
+    try sess.send(":vs\r");
+    try std.testing.expect(try Wait.panes(&sess, &grid, "WAA", "WAA"));
+    try sess.send(":e ");
+    try sess.send(nb);
+    try sess.send("\r");
+    try std.testing.expect(try Wait.panes(&sess, &grid, "WAA", "WBB"));
+
+    // <leader>bh: WBB moves to the LEFT window; the right window falls back
+    // to the next buffer (WAA). The buffer list is unchanged (two tabs).
+    try sess.send(" bh");
+    try std.testing.expect(try Wait.panes(&sess, &grid, "WBB", "WAA"));
+
+    // <leader>bl from the right window: no right neighbor → no-op
+    try sess.send(" bl");
+    try std.testing.expect(try Wait.panes(&sess, &grid, "WBB", "WAA"));
+
+    // focus the left window and <leader>bl: WBB moves back RIGHT; the left
+    // window falls back to WAA
+    try sess.send("\x17h");
+    try sess.send(" bl");
+    try std.testing.expect(try Wait.panes(&sess, &grid, "WAA", "WBB"));
+
+    // drop WBB (:bd in the right window) → both halves show WAA, one buffer
+    try sess.send("\x17l");
+    try sess.send(":bd\r");
+    try std.testing.expect(try Wait.panes(&sess, &grid, "WAA", "WAA"));
+
+    // <leader>bh with the LAST buffer: the buffer moves left and the current
+    // window closes — a single pane remains (no split separator on row 1)
+    try sess.send(" bh");
+    try std.testing.expect(try Wait.panes(&sess, &grid, "WAA", ""));
+    const row = grid.rowText(1);
+    const first = std.mem.indexOf(u8, row, "WAA").?;
+    try std.testing.expect(std.mem.indexOfPos(u8, row, first + 1, "WAA") == null);
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
 test "windows: editing in one split clamps the other window's stale cursor (no crash)" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;

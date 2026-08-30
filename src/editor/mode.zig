@@ -392,7 +392,7 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
     }
 
     // 0a3) <leader>b pending (buffer family): bb prev / bn next / bj pick /
-    //     bk close.
+    //     bk close / bh move to left window / bl move to right window.
     if (state.pending_leader_b) {
         state.pending_leader_b = false;
         if (isEscape(key)) {
@@ -404,6 +404,8 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
             'n' => return emitAction(state, .next_buffer), // <leader>bn next
             'j' => return emitAction(state, .picker_buffers), // <leader>bj pick
             'k' => return emitAction(state, .close_buffer), // <leader>bk close
+            'h' => return emitAction(state, .buffer_to_left_win), // <leader>bh move to left window
+            'l' => return emitAction(state, .buffer_to_right_win), // <leader>bl move to right window
             else => {
                 resetPending(state);
                 return .pending;
@@ -829,6 +831,8 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .picker_keymaps => emitAction(state, .picker_keymaps),
         .picker_themes => emitAction(state, .picker_themes),
         .close_buffer => emitAction(state, .close_buffer),
+        .buffer_to_left_win => emitAction(state, .buffer_to_left_win),
+        .buffer_to_right_win => emitAction(state, .buffer_to_right_win),
         .filetree_toggle => emitAction(state, .filetree_toggle),
         .diagnostic_next => emitAction(state, .diagnostic_next),
         .diagnostic_prev => emitAction(state, .diagnostic_prev),
