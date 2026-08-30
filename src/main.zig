@@ -7302,7 +7302,10 @@ const App = struct {
         // segments instead of one undifferentiated line of text.
         {
             var tab_i: usize = 0;
-            var col: u16 = 0;
+            // the tab bar belongs to the BUFFER area: with the file tree
+            // open it starts at the content column (right of the sidebar),
+            // not glued above the tree at x=0
+            var col: u16 = @intCast(self.contentCol());
             while (tab_i < self.buffers.items.len) : (tab_i += 1) {
                 const buf = &self.buffers.items[tab_i];
                 const name = if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
@@ -7556,8 +7559,11 @@ const App = struct {
             {
                 var segs = std.ArrayList(vaxis.Segment).empty;
                 try segs.append(a, .{ .text = "╰", .style = border_style });
+                // inner_w - 1 dashes: "╰" takes the left border column and
+                // "╯" must land ON the right border column (ft_width-1) —
+                // inner_w dashes would push it one cell past the edge
                 var cx: u32 = 0;
-                while (cx < inner_w) : (cx += 1) {
+                while (cx < inner_w -| 1) : (cx += 1) {
                     try segs.append(a, .{ .text = "─", .style = border_style });
                 }
                 try segs.append(a, .{ .text = "╯", .style = border_style });
