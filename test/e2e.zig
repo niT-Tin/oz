@@ -7123,8 +7123,8 @@ test "e2e: cc replaces the whole line and enters insert" {
     }
     try std.testing.expect(grid.contains("NORMAL"));
 
-    // jj → last line (no trailing '\n'); cc deletes the whole line and enters
-    // insert, typing "X" replaces it (row 3 becomes "X"). jk exits.
+    // jj → last real line ("ccc"); cc clears its text and enters insert,
+    // typing "X" replaces it (row 3 becomes "X"). jk exits.
     try sess.send("jjccXjk");
     waited = 0;
     while (grid.contains("Xccc") or !rowContains(&grid, 3, "X")) {
@@ -7161,7 +7161,151 @@ test "e2e: cc replaces the whole line and enters insert" {
     const buf = try alloc.alloc(u8, @intCast(size));
     defer alloc.free(buf);
     _ = try f.readPositionalAll(io, buf, 0);
-    try std.testing.expectEqualStrings("aaa\nbbb\nX", buf);
+    // cc keeps the line's newline (vim: change clears the line's TEXT, the
+    // line itself survives) — the saved file ends with '\n' like nvim's
+    // 'fixeol' default
+    try std.testing.expectEqualStrings("aaa\nbbb\nX\n", buf);
+}
+
+test "e2e: yy/dd/p/P linewise register matches nvim (lines below/above, cursor on first non-blank)" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}yank.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "abc\n  bbb\nccc\nddd\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    const Wait = struct {
+        fn until(s: *Session, g: *Grid, needle: []const u8) !bool {
+            var waited: i32 = 0;
+            while (!g.contains(needle)) {
+                const nn = try readAvailable(s.pty.master, s.out[s.used..], 200);
+                if (nn == 0) {
+                    waited += 200;
+                    if (waited >= 5000) return false;
+                    continue;
+                }
+                s.used += nn;
+                g.feed(s.out[s.used - nn .. s.used]);
+            }
+            return true;
+        }
+    };
+
+    try std.testing.expect(try Wait.until(&sess, &grid, "NORMAL"));
+
+    // yy p: the yanked line goes BELOW the cursor line as a whole line
+    // (nvim linewise put), not spliced into the text after the cursor.
+    // Buffer: abc / abc / bbb / ccc / ddd; cursor lands on the pasted line.
+    try sess.send("yyp");
+    try std.testing.expect(try Wait.until(&sess, &grid, "line 2/6"));
+    // rowText keeps the bg-padded trailing spaces — trim before comparing
+    try std.testing.expectEqualStrings("1 abc", std.mem.trim(u8, grid.rowText(1), " "));
+    try std.testing.expectEqualStrings("2 abc", std.mem.trim(u8, grid.rowText(2), " "));
+    try std.testing.expectEqualStrings("1   bbb", std.mem.trim(u8, grid.rowText(3), " "));
+
+    // one u undoes the whole paste (single undo group). The cursor stays at
+    // the change site, so wait for the restored line count, then gg home
+    try sess.send("u");
+    try std.testing.expect(try Wait.until(&sess, &grid, "/5 col"));
+    try sess.send("gg");
+    try std.testing.expect(try Wait.until(&sess, &grid, "line 1/5"));
+
+    // j yy P on the indented line: pasted ABOVE, cursor on the first
+    // non-blank of the pasted line (col 2), like nvim
+    try sess.send("jyyP");
+    try std.testing.expect(try Wait.until(&sess, &grid, "line 2/6 col 2"));
+    try std.testing.expectEqualStrings("2   bbb", std.mem.trim(u8, grid.rowText(2), " "));
+    try std.testing.expectEqualStrings("1   bbb", std.mem.trim(u8, grid.rowText(3), " "));
+
+    // u, then dd p: dd fills the register LINEWISE (vim unnamed register),
+    // p puts the cut line below the next one — abc moves under bbb
+    try sess.send("u");
+    try std.testing.expect(try Wait.until(&sess, &grid, "/5 col"));
+    try sess.send("gg");
+    try std.testing.expect(try Wait.until(&sess, &grid, "line 1/5"));
+    try sess.send("ddp");
+    try std.testing.expect(try Wait.until(&sess, &grid, "line 2/5"));
+    try std.testing.expectEqualStrings("1   bbb", std.mem.trim(u8, grid.rowText(1), " "));
+    try std.testing.expectEqualStrings("2 abc", std.mem.trim(u8, grid.rowText(2), " "));
+    try std.testing.expectEqualStrings("1 ccc", std.mem.trim(u8, grid.rowText(3), " "));
+
+    // save and verify the exact bytes
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+    const f = try std.Io.Dir.cwd().openFile(io, name, .{ .mode = .read_only });
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    try std.testing.expectEqualStrings("  bbb\nabc\nccc\nddd\n", buf);
+}
+
+test "e2e: xp swaps two characters (x fills the charwise register)" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}xp.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "abc\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // xp on "abc": cut 'a' (into the register, charwise) and put it after
+    // 'b' → "bac", cursor on the pasted char (col 1) — vim's char swap
+    try sess.send("xp");
+    waited = 0;
+    while (!grid.contains("bac")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("bac"));
+    try std.testing.expect(grid.contains("col 1"));
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
 test "file tree: Ctrl-w h/l switches focus between sidebar and buffer" {

@@ -236,6 +236,11 @@ const App = struct {
     visual_anchor: ?u32 = null,
     // yank buffer (M0: in-memory; OSC52 system clipboard is a later step)
     yank_buffer: ?[]u8 = null,
+    /// Register type (vim regtype): yy/dd/V{y,d} and linewise operator
+    /// motions yank LINEWISE — p/P then put whole lines below/above the
+    /// cursor line; charwise yanks (yw, vey, …) paste inline after/at the
+    /// cursor. nvim's unnamed register behaves exactly this way.
+    yank_linewise: bool = false,
 
     /// 'r' seen; the next plain key is the replacement character (normal
     /// mode), applied `count` times (vim 3rx). Cleared by execAction when
@@ -1734,6 +1739,7 @@ const App = struct {
                 }
                 if (self.yank_buffer) |b| self.alloc.free(b);
                 self.yank_buffer = try buf.toOwnedSlice(self.alloc);
+                self.yank_linewise = false; // blockwise yank pastes inline (no blockwise put yet)
                 try self.setMsg(try std.fmt.allocPrint(self.alloc, "yanked block {d} bytes", .{self.yank_buffer.?.len}));
             },
             else => {},
@@ -3520,14 +3526,25 @@ const App = struct {
     /// the character under the cursor.
     const SelEnd = enum { exclusive_cursor, inclusive_cursor };
 
-    /// Apply an operator (d/c/y) over a range. `exclusive` trims the end char
-    /// (vim exclusive motions); text objects and selections pass false with an
-    /// already-exact range.
-    fn applyOpRange(self: *App, op: editor.KeyEvent.ActionId, from: u32, to: u32, exclusive: bool) !void {
-        try self.applyOpRangeEx(op, from, to, exclusive, .exclusive_cursor);
+    /// Write [start, end) into the unnamed register (vim: y AND d/c all fill
+    /// it — dd p is cut-paste). `linewise` is the register's type and decides
+    /// how p/P puts the text (whole lines below/above vs inline).
+    fn setRegister(self: *App, start: u32, end: u32, linewise: bool) !void {
+        if (self.yank_buffer) |b| self.alloc.free(b);
+        const buf = try self.alloc.alloc(u8, end - start);
+        self.cur().pt.copyRange(start, buf);
+        self.yank_buffer = buf;
+        self.yank_linewise = linewise;
     }
 
-    fn applyOpRangeEx(self: *App, op: editor.KeyEvent.ActionId, from: u32, to: u32, exclusive: bool, sel: SelEnd) !void {
+    /// Apply an operator (d/c/y) over a range. `exclusive` trims the end char
+    /// (vim exclusive motions); text objects and selections pass false with an
+    /// already-exact range. `linewise` marks the register type (vim regtype).
+    fn applyOpRange(self: *App, op: editor.KeyEvent.ActionId, from: u32, to: u32, exclusive: bool, linewise: bool) !void {
+        try self.applyOpRangeEx(op, from, to, exclusive, .exclusive_cursor, linewise);
+    }
+
+    fn applyOpRangeEx(self: *App, op: editor.KeyEvent.ActionId, from: u32, to: u32, exclusive: bool, sel: SelEnd, linewise: bool) !void {
         const start = @min(from, to);
         var end = @max(from, to);
         if (exclusive and end > start) end -= 1;
@@ -3540,17 +3557,31 @@ const App = struct {
                 self.state.mode = .insert;
                 self.in_insert = true;
             }
+            // yy on an empty line (incl. the phantom EOF line a trailing
+            // newline creates): yanks an empty LINE, so p/P still put an
+            // empty line instead of erroring E353
+            if (op == .yank and linewise) try self.setRegister(start, start, true);
             return;
         }
         switch (op) {
             .delete => {
+                try self.setRegister(start, end, linewise);
                 self.cur().history.beginGroup();
                 try self.cur().history.record(&self.cur().pt, start, end - start, "");
                 self.cur().history.endGroup();
                 self.curCursor().* = start;
+                // deleting the last real line lands on the phantom empty
+                // line a trailing '\n' creates; nvim clamps the cursor to
+                // the last REAL line (dd at EOF, then p/P pastes relative
+                // to it)
+                if (self.cur().pt.len() > 0 and self.curCursor().* >= self.cur().pt.len()) {
+                    const lc = self.cur().pt.lineCount();
+                    self.curCursor().* = self.cur().pt.lineStart(lc -| 2);
+                }
                 self.markDirty();
             },
             .change => {
+                try self.setRegister(start, end, linewise);
                 self.curCursor().* = start;
                 self.cur().history.beginGroup();
                 try self.cur().history.record(&self.cur().pt, start, end - start, "");
@@ -3560,11 +3591,8 @@ const App = struct {
                 self.cur().syntax_revision = std.math.maxInt(u64);
             },
             .yank => {
-                if (self.yank_buffer) |b| self.alloc.free(b);
-                const buf = try self.alloc.alloc(u8, end - start);
-                self.cur().pt.copyRange(start, buf);
-                self.yank_buffer = buf;
-                try self.setMsg(try std.fmt.allocPrint(self.alloc, "yanked {d} bytes", .{buf.len}));
+                try self.setRegister(start, end, linewise);
+                try self.setMsg(try std.fmt.allocPrint(self.alloc, "yanked {d} bytes", .{self.yank_buffer.?.len}));
             },
             else => {},
         }
@@ -5613,15 +5641,18 @@ const App = struct {
             const end_line = @min(start_line + n - 1, self.cur().pt.lineCount() - 1);
             const start = self.cur().pt.lineStart(start_line);
             var end = self.cur().pt.lineStart(end_line) + self.cur().pt.lineLen(end_line);
-            if (end_line + 1 < self.cur().pt.lineCount()) end += 1; // include trailing '\n'
-            try self.applyOpRange(m.op, start, end, false);
+            // dd/yy take the trailing newline (the line is gone from the
+            // buffer); cc keeps it — vim's change clears the line's TEXT and
+            // puts the cursor on the (now empty) line, not on the next one
+            if (m.op != .change and end_line + 1 < self.cur().pt.lineCount()) end += 1;
+            try self.applyOpRange(m.op, start, end, false, true); // whole-line → linewise register
             return;
         }
         // text object (diw / ci( / yaw …): resolve at the cursor; the count
         // follows vim (2ciw = two words, 2i( = second nesting level)
         if (m.text_object) |kind| {
             const rng = editor.TextObject.range(&self.cur().pt, kind, self.curCursor().*, m.count);
-            try self.applyOpRange(m.op, rng.start, rng.end, false);
+            try self.applyOpRange(m.op, rng.start, rng.end, false, false);
             return;
         }
         // visual mode: the operator acts on the selection
@@ -5630,7 +5661,7 @@ const App = struct {
                 if (self.state.mode == .visual_block) {
                     try self.applyBlockOp(m.op);
                 } else {
-                    try self.applyOpRangeEx(m.op, anchor, self.curCursor().*, false, .inclusive_cursor);
+                    try self.applyOpRangeEx(m.op, anchor, self.curCursor().*, false, .inclusive_cursor, self.state.mode == .visual_line);
                 }
             }
             self.exitVisualAfterOp(m.op);
@@ -5654,7 +5685,7 @@ const App = struct {
             const start = self.cur().pt.lineStart(lo);
             var end = self.cur().pt.lineStart(hi) + self.cur().pt.lineLen(hi);
             if (hi + 1 < self.cur().pt.lineCount()) end += 1; // include trailing '\n'
-            try self.applyOpRange(m.op, start, end, false);
+            try self.applyOpRange(m.op, start, end, false, true); // linewise motion → linewise register
             return;
         }
         // normal mode: d/c/y over [cursor, target). vim semantics:
@@ -5665,7 +5696,7 @@ const App = struct {
         // the old unconditional end-=1 that broke dl/dh/d$/de/dw.
         var target_pos = editor.Motion.target(&self.cur().pt, m.motion, m.args, self.curCursor().*, m.count);
         if (m.inclusive and target_pos < self.cur().pt.len()) target_pos += 1;
-        try self.applyOpRange(m.op, self.curCursor().*, target_pos, false);
+        try self.applyOpRange(m.op, self.curCursor().*, target_pos, false, false);
     }
 
     fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !void {
@@ -5866,9 +5897,9 @@ const App = struct {
                             if (end < pt.len()) end += 1; // include the newline
                             // exclusive_cursor: the range already ends exactly
                             // after the last selected line's newline.
-                            try self.applyOpRangeEx(action, start, end, false, .exclusive_cursor);
+                            try self.applyOpRangeEx(action, start, end, false, .exclusive_cursor, true);
                         } else {
-                            try self.applyOpRangeEx(action, anchor, self.curCursor().*, false, .inclusive_cursor);
+                            try self.applyOpRangeEx(action, anchor, self.curCursor().*, false, .inclusive_cursor, false);
                         }
                     }
                     self.exitVisualAfterOp(action);
@@ -5940,8 +5971,20 @@ const App = struct {
                 // x: vim dl — delete `count` characters under the cursor. At
                 // the end of a line the newline is deleted (joining the next
                 // line), like vim; at EOF nothing happens. One undo group.
-                self.cur().history.beginGroup();
+                // The deleted text fills the unnamed register (charwise) —
+                // vim's xp char-swap depends on it. Capture BEFORE deleting:
+                // setRegister reads the live piece table.
+                const c0 = self.curCursor().*;
+                var reg_end = c0;
                 var i: u32 = 0;
+                while (i < @max(count, 1)) : (i += 1) {
+                    if (reg_end >= self.cur().pt.len()) break;
+                    const seq = self.charLenAt(&self.cur().pt, reg_end);
+                    reg_end = @min(reg_end + seq, self.cur().pt.len());
+                }
+                if (reg_end > c0) try self.setRegister(c0, reg_end, false);
+                self.cur().history.beginGroup();
+                i = 0;
                 while (i < @max(count, 1)) : (i += 1) {
                     const c = self.curCursor().*;
                     if (c >= self.cur().pt.len()) break;
@@ -5955,9 +5998,20 @@ const App = struct {
                 self.markDirty();
             },
             .delete_char_before => {
-                // X: vim dh — delete `count` chars before the cursor
-                self.cur().history.beginGroup();
+                // X: vim dh — delete `count` chars before the cursor (the
+                // deleted text fills the unnamed register, charwise; capture
+                // BEFORE deleting — setRegister reads the live piece table)
+                const c0 = self.curCursor().*;
+                var reg_start = c0;
                 var i: u32 = 0;
+                while (i < @max(count, 1)) : (i += 1) {
+                    if (reg_start == 0) break;
+                    reg_start -= 1;
+                    while (reg_start > 0 and (self.cur().pt.byteAt(reg_start) & 0xC0) == 0x80) reg_start -= 1;
+                }
+                if (reg_start < c0) try self.setRegister(reg_start, c0, false);
+                self.cur().history.beginGroup();
+                i = 0;
                 while (i < @max(count, 1)) : (i += 1) {
                     const c = self.curCursor().*;
                     if (c == 0) break;
@@ -5974,13 +6028,15 @@ const App = struct {
             .delete_to_eol => {
                 // D: delete to end of line (d$), keeping the newline so the
                 // line is emptied, not removed. vim count: `count` lines
-                // from the cursor (3D = delete to EOL on three lines).
+                // from the cursor (3D = delete to EOL on three lines). The
+                // deleted text fills the unnamed register (charwise).
                 const c = self.curCursor().*;
                 const pt = &self.cur().pt;
                 const line = pt.lineOf(c);
                 const end_line = @min(line + @max(count, 1) - 1, pt.lineCount() - 1);
                 const end = pt.lineStart(end_line) + pt.lineLen(end_line);
                 if (end > c) {
+                    try self.setRegister(c, end, false);
                     self.cur().history.beginGroup();
                     try self.cur().history.record(pt, c, end - c, "");
                     self.cur().history.endGroup();
@@ -6357,34 +6413,103 @@ const App = struct {
         self.markDirty();
     }
 
-    /// p / P: insert the yank buffer at the cursor (M1 simplification: p
-    /// inserts after the current char when not at line end, P at the cursor).
-    /// `count` pastes the buffer that many times (vim 5p), one undo group,
-    /// cursor after the last paste.
+    /// p / P: put the unnamed register exactly like nvim. A LINEWISE register
+    /// (yy, dd, V{y,d}, yG, …) puts whole lines below (p) / above (P) the
+    /// cursor line and leaves the cursor on the first non-blank of the first
+    /// pasted line. A charwise register (yw, vey, …) pastes inline after (p)
+    /// / at (P) the cursor and leaves the cursor on the last pasted char.
+    /// `count` pastes that many times (vim 5p), one undo group.
     fn pasteBuffer(self: *App, before: bool, count: u32) !void {
         const buf = self.yank_buffer orelse {
             try self.setMsg(try self.alloc.dupe(u8, "E353: Nothing in register"));
             return;
         };
-        var pos = self.curCursor().*;
-        if (!before) {
-            // p: after the character under the cursor (or at line end)
-            const line = self.cur().pt.lineOf(self.curCursor().*);
-            const line_end = self.cur().pt.lineStart(line) + self.cur().pt.lineLen(line);
-            if (self.curCursor().* < line_end) {
-                var i = self.curCursor().* + 1;
-                while (i < line_end and (self.cur().pt.byteAt(i) & 0xC0) == 0x80) : (i += 1) {}
-                pos = i;
+        if (buf.len == 0 and !self.yank_linewise) return;
+        const pt = &self.cur().pt;
+        const n = @max(count, 1);
+        if (self.yank_linewise) {
+            // normalize: the register must end with '\n' so every copy lands
+            // as complete lines (yy on a final line without a trailing
+            // newline yanks none; yy on an empty line yanks zero bytes —
+            // both paste as one empty line).
+            var norm = try self.alloc.alloc(u8, buf.len + 1);
+            defer self.alloc.free(norm);
+            @memcpy(norm[0..buf.len], buf);
+            const text: []const u8 = if (buf.len == 0) blk: {
+                norm[0] = '\n';
+                break :blk norm[0..1];
+            } else if (buf[buf.len - 1] == '\n') norm[0..buf.len] else blk: {
+                norm[buf.len] = '\n';
+                break :blk norm;
+            };
+            const line = pt.lineOf(self.curCursor().*);
+            self.cur().history.beginGroup();
+            var content_start: u32 = undefined; // first pasted byte (for the cursor)
+            if (before) {
+                var pos = pt.lineStart(line);
+                content_start = pos;
+                var i: u32 = 0;
+                while (i < n) : (i += 1) {
+                    try self.cur().history.record(pt, pos, 0, text);
+                    pos += @intCast(text.len);
+                }
+            } else if (line + 1 < pt.lineCount()) {
+                var pos = pt.lineStart(line + 1);
+                content_start = pos;
+                var i: u32 = 0;
+                while (i < n) : (i += 1) {
+                    try self.cur().history.record(pt, pos, 0, text);
+                    pos += @intCast(text.len);
+                }
+            } else {
+                // cursor on the last line: terminate it first when the buffer
+                // doesn't end with a newline, then the copies follow as
+                // whole lines
+                var pos = pt.len();
+                if (pos > 0 and pt.byteAt(pos - 1) != '\n') {
+                    try self.cur().history.record(pt, pos, 0, "\n");
+                    pos += 1;
+                }
+                content_start = pos;
+                var i: u32 = 0;
+                while (i < n) : (i += 1) {
+                    try self.cur().history.record(pt, pos, 0, text);
+                    pos += @intCast(text.len);
+                }
             }
+            self.cur().history.endGroup();
+            // cursor on the first non-blank of the first pasted line (an
+            // all-blank line leaves it at the line start)
+            var c = content_start;
+            while (c < pt.len() and (pt.byteAt(c) == ' ' or pt.byteAt(c) == '\t')) c += 1;
+            if (c < pt.len() and pt.byteAt(c) == '\n') c = content_start;
+            self.curCursor().* = c;
+        } else {
+            var pos = self.curCursor().*;
+            if (!before) {
+                // p: after the character under the cursor (or at line end)
+                const line = pt.lineOf(self.curCursor().*);
+                const line_end = pt.lineStart(line) + pt.lineLen(line);
+                if (self.curCursor().* < line_end) {
+                    var i = self.curCursor().* + 1;
+                    while (i < line_end and (pt.byteAt(i) & 0xC0) == 0x80) : (i += 1) {}
+                    pos = i;
+                }
+            }
+            self.cur().history.beginGroup();
+            var i: u32 = 0;
+            while (i < n) : (i += 1) {
+                try self.cur().history.record(pt, pos, 0, buf);
+                pos += @as(u32, @intCast(buf.len));
+            }
+            self.cur().history.endGroup();
+            // nvim: the cursor lands ON the last pasted character (not past
+            // it) — back up over UTF-8 continuation bytes
+            var c = pos - 1;
+            const paste_begin = pos - @as(u32, @intCast(buf.len));
+            while (c > paste_begin and (pt.byteAt(c) & 0xC0) == 0x80) c -= 1;
+            self.curCursor().* = c;
         }
-        self.cur().history.beginGroup();
-        var i: u32 = 0;
-        while (i < @max(count, 1)) : (i += 1) {
-            try self.cur().history.record(&self.cur().pt, pos, 0, buf);
-            pos += @as(u32, @intCast(buf.len));
-        }
-        self.cur().history.endGroup();
-        self.curCursor().* = pos;
         // markDirty is the single entry point for dirty flag / edit_seq /
         // LSP didChange / inlay invalidation — paste must go through it or
         // the server keeps an outdated document and hints stay stale.
