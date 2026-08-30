@@ -678,12 +678,15 @@ pub const Highlighter = struct {
     }
 
     /// Deepest multi-line "code block" node containing `byte`, as a byte
-    /// range. Starts at the root and drills down: while the child containing
-    /// `byte` is a block-like node that spans more than one line, record it
-    /// as the current scope and descend into it. Stops when no child
-    /// contains `byte`, the containing child is not block-like, or it is a
-    /// single-line node (variable_declaration, expression_statement, … —
-    /// those are not blocks, and highlighting one line reads as noise).
+    /// range. Starts at the root and drills down the child chain containing
+    /// `byte`; non-block wrapper nodes (call_expression, arguments,
+    /// assignment_expression, initializer_list, …) are TRANSPARENT — the
+    /// drill descends through them, and every block-like multi-line node on
+    /// the path replaces the scope. The scope is thus the DEEPEST block-like
+    /// ancestor: inside `b.createModule(.{ … })` the inner initializer wins
+    /// over the outer call, not the enclosing variable_declaration.
+    /// Single-line nodes (variable_declaration, expression_statement, …)
+    /// never become a scope — highlighting one line reads as noise.
     /// Returns null when there is no tree, the file is empty, or the cursor
     /// sits in top-level code with no enclosing block. Cost is O(tree depth
     /// × children per level) — never O(file).
@@ -708,11 +711,13 @@ pub const Highlighter = struct {
                 }
             }
             const child = next orelse break;
-            if (!isBlockNode(child)) break;
-            const cs = child.getStartByte();
-            const ce = child.getEndByte();
-            if (ce > cs and ce <= text.len and std.mem.indexOfScalar(u8, text[cs..ce], '\n') == null) break;
-            scope = child;
+            if (isBlockNode(child)) {
+                const cs = child.getStartByte();
+                const ce = child.getEndByte();
+                if (ce > cs and ce <= text.len and std.mem.indexOfScalar(u8, text[cs..ce], '\n') != null) {
+                    scope = child;
+                }
+            }
             current = child;
         }
         const s = scope orelse return null;
@@ -727,11 +732,18 @@ pub const Highlighter = struct {
 /// Loose "is this a code block?" check by node-type substring (zig names fn
 /// bodies `block`, fns `function_declaration`, containers `struct_declaration`
 /// etc. — lenient substring matching keeps this language-agnostic).
+/// Control-flow EXPRESSIONS need their own needles: zig's `switch_expression`
+/// and rust's `if_expression`/`match_expression`/`loop_expression` are not
+/// "*_statement", so without them the drill-down stops at the enclosing fn
+/// and the inner scope never lights up. `object`/`array` cover JSON/JS
+/// literals; the multi-line check in scopeAt filters the single-line noise
+/// (zig `array_type`, rust `match_arm`, …).
 fn isBlockNode(node: treez.Node) bool {
     const ty = node.getType();
     const needles = [_][]const u8{
-        "block", "function", "fn_", "declaration", "struct", "enum",
+        "block", "func", "fn_", "declaration", "struct", "enum",
         "union", "class", "interface", "impl", "module", "body", "statement",
+        "switch", "match", "loop", "if_", "for_", "while_", "object", "array",
     };
     for (needles) |nd| {
         if (std.mem.indexOf(u8, ty, nd) != null) return true;
@@ -895,6 +907,40 @@ test "scopeAt: empty/no-tree and top-level code return null, fn returns its bloc
     try std.testing.expect(fn_scope.start_byte == 0);
     const src2_rbrace = std.mem.indexOf(u8, src2, "}").?;
     try std.testing.expect(fn_scope.end_byte > src2_rbrace); // covers the closing brace
+}
+
+test "scopeAt: zig switch/if-expression bodies are scopes (control-flow expressions)" {
+    const alloc = std.testing.allocator;
+    // switch_expression / if_expression are not "*_statement" — they used to
+    // stop the drill-down at the fn block, so entering the inner scope lit
+    // the OUTER fn guide instead of the switch's own.
+    const src = "fn f() void {\n" ++
+        "    switch (v) {\n" ++
+        "        .a => one(),\n" ++
+        "        .b => two(),\n" ++
+        "    }\n" ++
+        "    const y = if (c) blk: {\n" ++
+        "        break :blk 1;\n" ++
+        "    } else 2;\n" ++
+        "}\n";
+    var hl = try Highlighter.init(alloc, "zig");
+    defer hl.deinit();
+    try hl.reparse(src);
+
+    // cursor on ".a => one(),": the deepest multi-line scope is the switch —
+    // its starting line is "    switch (v) {" (indent 4), NOT the fn line
+    const in_switch = std.mem.indexOf(u8, src, ".a =>").?;
+    const sw_scope = hl.scopeAt(@intCast(in_switch)).?;
+    const switch_kw = std.mem.indexOf(u8, src, "switch").?;
+    try std.testing.expect(sw_scope.start_byte <= switch_kw + 4); // starts at/around the switch line
+    try std.testing.expectEqual(@as(u32, 4), sw_scope.indent_col);
+
+    // cursor on "break :blk 1;": the labeled block_expression is the scope
+    // (its own indent-8 line), not the fn body
+    const in_blk = std.mem.indexOf(u8, src, "break :blk").?;
+    const blk_scope = hl.scopeAt(@intCast(in_blk)).?;
+    try std.testing.expect(blk_scope.indent_col >= 4); // deeper than the fn
+    try std.testing.expect(blk_scope.start_byte > switch_kw); // not the fn
 }
 
 test "languageFor: filetype to grammar" {
@@ -1218,4 +1264,46 @@ test "repro: o-then-type-j keeps the line below highlighted" {
     if (k0 != Style.keyword or k1 != Style.keyword) dumpSpans(after_j, spans.items);
     try std.testing.expectEqual(Style.keyword, k0);
     try std.testing.expectEqual(Style.keyword, k1);
+}
+
+test "scopeAt: nested call/initializer wrappers are transparent (build.zig case)" {
+    const alloc = std.testing.allocator;
+    // The real build.zig pattern: cursor inside b.createModule(.{ … }) or the
+    // .imports = &.{ … } list. The ancestor chain runs through transparent
+    // wrappers (call_expression → arguments → initializer_list →
+    // assignment_expression → …) — the scope must be the DEEPEST block-like
+    // node, not the outer variable_declaration / call.
+    const src =
+        \\pub fn build(b: *std.Build) void {
+        \\    const exe = b.addExecutable(.{
+        \\        .name = "oz",
+        \\        .root_module = b.createModule(.{
+        \\            .root_source_file = b.path("src/main.zig"),
+        \\            .imports = &.{
+        \\                .{ .name = "vaxis", .module = vaxis_mod },
+        \\            },
+        \\        }),
+        \\    });
+        \\}
+        \\
+    ;
+    var hl = try Highlighter.init(alloc, "zig");
+    defer hl.deinit();
+    try hl.reparse(src);
+
+    // cursor on ".root_source_file": the createModule(.{ … }) initializer is
+    // the scope; it starts on the ".root_module = …" line (indent 8)
+    const in_mod = std.mem.indexOf(u8, src, "root_source_file").?;
+    const sc1 = hl.scopeAt(@intCast(in_mod)).?;
+    try std.testing.expectEqual(@as(u32, 8), sc1.indent_col);
+    try std.testing.expect(sc1.start_byte <= in_mod and in_mod < sc1.end_byte);
+    // …and it is DEEPER than the outer addExecutable(.{ … }) initializer
+    const add_exec = std.mem.indexOf(u8, src, "addExecutable").?;
+    try std.testing.expect(sc1.start_byte > add_exec);
+
+    // cursor on ".{ .name": the &.{ … } imports list is the scope; it starts
+    // on the ".imports = …" line (indent 12)
+    const in_imports = std.mem.indexOf(u8, src, ".{ .name").?;
+    const sc2 = hl.scopeAt(@intCast(in_imports)).?;
+    try std.testing.expectEqual(@as(u32, 12), sc2.indent_col);
 }
