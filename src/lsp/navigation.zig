@@ -43,7 +43,23 @@ pub fn freeTextDocPositionParams(alloc: std.mem.Allocator, v: *std.json.Value) v
     td.object.deinit(alloc);
     var pos = params.get("position").?;
     pos.object.deinit(alloc);
+    // optional ReferenceParams context (buildReferencesParams)
+    if (params.getPtr("context")) |ctx| ctx.object.deinit(alloc);
     params.deinit(alloc);
+}
+
+/// ReferenceParams: TextDocumentPositionParams + the REQUIRED `context`
+/// (`includeDeclaration`). zls 0.16 treats a request missing `context` as
+/// unparseable and EXITS — taking the whole LSP session (inlay hints,
+/// diagnostics, nav) down with it.
+pub fn buildReferencesParams(alloc: std.mem.Allocator, uri: []const u8, line: u32, character: u32) !std.json.Value {
+    var v = try buildTextDocPositionParams(alloc, uri, line, character);
+    errdefer freeTextDocPositionParams(alloc, &v);
+    var ctx = try std.json.ObjectMap.init(alloc, &.{}, &.{});
+    errdefer ctx.deinit(alloc);
+    try ctx.put(alloc, "includeDeclaration", .{ .bool = true });
+    try v.object.put(alloc, "context", .{ .object = ctx });
+    return v;
 }
 
 /// Extract the hover text from a hover response (`contents` may be a string,
@@ -311,6 +327,18 @@ test "navigation: textDocument/position params round-trip" {
     const pos = v.object.get("position").?;
     try std.testing.expectEqual(@as(i64, 3), pos.object.get("line").?.integer);
     try std.testing.expectEqual(@as(i64, 7), pos.object.get("character").?.integer);
+}
+
+test "navigation: references params carry the mandatory context" {
+    const alloc = std.testing.allocator;
+    // ReferenceParams.context is REQUIRED by the spec; zls 0.16 exits on its
+    // absence, killing the whole session.
+    var v = try buildReferencesParams(alloc, "file:///a.zig", 3, 7);
+    defer freeTextDocPositionParams(alloc, &v);
+    const ctx = v.object.get("context").?;
+    try std.testing.expect(ctx.object.get("includeDeclaration").?.bool);
+    const pos = v.object.get("position").?;
+    try std.testing.expectEqual(@as(i64, 3), pos.object.get("line").?.integer);
 }
 
 test "navigation: hover text from markdown/string/array" {

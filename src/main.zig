@@ -5244,7 +5244,12 @@ const App = struct {
         defer self.alloc.free(uri);
         const line = self.cur().pt.lineOf(self.curCursor().*);
         const col = self.utf16Column(line, self.curCursor().* - self.cur().pt.lineStart(line));
-        var params = lsp_nav.buildTextDocPositionParams(self.alloc, uri, line, col) catch return;
+        // references needs ReferenceParams (mandatory `context`) — a bare
+        // position params is a ParseError for strict servers (zls exits!)
+        var params = if (action == .references)
+            lsp_nav.buildReferencesParams(self.alloc, uri, line, col) catch return
+        else
+            lsp_nav.buildTextDocPositionParams(self.alloc, uri, line, col) catch return;
         defer lsp_nav.freeTextDocPositionParams(self.alloc, &params);
         client.request(method, params, &self.nav_slot) catch return;
         self.nav_action = action;
