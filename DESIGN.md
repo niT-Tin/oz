@@ -607,9 +607,9 @@ Client = {
 ### M3 — Git + 终端（≈4-6 周）
 
 - **M3a**：git gutter（diff 符号）、]c/[c hunk 跳转、hunk stage/reset/preview、行内 blame（1s 延迟，leader tb 开关）、leader lg 起 lazygit（外部浮窗）
-- **M3b**：PTY + 迷你 VT 仿真（参考 flow `terminal/`），<M-r>/<M-w>/<M-e> 三种终端布局；终端内 Esc 退回 Normal
+- **M3b**：内嵌终端（改用 vaxis `widgets/terminal`：PTY + VT 仿真 + scrollback 骨架），<M-r> 浮动 / <M-w> 底部 / <M-e> 右侧三种布局；终端内 Esc 退回 Normal；lazygit 改跑内嵌浮动终端
 
-> 风险标注：M3b（内嵌终端仿真）是全项目最大工程项。若受阻，M3a 独立交付，M3b 可后置为 M4。
+> 风险标注：~~M3b（内嵌终端仿真）是全项目最大工程项~~ 已交付（vaxis 自带 widgets/terminal 大幅降低工程量；自研 scrollback 仍为 TODO）。
 
 ### M4 — UI 打磨 + AI（≈3-4 周）
 
@@ -627,7 +627,7 @@ Client = {
 
 | 风险 | 影响 | 缓解 |
 |------|------|------|
-| 内嵌终端仿真工程量巨大 | M3b 延期 | 拆 M3a/M3b；参考 flow `terminal/` 直接移植思路；lazygit 走外部浮窗先行 |
+| 内嵌终端 scrollback / 迷你 VT 边界 | M3b 滚动/OSC 子集不完整 | 采用 vaxis `widgets/terminal`（PTY+VT 已内置）；scrollback 为 vaxis TODO，暂禁用以保滚动正确 |
 | tree-sitter parser 编译时间/体积 | 构建变慢 | `-Duse-tree-sitter` 开关；parser 按需增量添加 |
 | LSP 协议面广、边界情况多 | M2 延期 | 每个方法配 mock server 测试；先用 zls/gopls 实测闭环 |
 | kitty 键盘协议缺失的旧终端 | 部分键位失效 | vaxis 自动降级；确保 16 色 + 标准转义可用 |

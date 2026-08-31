@@ -11688,3 +11688,227 @@ test "git: blame ghost stays inside its pane in a split" {
     const exit_code = try sess.commandAndWaitExit(":qa\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
+
+test "terminal: <M-r> float opens, keys forward, Esc returns, <M-w>/<M-e> switch, same key closes" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    // temp file with no "$" in it, so the shell prompt is the only "$" on
+    // screen while the embedded terminal is open. The terminal spawns with
+    // cwd = the buffer's directory (/tmp).
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}term.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "alpha\nbeta\ngamma\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+
+    // first (row, col) where `needle` starts, for layout-position checks
+    const findNeedle = struct {
+        fn find(g: *Grid, needle: []const u8) ?struct { row: usize, col: usize } {
+            var r: usize = 0;
+            while (r < g.rows) : (r += 1) {
+                const text = g.rowText(r);
+                if (std.mem.indexOf(u8, text, needle)) |c| return .{ .row = r, .col = c };
+            }
+            return null;
+        }
+    }.find;
+
+    const Wait = struct {
+        fn until(s: *Session, g: *Grid, needle: []const u8) !bool {
+            var waited: i32 = 0;
+            while (!g.contains(needle)) {
+                const nn = try readAvailable(s.pty.master, s.out[s.used..], 200);
+                if (nn == 0) {
+                    waited += 200;
+                    if (waited >= 8000) return false;
+                    continue;
+                }
+                s.used += nn;
+                g.feed(s.out[s.used - nn .. s.used]);
+            }
+            return true;
+        }
+        fn untilGone(s: *Session, g: *Grid, needle: []const u8) !bool {
+            var waited: i32 = 0;
+            while (g.contains(needle)) {
+                const nn = try readAvailable(s.pty.master, s.out[s.used..], 200);
+                if (nn == 0) {
+                    waited += 200;
+                    if (waited >= 8000) return false;
+                    continue;
+                }
+                s.used += nn;
+                g.feed(s.out[s.used - nn .. s.used]);
+            }
+            return true;
+        }
+        /// Poll (reading the pty every round) until `needle`'s first
+        /// occurrence satisfies `pred`. A bare until() would match a stale
+        /// "$" left in the grid by the PREVIOUS layout — the grid only
+        /// advances when this loop reads, so position-aware waits are
+        /// required across layout switches.
+        fn untilWhere(s: *Session, g: *Grid, needle: []const u8, pred: fn (usize, usize) bool) !bool {
+            var waited: i32 = 0;
+            while (true) {
+                if (findNeedle(g, needle)) |p| {
+                    if (pred(p.row, p.col)) return true;
+                }
+                const nn = try readAvailable(s.pty.master, s.out[s.used..], 200);
+                if (nn == 0) {
+                    waited += 200;
+                    if (waited >= 8000) return false;
+                    continue;
+                }
+                s.used += nn;
+                g.feed(s.out[s.used - nn .. s.used]);
+            }
+            return true;
+        }
+    };
+
+    try std.testing.expect(try Wait.until(&sess, &grid, "NORMAL"));
+
+    // <M-r> (ESC r) opens the FLOATING terminal: $SHELL is unset in the
+    // test env → /bin/sh (bash here, prompt "sh-5.3$ "). The shell takes a
+    // moment to start, so just poll for the prompt.
+    try sess.send("\x1br");
+    try std.testing.expect(try Wait.until(&sess, &grid, "$"));
+
+    // while the terminal is focused every key is forwarded to the shell:
+    // it echoes the command line and prints the output
+    try sess.send("echo TERM_E2E_OK\r");
+    try std.testing.expect(try Wait.until(&sess, &grid, "TERM_E2E_OK"));
+
+    // Esc returns to Normal: the editor must receive keys again. A lone Esc
+    // is ambiguous if coalesced with the next byte in one pty read (ESC+i
+    // would parse as Alt+i), so let oz process it alone before sending "ggi".
+    try sess.send("\x1b");
+    std.Io.sleep(io, .fromMilliseconds(250), .real) catch {};
+    try sess.send("ggi");
+    try std.testing.expect(try Wait.until(&sess, &grid, "INSERT"));
+
+    // Esc leaves insert mode again — the wait READS until the status bar no
+    // longer shows INSERT, which also proves oz processed the Esc and
+    // consumed its render before the next key write.
+    try sess.send("\x1b");
+    try std.testing.expect(try Wait.untilGone(&sess, &grid, "INSERT"));
+
+    // <M-w> switches the SAME session to the bottom strip: the resize clears
+    // the terminal screen but bash redraws its prompt — the session survives,
+    // and the prompt now sits in the bottom region (bottom strip of the
+    // 24-row screen starts at row 15). Wait until the "$" actually MOVES
+    // there (a stale "$" from the floating layout is still in the grid).
+    try sess.send("\x1bw");
+    try std.testing.expect(try Wait.untilWhere(&sess, &grid, "$", struct {
+        fn pred(row: usize, col: usize) bool {
+            _ = col;
+            return row >= 14;
+        }
+    }.pred));
+
+    // <M-e> switches to the right strip (40% width → cols 48..79): the
+    // prompt is still there, now past column 40
+    try sess.send("\x1be");
+    try std.testing.expect(try Wait.untilWhere(&sess, &grid, "$", struct {
+        fn pred(row: usize, col: usize) bool {
+            _ = row;
+            return col >= 40;
+        }
+    }.pred));
+
+    // <M-r> floats the same session again (centered overlay, neither strip)
+    try sess.send("\x1br");
+    try std.testing.expect(try Wait.untilWhere(&sess, &grid, "$", struct {
+        fn pred(row: usize, col: usize) bool {
+            return row < 14 and col < 40;
+        }
+    }.pred));
+
+    // <M-r> again closes the terminal: the prompt disappears from the grid.
+    //
+    // KNOWN ISSUE: this step currently FAILS because oz's terminal teardown
+    // is broken — see the test's failure dump. Closing a live terminal
+    // deadlocks oz (4/5 runs, vaxis handleSigChild blocked on global_vt_mutex
+    // inside the interrupted main thread / iterating the deinit'd global_vts
+    // map) or aborts it (1/5 runs, "incorrect alignment" panic in
+    // Command.zig:111). The same-key close therefore never completes.
+    try sess.send("\x1br");
+    const closed = try Wait.untilGone(&sess, &grid, "$");
+    if (!closed) {
+        std.debug.print("terminal did not close after second <M-r>:\n", .{});
+        grid.dump();
+        if (try sess.tryWaitExit()) |code| {
+            std.debug.print("oz died with code {d} (SIGABRT from the vaxis SIGCHLD handler)\n", .{code});
+        } else {
+            std.debug.print("oz still running (deadlocked in vaxis's handleSigChild)\n", .{});
+        }
+    }
+    try std.testing.expect(closed);
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "terminal: :q! quits cleanly while the terminal is still open" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}termq.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "alpha\nbeta\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+
+    const Wait = struct {
+        fn until(s: *Session, g: *Grid, needle: []const u8) !bool {
+            var waited: i32 = 0;
+            while (!g.contains(needle)) {
+                const nn = try readAvailable(s.pty.master, s.out[s.used..], 200);
+                if (nn == 0) {
+                    waited += 200;
+                    if (waited >= 8000) return false;
+                    continue;
+                }
+                s.used += nn;
+                g.feed(s.out[s.used - nn .. s.used]);
+            }
+            return true;
+        }
+    };
+
+    try std.testing.expect(try Wait.until(&sess, &grid, "NORMAL"));
+
+    // open the floating terminal, then quit WITHOUT closing it: teardown
+    // must join the reader thread and reap the child without deadlocking
+    // (the vaxis SIGCHLD handler vs global_vts map race)
+    try sess.send("\x1br");
+    try std.testing.expect(try Wait.until(&sess, &grid, "$"));
+    try sess.send("\x1b"); // Esc back to Normal
+    std.Io.sleep(io, .fromMilliseconds(250), .real) catch {};
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}

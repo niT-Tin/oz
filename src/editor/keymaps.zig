@@ -95,6 +95,10 @@ pub const normal: KeyMap = &.{
     act(.{ .codepoint = 'n', .mods = .{ .ctrl = true } }, .mc_add),
     act(.{ .codepoint = 'a', .mods = .{ .ctrl = true } }, .increment),
     act(.{ .codepoint = 'x', .mods = .{ .ctrl = true } }, .decrement),
+    // M3b embedded terminal layouts (<M-r> float, <M-w> bottom, <M-e> right)
+    act(.{ .codepoint = 'r', .mods = .{ .alt = true } }, .term_float),
+    act(.{ .codepoint = 'w', .mods = .{ .alt = true } }, .term_bottom),
+    act(.{ .codepoint = 'e', .mods = .{ .alt = true } }, .term_right),
 };
 
 /// Insert mode keymap (M0 minimal: everything not bound is reported back to

@@ -11,9 +11,62 @@ const std = @import("std");
 // The test root imports each module file directly so its `test` blocks are
 // collected; refAllDecls forces analysis of every public decl.
 
+/// Overwrite a vendored dependency file with the patched copy from
+/// patches/ when they differ. zig-pkg/ is a gitignored dependency cache
+/// (re-fetched on fresh checkouts), so the vaxis terminal-widget fixes
+/// (Zig 0.16 ioctl constants, SIGCHLD map lifecycle, copyTo scrollback
+/// bounds, non-blocking event pushes, teardown drain) must be re-applied
+/// on every build. Idempotent: an already-patched tree is left alone.
+fn applyVaxisPatch(b: *std.Build) void {
+    const fixes = [_]struct { target: []const u8, patch: []const u8 }{
+        .{
+            .target = "zig-pkg/vaxis-0.6.0-BWNV_ALfCQCcOilT8JtOaYa4gzMl_9oApKk0HfxNFo5Z/src/widgets/terminal/Pty.zig",
+            .patch = "patches/vaxis-Pty.zig",
+        },
+        .{
+            .target = "zig-pkg/vaxis-0.6.0-BWNV_ALfCQCcOilT8JtOaYa4gzMl_9oApKk0HfxNFo5Z/src/widgets/terminal/Command.zig",
+            .patch = "patches/vaxis-Command.zig",
+        },
+        .{
+            .target = "zig-pkg/vaxis-0.6.0-BWNV_ALfCQCcOilT8JtOaYa4gzMl_9oApKk0HfxNFo5Z/src/widgets/terminal/Screen.zig",
+            .patch = "patches/vaxis-Screen.zig",
+        },
+        .{
+            .target = "zig-pkg/vaxis-0.6.0-BWNV_ALfCQCcOilT8JtOaYa4gzMl_9oApKk0HfxNFo5Z/src/widgets/terminal/Terminal.zig",
+            .patch = "patches/vaxis-Terminal.zig",
+        },
+    };
+    const io = b.graph.io;
+    const dir = std.Io.Dir.cwd();
+    for (fixes) |fix| {
+        const target_path = b.pathFromRoot(fix.target);
+        const patch_path = b.pathFromRoot(fix.patch);
+        const patched = dir.readFileAlloc(io, patch_path, b.allocator, @enumFromInt(1 << 20)) catch |e| {
+            std.debug.print("oz: cannot read patch {s}: {s}\n", .{ fix.patch, @errorName(e) });
+            std.process.exit(1);
+        };
+        defer b.allocator.free(patched);
+        const current = dir.readFileAlloc(io, target_path, b.allocator, @enumFromInt(1 << 20)) catch {
+            // target missing (dependency not fetched yet — the build will
+            // fail later with a clearer error); nothing to patch
+            continue;
+        };
+        defer b.allocator.free(current);
+        if (!std.mem.eql(u8, current, patched)) {
+            dir.writeFile(io, .{ .sub_path = target_path, .data = patched }) catch |e| {
+                std.debug.print("oz: cannot apply {s} to {s}: {s}\n", .{ fix.patch, fix.target, @errorName(e) });
+                std.process.exit(1);
+            };
+            std.debug.print("oz: applied {s} -> {s}\n", .{ fix.patch, fix.target });
+        }
+    }
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // re-apply the vendored vaxis terminal-widget fixes before compiling
+    applyVaxisPatch(b);
 
     // ---- dependencies ----
     const vaxis_dep = b.dependency("vaxis", .{
@@ -30,6 +83,16 @@ pub fn build(b: *std.Build) void {
     });
     const treez_mod = ts_dep.module("treez");
 
+    // embedded terminal (PTY + VT emulation via vaxis widgets/terminal)
+    const term_mod = b.createModule(.{
+        .root_source_file = b.path("src/term.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vaxis", .module = vaxis_mod },
+        },
+    });
+
     // ---- executable ----
     const exe = b.addExecutable(.{
         .name = "oz",
@@ -40,6 +103,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "vaxis", .module = vaxis_mod },
                 .{ .name = "treez", .module = treez_mod },
+                .{ .name = "term", .module = term_mod },
             },
         }),
     });
@@ -75,6 +139,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "vaxis", .module = vaxis_mod },
                 .{ .name = "treez", .module = treez_mod },
+                .{ .name = "term", .module = term_mod },
             },
         }),
     });
