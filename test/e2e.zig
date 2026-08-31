@@ -684,6 +684,23 @@ const Grid = struct {
         return true;
     }
 
+    /// Byte offset into rowText(r) where column `c` starts. Cells hold
+    /// variable-width UTF-8 glyphs, so a byte-level slice of rowText can
+    /// split a glyph in half; slicing at this offset always lands on a cell
+    /// boundary.
+    fn rowByteOf(self: *Grid, r: usize, c: usize) usize {
+        const base = r * self.cols * 4;
+        var off: usize = 0;
+        var col: usize = 0;
+        while (col < c and col < self.cols) : (col += 1) {
+            const slot = self.buf[base + col * 4 ..][0..4];
+            var k: usize = 0;
+            while (k < 4 and slot[k] != 0) : (k += 1) {}
+            off += k;
+        }
+        return off;
+    }
+
     fn dump(self: *Grid) void {
         var r: usize = 0;
         while (r < self.rows) : (r += 1) {
@@ -7988,6 +8005,52 @@ test "insert: typing 'j' at end of a line keeps the next line's first word color
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+/// Poll until row 0's split tab bar shows every needle of `left` in the
+/// left zone and every needle of `right` in the right zone, each exactly
+/// once and never in the OTHER zone (the split tab bar owns each tab: a
+/// buffer's tab appears once, in the pane that last showed it). An empty
+/// slice asserts nothing about that zone.
+fn waitTabs(sess: *Session, grid: *Grid, left: []const []const u8, right: []const []const u8) !bool {
+    var w: i32 = 0;
+    while (true) {
+        const r0 = grid.rowText(0);
+        // split at the CELL boundary (glyphs are multi-byte; a byte-40 cut
+        // would tear a tab label in half)
+        const split = grid.rowByteOf(0, 40);
+        const lz = if (split < r0.len) r0[0..split] else r0;
+        const rz = if (split < r0.len) r0[split..] else "";
+        var ok = true;
+        for (left) |n| {
+            if (std.mem.indexOf(u8, lz, n) == null or std.mem.indexOf(u8, rz, n) != null) ok = false;
+        }
+        for (right) |n| {
+            if (std.mem.indexOf(u8, rz, n) == null or std.mem.indexOf(u8, lz, n) != null) ok = false;
+        }
+        if (ok) return true;
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            w += 200;
+            if (w >= 5000) return false;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+}
+
+/// Count occurrences of `needle` in grid row `r` ("appears exactly once"
+/// assertions for the single-window tab bar).
+fn countInRow(g: *Grid, r: usize, needle: []const u8) usize {
+    const row = g.rowText(r);
+    var n: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, row, pos, needle)) |p| {
+        n += 1;
+        pos = p + needle.len;
+    }
+    return n;
+}
+
 test "windows: :vs splits side-by-side; Ctrl-w l/h switch; :q closes one; :qa quits" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -8158,10 +8221,11 @@ test "windows: :sp splits stacked; each window scrolls independently" {
     }
     try std.testing.expect(grid.contains("NORMAL"));
 
-    // :sp — horizontal split: the top window shows "topline" on row 1; the
-    // "─" separator consumes row 12 (vim statusline style), and the bottom
-    // window's content starts at row 13 — its own first line ("topline")
-    // sits underneath the separator, so the first visible line is "second"
+    // :sp — horizontal split: the tab bar gains a second row for the
+    // stacked pane; the top window shows "topline" on row 2; the "─"
+    // separator consumes row 12 (vim statusline style), and the bottom
+    // window's own first line sits underneath the separator, so its first
+    // visible line ("second") starts at row 13
     try sess.send(":sp\r");
     waited = 0;
     var both = false;
@@ -8174,7 +8238,7 @@ test "windows: :sp splits stacked; each window scrolls independently" {
         }
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
-        both = rowContains(&grid, 1, "topline") and rowContains(&grid, 13, "second");
+        both = rowContains(&grid, 2, "topline") and rowContains(&grid, 13, "second");
     }
     if (!both) {
         std.debug.print("after :sp:\n", .{});
@@ -8199,11 +8263,138 @@ test "windows: :sp splits stacked; each window scrolls independently" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(grid.contains("line 6/6"));
-    try std.testing.expect(rowContains(&grid, 1, "topline")); // top window unchanged
+    try std.testing.expect(rowContains(&grid, 2, "topline")); // top window unchanged
 
     const exit_code = try sess.commandAndWaitExit(":qa\r");
     if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
     try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "TMP: tab-bar fuzz — every open buffer's tab appears exactly once" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    // three short-named files in a unique dir (short basenames keep tabs
+    // unclipped even when several stack in one 40-col pane)
+    var dir_buf: [128:0]u8 = undefined;
+    const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/ozfz_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteDir(io, dir) catch {};
+    try std.Io.Dir.cwd().createDir(io, dir, .default_dir);
+    var paths: [3][160:0]u8 = undefined;
+    const contents = [_][]const u8{ "AAAA\n", "BBBB\n", "CCCC\n" };
+    const names = [_][]const u8{ "a.txt", "b.txt", "c.txt" };
+    for (0..3) |i| {
+        const p = try std.fmt.bufPrintZ(&paths[i], "{s}/{s}", .{ dir, names[i] });
+        const f = try std.Io.Dir.cwd().createFile(io, p, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, contents[i]);
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, &paths[0] });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // random window/buffer ops (fixed seed): after every op, every open
+    // buffer's tab must appear EXACTLY ONCE on the tab bar — a missing or
+    // duplicated name means ownership or rendering went wrong (e.g.
+    // horizontal splits stack panes over the same tab-bar columns and the
+    // later pane's tabs overwrite the earlier pane's). Every op starts
+    // with Esc so a leftover command line can't swallow the keys (a real
+    // user would press Esc first); :q! is excluded because it quits when
+    // a single window is left.
+    const actions = [_][]const u8{
+        ":vs\r", ":sp\r", "\x17h", "\x17l", "\x17j", "\x17k", " bh", " bl", "gt", ":bd\r",
+    };
+    var prng = std.Random.DefaultPrng.init(0xF00DF00D);
+    const seeds = [_]u64{ 0xF00DF00D, 0xDEADBEEF, 0x12345678, 0xC0FFEE42 };
+    var i: usize = 0;
+    while (i < 150) : (i += 1) {
+        // rotate the seed every 40 steps so several random sequences are
+        // exercised, not just one fixed one
+        prng = std.Random.DefaultPrng.init(seeds[i / 40]);
+        var act_buf: [192]u8 = undefined;
+        var act: []const u8 = undefined;
+        if (prng.random().uintLessThan(usize, 6) == 0) {
+            const f = 1 + prng.random().uintLessThan(usize, 2);
+            act = try std.fmt.bufPrint(&act_buf, ":e {s}\r", .{&paths[f]});
+        } else {
+            act = actions[prng.random().uintLessThan(usize, actions.len)];
+        }
+        try sess.send("\x1b"); // back to Normal before every op
+        try sess.send(act);
+        // drain until quiet
+        var d: i32 = 0;
+        while (d < 600) {
+            const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
+            if (n == 0) {
+                d += 50;
+                if (d >= 600) break;
+                continue;
+            }
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        // invariants on the tab bar (rows 0..status; stacked panes draw
+        // their tabs on separate rows):
+        //  - each name appears AT MOST once across all rows (never
+        //    duplicated or overwritten);
+        //  - a buffer whose content is VISIBLE in some pane (its unique
+        //    content marker appears in rows 1..status) MUST have its tab
+        //    on the bar exactly once — a pane shows it, so the tab cannot
+        //    be missing (horizontal splits stack panes over the same
+        //    columns; without per-row tab bars the later pane's tabs would
+        //    overwrite the earlier pane's).
+        for (names, 0..) |nm, fi| {
+            var cnt: usize = 0;
+            var rr: usize = 0;
+            while (rr + 1 < grid.rows) : (rr += 1) {
+                const row = grid.rowText(rr);
+                var pos: usize = 0;
+                while (std.mem.indexOfPos(u8, row, pos, nm)) |p| {
+                    cnt += 1;
+                    pos = p + nm.len;
+                }
+            }
+            if (cnt > 1) {
+                std.debug.print("step {d} act '{s}': tab '{s}' appears {d} times\n", .{ i, act, nm, cnt });
+                grid.dump();
+                return error.TabBarInvariantBroken;
+            }
+            const marker = contents[fi][0..4];
+            var visible = false;
+            rr = 1;
+            while (rr + 1 < grid.rows) : (rr += 1) {
+                if (std.mem.indexOf(u8, grid.rowText(rr), marker) != null) {
+                    visible = true;
+                    break;
+                }
+            }
+            if (visible and cnt != 1) {
+                std.debug.print("step {d} act '{s}': '{s}' visible in a pane but its tab appears {d} times\n", .{ i, act, nm, cnt });
+                grid.dump();
+                return error.TabBarInvariantBroken;
+            }
+        }
+    }
+
+    const code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), code);
 }
 
 test "TMP: split/close cycles + Ctrl-w navigation" {
@@ -8263,12 +8454,12 @@ test "TMP: split/close cycles + Ctrl-w navigation" {
     try std.testing.expect(std.mem.indexOf(u8, all, "leaked") == null);
 }
 
-test "windows: :vs keeps the old window left; Ctrl-w h/l + :e target the focused one" {
+test "windows: :vs keeps the old window left; :e lands in the left window when split" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
     var na_buf: [128:0]u8 = undefined;
-    const na = try std.fmt.bufPrintZ(&na_buf, "/tmp/oz_e2e_{d}_{d}wla.txt", .{ linux.getpid(), tmp_counter });
+    const na = try std.fmt.bufPrintZ(&na_buf, "/tmp/oz_{d}_{d}a.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
     {
@@ -8277,7 +8468,7 @@ test "windows: :vs keeps the old window left; Ctrl-w h/l + :e target the focused
         try f.writeStreamingAll(io, "AAA\n");
     }
     var nb_buf: [128:0]u8 = undefined;
-    const nb = try std.fmt.bufPrintZ(&nb_buf, "/tmp/oz_e2e_{d}_{d}wlb.txt", .{ linux.getpid(), tmp_counter });
+    const nb = try std.fmt.bufPrintZ(&nb_buf, "/tmp/oz_{d}_{d}b.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, nb) catch {};
     {
@@ -8286,7 +8477,7 @@ test "windows: :vs keeps the old window left; Ctrl-w h/l + :e target the focused
         try f.writeStreamingAll(io, "BBB\n");
     }
     var nc_buf: [128:0]u8 = undefined;
-    const nc = try std.fmt.bufPrintZ(&nc_buf, "/tmp/oz_e2e_{d}_{d}wlc.txt", .{ linux.getpid(), tmp_counter });
+    const nc = try std.fmt.bufPrintZ(&nc_buf, "/tmp/oz_{d}_{d}c.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, nc) catch {};
     {
@@ -8372,8 +8563,16 @@ test "windows: :vs keeps the old window left; Ctrl-w h/l + :e target the focused
         grid.dump();
     }
     try std.testing.expect(swapped);
+    // split tab bar: each buffer's tab appears exactly once — BBB's in the
+    // LEFT zone (the pane showing it), AAA's in the RIGHT
+    if (!(try waitTabs(&sess, &grid, &.{"b.txt"}, &.{"a.txt"}))) {
+        std.debug.print("tab bar after Ctrl-w h + :e b.txt:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(try waitTabs(&sess, &grid, &.{"b.txt"}, &.{"a.txt"}));
 
-    // Ctrl-w l → RIGHT window; :e c.txt puts CCC in the RIGHT half
+    // Ctrl-w l → RIGHT window; :e c.txt STILL lands in the LEFT window (the
+    // open-in-left default), focus follows it; the right half keeps AAA
     try sess.send("\x17l");
     waited = 0;
     while (true) {
@@ -8391,8 +8590,8 @@ test "windows: :vs keeps the old window left; Ctrl-w h/l + :e target the focused
     try sess.send(nc);
     try sess.send("\r");
     waited = 0;
-    var right_c = false;
-    while (!right_c) {
+    var left_c = false;
+    while (!left_c) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -8402,19 +8601,27 @@ test "windows: :vs keeps the old window left; Ctrl-w h/l + :e target the focused
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
         const row = grid.rowText(1);
-        right_c = std.mem.indexOf(u8, row[40..80], "CCC") != null and std.mem.indexOf(u8, row[0..40], "BBB") != null;
+        left_c = std.mem.indexOf(u8, row[0..40], "CCC") != null and std.mem.indexOf(u8, row[40..80], "AAA") != null;
     }
-    if (!right_c) {
+    if (!left_c) {
         std.debug.print("after Ctrl-w l + :e c.txt:\n", .{});
         grid.dump();
     }
-    try std.testing.expect(right_c);
+    try std.testing.expect(left_c);
+    // split tab bar: CCC (left pane) AND hidden BBB (last shown in the
+    // left pane) keep tabs in the LEFT zone; AAA's tab stays in the RIGHT
+    // zone — each exactly once
+    if (!(try waitTabs(&sess, &grid, &.{ "c.txt", "b.txt" }, &.{"a.txt"}))) {
+        std.debug.print("tab bar after Ctrl-w l + :e c.txt:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(try waitTabs(&sess, &grid, &.{ "c.txt", "b.txt" }, &.{"a.txt"}));
 
-    // :q closes the focused (right) window → only BBB (left) remains
+    // :q closes the focused (left) window → only AAA (right) remains
     try sess.send(":q!\r");
     waited = 0;
-    var only_b = false;
-    while (!only_b) {
+    var only_a = false;
+    while (!only_a) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -8424,11 +8631,16 @@ test "windows: :vs keeps the old window left; Ctrl-w h/l + :e target the focused
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
         const row = grid.rowText(1);
-        const has_b = std.mem.indexOf(u8, row, "BBB") != null;
+        const has_a = std.mem.indexOf(u8, row, "AAA") != null;
         const has_c = std.mem.indexOf(u8, row, "CCC") != null;
-        only_b = has_b and !has_c;
+        only_a = has_a and !has_c;
     }
-    try std.testing.expect(only_b);
+    try std.testing.expect(only_a);
+    // back to a single window: the tab bar lists every buffer exactly once
+    // (BBB/CCC re-homed to the surviving pane when their window closed)
+    try std.testing.expectEqual(@as(usize, 1), countInRow(&grid, 0, "a.txt"));
+    try std.testing.expectEqual(@as(usize, 1), countInRow(&grid, 0, "b.txt"));
+    try std.testing.expectEqual(@as(usize, 1), countInRow(&grid, 0, "c.txt"));
 
     const exit_code = try sess.commandAndWaitExit(":qa\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
@@ -8499,41 +8711,57 @@ test "windows: <leader>bh/bl move the buffer to the left/right window; last buff
         }
     };
 
-    // :vs → both halves show WAA; :e b.txt puts WBB in the focused (right) half
+    // :vs → both halves show WAA; :e b.txt LANDS IN THE LEFT window (the
+    // open-in-left default: panes hold distinct buffers, focus follows)
     try sess.send(":vs\r");
     try std.testing.expect(try Wait.panes(&sess, &grid, "WAA", "WAA"));
+    // the new (focused) pane is the last to show the shared buffer: its
+    // single tab sits in the RIGHT zone, the left zone shows no tab
+    if (!(try waitTabs(&sess, &grid, &.{}, &.{"bha.txt"}))) {
+        std.debug.print("tab bar after :vs:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(try waitTabs(&sess, &grid, &.{}, &.{"bha.txt"}));
     try sess.send(":e ");
     try sess.send(nb);
     try sess.send("\r");
+    try std.testing.expect(try Wait.panes(&sess, &grid, "WBB", "WAA"));
+    // tabs follow the panes: WBB's tab in the LEFT zone, WAA's in the RIGHT
+    try std.testing.expect(try waitTabs(&sess, &grid, &.{"bhb.txt"}, &.{"bha.txt"}));
+
+    // <leader>bl from the left window: WBB moves RIGHT; the left window
+    // falls back to the next buffer (WAA)
+    try sess.send(" bl");
+    try std.testing.expect(try Wait.panes(&sess, &grid, "WAA", "WBB"));
+    // the moved buffer's tab crossed the divider with it
+    try std.testing.expect(try waitTabs(&sess, &grid, &.{"bha.txt"}, &.{"bhb.txt"}));
+
+    // <leader>bh from the left window: no left neighbor → no-op
+    try sess.send(" bh");
     try std.testing.expect(try Wait.panes(&sess, &grid, "WAA", "WBB"));
 
-    // <leader>bh: WBB moves to the LEFT window; the right window falls back
-    // to the next buffer (WAA). The buffer list is unchanged (two tabs).
+    // focus the right window and <leader>bh: WBB moves back LEFT; the right
+    // window falls back to WAA
+    try sess.send("\x17l");
     try sess.send(" bh");
     try std.testing.expect(try Wait.panes(&sess, &grid, "WBB", "WAA"));
+    try std.testing.expect(try waitTabs(&sess, &grid, &.{"bhb.txt"}, &.{"bha.txt"}));
 
-    // <leader>bl from the right window: no right neighbor → no-op
-    try sess.send(" bl");
-    try std.testing.expect(try Wait.panes(&sess, &grid, "WBB", "WAA"));
-
-    // focus the left window and <leader>bl: WBB moves back RIGHT; the left
-    // window falls back to WAA
-    try sess.send("\x17h");
-    try sess.send(" bl");
-    try std.testing.expect(try Wait.panes(&sess, &grid, "WAA", "WBB"));
-
-    // drop WBB (:bd in the right window) → both halves show WAA, one buffer
-    try sess.send("\x17l");
+    // drop WAA (:bd in the right window) → both halves show WBB, one buffer
     try sess.send(":bd\r");
-    try std.testing.expect(try Wait.panes(&sess, &grid, "WAA", "WAA"));
+    try std.testing.expect(try Wait.panes(&sess, &grid, "WBB", "WBB"));
+    // the sole buffer's tab belongs to the focused (right) pane
+    try std.testing.expect(try waitTabs(&sess, &grid, &.{}, &.{"bhb.txt"}));
 
     // <leader>bh with the LAST buffer: the buffer moves left and the current
     // window closes — a single pane remains (no split separator on row 1)
     try sess.send(" bh");
-    try std.testing.expect(try Wait.panes(&sess, &grid, "WAA", ""));
+    try std.testing.expect(try Wait.panes(&sess, &grid, "WBB", ""));
     const row = grid.rowText(1);
-    const first = std.mem.indexOf(u8, row, "WAA").?;
-    try std.testing.expect(std.mem.indexOfPos(u8, row, first + 1, "WAA") == null);
+    const first = std.mem.indexOf(u8, row, "WBB").?;
+    try std.testing.expect(std.mem.indexOfPos(u8, row, first + 1, "WBB") == null);
+    // single-window tab bar: the buffer's tab appears exactly once
+    try std.testing.expectEqual(@as(usize, 1), countInRow(&grid, 0, "bhb.txt"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);

@@ -134,6 +134,11 @@ const App = struct {
         /// window) — lazily built on the first render of a window showing it,
         /// so every split window gets real highlighting for its own buffer.
         hl: ?syntax.Highlighter = null,
+        /// Pane this buffer's tab belongs to in the split tab bar: the window
+        /// that last SHOWED it. Each buffer's tab appears exactly once — in
+        /// its owning pane's zone — and a buffer hidden from every pane keeps
+        /// its tab in the pane it was last displayed in.
+        last_win: usize = 0,
         /// history.revision at this buffer's last parse (incremental-parse
         /// bookkeeping; maxInt forces a full reparse).
         syntax_revision: u64 = 0,
@@ -465,8 +470,8 @@ const App = struct {
         const win = self.vx.window();
         const height: u32 = win.height;
         if (height <= status_row_count) return 1;
-        const content_rows = height - status_row_count - tab_bar_rows;
-        const layout = self.layoutWindows(arena.allocator(), self.contentTop(), content_rows, self.contentCol(), win.width) catch return content_rows;
+        const content_rows = height - status_row_count - self.tabBarRows(arena.allocator());
+        const layout = self.layoutWindows(arena.allocator(), self.contentTop(arena.allocator()), content_rows, self.contentCol(), win.width) catch return content_rows;
         for (layout.leaves) |leaf| {
             if (leaf.win == self.current_win) return leaf.height;
         }
@@ -717,6 +722,11 @@ const App = struct {
             .view_top = self.windows.items[cur_win].view_top,
         });
         const new_idx: usize = self.windows.items.len - 1;
+        // the new pane (which takes focus) is the last to SHOW the shared
+        // buffer, so the buffer's tab belongs to the new pane's zone (split
+        // tab bar: each buffer's tab appears exactly once, in the pane that
+        // last displayed it)
+        self.buffers.items[self.windows.items[new_idx].buf].last_win = new_idx;
         const root = self.win_root orelse return;
         try self.replaceLeaf(root, cur_win, dir, new_idx);
         self.current_win = new_idx;
@@ -901,6 +911,21 @@ const App = struct {
         self.adjustLeafIndices(self.win_root.?, cur_win);
         self.current_win = self.firstLeaf(self.win_root.?);
         self.winTreeSanity();
+        // tab ownership tracks the window indices: the removed window's
+        // buffers re-home to the surviving leftmost pane (unless another
+        // window shows them), indices above shift down, and a displayed
+        // buffer always owns its displaying pane
+        const home = self.current_win;
+        for (self.buffers.items) |*buf| {
+            if (buf.last_win == cur_win) {
+                buf.last_win = home;
+            } else if (buf.last_win > cur_win) {
+                buf.last_win -= 1;
+            }
+        }
+        for (self.windows.items, 0..) |w, wi| {
+            self.buffers.items[w.buf].last_win = wi;
+        }
         // sync the current buffer/highlighter with the surviving window
         const b = self.windows.items[self.current_win].buf;
         if (b != self.current) {
@@ -941,11 +966,11 @@ const App = struct {
         if (self.windows.items.len <= 1) return null;
         const height: u32 = self.vx.window().height;
         if (height <= status_row_count) return null;
-        const content_rows = height - status_row_count - tab_bar_rows;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const layout = self.layoutWindows(a, self.contentTop(), content_rows, self.contentCol(), self.vx.window().width) catch return null;
+        const content_rows = height - status_row_count - self.tabBarRows(a);
+        const layout = self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), self.vx.window().width) catch return null;
         const leaves = layout.leaves;
         var cur_rect: ?LeafRect = null;
         for (leaves) |lr| {
@@ -997,6 +1022,8 @@ const App = struct {
         // the neighbor adopts the moved buffer (its old buffer stays open in
         // the list); its cursor is clamped to the new text
         self.windows.items[target].buf = moved;
+        // …and the moved buffer's tab belongs to the neighbor's pane
+        self.buffers.items[moved].last_win = target;
         const mlen = self.buffers.items[moved].pt.len();
         self.windows.items[target].cursor = @min(self.windows.items[target].cursor, mlen);
         if (self.buffers.items.len <= 1) {
@@ -5018,6 +5045,19 @@ const App = struct {
     fn switchTo(self: *App, i: usize) void {
         if (self.buffers.items.len == 0) return;
         self.current = i % self.buffers.items.len;
+        // re-home the buffer the focused pane is leaving: if another pane
+        // still shows it, its tab moves to THAT pane ("displayed in which
+        // pane, the tab belongs to which pane"); hidden from every pane, it
+        // keeps this one — the pane that last showed it
+        const leaving = self.windows.items[self.current_win].buf;
+        if (leaving != self.current) {
+            for (self.windows.items, 0..) |w, wi| {
+                if (wi != self.current_win and w.buf == leaving) {
+                    self.buffers.items[leaving].last_win = wi;
+                    break;
+                }
+            }
+        }
         // the focused window follows the switch; other split windows keep
         // showing whatever buffer they had. This must happen BEFORE
         // ensureLsp: cur() resolves through the window's buf index, so with
@@ -5025,6 +5065,8 @@ const App = struct {
         // PREVIOUS buffer — files opened via the tree / :e / the picker got
         // no LSP session at all.
         self.windows.items[self.current_win].buf = self.current;
+        // the buffer's tab belongs to the pane now showing it
+        self.buffers.items[self.current].last_win = self.current_win;
         self.ensureLsp();
         self.state.mode = .normal;
         // leaving the buffer invalidates any visual selection from it
@@ -5058,6 +5100,26 @@ const App = struct {
         self.switchTo(@intCast(@mod(next, @as(i32, @intCast(n)))));
     }
 
+    /// <leader>bh/bl workspace model: with a split open, a buffer opened
+    /// from outside (:e, file tree, pickers, gd/gr into another file) lands
+    /// in the LEFT window — the panes then hold distinct buffers by default
+    /// and bh/bl shuttles them. A buffer already shown in a window is
+    /// focused THERE instead (never duplicate it into both panes).
+    /// No-op without a split.
+    fn targetWindowForOpen(self: *App, buf_idx: ?usize) void {
+        if (self.windows.items.len <= 1) return;
+        if (buf_idx) |b| {
+            for (self.windows.items, 0..) |w, wi| {
+                if (w.buf == b) {
+                    self.current_win = wi;
+                    return;
+                }
+            }
+        }
+        const root = self.win_root orelse return;
+        self.current_win = self.firstLeaf(root);
+    }
+
     /// Open `path` in a new buffer unless it is already open (then switch).
     /// The stored path is ABSOLUTE (like the CLI arg path): LSP uri building,
     /// filetype detection and recent-file dedupe all assume absolute paths, so
@@ -5069,6 +5131,7 @@ const App = struct {
         for (self.buffers.items, 0..) |*buf, i| {
             if (buf.path) |p| {
                 if (std.mem.eql(u8, p, abs)) {
+                    self.targetWindowForOpen(i);
                     self.switchTo(i);
                     return;
                 }
@@ -5097,6 +5160,7 @@ const App = struct {
             .path = try self.alloc.dupe(u8, abs),
         });
         try self.addRecent(abs);
+        self.targetWindowForOpen(null);
         self.switchTo(self.buffers.items.len - 1);
     }
 
@@ -5155,6 +5219,10 @@ const App = struct {
             }
         }
         self.winTreeSanity();
+        // tab ownership: a displayed buffer owns its displaying pane
+        for (self.windows.items, 0..) |w, wi| {
+            self.buffers.items[w.buf].last_win = wi;
+        }
         self.state.mode = .normal;
         // closing the buffer also discards a visual selection anchored in it
         self.visual_anchor = null;
@@ -6553,12 +6621,57 @@ const App = struct {
     // ---- rendering ----
 
     const filetree_width: u32 = 25;
-    const tab_bar_rows: u32 = 1;
+
+    /// Tab-bar rows: one per column-overlap layer of the pane layout.
+    /// Panes whose column spans overlap (horizontal splits stack
+    /// full-width panes) draw their tabs on separate rows so tabs never
+    /// overwrite each other; vertical splits share a row (their spans are
+    /// disjoint). Column spans don't depend on the split heights, so a
+    /// nominal content height is fine here.
+    fn tabBarRows(self: *App, a: std.mem.Allocator) u32 {
+        if (self.windows.items.len <= 1) return 1;
+        const height: u32 = self.vx.window().height;
+        if (height <= status_row_count) return 1;
+        const layout = self.layoutWindows(a, 1, height - status_row_count - 1, self.contentCol(), self.vx.window().width) catch return 1;
+        const leaves = layout.leaves;
+        // greedy interval coloring: assign each pane to the lowest layer
+        // whose rightmost pane ends at or before this pane's column start
+        var order: std.ArrayList(usize) = .empty;
+        defer order.deinit(a);
+        for (0..leaves.len) |i| order.append(a, i) catch return 1;
+        std.mem.sort(usize, order.items, TabSort{ .leaves = leaves }, TabSort.lt);
+        var layer_end: std.ArrayList(u32) = .empty;
+        defer layer_end.deinit(a);
+        var layers: u32 = 0;
+        for (order.items) |oi| {
+            const lr = leaves[oi];
+            var li: usize = 0;
+            while (li < layers and layer_end.items[li] > lr.col) li += 1;
+            if (li == layers) {
+                layer_end.append(a, lr.col + lr.width) catch return 1;
+                layers += 1;
+            } else {
+                layer_end.items[li] = lr.col + lr.width;
+            }
+        }
+        return layers;
+    }
+
+    /// Sort panes by column for tab streaming: left to right, wider first
+    /// when spans start at the same column (stable per pane index).
+    const TabSort = struct {
+        leaves: []LeafRect,
+        fn lt(ctx: TabSort, x: usize, y: usize) bool {
+            const ax = ctx.leaves[x];
+            const ay = ctx.leaves[y];
+            if (ax.col != ay.col) return ax.col < ay.col;
+            return ax.width > ay.width;
+        }
+    };
 
     /// Row where the editor content starts (below the tab bar).
-    fn contentTop(self: *const App) u32 {
-        _ = self;
-        return tab_bar_rows;
+    fn contentTop(self: *App, a: std.mem.Allocator) u32 {
+        return self.tabBarRows(a);
     }
 
     fn contentCol(self: *const App) u32 {
@@ -7438,7 +7551,7 @@ const App = struct {
         const height: u32 = win.height;
         if (height <= status_row_count) return;
         // Content area rows: below the tab bar, above the status bar.
-        const content_rows = height - status_row_count - tab_bar_rows;
+        const content_rows = height - status_row_count - self.tabBarRows(a);
 
         // Clamp the focused window's cursor/viewport BEFORE any lineOf /
         // column math below: switching windows or buffers can leave a stale
@@ -7457,11 +7570,12 @@ const App = struct {
 
         // tab bar. Single window: one entry per buffer, current highlighted,
         // + dirty marker — solid blocks separated by a 1-cell base-bg gap.
-        // Split windows: every pane lists ALL buffers clipped to its zone
-        // (a buffer not shown anywhere must not vanish), and the pane's OWN
-        // buffer carries the active style — the divider separates "which
-        // buffer is where", so a buffer moving panes (<leader>bh/bl) is
-        // visible on the tab bar.
+        // Split windows: each buffer's tab appears EXACTLY ONCE, in the pane
+        // that last showed it (last_win) — a buffer displayed in a pane
+        // belongs to that pane, a buffer hidden from every pane keeps its
+        // tab in the pane it was last in. The pane's OWN buffer carries the
+        // active style, so a buffer moving panes (<leader>bh/bl) is visible
+        // on the tab bar.
         if (self.windows.items.len <= 1) {
             var tab_i: usize = 0;
             // the tab bar belongs to the BUFFER area: with the file tree
@@ -7496,43 +7610,89 @@ const App = struct {
                 col +|= @intCast(1 + label.len + 1);
                 if (col >= win.width) break;
             }
-        } else if (self.layoutWindows(a, self.contentTop(), content_rows, self.contentCol(), win.width)) |tab_layout| {
-            // every pane lists ALL buffers (a buffer not shown in any pane
-            // must not vanish from the tab bar); the pane's OWN buffer
-            // carries the active style, so the divider still separates
-            // "which buffer is where" and <leader>bh/bl visibly moves it
-            for (tab_layout.leaves) |lr| {
-                const own = self.windows.items[lr.win].buf;
-                var tab_i: usize = 0;
-                var col: u32 = lr.col;
-                const pane_end = lr.col + lr.width;
-                while (tab_i < self.buffers.items.len) : (tab_i += 1) {
-                    const buf = &self.buffers.items[tab_i];
-                    const name = if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
-                    const dirty = if (buf.dirty) "\u{25cf}" else " ";
-                    const label = try std.fmt.allocPrint(a, " {s}{s} ", .{ name, dirty });
-                    const active = tab_i == own;
-                    const tab_style: vaxis.Style = if (active)
-                        .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_status }, .bold = true }
-                    else
-                        .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
-                    const icon = icons.forPath(if (buf.path) |p| p else "", false);
-                    const icon_style: vaxis.Style = .{
-                        .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) },
-                        .bg = tab_style.bg,
-                        .bold = active,
-                    };
-                    // clip to the pane: icon (1 cell) + what fits of the
-                    // label — tabs must not bleed into the neighbor's zone
-                    const fit = cellFitPrefix(win, label, pane_end -| col -| 1);
-                    if (fit.cells == 0) break;
-                    const segs = [_]vaxis.Segment{
-                        .{ .text = icon.glyph, .style = icon_style },
-                        .{ .text = fit.slice, .style = tab_style },
-                    };
-                    _ = win.print(&segs, .{ .row_offset = 0, .col_offset = @intCast(col), .wrap = .none });
-                    col += @intCast(1 + fit.cells + 1); // icon + label + gap
-                    if (col >= pane_end) break;
+        } else if (self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), win.width)) |tab_layout| {
+            // each buffer's tab appears EXACTLY ONCE, owned by the pane that
+            // displays it (the focused pane wins when several panes show the
+            // same buffer); a buffer hidden from every pane keeps its tab in
+            // the pane that last showed it. Panes whose column spans overlap
+            // (horizontal splits) draw on separate tab-bar rows so tabs never
+            // overwrite each other; within a row, tabs stream left to right
+            // from each pane's column, borrowing space to the right when a
+            // pane is too narrow to fit its tabs (labels clip only at the
+            // row's right edge). The pane's displayed buffer carries the
+            // active style, so <leader>bh/bl visibly moves the tab.
+            const leaves = tab_layout.leaves;
+            const pane_layer = a.alloc(u32, leaves.len) catch return;
+            var order: std.ArrayList(usize) = .empty;
+            for (0..leaves.len) |i| order.append(a, i) catch return;
+            std.mem.sort(usize, order.items, TabSort{ .leaves = leaves }, TabSort.lt);
+            var layer_end: std.ArrayList(u32) = .empty;
+            var layers: u32 = 0;
+            for (order.items) |oi| {
+                const lr = leaves[oi];
+                var lli: usize = 0;
+                while (lli < layers and layer_end.items[lli] > lr.col) lli += 1;
+                if (lli == layers) {
+                    layer_end.append(a, lr.col + lr.width) catch return;
+                    layers += 1;
+                } else {
+                    layer_end.items[lli] = lr.col + lr.width;
+                }
+                pane_layer[oi] = @intCast(lli);
+            }
+            var lli: u32 = 0;
+            while (lli < layers) : (lli += 1) {
+                // right edge of the layer's widest span: tabs clip here
+                var right: u32 = 0;
+                for (order.items) |oi| {
+                    if (pane_layer[oi] == lli) right = @max(right, leaves[oi].col + leaves[oi].width);
+                }
+                var pos: u32 = 0;
+                for (order.items) |oi| {
+                    if (pane_layer[oi] != lli) continue;
+                    const lr = leaves[oi];
+                    // start at the pane's own column, or right after the
+                    // previous pane's tabs when they overflow this span
+                    pos = @max(pos, lr.col);
+                    const own = self.windows.items[lr.win].buf;
+                    var tab_i: usize = 0;
+                    var col = pos;
+                    while (tab_i < self.buffers.items.len) : (tab_i += 1) {
+                        // owner: the pane showing the buffer (the focused
+                        // pane wins when several panes show it); a hidden
+                        // buffer keeps the pane that last showed it
+                        var owner: usize = self.buffers.items[tab_i].last_win;
+                        if (owner >= self.windows.items.len) owner = self.windows.items.len - 1;
+                        if (self.windows.items[self.current_win].buf == tab_i) owner = self.current_win;
+                        if (owner != lr.win) continue;
+                        const buf = &self.buffers.items[tab_i];
+                        const name = if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
+                        const dirty = if (buf.dirty) "\u{25cf}" else " ";
+                        const label = try std.fmt.allocPrint(a, " {s}{s} ", .{ name, dirty });
+                        const active = tab_i == own;
+                        const tab_style: vaxis.Style = if (active)
+                            .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_status }, .bold = true }
+                        else
+                            .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
+                        const icon = icons.forPath(if (buf.path) |p| p else "", false);
+                        const icon_style: vaxis.Style = .{
+                            .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) },
+                            .bg = tab_style.bg,
+                            .bold = active,
+                        };
+                        // clip only at the row's right edge: tabs may borrow
+                        // space right of their own (too narrow) pane span
+                        const fit = cellFitPrefix(win, label, right -| col -| 1);
+                        if (fit.cells == 0) break;
+                        const segs = [_]vaxis.Segment{
+                            .{ .text = icon.glyph, .style = icon_style },
+                            .{ .text = fit.slice, .style = tab_style },
+                        };
+                        _ = win.print(&segs, .{ .row_offset = @intCast(lli), .col_offset = @intCast(col), .wrap = .none });
+                        col += @intCast(1 + fit.cells + 1); // icon + label + gap
+                        if (col >= right) break;
+                    }
+                    pos = col;
                 }
             }
         } else |_| {}
@@ -7543,7 +7703,7 @@ const App = struct {
                 .text = " oz  ",
                 .style = .{ .fg = .{ .rgb = self.theme.accent }, .bold = true },
             }};
-            _ = win.print(&title_seg, .{ .row_offset = @intCast(self.contentTop() + 2), .col_offset = 2, .wrap = .none });
+            _ = win.print(&title_seg, .{ .row_offset = @intCast(self.contentTop(a) + 2), .col_offset = 2, .wrap = .none });
             // key-hint line, segmented so the bindings get token colors while
             // the prose stays faint (the text content is unchanged, so e2e
             // `contains` assertions on the line still hold)
@@ -7561,7 +7721,7 @@ const App = struct {
                 .{ .text = ":q", .style = .{ .fg = .{ .rgb = self.theme.accent } } },
                 .{ .text = " 退出", .style = .{ .fg = .{ .rgb = self.theme.fg_faint } } },
             };
-            _ = win.print(&hint_segs, .{ .row_offset = @intCast(self.contentTop() + 3), .col_offset = 2, .wrap = .none });
+            _ = win.print(&hint_segs, .{ .row_offset = @intCast(self.contentTop(a) + 3), .col_offset = 2, .wrap = .none });
             var ri: usize = 0;
             while (ri < @min(self.recent_files.items.len, 8)) : (ri += 1) {
                 const fname = self.recent_files.items[ri];
@@ -7575,10 +7735,10 @@ const App = struct {
                     .{ .text = " ", .style = .{ .bg = bg } },
                     .{ .text = fname, .style = .{ .fg = fg, .bg = bg } },
                 };
-                _ = win.print(&segs, .{ .row_offset = @intCast(self.contentTop() + row), .col_offset = 2, .wrap = .none });
+                _ = win.print(&segs, .{ .row_offset = @intCast(self.contentTop(a) + row), .col_offset = 2, .wrap = .none });
             }
             self.vx.screen.cursor = .{
-                .row = @intCast(self.contentTop() + 5 + @as(u32, @intCast(@min(self.recent_sel, 7)))),
+                .row = @intCast(self.contentTop(a) + 5 + @as(u32, @intCast(@min(self.recent_sel, 7)))),
                 .col = 2,
             };
             self.vx.screen.cursor_vis = true;
@@ -7589,7 +7749,7 @@ const App = struct {
 
         // split windows: every leaf gets a rectangle and renders its buffer;
         // the focused window carries syntax highlighting and the selection
-        const layout = try self.layoutWindows(a, self.contentTop(), content_rows, self.contentCol(), win.width);
+        const layout = try self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), win.width);
         const leaves = layout.leaves;
         var cur_rect: LeafRect = .{ .win = self.current_win, .row = 0, .col = 0, .height = 0, .width = 0 };
         var li: usize = 0;
@@ -7636,7 +7796,7 @@ const App = struct {
         if (self.filetree_active) {
             const ft_col: u32 = 0;
             const ft_width = filetree_width;
-            const ft_top = self.contentTop();
+            const ft_top = self.contentTop(a);
             const ft_bottom = height - status_row_count; // above the status bar
             const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg } };
             // Paint the whole panel with the editor background first — without
@@ -8768,7 +8928,7 @@ const App = struct {
             // Items render at contentTop()+1+k (below the "╭─ files" title
             // row) with text starting at column 1 (after the left border) —
             // the cursor must land on the same row/column as the highlight.
-            const sel_row: u32 = self.contentTop() + 1 + @as(u32, @intCast(self.filetree_sel -| self.filetree_top));
+            const sel_row: u32 = self.contentTop(a) + 1 + @as(u32, @intCast(self.filetree_sel -| self.filetree_top));
             self.vx.screen.cursor = .{
                 .row = @intCast(sel_row),
                 .col = 1,
