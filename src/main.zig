@@ -8604,16 +8604,22 @@ const App = struct {
                         // which would push it away from the word when the
                         // word has a prefix like "b." (b.stand + ghost had a
                         // gap that made the completion look broken)
-                        if (ghost.len > 0 and ghost_col + ghost.len < win.width) {
-                            const seg = [_]vaxis.Segment{.{
-                                .text = ghost,
-                                .style = .{ .dim = true },
-                            }};
-                            _ = win.print(&seg, .{
-                                .row_offset = @intCast(ghost_line - self.curViewTop().* + cur_rect.row),
-                                .col_offset = @intCast(cur_rect.col + gutter + ghost_col),
-                                .wrap = .none,
-                            });
+                        if (ghost.len > 0) {
+                            // keep the ghost inside THIS pane: win.width is
+                            // the whole screen, and a split's neighbor owns
+                            // the columns past the pane's right edge
+                            const ghost_start = cur_rect.col + gutter + ghost_col;
+                            if (ghost_start + ghost.len <= cur_rect.col + cur_rect.width) {
+                                const seg = [_]vaxis.Segment{.{
+                                    .text = ghost,
+                                    .style = .{ .dim = true },
+                                }};
+                                _ = win.print(&seg, .{
+                                    .row_offset = @intCast(ghost_line - self.curViewTop().* + cur_rect.row),
+                                    .col_offset = @intCast(ghost_start),
+                                    .wrap = .none,
+                                });
+                            }
                         }
                     }
                 }
@@ -8657,8 +8663,12 @@ const App = struct {
                         const marker = try std.fmt.allocPrint(a, " … {d} lines", .{f.hiddenCount()});
                         start_col += self.textWidth(win, marker);
                     }
-                    if (start_col < win.width) {
-                        const fit = cellFitPrefix(win, label, win.width - start_col);
+                    // the ghost must stay inside THIS pane: win.width is
+                    // the whole screen, and a split's neighbor owns the
+                    // columns past the pane's right edge
+                    const pane_end = cur_rect.col + cur_rect.width;
+                    if (start_col < pane_end) {
+                        const fit = cellFitPrefix(win, label, pane_end - start_col);
                         if (fit.cells > 0) {
                             const seg = [_]vaxis.Segment{.{
                                 .text = fit.slice,

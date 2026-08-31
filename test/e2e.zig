@@ -11580,3 +11580,111 @@ test "git: gutter signs, ]c hunk jump, hunk stage/reset, blame ghost, branch" {
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
+
+test "git: blame ghost stays inside its pane in a split" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    // ---- temp git repo: one long line ----
+    var dir_buf: [160]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/oz_e2e_ghost_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().createDir(io, dir, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    _ = try runCmdCapture(io, alloc, &.{ "git", "init", "-q", "-b", "main" }, dir);
+    _ = try runCmdCapture(io, alloc, &.{ "git", "config", "user.email", "e2e@test" }, dir);
+    _ = try runCmdCapture(io, alloc, &.{ "git", "config", "user.name", "E2E Tester" }, dir);
+    // 30 chars: the ghost anchored past the line end (gutter 2 + 30 = col
+    // 32) overflows the left pane's 40-col right edge — clipping must use
+    // the PANE edge, not the screen width, or the ghost bleeds into the
+    // right pane's columns
+    var long = std.ArrayList(u8).empty;
+    defer long.deinit(alloc);
+    try long.appendSlice(alloc, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n");
+    try writeTestFile(io, dir, "a.txt", long.items);
+    _ = try runCmdCapture(io, alloc, &.{ "git", "add", "a.txt" }, dir);
+    _ = try runCmdCapture(io, alloc, &.{ "git", "commit", "-qm", "init" }, dir);
+
+    var sess = try Session.spawnCwd(io, &.{ oz_exe_path, "a.txt" }, dir);
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+
+    const Wait = struct {
+        fn until(s: *Session, g: *Grid, needle: []const u8) !bool {
+            var waited: i32 = 0;
+            while (!g.contains(needle)) {
+                const nn = try readAvailable(s.pty.master, s.out[s.used..], 200);
+                if (nn == 0) {
+                    waited += 200;
+                    if (waited >= 5000) return false;
+                    continue;
+                }
+                s.used += nn;
+                g.feed(s.out[s.used - nn .. s.used]);
+            }
+            return true;
+        }
+    };
+
+    try std.testing.expect(try Wait.until(&sess, &grid, "NORMAL"));
+    try std.testing.expect(try Wait.until(&sess, &grid, "⎇ main"));
+
+    // :vs → both panes show the long line; focus the LEFT (40-col) pane
+    try sess.send(":vs\r");
+    try std.testing.expect(try Wait.until(&sess, &grid, "\u{2502}")); // │
+    try sess.send("\x17h");
+    // the current-line blame ghost appears on the cursor line. It must be
+    // clipped to the LEFT pane: its TAIL ("init", the commit summary,
+    // which lands at col 53+ when drawn unclipped) must never cross col 40
+    // into the right pane — with screen-width clipping the tail shows up
+    // inside the neighbor's columns. The ghost's prefix ("E2E") sits at
+    // col 33-35, so only the tail can detect the leak.
+    var placed = false;
+    var leaked = false;
+    var waited: i32 = 0;
+    while (!placed and waited < 5000) {
+        const row1 = grid.rowText(1);
+        const left = if (row1.len > 40) row1[0..40] else row1;
+        const right = if (row1.len > 40) row1[40..] else "";
+        if (std.mem.indexOf(u8, right, "init") != null) leaked = true;
+        if (std.mem.indexOf(u8, left, "E2E") != null) {
+            // the ghost is on the left — give the post-Ctrl-w-h frame a
+            // moment to settle, then re-check the tail
+            var quiet: i32 = 0;
+            while (quiet < 300) {
+                const nn = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
+                if (nn == 0) {
+                    quiet += 50;
+                    continue;
+                }
+                sess.used += nn;
+                grid.feed(sess.out[sess.used - nn .. sess.used]);
+                quiet = 0;
+            }
+            const r2 = grid.rowText(1);
+            const rr2 = if (r2.len > 40) r2[40..] else "";
+            if (std.mem.indexOf(u8, rr2, "init") != null) leaked = true;
+            placed = true;
+            break;
+        }
+        const nn = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (nn == 0) {
+            waited += 200;
+            continue;
+        }
+        sess.used += nn;
+        grid.feed(sess.out[sess.used - nn .. sess.used]);
+    }
+    if (!placed or leaked) {
+        std.debug.print("ghost placement: placed={} leaked={} row1='{s}'\n", .{ placed, leaked, grid.rowText(1) });
+        grid.dump();
+    }
+    try std.testing.expect(placed);
+    try std.testing.expect(!leaked);
+
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
