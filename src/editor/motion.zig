@@ -138,6 +138,57 @@ fn moveOnce(pt: *const PieceTable, motion: Motion, args: Args, pos_in: u32) u32 
     };
 }
 
+// ------------------- sliding window byte access (O(line) scans) -------------
+
+/// A motion scans document bytes through a sliding window refilled with
+/// `copyRange`. One window per motion: the first refill costs O(pieces)
+/// once, then every per-byte read is a plain slice index — w/e/b/f/t/{}
+/// stop paying O(chars × pieces) on fragmented piece tables. Windows are
+/// 4 KiB; a longer scan slides the window (each slide another copyRange),
+/// so cost stays O(line) in bytes scanned, never O(chars × pieces).
+///
+/// The window is placed with a 4-byte margin on the refill side so the
+/// UTF-8 boundary peeks (prevCharBoundary/nextCharBoundary walk ≤ 3 bytes
+/// around a position) stay inside the window and don't trigger refills.
+const ScanBufLen = 4096;
+const DocScan = struct {
+    pt: *const PieceTable,
+    start: u32, // doc offset of buf[0]
+    buf: [ScanBufLen]u8,
+    len: u32, // valid bytes in buf ([start, start+len))
+    back: bool, // backward scan: window ends just past the refill point
+
+    fn init(pt: *const PieceTable, back: bool) DocScan {
+        return .{ .pt = pt, .start = 0, .buf = undefined, .len = 0, .back = back };
+    }
+
+    /// Byte at doc offset `pos`; ' ' at/past the document end (EOF behaves
+    /// like trailing whitespace for word motions, mirroring byteOrSpace).
+    fn byte(self: *DocScan, pos: u32) u8 {
+        if (pos >= self.pt.len()) return ' ';
+        if (pos < self.start or pos >= self.start + self.len) self.refill(pos);
+        return self.buf[@as(usize, pos - self.start)];
+    }
+
+    fn refill(self: *DocScan, pos: u32) void {
+        const doc_len = self.pt.len();
+        if (self.back) {
+            // window ends 4 bytes past `pos` so forward UTF-8 peeks stay in
+            const end_excl: u32 = @min(doc_len, pos + 5);
+            const n: u32 = @min(@as(u32, @intCast(ScanBufLen)), end_excl);
+            self.start = end_excl - n;
+            self.pt.copyRange(self.start, self.buf[0..n]);
+            self.len = n;
+        } else {
+            // window starts 4 bytes before `pos` so backward UTF-8 peeks stay in
+            self.start = pos -| 4;
+            const n: u32 = @min(@as(u32, @intCast(ScanBufLen)), doc_len - self.start);
+            self.pt.copyRange(self.start, self.buf[0..n]);
+            self.len = n;
+        }
+    }
+};
+
 // ------------------------- UTF-8 char boundaries ----------------------------
 
 /// Length of the UTF-8 sequence a lead byte starts (1 for ASCII, stray
@@ -153,16 +204,18 @@ fn utf8SeqLen(lead: u8) u32 {
 
 /// Index of the previous character boundary strictly before `pos`
 /// (0 when none). Malformed sequences count as 1-byte characters.
-fn prevCharBoundary(pt: *const PieceTable, pos: u32) u32 {
-    std.debug.assert(pos > 0 and pos <= pt.len());
+/// Reads through `scan` so a whole motion pays one copyRange, not one per
+/// byte.
+fn prevCharBoundary(scan: *DocScan, pos: u32) u32 {
+    std.debug.assert(pos > 0 and pos <= scan.pt.len());
     const i = pos - 1;
-    const b = pt.byteAt(i);
+    const b = scan.byte(i);
     if (b < 0x80 or b >= 0xC0) return i; // ASCII or stray lead: its own char
     // b is a continuation byte: walk back to a lead byte (max 3 steps).
     var lead: u32 = i;
     while (lead > 0 and i - lead < 3) {
         lead -= 1;
-        const c = pt.byteAt(lead);
+        const c = scan.byte(lead);
         if (c < 0x80) return i; // orphaned continuation before ASCII
         if (c >= 0xC0) {
             // Well-formed iff the sequence starting at `lead` ends at `pos`.
@@ -175,16 +228,16 @@ fn prevCharBoundary(pt: *const PieceTable, pos: u32) u32 {
 
 /// Index of the next character boundary strictly after `pos`
 /// (pt.len() when none). Malformed sequences count as 1-byte characters.
-fn nextCharBoundary(pt: *const PieceTable, pos: u32) u32 {
-    std.debug.assert(pos < pt.len());
-    const b = pt.byteAt(pos);
+fn nextCharBoundary(scan: *DocScan, pos: u32) u32 {
+    std.debug.assert(pos < scan.pt.len());
+    const b = scan.byte(pos);
     if (b < 0xC0) return pos + 1; // ASCII or stray continuation
     const seq_len = utf8SeqLen(b);
     const end = pos + seq_len;
-    if (end > pt.len()) return pos + 1; // truncated sequence
+    if (end > scan.pt.len()) return pos + 1; // truncated sequence
     var k: u32 = 1;
     while (k < seq_len) : (k += 1) {
-        const c = pt.byteAt(pos + k);
+        const c = scan.byte(pos + k);
         if (c < 0x80 or c >= 0xC0) return pos + 1; // malformed continuation
     }
     return end;
@@ -197,7 +250,8 @@ fn nextCharBoundary(pt: *const PieceTable, pos: u32) u32 {
 fn moveLeft(pt: *const PieceTable, pos: u32) u32 {
     if (pos == 0) return 0;
     if (pos == pt.lineStart(pt.lineOf(pos))) return pos;
-    return prevCharBoundary(pt, pos);
+    var scan = DocScan.init(pt, true);
+    return prevCharBoundary(&scan, pos);
 }
 
 /// l — next character; clamps at the end of the line (no wrap).
@@ -210,7 +264,8 @@ fn moveRight(pt: *const PieceTable, pos: u32) u32 {
     // byte as a normal column and walk past the line end.
     const last = lastCharStart(pt, start, line_len);
     if (pos >= last) return pos;
-    return nextCharBoundary(pt, pos);
+    var scan = DocScan.init(pt, false);
+    return nextCharBoundary(&scan, pos);
 }
 
 // -------------------------------- down / up ---------------------------------
@@ -269,19 +324,13 @@ fn isBlankByte(b: u8) bool {
     return b == ' ' or b == '\t' or b == '\n' or b == '\r';
 }
 
-/// Byte at `pos`, or a space when `pos` is at the end of the document
-/// (end of text behaves like trailing whitespace for word motions).
-fn byteOrSpace(pt: *const PieceTable, pos: u32) u8 {
-    if (pos >= pt.len()) return ' ';
-    return pt.byteAt(pos);
-}
-
 /// The start of the last character in the line segment [start, start+line_len).
 /// Multibyte-safe: lineEnd/$/j/k/}/e must land on a character boundary, not
 /// the last byte (a CJK char's continuation byte would corrupt the cursor).
 fn lastCharStart(pt: *const PieceTable, start: u32, line_len: u32) u32 {
     if (line_len == 0) return start;
-    return prevCharBoundary(pt, start + line_len);
+    var scan = DocScan.init(pt, true);
+    return prevCharBoundary(&scan, start + line_len);
 }
 
 /// w — start of the next word (crosses newlines; each punctuation char is a
@@ -290,24 +339,25 @@ fn lastCharStart(pt: *const PieceTable, start: u32, line_len: u32) u32 {
 fn wordNext(pt: *const PieceTable, pos: u32) u32 {
     const len = pt.len();
     if (pos >= len) return pos;
-    const c = pt.byteAt(pos);
+    var scan = DocScan.init(pt, false);
+    const c = scan.byte(pos);
     if (isWordByte(c)) {
         // Skip the rest of the current word, then any blanks.
         var p = pos;
-        while (p < len and isWordByte(pt.byteAt(p))) : (p += 1) {}
-        while (p < len and isBlankByte(pt.byteAt(p))) : (p += 1) {}
+        while (p < len and isWordByte(scan.byte(p))) : (p += 1) {}
+        while (p < len and isBlankByte(scan.byte(p))) : (p += 1) {}
         return if (p >= len) wordEndFallback(pt, pos) else p;
     }
     if (isBlankByte(c)) {
         var p = pos;
-        while (p < len and isBlankByte(pt.byteAt(p))) : (p += 1) {}
+        while (p < len and isBlankByte(scan.byte(p))) : (p += 1) {}
         return if (p >= len) wordEndFallback(pt, pos) else p;
     }
     // On punctuation: a run of punctuation is one word (vim: "..." is one
     // word). Skip the whole run, then blanks, landing on the next word.
     var p = pos;
-    while (p < len and !isWordByte(pt.byteAt(p)) and !isBlankByte(pt.byteAt(p))) : (p += 1) {}
-    while (p < len and isBlankByte(pt.byteAt(p))) : (p += 1) {}
+    while (p < len and !isWordByte(scan.byte(p)) and !isBlankByte(scan.byte(p))) : (p += 1) {}
+    while (p < len and isBlankByte(scan.byte(p))) : (p += 1) {}
     return if (p >= len) wordEndFallback(pt, pos) else p;
 }
 
@@ -328,49 +378,50 @@ fn wordEndFallback(pt: *const PieceTable, pos: u32) u32 {
 fn wordNextEnd(pt: *const PieceTable, pos: u32) u32 {
     const len = pt.len();
     if (pos >= len) return pos;
-    const c = pt.byteAt(pos);
+    var scan = DocScan.init(pt, false);
+    const c = scan.byte(pos);
     if (isWordByte(c)) {
-        if (pos + 1 < len and isWordByte(pt.byteAt(pos + 1))) {
+        if (pos + 1 < len and isWordByte(scan.byte(pos + 1))) {
             // Mid-word: end of the current word.
             var p = pos + 1;
-            while (p < len and isWordByte(pt.byteAt(p))) : (p += 1) {}
-            return prevCharBoundary(pt, p);
+            while (p < len and isWordByte(scan.byte(p))) : (p += 1) {}
+            return prevCharBoundary(&scan, p);
         }
         // On the last char of a word: end of the NEXT word.
         var p = pos + 1;
-        while (p < len and isBlankByte(pt.byteAt(p))) : (p += 1) {}
+        while (p < len and isBlankByte(scan.byte(p))) : (p += 1) {}
         if (p >= len) return pos;
-        if (isWordByte(pt.byteAt(p))) {
-            while (p < len and isWordByte(pt.byteAt(p))) : (p += 1) {}
-            return prevCharBoundary(pt, p);
+        if (isWordByte(scan.byte(p))) {
+            while (p < len and isWordByte(scan.byte(p))) : (p += 1) {}
+            return prevCharBoundary(&scan, p);
         }
         // punctuation run: e lands on its last char (vim: "..." -> last dot)
-        while (p < len and !isWordByte(pt.byteAt(p)) and !isBlankByte(pt.byteAt(p))) : (p += 1) {}
-        return prevCharBoundary(pt, p);
+        while (p < len and !isWordByte(scan.byte(p)) and !isBlankByte(scan.byte(p))) : (p += 1) {}
+        return prevCharBoundary(&scan, p);
     }
     if (isBlankByte(c)) {
         var p = pos;
-        while (p < len and isBlankByte(pt.byteAt(p))) : (p += 1) {}
+        while (p < len and isBlankByte(scan.byte(p))) : (p += 1) {}
         if (p >= len) return pos;
-        if (isWordByte(pt.byteAt(p))) {
-            while (p < len and isWordByte(pt.byteAt(p))) : (p += 1) {}
-            return prevCharBoundary(pt, p);
+        if (isWordByte(scan.byte(p))) {
+            while (p < len and isWordByte(scan.byte(p))) : (p += 1) {}
+            return prevCharBoundary(&scan, p);
         }
-        while (p < len and !isWordByte(pt.byteAt(p)) and !isBlankByte(pt.byteAt(p))) : (p += 1) {}
-        return prevCharBoundary(pt, p);
+        while (p < len and !isWordByte(scan.byte(p)) and !isBlankByte(scan.byte(p))) : (p += 1) {}
+        return prevCharBoundary(&scan, p);
     }
     // On punctuation: end of the next punctuation run (vim: e over "..."
     // stops on the last dot), skipping any blanks after the run.
     var p = pos + 1;
-    while (p < len and isBlankByte(pt.byteAt(p))) : (p += 1) {}
+    while (p < len and isBlankByte(scan.byte(p))) : (p += 1) {}
     if (p >= len) return pos;
-    if (isWordByte(pt.byteAt(p))) {
-        while (p < len and isWordByte(pt.byteAt(p))) : (p += 1) {}
-        return prevCharBoundary(pt, p);
+    if (isWordByte(scan.byte(p))) {
+        while (p < len and isWordByte(scan.byte(p))) : (p += 1) {}
+        return prevCharBoundary(&scan, p);
     }
     // punctuation run: land on its last character
-    while (p < len and !isWordByte(pt.byteAt(p)) and !isBlankByte(pt.byteAt(p))) : (p += 1) {}
-    return prevCharBoundary(pt, p);
+    while (p < len and !isWordByte(scan.byte(p)) and !isBlankByte(scan.byte(p))) : (p += 1) {}
+    return prevCharBoundary(&scan, p);
 }
 
 /// b — start of the word the byte before the cursor belongs to (skipping
@@ -379,15 +430,16 @@ fn wordNextEnd(pt: *const PieceTable, pos: u32) u32 {
 /// punctuation is one word, same as `w` (vim semantics).
 fn wordPrev(pt: *const PieceTable, pos: u32) u32 {
     if (pos == 0) return 0;
+    var scan = DocScan.init(pt, true);
     var p = pos - 1;
     // Skip blanks backwards; if only blanks precede the cursor, land on the
     // first byte of the document.
-    while (p > 0 and isBlankByte(pt.byteAt(p))) : (p -= 1) {}
-    if (isBlankByte(pt.byteAt(p))) return 0;
+    while (p > 0 and isBlankByte(scan.byte(p))) : (p -= 1) {}
+    if (isBlankByte(scan.byte(p))) return 0;
     // Land on the start of the word/punctuation run containing p.
-    const word_run = isWordByte(pt.byteAt(p));
+    const word_run = isWordByte(scan.byte(p));
     while (p > 0) : (p -= 1) {
-        const b = pt.byteAt(p - 1);
+        const b = scan.byte(p - 1);
         if (isBlankByte(b) or isWordByte(b) != word_run) break;
     }
     return p;
@@ -399,18 +451,19 @@ fn wordPrev(pt: *const PieceTable, pos: u32) u32 {
 /// end. With no word end before the cursor (inside/at the first word), vim
 /// lands on the first byte of the buffer.
 fn wordPrevEnd(pt: *const PieceTable, pos: u32) u32 {
+    var scan = DocScan.init(pt, true);
     var p = pos;
     while (p > 0) {
-        p = prevCharBoundary(pt, p); // previous character's start
-        const c = pt.byteAt(p);
+        p = prevCharBoundary(&scan, p); // previous character's start
+        const c = scan.byte(p);
         if (isBlankByte(c)) continue;
         // p is a word's last character iff the next character starts a
         // different class (word/blank/punct) or p is the doc's last char.
         // Multibyte-safe: walking char-by-char (not byte-by-byte) so CJK
         // words don't fall through to 0.
-        const next = nextCharBoundary(pt, p);
+        const next = nextCharBoundary(&scan, p);
         if (next >= pt.len()) return p;
-        const nc = pt.byteAt(next);
+        const nc = scan.byte(next);
         if (isBlankByte(nc) or isWordByte(nc) != isWordByte(c)) return p;
     }
     return 0;
@@ -424,10 +477,11 @@ fn lineFirstNonBlank(pt: *const PieceTable, pos: u32) u32 {
     const line = pt.lineOf(pos);
     const start = pt.lineStart(line);
     const line_len = pt.lineLen(line);
+    var scan = DocScan.init(pt, false);
     var p = start;
     const end = start + line_len;
     while (p < end) : (p += 1) {
-        const b = pt.byteAt(p);
+        const b = scan.byte(p);
         if (b != ' ' and b != '\t') return p;
     }
     if (line_len == 0) return start;
@@ -514,10 +568,11 @@ fn findInLine(pt: *const PieceTable, pos: u32, ch: u8, dir: i8, till: bool) u32 
     const line = pt.lineOf(pos);
     const start = pt.lineStart(line);
     const end = start + pt.lineLen(line);
+    var scan = DocScan.init(pt, dir < 0);
     if (dir > 0) {
         var i = pos + 1;
         while (i < end) : (i += 1) {
-            if (pt.byteAt(i) == ch) {
+            if (scan.byte(i) == ch) {
                 if (till) {
                     const t = i - 1;
                     return if (t < start) start else t; // can't land before col 0
@@ -528,7 +583,7 @@ fn findInLine(pt: *const PieceTable, pos: u32, ch: u8, dir: i8, till: bool) u32 
     } else {
         var i = pos;
         while (i > start) : (i -= 1) {
-            if (pt.byteAt(i - 1) == ch) {
+            if (scan.byte(i - 1) == ch) {
                 if (till) return i; // one char after the match
                 return i - 1;
             }
@@ -549,12 +604,13 @@ fn matchPair(pt: *const PieceTable, pos: u32) u32 {
     const line = pt.lineOf(pos);
     const start = pt.lineStart(line);
     const end = start + pt.lineLen(line);
+    var scan = DocScan.init(pt, false);
     var p = pos;
-    var b = pt.byteAt(p);
+    var b = scan.byte(p);
     if (!isOpenBracket(b) and !isCloseBracket(b)) {
         var found: ?u32 = null;
         while (p < end) : (p += 1) {
-            const c = pt.byteAt(p);
+            const c = scan.byte(p);
             if (isOpenBracket(c) or isCloseBracket(c)) {
                 found = p;
                 break;
@@ -562,12 +618,13 @@ fn matchPair(pt: *const PieceTable, pos: u32) u32 {
         }
         const f = found orelse return pos;
         p = f;
-        b = pt.byteAt(p);
+        b = scan.byte(p);
     }
     if (isOpenBracket(b)) {
-        return matchOpen(pt, p, b) orelse pos;
+        return matchOpen(&scan, p, b) orelse pos;
     }
-    return matchClose(pt, p, b) orelse pos;
+    var close_scan = DocScan.init(pt, true);
+    return matchClose(&close_scan, p, b) orelse pos;
 }
 
 fn isOpenBracket(b: u8) bool {
@@ -591,13 +648,13 @@ fn counterpart(b: u8) u8 {
 }
 
 /// Depth-first scan forward from an opening bracket to its close.
-fn matchOpen(pt: *const PieceTable, open_pos: u32, open: u8) ?u32 {
+fn matchOpen(scan: *DocScan, open_pos: u32, open: u8) ?u32 {
     const close = counterpart(open);
-    const len = pt.len();
+    const len = scan.pt.len();
     var depth: u32 = 1;
     var p = open_pos + 1;
     while (p < len) : (p += 1) {
-        const c = pt.byteAt(p);
+        const c = scan.byte(p);
         if (c == open) {
             depth += 1;
         } else if (c == close) {
@@ -609,13 +666,13 @@ fn matchOpen(pt: *const PieceTable, open_pos: u32, open: u8) ?u32 {
 }
 
 /// Depth-first scan backward from a closing bracket to its open.
-fn matchClose(pt: *const PieceTable, close_pos: u32, close: u8) ?u32 {
+fn matchClose(scan: *DocScan, close_pos: u32, close: u8) ?u32 {
     const open = counterpart(close);
     var depth: u32 = 1;
     var p = close_pos;
     while (p > 0) {
         p -= 1;
-        const c = pt.byteAt(p);
+        const c = scan.byte(p);
         if (c == close) {
             depth += 1;
         } else if (c == open) {
