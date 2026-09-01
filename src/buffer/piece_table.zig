@@ -103,6 +103,9 @@ pub const PieceTable = struct {
             .line_starts = .empty,
             .doc_len = @intCast(mapping.len),
             .line_starts_valid = false,
+            .scratch = .empty,
+            .byte_hint_index = 0,
+            .byte_hint_offset = 0,
         };
         errdefer self.deinit();
         if (mapping.len > 0) {
