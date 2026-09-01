@@ -4,6 +4,7 @@
 //!   nextEvent → Mode state machine → execute result against PieceTable
 //!   → render frame (line numbers + text + status bar) → vaxis diff output.
 const std = @import("std");
+const builtin = @import("builtin");
 const vaxis = @import("vaxis");
 
 const buffer = @import("buffer/root.zig");
@@ -9466,7 +9467,15 @@ fn parseLineArg(arg: []const u8) ?u32 {
 }
 
 pub fn main(init: std.process.Init) !void {
-    var app = try App.create(init);
+    // Debug builds use the DebugAllocator, which captures a stack trace on
+    // EVERY allocation — and MachO/DWARF stack unwinding on macOS is slow
+    // enough to make typing visibly laggy once an LSP server is attached
+    // (each keystroke parses a large JSON response = thousands of allocs).
+    // The libc allocator keeps dev builds responsive; safety checks in the
+    // code itself are unaffected. Release builds already use c_allocator.
+    var app_init = init;
+    if (builtin.mode == .Debug and builtin.link_libc) app_init.gpa = std.heap.c_allocator;
+    var app = try App.create(app_init);
     defer app.destroy();
 
     // args: oz [file[:line]] ...
