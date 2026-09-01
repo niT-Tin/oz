@@ -89,6 +89,14 @@ pub const Client = struct {
     /// dupe) that deinit must free; OZ_LSP_CMD's entry is a borrowed env slice.
     argv_override_first_owned: bool = false,
 
+    /// Documents currently open in the server (uri hash → {}). didOpen
+    /// inserts, didClose removes. Buffer switches do NOT close the previous
+    /// document (LSP servers track several), so switching back to an open,
+    /// unchanged document costs nothing — the App checks `isDocOpen` and
+    /// skips the re-open (and its full-text copy) entirely. Lazily
+    /// initialized (hand-built test Clients skip it).
+    open_docs: ?std.AutoHashMap(u64, void) = null,
+
     thread: ?std.Thread = null,
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Set by the reader thread when the server's stdout hit EOF or a read
@@ -343,6 +351,7 @@ pub const Client = struct {
         // deinit), so the pending array itself is all we own.
         self.queue.deinit(self.alloc);
         self.pending.deinit(self.alloc);
+        if (self.open_docs) |*od| od.deinit();
         for (self.completion_triggers.items) |t| self.alloc.free(t);
         self.completion_triggers.deinit(self.alloc);
         if (self.argv_override) |arr| {
@@ -387,6 +396,26 @@ pub const Client = struct {
         var changes = params.get("contentChanges").?;
         const change = &changes.array.items[0].object;
         self.alloc.free(change.get("text").?.string);
+        // An incremental change carries a nested {start, end} range object;
+        // ObjectMap.deinit does not recurse, so free its maps here.
+        if (change.get("range")) |rv| {
+            if (rv == .object) {
+                var r = rv;
+                if (r.object.get("start")) |sv| {
+                    if (sv == .object) {
+                        var s = sv;
+                        s.object.deinit(self.alloc);
+                    }
+                }
+                if (r.object.get("end")) |ev| {
+                    if (ev == .object) {
+                        var e = ev;
+                        e.object.deinit(self.alloc);
+                    }
+                }
+                r.object.deinit(self.alloc);
+            }
+        }
         change.deinit(self.alloc);
         changes.array.deinit();
         params.deinit(self.alloc);
@@ -421,6 +450,26 @@ pub const Client = struct {
 
     // ---- text sync ----
 
+    fn hashUri(uri: []const u8) u64 {
+        return std.hash.Wyhash.hash(0, uri);
+    }
+
+    /// Lazily-created set of documents the server has open.
+    fn docs(self: *Client) *std.AutoHashMap(u64, void) {
+        if (self.open_docs == null) {
+            self.open_docs = std.AutoHashMap(u64, void).init(self.alloc);
+        }
+        return &self.open_docs.?;
+    }
+
+    /// Whether the server currently has `uri` open (a didOpen was sent and no
+    /// didClose since). The App uses this to skip re-opening a document whose
+    /// server copy is still current.
+    pub fn isDocOpen(self: *const Client, uri: []const u8) bool {
+        const d = self.open_docs orelse return false;
+        return d.contains(hashUri(uri));
+    }
+
     fn didOpen(self: *Client, text: []const u8) !void {
         var td = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer td.deinit(self.alloc);
@@ -451,9 +500,15 @@ pub const Client = struct {
         var v = std.json.Value{ .object = params };
         defer self.freeDidOpenParams(&v);
         try self.notify("textDocument/didOpen", v);
+        self.docs().put(hashUri(self.uri), {}) catch {};
     }
 
-    pub fn didChange(self: *Client, text: []const u8) !void {
+    /// Send a textDocument/didChange. `range` non-null sends an incremental
+    /// change ({range, text}: the bytes [range.start, range.end) of the
+    /// PRE-CHANGE document were replaced by `text`) — the per-keystroke path;
+    /// null sends a full-document replacement (the fallback for edits whose
+    /// range is not tracked: undo/redo, multi-cursor ops, paste, …).
+    pub fn didChange(self: *Client, range: ?types.Range, text: []const u8) !void {
         self.version += 1;
         var td = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer td.deinit(self.alloc);
@@ -463,6 +518,21 @@ pub const Client = struct {
         try td.put(self.alloc, "version", .{ .integer = self.version });
         var change = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer change.deinit(self.alloc);
+        if (range) |r| {
+            var range_obj = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+            errdefer range_obj.deinit(self.alloc);
+            var start_obj = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+            errdefer start_obj.deinit(self.alloc);
+            try start_obj.put(self.alloc, "line", .{ .integer = r.start.line });
+            try start_obj.put(self.alloc, "character", .{ .integer = r.start.character });
+            var end_obj = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+            errdefer end_obj.deinit(self.alloc);
+            try end_obj.put(self.alloc, "line", .{ .integer = r.end.line });
+            try end_obj.put(self.alloc, "character", .{ .integer = r.end.character });
+            try range_obj.put(self.alloc, "start", .{ .object = start_obj });
+            try range_obj.put(self.alloc, "end", .{ .object = end_obj });
+            try change.put(self.alloc, "range", .{ .object = range_obj });
+        }
         const text_copy = try self.alloc.dupe(u8, text);
         errdefer self.alloc.free(text_copy);
         try change.put(self.alloc, "text", .{ .string = text_copy });
@@ -490,17 +560,26 @@ pub const Client = struct {
         var v = std.json.Value{ .object = params };
         defer self.freeDidCloseParams(&v);
         try self.notify("textDocument/didClose", v);
+        if (self.open_docs) |*od| _ = od.remove(hashUri(self.uri));
     }
 
-    /// Switch the client to a new document of the same filetype (the editor
-    /// switched buffers): close the old document, retarget `uri`, open the
-    /// new one. Versions keep increasing across the client's lifetime, which
-    /// LSP requires.
-    pub fn switchDocument(self: *Client, new_uri: []const u8, text: []const u8) !void {
-        try self.didClose();
+    /// Retarget the client's current document without talking to the server
+    /// (used when switching to a document the server already has open with
+    /// current content — no didClose/didOpen needed).
+    pub fn retarget(self: *Client, new_uri: []const u8) !void {
         const copy = try self.alloc.dupe(u8, new_uri);
         self.alloc.free(self.uri);
         self.uri = copy;
+    }
+
+    /// Switch the client to a new document of the same filetype (the editor
+    /// switched buffers): open the new one. The PREVIOUS document is left
+    /// open — LSP servers track several documents at once, and the App
+    /// skips this entirely (via `retarget`) when the target is already open
+    /// and unchanged, so switching back is free. Versions keep increasing
+    /// across the client's lifetime, which LSP requires.
+    pub fn switchDocument(self: *Client, new_uri: []const u8, text: []const u8) !void {
+        try self.retarget(new_uri);
         try self.didOpen(text);
     }
 
@@ -898,6 +977,7 @@ fn testClient(alloc: std.mem.Allocator, io: std.Io, stdin: std.Io.File) !Client 
 fn cleanupClient(alloc: std.mem.Allocator, c: *Client) void {
     c.queue.deinit(alloc);
     c.pending.deinit(alloc);
+    if (c.open_docs) |*od| od.deinit();
     alloc.free(c.uri);
 }
 
@@ -914,8 +994,8 @@ test "didOpen/didChange: document version is monotonic (1, 2, 3, ...)" {
     defer cleanupClient(alloc, &client);
 
     try client.didOpen("hello");
-    try client.didChange("hello!");
-    try client.didChange("hello!!");
+    try client.didChange(null, "hello!");
+    try client.didChange(null, "hello!!");
 
     var reader = FrameReader.init(alloc, read_end, io);
     defer reader.deinit();
