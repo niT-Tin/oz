@@ -44,7 +44,6 @@ const blame_hold_ms: i64 = 1000;
 /// max_file_length — blame on huge files is slow and useless).
 const max_blame_lines: u32 = 40000;
 
-
 /// LSP navigation request kinds (K / gd / gD / gr / gI / gs).
 const NavAction = enum { none, hover, definition, declaration, references, implementation, signature };
 
@@ -123,6 +122,21 @@ const ScopeAnim = struct {
     const duration_ms: i128 = 500;
 };
 
+/// Cached tree-sitter spans for one buffer's visible byte range. The query
+/// result depends only on the tree (identified by the buffer's history
+/// revision) and the byte range, so while both are unchanged the renderer
+/// reuses the previous frame's spans instead of re-running the query — the
+/// common case for cursor movement inside a window and for the ~30 scope-
+/// animation frames that repaint the same viewport. Owned via self.alloc
+/// (the frame arena would free it before the next frame); see
+/// clearSpanCache, which must be called when the buffer's text is replaced.
+const SpanRangeCache = struct {
+    revision: u64, // buf.history.revision when computed
+    start: u32, // byte range the spans cover (inclusive start)
+    end: u32, // byte range the spans cover (exclusive end)
+    spans: []syntax.Span, // owned via self.alloc
+};
+
 /// Cached result of `syntax.Highlighter.scopeAt` for one (window, buffer)
 /// pair. scopeAt walks the tree from the ROOT on every call — on a large
 /// file that is a linear scan of the root's children, which is the single
@@ -194,6 +208,9 @@ const App = struct {
         /// (markDirty) — line numbers drift after edits, and re-folding is
         /// cheap; vim-style fold carryover across edits is out of scope.
         folds: std.ArrayList(editor.fold.Range) = .empty,
+        /// Cached syntax spans for this buffer's last-rendered visible byte
+        /// range (owned; see SpanRangeCache). null until the first render.
+        span_cache: ?SpanRangeCache = null,
     };
 
     /// One split window: which buffer it shows plus its own cursor/viewport.
@@ -1166,6 +1183,7 @@ const App = struct {
             buf.pt.deinit();
             buf.folds.deinit(self.alloc);
             if (buf.hl) |*h| h.deinit();
+            if (buf.span_cache) |*sc| self.alloc.free(sc.spans);
             if (buf.path) |p| self.alloc.free(p);
         }
         self.buffers.deinit(self.alloc);
@@ -4451,6 +4469,15 @@ const App = struct {
         self.blame_ghost_label = null;
     }
 
+    /// Drop `buf`'s cached syntax spans (owned). Called when the buffer's
+    /// text is replaced in place (a new file loaded into the same slot):
+    /// the cache key would otherwise collide across files (a fresh history
+    /// starts at revision 0 with an identical byte range).
+    fn clearSpanCache(self: *App, buf: *Buffer) void {
+        if (buf.span_cache) |*sc| self.alloc.free(sc.spans);
+        buf.span_cache = null;
+    }
+
     /// Load blame for the current file when current-line blame is active,
     /// the repo check has passed (git_branch set), the file is under the
     /// big-file limit, and the cached blame is stale/missing. No-op
@@ -5455,6 +5482,7 @@ const App = struct {
         buf.pt.deinit();
         buf.folds.deinit(self.alloc);
         if (buf.hl) |*h| h.deinit();
+        if (buf.span_cache) |*sc| self.alloc.free(sc.spans);
         if (buf.path) |p| self.alloc.free(p);
         if (self.current >= self.buffers.items.len) self.current = self.buffers.items.len - 1;
         if (buf_idx < self.current) self.current -= 1;
@@ -7207,7 +7235,45 @@ const App = struct {
                 last_visible = foldNextLine(buf, last_visible);
             }
         }
-        const merged = try self.visibleSpansFor(buf, a, w.view_top, last_visible - w.view_top + 1);
+        // Syntax spans covering the visible byte range. The tree-sitter
+        // query is the single most expensive per-frame item (it runs per
+        // visible range), and its result is a pure function of (tree
+        // revision, byte range) — so cache it per buffer and reuse it while
+        // both are unchanged. Cursor movement inside a window keeps the
+        // range fixed, and the ~30 scope-animation frames repaint the same
+        // viewport, so this turns the common case into a pointer fetch.
+        // visibleSpansFor still owns the query + reparse logic (and lazily
+        // initializes buf.hl on the first miss).
+        const span_revision = buf.history.revision;
+        const span_rows = last_visible - w.view_top + 1;
+        const span_start = buf.pt.lineStart(@min(w.view_top, line_count -| 1));
+        const span_vbottom = @min(w.view_top + span_rows, line_count);
+        const span_end: u32 = if (span_vbottom >= line_count) buf.pt.len() else buf.pt.lineStart(span_vbottom);
+        var merged: []syntax.Span = undefined;
+        if (buf.span_cache) |*sc| {
+            if (sc.revision == span_revision and sc.start == span_start and sc.end == span_end) {
+                merged = sc.spans;
+            } else {
+                const fresh = try self.visibleSpansFor(buf, a, w.view_top, span_rows);
+                if (sc.spans.len > 0) self.alloc.free(sc.spans);
+                sc.* = .{
+                    .revision = span_revision,
+                    .start = span_start,
+                    .end = span_end,
+                    .spans = try self.alloc.dupe(syntax.Span, fresh),
+                };
+                merged = sc.spans;
+            }
+        } else {
+            const fresh = try self.visibleSpansFor(buf, a, w.view_top, span_rows);
+            buf.span_cache = .{
+                .revision = span_revision,
+                .start = span_start,
+                .end = span_end,
+                .spans = try self.alloc.dupe(syntax.Span, fresh),
+            };
+            merged = buf.span_cache.?.spans;
+        }
 
         // scope highlight (nvim snacks.indent.scope): the byte range of the
         // block containing this window's cursor, converted to a line range.
@@ -9397,6 +9463,10 @@ const App = struct {
         try self.vx.enterAltScreen(self.tty.writer());
         try self.loop.start();
         defer self.loop.stop();
+        // monotonic ms of the last frame we actually drew — poll-mode
+        // iterations without events skip render() until 16ms have elapsed
+        // (the animation frame cadence), so idle polling costs no renders.
+        var last_render_ms: i64 = 0;
         while (!self.quit) {
             // LSP messages first: responses fill request slots, notifications
             // reach the handler before the frame renders; then consume any
@@ -9467,6 +9537,7 @@ const App = struct {
             }
             if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready or term_ready) {
                 try self.render();
+                last_render_ms = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
                 continue;
             }
             // Auto-refresh inlay hints when the view scrolls (LSP available
@@ -9484,13 +9555,20 @@ const App = struct {
             // the blame hold is counting, or a terminal is open (its reader
             // thread has no wake hook), poll instead of blocking so the
             // frame advances without keypresses (16ms ≈ 60fps; vaxis diffs
-            // the output).
+            // the output). The poll slice is SHORT (1ms) — a keypress must
+            // wake the loop within ~1ms, not up to 16ms: while the animation
+            // runs, the loop would otherwise sleep past the key and add a
+            // full frame's latency to every keypress (a "G k x20" script
+            // spends its whole run inside the 500ms animation window).
+            // The render pacing below keeps animation frames at ~16ms.
             if (self.scopeAnimActive() or self.blameHoldActive() or (builtin.os.tag == .linux and self.term_pane != null)) {
-                std.Io.sleep(self.io, .fromMilliseconds(16), .real) catch {};
+                std.Io.sleep(self.io, .fromMilliseconds(1), .real) catch {};
             } else {
                 try self.loop.pollEvent();
             }
+            var handled = false;
             while (try self.loop.tryEvent()) |event| {
+                handled = true;
                 switch (event) {
                     .key_press => |key| try self.handleKey(key),
                     .paste => |text| {
@@ -9513,7 +9591,11 @@ const App = struct {
                     else => {},
                 }
             }
-            try self.render();
+            const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
+            if (handled or now_ms - last_render_ms >= 16) {
+                try self.render();
+                last_render_ms = now_ms;
+            }
         }
 
         try self.vx.exitAltScreen(self.tty.writer());
@@ -9952,6 +10034,7 @@ pub fn main(init: std.process.Init) !void {
                     error.FileNotFound => {
                         app.cur().pt.deinit();
                         app.cur().pt = try buffer.PieceTable.init(app.alloc, "");
+                        app.clearSpanCache(app.cur());
                         if (app.cur().path) |p| app.alloc.free(p);
                         app.cur().path = try app.absolutePath(file_path);
                     },
@@ -9980,6 +10063,7 @@ pub fn main(init: std.process.Init) !void {
             _ = try file.readPositionalAll(app.io, bytes, 0);
             app.cur().pt.deinit();
             app.cur().pt = try buffer.PieceTable.init(app.alloc, bytes);
+            app.clearSpanCache(app.cur());
             if (app.cur().path) |p| app.alloc.free(p);
             // Store an absolute path so LSP (uri building, server matching)
             // works for relative CLI args like `oz build.zig` — filetypeOf
