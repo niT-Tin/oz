@@ -44,6 +44,7 @@ const blame_hold_ms: i64 = 1000;
 /// max_file_length — blame on huge files is slow and useless).
 const max_blame_lines: u32 = 40000;
 
+
 /// LSP navigation request kinds (K / gd / gD / gr / gI / gs).
 const NavAction = enum { none, hover, definition, declaration, references, implementation, signature };
 
@@ -120,6 +121,34 @@ const ScopeAnim = struct {
     cursor_line: u32,
     start_ms: i128, // monotonic clock, ms
     const duration_ms: i128 = 500;
+};
+
+/// Cached result of `syntax.Highlighter.scopeAt` for one (window, buffer)
+/// pair. scopeAt walks the tree from the ROOT on every call — on a large
+/// file that is a linear scan of the root's children, which is the single
+/// most expensive thing in the render path. The result depends only on the
+/// tree (identified by the buffer's history revision) and the queried byte,
+/// so it is sound to reuse it while both are unchanged — e.g. the ~30
+/// animation frames after a scope change, or split windows sharing a buffer.
+const ScopeCache = struct {
+    buf: usize, // buffers.items index
+    win: usize, // windows.items index
+    revision: u64, // buf.history.revision when computed
+    cursor: u32, // cursor byte the scope was computed for
+    start_line: u32,
+    end_line: u32,
+    indent_col: u32,
+    has: bool,
+};
+
+/// Cached current-line blame ghost label (owned via self.alloc). The ghost
+/// repaints every idle frame, so the formatted label is rebuilt only when the
+/// blame LINE or the blame DATA changed — the entry pointer identifies both
+/// (entries live in git_blame's own array, which is replaced on refresh).
+const BlameGhostLabel = struct {
+    line: u32,
+    entry: *const git.BlameEntry,
+    label: []u8, // owned
 };
 
 /// Embedded terminal pane (Linux only; `void` elsewhere so the App field
@@ -394,6 +423,8 @@ const App = struct {
     /// offset seen by the renderer and when it changed.
     blame_last_cursor: u32 = 0,
     blame_move_ms: i64 = 0,
+    /// Cached current-line blame ghost label (see BlameGhostLabel).
+    blame_ghost_label: ?BlameGhostLabel = null,
     /// Hunk preview float (<leader>hp); owned patch text.
     git_preview: ?GitPreview = null,
     /// <leader>hp hit while the diff was stale: show the preview when the
@@ -442,6 +473,9 @@ const App = struct {
     /// Scope-highlight animation state (null when idle / no scope). Restarted
     /// whenever the focused window's scope block changes; see ScopeAnim.
     scope_anim: ?ScopeAnim = null,
+    /// Cached scopeAt result for the last rendered (window, buffer, cursor,
+    /// revision) — recomputed only when the tree or the cursor byte changed.
+    scope_cache: ?ScopeCache = null,
     /// Set when the inlay data no longer matches the document (after an
     /// insert session ends) until a fresh response arrives: renderers hide
     /// stale hints instead of drawing them at shifted, wrong columns, and
@@ -1191,6 +1225,7 @@ const App = struct {
         if (self.git_diff_path) |p| self.alloc.free(p);
         if (self.git_queued) |q| self.alloc.free(q.path);
         self.git_diff.deinit(self.alloc);
+        self.clearBlameGhostLabel();
         if (self.git_blame) |*b| b.deinit(self.alloc);
         if (self.git_blame_path) |bp| self.alloc.free(bp);
         if (self.git_preview) |p| self.alloc.free(p.text);
@@ -3462,6 +3497,9 @@ const App = struct {
     /// arena slices so they live for the frame. Hints with a character inside
     /// the line's text are kept at that column — the renderer splices them in.
     fn lineHints(self: *App, a: std.mem.Allocator, line: u32) ![]InlayHint {
+        // common fast path: no hints in the buffer at all — skip the
+        // ArrayList dance entirely (this is called once per rendered row)
+        if (self.inlay_hints.items.len == 0) return &.{};
         var out = std.ArrayList(InlayHint).empty;
         for (self.inlay_hints.items) |hint| {
             if (hint.line != line) continue;
@@ -4211,6 +4249,7 @@ const App = struct {
                 }
             },
             .blame => {
+                self.clearBlameGhostLabel();
                 if (self.git_blame) |*b| b.deinit(self.alloc);
                 self.git_blame = null;
                 // blame must describe the CURRENT file; a stale response
@@ -4238,6 +4277,7 @@ const App = struct {
                 // and the blame describes the old file — invalidate it so
                 // the status refresh reloads blame for the new content
                 if (self.blame_active) {
+                    self.clearBlameGhostLabel();
                     if (self.git_blame) |*b| b.deinit(self.alloc);
                     self.git_blame = null;
                     if (self.git_blame_path) |bp| self.alloc.free(bp);
@@ -4402,6 +4442,13 @@ const App = struct {
         }
         self.blame_active = true;
         self.maybeLoadBlame();
+    }
+
+    /// Drop the cached blame-ghost label — called whenever git_blame is
+    /// replaced or invalidated so the cache never outlives its data.
+    fn clearBlameGhostLabel(self: *App) void {
+        if (self.blame_ghost_label) |g| self.alloc.free(g.label);
+        self.blame_ghost_label = null;
     }
 
     /// Load blame for the current file when current-line blame is active,
@@ -7009,34 +7056,80 @@ const App = struct {
     }
 
     /// true when buffer line `l` has no non-whitespace content.
+    /// Reads the line with ONE copyRange into a stack buffer (chunked for
+    /// long lines) instead of per-char byteAt — byteAt is O(pieces) per byte,
+    /// so a per-char scan of a many-piece buffer is quadratic; a copyRange is
+    /// O(pieces + len) total.
     fn isBlankLine(self: *App, buf: *Buffer, l: u32) bool {
         _ = self;
         const ls = buf.pt.lineStart(l);
         const ll = buf.pt.lineLen(l);
-        var i: u32 = 0;
-        while (i < ll) : (i += 1) {
-            const b = buf.pt.byteAt(ls + i);
-            if (b != ' ' and b != '\t') return false;
+        var chunk: [128]u8 = undefined;
+        var off: u32 = 0;
+        while (off < ll) {
+            const n = @min(ll - off, @as(u32, chunk.len));
+            buf.pt.copyRange(ls + off, chunk[0..n]);
+            for (chunk[0..n]) |b| {
+                if (b != ' ' and b != '\t') return false;
+            }
+            off += n;
         }
         return true;
     }
 
     /// Expanded indent levels (columns / tab_width) of buffer line `l`.
+    /// Same single-copyRange read as isBlankLine (the indent region is at the
+    /// line start, so the first chunk almost always decides).
     fn lineIndentLevels(self: *App, buf: *Buffer, l: u32) u32 {
         _ = self;
         const ls = buf.pt.lineStart(l);
         const ll = buf.pt.lineLen(l);
+        var chunk: [128]u8 = undefined;
         var cols: u32 = 0;
-        var i: u32 = 0;
-        while (i < ll) : (i += 1) {
-            const b = buf.pt.byteAt(ls + i);
-            if (b == ' ') {
-                cols += 1;
-            } else if (b == '\t') {
-                cols += tab_width;
-            } else break;
+        var off: u32 = 0;
+        while (off < ll) {
+            const n = @min(ll - off, @as(u32, chunk.len));
+            buf.pt.copyRange(ls + off, chunk[0..n]);
+            for (chunk[0..n]) |b| {
+                if (b == ' ') {
+                    cols += 1;
+                } else if (b == '\t') {
+                    cols += tab_width;
+                } else return cols / tab_width;
+            }
+            off += n;
         }
         return cols / tab_width;
+    }
+
+    /// Indent levels of the nearest non-blank line around `line`, up to 500
+    /// lines out — the context for blank-line indent-guide continuation.
+    /// Scans upward first, then downward from `line + 1` (the original
+    /// per-row semantics). 0 when the 500-line window is all blank.
+    fn blankContextLevels(self: *App, buf: *Buffer, line: u32, line_count: u32) u32 {
+        var ctx_levels: u32 = 0;
+        var ctx: i64 = @as(i64, @intCast(line)) - 1;
+        var dir: i64 = -1;
+        var scanned: usize = 0;
+        const lc: i64 = @as(i64, @intCast(line_count));
+        while (scanned < 500) : (scanned += 1) {
+            if (ctx < 0) {
+                if (dir == -1) {
+                    ctx = @as(i64, @intCast(line)) + 1;
+                    dir = 1;
+                    continue;
+                }
+                break;
+            }
+            if (ctx >= lc) break;
+            const cl: u32 = @intCast(ctx);
+            if (!self.isBlankLine(buf, cl)) {
+                ctx_levels = self.lineIndentLevels(buf, cl);
+                break;
+            }
+            ctx += dir;
+        }
+        return ctx_levels;
     }
 
     /// Render one split window's lines into `rect` (content-area coordinates).
@@ -7126,17 +7219,57 @@ const App = struct {
         var scope_indent_col: u32 = 0;
         var has_scope = false;
         if (buf.hl) |*hl| {
-            if (hl.scopeAt(w.cursor)) |sc| {
-                scope_start_line = buf.pt.lineOf(sc.start_byte);
-                // end_byte is exclusive — the last byte inside the scope is
-                // end_byte - 1 (lineOf maps pos == len to the last line, so
-                // either clamp would work; -| guards the empty edge case)
-                scope_end_line = buf.pt.lineOf(sc.end_byte -| 1);
-                // the scope's own guide column: the expanded indent of its
-                // starting line (snacks.indent renders the scope line at
-                // `scope.indent`)
-                scope_indent_col = sc.indent_col;
-                has_scope = true;
+            // scopeAt walks the tree from the root each call — reuse the last
+            // result while the tree (history revision) and the queried cursor
+            // byte are unchanged (sound: scopeAt's result is a pure function
+            // of the tree and the byte). This is the common case for the
+            // scope-animation frames that repaint every 16ms without the
+            // cursor moving, and for split windows showing the same buffer.
+            const revision = buf.history.revision;
+            var cached = false;
+            if (self.scope_cache) |*c| {
+                if (c.buf == w.buf and c.win == rect.win and
+                    c.revision == revision and c.cursor == w.cursor)
+                {
+                    scope_start_line = c.start_line;
+                    scope_end_line = c.end_line;
+                    scope_indent_col = c.indent_col;
+                    has_scope = c.has;
+                    cached = true;
+                }
+            }
+            if (!cached) {
+                var sc_has = false;
+                var sc_start: u32 = 0;
+                var sc_end: u32 = 0;
+                var sc_indent: u32 = 0;
+                if (hl.scopeAt(w.cursor)) |sc| {
+                    sc_start = buf.pt.lineOf(sc.start_byte);
+                    // end_byte is exclusive — the last byte inside the scope
+                    // is end_byte - 1 (lineOf maps pos == len to the last
+                    // line, so either clamp would work; -| guards the empty
+                    // edge case)
+                    sc_end = buf.pt.lineOf(sc.end_byte -| 1);
+                    // the scope's own guide column: the expanded indent of
+                    // its starting line (snacks.indent renders the scope line
+                    // at `scope.indent`)
+                    sc_indent = sc.indent_col;
+                    sc_has = true;
+                }
+                self.scope_cache = .{
+                    .buf = w.buf,
+                    .win = rect.win,
+                    .revision = revision,
+                    .cursor = w.cursor,
+                    .start_line = sc_start,
+                    .end_line = sc_end,
+                    .indent_col = sc_indent,
+                    .has = sc_has,
+                };
+                scope_start_line = sc_start;
+                scope_end_line = sc_end;
+                scope_indent_col = sc_indent;
+                has_scope = sc_has;
             }
         }
         // ---- scope highlight animation (snacks.indent.animate "out") ----
@@ -7178,6 +7311,29 @@ const App = struct {
         var span_i: usize = 0;
         var row: u32 = rect.row;
         var line = w.view_top;
+        // blank-run context cache: consecutive blank rows share the nearest
+        // non-blank line's indent levels (see the scan below)
+        var prev_blank: ?u32 = null;
+        var blank_run_ctx: u32 = 0;
+        // Per-row allocations are a per-frame cost, not a per-row one: one
+        // text buffer (width × height), one gutter-number buffer and one
+        // guide-row buffer for the whole window, and ONE segs ArrayList whose
+        // capacity is reserved once per frame (clearRetainingCapacity per
+        // row). The segments' text slices reference these frame buffers (and
+        // the arena), both alive until vx.render().
+        const text_buf = try a.alloc(u8, @as(usize, rect.width) * rect.height);
+        const num_buf = try a.alloc(u8, @as(usize, gutter) * rect.height);
+        const guide_buf = try a.alloc(u8, rect.width);
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        try segs.ensureTotalCapacity(a, @as(usize, rect.width) * 2 + 64);
+        // diagnostics are sorted by line (sortByLine): a moving pointer keeps
+        // the mark lookup O(rows + diags) instead of O(rows × diags)
+        var diag_i: usize = 0;
+        const diags = self.lsp_diagnostics.items;
+        // git hunks are sorted by construction (git diff output order): the
+        // same moving-pointer trick for the gutter sign
+        var hunk_i: usize = 0;
+        const hunks = self.git_diff.hunks.items;
         while (row < rect.row + rect.height and line < line_count) : ({
             // skip a closed fold's body: it shares its header's screen row
             line = foldNextLine(buf, line);
@@ -7189,10 +7345,14 @@ const App = struct {
                 line - cursor_line
             else
                 cursor_line - line;
-            // allocPrint's width is comptime-only, so pad by hand: digits
-            // right-aligned in the numeric field plus one trailing space
-            const num_raw = try std.fmt.allocPrint(a, "{d}", .{rel});
-            const num_str = try a.alloc(u8, gutter);
+            // relative number, right-aligned in the numeric field plus one
+            // trailing space. allocPrint's width is comptime-only, so pad by
+            // hand; the digits go into a stack buffer, the padded field into
+            // the per-frame num_buf slice for this row.
+            var raw_digits: [32]u8 = undefined;
+            const num_raw = std.fmt.bufPrint(&raw_digits, "{d}", .{rel}) catch unreachable;
+            const row_i: usize = (row - rect.row);
+            const num_str = num_buf[row_i * gutter ..][0..gutter];
             @memset(num_str[0..gutter], ' ');
             @memcpy(num_str[gutter_digits - num_raw.len .. gutter_digits], num_raw);
             num_str[gutter - 1] = ' ';
@@ -7207,21 +7367,22 @@ const App = struct {
             // a bug; the diag_dirty repaint keeps them live while typing.
             var diag_mark: []const u8 = " ";
             var diag_mark_fg: ?vaxis.Style = null;
-            if (w.buf == self.current and self.lsp_diagnostics.items.len > 0) {
-                for (self.lsp_diagnostics.items) |d| {
-                    if (d.range.start.line == line) {
-                        diag_mark = switch (d.severity) {
-                            .err => "\u{f467}", // nf-fa-times_circle ✖
-                            .warning => "\u{f071}", // nf-fa-warning ⚠
-                            else => "\u{f05a}", // nf-fa-info_circle ℹ
-                        };
-                        diag_mark_fg = switch (d.severity) {
-                            .err => .{ .fg = .{ .rgb = self.theme.diag_error } },
-                            .warning => .{ .fg = .{ .rgb = self.theme.diag_warn } },
-                            else => .{ .fg = .{ .rgb = self.theme.diag_info } },
-                        };
-                        break;
-                    }
+            if (w.buf == self.current and diags.len > 0) {
+                // advance to the first diagnostic at/after this row's line
+                // (rows ascend, so diag_i only moves forward)
+                while (diag_i < diags.len and diags[diag_i].range.start.line < line) diag_i += 1;
+                if (diag_i < diags.len and diags[diag_i].range.start.line == line) {
+                    const d = diags[diag_i];
+                    diag_mark = switch (d.severity) {
+                        .err => "\u{f467}", // nf-fa-times_circle ✖
+                        .warning => "\u{f071}", // nf-fa-warning ⚠
+                        else => "\u{f05a}", // nf-fa-info_circle ℹ
+                    };
+                    diag_mark_fg = switch (d.severity) {
+                        .err => .{ .fg = .{ .rgb = self.theme.diag_error } },
+                        .warning => .{ .fg = .{ .rgb = self.theme.diag_warn } },
+                        else => .{ .fg = .{ .rgb = self.theme.diag_info } },
+                    };
                 }
             }
 
@@ -7236,13 +7397,25 @@ const App = struct {
                 if (self.git_diff_path) |dp| {
                     if (buf.path) |cp| {
                         if (std.mem.eql(u8, dp, cp)) {
-                            if (self.git_diff.markAt(line)) |k| {
-                                git_mark = k;
-                                git_mark_fg = switch (k) {
-                                    .added => .{ .fg = .{ .rgb = self.theme.git_add } },
-                                    .modified => .{ .fg = .{ .rgb = self.theme.git_mod } },
-                                    .removed_above, .removed_below => .{ .fg = .{ .rgb = self.theme.git_del } },
-                                };
+                            if (self.git_diff.untracked) {
+                                // untracked file: every line reads as added
+                                git_mark = .added;
+                                git_mark_fg = .{ .fg = .{ .rgb = self.theme.git_add } };
+                            } else {
+                                // advance past hunks whose marked region ends
+                                // before this row's line (hunks sorted; lines[]
+                                // is indexed by absolute line number)
+                                while (hunk_i < hunks.len and hunks[hunk_i].lines.len <= line) hunk_i += 1;
+                                if (hunk_i < hunks.len) {
+                                    if (hunks[hunk_i].markAt(line)) |k| {
+                                        git_mark = k;
+                                        git_mark_fg = switch (k) {
+                                            .added => .{ .fg = .{ .rgb = self.theme.git_add } },
+                                            .modified => .{ .fg = .{ .rgb = self.theme.git_mod } },
+                                            .removed_above, .removed_below => .{ .fg = .{ .rgb = self.theme.git_del } },
+                                        };
+                                    }
+                                }
                             }
                         }
                     }
@@ -7260,7 +7433,9 @@ const App = struct {
             while (n > 0 and n < line_len and (buf.pt.byteAt(line_start + n) & 0xC0) == 0x80) {
                 n -= 1;
             }
-            const text = try a.alloc(u8, n);
+            // line text lives in the per-frame text_buf row slice (valid
+            // until vx.render, like every other segment slice)
+            const text = text_buf[row_i * rect.width ..][0..n];
             buf.pt.copyRange(line_start, text);
 
             // visual selection bounds as local columns (both = n if absent);
@@ -7297,7 +7472,7 @@ const App = struct {
             // split the line into styled runs: syntax fg from the merged
             // spans, cursorline bg on the cursor's row, selection bg wins
             const is_cur_line = line == cursor_line;
-            var segs = std.ArrayList(vaxis.Segment).empty;
+            segs.clearRetainingCapacity();
             // gutter: always painted (bg_alt), cursor line slightly brighter
             const cursorline_style: vaxis.Style = if (is_cur_line)
                 .{ .bg = .{ .rgb = self.theme.bg_curline }, .fg = .{ .rgb = self.theme.fg } }
@@ -7401,31 +7576,20 @@ const App = struct {
             // reach this — a content line at column 0 (fn header,
             // closing brace) has indent_end == 0 but indent_end != n, so
             // the scope's vertical never extends onto those rows.
+            //
+            // Consecutive blank rows share their context: the scan probes
+            // the same blank lines for every row of a run (a run of R rows
+            // would otherwise probe up to R×500 lines), so the context is
+            // computed once per run and reused while the run continues.
             if (indent_end == n) {
                 var ctx_levels: u32 = 0;
-                {
-                    var ctx: i64 = @as(i64, @intCast(line)) - 1;
-                    var dir: i64 = -1;
-                    var scanned: usize = 0;
-                    const lc: i64 = @as(i64, @intCast(line_count));
-                    while (scanned < 500) : (scanned += 1) {
-                        if (ctx < 0) {
-                            if (dir == -1) {
-                                ctx = @as(i64, @intCast(line)) + 1;
-                                dir = 1;
-                                continue;
-                            }
-                            break;
-                        }
-                        if (ctx >= lc) break;
-                        const cl: u32 = @intCast(ctx);
-                        if (!self.isBlankLine(buf, cl)) {
-                            ctx_levels = self.lineIndentLevels(buf, cl);
-                            break;
-                        }
-                        ctx += dir;
-                    }
+                if (prev_blank != null and line == prev_blank.? + 1) {
+                    ctx_levels = blank_run_ctx;
+                } else {
+                    ctx_levels = self.blankContextLevels(buf, line, line_count);
+                    blank_run_ctx = ctx_levels;
                 }
+                prev_blank = line;
                 const start_col: u32 = indent_cols;
                 const ctx_cols: u32 = @min(ctx_levels * tab_width, rect.width -| gutter);
                 // the scope's highlighted guide column (only when it lies
@@ -7440,7 +7604,7 @@ const App = struct {
                 const end_col: u32 = @max(ctx_cols, if (scope_col < rect.width) scope_col + 1 else ctx_cols);
                 if (end_col > start_col) {
                     const n_cells = end_col - start_col;
-                    const row_buf = try a.alloc(u8, n_cells);
+                    const row_buf = guide_buf[0..n_cells];
                     @memset(row_buf, ' ');
                     var gc: u32 = start_col;
                     while (gc < end_col) : (gc += 1) {
@@ -7474,6 +7638,8 @@ const App = struct {
                     }
                     if (run_start < n_cells) try segs.append(a, .{ .text = row_buf[run_start..], .style = gstyle });
                 }
+            } else {
+                prev_blank = null;
             }
             var col: u32 = indent_end; // text starts after the indent region
             while (col < n) {
@@ -8857,41 +9023,58 @@ const App = struct {
                     if (fbuf.path == null or !std.mem.eql(u8, bp, fbuf.path.?)) {
                         // cached blame is for another file — no ghost
                     } else if (self.git_blame.?.at(blame_line)) |e| {
-                    var hm_buf: [5]u8 = undefined;
-                    const hm = formatHm(&hm_buf, e.author_time);
-                    const label = try std.fmt.allocPrint(a, " {s}, {s} - {s}", .{ e.author, hm, e.summary });
-                    // anchor at the END of the line's RENDERED text:
-                    // screenCellCol (not lineCellCol) counts the inlay hints
-                    // spliced into the line — anchoring at the raw text end
-                    // would draw the ghost ON TOP of hinted text
-                    const line_end = fbuf.pt.lineStart(blame_line) + fbuf.pt.lineLen(blame_line);
-                    const end_col = self.screenCellCol(win, blame_line, line_end);
-                    var start_col = cur_rect.col + gutter + end_col;
-                    // a closed fold's " … N lines" marker also renders after
-                    // the text — shift the ghost past it
-                    if (foldAt(fbuf, blame_line)) |f| {
-                        const marker = try std.fmt.allocPrint(a, " … {d} lines", .{f.hiddenCount()});
-                        start_col += self.textWidth(win, marker);
-                    }
-                    // the ghost must stay inside THIS pane: win.width is
-                    // the whole screen, and a split's neighbor owns the
-                    // columns past the pane's right edge
-                    const pane_end = cur_rect.col + cur_rect.width;
-                    if (start_col < pane_end) {
-                        const fit = cellFitPrefix(win, label, pane_end - start_col);
-                        if (fit.cells > 0) {
-                            const seg = [_]vaxis.Segment{.{
-                                .text = fit.slice,
-                                .style = .{ .dim = true },
-                            }};
-                            _ = win.print(&seg, .{
-                                .row_offset = @intCast(blame_line - self.curViewTop().* + cur_rect.row),
-                                .col_offset = @intCast(start_col),
-                                .wrap = .none,
-                            });
+                        // The label is rebuilt only when the blame LINE or the
+                        // blame DATA changed (the entry pointer identifies both:
+                        // entries live in git_blame's own array, replaced on
+                        // refresh) — the ghost repaints every idle frame.
+                        var label: []const u8 = undefined;
+                        if (self.blame_ghost_label) |*g| {
+                            if (g.line == blame_line and g.entry == e) {
+                                label = g.label;
+                            } else {
+                                self.alloc.free(g.label);
+                                self.blame_ghost_label = null;
+                            }
+                        }
+                        if (self.blame_ghost_label == null) {
+                            var hm_buf: [5]u8 = undefined;
+                            const hm = formatHm(&hm_buf, e.author_time);
+                            const lbl = try std.fmt.allocPrint(self.alloc, " {s}, {s} - {s}", .{ e.author, hm, e.summary });
+                            self.blame_ghost_label = .{ .line = blame_line, .entry = e, .label = lbl };
+                            label = lbl;
+                        }
+                        // anchor at the END of the line's RENDERED text:
+                        // screenCellCol (not lineCellCol) counts the inlay hints
+                        // spliced into the line — anchoring at the raw text end
+                        // would draw the ghost ON TOP of hinted text
+                        const line_end = fbuf.pt.lineStart(blame_line) + fbuf.pt.lineLen(blame_line);
+                        const end_col = self.screenCellCol(win, blame_line, line_end);
+                        var start_col = cur_rect.col + gutter + end_col;
+                        // a closed fold's " … N lines" marker also renders after
+                        // the text — shift the ghost past it
+                        if (foldAt(fbuf, blame_line)) |f| {
+                            const marker = try std.fmt.allocPrint(a, " … {d} lines", .{f.hiddenCount()});
+                            start_col += self.textWidth(win, marker);
+                        }
+                        // the ghost must stay inside THIS pane: win.width is
+                        // the whole screen, and a split's neighbor owns the
+                        // columns past the pane's right edge
+                        const pane_end = cur_rect.col + cur_rect.width;
+                        if (start_col < pane_end) {
+                            const fit = cellFitPrefix(win, label, pane_end - start_col);
+                            if (fit.cells > 0) {
+                                const seg = [_]vaxis.Segment{.{
+                                    .text = fit.slice,
+                                    .style = .{ .dim = true },
+                                }};
+                                _ = win.print(&seg, .{
+                                    .row_offset = @intCast(blame_line - self.curViewTop().* + cur_rect.row),
+                                    .col_offset = @intCast(start_col),
+                                    .wrap = .none,
+                                });
+                            }
                         }
                     }
-                }
                 }
             }
         }
