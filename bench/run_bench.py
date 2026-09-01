@@ -257,8 +257,7 @@ def main():
     for name, script in scripts:
         om, ot = bench_keys(oz, medium, script, "oz", args.iters)
         nm, nt = bench_keys(nv, medium, script, "nv", args.iters)
-        row(f"{name}", f"{fmt(om)}", f"{fmt(nm)}")
-        row(f"{name} (total)", f"{fmt(ot)}", f"{fmt(nt)}")
+        L.append(f"| {name} | {fmt(om)} | {fmt(nm)} | {fmt(ot)} | {fmt(nt)} | ms |")
         print(f"{name}: oz {fmt(om)}ms/key (total {fmt(ot)}) | nvim {fmt(nm)}ms/key (total {fmt(nt)})", flush=True)
 
     # large jumps on the 12MB file
