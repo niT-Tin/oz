@@ -157,6 +157,11 @@ const App = struct {
         /// history.revision at this buffer's last parse (incremental-parse
         /// bookkeeping; maxInt forces a full reparse).
         syntax_revision: u64 = 0,
+        /// history.revision when this buffer's content was last sent to the
+        /// LSP server (didOpen/didChange). Combined with the client's open
+        /// set, equal revision ⇒ the server's copy is current, so a buffer
+        /// switch back to it can skip the re-open and its full-text copy.
+        lsp_synced_rev: u64 = 0,
         /// Closed folds (indent-detected, see editor/fold.zig), sorted by
         /// start line. Kept PER BUFFER, not per window: two splits showing
         /// the same buffer share the fold state, so za in one split is
@@ -1506,6 +1511,9 @@ const App = struct {
                 {
                     if (self.curCursor().* > 0 and self.cur().pt.byteAt(self.curCursor().* - 1) == 'j') {
                         const pos = self.curCursor().* - 1;
+                        // LSP range in the PRE-EDIT document: [pos, pos+1).
+                        const start_pos = self.lspPositionAt(&self.cur().pt, pos);
+                        const end_pos = self.lspPositionAt(&self.cur().pt, pos + 1);
                         try self.cur().history.record(&self.cur().pt, pos, 1, "");
                         self.curCursor().* = pos;
                         // The 'j' was shift-adjusted INTO the hints when it
@@ -1525,7 +1533,7 @@ const App = struct {
                         // response is discarded as stale. (Runs before
                         // exitInsert, so in_insert is still true and the
                         // freshly shifted-back hints are NOT invalidated.)
-                        self.markDirty();
+                        self.markDirtyRange(start_pos, end_pos, "");
                     }
                     self.exitInsert();
                     return;
@@ -2140,13 +2148,16 @@ const App = struct {
         const cursor = self.curCursor().*;
         const line = self.cur().pt.lineOf(start);
         const col = start - self.cur().pt.lineStart(line);
+        // LSP range in the PRE-EDIT document: [start, cursor).
+        const start_pos = self.lspPositionAt(&self.cur().pt, start);
+        const end_pos = self.lspPositionAt(&self.cur().pt, cursor);
         var deleted: [16]u8 = undefined;
         const del_len: usize = @intCast(cursor - start);
         self.cur().pt.copyRange(start, deleted[0..del_len]);
         try self.cur().history.record(&self.cur().pt, start, cursor - start, "");
         self.curCursor().* = start;
         self.adjustInlayHintsDelete(line, col, deleted[0..del_len]);
-        self.markDirty();
+        self.markDirtyRange(start_pos, end_pos, "");
     }
 
     /// Delete the word before the cursor (Ctrl-w). Vim semantics: walk back
@@ -2162,6 +2173,9 @@ const App = struct {
         const cursor = self.curCursor().*;
         const line = self.cur().pt.lineOf(start);
         const col = start - self.cur().pt.lineStart(line);
+        // LSP range in the PRE-EDIT document: [start, cursor).
+        const start_pos = self.lspPositionAt(&self.cur().pt, start);
+        const end_pos = self.lspPositionAt(&self.cur().pt, cursor);
         const del_len: usize = @intCast(cursor - start);
         const deleted = try self.alloc.alloc(u8, del_len);
         defer self.alloc.free(deleted);
@@ -2169,7 +2183,7 @@ const App = struct {
         try self.cur().history.record(&self.cur().pt, start, cursor - start, "");
         self.curCursor().* = start;
         self.adjustInlayHintsDelete(line, col, deleted);
-        self.markDirty();
+        self.markDirtyRange(start_pos, end_pos, "");
     }
 
     // ---- insert-mode keyword completion (Ctrl+n) ----
@@ -2854,9 +2868,12 @@ const App = struct {
             self.cur().history.beginGroup();
             self.in_insert = true;
         }
+        // LSP range in the PRE-EDIT document: [pos, cursor) → word.
+        const start_pos = self.lspPositionAt(pt, pos);
+        const end_pos = self.lspPositionAt(pt, cursor);
         try self.cur().history.record(pt, pos, cursor - pos, word);
         self.curCursor().* = pos + @as(u32, @intCast(word.len));
-        self.markDirty();
+        self.markDirtyRange(start_pos, end_pos, word);
         self.closeCompletion();
     }
 
@@ -2918,20 +2935,26 @@ const App = struct {
         const line_end = line_start + pt.lineLen(line);
         const col = cursor - line_start;
         if (cursor < line_end) {
+            // LSP range in the PRE-EDIT document: [cursor, line_end).
+            const start_pos = self.lspPositionAt(pt, cursor);
+            const end_pos = self.lspPositionAt(pt, line_end);
             const del_len: usize = @intCast(line_end - cursor);
             const deleted = try self.alloc.alloc(u8, del_len);
             defer self.alloc.free(deleted);
             pt.copyRange(cursor, deleted);
             try self.cur().history.record(pt, cursor, line_end - cursor, "");
             self.adjustInlayHintsDelete(line, col, deleted);
+            self.markDirtyRange(start_pos, end_pos, "");
         } else if (line_end < pt.len()) {
             // at end of line: swallow the trailing newline (joins next line)
+            const start_pos = self.lspPositionAt(pt, line_end);
+            const end_pos = self.lspPositionAt(pt, line_end + 1);
             try self.cur().history.record(pt, line_end, 1, "");
             self.adjustInlayHintsDelete(line, col, "\n");
+            self.markDirtyRange(start_pos, end_pos, "");
         } else {
             return; // last line, nothing to delete
         }
-        self.markDirty();
     }
 
     // ---- command line (':') ----
@@ -3316,31 +3339,128 @@ const App = struct {
         try self.searchOnce(q, self.last_search_bwd != flip);
     }
 
+    /// Search `query` in the document byte range [start, end) of `pt`,
+    /// iterating pieces in document order with NO full-document copy. Returns
+    /// the absolute offset of the first (want_last = false) or last
+    /// (want_last = true) match STARTING inside the range, or null.
+    ///
+    /// A match may straddle a piece boundary, so a window of the last
+    /// (query.len - 1) stream bytes is carried between pieces (stack buffer)
+    /// and searched together with the next piece's head. Null when the query
+    /// is empty or longer than the window cap (caller falls back to the
+    /// full-text path for absurdly long patterns).
+    fn findInPieces(
+        pt: *const buffer.PieceTable,
+        start: u32,
+        end: u32,
+        query: []const u8,
+        want_last: bool,
+    ) ?u32 {
+        const qlen = query.len;
+        if (qlen == 0 or end <= start or end - start < qlen) return null;
+        const need: usize = qlen - 1;
+        const max_win = 255;
+        if (need > max_win) return null; // absurd pattern; caller falls back
+        var tail: [max_win]u8 = undefined;
+        var tail_len: usize = 0;
+        var concat: [2 * max_win]u8 = undefined;
+        var result: ?u32 = null;
+        var doc_off: u32 = 0;
+        for (pt.pieces.items) |p| {
+            const piece_end = doc_off + p.len;
+            if (piece_end <= start) {
+                doc_off = piece_end;
+                continue;
+            }
+            if (doc_off >= end) break;
+            const src: []const u8 = if (p.source == .origin) pt.origin else pt.add.items;
+            const skip: u32 = if (start > doc_off) start - doc_off else 0;
+            const take: u32 = @min(p.len - skip, end - doc_off);
+            const bytes = src[@as(usize, p.start) + skip .. @as(usize, p.start) + skip + take];
+            if (bytes.len == 0) {
+                doc_off = piece_end;
+                continue;
+            }
+            // Boundary window: a match can start in the carried tail and
+            // extend into this piece — search tail ++ head together.
+            if (tail_len > 0) {
+                const head: usize = @min(bytes.len, need);
+                @memcpy(concat[0..tail_len], tail[0..tail_len]);
+                @memcpy(concat[tail_len .. tail_len + head], bytes[0..head]);
+                if (std.mem.indexOf(u8, concat[0 .. tail_len + head], query)) |k| {
+                    const abs = doc_off - @as(u32, @intCast(tail_len)) + @as(u32, @intCast(k));
+                    if (!want_last) return abs;
+                    if (result == null or abs > result.?) result = abs;
+                }
+            }
+            if (std.mem.indexOf(u8, bytes, query)) |k| {
+                const abs = doc_off + skip + @as(u32, @intCast(k));
+                if (!want_last) return abs;
+                if (result == null or abs > result.?) result = abs;
+            }
+            // Carry the last `need` stream bytes for the next boundary.
+            if (bytes.len >= need) {
+                @memcpy(tail[0..need], bytes[bytes.len - need ..]);
+                tail_len = need;
+            } else if (need > 0) {
+                if (tail_len + bytes.len > need) {
+                    const drop = tail_len + bytes.len - need;
+                    std.mem.copyForwards(u8, tail[0 .. tail_len - drop], tail[drop..tail_len]);
+                    tail_len -= drop;
+                }
+                @memcpy(tail[tail_len .. tail_len + bytes.len], bytes);
+                tail_len += bytes.len;
+            }
+            doc_off = piece_end;
+        }
+        return result;
+    }
+
     fn searchOnce(self: *App, query: []const u8, backward: bool) !void {
         const len = self.cur().pt.len();
         if (len == 0) return;
-        const text = try self.curText();
-        defer self.alloc.free(text);
         const cursor = self.curCursor().*;
-        var hit: ?usize = null;
-        if (backward) {
-            // last match starting before the cursor, else wrap to the file end
-            hit = std.mem.lastIndexOf(u8, text[0..@min(cursor, len)], query);
-            if (hit == null) {
+        var hit: ?u32 = null;
+        if (query.len - 1 > 255) {
+            // Pathological pattern length: the piece-walker's boundary window
+            // caps at 255 bytes, so fall back to the (rare) full-text path.
+            const text = try self.curText();
+            defer self.alloc.free(text);
+            if (backward) {
+                if (std.mem.lastIndexOf(u8, text[0..@min(cursor, len)], query)) |i| {
+                    hit = @intCast(i);
+                } else {
+                    const from = @min(cursor + 1, len);
+                    if (std.mem.lastIndexOf(u8, text[from..], query)) |i| hit = @intCast(from + i);
+                }
+            } else {
                 const from = @min(cursor + 1, len);
-                if (std.mem.lastIndexOf(u8, text[from..], query)) |i| hit = from + i;
+                if (std.mem.indexOf(u8, text[from..], query)) |i| {
+                    hit = @intCast(from + i);
+                } else {
+                    if (std.mem.indexOf(u8, text[0..from], query)) |i| hit = @intCast(i);
+                }
             }
         } else {
-            // first match starting after the cursor, else wrap to the top
-            const from = @min(cursor + 1, len);
-            if (std.mem.indexOf(u8, text[from..], query)) |i| {
-                hit = from + i;
+            const pt = &self.cur().pt;
+            if (backward) {
+                // last match starting before the cursor, else wrap to the end
+                hit = findInPieces(pt, 0, @min(cursor, len), query, true);
+                if (hit == null) {
+                    const from = @min(cursor + 1, len);
+                    hit = findInPieces(pt, from, len, query, true);
+                }
             } else {
-                hit = std.mem.indexOf(u8, text[0..from], query);
+                // first match starting after the cursor, else wrap to the top
+                const from = @min(cursor + 1, len);
+                hit = findInPieces(pt, from, len, query, false);
+                if (hit == null) {
+                    hit = findInPieces(pt, 0, from, query, false);
+                }
             }
         }
         if (hit) |h| {
-            self.curCursor().* = @intCast(h);
+            self.curCursor().* = h;
             self.clearHover();
         } else {
             try self.setMsg(try std.fmt.allocPrint(self.alloc, "pattern not found: {s}", .{query}));
@@ -3518,13 +3638,28 @@ const App = struct {
     }
 
     fn saveFile(self: *App, path: []const u8) !void {
-        var f = try std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = true });
-        defer f.close(self.io);
         const len = self.cur().pt.len();
         const buf = try self.alloc.alloc(u8, len);
         defer self.alloc.free(buf);
         self.cur().pt.copyRange(0, buf);
+        // Write to a sibling temp file and rename it over `path` — NEVER
+        // truncate the open file in place: the buffer's origin may be an
+        // mmap of it, and truncating a mapped file SIGBUSes every later read
+        // of the mapping (the file no longer backs those pages). Temp+rename
+        // also makes saves atomic for other readers (they never see a
+        // half-written file) and keeps the old inode alive for the mapping.
+        const tmp = try std.fmt.allocPrint(self.alloc, "{s}.oztmp{d}", .{ path, std.c.getpid() });
+        defer self.alloc.free(tmp);
+        var flags: std.Io.Dir.CreateFileOptions = .{ .truncate = true };
+        // Preserve the original file's mode (executable bit etc.) on the
+        // replacement file.
+        if (std.Io.Dir.cwd().statFile(self.io, path, .{})) |st| {
+            flags.permissions = st.permissions;
+        } else |_| {}
+        var f = try std.Io.Dir.cwd().createFile(self.io, tmp, flags);
+        defer f.close(self.io);
         try f.writeStreamingAll(self.io, buf);
+        try std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), path, self.io);
     }
 
     fn openFile(self: *App, path: []const u8) !void {
@@ -3540,13 +3675,17 @@ const App = struct {
         const pos = self.curCursor().*;
         const line = self.cur().pt.lineOf(pos);
         const col = pos - self.cur().pt.lineStart(line);
+        // LSP range for a pure insert: [pos, pos) in the pre-edit document
+        // (an insert changes nothing before `pos`, so the position is the
+        // same before and after the edit).
+        const at = self.lspPositionAt(&self.cur().pt, pos);
         // record() snapshots the pre-edit state and applies the edit itself
         try self.cur().history.record(&self.cur().pt, pos, 0, text);
         self.curCursor().* += @intCast(text.len);
         // keep inlay hints aligned instead of clearing them (insert mode:
         // clearing + re-requesting on every keystroke makes the view flicker)
         self.adjustInlayHintsInsert(line, col, text);
-        self.markDirty();
+        self.markDirtyRange(at, at, text);
     }
 
     // ---- auto-pairs (insert mode): 括号/引号自动闭合与跳过 ----
@@ -3617,10 +3756,12 @@ const App = struct {
         const start = pos - 1;
         const line = self.cur().pt.lineOf(start);
         const col = start - self.cur().pt.lineStart(line);
+        const start_pos = self.lspPositionAt(&self.cur().pt, start);
+        const end_pos = self.lspPositionAt(&self.cur().pt, start + 2);
         try self.cur().history.record(&self.cur().pt, start, 2, "");
         self.curCursor().* = start;
         self.adjustInlayHintsDelete(line, col, &[_]u8{ open, closer });
-        self.markDirty();
+        self.markDirtyRange(start_pos, end_pos, "");
         return true;
     }
 
@@ -3667,6 +3808,9 @@ const App = struct {
         }
         switch (op) {
             .delete => {
+                // LSP range in the PRE-EDIT document: [start, end).
+                const start_pos = self.lspPositionAt(&self.cur().pt, start);
+                const end_pos = self.lspPositionAt(&self.cur().pt, end);
                 try self.setRegister(start, end, linewise);
                 self.cur().history.beginGroup();
                 try self.cur().history.record(&self.cur().pt, start, end - start, "");
@@ -3680,16 +3824,19 @@ const App = struct {
                     const lc = self.cur().pt.lineCount();
                     self.curCursor().* = self.cur().pt.lineStart(lc -| 2);
                 }
-                self.markDirty();
+                self.markDirtyRange(start_pos, end_pos, "");
             },
             .change => {
+                // LSP range in the PRE-EDIT document: [start, end).
+                const start_pos = self.lspPositionAt(&self.cur().pt, start);
+                const end_pos = self.lspPositionAt(&self.cur().pt, end);
                 try self.setRegister(start, end, linewise);
                 self.curCursor().* = start;
                 self.cur().history.beginGroup();
                 try self.cur().history.record(&self.cur().pt, start, end - start, "");
                 self.state.mode = .insert;
                 self.in_insert = true; // keep the group open; exitInsert closes it
-                self.markDirty();
+                self.markDirtyRange(start_pos, end_pos, "");
                 self.cur().syntax_revision = std.math.maxInt(u64);
             },
             .yank => {
@@ -3785,10 +3932,13 @@ const App = struct {
     }
 
     fn applyEdit(self: *App, start: u32, end: u32, text: []const u8) !void {
+        // LSP range in the PRE-EDIT document: [start, end).
+        const start_pos = self.lspPositionAt(&self.cur().pt, start);
+        const end_pos = self.lspPositionAt(&self.cur().pt, end);
         self.cur().history.beginGroup();
         try self.cur().history.record(&self.cur().pt, start, end - start, text);
         self.cur().history.endGroup();
-        self.markDirty();
+        self.markDirtyRange(start_pos, end_pos, text);
     }
 
     fn isVisual(self: *const App) bool {
@@ -4564,22 +4714,22 @@ const App = struct {
         // platforms fall back to the external $TERMINAL window below.
         if (builtin.os.tag == .linux) {
             if (self.term_pane) |*tp| {
-            tp.layout = .floating;
-            tp.focused = true;
-            return;
-        }
-        const t = term.Terminal.create(self.io, self.alloc, &.{"lazygit"}, self.env_map, .{
-            .winsize = .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 },
-            // vaxis's scrollback is a TODO (its copyTo can't render it);
-            // 0 keeps the back screen the same size as the front so line
-            // scrolling works
-            .scrollback_size = 0,
-            .initial_working_directory = self.termCwd(),
-        }) catch |e| {
-            const m = std.fmt.allocPrint(self.alloc, "lazygit: {s}", .{@errorName(e)}) catch return;
-            self.setMsg(m) catch {};
-            return;
-        };
+                tp.layout = .floating;
+                tp.focused = true;
+                return;
+            }
+            const t = term.Terminal.create(self.io, self.alloc, &.{"lazygit"}, self.env_map, .{
+                .winsize = .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 },
+                // vaxis's scrollback is a TODO (its copyTo can't render it);
+                // 0 keeps the back screen the same size as the front so line
+                // scrolling works
+                .scrollback_size = 0,
+                .initial_working_directory = self.termCwd(),
+            }) catch |e| {
+                const m = std.fmt.allocPrint(self.alloc, "lazygit: {s}", .{@errorName(e)}) catch return;
+                self.setMsg(m) catch {};
+                return;
+            };
             self.term_pane = .{ .t = t, .layout = .floating, .focused = true };
             return;
         }
@@ -5321,6 +5471,24 @@ const App = struct {
         self.current_win = self.firstLeaf(root);
     }
 
+    /// Load `file` (size bytes) into a PieceTable without copying the file
+    /// into the heap: a read-only PRIVATE mmap backs the origin piece, so a
+    /// 50MB file costs one mapping, not a 50MB heap copy (RSS ~1× the file
+    /// instead of 2×). Falls back to read + copy when the file is empty or
+    /// the mapping fails (special filesystems, quota, …). The caller keeps
+    /// `file` open only until this returns — the mapping survives the close.
+    fn loadPieceTable(self: *App, file: std.Io.File, size: u64) !buffer.PieceTable {
+        if (size == 0) return buffer.PieceTable.init(self.alloc, "");
+        const len: usize = @intCast(size);
+        const mapping = std.posix.mmap(null, len, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0) catch {
+            const bytes = try self.alloc.alloc(u8, len);
+            defer self.alloc.free(bytes);
+            _ = try file.readPositionalAll(self.io, bytes, 0);
+            return buffer.PieceTable.init(self.alloc, bytes);
+        };
+        return buffer.PieceTable.initMapped(self.alloc, mapping);
+    }
+
     /// Open `path` in a new buffer unless it is already open (then switch).
     /// The stored path is ABSOLUTE (like the CLI arg path): LSP uri building,
     /// filetype detection and recent-file dedupe all assume absolute paths, so
@@ -5351,12 +5519,9 @@ const App = struct {
             try self.setMsg(try self.alloc.dupe(u8, "file too large (>4GiB)"));
             return;
         }
-        const bytes = try self.alloc.alloc(u8, @intCast(size));
-        defer self.alloc.free(bytes);
-        _ = try file.readPositionalAll(self.io, bytes, 0);
 
         try self.buffers.append(self.alloc, .{
-            .pt = try buffer.PieceTable.init(self.alloc, bytes),
+            .pt = try self.loadPieceTable(file, size),
             .history = buffer.History.init(self.alloc),
             .path = try self.alloc.dupe(u8, abs),
         });
@@ -5713,9 +5878,19 @@ const App = struct {
                 const uri = lsp_types.pathToFileUri(self.alloc, path) catch return;
                 defer self.alloc.free(uri);
                 if (!std.mem.eql(u8, c.uri, uri)) {
+                    // The server keeps every opened document, so a switch to a
+                    // document it already has — and whose content is unchanged
+                    // since the last didOpen/didChange (lsp_synced_rev) —
+                    // needs no re-open and no full-text copy: just retarget.
+                    const buf = &self.buffers.items[self.current];
+                    if (c.isDocOpen(uri) and buf.lsp_synced_rev == buf.history.revision) {
+                        c.retarget(uri) catch {};
+                        return;
+                    }
                     const text = self.curText() catch return;
                     defer self.alloc.free(text);
                     c.switchDocument(uri, text) catch {};
+                    buf.lsp_synced_rev = buf.history.revision;
                 }
                 return;
             }
@@ -5747,6 +5922,9 @@ const App = struct {
             c.wake_ctx = self;
             c.wake_fn = lspWake;
         }
+        // The didOpen above carried the current text: the server's copy of
+        // this buffer is now current.
+        self.cur().lsp_synced_rev = self.cur().history.revision;
     }
 
     /// Called from the LSP reader thread when a message arrives: post a
@@ -5765,6 +5943,81 @@ const App = struct {
         errdefer self.alloc.free(buf);
         self.cur().pt.copyRange(0, buf);
         return buf;
+    }
+
+    /// LSP Position (line + UTF-16 character) of byte offset `byte` in `pt`.
+    /// LSP counts characters in UTF-16 code units; `utf16Units` converts the
+    /// byte column without materializing the document.
+    fn lspPositionAt(self: *App, pt: *const buffer.PieceTable, byte: u32) lsp_types.Position {
+        const line = pt.lineOf(byte);
+        const ls = pt.lineStart(line);
+        return .{ .line = line, .character = self.utf16Units(pt, ls, byte) };
+    }
+
+    /// UTF-16 code units in [from, to) of `pt` (BMP chars = 1, astral = 2).
+    /// Walks the pieces directly — no document copy — carrying a small window
+    /// across piece boundaries for multi-byte sequences split by an edit.
+    fn utf16Units(self: *App, pt: *const buffer.PieceTable, from: u32, to: u32) u32 {
+        _ = self;
+        if (to <= from) return 0;
+        var units: u32 = 0;
+        var carry: [3]u8 = undefined; // lead bytes of a sequence split at a boundary
+        var carry_len: usize = 0;
+        var doc_off: u32 = 0;
+        var first = true;
+        for (pt.pieces.items) |p| {
+            const piece_end = doc_off + p.len;
+            if (piece_end <= from) {
+                doc_off = piece_end;
+                continue;
+            }
+            if (doc_off >= to) break;
+            const src: []const u8 = if (p.source == .origin) pt.origin else pt.add.items;
+            const skip: u32 = if (from > doc_off) from - doc_off else 0;
+            const take: u32 = @min(p.len - skip, to - doc_off);
+            const bytes = src[@as(usize, p.start) + skip .. @as(usize, p.start) + skip + take];
+            var i: usize = 0;
+            if (!first and carry_len > 0 and bytes.len > 0 and (bytes[0] & 0xC0) == 0x80) {
+                // The previous window ended mid-sequence: complete it with the
+                // continuation bytes that start this window.
+                const total: usize = std.unicode.utf8ByteSequenceLength(carry[0]) catch 0;
+                if (total > carry_len) {
+                    const need = total - carry_len;
+                    if (bytes.len >= need) {
+                        units += if (total == 4) 2 else 1;
+                        i = need;
+                    } else {
+                        // Still split (tiny pieces): carry everything over.
+                        @memcpy(carry[carry_len .. carry_len + bytes.len], bytes);
+                        carry_len += bytes.len;
+                        doc_off = piece_end;
+                        first = false;
+                        continue;
+                    }
+                }
+            }
+            carry_len = 0;
+            while (i < bytes.len) {
+                const b = bytes[i];
+                if (b < 0x80) {
+                    units += 1;
+                    i += 1;
+                    continue;
+                }
+                const seq_len: usize = std.unicode.utf8ByteSequenceLength(b) catch 1;
+                if (i + seq_len > bytes.len) {
+                    const left = bytes.len - i;
+                    @memcpy(carry[0..left], bytes[i..]);
+                    carry_len = left;
+                    break;
+                }
+                units += if (seq_len == 4) 2 else 1;
+                i += seq_len;
+            }
+            doc_off = piece_end;
+            first = false;
+        }
+        return units;
     }
 
     /// Free every diagnostic message and empty the list. Messages are dupe'd
@@ -5794,7 +6047,10 @@ const App = struct {
         }
     }
 
-    fn markDirty(self: *App) void {
+    /// Shared edit bookkeeping (dirty flag, edit_seq, fold reset, inlay
+    /// invalidation). The LSP sync is left to the caller: markDirty (full
+    /// text) or markDirtyRange (incremental).
+    fn markDirtyBase(self: *App) void {
         self.cur().dirty = true;
         self.edit_seq += 1;
         // Any edit drops this buffer's fold set (all folds re-open): edit
@@ -5809,12 +6065,39 @@ const App = struct {
         // fresh request once the session ends. One-shot normal-mode ops
         // (dd, x, o…) still invalidate here and let the auto-refresh re-request.
         if (!self.in_insert) self.invalidateInlayHints();
-        // LSP text sync: push the new document content to the server. Cheap
-        // enough per keystroke for now (debounce lands with the M2 UI work).
+    }
+
+    /// Mark the current buffer dirty and push its FULL text to the LSP server
+    /// (fallback for edits without a tracked byte range: undo/redo,
+    /// multi-cursor ops, paste, format, …).
+    fn markDirty(self: *App) void {
+        self.markDirtyBase();
+        self.syncLspFull();
+    }
+
+    /// Mark the current buffer dirty and push an INCREMENTAL didChange to the
+    /// LSP server: `text` replaced [start, end) of the PRE-EDIT document
+    /// (`start`/`end` are LSP positions computed before the edit was applied).
+    /// The per-keystroke path — no full-document copy.
+    fn markDirtyRange(self: *App, start: lsp_types.Position, end: lsp_types.Position, text: []const u8) void {
+        self.markDirtyBase();
+        if (self.lsp_client) |c| {
+            c.didChange(.{ .start = start, .end = end }, text) catch {
+                return;
+            };
+            self.cur().lsp_synced_rev = self.cur().history.revision;
+        }
+    }
+
+    /// Full-text didChange for the current buffer (see markDirty).
+    fn syncLspFull(self: *App) void {
         if (self.lsp_client) |c| {
             const text = self.curText() catch return;
             defer self.alloc.free(text);
-            c.didChange(text) catch {};
+            c.didChange(null, text) catch {
+                return;
+            };
+            self.cur().lsp_synced_rev = self.cur().history.revision;
         }
     }
 
@@ -6290,6 +6573,9 @@ const App = struct {
                     reg_end = @min(reg_end + seq, self.cur().pt.len());
                 }
                 if (reg_end > c0) try self.setRegister(c0, reg_end, false);
+                // LSP range in the PRE-EDIT document: [c0, reg_end).
+                const start_pos = self.lspPositionAt(&self.cur().pt, c0);
+                const end_pos = self.lspPositionAt(&self.cur().pt, reg_end);
                 self.cur().history.beginGroup();
                 i = 0;
                 while (i < @max(count, 1)) : (i += 1) {
@@ -6302,7 +6588,7 @@ const App = struct {
                     try self.cur().history.record(pt, c, end - c, "");
                 }
                 self.cur().history.endGroup();
-                self.markDirty();
+                self.markDirtyRange(start_pos, end_pos, "");
             },
             .delete_char_before => {
                 // X: vim dh — delete `count` chars before the cursor (the
@@ -6317,6 +6603,9 @@ const App = struct {
                     while (reg_start > 0 and (self.cur().pt.byteAt(reg_start) & 0xC0) == 0x80) reg_start -= 1;
                 }
                 if (reg_start < c0) try self.setRegister(reg_start, c0, false);
+                // LSP range in the PRE-EDIT document: [reg_start, c0).
+                const start_pos = self.lspPositionAt(&self.cur().pt, reg_start);
+                const end_pos = self.lspPositionAt(&self.cur().pt, c0);
                 self.cur().history.beginGroup();
                 i = 0;
                 while (i < @max(count, 1)) : (i += 1) {
@@ -6330,7 +6619,7 @@ const App = struct {
                     self.curCursor().* = start;
                 }
                 self.cur().history.endGroup();
-                self.markDirty();
+                self.markDirtyRange(start_pos, end_pos, "");
             },
             .delete_to_eol => {
                 // D: delete to end of line (d$), keeping the newline so the
@@ -6344,11 +6633,14 @@ const App = struct {
                 const end = pt.lineStart(end_line) + pt.lineLen(end_line);
                 if (end > c) {
                     try self.setRegister(c, end, false);
+                    // LSP range in the PRE-EDIT document: [c, end).
+                    const start_pos = self.lspPositionAt(&self.cur().pt, c);
+                    const end_pos = self.lspPositionAt(&self.cur().pt, end);
                     self.cur().history.beginGroup();
                     try self.cur().history.record(pt, c, end - c, "");
                     self.cur().history.endGroup();
                     self.curCursor().* = c;
-                    self.markDirty();
+                    self.markDirtyRange(start_pos, end_pos, "");
                 }
             },
             .change_to_eol => {
@@ -6360,13 +6652,22 @@ const App = struct {
                 const line = pt.lineOf(c);
                 const end_line = @min(line + @max(count, 1) - 1, pt.lineCount() - 1);
                 const end = pt.lineStart(end_line) + pt.lineLen(end_line);
+                // LSP range in the PRE-EDIT document: [c, end).
+                const start_pos = self.lspPositionAt(&self.cur().pt, c);
+                const end_pos = self.lspPositionAt(&self.cur().pt, end);
                 self.cur().history.beginGroup();
                 if (end > c) {
                     try self.cur().history.record(pt, c, end - c, "");
                 }
                 self.state.mode = .insert;
                 self.in_insert = true; // group stays open until exitInsert
-                self.markDirty();
+                // markDirty (via markDirtyBase) skips inlay invalidation
+                // while in_insert, matching the pre-edit behavior of C.
+                if (end > c) {
+                    self.markDirtyRange(start_pos, end_pos, "");
+                } else {
+                    self.markDirtyBase(); // no edit; just the bookkeeping
+                }
                 self.cur().syntax_revision = std.math.maxInt(u64);
             },
             .change_line => {
@@ -6378,11 +6679,14 @@ const App = struct {
                 const start = pt.lineStart(line);
                 const end = start + pt.lineLen(line);
                 self.curCursor().* = start;
+                // LSP range in the PRE-EDIT document: [start, end).
+                const start_pos = self.lspPositionAt(&self.cur().pt, start);
+                const end_pos = self.lspPositionAt(&self.cur().pt, end);
                 self.cur().history.beginGroup();
                 try self.cur().history.record(pt, start, end - start, "");
                 self.state.mode = .insert;
                 self.in_insert = true;
-                self.markDirty();
+                self.markDirtyRange(start_pos, end_pos, "");
                 self.cur().syntax_revision = std.math.maxInt(u64);
             },
             .replace_char => {
@@ -8857,41 +9161,41 @@ const App = struct {
                     if (fbuf.path == null or !std.mem.eql(u8, bp, fbuf.path.?)) {
                         // cached blame is for another file — no ghost
                     } else if (self.git_blame.?.at(blame_line)) |e| {
-                    var hm_buf: [5]u8 = undefined;
-                    const hm = formatHm(&hm_buf, e.author_time);
-                    const label = try std.fmt.allocPrint(a, " {s}, {s} - {s}", .{ e.author, hm, e.summary });
-                    // anchor at the END of the line's RENDERED text:
-                    // screenCellCol (not lineCellCol) counts the inlay hints
-                    // spliced into the line — anchoring at the raw text end
-                    // would draw the ghost ON TOP of hinted text
-                    const line_end = fbuf.pt.lineStart(blame_line) + fbuf.pt.lineLen(blame_line);
-                    const end_col = self.screenCellCol(win, blame_line, line_end);
-                    var start_col = cur_rect.col + gutter + end_col;
-                    // a closed fold's " … N lines" marker also renders after
-                    // the text — shift the ghost past it
-                    if (foldAt(fbuf, blame_line)) |f| {
-                        const marker = try std.fmt.allocPrint(a, " … {d} lines", .{f.hiddenCount()});
-                        start_col += self.textWidth(win, marker);
-                    }
-                    // the ghost must stay inside THIS pane: win.width is
-                    // the whole screen, and a split's neighbor owns the
-                    // columns past the pane's right edge
-                    const pane_end = cur_rect.col + cur_rect.width;
-                    if (start_col < pane_end) {
-                        const fit = cellFitPrefix(win, label, pane_end - start_col);
-                        if (fit.cells > 0) {
-                            const seg = [_]vaxis.Segment{.{
-                                .text = fit.slice,
-                                .style = .{ .dim = true },
-                            }};
-                            _ = win.print(&seg, .{
-                                .row_offset = @intCast(blame_line - self.curViewTop().* + cur_rect.row),
-                                .col_offset = @intCast(start_col),
-                                .wrap = .none,
-                            });
+                        var hm_buf: [5]u8 = undefined;
+                        const hm = formatHm(&hm_buf, e.author_time);
+                        const label = try std.fmt.allocPrint(a, " {s}, {s} - {s}", .{ e.author, hm, e.summary });
+                        // anchor at the END of the line's RENDERED text:
+                        // screenCellCol (not lineCellCol) counts the inlay hints
+                        // spliced into the line — anchoring at the raw text end
+                        // would draw the ghost ON TOP of hinted text
+                        const line_end = fbuf.pt.lineStart(blame_line) + fbuf.pt.lineLen(blame_line);
+                        const end_col = self.screenCellCol(win, blame_line, line_end);
+                        var start_col = cur_rect.col + gutter + end_col;
+                        // a closed fold's " … N lines" marker also renders after
+                        // the text — shift the ghost past it
+                        if (foldAt(fbuf, blame_line)) |f| {
+                            const marker = try std.fmt.allocPrint(a, " … {d} lines", .{f.hiddenCount()});
+                            start_col += self.textWidth(win, marker);
+                        }
+                        // the ghost must stay inside THIS pane: win.width is
+                        // the whole screen, and a split's neighbor owns the
+                        // columns past the pane's right edge
+                        const pane_end = cur_rect.col + cur_rect.width;
+                        if (start_col < pane_end) {
+                            const fit = cellFitPrefix(win, label, pane_end - start_col);
+                            if (fit.cells > 0) {
+                                const seg = [_]vaxis.Segment{.{
+                                    .text = fit.slice,
+                                    .style = .{ .dim = true },
+                                }};
+                                _ = win.print(&seg, .{
+                                    .row_offset = @intCast(blame_line - self.curViewTop().* + cur_rect.row),
+                                    .col_offset = @intCast(start_col),
+                                    .wrap = .none,
+                                });
+                            }
                         }
                     }
-                }
                 }
             }
         }
@@ -9792,11 +10096,8 @@ pub fn main(init: std.process.Init) !void {
                 try app.setMsg(try app.alloc.dupe(u8, "file too large (>4GiB)"));
                 continue;
             }
-            const bytes = try app.alloc.alloc(u8, @intCast(size));
-            defer app.alloc.free(bytes);
-            _ = try file.readPositionalAll(app.io, bytes, 0);
             app.cur().pt.deinit();
-            app.cur().pt = try buffer.PieceTable.init(app.alloc, bytes);
+            app.cur().pt = try app.loadPieceTable(file, size);
             if (app.cur().path) |p| app.alloc.free(p);
             // Store an absolute path so LSP (uri building, server matching)
             // works for relative CLI args like `oz build.zig` — filetypeOf

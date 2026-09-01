@@ -30,6 +30,7 @@
 
 const std = @import("std");
 const json_rpc = @import("../util/json_rpc.zig");
+const lsp_types = @import("types.zig");
 
 /// URI used for the proactive publishDiagnostics when no document has been
 /// opened yet (which is the normal case: LSP sends `initialized` before any
@@ -690,10 +691,70 @@ fn recordDidOpen(alloc: std.mem.Allocator, state: *State, params: ?std.json.Valu
     try state.changed.append(alloc, .{ .uri = uri_copy, .text = text_copy });
 }
 
+/// Byte offset in `text` of LSP position `pos` (line + UTF-16 character).
+/// Clamps to the end of the line/document; null when the line does not exist.
+fn byteOffsetAt(text: []const u8, pos: lsp_types.Position) ?usize {
+    var line: u32 = 0;
+    var i: usize = 0;
+    while (line < pos.line) {
+        const nl = std.mem.indexOfScalarPos(u8, text, i, '\n') orelse return null;
+        i = nl + 1;
+        line += 1;
+    }
+    var units: u32 = 0;
+    while (units < pos.character) {
+        if (i >= text.len or text[i] == '\n') break; // clamp to line end
+        const b = text[i];
+        const seq_len: usize = if (b < 0x80) 1 else (std.unicode.utf8ByteSequenceLength(b) catch 1);
+        units += if (seq_len == 4) 2 else 1;
+        i += seq_len;
+    }
+    return i;
+}
+
+/// Apply one incremental change {range, text} to `base` (the pre-change
+/// document) and return the new full text (owned). A change whose range is
+/// out of bounds is dropped (LSP clients must not send those, but a stray
+/// fake range in a test should not corrupt the recorded document).
+fn applyChange(alloc: std.mem.Allocator, base: []const u8, range: lsp_types.Range, text: []const u8) ![]u8 {
+    const start = (byteOffsetAt(base, range.start) orelse return alloc.dupe(u8, base));
+    const end = (byteOffsetAt(base, range.end) orelse return alloc.dupe(u8, base));
+    if (start > end) return alloc.dupe(u8, base);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, base[0..start]);
+    try out.appendSlice(alloc, text);
+    try out.appendSlice(alloc, base[end..]);
+    return out.toOwnedSlice(alloc);
+}
+
+/// JSON numbers arrive as `.number_string` (raw text) through this codebase's
+/// parser (see util/json_rpc.zig takeValue); tolerate plain `.integer` too.
+fn jsonInt(v: std.json.Value) ?i64 {
+    return switch (v) {
+        .integer => |i| i,
+        .number_string => |s| std.fmt.parseInt(i64, s, 10) catch null,
+        else => null,
+    };
+}
+
 fn recordDidChange(alloc: std.mem.Allocator, state: *State, params: ?std.json.Value) !void {
     const uri = extractUri(alloc, params) catch return;
     errdefer alloc.free(uri);
+    // The pre-change document is the last recorded state for this uri (the
+    // didOpen seed, or the previous didChange). Incremental changes splice
+    // into it; range-less changes replace it wholesale (full-text sync).
+    var base: []const u8 = "";
+    var i = state.changed.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (std.mem.eql(u8, state.changed.items[i].uri, uri)) {
+            base = state.changed.items[i].text;
+            break;
+        }
+    }
     var text: []const u8 = "";
+    var range: ?lsp_types.Range = null;
     if (params) |p| {
         if (p == .object) {
             if (p.object.get("contentChanges")) |cc| {
@@ -703,12 +764,51 @@ fn recordDidChange(alloc: std.mem.Allocator, state: *State, params: ?std.json.Va
                         if (first.object.get("text")) |t| {
                             if (t == .string) text = t.string;
                         }
+                        if (first.object.get("range")) |r| {
+                            if (r == .object) {
+                                var rg: lsp_types.Range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } };
+                                var got_start = false;
+                                var got_end = false;
+                                if (r.object.get("start")) |s| {
+                                    if (s == .object) {
+                                        if (s.object.get("line")) |ln| {
+                                            if (s.object.get("character")) |ch| {
+                                                const line = jsonInt(ln);
+                                                const character = jsonInt(ch);
+                                                if (line != null and character != null) {
+                                                    rg.start = .{ .line = @intCast(line.?), .character = @intCast(character.?) };
+                                                    got_start = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if (r.object.get("end")) |e| {
+                                    if (e == .object) {
+                                        if (e.object.get("line")) |ln| {
+                                            if (e.object.get("character")) |ch| {
+                                                const line = jsonInt(ln);
+                                                const character = jsonInt(ch);
+                                                if (line != null and character != null) {
+                                                    rg.end = .{ .line = @intCast(line.?), .character = @intCast(character.?) };
+                                                    got_end = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if (got_start and got_end) range = rg;
+                            }
+                        }
                     }
                 }
             }
         }
     }
-    const text_copy = try alloc.dupe(u8, text);
+    const text_copy = if (range) |rg|
+        try applyChange(alloc, base, rg, text)
+    else
+        try alloc.dupe(u8, text);
     errdefer alloc.free(text_copy);
     try state.changed.append(alloc, .{ .uri = uri, .text = text_copy });
 }
@@ -1139,6 +1239,36 @@ test "didOpen and didChange are recorded in state" {
     try testing.expectEqual(@as(usize, 2), state.changed.items.len);
     try testing.expectEqualStrings("file:///a.txt", state.changed.items[1].uri);
     try testing.expectEqualStrings("world", state.changed.items[1].text);
+}
+
+test "didChange: incremental range edits are applied to the recorded document" {
+    const alloc = testing.allocator;
+    var state = State{};
+    defer state.deinit(alloc);
+    const open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///a.txt\",\"version\":1,\"text\":\"const a = 1;\\n\"}}}";
+    var out_open = try handleContent(alloc, .hello, &state, open);
+    defer out_open.deinit(alloc);
+
+    // insert "X" at line 0 col 0 (the per-keystroke didChange the client sends)
+    const ins = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///a.txt\",\"version\":2},\"contentChanges\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"text\":\"X\"}]}}";
+    var out_ins = try handleContent(alloc, .hello, &state, ins);
+    defer out_ins.deinit(alloc);
+    try testing.expectEqual(@as(usize, 2), state.changed.items.len);
+    try testing.expectEqualStrings("Xconst a = 1;\n", state.changed.items[1].text);
+
+    // delete "X" again: [0,1) → "" (jk-exit removal style)
+    const del = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///a.txt\",\"version\":3},\"contentChanges\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}},\"text\":\"\"}]}}";
+    var out_del = try handleContent(alloc, .hello, &state, del);
+    defer out_del.deinit(alloc);
+    try testing.expectEqual(@as(usize, 3), state.changed.items.len);
+    try testing.expectEqualStrings("const a = 1;\n", state.changed.items[2].text);
+
+    // multi-line edit: replace "a = 1" (col 6..11 on line 0) with "b = 2"
+    const rep = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///a.txt\",\"version\":4},\"contentChanges\":[{\"range\":{\"start\":{\"line\":0,\"character\":6},\"end\":{\"line\":0,\"character\":11}},\"text\":\"b = 2\"}]}}";
+    var out_rep = try handleContent(alloc, .hello, &state, rep);
+    defer out_rep.deinit(alloc);
+    try testing.expectEqual(@as(usize, 4), state.changed.items.len);
+    try testing.expectEqualStrings("const b = 2;\n", state.changed.items[3].text);
 }
 
 test "exit notification sets exit_requested" {

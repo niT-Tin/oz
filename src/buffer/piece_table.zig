@@ -32,7 +32,10 @@ pub const Edit = struct {
 
 pub const PieceTable = struct {
     allocator: std.mem.Allocator,
-    origin: []u8, // owned copy of initial content
+    origin: []u8, // initial content (owned copy, or a read-only file mapping)
+    /// When non-null, `origin` aliases this read-only mmap of the loaded file
+    /// and deinit must munmap it instead of freeing (see `initMapped`).
+    origin_mapping: ?[]align(std.heap.page_size_min) u8 = null,
     add: std.ArrayList(u8), // append-only edit bytes
     pieces: std.ArrayList(Piece), // ordered pieces covering the whole doc
     line_starts: std.ArrayList(u32), // cached; line_starts[0] == 0
@@ -68,8 +71,40 @@ pub const PieceTable = struct {
         return self;
     }
 
+    /// Create a table whose origin is a read-only file mapping (zero-copy
+    /// load path: the file bytes are never copied into the heap). The
+    /// mapping must stay alive for the table's lifetime; `deinit` munmaps
+    /// it. Only used for regular files where mmap succeeds — the load path
+    /// falls back to `init` (read + copy) otherwise.
+    pub fn initMapped(allocator: std.mem.Allocator, mapping: []align(std.heap.page_size_min) u8) !PieceTable {
+        var self = PieceTable{
+            .allocator = allocator,
+            .origin = mapping, // []align(page) u8 coerces to []u8
+            .origin_mapping = mapping,
+            .add = .empty,
+            .pieces = .empty,
+            .line_starts = .empty,
+            .doc_len = @intCast(mapping.len),
+            .line_starts_valid = false,
+        };
+        errdefer self.deinit();
+        if (mapping.len > 0) {
+            try self.pieces.append(allocator, .{
+                .source = .origin,
+                .start = 0,
+                .len = @intCast(mapping.len),
+            });
+        }
+        self.ensureLineStarts();
+        return self;
+    }
+
     pub fn deinit(self: *PieceTable) void {
-        self.allocator.free(self.origin);
+        if (self.origin_mapping) |m| {
+            std.posix.munmap(m);
+        } else {
+            self.allocator.free(self.origin);
+        }
         self.add.deinit(self.allocator);
         self.pieces.deinit(self.allocator);
         self.line_starts.deinit(self.allocator);
