@@ -7546,8 +7546,13 @@ const App = struct {
         // pushing the cursor off-screen)
         {
             var below: u32 = rows_to_cursor + 1; // + the cursor row itself
+            // Count the visible rows below the cursor, but only up to the
+            // viewport height: the pull-up below only cares whether fewer
+            // than `height` rows remain, and the walk to EOF is O(lines)
+            // per frame (a 135k-line file would scan to the end on every
+            // render). Early-exit keeps this O(height) in the common case.
             var l = cursor_line;
-            while (l + 1 < line_count) {
+            while (l + 1 < line_count and below < rect.height) {
                 l = foldNextLine(buf, l);
                 below += 1;
             }

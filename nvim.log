@@ -274,3 +274,305 @@ WRN 2026-09-01T23:06:59.233 ?.1552     server_start:197: Failed to start server:
 WRN 2026-09-01T23:07:00.468 ui.1551    tui_stop:658: TUI: timed out waiting for DA1 response
 WRN 2026-09-01T23:07:00.485 ?.1554     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1554.0
 WRN 2026-09-01T23:07:01.721 ui.1553    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:40:46.943 ?.38       server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.38.0
+WRN 2026-09-02T01:40:48.228 ui.37      tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:40:48.245 ?.40       server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.40.0
+WRN 2026-09-02T01:40:49.531 ui.39      tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:40:49.547 ?.42       server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.42.0
+WRN 2026-09-02T01:40:50.832 ui.41      tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:40:50.848 ?.44       server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.44.0
+WRN 2026-09-02T01:40:52.133 ui.43      tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:40:53.068 ?.155      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.155.0
+WRN 2026-09-02T01:40:54.352 ui.154     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:40:54.369 ?.157      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.157.0
+WRN 2026-09-02T01:40:55.654 ui.156     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:40:55.670 ?.159      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.159.0
+WRN 2026-09-02T01:40:56.955 ui.158     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:40:56.971 ?.161      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.161.0
+WRN 2026-09-02T01:40:58.256 ui.160     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:40:59.320 ?.271      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.271.0
+WRN 2026-09-02T01:41:00.605 ui.270     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:41:00.622 ?.273      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.273.0
+WRN 2026-09-02T01:41:01.906 ui.272     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:41:01.923 ?.275      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.275.0
+WRN 2026-09-02T01:41:03.208 ui.274     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:41:03.224 ?.277      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.277.0
+WRN 2026-09-02T01:41:04.509 ui.276     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:41:05.285 ?.303      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.303.0
+WRN 2026-09-02T01:41:06.578 ui.302     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:41:06.594 ?.305      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.305.0
+WRN 2026-09-02T01:41:07.887 ui.304     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:41:07.903 ?.307      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.307.0
+WRN 2026-09-02T01:41:09.196 ui.306     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:41:09.213 ?.309      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.309.0
+WRN 2026-09-02T01:41:10.506 ui.308     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:41:11.330 ?.335      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.335.0
+WRN 2026-09-02T01:41:12.639 ui.334     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:41:12.656 ?.337      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.337.0
+WRN 2026-09-02T01:41:13.965 ui.336     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:41:13.982 ?.339      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.339.0
+WRN 2026-09-02T01:41:15.292 ui.338     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:41:15.309 ?.341      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.341.0
+WRN 2026-09-02T01:41:16.618 ui.340     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:41:17.488 ?.452      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.452.0
+WRN 2026-09-02T01:41:24.717 ui.451     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:41:24.734 ?.454      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.454.0
+WRN 2026-09-02T01:41:31.962 ui.453     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:41:31.979 ?.456      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.456.0
+WRN 2026-09-02T01:41:39.208 ui.455     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:41:39.224 ?.458      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.458.0
+WRN 2026-09-02T01:41:46.454 ui.457     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:41:47.342 ?.568      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.568.0
+WRN 2026-09-02T01:41:48.570 ui.567     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:41:48.586 ?.570      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.570.0
+WRN 2026-09-02T01:41:49.813 ui.569     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:41:49.829 ?.572      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.572.0
+WRN 2026-09-02T01:41:51.056 ui.571     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:41:51.073 ?.574      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.574.0
+WRN 2026-09-02T01:41:52.300 ui.573     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:41:53.141 ?.685      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.685.0
+WRN 2026-09-02T01:42:00.369 ui.684     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:42:00.386 ?.687      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.687.0
+WRN 2026-09-02T01:42:07.614 ui.686     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:42:07.631 ?.689      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.689.0
+WRN 2026-09-02T01:42:14.859 ui.688     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:42:14.876 ?.691      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.691.0
+WRN 2026-09-02T01:42:22.105 ui.690     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:42:22.947 ?.802      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.802.0
+WRN 2026-09-02T01:42:30.176 ui.801     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:42:30.194 ?.804      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.804.0
+WRN 2026-09-02T01:42:37.421 ui.803     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:42:37.438 ?.806      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.806.0
+WRN 2026-09-02T01:42:44.666 ui.805     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:42:44.683 ?.808      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.808.0
+WRN 2026-09-02T01:42:51.911 ui.807     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:42:52.840 ?.920      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.920.0
+WRN 2026-09-02T01:42:54.067 ui.919     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:42:54.084 ?.922      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.922.0
+WRN 2026-09-02T01:42:55.311 ui.921     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:42:55.328 ?.924      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.924.0
+WRN 2026-09-02T01:42:56.555 ui.923     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:42:56.571 ?.926      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.926.0
+WRN 2026-09-02T01:42:57.798 ui.925     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:42:58.626 ?.1040     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1040.0
+WRN 2026-09-02T01:43:05.857 ui.1039    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:43:05.873 ?.1042     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1042.0
+WRN 2026-09-02T01:43:15.107 ?.1044     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1044.0
+WRN 2026-09-02T01:43:22.336 ui.1043    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:43:22.353 ?.1046     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1046.0
+WRN 2026-09-02T01:43:29.582 ui.1045    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:43:30.428 ?.1156     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1156.0
+WRN 2026-09-02T01:43:31.657 ui.1155    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:43:31.673 ?.1158     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1158.0
+WRN 2026-09-02T01:43:32.902 ui.1157    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:43:32.918 ?.1160     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1160.0
+WRN 2026-09-02T01:43:36.150 ?.1162     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1162.0
+WRN 2026-09-02T01:43:37.379 ui.1161    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:43:38.237 ?.1274     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1274.0
+WRN 2026-09-02T01:43:45.467 ui.1273    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:43:45.483 ?.1276     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1276.0
+WRN 2026-09-02T01:43:52.712 ui.1275    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:43:52.729 ?.1278     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1278.0
+WRN 2026-09-02T01:43:59.958 ui.1277    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:43:59.975 ?.1280     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1280.0
+WRN 2026-09-02T01:44:07.204 ui.1279    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:44:08.040 ?.1392     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1392.0
+WRN 2026-09-02T01:44:15.269 ui.1391    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:44:15.286 ?.1394     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1394.0
+WRN 2026-09-02T01:44:22.513 ui.1393    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:44:22.530 ?.1396     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1396.0
+WRN 2026-09-02T01:44:29.758 ui.1395    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:44:29.775 ?.1398     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1398.0
+WRN 2026-09-02T01:44:37.004 ui.1397    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:44:37.540 ?.1424     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1424.0
+WRN 2026-09-02T01:44:44.775 ui.1423    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:44:44.792 ?.1426     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1426.0
+WRN 2026-09-02T01:44:52.026 ui.1425    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:44:52.043 ?.1428     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1428.0
+WRN 2026-09-02T01:44:59.278 ui.1427    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:44:59.295 ?.1430     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1430.0
+WRN 2026-09-02T01:45:06.530 ui.1429    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:45:07.066 ?.1456     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1456.0
+WRN 2026-09-02T01:45:08.299 ui.1455    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:45:08.316 ?.1458     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1458.0
+WRN 2026-09-02T01:45:09.549 ui.1457    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:45:09.565 ?.1460     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1460.0
+WRN 2026-09-02T01:45:10.798 ui.1459    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:45:10.815 ?.1462     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1462.0
+WRN 2026-09-02T01:45:12.048 ui.1461    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:45:12.598 ?.1488     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1488.0
+WRN 2026-09-02T01:45:13.833 ui.1487    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:45:13.849 ?.1490     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1490.0
+WRN 2026-09-02T01:45:15.085 ui.1489    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:45:15.102 ?.1492     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1492.0
+WRN 2026-09-02T01:45:16.337 ui.1491    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:45:16.354 ?.1494     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1494.0
+WRN 2026-09-02T01:45:17.589 ui.1493    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:45:18.135 ?.1520     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1520.0
+WRN 2026-09-02T01:45:19.373 ui.1519    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:45:19.389 ?.1522     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1522.0
+WRN 2026-09-02T01:45:20.628 ui.1521    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:45:20.644 ?.1524     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1524.0
+WRN 2026-09-02T01:45:21.883 ui.1523    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:45:21.899 ?.1526     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1526.0
+WRN 2026-09-02T01:45:23.137 ui.1525    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:45:23.753 ?.1552     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1552.0
+WRN 2026-09-02T01:45:24.990 ui.1551    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:45:25.007 ?.1554     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1554.0
+WRN 2026-09-02T01:45:26.245 ui.1553    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:45:26.262 ?.1556     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1556.0
+WRN 2026-09-02T01:45:27.498 ui.1555    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:45:27.515 ?.1558     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1558.0
+WRN 2026-09-02T01:45:28.752 ui.1557    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:16.611 ?.773      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.773.0
+WRN 2026-09-02T01:46:17.897 ui.772     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:17.914 ?.775      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.775.0
+WRN 2026-09-02T01:46:19.200 ui.774     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:19.216 ?.777      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.777.0
+WRN 2026-09-02T01:46:20.501 ui.776     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:20.518 ?.779      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.779.0
+WRN 2026-09-02T01:46:21.803 ui.778     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:22.752 ?.890      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.890.0
+WRN 2026-09-02T01:46:24.037 ui.889     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:24.053 ?.892      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.892.0
+WRN 2026-09-02T01:46:25.338 ui.891     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:25.354 ?.894      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.894.0
+WRN 2026-09-02T01:46:26.639 ui.893     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:26.656 ?.896      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.896.0
+WRN 2026-09-02T01:46:27.941 ui.895     tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:29.006 ?.1006     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1006.0
+WRN 2026-09-02T01:46:30.291 ui.1005    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:30.308 ?.1008     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1008.0
+WRN 2026-09-02T01:46:31.593 ui.1007    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:31.609 ?.1010     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1010.0
+WRN 2026-09-02T01:46:32.894 ui.1009    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:32.910 ?.1012     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1012.0
+WRN 2026-09-02T01:46:34.195 ui.1011    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:34.970 ?.1038     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1038.0
+WRN 2026-09-02T01:46:36.263 ui.1037    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:36.279 ?.1040     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1040.0
+WRN 2026-09-02T01:46:37.572 ui.1039    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:37.589 ?.1042     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1042.0
+WRN 2026-09-02T01:46:38.882 ui.1041    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:38.898 ?.1044     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1044.0
+WRN 2026-09-02T01:46:40.192 ui.1043    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:41.016 ?.1070     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1070.0
+WRN 2026-09-02T01:46:42.326 ui.1069    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:42.342 ?.1072     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1072.0
+WRN 2026-09-02T01:46:43.652 ui.1071    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:43.668 ?.1074     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1074.0
+WRN 2026-09-02T01:46:44.978 ui.1073    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:44.994 ?.1076     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1076.0
+WRN 2026-09-02T01:46:46.304 ui.1075    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:47.173 ?.1187     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1187.0
+WRN 2026-09-02T01:46:54.402 ui.1186    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:46:54.419 ?.1189     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1189.0
+WRN 2026-09-02T01:47:01.648 ui.1188    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:47:01.664 ?.1191     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1191.0
+WRN 2026-09-02T01:47:08.893 ui.1190    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:47:08.910 ?.1193     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1193.0
+WRN 2026-09-02T01:47:16.140 ui.1192    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:47:17.024 ?.1305     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1305.0
+WRN 2026-09-02T01:47:18.251 ui.1304    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:47:18.267 ?.1307     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1307.0
+WRN 2026-09-02T01:47:19.495 ui.1306    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:47:19.512 ?.1309     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1309.0
+WRN 2026-09-02T01:47:20.739 ui.1308    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:47:20.755 ?.1311     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1311.0
+WRN 2026-09-02T01:47:21.982 ui.1310    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:47:22.824 ?.1422     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1422.0
+WRN 2026-09-02T01:47:30.051 ui.1421    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:47:30.068 ?.1424     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1424.0
+WRN 2026-09-02T01:47:37.295 ui.1423    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:47:37.312 ?.1426     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1426.0
+WRN 2026-09-02T01:47:44.541 ui.1425    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:47:44.558 ?.1428     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1428.0
+WRN 2026-09-02T01:47:51.787 ui.1427    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:47:52.629 ?.1538     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1538.0
+WRN 2026-09-02T01:47:59.858 ui.1537    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:47:59.875 ?.1540     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1540.0
+WRN 2026-09-02T01:48:07.103 ui.1539    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:48:07.120 ?.1542     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1542.0
+WRN 2026-09-02T01:48:14.350 ui.1541    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:48:14.367 ?.1544     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1544.0
+WRN 2026-09-02T01:48:21.597 ui.1543    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:48:22.524 ?.1656     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1656.0
+WRN 2026-09-02T01:48:23.752 ui.1655    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:48:23.768 ?.1658     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1658.0
+WRN 2026-09-02T01:48:24.996 ui.1657    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:48:25.013 ?.1660     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1660.0
+WRN 2026-09-02T01:48:26.240 ui.1659    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:48:26.257 ?.1662     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1662.0
+WRN 2026-09-02T01:48:27.484 ui.1661    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:48:28.315 ?.1772     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1772.0
+WRN 2026-09-02T01:48:35.545 ui.1771    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:48:35.561 ?.1774     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1774.0
+WRN 2026-09-02T01:48:42.791 ui.1773    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:48:42.808 ?.1776     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1776.0
+WRN 2026-09-02T01:48:50.037 ui.1775    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:48:50.053 ?.1778     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1778.0
+WRN 2026-09-02T01:48:57.284 ui.1777    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:48:58.134 ?.1891     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1891.0
+WRN 2026-09-02T01:48:59.363 ui.1890    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:48:59.380 ?.1893     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1893.0
+WRN 2026-09-02T01:49:00.608 ui.1892    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:49:00.624 ?.1895     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1895.0
+WRN 2026-09-02T01:49:01.853 ui.1894    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:49:01.870 ?.1897     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1897.0
+WRN 2026-09-02T01:49:03.099 ui.1896    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:49:03.959 ?.2007     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2007.0
+WRN 2026-09-02T01:49:11.189 ui.2006    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:49:11.206 ?.2009     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2009.0
+WRN 2026-09-02T01:49:18.435 ui.2008    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:49:18.452 ?.2011     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2011.0
+WRN 2026-09-02T01:49:25.682 ui.2010    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:49:25.698 ?.2013     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2013.0
+WRN 2026-09-02T01:49:32.928 ui.2012    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:49:33.766 ?.2125     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2125.0
+WRN 2026-09-02T01:49:40.994 ui.2124    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:49:41.011 ?.2127     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2127.0
+WRN 2026-09-02T01:49:48.238 ui.2126    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:49:48.254 ?.2129     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2129.0
+WRN 2026-09-02T01:49:55.482 ui.2128    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:49:55.499 ?.2131     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2131.0
+WRN 2026-09-02T01:50:02.726 ui.2130    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:50:03.263 ?.2157     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2157.0
+WRN 2026-09-02T01:50:10.498 ui.2156    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:50:10.515 ?.2159     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2159.0
+WRN 2026-09-02T01:50:17.751 ui.2158    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:50:17.768 ?.2161     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2161.0
+WRN 2026-09-02T01:50:25.004 ui.2160    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:50:25.021 ?.2163     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2163.0
+WRN 2026-09-02T01:50:32.255 ui.2162    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:50:32.791 ?.2189     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2189.0
+WRN 2026-09-02T01:50:34.025 ui.2188    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:50:34.042 ?.2191     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2191.0
+WRN 2026-09-02T01:50:35.275 ui.2190    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:50:35.291 ?.2193     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2193.0
+WRN 2026-09-02T01:50:36.525 ui.2192    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:50:36.541 ?.2195     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2195.0
+WRN 2026-09-02T01:50:37.774 ui.2194    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:50:38.323 ?.2221     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2221.0
+WRN 2026-09-02T01:50:39.558 ui.2220    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:50:39.575 ?.2223     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2223.0
+WRN 2026-09-02T01:50:40.811 ui.2222    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:50:40.827 ?.2225     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2225.0
+WRN 2026-09-02T01:50:42.063 ui.2224    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:50:42.080 ?.2227     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2227.0
+WRN 2026-09-02T01:50:43.316 ui.2226    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:50:43.860 ?.2253     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2253.0
+WRN 2026-09-02T01:50:45.098 ui.2252    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:50:45.113 ?.2255     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2255.0
+WRN 2026-09-02T01:50:46.352 ui.2254    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:50:46.368 ?.2257     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2257.0
+WRN 2026-09-02T01:50:47.606 ui.2256    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:50:47.623 ?.2259     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2259.0
+WRN 2026-09-02T01:50:48.861 ui.2258    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:50:49.473 ?.2285     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2285.0
+WRN 2026-09-02T01:50:50.709 ui.2284    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:50:50.726 ?.2287     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2287.0
+WRN 2026-09-02T01:50:51.962 ui.2286    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:50:51.978 ?.2289     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2289.0
+WRN 2026-09-02T01:50:53.215 ui.2288    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-09-02T01:50:53.232 ?.2291     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.2291.0
+WRN 2026-09-02T01:50:54.468 ui.2290    tui_stop:658: TUI: timed out waiting for DA1 response
