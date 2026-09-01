@@ -157,6 +157,17 @@ const App = struct {
         /// history.revision at this buffer's last parse (incremental-parse
         /// bookkeeping; maxInt forces a full reparse).
         syntax_revision: u64 = 0,
+        /// Cached merged visible spans from the last visibleSpansFor call
+        /// (owned by this buffer, alloc'd with the app allocator; spans are
+        /// tiny — one viewport's worth — so the copy is cheaper than the
+        /// query+merge it skips). Valid iff `spans_cache_valid` and the key
+        /// (syntax_revision, byte range) matches — non-scrolling keys then
+        /// cost 0 syntax work instead of a full query+merge per frame.
+        spans_cache: []syntax.Span = &.{},
+        spans_cache_valid: bool = false,
+        spans_cache_start: u32 = 0,
+        spans_cache_end: u32 = 0,
+        spans_cache_rev: u64 = 0,
         /// Closed folds (indent-detected, see editor/fold.zig), sorted by
         /// start line. Kept PER BUFFER, not per window: two splits showing
         /// the same buffer share the fold state, so za in one split is
@@ -1131,6 +1142,7 @@ const App = struct {
             buf.history.deinit();
             buf.pt.deinit();
             buf.folds.deinit(self.alloc);
+            if (buf.spans_cache.len > 0) self.alloc.free(buf.spans_cache);
             if (buf.hl) |*h| h.deinit();
             if (buf.path) |p| self.alloc.free(p);
         }
@@ -5407,6 +5419,7 @@ const App = struct {
         buf.history.deinit();
         buf.pt.deinit();
         buf.folds.deinit(self.alloc);
+        if (buf.spans_cache.len > 0) self.alloc.free(buf.spans_cache);
         if (buf.hl) |*h| h.deinit();
         if (buf.path) |p| self.alloc.free(p);
         if (self.current >= self.buffers.items.len) self.current = self.buffers.items.len - 1;
@@ -5867,6 +5880,15 @@ const App = struct {
         const vbottom = @min(view_top + content_rows, line_count);
         // lineStart has no EOF sentinel: the last visible line's end is pt.len()
         const end: u32 = if (vbottom >= line_count) buf.pt.len() else buf.pt.lineStart(vbottom);
+        // Cache hit: no edit since the last query (revision unchanged) and
+        // the same visible byte range — the query+merge below is the
+        // dominant frame cost and would be pure waste (every non-scrolling
+        // key, every cursor move inside the viewport, every repaint).
+        if (buf.spans_cache_valid and buf.spans_cache_rev == rev and
+            buf.spans_cache_start == start and buf.spans_cache_end == end)
+        {
+            return buf.spans_cache;
+        }
         var raw = std.ArrayList(syntax.Span).empty;
         try hl.spansInRange(@intCast(start), @intCast(end), arena, &raw);
         var out = std.ArrayList(syntax.Span).empty;
@@ -5883,7 +5905,16 @@ const App = struct {
             }
             try out.append(arena, sp);
         }
-        return out.items;
+        // own a copy so future cache hits return a stable slice (the arena
+        // is per-frame; the buffer outlives any frame)
+        const cached = try self.alloc.dupe(syntax.Span, out.items);
+        if (buf.spans_cache.len > 0) self.alloc.free(buf.spans_cache);
+        buf.spans_cache = cached;
+        buf.spans_cache_valid = true;
+        buf.spans_cache_start = start;
+        buf.spans_cache_end = end;
+        buf.spans_cache_rev = rev;
+        return buf.spans_cache;
     }
 
     /// Load recent files from ~/.cache/oz/recent (one path per line).

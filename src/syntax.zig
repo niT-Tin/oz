@@ -20,6 +20,26 @@
 const std = @import("std");
 const treez = @import("treez");
 
+/// treez's `Tree.Cursor` binding is BROKEN for this tree-sitter version: it
+/// declares TSTreeCursor as 24 bytes (tree/id/context[2]) but the real struct
+/// is 28 bytes (context[3] — the third word is `root_alias_symbol`).
+/// ts_tree_cursor_new writes all 28 bytes, so the 4-byte overflow lands past
+/// the Zig struct and root_alias_symbol reads as garbage — getCurrentNode()
+/// then produces a node whose type() is NULL and getType() segfaults on the
+/// span() strlen. We declare the correct layout and call the externs
+/// directly (the symbols come from the linked libtree-sitter).
+const TsTreeCursor = extern struct {
+    tree: ?*const anyopaque,
+    id: ?*const anyopaque,
+    context: [3]u32,
+};
+extern fn ts_tree_cursor_new(node: treez.Node) TsTreeCursor;
+extern fn ts_tree_cursor_delete(cursor: *TsTreeCursor) void;
+extern fn ts_tree_cursor_current_node(cursor: *const TsTreeCursor) treez.Node;
+extern fn ts_tree_cursor_goto_parent(cursor: *TsTreeCursor) bool;
+extern fn ts_tree_cursor_goto_next_sibling(cursor: *TsTreeCursor) bool;
+extern fn ts_tree_cursor_goto_first_child(cursor: *TsTreeCursor) bool;
+
 /// Highlight style groups, indexed by `Span.style` (0 = default). The caller
 /// (main.zig) owns the actual vaxis style palette, keyed by this enum's
 /// ordinal — syntax.zig only assigns groups.
@@ -447,6 +467,16 @@ fn bracketDepth(node: treez.Node) u32 {
     return depth;
 }
 
+/// Rainbow depth of a bracket node: a hashmap lookup into the per-call
+/// depth map. The fallback (node not in the walked range — should not
+/// happen since setByteRange only yields captures intersecting the range,
+/// which the walk covers) keeps the old getParent walk so the result is
+/// never wrong, only rarely slower.
+fn depthOf(node: treez.Node, depths: *const std.AutoHashMap(*const anyopaque, u32)) u32 {
+    if (depths.get(node.id.?)) |d| return d;
+    return bracketDepth(node);
+}
+
 /// A parsed+queried buffer for one language. Owns the tree-sitter parser,
 /// the compiled highlight query and the last parse tree.
 pub const Highlighter = struct {
@@ -462,6 +492,9 @@ pub const Highlighter = struct {
     /// points corrupt tree-sitter's internal position metadata and can drift
     /// the highlight spans after a burst of edits.
     prev_text: ?[]u8 = null,
+    /// Reusable query cursor (created on first use; ts_query_cursor_new
+    /// mallocs, and spansInRange runs every frame per visible window).
+    cursor: ?*treez.Query.Cursor = null,
 
     /// Grammars with a bundled query file (src/syntax/queries/<lang>.scm).
     const LANGUAGES = [_][]const u8{
@@ -497,6 +530,7 @@ pub const Highlighter = struct {
     pub fn deinit(self: *Highlighter) void {
         if (self.prev_text) |t| self.allocator.free(t);
         if (self.tree) |t| t.destroy();
+        if (self.cursor) |c| c.destroy();
         self.query.destroy();
         self.parser.destroy();
     }
@@ -567,11 +601,26 @@ pub const Highlighter = struct {
     /// Run the highlight query over [start_byte, end_byte) and append spans
     /// to `out` (allocated from `arena`, e.g. the render frame arena). The
     /// query cursor is byte-range limited — the O(visible) contract.
+    ///
+    /// Rainbow-bracket depth comes from ONE DFS over the visible subtree
+    /// (`walkVisible`), not per-bracket `getParent()` chains: tree-sitter
+    /// 0.26's `ts_node_parent` re-descends from the root on every call
+    /// (O(children) per level), which cost ~6µs/step — 46 brackets × 25
+    /// steps ≈ 7ms/frame on token-dense code, the dominant frame cost.
     pub fn spansInRange(self: *Highlighter, start_byte: u32, end_byte: u32, arena: std.mem.Allocator, out: *std.ArrayList(Span)) !void {
         const tree = self.tree orelse return;
         const text = self.prev_text orelse return;
-        var cursor = try treez.Query.Cursor.create();
-        defer cursor.destroy();
+        // one walk over the visible subtree: ERROR ranges (for the fallback
+        // lexer) + node-id → depth (for rainbow brackets)
+        var errs = std.ArrayList(ByteRange).empty;
+        defer errs.deinit(arena);
+        var depths = std.AutoHashMap(*const anyopaque, u32).init(arena);
+        defer depths.deinit();
+        try self.walkVisible(start_byte, end_byte, arena, &errs, &depths);
+        const cursor = if (self.cursor) |c| c else blk: {
+            self.cursor = try treez.Query.Cursor.create();
+            break :blk self.cursor.?;
+        };
         cursor.setByteRange(start_byte, end_byte);
         cursor.execute(self.query, tree.getRootNode());
         while (cursor.nextCapture()) |nc| {
@@ -588,7 +637,7 @@ pub const Highlighter = struct {
             // instead of the plain .punctuation that captureStyle() would
             // fold them to (it collapses dotted suffixes onto the base).
             const style: Style = if (isBracketCapture(name))
-                bracketStyle(bracketDepth(cap.node))
+                bracketStyle(depthOf(cap.node, &depths))
             else
                 captureStyle(name);
             if (style == .default) continue;
@@ -629,9 +678,6 @@ pub const Highlighter = struct {
         // keep their colors while the text is syntactically broken. The lexer
         // runs only on ERROR ranges intersecting the visible range, so the
         // O(visible) contract holds.
-        var errs = std.ArrayList(ByteRange).empty;
-        defer errs.deinit(arena);
-        try self.collectErrorRanges(start_byte, end_byte, arena, &errs);
         for (errs.items) |r| {
             if (r.end <= r.start) continue;
             if (r.end > text.len) continue;
@@ -646,29 +692,50 @@ pub const Highlighter = struct {
         std.mem.sort(Span, out.items, {}, lessThan);
     }
 
-    /// Walk the tree (pruned to the byte range) collecting ERROR nodes.
-    fn collectErrorRanges(self: *Highlighter, start: u32, end: u32, arena: std.mem.Allocator, out: *std.ArrayList(ByteRange)) !void {
+    /// One DFS over the subtree intersecting [start, end): records ERROR
+    /// byte ranges into `errs` (the fallback-lexer input) and every visited
+    /// node's depth (root = 0) into `depths`, keyed by node id. A single
+    /// O(visible) pass replaces per-bracket getParent() chains — see
+    /// `spansInRange` for why.
+    ///
+    /// Uses a tree CURSOR, not getChild(i): tree-sitter 0.26's ts_node_child
+    /// rescans children from index 0 (O(N²) on nodes with many children — a
+    /// 911-child ERROR root costs ~1.5ms per walk), while the cursor walks
+    /// siblings incrementally. The cursor visits every node that is visible
+    /// or has visible descendants; hidden LEAF tokens (brackets, punctuation)
+    /// are skipped — their depth is recovered on lookup miss by one
+    /// getParent() hop (`depthOf`), since the skipped token's parent is
+    /// visited by this walk.
+    fn walkVisible(self: *Highlighter, start: u32, end: u32, arena: std.mem.Allocator, errs: *std.ArrayList(ByteRange), depths: *std.AutoHashMap(*const anyopaque, u32)) !void {
         const tree = self.tree orelse return;
-        var stack: [256]treez.Node = undefined;
-        var sp: usize = 0;
-        stack[sp] = tree.getRootNode();
-        sp += 1;
-        while (sp > 0) {
-            sp -= 1;
-            const n = stack[sp];
+        var cur = ts_tree_cursor_new(tree.getRootNode());
+        defer ts_tree_cursor_delete(&cur);
+        // per-level "inside an ERROR region" flags, indexed by depth
+        var in_err: [512]bool = undefined;
+        var depth: u32 = 0;
+        in_err[0] = false;
+        while (true) {
+            const n = ts_tree_cursor_current_node(&cur);
             const ns = n.getStartByte();
             const ne = n.getEndByte();
-            if (ne <= start or ns >= end) continue; // outside the visible range
-            if (std.mem.eql(u8, n.getType(), "ERROR")) {
-                try out.append(arena, .{ .start = ns, .end = ne });
-                continue; // don't descend into the error's own children
-            }
-            var i: u32 = 0;
-            while (i < n.getChildCount()) : (i += 1) {
-                if (sp < stack.len) {
-                    stack[sp] = n.getChild(i);
-                    sp += 1;
+            const in_range = ns < end and ne > start;
+            if (in_range) {
+                if (n.id) |id| depths.put(id, depth) catch {};
+                const is_err = std.mem.eql(u8, n.getType(), "ERROR");
+                if (is_err and !in_err[depth]) try errs.append(arena, .{ .start = ns, .end = ne });
+                if (depth + 1 < in_err.len and ts_tree_cursor_goto_first_child(&cur)) {
+                    depth += 1;
+                    in_err[depth] = in_err[depth - 1] or is_err;
+                    continue;
                 }
+            }
+            // ascend until a next sibling exists (skipping out-of-range
+            // subtrees entirely)
+            while (true) {
+                if (ts_tree_cursor_goto_next_sibling(&cur)) break;
+                if (depth == 0) return;
+                _ = ts_tree_cursor_goto_parent(&cur);
+                depth -= 1;
             }
         }
     }
@@ -741,9 +808,10 @@ pub const Highlighter = struct {
 fn isBlockNode(node: treez.Node) bool {
     const ty = node.getType();
     const needles = [_][]const u8{
-        "block", "func", "fn_", "declaration", "struct", "enum",
-        "union", "class", "interface", "impl", "module", "body", "statement",
-        "switch", "match", "loop", "if_", "for_", "while_", "object", "array",
+        "block",     "func",   "fn_",       "declaration", "struct", "enum",
+        "union",     "class",  "interface", "impl",        "module", "body",
+        "statement", "switch", "match",     "loop",        "if_",    "for_",
+        "while_",    "object", "array",
     };
     for (needles) |nd| {
         if (std.mem.indexOf(u8, ty, nd) != null) return true;
@@ -1141,7 +1209,6 @@ test "repro: insert 'j' at end of an indented fn-body line keeps next-line keywo
     if (st != Style.keyword) dumpSpans(new_src, spans.items);
     try std.testing.expectEqual(Style.keyword, st);
 }
-
 
 test "build.zig style: parameter, type, module, function call get distinct styles" {
     // Regression: the catch-all `(identifier) @variable` used to drown the
