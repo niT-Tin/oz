@@ -142,7 +142,7 @@ Piece = { source: enum{origin, add}, start: u32, len: u32 }
 
 - 读：`charAt(byte_offset)` → 定位 piece（二分 + 缓存最后访问 piece）
 - 写：`replace(pos, len, bytes)` → 分裂/插入 piece，返回 `Edit {pos, before_len, after_bytes}`
-- **行索引**：`line_starts: ArrayList(u32)` 缓存每行起始字节偏移，增量维护（编辑只影响后缀，标记脏区间后惰性重建）
+- **行索引**：`line_starts: ArrayList(u32)` 缓存每行起始字节偏移，`replace` 时增量维护（区间替换 + 后缀平移）；OOM 兜底才置脏、下次查询用 memchr 全量重建
 - 大文件：piece 数量与编辑次数成正比，定期 `compact()` 合并相邻同源 piece
 - 多光标：所有光标共享同一 PieceTable，编辑批量合并为一个 undo 组
 

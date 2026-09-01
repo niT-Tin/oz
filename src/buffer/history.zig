@@ -23,6 +23,10 @@ pub const Group = struct {
     }
 };
 
+/// Piece-list compaction cadence: every this many recorded edits the piece
+/// table merges adjacent pieces, keeping byteAt/copyRange scans bounded.
+const compact_interval = 64;
+
 pub const History = struct {
     allocator: std.mem.Allocator,
     undo_stack: std.ArrayList(Group),
@@ -37,6 +41,8 @@ pub const History = struct {
     /// change then has no single-edit description). The stored value shares
     /// `before`/`after` with the group's Edit entries (History owns them).
     last_record: ?Edit = null,
+    /// Edit counter driving periodic piece-table compaction (see `record`).
+    edits_since_compact: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator) History {
         return .{
@@ -104,6 +110,15 @@ pub const History = struct {
         });
         self.last_record = .{ .pos = pos, .before = before, .after = after_copy };
         self.revision += 1;
+
+        // Bound piece-list growth from long edit streams: merge adjacent
+        // pieces every so often. Content-neutral — document bytes, the line
+        // index, and History-owned copies are all unaffected by compaction.
+        self.edits_since_compact += 1;
+        if (self.edits_since_compact >= compact_interval) {
+            self.edits_since_compact = 0;
+            pt.compact();
+        }
 
         if (auto_group) self.endGroup();
     }
@@ -351,6 +366,32 @@ test "empty group dropped; undo/redo on empty history return false" {
     try std.testing.expect(hist.redo(&pt));
     try std.testing.expect(!hist.redo(&pt));
     try expectDoc(&pt, std.testing.allocator, "hello!?");
+}
+
+test "record periodically compacts the piece list" {
+    const alloc = std.testing.allocator;
+    var pt = try PieceTable.init(alloc, "");
+    defer pt.deinit();
+    var hist = History.init(alloc);
+    defer hist.deinit();
+
+    // 3x the compact interval of single-byte appends: without compaction the
+    // piece list would hold one piece per edit.
+    var i: usize = 0;
+    while (i < 3 * compact_interval) : (i += 1) {
+        try hist.record(&pt, pt.len(), 0, "x");
+    }
+    const expected = try alloc.alloc(u8, 3 * compact_interval);
+    defer alloc.free(expected);
+    @memset(expected, 'x');
+    try expectDoc(&pt, alloc, expected);
+    try std.testing.expect(pt.pieces.items.len <= compact_interval + 2);
+
+    // Undo/redo still work across the compacted piece list.
+    while (hist.undo(&pt)) {}
+    try expectDoc(&pt, alloc, "");
+    while (hist.redo(&pt)) {}
+    try expectDoc(&pt, alloc, expected);
 }
 
 /// Independent naive model of the History semantics, built directly on

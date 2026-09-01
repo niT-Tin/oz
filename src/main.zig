@@ -101,6 +101,23 @@ const GitPreview = struct {
     top: usize, // scroll offset
 };
 
+/// Async LSP attach: the server spawn + initialize handshake run on a worker
+/// thread so opening a file never blocks the UI (a cold zls boot takes
+/// hundreds of ms; a wedged server would otherwise stall first paint for the
+/// full 30s handshake cap). The worker fills `client`/`err` BEFORE flipping
+/// `done` (release); the main loop consumes with acquire and joins. The
+/// handshake is aborted via `cancel` (checked by waitResponse) when the
+/// buffer's filetype changes mid-attach.
+const LspStartJob = struct {
+    lang: []u8, // owned (filetype)
+    uri: []u8, // owned
+    cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    client: ?*lsp.Client = null,
+    err: ?[]const u8 = null, // @errorName — static string, not owned
+    thread: std.Thread = undefined,
+};
+
 /// Pending 'r{char}' capture: the count from '3r', the char filled when the
 /// next plain key arrives (normal mode only).
 const ReplacePending = struct {
@@ -274,6 +291,9 @@ const App = struct {
     // server / spawn failed — silent degrade). Diagnostics received are
     // stashed here until the M2 diagnostics UI lands.
     lsp_client: ?*lsp.Client = null,
+    /// In-flight async attach (ensureLsp); null when idle. Consumed by
+    /// finishLspStart in the run loop.
+    lsp_starting: ?*LspStartJob = null,
     lsp_diagnostics: std.ArrayList(lsp_types.Diagnostic) = .empty,
     /// Set by lspHandler when publishDiagnostics changed the list: the run
     /// loop must repaint or the gutter marks go stale (a final "all clean"
@@ -445,6 +465,11 @@ const App = struct {
     /// edit_seq at the moment the in-flight formatting/rename request was
     /// sent (format_slot is shared by both).
     format_req_seq: u64 = 0,
+
+    /// Per-frame memo for screenCellCol: the same (line, byte_pos) query
+    /// recurs several times a frame (status bar, cursor block, completion
+    /// menu, ghost text). Invalidated at the top of render().
+    cell_col_memo: struct { line: u32 = 0, pos: u32 = 0, col: u32 = 0, valid: bool = false } = .{},
 
     /// The active buffer (the focused window's buffer; per-buffer document
     /// state lives here, per-window cursor/viewport in `windows`).
@@ -1103,6 +1128,10 @@ const App = struct {
 
     fn deinit(self: *App) void {
         self.loop.stop();
+        // An in-flight LSP attach must be cancelled and joined before the
+        // pieces it borrows (env_map, io, the vaxis loop its wake posts to)
+        // go away.
+        self.cancelLspStart();
         self.vx.deinit(self.alloc, self.tty.writer());
         self.tty.deinit();
         self.alloc.free(self.tty_buffer);
@@ -5156,11 +5185,13 @@ const App = struct {
             return;
         }
         const bytes = try self.alloc.alloc(u8, @intCast(size));
-        defer self.alloc.free(bytes);
+        errdefer self.alloc.free(bytes);
         _ = try file.readPositionalAll(self.io, bytes, 0);
 
         try self.buffers.append(self.alloc, .{
-            .pt = try buffer.PieceTable.init(self.alloc, bytes),
+            // initAdopt takes ownership of `bytes` — no second copy of the
+            // file in memory (init would dupe it)
+            .pt = try buffer.PieceTable.initAdopt(self.alloc, bytes),
             .history = buffer.History.init(self.alloc),
             .path = try self.alloc.dupe(u8, abs),
         });
@@ -5173,6 +5204,7 @@ const App = struct {
     /// the server exited on its own (reader EOF) — then the user is told,
     /// because pending requests will never resolve.
     fn teardownLsp(self: *App, died: bool) void {
+        self.cancelLspStart();
         if (self.lsp_client) |c| {
             c.deinit();
             self.lsp_client = null;
@@ -5203,6 +5235,7 @@ const App = struct {
     /// :q path.
     fn closeBufferAt(self: *App, buf_idx: usize) void {
         if (self.buffers.items.len <= 1) return;
+        self.cancelLspStart();
         if (self.lsp_client) |c| {
             c.deinit();
             self.lsp_client = null;
@@ -5531,26 +5564,116 @@ const App = struct {
         const path = self.cur().path orelse return;
         if (path.len == 0) return;
         const uri = lsp_types.pathToFileUri(self.alloc, path) catch return;
-        defer self.alloc.free(uri);
-        const text = self.curText() catch return;
-        defer self.alloc.free(text);
-        const start_result = lsp.Client.start(self.alloc, self.io, self.env_map, ft, uri, text);
-        self.lsp_client = start_result catch |err| {
-            // Tell the user why LSP features are silent: the configured
-            // server binary is missing or failed to spawn (e.g. no zls
-            // installed for Zig files). On OOM there is nothing to say —
-            // never hand a static "" to setMsg (it would be freed later).
-            const msg = std.fmt.allocPrint(self.alloc, "LSP {s}: {s}", .{ ft, @errorName(err) }) catch return;
-            self.setMsg(msg) catch {};
+        // An attach already in flight for this exact filetype+uri is enough;
+        // a mismatched one belongs to a buffer the user already left —
+        // cancel it before starting the new one.
+        if (self.lsp_starting) |job| {
+            if (std.mem.eql(u8, job.lang, ft) and std.mem.eql(u8, job.uri, uri)) {
+                self.alloc.free(uri);
+                return;
+            }
+            self.cancelLspStart();
+        }
+        // Async attach: spawn + handshake run on a worker thread (LspStartJob)
+        // so first paint and editing never block on a slow server boot. The
+        // job posts a wake event when done; the run loop installs the client
+        // (finishLspStart) and only then opens the document with the CURRENT
+        // text, so edits during the handshake are not lost.
+        const job = self.alloc.create(LspStartJob) catch {
+            self.alloc.free(uri);
             return;
         };
+        job.* = .{
+            .lang = self.alloc.dupe(u8, ft) catch {
+                self.alloc.free(uri);
+                self.alloc.destroy(job);
+                return;
+            },
+            .uri = uri,
+        };
+        job.thread = std.Thread.spawn(.{}, lspStartMain, .{ self.alloc, self.io, self.env_map, job, self }) catch {
+            self.alloc.free(job.lang);
+            self.alloc.free(job.uri);
+            self.alloc.destroy(job);
+            return;
+        };
+        self.lsp_starting = job;
+    }
+
+    /// Worker: run the spawn + initialize handshake off the UI thread.
+    fn lspStartMain(alloc: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map, job: *LspStartJob, app: *App) void {
+        if (lsp.Client.connect(alloc, io, env_map, job.lang, job.uri, &job.cancel)) |client| {
+            job.client = client;
+        } else |e| {
+            job.err = @errorName(e);
+        }
+        job.done.store(true, .release);
+        // wake the main loop so the client is installed without a keypress
+        lspWake(app);
+    }
+
+    /// Abort and reap an in-flight attach (buffer switched away / teardown).
+    /// The join is quick: waitResponse polls `cancel` every 100ms.
+    fn cancelLspStart(self: *App) void {
+        const job = self.lsp_starting orelse return;
+        job.cancel.store(true, .release);
+        job.thread.join();
+        if (job.client) |c| c.deinit();
+        self.alloc.free(job.lang);
+        self.alloc.free(job.uri);
+        self.alloc.destroy(job);
+        self.lsp_starting = null;
+    }
+
+    /// Consume a finished async attach (run loop, each frame): install the
+    /// client for the current buffer, or drop it when the user moved on
+    /// mid-handshake. Returns true when a job was consumed (caller renders).
+    fn finishLspStart(self: *App) bool {
+        const job = self.lsp_starting orelse return false;
+        if (!job.done.load(.acquire)) return false;
+        job.thread.join();
+        self.lsp_starting = null;
+        defer {
+            self.alloc.free(job.lang);
+            self.alloc.free(job.uri);
+            self.alloc.destroy(job);
+        }
+        const client = job.client orelse {
+            // A cancel is a buffer switch, not an error — stay silent.
+            if (job.err) |name| {
+                if (!std.mem.eql(u8, name, "Cancelled")) {
+                    // Tell the user why LSP features are silent: the
+                    // configured server binary is missing or failed to spawn.
+                    const msg = std.fmt.allocPrint(self.alloc, "LSP {s}: {s}", .{ job.lang, name }) catch return true;
+                    self.setMsg(msg) catch {};
+                }
+            }
+            return true;
+        };
+        // Install only when the current buffer still matches the job.
+        const ft = filetypeOf(self.cur().path);
+        const cur_uri: ?[]u8 = blk: {
+            const path = self.cur().path orelse break :blk null;
+            break :blk lsp_types.pathToFileUri(self.alloc, path) catch null;
+        };
+        defer if (cur_uri) |u| self.alloc.free(u);
+        if (cur_uri == null or !std.mem.eql(u8, ft, job.lang) or !std.mem.eql(u8, cur_uri.?, job.uri)) {
+            client.deinit(); // user moved on mid-handshake
+            self.ensureLsp(); // attach for whatever is current now
+            return true;
+        }
         // Wire the reader thread's wake callback to our event loop: any
         // incoming LSP message posts an event so the main loop (blocked in
         // pollEvent) wakes up and drains it without waiting for a keypress.
-        if (self.lsp_client) |c| {
-            c.wake_ctx = self;
-            c.wake_fn = lspWake;
-        }
+        client.wake_ctx = self;
+        client.wake_fn = lspWake;
+        self.lsp_client = client;
+        // Open with the CURRENT text — edits made during the handshake must
+        // not be lost.
+        const text = self.curText() catch return true;
+        defer self.alloc.free(text);
+        client.openDocument(text) catch {};
+        return true;
     }
 
     /// Called from the LSP reader thread when a message arrives: post a
@@ -6706,8 +6829,19 @@ const App = struct {
         const line_start = pt.lineStart(line);
         var p = line_start;
         var col: u32 = 0;
+        // Scan a chunked COPY of the line: per-byte byteAt is O(pieces), so
+        // walking long lines byte by byte costs O(line_len × pieces) per
+        // call, several times per frame.
+        var chunk: [4096]u8 = undefined;
+        var chunk_start: u32 = 0;
+        var chunk_len: usize = 0;
         while (p < byte_pos) {
-            const b = pt.byteAt(p);
+            if (p < chunk_start or p >= chunk_start + chunk_len) {
+                chunk_start = p;
+                chunk_len = @min(@as(usize, @intCast(byte_pos - p)), chunk.len);
+                pt.copyRange(p, chunk[0..chunk_len]);
+            }
+            const b = chunk[p - chunk_start];
             // A tab occupies `tab_width` cells (the renderer expands it), not
             // the 0 vaxis reports — otherwise cursor/ghost/menu columns would
             // disagree with the drawn line on files containing tabs.
@@ -6793,6 +6927,9 @@ const App = struct {
     /// On-screen cell column of `byte_pos` within `line`: the text column
     /// plus the width of every inlay hint spliced before it.
     fn screenCellCol(self: *App, win: vaxis.Window, line: u32, byte_pos: u32) u32 {
+        if (self.cell_col_memo.valid and self.cell_col_memo.line == line and self.cell_col_memo.pos == byte_pos) {
+            return self.cell_col_memo.col;
+        }
         const text_col = self.lineCellCol(win, line, byte_pos);
         var col = text_col;
         // hints anchored before the cursor widen the cursor's cell column.
@@ -6805,6 +6942,7 @@ const App = struct {
                 col += self.textWidth(win, hint.label);
             }
         }
+        self.cell_col_memo = .{ .line = line, .pos = byte_pos, .col = col, .valid = true };
         return col;
     }
 
@@ -6813,10 +6951,16 @@ const App = struct {
         _ = self;
         const ls = buf.pt.lineStart(l);
         const ll = buf.pt.lineLen(l);
+        // chunked copy instead of per-byte byteAt (O(pieces) each)
+        var chunk: [1024]u8 = undefined;
         var i: u32 = 0;
-        while (i < ll) : (i += 1) {
-            const b = buf.pt.byteAt(ls + i);
-            if (b != ' ' and b != '\t') return false;
+        while (i < ll) {
+            const n = @min(ll - i, chunk.len);
+            buf.pt.copyRange(ls + i, chunk[0..n]);
+            for (chunk[0..n]) |b| {
+                if (b != ' ' and b != '\t') return false;
+            }
+            i += @intCast(n);
         }
         return true;
     }
@@ -6827,14 +6971,20 @@ const App = struct {
         const ls = buf.pt.lineStart(l);
         const ll = buf.pt.lineLen(l);
         var cols: u32 = 0;
+        // chunked copy instead of per-byte byteAt (O(pieces) each)
+        var chunk: [1024]u8 = undefined;
         var i: u32 = 0;
-        while (i < ll) : (i += 1) {
-            const b = buf.pt.byteAt(ls + i);
-            if (b == ' ') {
-                cols += 1;
-            } else if (b == '\t') {
-                cols += tab_width;
-            } else break;
+        outer: while (i < ll) {
+            const n = @min(ll - i, chunk.len);
+            buf.pt.copyRange(ls + i, chunk[0..n]);
+            for (chunk[0..n]) |b| {
+                if (b == ' ') {
+                    cols += 1;
+                } else if (b == '\t') {
+                    cols += tab_width;
+                } else break :outer;
+            }
+            i += @intCast(n);
         }
         return cols / tab_width;
     }
@@ -6889,9 +7039,13 @@ const App = struct {
         // while fewer than `height` visible rows remain below it (without
         // pushing the cursor off-screen)
         {
+            // Count visible rows below the cursor, CAPPED at rect.height:
+            // the pull-up loop below only needs to know whether fewer than
+            // `height` rows remain, so walking to EOF (O(file) per frame)
+            // is wasted work on large files.
             var below: u32 = rows_to_cursor + 1; // + the cursor row itself
             var l = cursor_line;
-            while (l + 1 < line_count) {
+            while (l + 1 < line_count and below < rect.height) {
                 l = foldNextLine(buf, l);
                 below += 1;
             }
@@ -6978,6 +7132,11 @@ const App = struct {
         var span_i: usize = 0;
         var row: u32 = rect.row;
         var line = w.view_top;
+        // Blank-line indent-guide memo: consecutive blank rows share the exact same
+        // "nearest non-blank line (above, else below) scan result — the scan for line L and
+        // L+1 differs by one blank line at most, so the memo of the previous blank
+        // line's ctx_levels carries over (only reused for consecutive blank lines).
+        var blank_guide_memo: ?struct { line: u32, levels: u32 } = null;
         while (row < rect.row + rect.height and line < line_count) : ({
             // skip a closed fold's body: it shares its header's screen row
             line = foldNextLine(buf, line);
@@ -7203,7 +7362,14 @@ const App = struct {
             // the scope's vertical never extends onto those rows.
             if (indent_end == n) {
                 var ctx_levels: u32 = 0;
-                {
+                var have_levels = false;
+                if (blank_guide_memo) |m| {
+                    if (m.line + 1 == line) { // consecutive blank run: reuse the previous line's scan
+                        ctx_levels = m.levels;
+                        have_levels = true;
+                    }
+                }
+                if (!have_levels) {
                     var ctx: i64 = @as(i64, @intCast(line)) - 1;
                     var dir: i64 = -1;
                     var scanned: usize = 0;
@@ -7226,6 +7392,7 @@ const App = struct {
                         ctx += dir;
                     }
                 }
+                blank_guide_memo = .{ .line = line, .levels = ctx_levels };
                 const start_col: u32 = indent_cols;
                 const ctx_cols: u32 = @min(ctx_levels * tab_width, rect.width -| gutter);
                 // the scope's highlighted guide column (only when it lies
@@ -7546,6 +7713,9 @@ const App = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
+        // per-frame memo invalidation (screenCellCol is called with identical
+        // args several times a frame)
+        self.cell_col_memo.valid = false;
 
         const win = self.vx.window();
         win.clear();
@@ -9023,7 +9193,10 @@ const App = struct {
                     git_ready = true;
                 }
             }
-            if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready) {
+            // A finished async LSP attach installs its client (and opens the
+            // document) — render so diagnostics/inlay requests can start.
+            const lsp_ready = self.finishLspStart();
+            if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready or lsp_ready) {
                 try self.render();
                 continue;
             }
@@ -9038,15 +9211,21 @@ const App = struct {
             }
             // poll + drain: block until an event arrives (keypress OR an
             // LSP wake posted by the reader thread), then handle the whole
-            // batch and render once. While the scope highlight is animating,
-            // poll instead of blocking so the spread advances frame by frame
-            // without keypresses (16ms ≈ 60fps; vaxis diffs the output).
-            if (self.scopeAnimActive() or self.blameHoldActive()) {
+            // batch and render once. While the scope highlight is animating
+            // or the blame CursorHold is counting, poll at 60fps instead of
+            // blocking — but render only when something actually changed
+            // (events handled / animation frame / blame ghost deadline
+            // reached), not on every poll tick.
+            const scope_was = self.scopeAnimActive();
+            const hold_was = self.blameHoldActive();
+            if (scope_was or hold_was) {
                 std.Io.sleep(self.io, .fromMilliseconds(16), .real) catch {};
             } else {
                 try self.loop.pollEvent();
             }
+            var handled = false;
             while (try self.loop.tryEvent()) |event| {
+                handled = true;
                 switch (event) {
                     .key_press => |key| try self.handleKey(key),
                     .paste => |text| {
@@ -9060,7 +9239,10 @@ const App = struct {
                     else => {},
                 }
             }
-            try self.render();
+            const blame_due = hold_was and !self.blameHoldActive();
+            if (handled or scope_was or blame_due) {
+                try self.render();
+            }
         }
 
         try self.vx.exitAltScreen(self.tty.writer());
@@ -9523,10 +9705,11 @@ pub fn main(init: std.process.Init) !void {
                 continue;
             }
             const bytes = try app.alloc.alloc(u8, @intCast(size));
-            defer app.alloc.free(bytes);
+            errdefer app.alloc.free(bytes);
             _ = try file.readPositionalAll(app.io, bytes, 0);
             app.cur().pt.deinit();
-            app.cur().pt = try buffer.PieceTable.init(app.alloc, bytes);
+            // initAdopt takes ownership of `bytes` — no second copy
+            app.cur().pt = try buffer.PieceTable.initAdopt(app.alloc, bytes);
             if (app.cur().path) |p| app.alloc.free(p);
             // Store an absolute path so LSP (uri building, server matching)
             // works for relative CLI args like `oz build.zig` — filetypeOf
