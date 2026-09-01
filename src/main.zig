@@ -506,6 +506,12 @@ const App = struct {
     /// Scope-highlight animation state (null when idle / no scope). Restarted
     /// whenever the focused window's scope block changes; see ScopeAnim.
     scope_anim: ?ScopeAnim = null,
+    /// True while the run loop is in the 1ms poll slice (scope animation,
+    /// blame hold, or an open embedded terminal). Cleared the moment the
+    /// loop switches back to blocking pollEvent; the run loop forces one
+    /// render on that transition so the final state (ghost appearing as the
+    /// CursorHold expires, animation's last spread) is never skipped.
+    poll_mode_active: bool = false,
     /// Cached scopeAt result for the last rendered (window, buffer, cursor,
     /// revision) — recomputed only when the tree or the cursor byte changed.
     scope_cache: ?ScopeCache = null,
@@ -9449,10 +9455,6 @@ const App = struct {
                             self.blame_ghost_label = .{ .line = blame_line, .entry = e, .label = lbl };
                             label = lbl;
                         }
-                        // anchor at the END of the line's RENDERED text:
-                        // screenCellCol (not lineCellCol) counts the inlay hints
-                        // spliced into the line — anchoring at the raw text end
-                        // would draw the ghost ON TOP of hinted text
                         const line_end = fbuf.pt.lineStart(blame_line) + fbuf.pt.lineLen(blame_line);
                         const end_col = self.screenCellCol(win, blame_line, line_end);
                         var start_col = cur_rect.col + gutter + end_col;
@@ -9901,8 +9903,26 @@ const App = struct {
             // full frame's latency to every keypress (a "G k x20" script
             // spends its whole run inside the 500ms animation window).
             // The render pacing below keeps animation frames at ~16ms.
+            // Poll-mode transition guard: while scope-animating / blame-
+            // holding / terminal-open, the loop sleeps in 1ms slices so a
+            // keypress wakes it within ~1ms. When the last such condition
+            // flips false the loop is about to block in pollEvent — the
+            // render pacing below could otherwise skip the FINAL frame (e.g.
+            // the blame ghost appearing as the 1s CursorHold expires, or the
+            // animation's last spread) and the loop would block forever
+            // without ever drawing it. Force that one render.
+            var poll_transition = false;
             if (self.scopeAnimActive() or self.blameHoldActive() or (builtin.os.tag == .linux and self.term_pane != null)) {
                 std.Io.sleep(self.io, .fromMilliseconds(1), .real) catch {};
+                self.poll_mode_active = true;
+            } else if (self.poll_mode_active) {
+                // Transition out of poll mode: do NOT block in pollEvent
+                // yet — the render below (forced via poll_transition) must
+                // draw the final poll state first (the blame ghost appearing
+                // as the 1s CursorHold expires, the animation's last spread).
+                // The next iteration blocks as usual.
+                self.poll_mode_active = false;
+                poll_transition = true;
             } else {
                 try self.loop.pollEvent();
             }
@@ -9932,7 +9952,7 @@ const App = struct {
                 }
             }
             const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
-            if (handled or now_ms - last_render_ms >= 16) {
+            if (handled or poll_transition or now_ms - last_render_ms >= 16) {
                 try self.render();
                 last_render_ms = now_ms;
             }

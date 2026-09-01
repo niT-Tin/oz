@@ -1,0 +1,48 @@
+e2e
++- run test 108 pass, 1 fail (109 total)
+error: 'e2e.test.git: gutter signs, ]c hunk jump, hunk stage/reset, blame ghost, branch' failed:
+       jk toggle 0: hint col 6
+       jk toggle 1: hint col 6
+       jk toggle 2: hint col 6
+       jk toggle 3: hint col 6
+       BLAME GHOST DEBUG: used=8245 out_len=1048576
+       |󰈙 a.txt                                                                         |
+       |16 line1                                                                        |
+       |15 line2                                                                        |
+       |14 CHANGED                                                                      |
+       |13 line4                                                                        |
+       |12 line5                                                                        |
+       |11 line6                                                                        |
+       |10 line7                                                                        |
+       | 9 line8                                                                        |
+       | 8 line9                                                                        |
+       | 7 line10                                                                       |
+       | 6 line11                                                                       |
+       | 5 line12                                                                       |
+       | 4 line13                                                                       |
+       | 3 line14                                                                       |
+       | 2 line15                                                                       |
+       | 1 line16                                                                       |
+       |17 NEW                                                                          |
+       | 1 line17                                                                       |
+       | 2 line18                                                                       |
+       | 3                                                                              |
+       |                                                                                |
+       |                                                                                |
+       | NORMAL  line 17/20 col 0  hunk reset  ⎇ main                                   |
+       BLAME GHOST RAW TAIL:
+       ?25l[H[m[18;4H[?25h[?2026l[?2026h[?25l[H[m[18;4H[?25h[?2026l[?2026h[?25l[H[m[18;4H[?25h[?2026l[?2026h[?25l[H[m[18;4H[?25h[?2026l[?2026h[?25l[H[m[18;4H[?25h[?2026l[?2026h[?25l[H[m[18;4H[?25h[?2026l[?2026h[?25l[H[m[18;4H[?25h[?2026l[?2026h[?25l[H[m[18;4H[?25h[?2026l[?2026h[?25l[H[m[18;4H[?25h[?2026l[?2026h[?25l[H[m[18;4H[?25h[?2026l
+       /usr/lib/zig/std/testing.zig:615:14: 0x1260b99 in expect (std.zig)
+           if (!ok) return error.TestUnexpectedResult;
+                    ^
+       /home/leoz/sources/oz/test/e2e.zig:11572:5: 0x1286dc6 in test.git: gutter signs, ]c hunk jump, hunk stage/reset, blame ghost, branch (e2e.zig)
+           try std.testing.expect(ghost_ok);
+           ^
+failed command: ./.zig-cache/o/aaf007358744788829cab9813b962191/test --cache-dir=./.zig-cache --seed=0x435c5b64 --listen=-
+
+Build Summary: 331/333 steps succeeded (1 failed); 108/109 tests passed (1 failed)
+e2e transitive failure
++- run test 108 pass, 1 fail (109 total)
+
+error: the following build command failed with exit code 1:
+.zig-cache/o/e156fab6a25910f50c374ce98d56ab32/build /usr/bin/zig /usr/lib/zig /home/leoz/sources/oz .zig-cache .zig-global-cache --seed 0x435c5b64 -Z2539127dbca4b91d e2e

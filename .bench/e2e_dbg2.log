@@ -1,0 +1,8 @@
+e2e
++- run test w
+jk toggle 0: hint col 6
+jk toggle 1: hint col 6
+jk toggle 2: hint col 6
+jk toggle 3: hint col 6
+failed command: ./.zig-cache/o/aaf007358744788829cab9813b962191/test --cache-dir=./.zig-cache --seed=0x2fa00008 --listen=-
+

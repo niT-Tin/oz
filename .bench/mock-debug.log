@@ -1,0 +1,15 @@
+mock_lsp: script=hello ready
+mock_lsp: recv request id=1 method=initialize
+mock_lsp: sent frame (194 bytes)
+mock_lsp: recv notification method=initialized
+mock_lsp: recv notification method=textDocument/didOpen
+mock_lsp: sent frame (232 bytes)
+mock_lsp: recv request id=2 method=textDocument/inlayHint
+mock_lsp: sent frame (89 bytes)
+mock_lsp: recv notification method=textDocument/didChange
+mock_lsp: recv request id=3 method=textDocument/completion
+DBG completionPrefix: uri=file:///tmp/oz_repro.zig line=2 col=3 changed=2
+DBG   rec uri=file:///tmp/oz_repro.zig text=const a = 1;
+const b = 2;
+mox
+mock_lsp: sent frame (215 bytes)

@@ -1,0 +1,21 @@
+e2e
++- run test 108 pass, 1 fail (109 total)
+error: 'e2e.test.git: gutter signs, ]c hunk jump, hunk stage/reset, blame ghost, branch' failed:
+       jk toggle 0: hint col 6
+       jk toggle 1: hint col 6
+       jk toggle 2: hint col 6
+       jk toggle 3: hint col 6
+       /usr/lib/zig/std/testing.zig:615:14: 0x1260b99 in expect (std.zig)
+           if (!ok) return error.TestUnexpectedResult;
+                    ^
+       /home/leoz/sources/oz/test/e2e.zig:11566:5: 0x1286cc8 in test.git: gutter signs, ]c hunk jump, hunk stage/reset, blame ghost, branch (e2e.zig)
+           try std.testing.expect(try Wait.until(&sess, &grid, "E2E Tester, "));
+           ^
+failed command: ./.zig-cache/o/7d5e45ab156b29d28f01552b62af7f40/test --cache-dir=./.zig-cache --seed=0xd19f7073 --listen=-
+
+Build Summary: 331/333 steps succeeded (1 failed); 108/109 tests passed (1 failed)
+e2e transitive failure
++- run test 108 pass, 1 fail (109 total)
+
+error: the following build command failed with exit code 1:
+.zig-cache/o/e156fab6a25910f50c374ce98d56ab32/build /usr/bin/zig /usr/lib/zig /home/leoz/sources/oz .zig-cache .zig-global-cache --seed 0xd19f7073 -Z98dcb3fac67cbdb0 e2e
