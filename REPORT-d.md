@@ -116,3 +116,49 @@ end-to-end "≤ 2 ms/key for gg j x20" target needs the render-side work.
 `src/syntax.zig`, `src/main.zig` (only the `Buffer` cache fields +
 `visibleSpansFor` + two cache frees), this report. The untracked `bench/` and
 `.guard-marker-d` are pre-existing setup artifacts and were left untouched.
+
+## Follow-up: scopeAt O(n²) fix (render-path agent's findings, round 2)
+
+Committed on top (second commit). Findings from the render-path agent applied
+to src/syntax.zig:
+
+1. **scopeAt was O(n²) ≈ 5.5ms at the end of medium.zig** — confirmed by direct
+   measurement: `scopeAt` at byte 78000 cost **5415µs** (vs 0µs at byte 0).
+   Root cause: the drill-down scanned children with `ts_node_child(i)`, which
+   rescans children from index 0 — 911 root children ⇒ ~415K child-steps.
+   **Fix**: one forward pass of a tree cursor per level (goto_first_child +
+   goto_next_sibling), stopping at the first child whose start byte exceeds
+   the cursor (children are sorted). **5415µs → 45µs** (120×). Verified
+   **819/819 byte positions produce byte-identical Scope results** vs the old
+   indexed scan (hidden-leaf children are skipped by the cursor, but they are
+   leaves — descending into them was always a dead end, so the scope is
+   unchanged). This was the biggest per-key cost: it ran every render via
+   `visibleSpansFor`'s caller.
+
+2. **spansInRange position-dependence at EOF (reported 4.2ms)** — re-measured
+   on the current code: spansInRange is **uniform ~235–280µs** at all five
+   positions (bytes 0 / 20k / 40k / 60k / 78k, 40-row windows, incl. the
+   exact EOF range). The query engine walks out-of-range siblings with an
+   incremental tree cursor (O(1) per node — verified in query.c); the O(N²)
+   sibling scans existed only in the pre-fix getChild-based code that round 1
+   already replaced (walkVisible) — nothing further to do here.
+
+3. **Animation poll loop** (main.zig run() ~9305, ~16ms/key during the 500ms
+   scope animation) — event-loop/render territory; noted for the render agent
+   to fix (my remaining share of the affected keys is ~0.2ms).
+
+## Bench after round 2 (medium.zig, 3 iters, medians)
+
+| script | round 1 | round 2 | target |
+|---|---|---|---|
+| gg j x20 (line down) | 5.7 ms/key | **0.3 ms/key** | ≤1 ✓ |
+| G k x20 (line up) | 21.6 | 16.2 (≈16ms animation poll, render-side) | ≤2 (pending render fix) |
+| G b x30 (word back) | 21.6 | 16.2 (same poll) | |
+| G ctrl-b x10 (page up) | 5.3 | **0.2** | |
+| gg ctrl-f x10 (page down) | 0.1 | 0.1 | |
+| gg w/e/f4 | 0.1 | 0.1 | |
+
+Verification: `zig build test` 281/281 (pre-existing baseline leak only);
+`zig build e2e` 104/109 — the 5 failures are the same known-flaky baseline set
+(file tree ×3, filetree, relative CLI path); scope/indent/rainbow e2e tests
+pass.
