@@ -139,6 +139,7 @@
 //! - Only Linux is supported by the widget.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const vaxis = @import("vaxis");
 
 /// The three terminal placements (M3b).
@@ -226,7 +227,7 @@ pub fn layoutRect(layout: Layout, content_top: u32, content_rows: u32, screen_w:
 /// called from the main thread; `pollEvent` must be drained every frame (see
 /// module notes). `inner` is exposed for advanced use (e.g. scrollback via
 /// `inner.scroll_offset` under `inner.back_mutex`).
-pub const Terminal = struct {
+pub const Terminal = if (builtin.os.tag == .linux) struct {
     inner: vaxis.widgets.Terminal,
     /// Buffer for the PTY streaming writer — owned by this wrapper.
     write_buf: []u8,
@@ -320,6 +321,55 @@ pub const Terminal = struct {
     /// changed — call every frame or on `.redraw` events.
     pub fn draw(self: *Terminal, win: vaxis.Window) !void {
         try self.inner.draw(self.allocator, win);
+    }
+} else struct {
+    // Non-Linux stub: vaxis's PTY backend is Linux-only (@compileError in
+    // Pty.init). Keeps this module compileable everywhere (tests.zig runs
+    // refAllDecls); every call fails at runtime with UnsupportedPlatform.
+    // The embedded terminal simply cannot be opened on other platforms.
+    pub const default_write_buf_size: usize = 4096;
+
+    pub fn create(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        argv: []const []const u8,
+        env: *const std.process.Environ.Map,
+        opts: vaxis.widgets.Terminal.Options,
+    ) !*Terminal {
+        _ = io;
+        _ = allocator;
+        _ = argv;
+        _ = env;
+        _ = opts;
+        return error.UnsupportedPlatform;
+    }
+    pub fn destroy(self: *Terminal) void {
+        _ = self;
+    }
+    pub fn resize(self: *Terminal, rows: u16, cols: u16) !void {
+        _ = self;
+        _ = rows;
+        _ = cols;
+        return error.UnsupportedPlatform;
+    }
+    pub fn pollEvent(self: *Terminal) !?vaxis.widgets.Terminal.Event {
+        _ = self;
+        return null;
+    }
+    pub fn sendKey(self: *Terminal, key: vaxis.Key) !void {
+        _ = self;
+        _ = key;
+        return error.UnsupportedPlatform;
+    }
+    pub fn sendText(self: *Terminal, text: []const u8) !void {
+        _ = self;
+        _ = text;
+        return error.UnsupportedPlatform;
+    }
+    pub fn draw(self: *Terminal, win: vaxis.Window) !void {
+        _ = self;
+        _ = win;
+        return error.UnsupportedPlatform;
     }
 };
 

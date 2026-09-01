@@ -65,6 +65,7 @@ fn applyVaxisPatch(b: *std.Build) void {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const strip = b.option(bool, "strip", "Strip debug info from the installed binaries") orelse false;
     // re-apply the vendored vaxis terminal-widget fixes before compiling
     applyVaxisPatch(b);
 
@@ -100,6 +101,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
             .imports = &.{
                 .{ .name = "vaxis", .module = vaxis_mod },
                 .{ .name = "treez", .module = treez_mod },

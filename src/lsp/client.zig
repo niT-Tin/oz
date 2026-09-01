@@ -717,7 +717,10 @@ pub const Client = struct {
         try inner.put(self.alloc, "textDocument", .{ .object = td_cap });
         var cap = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer cap.deinit(self.alloc);
-        try cap.put(self.alloc, "processId", .{ .integer = @intCast(std.os.linux.getpid()) });
+        // libc getpid — portable (the binary links libc). std.os.linux.getpid
+        // issues the LINUX syscall number, which on macOS maps to an
+        // unrelated/unimplemented syscall and kills the process with SIGSYS.
+        try cap.put(self.alloc, "processId", .{ .integer = @as(i64, std.c.getpid()) });
         const root_dir = try self.rootDir();
         defer self.alloc.free(root_dir);
         const root_uri = try types.pathToFileUri(self.alloc, root_dir);
@@ -1100,11 +1103,12 @@ test "reader: server stdout EOF sets server_died (crash detection)" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
 
-    // /bin/true exits immediately: the reader sees clean EOF on the pipe
+    // A binary that exits immediately: the reader sees clean EOF on the pipe
     // and must flag the server as gone (the editor then tears it down and
-    // tells the user instead of hanging on pending requests).
+    // tells the user instead of hanging on pending requests). /usr/bin/true
+    // exists on both Linux and macOS (macOS 26 removed /bin/true).
     const proc = try std.process.spawn(io, .{
-        .argv = &.{"/bin/true"},
+        .argv = &.{"/usr/bin/true"},
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .ignore,

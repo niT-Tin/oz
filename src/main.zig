@@ -4,6 +4,7 @@
 //!   nextEvent → Mode state machine → execute result against PieceTable
 //!   → render frame (line numbers + text + status bar) → vaxis diff output.
 const std = @import("std");
+const builtin = @import("builtin");
 const vaxis = @import("vaxis");
 
 const buffer = @import("buffer/root.zig");
@@ -120,6 +121,19 @@ const ScopeAnim = struct {
     start_ms: i128, // monotonic clock, ms
     const duration_ms: i128 = 500;
 };
+
+/// Embedded terminal pane (Linux only; `void` elsewhere so the App field
+/// and all references compile on every platform). The vaxis widget's reader
+/// thread holds a *Terminal for its whole life, so the pane lives at a
+/// stable address — a plain App field, never a reallocating list.
+const TermPane = if (builtin.os.tag == .linux) struct {
+    t: *term.Terminal,
+    layout: term.Layout = .floating,
+    focused: bool = false,
+    /// Duped from .title_change events (widget events borrow its own
+    /// buffer, unsafe across frames).
+    title: ?[]u8 = null,
+} else void;
 
 const App = struct {
     /// One open document. `pt`/`history` own their allocations; the struct is
@@ -447,20 +461,11 @@ const App = struct {
     format_req_seq: u64 = 0,
 
     // ---- M3b embedded terminal (<M-r> float / <M-w> bottom / <M-e> right) ----
-    /// One reusable terminal session (spec: 可复用会话). The vaxis widget's
-    /// reader thread holds a *Terminal for its whole life, so the pane must
-    /// live at a stable address — a plain App field, never a reallocating
-    /// list. null = no session open.
-    term: ?TermPane = null,
-
-    const TermPane = struct {
-        t: *term.Terminal,
-        layout: term.Layout = .floating,
-        focused: bool = false,
-        /// Duped from .title_change events (widget events borrow its own
-        /// buffer, unsafe across frames).
-        title: ?[]u8 = null,
-    };
+    /// Embedded terminal session; TermPane is void on non-Linux (vaxis PTY
+    /// backend), making this field ?void there. The vaxis widget's reader
+    /// thread holds a *Terminal for its whole life, so the pane lives at a
+    /// stable address — a plain App field, never a reallocating list.
+    term_pane: ?TermPane = null,
 
     /// The active buffer (the focused window's buffer; per-buffer document
     /// state lives here, per-window cursor/viewport in `windows`).
@@ -1190,9 +1195,11 @@ const App = struct {
         if (self.git_blame_path) |bp| self.alloc.free(bp);
         if (self.git_preview) |p| self.alloc.free(p.text);
         // M3b embedded terminal (kills the child, joins the reader thread)
-        if (self.term) |*tp| {
-            tp.t.destroy();
-            if (tp.title) |x| self.alloc.free(x);
+        if (builtin.os.tag == .linux) {
+            if (self.term_pane) |*tp| {
+                tp.t.destroy();
+                if (tp.title) |x| self.alloc.free(x);
+            }
         }
     }
 
@@ -1201,10 +1208,12 @@ const App = struct {
     fn handleKey(self: *App, key: vaxis.Key) !void {
         // Terminal focus first: every key belongs to the child (Esc /
         // Alt+r/w/e are intercepted inside handleTerminalKey).
-        if (self.term) |*tp| {
-            if (tp.focused) {
-                try self.handleTerminalKey(key);
-                return;
+        if (builtin.os.tag == .linux) {
+            if (self.term_pane) |*tp| {
+                if (tp.focused) {
+                    try self.handleTerminalKey(key);
+                    return;
+                }
             }
         }
         // Command mode first: while the ':' command line is open, Enter/Esc
@@ -3472,13 +3481,17 @@ const App = struct {
     fn absolutePath(self: *App, path: []const u8) ![]u8 {
         if (path.len > 0 and path[0] == '/') return self.alloc.dupe(u8, path);
         var cwd_buf: [4096:0]u8 = undefined;
-        const cwd_len = std.os.linux.getcwd(&cwd_buf, cwd_buf.len);
-        if (cwd_len == 0) return self.alloc.dupe(u8, path);
-        // getcwd returns the buffer length INCLUDING the terminating NUL
-        // (the raw syscall result); slicing with it embeds a \0 in the path,
-        // which later fails as BadPathName on createFile/write (openat just
-        // truncates at the NUL, so opening still works — the saved path is
-        // silently corrupt). Trim to the C-string length.
+        // libc getcwd — portable (the binary links libc). A raw
+        // std.os.linux.getcwd issues the LINUX syscall number: on macOS that
+        // number maps to an unrelated syscall, so the buffer stays garbage
+        // with no NUL and the resolved path is thousands of bogus bytes
+        // (createFile then failed with NameTooLong on :w).
+        if (std.c.getcwd(&cwd_buf, cwd_buf.len) == null) return self.alloc.dupe(u8, path);
+        // getcwd NUL-terminates on success; trim to the C-string length
+        // before joining so no \0 lands inside the path (an embedded NUL
+        // later fails as BadPathName on createFile/write — openat just
+        // truncates at the NUL, so opening still works while the saved path
+        // is silently corrupt).
         var n: usize = 0;
         while (n < cwd_buf.len and cwd_buf[n] != 0) : (n += 1) {}
         return std.Io.Dir.path.resolve(self.alloc, &.{ cwd_buf[0..n], path }) catch
@@ -4412,6 +4425,7 @@ const App = struct {
     /// Absolute cwd for a new terminal session: the current buffer's
     /// directory, or null (inherit oz's cwd) when the buffer has no path.
     fn termCwd(self: *App) ?[]const u8 {
+        if (builtin.os.tag != .linux) return null;
         const path = if (self.buffers.items.len > 0) self.cur().path else null;
         if (path) |p| {
             if (std.fs.path.dirname(p)) |d| return d;
@@ -4425,10 +4439,11 @@ const App = struct {
     /// terminal OVERLAYS the buffer area (drawn after the panes), it does
     /// not squeeze them.
     fn termRect(self: *App, a: std.mem.Allocator) term.Rect {
+        if (builtin.os.tag != .linux) return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
         const win = self.vx.window();
         const top = self.contentTop(a);
         const avail_rows = win.height -| status_row_count -| top;
-        const tp = &self.term.?;
+        const tp = &self.term_pane.?;
         return switch (tp.layout) {
             .floating => blk: {
                 const w = @max(40, @min(win.width * 8 / 10, win.width));
@@ -4460,7 +4475,8 @@ const App = struct {
     /// (its early return would skip the normal path). resize() no-ops when
     /// unchanged; draw() is cheap when nothing changed.
     fn drawTerm(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
-        if (self.term) |*tp| {
+        if (builtin.os.tag != .linux) return;
+        if (self.term_pane) |*tp| {
             const r = self.termRect(a);
             if (r.w > 0 and r.h > 0 and r.w <= win.width and r.h <= win.height) {
                 try tp.t.resize(@intCast(r.h), @intCast(r.w));
@@ -4480,7 +4496,8 @@ const App = struct {
     /// again closes it (spec: 开关); a different layout key switches the
     /// placement of the SAME session (spec: 可复用会话) and refocuses it.
     fn toggleTerm(self: *App, layout: term.Layout) !void {
-        if (self.term) |*tp| {
+        if (builtin.os.tag != .linux) return;
+        if (self.term_pane) |*tp| {
             if (tp.layout == layout) {
                 self.closeTerm();
             } else {
@@ -4502,16 +4519,17 @@ const App = struct {
             try self.setMsg(m);
             return;
         };
-        self.term = .{ .t = t, .layout = layout, .focused = true };
+        self.term_pane = .{ .t = t, .layout = layout, .focused = true };
     }
 
     /// Destroy the terminal session (kills the child, joins the reader
     /// thread, closes the pty).
     fn closeTerm(self: *App) void {
-        if (self.term) |*tp| {
+        if (builtin.os.tag != .linux) return;
+        if (self.term_pane) |*tp| {
             tp.t.destroy();
             if (tp.title) |x| self.alloc.free(x);
-            self.term = null;
+            self.term_pane = null;
         }
     }
 
@@ -4521,7 +4539,8 @@ const App = struct {
     /// (spec: 终端内 <M-r> 等同一键位可直接退回 Normal/关闭); everything
     /// else is forwarded to the child.
     fn handleTerminalKey(self: *App, key: vaxis.Key) !void {
-        const tp = &self.term.?;
+        if (builtin.os.tag != .linux) return;
+        const tp = &self.term_pane.?;
         if (key.codepoint == vaxis.Key.escape) {
             tp.focused = false;
             return;
@@ -4541,7 +4560,10 @@ const App = struct {
     /// lazygit 直接跑在浮动终端里). An open session is re-floated and
     /// focused; otherwise a fresh lazygit session starts.
     fn launchLazygit(self: *App) void {
-        if (self.term) |*tp| {
+        // Linux: run lazygit in the embedded floating terminal. Other
+        // platforms fall back to the external $TERMINAL window below.
+        if (builtin.os.tag == .linux) {
+            if (self.term_pane) |*tp| {
             tp.layout = .floating;
             tp.focused = true;
             return;
@@ -4558,7 +4580,31 @@ const App = struct {
             self.setMsg(m) catch {};
             return;
         };
-        self.term = .{ .t = t, .layout = .floating, .focused = true };
+            self.term_pane = .{ .t = t, .layout = .floating, .focused = true };
+            return;
+        }
+        // non-Linux fallback: external terminal (historical behavior)
+        const term_bin = self.env_map.get("TERMINAL") orelse "x-terminal-emulator";
+        var proc = std.process.spawn(self.io, .{
+            .argv = &.{ term_bin, "-e", "lazygit" },
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        }) catch |e| {
+            const m = std.fmt.allocPrint(self.alloc, "lazygit: {s}", .{@errorName(e)}) catch return;
+            self.setMsg(m) catch {};
+            return;
+        };
+        const t2 = std.Thread.spawn(.{}, struct {
+            fn reap(io: std.Io, p: std.process.Child) void {
+                var c = p;
+                _ = c.wait(io) catch {};
+            }
+        }.reap, .{ self.io, proc }) catch {
+            proc.kill(self.io);
+            return;
+        };
+        t2.detach();
     }
 
     // ---- fuzzy picker (<leader>sf) ----
@@ -6223,9 +6269,9 @@ const App = struct {
             .blame_toggle => self.toggleBlame(),
             .git_lazygit => self.launchLazygit(),
             // M3b embedded terminal
-            .term_float => try self.toggleTerm(.floating),
-            .term_bottom => try self.toggleTerm(.bottom),
-            .term_right => try self.toggleTerm(.right),
+            .term_float => if (builtin.os.tag == .linux) try self.toggleTerm(.floating) else {},
+            .term_bottom => if (builtin.os.tag == .linux) try self.toggleTerm(.bottom) else {},
+            .term_right => if (builtin.os.tag == .linux) try self.toggleTerm(.right) else {},
             .paste => try self.pasteBuffer(false, count),
             .paste_before => try self.pasteBuffer(true, count),
             .delete_char => {
@@ -7901,7 +7947,7 @@ const App = struct {
             };
             self.vx.screen.cursor_vis = true;
             self.vx.screen.cursor_shape = .block;
-            try self.drawTerm(a, win);
+            if (builtin.os.tag == .linux) try self.drawTerm(a, win);
             try self.vx.render(self.tty.writer());
             return;
         }
@@ -8136,7 +8182,7 @@ const App = struct {
 
         // embedded terminal overlay: drawn after the panes so it covers
         // them; the modal overlays below float above it
-        try self.drawTerm(a, win);
+        if (builtin.os.tag == .linux) try self.drawTerm(a, win);
 
         // fuzzy picker overlay (telescope/snacks style: a solid bg_float
         // floating window with a border, a title and an in-panel input row,
@@ -9098,10 +9144,12 @@ const App = struct {
 
         // terminal focused: the widget's draw() already placed the child's
         // cursor — the editor cursor must not overwrite it
-        if (self.term) |*tp| {
-            if (tp.focused) {
-                try self.vx.render(self.tty.writer());
-                return;
+        if (builtin.os.tag == .linux) {
+            if (self.term_pane) |*tp| {
+                if (tp.focused) {
+                    try self.vx.render(self.tty.writer());
+                    return;
+                }
             }
         }
         // cursor position — in the file tree when the tree has focus,
@@ -9204,32 +9252,34 @@ const App = struct {
             // hook — while a terminal is open the loop polls at 16ms below
             // instead of blocking in pollEvent.
             var term_ready = false;
-            if (self.term) |*tp| {
-                // .exited closes the terminal, freeing `tp` — break out of
-                // the loop first (the while condition would dereference the
-                // freed pane) and close after draining.
-                var term_exited = false;
-                while (try tp.t.pollEvent()) |ev| {
-                    switch (ev) {
-                        .exited => {
-                            term_exited = true;
-                            break;
-                        },
-                        .redraw => term_ready = true,
-                        .bell => {},
-                        .title_change => |t| {
-                            // event slice borrows the widget's internal
-                            // buffer — dupe before the next event
-                            if (tp.title) |x| self.alloc.free(x);
-                            tp.title = try self.alloc.dupe(u8, t);
-                        },
-                        .pwd_change => {},
+            if (builtin.os.tag == .linux) {
+                if (self.term_pane) |*tp| {
+                    // .exited closes the terminal, freeing `tp` — break out
+                    // of the loop first (the while condition would
+                    // dereference the freed pane) and close after draining.
+                    var term_exited = false;
+                    while (try tp.t.pollEvent()) |ev| {
+                        switch (ev) {
+                            .exited => {
+                                term_exited = true;
+                                break;
+                            },
+                            .redraw => term_ready = true,
+                            .bell => {},
+                            .title_change => |t| {
+                                // event slice borrows the widget's internal
+                                // buffer — dupe before the next event
+                                if (tp.title) |x| self.alloc.free(x);
+                                tp.title = try self.alloc.dupe(u8, t);
+                            },
+                            .pwd_change => {},
+                        }
                     }
-                }
-                if (term_exited) {
-                    const m = self.alloc.dupe(u8, "terminal exited") catch null;
-                    if (m) |mm| try self.setMsg(mm);
-                    self.closeTerm();
+                    if (term_exited) {
+                        const m = self.alloc.dupe(u8, "terminal exited") catch null;
+                        if (m) |mm| try self.setMsg(mm);
+                        self.closeTerm();
+                    }
                 }
             }
             if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready or term_ready) {
@@ -9252,7 +9302,7 @@ const App = struct {
             // thread has no wake hook), poll instead of blocking so the
             // frame advances without keypresses (16ms ≈ 60fps; vaxis diffs
             // the output).
-            if (self.scopeAnimActive() or self.blameHoldActive() or self.term != null) {
+            if (self.scopeAnimActive() or self.blameHoldActive() or (builtin.os.tag == .linux and self.term_pane != null)) {
                 std.Io.sleep(self.io, .fromMilliseconds(16), .real) catch {};
             } else {
                 try self.loop.pollEvent();
@@ -9262,10 +9312,12 @@ const App = struct {
                     .key_press => |key| try self.handleKey(key),
                     .paste => |text| {
                         // terminal focus: forward the paste to the child
-                        if (self.term) |*tp| {
-                            if (tp.focused) {
-                                try tp.t.sendText(text);
-                                continue;
+                        if (builtin.os.tag == .linux) {
+                            if (self.term_pane) |*tp| {
+                                if (tp.focused) {
+                                    try tp.t.sendText(text);
+                                    continue;
+                                }
                             }
                         }
                         if (self.state.mode == .insert) {
@@ -9685,7 +9737,15 @@ fn parseLineArg(arg: []const u8) ?u32 {
 }
 
 pub fn main(init: std.process.Init) !void {
-    var app = try App.create(init);
+    // Debug builds use the DebugAllocator, which captures a stack trace on
+    // EVERY allocation — and MachO/DWARF stack unwinding on macOS is slow
+    // enough to make typing visibly laggy once an LSP server is attached
+    // (each keystroke parses a large JSON response = thousands of allocs).
+    // The libc allocator keeps dev builds responsive; safety checks in the
+    // code itself are unaffected. Release builds already use c_allocator.
+    var app_init = init;
+    if (builtin.mode == .Debug and builtin.link_libc) app_init.gpa = std.heap.c_allocator;
+    var app = try App.create(app_init);
     defer app.destroy();
 
     // args: oz [file[:line]] ...
