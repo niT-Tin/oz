@@ -4,3 +4,5 @@ zig-pkg/
 .zig-global-cache/
 .wt-*/
 .zig-global-cache/
+.zig-cache
+zig-pkg
