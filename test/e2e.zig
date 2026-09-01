@@ -2693,10 +2693,12 @@ test "grep picker: fixed-size panel with split syntax preview" {
 
     // type a query → results arrive; the panel width must NOT change (the
     // separator stays at the same column) and the split preview appears.
-    // "pub fn" hits build.zig:14 first (small file → preview available).
+    // "pub fn" hits build.zig first ("pub fn build" — the only "pub fn" in
+    // build.zig; small file → preview available). Assert the file, not the
+    // line: build.zig's line numbers drift with the vendored-patch block.
     try sess.send("pub fn");
     waited = 0;
-    while (!grid.contains("❯ pub fn") or !grid.contains("build.zig:14:")) {
+    while (!grid.contains("❯ pub fn") or !grid.contains("build.zig:")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -2706,7 +2708,7 @@ test "grep picker: fixed-size panel with split syntax preview" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(grid.contains("build.zig:14:"));
+    try std.testing.expect(grid.contains("build.zig:"));
     const sep_col_filled = nthPipeCol(&grid, hint_row.?, 1) orelse return error.MissingSeparator;
     try std.testing.expectEqual(sep_col_empty, sep_col_filled);
 
@@ -2856,7 +2858,8 @@ test "file tree: <leader>e shows files, Enter opens one" {
     // j × 3: docs → src → test → DESIGN.md (first-level file); Enter opens
     // it but KEEPS the tree open — only <space>e (toggle) or Esc close it;
     // focus returns to the buffer so typing edits the file.
-    try sess.send("jjj\r");
+    // dirs-first first level: docs, patches, src, test — 4 × j to DESIGN.md
+    try sess.send("jjjjj\r");
     waited = 0;
     while (!grid.contains("# oz") or !grid.contains("NORMAL")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
@@ -4590,7 +4593,7 @@ test "file tree: sidebar scrolls as the selection moves past the window" {
     // Expand enough of the tree to overflow the ~20 visible sidebar rows:
     // l on docs (its child appears), jj to src + l (12 children), j to
     // buffer + l (5 children) → 25 visible rows > 20.
-    try sess.send("ljjljl");
+    try sess.send("ljjjljl");
     waited = 0;
     while (!grid.contains("ops.zig")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
@@ -6749,7 +6752,7 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
     // opens it (markdown has no zig grammar). The tree STAYS open (only
     // <space>e / Esc close it) — the buffer tab shows README.md (row 0, now
     // NOT covered by the sidebar).
-    try sess.send("jjjj\r");
+    try sess.send("jjjjj\r");
     waited = 0;
     while (std.mem.indexOf(u8, grid.rowText(0), "README.md") == null and
         std.mem.indexOf(u8, grid.rowText(2), "README.md") == null)
@@ -11856,6 +11859,14 @@ test "terminal: <M-r> float opens, keys forward, Esc returns, <M-w>/<M-e> switch
         }
     }
     try std.testing.expect(closed);
+
+    // reopen: the global_vts map must survive the teardown — its deinit
+    // leaves the map undefined and the next spawn's put() crashed on the
+    // pointer-stability assert (open -> close -> open SIGABRT)
+    try sess.send("\x1br");
+    try std.testing.expect(try Wait.until(&sess, &grid, "$"));
+    try sess.send("\x1br");
+    try std.testing.expect(try Wait.untilGone(&sess, &grid, "$"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});

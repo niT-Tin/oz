@@ -145,7 +145,11 @@ pub fn deinit(self: *Terminal) void {
             _ = global_vts.remove(pid);
         if (global_vts.count() == 0) {
             global_vts_alive = false;
-            global_vts.deinit(self.allocator);
+            // NOT deinit(): HashMapUnmanaged.deinit leaves the struct
+            // undefined (self.* = undefined), and the next spawn's put()
+            // would trip its pointer-stability assert / read freed
+            // metadata. Keep the map empty-but-usable.
+            global_vts.clearRetainingCapacity();
         }
     }
     self.cmd.kill();
