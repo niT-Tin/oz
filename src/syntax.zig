@@ -766,15 +766,27 @@ pub const Highlighter = struct {
         var current = root;
         while (true) {
             // find the child containing `byte` (siblings never overlap, so at
-            // most one matches)
+            // most one matches). Children are scanned with ONE forward pass of
+            // a tree cursor, stopping at the first child whose start exceeds
+            // `byte` (children are sorted by start byte). An indexed scan
+            // (ts_node_child(i)) would be O(N²): ts_node_child rescans
+            // children from index 0, so scanning a 911-child root costs
+            // ~415K child-steps ≈ 5ms when the cursor sits near the end of
+            // the file; the cursor walk is O(N) total.
             var next: ?treez.Node = null;
-            var i: u32 = 0;
-            while (i < current.getChildCount()) : (i += 1) {
-                const child = current.getChild(i);
-                if (child.isNull()) continue;
-                if (child.getStartByte() <= byte and byte < child.getEndByte()) {
-                    next = child;
-                    break;
+            var cur = ts_tree_cursor_new(current);
+            defer ts_tree_cursor_delete(&cur);
+            if (ts_tree_cursor_goto_first_child(&cur)) {
+                while (true) {
+                    const child = ts_tree_cursor_current_node(&cur);
+                    const cs = child.getStartByte();
+                    if (cs > byte) break; // sorted: no later child contains byte
+                    const ce = child.getEndByte();
+                    if (cs <= byte and byte < ce) {
+                        next = child;
+                        break;
+                    }
+                    if (!ts_tree_cursor_goto_next_sibling(&cur)) break;
                 }
             }
             const child = next orelse break;
