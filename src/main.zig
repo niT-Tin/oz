@@ -412,10 +412,11 @@ const App = struct {
     picker_top: usize = 0,
     // grep mode: one result per line from rg
     grep_results: std.ArrayList(GrepResult) = .empty,
-    // grep picker split preview: the selected result's file content plus its
-    // tree-sitter highlighter, rebuilt only when the selection's path changes
-    // (never per-frame). preview_text == null means unavailable (>SIZE_LIMIT
-    // or read failed) — the panel shows a "preview unavailable" hint.
+    // split preview (grep panel right column, nav-list right column): the
+    // selected entry's file content plus its tree-sitter highlighter, rebuilt
+    // only when the selection's path changes (never per-frame).
+    // preview_text == null means unavailable (>SIZE_LIMIT or read failed) —
+    // the panel shows a "preview unavailable" hint.
     preview_path: ?[]u8 = null,
     preview_text: ?[]u8 = null,
     preview_hl: ?syntax.Highlighter = null,
@@ -2819,6 +2820,7 @@ const App = struct {
         }
         self.nav_list_active = self.nav_locations.items.len > 0;
         self.nav_list_title = " Outline ";
+        self.refreshNavPreview();
         return true;
     }
 
@@ -5054,9 +5056,7 @@ const App = struct {
         self.preview_path = null;
     }
 
-    /// (Re)build the split-preview file + highlighter for the SELECTED grep
-    /// result. No-op while the path is unchanged — this is what keeps the
-    /// panel from re-reading files / re-parsing on every frame. Best-effort:
+    /// (Re)build the split preview for the SELECTED grep result. Best-effort:
     /// a failed read or a file over syntax.SIZE_LIMIT leaves preview_text
     /// null and the renderer shows "preview unavailable".
     fn refreshGrepPreview(self: *App) void {
@@ -5065,15 +5065,43 @@ const App = struct {
             self.freeGrepPreview();
             return;
         }
-        const r = self.grep_results.items[self.picker_sel];
+        self.loadPreview(self.grep_results.items[self.picker_sel].path);
+    }
+
+    /// (Re)build the split-preview file + highlighter for the SELECTED
+    /// nav-list location (gr/gI list row, or an outline row — those pack
+    /// "label\x00line" into uri and target the current buffer).
+    fn refreshNavPreview(self: *App) void {
+        if (!self.nav_list_active or self.nav_locations.items.len == 0) {
+            self.freeGrepPreview();
+            return;
+        }
+        const loc = self.nav_locations.items[@min(self.nav_list_sel, self.nav_locations.items.len - 1)];
+        if (std.mem.indexOfScalar(u8, loc.uri, 0) != null) {
+            if (self.cur().path) |p| self.loadPreview(p) else self.freeGrepPreview();
+            return;
+        }
+        const path = lsp_types.fileUriToPath(self.alloc, loc.uri) catch {
+            self.freeGrepPreview();
+            return;
+        };
+        defer self.alloc.free(path);
+        self.loadPreview(path);
+    }
+
+    /// Load (or keep, while the path is unchanged) the shared preview file +
+    /// highlighter used by the grep panel and the nav list. The unchanged-path
+    /// early-out is what keeps the panels from re-reading files / re-parsing
+    /// on every frame.
+    fn loadPreview(self: *App, path: []const u8) void {
         if (self.preview_path) |pp| {
-            if (std.mem.eql(u8, pp, r.path)) return;
+            if (std.mem.eql(u8, pp, path)) return;
         }
         self.freeGrepPreview();
-        self.preview_path = self.alloc.dupe(u8, r.path) catch return;
-        const text = std.Io.Dir.cwd().readFileAlloc(self.io, r.path, self.alloc, .limited(syntax.SIZE_LIMIT)) catch return;
+        self.preview_path = self.alloc.dupe(u8, path) catch return;
+        const text = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.alloc, .limited(syntax.SIZE_LIMIT)) catch return;
         self.preview_text = text;
-        const ft = filetypeOf(r.path);
+        const ft = filetypeOf(path);
         if (syntax.languageFor(ft)) |lang| {
             var hl = syntax.Highlighter.init(self.alloc, lang) catch return;
             hl.reparse(text) catch {
@@ -5084,13 +5112,14 @@ const App = struct {
         }
     }
 
-    /// Render one preview-column row of the grep split panel (k = 0 is the
-    /// "basename:line" header; k > 0 a syntax-highlighted content line from
-    /// the selected result's file, a ±(content_rows/2) window around the
-    /// selected line). Every segment is arena-allocated so the text outlives
-    /// vx.render(). The file itself is read / reparsed only in
-    /// refreshGrepPreview — here we just run the (already built) highlighter
-    /// over the visible byte range.
+    /// Render one preview-column row of a split panel — the grep picker's
+    /// right column and the nav list's (gr/gI/outline) right column both use
+    /// it. k = 0 is the "basename:line" header (of `path` / `line`, 1-based);
+    /// k > 0 a syntax-highlighted content line from the previewed file, a
+    /// ±(content_rows/2) window around the selected line. Every segment is
+    /// arena-allocated so the text outlives vx.render(). The file itself is
+    /// read / reparsed only in loadPreview — here we just run the (already
+    /// built) highlighter over the visible byte range.
     fn renderGrepPreviewRow(
         self: *App,
         segs: *std.ArrayList(vaxis.Segment),
@@ -5099,15 +5128,16 @@ const App = struct {
         k: usize,
         list_rows: usize,
         preview_w: u32,
+        path: []const u8,
+        line: u32,
     ) !void {
         const float_bg: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float } };
         const pw: usize = @intCast(preview_w);
-        const r = self.grep_results.items[self.picker_sel];
         if (k == 0) {
             // header: basename (fg) + ":line" (fg_dim), then padding; widths
             // are cells (a CJK basename is 2 cells/char, 3-4 bytes)
-            const base = std.fs.path.basename(r.path);
-            const line_str = try std.fmt.allocPrint(a, ":{d}", .{r.line});
+            const base = std.fs.path.basename(path);
+            const line_str = try std.fmt.allocPrint(a, ":{d}", .{line});
             const f1 = cellFitPrefix(win, base, pw);
             try segs.append(a, .{ .text = f1.slice, .style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_float } } });
             const f2 = cellFitPrefix(win, line_str, pw -| f1.cells);
@@ -5131,7 +5161,7 @@ const App = struct {
             }
             return;
         };
-        const sel_line: usize = r.line -| 1; // rg reports 1-based lines
+        const sel_line: usize = line -| 1; // callers pass 1-based lines
         const line_count = std.mem.count(u8, text, "\n") + @intFromBool(text.len > 0);
         if (sel_line >= line_count) {
             try appendRowSegs(segs, a, win, "", &.{}, &[_]vaxis.Style{}, preview_w, float_bg);
@@ -5164,7 +5194,7 @@ const App = struct {
         const n = fit.slice.len;
         // syntax spans for THIS line's byte range (O(visible) query; the
         // highlighter itself is only reparsed when the selection's path
-        // changes, in refreshGrepPreview)
+        // changes, in loadPreview)
         var spans = std.ArrayList(syntax.Span).empty;
         if (self.preview_hl) |*hl| {
             var raw = std.ArrayList(syntax.Span).empty;
@@ -5555,6 +5585,7 @@ const App = struct {
         self.clearDiagnostics();
         self.clearHover();
         self.nav_list_active = false;
+        self.freeGrepPreview();
         self.closeCompletion();
         self.closeGitPreview();
         // git branch + diff marks describe the newly focused buffer; blame
@@ -5913,6 +5944,7 @@ const App = struct {
                 self.nav_loc_top = 0;
                 self.nav_list_active = self.nav_locations.items.len > 0;
                 self.nav_list_title = if (self.nav_action == .implementation) " Implementations " else " References ";
+                self.refreshNavPreview();
             },
             .none => {},
         }
@@ -5965,14 +5997,21 @@ const App = struct {
         switch (key.codepoint) {
             vaxis.Key.escape => {
                 self.nav_list_active = false;
+                self.freeGrepPreview();
                 return true;
             },
             'j', vaxis.Key.down => {
-                if (self.nav_list_sel + 1 < self.nav_locations.items.len) self.nav_list_sel += 1;
+                if (self.nav_list_sel + 1 < self.nav_locations.items.len) {
+                    self.nav_list_sel += 1;
+                    self.refreshNavPreview();
+                }
                 return true;
             },
             'k', vaxis.Key.up => {
-                if (self.nav_list_sel > 0) self.nav_list_sel -= 1;
+                if (self.nav_list_sel > 0) {
+                    self.nav_list_sel -= 1;
+                    self.refreshNavPreview();
+                }
                 return true;
             },
             vaxis.Key.enter => {
@@ -5980,6 +6019,7 @@ const App = struct {
                     const loc = self.nav_locations.items[self.nav_list_sel];
                     self.jumpToLocation(loc);
                     self.nav_list_active = false;
+                    self.freeGrepPreview();
                 }
                 return true;
             },
@@ -9146,7 +9186,7 @@ const App = struct {
                         try segs.append(a, .{ .text = " ", .style = sep_pad_style });
                         try segs.append(a, .{ .text = "│", .style = sep_style });
                         try segs.append(a, .{ .text = " ", .style = sep_pad_style });
-                        try self.renderGrepPreviewRow(&segs, a, win, k, list_rows, preview_w);
+                        try self.renderGrepPreviewRow(&segs, a, win, k, list_rows, preview_w, r.path, r.line);
                     }
                 } else if (self.picker_mode == .themes) {
                     // color-swatch row: 3 cells painted with the theme's OWN
@@ -9281,7 +9321,10 @@ const App = struct {
         // LSP navigation location list overlay (gr / gI / <leader>o outline):
         // a floating window in the same visual language as the pickers
         // (solid bg_float panel, fg_faint border, accent title, bg_sel
-        // selection, centered on screen) — not a bare bottom list.
+        // selection, centered on screen). Like the grep panel it is a
+        // fixed-size split: left = the location list, then a " │ " separator,
+        // right = a syntax-highlighted preview around the selected location —
+        // a bare "line: file" row doesn't say what the reference is doing.
         if (self.nav_list_active) {
             const total = self.nav_locations.items.len;
             const list_rows = @min(@as(usize, 10), total);
@@ -9291,24 +9334,16 @@ const App = struct {
                 if (self.nav_list_sel >= self.nav_loc_top + list_rows) self.nav_loc_top = self.nav_list_sel - list_rows + 1;
             } else self.nav_loc_top = 0;
             const ntop = self.nav_loc_top;
-            // measure the widest label for the box width (capped like the
-            // picker; a huge outline name never spans the whole terminal)
-            var max_w: usize = 0;
-            {
-                var mk: usize = 0;
-                while (mk < list_rows) : (mk += 1) {
-                    const loc = self.nav_locations.items[ntop + mk];
-                    const label = if (std.mem.indexOfScalar(u8, loc.uri, 0)) |z|
-                        try std.fmt.allocPrint(a, "{d}: {s}", .{ loc.line + 1, loc.uri[0..z] })
-                    else
-                        try std.fmt.allocPrint(a, "{d}: {s}", .{ loc.line + 1, std.fs.path.basename(loc.uri) });
-                    max_w = @max(max_w, label.len);
-                }
-            }
-            max_w = @min(max_w, 60);
-            const inner_w: u32 = @intCast(@max(max_w, 12));
-            const box_w = @min(inner_w + 2, win.width * 3 / 5);
-            const inner = box_w - 2;
+            // fixed-size panel (same 70%-of-screen rule as the grep panel, so
+            // the box doesn't resize as the selection moves between files)
+            var inner_w: u32 = @max(win.width * 7 / 10 -| 2, 44);
+            const box_w = @min(inner_w + 2, win.width * 7 / 10);
+            inner_w = box_w - 2;
+            const inner = inner_w;
+            // split widths like the grep panel: the list gets inner-3-preview,
+            // the " │ " separator is 1 cell plus a bg_float space each side
+            const preview_w: u32 = inner * 2 / 5;
+            const left_w: u32 = inner -| 3 -| preview_w;
             // title row + list rows + bottom border (no input row — the list
             // is navigated with j/k, not filtered)
             const box_h: u32 = @as(u32, @intCast(list_rows)) + 2;
@@ -9321,18 +9356,32 @@ const App = struct {
             const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
             const row_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } };
             const sel_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_sel }, .fg = .{ .rgb = self.theme.fg } };
-            // top border + title
+            const sep_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.win_sep }, .bg = .{ .rgb = self.theme.bg_float } };
+            const sep_pad_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float } };
+            // top border + title (the title is cell-truncated to the interior
+            // so a narrow terminal never pushes the ╮ corner off the box)
             {
+                const title_fit = cellFitPrefix(win, self.nav_list_title, inner);
                 var segs = std.ArrayList(vaxis.Segment).empty;
                 try segs.append(a, .{ .text = "╭", .style = border_style });
-                try segs.append(a, .{ .text = self.nav_list_title, .style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_float } } });
-                var cx: u32 = 1 + @as(u32, @intCast(self.nav_list_title.len));
+                try segs.append(a, .{ .text = title_fit.slice, .style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_float } } });
+                var cx: u32 = 1 + @as(u32, @intCast(title_fit.cells));
                 while (cx < inner + 1) : (cx += 1) {
                     try segs.append(a, .{ .text = "─", .style = border_style });
                 }
                 try segs.append(a, .{ .text = "╮", .style = border_style });
                 _ = win.print(segs.items, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(start_col), .wrap = .none });
             }
+            // preview target of the selected row, resolved once per frame:
+            // outline rows pack "label\x00line" into uri and preview the
+            // current buffer; gr/gI rows carry a file:// uri. LSP lines are
+            // 0-based, the preview renderer wants 1-based.
+            const sel_loc = self.nav_locations.items[self.nav_list_sel];
+            const preview_path: []const u8 = if (std.mem.indexOfScalar(u8, sel_loc.uri, 0) != null)
+                (self.cur().path orelse "")
+            else
+                lsp_types.fileUriToPath(a, sel_loc.uri) catch "";
+            const preview_line: u32 = sel_loc.line + 1;
             var k: usize = 0;
             while (k < list_rows) : (k += 1) {
                 const ri = ntop + k;
@@ -9344,13 +9393,18 @@ const App = struct {
                 const rs: vaxis.Style = if (ri == self.nav_list_sel) sel_style else row_style;
                 var segs = std.ArrayList(vaxis.Segment).empty;
                 try segs.append(a, .{ .text = "│", .style = border_style });
-                // cell-truncate the label to the interior width so a long
-                // outline name never overflows the panel
-                const fit = cellFitPrefix(win, label, inner -| 1);
-                const row = try a.alloc(u8, fit.slice.len + (inner -| 1 -| fit.cells));
+                // cell-truncate the label to the left column and pad the rest
+                // so the row spans the full box width and the right "│" lands
+                // flush under the top border's ╮
+                const fit = cellFitPrefix(win, label, left_w);
+                const row = try a.alloc(u8, fit.slice.len + (left_w -| fit.cells));
                 @memset(row, ' ');
                 @memcpy(row[0..fit.slice.len], fit.slice);
                 try segs.append(a, .{ .text = row, .style = rs });
+                try segs.append(a, .{ .text = " ", .style = sep_pad_style });
+                try segs.append(a, .{ .text = "│", .style = sep_style });
+                try segs.append(a, .{ .text = " ", .style = sep_pad_style });
+                try self.renderGrepPreviewRow(&segs, a, win, k, list_rows, preview_w, preview_path, preview_line);
                 try segs.append(a, .{ .text = "│", .style = border_style });
                 _ = win.print(segs.items, .{ .row_offset = @intCast(start_row + 1 + k), .col_offset = @intCast(start_col), .wrap = .none });
             }
