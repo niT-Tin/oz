@@ -448,11 +448,12 @@ pub fn handlePickerKey(self: *App, key: vaxis.Key) !void {
                 return;
             }
             if (self.picker_mode == .themes) {
-                // Enter confirms the previewed theme: keep it, report it
+                // Enter confirms the previewed theme: keep it, persist it, report it
                 // and close (the preview already applied it on move).
                 if (self.picker_matches.items.len > 0) {
                     const ti = self.picker_matches.items[self.picker_sel];
                     self.theme = theme.themes[ti];
+                    self.saveTheme() catch {};
                     try self.setMsg(try std.fmt.allocPrint(self.alloc, "theme: {s}", .{theme.themes[ti].name}));
                 }
                 self.closePicker();

@@ -107,5 +107,6 @@ pub fn main(init: std.process.Init) !void {
     app.scheduleGitStatus();
     try app.loadRecent();
     defer app.saveRecent() catch {};
+    try app.loadTheme();
     try app.run();
 }

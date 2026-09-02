@@ -17,7 +17,7 @@ A terminal text editor written in Zig.
 **Syntax & UI**
 
 - tree-sitter syntax highlighting (multiple bundled grammars), rainbow brackets, indent guides + scope highlight animation
-- Multiple themes (`OZ_THEME` env var + `<leader>sp` theme picker with live preview)
+- Multiple themes (`<leader>sp` theme picker with live preview; the choice persists automatically — no config or env var needed)
 - Large-file degradation: highlighting turns off above 100 KB to stay smooth
 
 ![Syntax highlighting, indent guides, inlay hints](docs/screenshots/editor.png)

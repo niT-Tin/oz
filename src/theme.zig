@@ -1,7 +1,8 @@
 //! Color themes for oz. Semantic palette — the renderer references these
 //! names, and a theme maps each to concrete RGB. Defaults to kanagawa-wave
 //! (matching the user's nvim colorscheme); other themes are selectable via
-//! `:theme <name>` (Tab cycles) or OZ_THEME env var.
+//! `:theme <name>` (Tab cycles) or the theme picker. The selection persists
+//! automatically to ~/.cache/oz/theme — no env var, no config file.
 
 const std = @import("std");
 
@@ -252,10 +253,28 @@ pub fn byName(name: []const u8) ?Theme {
     return match;
 }
 
-/// Theme picked from OZ_THEME env var, falling back to the default.
-pub fn fromEnv(env_map: *std.process.Environ.Map) Theme {
-    if (env_map.get("OZ_THEME")) |name| {
-        if (byName(name)) |t| return t;
-    }
-    return default;
+/// ANSI 16-color palette for the embedded terminal, derived from the theme slots. Classic ANSI escape
+/// colors (index 0-15) map onto theme-derived RGB so the embedded terminal pane follows the active
+/// theme instead of leaking the host terminal's palette.
+pub fn ansi16(t: Theme) [16]Rgb {
+    return .{
+        // normal
+        t.bg_alt, // 0 black — slightly raised dark surface so black text stays visible on bg
+        t.diag_error, // 1 red
+        t.git_add, // 2 green
+        t.diag_warn, // 3 yellow
+        t.accent_alt, // 4 blue
+        t.keyword, // 5 magenta
+        t.type, // 6 cyan
+        t.fg, // 7 white
+        // bright
+        t.fg_dim, // 8 bright black
+        t.builtin, // 9 bright red
+        t.string, // 10 bright green
+        t.accent, // 11 bright yellow
+        t.function, // 12 bright blue
+        t.keyword, // 13 bright magenta
+        t.constructor, // 14 bright cyan
+        t.fg, // 15 bright white
+    };
 }

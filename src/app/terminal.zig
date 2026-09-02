@@ -3,6 +3,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const term = @import("../term.zig");
+const theme_mod = @import("../theme.zig");
 
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
@@ -89,7 +90,37 @@ pub fn drawTerm(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
                 .height = @intCast(r.h),
             });
             try tp.t.draw(sub);
+            restyleTerm(sub, self.theme);
             if (!tp.focused) sub.hideCursor();
+        }
+    }
+}
+
+/// Map one cell color to the theme: .default → the given theme slot RGB; ANSI index 0-15 → the theme's terminal palette; RGB and 256-color (index 16+)
+/// escape colors pass through untouched.
+fn mapTermColor(c: vaxis.Color, default_rgb: [3]u8, pal: [16]theme_mod.Rgb) vaxis.Color {
+    return switch (c) {
+        .default => .{ .rgb = default_rgb },
+        .index => |n| if (n < 16) .{ .rgb = pal[n] } else c,
+        .rgb => c,
+    };
+}
+
+/// Restyle the just-drawn terminal pane cells to the active theme: the shell's default fg/bg follow the theme and the classic ANSI colors map
+/// onto theme-derived RGB, so the embedded terminal blends into the editor instead of leaking the host terminal's palette.
+fn restyleTerm(sub: vaxis.Window, t: theme_mod.Theme) void {
+    const pal = theme_mod.ansi16(t);
+    var row: u16 = 0;
+    while (row < sub.height) : (row += 1) {
+        var col: u16 = 0;
+        while (col < sub.width) {
+            const cell = sub.readCell(col, row) orelse break;
+            var c = cell;
+            c.style.fg = mapTermColor(c.style.fg, t.fg, pal);
+            c.style.bg = mapTermColor(c.style.bg, t.bg, pal);
+            c.style.ul = mapTermColor(c.style.ul, t.fg, pal);
+            sub.writeCell(col, row, c);
+            col += @max(cell.char.width, 1);
         }
     }
 }

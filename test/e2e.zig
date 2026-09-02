@@ -162,7 +162,16 @@ fn spawnChildEnvCwd(io: Io, pty: *Pty, argv: []const []const u8, env_extra: ?[]c
     var env_ptrs: [13]?[*:0]const u8 = .{null} ** 13;
     var nenv: usize = 0;
     const base_env = [_][]const u8{ "TERM=xterm-256color", "PATH=/usr/bin:/bin:/usr/local/bin", "HOME=/tmp" };
-    for (base_env) |e| {
+    outer: for (base_env) |e| {
+        const key = e[0..(std.mem.indexOfScalar(u8, e, '=') orelse e.len)];
+        if (env_extra) |extra| {
+            // env_extra entries with the same key override the base entry (theme tests pass their own
+            // HOME=... so their persisted state stays out of the shared /tmp)
+            for (extra) |x| {
+                const xkey = x[0..(std.mem.indexOfScalar(u8, x, '=') orelse x.len)];
+                if (std.mem.eql(u8, xkey, key)) continue :outer;
+            }
+        }
         const ez: [:0]u8 = try std.fmt.bufPrintZ(&env_bufs[nenv], "{s}", .{e});
         env_ptrs[nenv] = ez.ptr;
         nenv += 1;
@@ -1112,7 +1121,8 @@ test ":theme lists themes, switches colors, rejects unknown names" {
         try f.writeStreamingAll(io, "const a = 1;\n");
     }
 
-    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    // isolated HOME: :theme switches are persisted now, keep them out of the shared /tmp
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{"HOME=/tmp/oz_e2e_th"});
     defer sess.close();
     defer killPid(sess.pid);
 
@@ -1201,7 +1211,8 @@ test "theme picker: <leader>sp lists themes, previews live, Esc restores" {
         try f.writeStreamingAll(io, "hello\n");
     }
 
-    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    // isolated HOME: Enter persists the theme now, keep it out of the shared /tmp
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{"HOME=/tmp/oz_e2e_thp"});
     defer sess.close();
     defer killPid(sess.pid);
 

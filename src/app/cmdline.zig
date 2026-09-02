@@ -293,7 +293,42 @@ pub fn execTheme(self: *App, name: []const u8) !void {
         return;
     };
     self.theme = t;
+    self.saveTheme() catch {};
     try self.setMsg(try std.fmt.allocPrint(self.alloc, "theme: {s}", .{t.name}));
+}
+
+/// Load the saved theme from ~/.cache/oz/theme (one line: theme name; written by saveTheme). No env var, no config file — the app remembers the selection itself, next to ~/.cache/oz/recent.
+pub fn loadTheme(self: *App) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = self.env_map.get("HOME") orelse return;
+    const dir_path = try std.fmt.bufPrint(&buf, "{s}/.cache/oz", .{home});
+    var dir = std.Io.Dir.cwd().openDir(self.io, dir_path, .{}) catch return;
+    defer dir.close(self.io);
+    const file = dir.openFile(self.io, "theme", .{ .mode = .read_only }) catch return;
+    defer file.close(self.io);
+    const size = (try file.stat(self.io)).size;
+    if (size == 0 or size > 128) return;
+    var content: [128]u8 = undefined;
+    const n: usize = @intCast(size);
+    _ = try file.readPositionalAll(self.io, content[0..n], 0);
+    const name = std.mem.trim(u8, content[0..n], " \t\r\n");
+    if (theme.byName(name)) |t| self.theme = t;
+}
+
+/// Persist the active theme to ~/.cache/oz/theme (next to recent files).
+pub fn saveTheme(self: *App) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = self.env_map.get("HOME") orelse return;
+    const dir_path = try std.fmt.bufPrint(&buf, "{s}/.cache/oz", .{home});
+    var dir = std.Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true }) catch blk: {
+        try std.Io.Dir.cwd().createDirPath(self.io, dir_path);
+        break :blk try std.Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true });
+    };
+    defer dir.close(self.io);
+    const file = try dir.createFile(self.io, "theme", .{ .truncate = true });
+    defer file.close(self.io);
+    try file.writeStreamingAll(self.io, self.theme.name);
+    try file.writeStreamingAll(self.io, "\n");
 }
 
 /// :s/pat/rep[/g] — literal substitution on the current line, the whole

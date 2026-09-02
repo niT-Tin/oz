@@ -193,7 +193,7 @@ pub const App = struct {
     io: std.Io,
     alloc: std.mem.Allocator,
     env_map: *std.process.Environ.Map,
-    /// Active color theme (from OZ_THEME, switchable at runtime).
+    /// Active color theme (persisted to ~/.cache/oz/theme, switchable at runtime).
     theme: theme.Theme,
     /// Theme when the theme picker opened — Esc restores it (no allocation;
     /// value copy, nothing to free in deinit).
@@ -1090,7 +1090,7 @@ pub const App = struct {
             .io = init.io,
             .alloc = init.gpa,
             .env_map = init.environ_map,
-            .theme = theme.fromEnv(init.environ_map),
+            .theme = theme.default,
             .vx = vx,
             .tty = tty,
             .tty_buffer = tty_buffer,
@@ -1295,6 +1295,8 @@ pub const App = struct {
     pub const loadHistory = @import("app/cmdline.zig").loadHistory;
     pub const execCommand = @import("app/cmdline.zig").execCommand;
     pub const execTheme = @import("app/cmdline.zig").execTheme;
+    pub const loadTheme = @import("app/cmdline.zig").loadTheme;
+    pub const saveTheme = @import("app/cmdline.zig").saveTheme;
     pub const execSubstitute = @import("app/cmdline.zig").execSubstitute;
     pub const listBuffers = @import("app/cmdline.zig").listBuffers;
     pub const setMsg = @import("app/cmdline.zig").setMsg;

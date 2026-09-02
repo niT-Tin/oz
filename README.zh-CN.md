@@ -17,7 +17,7 @@
 **语法与界面**
 
 - tree-sitter 语法高亮（内置多种语言 grammar）、彩虹括号、indent guide + scope 高亮动画
-- 多主题（`OZ_THEME` 环境变量 + `<leader>sp` 主题选择器，实时预览）
+- 多主题（`<leader>sp` 主题选择器，实时预览；选择自动持久化，无需任何配置或环境变量）
 - 大文件降级：超过 100KB 自动关闭高亮，保证流畅
 
 ![语法高亮、indent guide、inlay hints](docs/screenshots/editor.png)
