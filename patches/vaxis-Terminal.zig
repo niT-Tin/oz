@@ -158,20 +158,14 @@ pub fn deinit(self: *Terminal) void {
         // block forever on a full pty buffer (output we never read while
         // quitting)
         const fd = self.pty.pty.handle;
-        const linux = std.os.linux;
-        const old_flags = linux.fcntl(fd, linux.F.GETFL, 0);
-        if (linux.errno(old_flags) == .SUCCESS) {
-            const o_nonblock: u32 = @bitCast(linux.O{ .NONBLOCK = true });
-            _ = linux.fcntl(fd, linux.F.SETFL, old_flags | o_nonblock);
-        }
+        const old_flags: ?i32 = fcntlGetFl(fd);
+        if (old_flags) |f| fcntlSetFl(fd, f | nonblockFlag());
         var tmp: [4096]u8 = undefined;
         while (true) {
             const n = posix.read(fd, &tmp) catch break; // WouldBlock -> break
             if (n == 0) break;
         }
-        if (linux.errno(old_flags) == .SUCCESS) {
-            _ = linux.fcntl(fd, linux.F.SETFL, old_flags);
-        }
+        if (old_flags) |f| fcntlSetFl(fd, f);
         // write an EOT into the tty to trigger a read on our thread
         const EOT = "\x04";
         self.pty.tty.writeStreamingAll(self.io, EOT) catch {};
@@ -798,6 +792,37 @@ pub fn horizontalTab(self: *Terminal, n: usize) void {
 
     // Move right the delta
     self.back_screen.cursorRight(final -| col);
+}
+
+// ---- platform helpers: raw syscalls on Linux, libc elsewhere (macOS) ----
+
+fn fcntlGetFl(fd: posix.fd_t) ?i32 {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const rc = linux.fcntl(fd, linux.F.GETFL, 0);
+        if (linux.errno(rc) != .SUCCESS) return null;
+        return @intCast(rc);
+    }
+    const rc = std.c.fcntl(fd, std.c.F.GETFL);
+    if (rc < 0) return null;
+    return rc;
+}
+
+fn fcntlSetFl(fd: posix.fd_t, flags: i32) void {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        _ = linux.fcntl(fd, linux.F.SETFL, @intCast(flags));
+        return;
+    }
+    _ = std.c.fcntl(fd, std.c.F.SETFL, flags);
+}
+
+fn nonblockFlag() i32 {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        return @bitCast(@as(u32, @bitCast(linux.O{ .NONBLOCK = true })));
+    }
+    return @bitCast(@as(u32, @bitCast(std.c.O{ .NONBLOCK = true })));
 }
 
 pub fn horizontalBackTab(self: *Terminal, n: usize) void {

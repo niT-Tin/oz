@@ -13,8 +13,8 @@
 //! ============================================================================
 //!
 //! 1. init(io, allocator, argv, env, opts, write_buf) !Terminal
-//!    - io        : the app's std.Io (oz: `app.io`). Only Linux is supported
-//!                  (Pty.zig `@compileError` elsewhere).
+//!    - io        : the app's std.Io (oz: `app.io`). Linux and macOS are
+//!                  supported (Pty.zig `@compileError` elsewhere).
 //!    - allocator : general allocator used for the double-buffered screens.
 //!    - argv      : the FULL argv, passed verbatim to execvpe — argv[0] is the
 //!                  program, there is NO implicit shell. Interactive shell:
@@ -136,7 +136,7 @@
 //! - draw() sets the cursor last and per-widget: with multiple widgets the last
 //!   draw wins; hide the terminal cursor when unfocused.
 //! - Terminal.init validates that initial_working_directory is absolute.
-//! - Only Linux is supported by the widget.
+//! - The widget supports Linux and macOS.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -227,7 +227,14 @@ pub fn layoutRect(layout: Layout, content_top: u32, content_rows: u32, screen_w:
 /// called from the main thread; `pollEvent` must be drained every frame (see
 /// module notes). `inner` is exposed for advanced use (e.g. scrollback via
 /// `inner.scroll_offset` under `inner.back_mutex`).
-pub const Terminal = if (builtin.os.tag == .linux) struct {
+/// Platforms with a working PTY backend (vaxis widgets/terminal). Linux was
+/// the first; macOS joined via the posix_openpt path in patches/vaxis-Pty.zig.
+pub const supported = switch (builtin.os.tag) {
+    .linux, .macos => true,
+    else => false,
+};
+
+pub const Terminal = if (supported) struct {
     inner: vaxis.widgets.Terminal,
     /// Buffer for the PTY streaming writer — owned by this wrapper.
     write_buf: []u8,
@@ -323,10 +330,9 @@ pub const Terminal = if (builtin.os.tag == .linux) struct {
         try self.inner.draw(self.allocator, win);
     }
 } else struct {
-    // Non-Linux stub: vaxis's PTY backend is Linux-only (@compileError in
-    // Pty.init). Keeps this module compileable everywhere (tests.zig runs
-    // refAllDecls); every call fails at runtime with UnsupportedPlatform.
-    // The embedded terminal simply cannot be opened on other platforms.
+    // Unsupported-platform stub: keeps this module compileable everywhere
+    // (tests.zig runs refAllDecls); every call fails at runtime with
+    // UnsupportedPlatform. The embedded terminal cannot be opened there.
     pub const default_write_buf_size: usize = 4096;
 
     pub fn create(

@@ -1,4 +1,4 @@
-//! oz entry point: vaxis event loop + M0 integration (DESIGN.md §5).
+//! oz entry point: vaxis event loop + editor integration (DESIGN.md).
 //!
 //! Loop:
 //!   nextEvent → Mode state machine → execute result against PieceTable
@@ -186,7 +186,7 @@ const BlameGhostLabel = struct {
 /// and all references compile on every platform). The vaxis widget's reader
 /// thread holds a *Terminal for its whole life, so the pane lives at a
 /// stable address — a plain App field, never a reallocating list.
-const TermPane = if (builtin.os.tag == .linux) struct {
+const TermPane = if (term.supported) struct {
     t: *term.Terminal,
     layout: term.Layout = .floating,
     focused: bool = false,
@@ -1300,7 +1300,7 @@ const App = struct {
         if (self.git_blame_path) |bp| self.alloc.free(bp);
         if (self.git_preview) |p| self.alloc.free(p.text);
         // M3b embedded terminal (kills the child, joins the reader thread)
-        if (builtin.os.tag == .linux) {
+        if (term.supported) {
             if (self.term_pane) |*tp| {
                 tp.t.destroy();
                 if (tp.title) |x| self.alloc.free(x);
@@ -1313,7 +1313,7 @@ const App = struct {
     fn handleKey(self: *App, key: vaxis.Key) !void {
         // Terminal focus first: every key belongs to the child (Esc /
         // Alt+r/w/e are intercepted inside handleTerminalKey).
-        if (builtin.os.tag == .linux) {
+        if (term.supported) {
             if (self.term_pane) |*tp| {
                 if (tp.focused) {
                     try self.handleTerminalKey(key);
@@ -4696,7 +4696,7 @@ const App = struct {
     /// Absolute cwd for a new terminal session: the current buffer's
     /// directory, or null (inherit oz's cwd) when the buffer has no path.
     fn termCwd(self: *App) ?[]const u8 {
-        if (builtin.os.tag != .linux) return null;
+        if (!term.supported) return null;
         const path = if (self.buffers.items.len > 0) self.cur().path else null;
         if (path) |p| {
             if (std.fs.path.dirname(p)) |d| return d;
@@ -4710,7 +4710,7 @@ const App = struct {
     /// terminal OVERLAYS the buffer area (drawn after the panes), it does
     /// not squeeze them.
     fn termRect(self: *App, a: std.mem.Allocator) term.Rect {
-        if (builtin.os.tag != .linux) return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        if (!term.supported) return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
         const win = self.vx.window();
         const top = self.contentTop(a);
         const avail_rows = win.height -| status_row_count -| top;
@@ -4746,7 +4746,7 @@ const App = struct {
     /// (its early return would skip the normal path). resize() no-ops when
     /// unchanged; draw() is cheap when nothing changed.
     fn drawTerm(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
-        if (builtin.os.tag != .linux) return;
+        if (!term.supported) return;
         if (self.term_pane) |*tp| {
             const r = self.termRect(a);
             if (r.w > 0 and r.h > 0 and r.w <= win.width and r.h <= win.height) {
@@ -4767,7 +4767,7 @@ const App = struct {
     /// again closes it (spec: 开关); a different layout key switches the
     /// placement of the SAME session (spec: 可复用会话) and refocuses it.
     fn toggleTerm(self: *App, layout: term.Layout) !void {
-        if (builtin.os.tag != .linux) return;
+        if (!term.supported) return;
         if (self.term_pane) |*tp| {
             if (tp.layout == layout) {
                 self.closeTerm();
@@ -4796,7 +4796,7 @@ const App = struct {
     /// Destroy the terminal session (kills the child, joins the reader
     /// thread, closes the pty).
     fn closeTerm(self: *App) void {
-        if (builtin.os.tag != .linux) return;
+        if (!term.supported) return;
         if (self.term_pane) |*tp| {
             tp.t.destroy();
             if (tp.title) |x| self.alloc.free(x);
@@ -4810,7 +4810,7 @@ const App = struct {
     /// (spec: 终端内 <M-r> 等同一键位可直接退回 Normal/关闭); everything
     /// else is forwarded to the child.
     fn handleTerminalKey(self: *App, key: vaxis.Key) !void {
-        if (builtin.os.tag != .linux) return;
+        if (!term.supported) return;
         const tp = &self.term_pane.?;
         if (key.codepoint == vaxis.Key.escape) {
             tp.focused = false;
@@ -4833,7 +4833,7 @@ const App = struct {
     fn launchLazygit(self: *App) void {
         // Linux: run lazygit in the embedded floating terminal. Other
         // platforms fall back to the external $TERMINAL window below.
-        if (builtin.os.tag == .linux) {
+        if (term.supported) {
             if (self.term_pane) |*tp| {
                 tp.layout = .floating;
                 tp.focused = true;
@@ -6785,9 +6785,9 @@ const App = struct {
             .blame_toggle => self.toggleBlame(),
             .git_lazygit => self.launchLazygit(),
             // M3b embedded terminal
-            .term_float => if (builtin.os.tag == .linux) try self.toggleTerm(.floating) else {},
-            .term_bottom => if (builtin.os.tag == .linux) try self.toggleTerm(.bottom) else {},
-            .term_right => if (builtin.os.tag == .linux) try self.toggleTerm(.right) else {},
+            .term_float => if (term.supported) try self.toggleTerm(.floating) else {},
+            .term_bottom => if (term.supported) try self.toggleTerm(.bottom) else {},
+            .term_right => if (term.supported) try self.toggleTerm(.right) else {},
             .paste => try self.pasteBuffer(false, count),
             .paste_before => try self.pasteBuffer(true, count),
             .delete_char => {
@@ -8664,7 +8664,7 @@ const App = struct {
             };
             self.vx.screen.cursor_vis = true;
             self.vx.screen.cursor_shape = .block;
-            if (builtin.os.tag == .linux) try self.drawTerm(a, win);
+            if (term.supported) try self.drawTerm(a, win);
             try self.vx.render(self.tty.writer());
             return;
         }
@@ -8899,7 +8899,7 @@ const App = struct {
 
         // embedded terminal overlay: drawn after the panes so it covers
         // them; the modal overlays below float above it
-        if (builtin.os.tag == .linux) try self.drawTerm(a, win);
+        if (term.supported) try self.drawTerm(a, win);
 
         // fuzzy picker overlay (telescope/snacks style: a solid bg_float
         // floating window with a border, a title and an in-panel input row,
@@ -9874,7 +9874,7 @@ const App = struct {
 
         // terminal focused: the widget's draw() already placed the child's
         // cursor — the editor cursor must not overwrite it
-        if (builtin.os.tag == .linux) {
+        if (term.supported) {
             if (self.term_pane) |*tp| {
                 if (tp.focused) {
                     try self.vx.render(self.tty.writer());
@@ -9989,7 +9989,7 @@ const App = struct {
             // hook — while a terminal is open the loop polls at 16ms below
             // instead of blocking in pollEvent.
             var term_ready = false;
-            if (builtin.os.tag == .linux) {
+            if (term.supported) {
                 if (self.term_pane) |*tp| {
                     // .exited closes the terminal, freeing `tp` — break out
                     // of the loop first (the while condition would
@@ -10054,7 +10054,7 @@ const App = struct {
             // animation's last spread) and the loop would block forever
             // without ever drawing it. Force that one render.
             var poll_transition = false;
-            if (self.scopeAnimActive() or self.blameHoldActive() or (builtin.os.tag == .linux and self.term_pane != null)) {
+            if (self.scopeAnimActive() or self.blameHoldActive() or (term.supported and self.term_pane != null)) {
                 std.Io.sleep(self.io, .fromMilliseconds(1), .real) catch {};
                 self.poll_mode_active = true;
             } else if (self.poll_mode_active) {
@@ -10075,7 +10075,7 @@ const App = struct {
                     .key_press => |key| try self.handleKey(key),
                     .paste => |text| {
                         // terminal focus: forward the paste to the child
-                        if (builtin.os.tag == .linux) {
+                        if (term.supported) {
                             if (self.term_pane) |*tp| {
                                 if (tp.focused) {
                                     try tp.t.sendText(text);

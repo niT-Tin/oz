@@ -8,6 +8,14 @@ const Terminal = @import("Terminal.zig");
 const linux = std.os.linux;
 const posix = std.posix;
 
+/// TIOCSCTTY per-OS (std.posix.T lacks it for Darwin). macOS uses the BSD
+/// convention (0x20007461), Linux uses 0x540E.
+const TIOCSCTTY: c_uint = switch (builtin.os.tag) {
+    .linux => 0x540E,
+    .macos => 0x20007461,
+    else => @compileError("unsupported os"),
+};
+
 argv: []const []const u8,
 
 working_directory: ?[]const u8,
@@ -30,54 +38,30 @@ pub fn spawn(self: *Command, io: std.Io, allocator: std.mem.Allocator) !void {
     const env_block = try self.env_map.createPosixBlock(arena, .{});
     const path = self.env_map.get("PATH") orelse std.Io.Threaded.default_PATH;
 
-    const pid = pid: {
-        const rc = linux.fork();
-        break :pid switch (linux.errno(rc)) {
-            .SUCCESS => rc,
-            else => return error.ForkError,
-        };
-    };
+    const pid = try rawFork();
     if (pid == 0) {
         // we are the child
-        _ = std.os.linux.setsid();
+        rawSetsid();
 
         // set the controlling terminal
         var u: c_uint = std.posix.STDIN_FILENO;
-        if (posix.system.ioctl(self.pty.tty.handle, posix.T.IOCSCTTY, @intFromPtr(&u)) != 0) return error.IoctlError;
+        if (posix.system.ioctl(self.pty.tty.handle, TIOCSCTTY, @intFromPtr(&u)) != 0) return error.IoctlError;
 
         // set up io
-        {
-            const rc = linux.dup2(self.pty.tty.handle, std.posix.STDIN_FILENO);
-            switch (linux.errno(rc)) {
-                .SUCCESS => {},
-                else => return error.Dup2Failed,
-            }
-        }
-        {
-            const rc = linux.dup2(self.pty.tty.handle, std.posix.STDOUT_FILENO);
-            switch (linux.errno(rc)) {
-                .SUCCESS => {},
-                else => return error.Dup2Failed,
-            }
-        }
-        {
-            const rc = linux.dup2(self.pty.tty.handle, std.posix.STDERR_FILENO);
-            switch (linux.errno(rc)) {
-                .SUCCESS => {},
-                else => return error.Dup2Failed,
-            }
-        }
+        try rawDup2(self.pty.tty.handle, std.posix.STDIN_FILENO);
+        try rawDup2(self.pty.tty.handle, std.posix.STDOUT_FILENO);
+        try rawDup2(self.pty.tty.handle, std.posix.STDERR_FILENO);
         self.pty.tty.close(io);
         if (self.pty.pty.handle > 2) self.pty.pty.close(io);
 
         if (self.working_directory) |wd| {
             const wd_z = try posix.toPosixPath(wd);
-            if (linux.errno(linux.chdir(&wd_z)) != .SUCCESS) return error.ChdirFailed;
+            try rawChdir(&wd_z);
         }
 
         // exec
         execvpeLinux(argv_block.ptr, env_block, self.argv[0], path) catch {};
-        linux.exit(127);
+        rawExit(127);
     }
 
     // we are the parent
@@ -110,15 +94,8 @@ fn handleSigChild(_: posix.SIG) callconv(.c) void {
     if (!Terminal.global_vts_alive) return; // map was freed by deinit
     var it = Terminal.global_vts.iterator();
     while (it.next()) |entry| {
-        var status: u32 = undefined;
-        const rc = linux.waitpid(entry.key_ptr.*, &status, linux.W.NOHANG);
-        switch (linux.errno(rc)) {
-            .SUCCESS => {
-                if (rc != 0) {
-                    entry.value_ptr.*.event_queue.push(.exited) catch {};
-                }
-            },
-            else => {},
+        if (rawWaitpidExited(entry.key_ptr.*)) {
+            entry.value_ptr.*.event_queue.push(.exited) catch {};
         }
     }
 }
@@ -128,6 +105,69 @@ pub fn kill(self: *Command) void {
         posix.kill(pid, posix.SIG.TERM) catch {};
         self.pid = null;
     }
+}
+
+// ---- platform wrappers: raw syscalls on Linux (no libc dependency), libc
+// on macOS (the numbers differ; the app links libc everywhere) ----
+
+fn rawFork() !posix.pid_t {
+    if (builtin.os.tag == .linux) {
+        const rc = linux.fork();
+        return switch (linux.errno(rc)) {
+            .SUCCESS => @intCast(rc),
+            else => error.ForkError,
+        };
+    }
+    const rc = std.c.fork();
+    if (rc < 0) return error.ForkError;
+    return rc;
+}
+
+fn rawSetsid() void {
+    if (builtin.os.tag == .linux) {
+        _ = linux.setsid();
+    } else {
+        _ = std.c.setsid();
+    }
+}
+
+fn rawDup2(old: posix.fd_t, new: posix.fd_t) !void {
+    if (builtin.os.tag == .linux) {
+        switch (linux.errno(linux.dup2(old, new))) {
+            .SUCCESS => return,
+            else => return error.Dup2Failed,
+        }
+    }
+    if (std.c.dup2(old, new) < 0) return error.Dup2Failed;
+}
+
+fn rawChdir(path: [*:0]const u8) !void {
+    if (builtin.os.tag == .linux) {
+        if (linux.errno(linux.chdir(path)) != .SUCCESS) return error.ChdirFailed;
+        return;
+    }
+    if (std.c.chdir(path) != 0) return error.ChdirFailed;
+}
+
+fn rawExit(code: u8) noreturn {
+    if (builtin.os.tag == .linux) {
+        linux.exit(code);
+    } else {
+        std.c._exit(code);
+    }
+}
+
+/// Non-blocking waitpid: true when the child exited.
+fn rawWaitpidExited(pid: posix.pid_t) bool {
+    if (builtin.os.tag == .linux) {
+        var status: u32 = undefined;
+        const rc = linux.waitpid(pid, &status, linux.W.NOHANG);
+        return linux.errno(rc) == .SUCCESS and rc != 0;
+    }
+    var status: c_int = undefined;
+    // WNOHANG is 1 on both Linux and Darwin
+    const rc = std.c.waitpid(pid, &status, 1);
+    return rc > 0;
 }
 
 // Keep fork->exec child path allocation-free, following std/Io/Threaded.zig:posixExecv
