@@ -62,6 +62,92 @@ const Queue = struct {
     }
 };
 
+/// One outbound frame. `raw` is a fully serialized JSON-RPC frame (header +
+/// body); `did_change` carries the raw document text and is JSON-encoded BY
+/// THE WRITER THREAD — per-keystroke full-text stringification must not run
+/// on the UI thread. The uri is captured at push time: the writer thread
+/// must not read `Client.uri`, which the main thread frees and replaces on
+/// every retarget/switchDocument.
+const OutFrame = union(enum) {
+    raw: []u8,
+    did_change: struct { uri: []u8, text: []u8, version: i32 },
+
+    fn deinit(self: OutFrame, alloc: std.mem.Allocator) void {
+        switch (self) {
+            .raw => |f| alloc.free(f),
+            .did_change => |dc| {
+                alloc.free(dc.uri);
+                alloc.free(dc.text);
+            },
+        }
+    }
+};
+
+/// Outbound frame queue for the writer thread. didChange frames carry the
+/// FULL document text, so a queued-but-unsent didChange is stale the moment
+/// a newer edit exists — it is REPLACED in place (coalesced, pre-encode)
+/// instead of piling up obsolete full-text frames faster than the server
+/// drains them.
+const OutQueue = struct {
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+    items: std.ArrayList(OutFrame) = .empty,
+    /// Index of the queued didChange frame, if any (the coalesce target).
+    did_change_idx: ?usize = null,
+
+    fn push(self: *OutQueue, alloc: std.mem.Allocator, frame: OutFrame) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (frame == .did_change) {
+            if (self.did_change_idx) |i| {
+                self.items.items[i].deinit(alloc);
+                self.items.items[i] = frame;
+                self.cond.signal(self.io);
+                return;
+            }
+        }
+        try self.items.append(alloc, frame);
+        if (frame == .did_change) self.did_change_idx = self.items.items.len - 1;
+        self.cond.signal(self.io);
+    }
+
+    /// Non-blocking pop; null when empty.
+    fn pop(self: *OutQueue) ?OutFrame {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.items.items.len == 0) return null;
+        const f = self.items.orderedRemove(0);
+        if (self.did_change_idx) |i| {
+            self.did_change_idx = if (i == 0) null else i - 1;
+        }
+        return f;
+    }
+
+    /// Block up to `timeout_ns` for an item; null on timeout.
+    fn popTimeout(self: *OutQueue, timeout_ns: i128) ?OutFrame {
+        const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+        const deadline = now + timeout_ns;
+        while (true) {
+            if (self.pop()) |c| return c;
+            if (std.Io.Timestamp.now(self.io, .real).nanoseconds >= deadline) return null;
+            std.Io.sleep(self.io, .fromNanoseconds(20 * std.time.ns_per_ms), .real) catch {};
+        }
+    }
+
+    /// Wake a blocked popTimeout (teardown).
+    fn wake(self: *OutQueue) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.cond.signal(self.io);
+    }
+
+    fn deinit(self: *OutQueue, alloc: std.mem.Allocator) void {
+        for (self.items.items) |c| c.deinit(alloc);
+        self.items.deinit(alloc);
+    }
+};
+
 pub const Client = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -98,6 +184,14 @@ pub const Client = struct {
     open_docs: ?std.AutoHashMap(u64, void) = null,
 
     thread: ?std.Thread = null,
+    /// Writer thread: post-handshake frames (didChange, requests) are QUEUED
+    /// and written off the main thread — a full pipe (slow/wedged server
+    /// draining a large full-text sync) must never block the UI. null until
+    /// connect() finishes the handshake (handshake frames are written
+    /// directly by the connect thread; tests without a process write
+    /// directly too).
+    writer: ?std.Thread = null,
+    out: OutQueue,
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Set by the reader thread when the server's stdout hit EOF or a read
     /// error — i.e. the server EXITED (or crashed) on its own. The editor
@@ -168,14 +262,20 @@ pub const Client = struct {
         return .{ .handle = fd, .flags = .{ .nonblocking = false } };
     }
 
-    /// Spawn the server for `lang`, handshake, and open `uri` with `text`.
-    pub fn start(
+    /// Spawn the server for `lang` and run the initialize handshake, WITHOUT
+    /// opening a document — the caller follows with openDocument(). Split
+    /// from `start` so the App can run the handshake on a worker thread (a
+    /// slow server boot — zls on a cold workspace can take seconds — must
+    /// never block the UI). `cancel` (optional) aborts the handshake wait:
+    /// waitResponse returns error.Cancelled and the spawned server is killed
+    /// by the errdefer chain.
+    pub fn connect(
         alloc: std.mem.Allocator,
         io: std.Io,
         env_map: *std.process.Environ.Map,
         lang: []const u8,
         uri: []const u8,
-        text: []const u8,
+        cancel: ?*std.atomic.Value(bool),
     ) !*Client {
         var argv = server_config.commandFor(lang) orelse return error.NoLspServer;
         // Test hook: OZ_LSP_CMD overrides the server command (e2e injects the
@@ -250,6 +350,7 @@ pub const Client = struct {
             .proc = proc,
             .stdin = proc.stdin orelse return error.NoStdin,
             .queue = .{ .io = io },
+            .out = .{ .io = io },
             .argv_override = argv_override,
             .argv_override_first_owned = argv_first_owned,
         };
@@ -286,7 +387,7 @@ pub const Client = struct {
                 return e;
             };
         }
-        var init_msg = try self.waitResponse(init_id);
+        var init_msg = try self.waitResponse(init_id, cancel);
         defer init_msg.deinit(self.alloc);
         // Record server capabilities the editor feature gates on
         // (e.g. inlayHintProvider=false ⇒ don't send inlayHint requests).
@@ -334,8 +435,37 @@ pub const Client = struct {
             defer self.alloc.free(content);
             try self.writeFrameToStdin(content);
         }
+        // Handshake done: every frame from now on goes through the writer
+        // thread so a slow server (full pipe mid-didChange) never blocks the
+        // UI thread. A spawn failure here still unwinds through the errdefer
+        // chain above (kill + reader join + destroy).
+        self.writer = try std.Thread.spawn(.{}, writerMain, .{self});
+        return self;
+    }
+
+    /// Spawn the server, handshake, and open `uri` with `text` — all
+    /// synchronous (used by tests; the App uses connect + openDocument so a
+    /// slow server boot never blocks the UI).
+    pub fn start(
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        env_map: *std.process.Environ.Map,
+        lang: []const u8,
+        uri: []const u8,
+        text: []const u8,
+    ) !*Client {
+        const self = try connect(alloc, io, env_map, lang, uri, null);
+        errdefer self.deinit();
         try self.didOpen(text);
         return self;
+    }
+
+    /// didOpen for a client that came from connect() — called on the main
+    /// thread once the App installs the client. The text passed here must be
+    /// the CURRENT buffer content: edits made while the handshake ran on the
+    /// worker thread would otherwise be lost.
+    pub fn openDocument(self: *Client, text: []const u8) !void {
+        return self.didOpen(text);
     }
 
     pub fn deinit(self: *Client) void {
@@ -345,11 +475,16 @@ pub const Client = struct {
         // server that never closes its pipe. NOTE: Child.kill already cleans
         // up (id → null), so no wait() afterwards — it would assert.
         _ = self.proc.kill(self.io);
+        // Wake the writer so it sees `stop` immediately; a writer blocked in
+        // writev is unblocked by the kill above (the pipe dies with it).
+        if (self.writer != null) self.out.wake();
+        if (self.writer) |t| t.join();
         if (self.thread) |t| t.join();
         // Leftover queue frames are freed here; unreceived response VALUES
         // live in the caller's slots (the App frees nav_slot etc. in its own
         // deinit), so the pending array itself is all we own.
         self.queue.deinit(self.alloc);
+        self.out.deinit(self.alloc);
         self.pending.deinit(self.alloc);
         if (self.open_docs) |*od| od.deinit();
         for (self.completion_triggers.items) |t| self.alloc.free(t);
@@ -510,6 +645,21 @@ pub const Client = struct {
     /// range is not tracked: undo/redo, multi-cursor ops, paste, …).
     pub fn didChange(self: *Client, range: ?types.Range, text: []const u8) !void {
         self.version += 1;
+        if (self.writer != null and range == null) {
+            // Async full-text path: hand the raw text to the writer thread,
+            // which JSON-encodes off the UI thread and coalesces pre-encode
+            // (a queued full text is replaced by the newer edit before it is
+            // ever stringified). Incremental frames are tiny, so they keep
+            // the inline-encode path below and are queued as raw frames.
+            // The uri is captured now: by the time the writer encodes, the
+            // main thread may have retargeted the client.
+            const uri_copy = try self.alloc.dupe(u8, self.uri);
+            errdefer self.alloc.free(uri_copy);
+            const copy = try self.alloc.dupe(u8, text);
+            errdefer self.alloc.free(copy);
+            try self.out.push(self.alloc, .{ .did_change = .{ .uri = uri_copy, .text = copy, .version = self.version } });
+            return;
+        }
         var td = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer td.deinit(self.alloc);
         const uri_copy = try self.alloc.dupe(u8, self.uri);
@@ -626,10 +776,78 @@ pub const Client = struct {
     }
 
     fn writeFrameToStdin(self: *Client, content: []const u8) !void {
+        return self.sendFrame(content);
+    }
+
+    /// Serialize + send one frame. With no writer thread (the handshake runs
+    /// on the connect thread; tests use bare pipes) frames are written
+    /// directly; otherwise the frame is queued for the writer thread so a
+    /// full pipe never blocks the caller.
+    fn sendFrame(self: *Client, content: []const u8) !void {
+        if (self.writer == null) {
+            try self.writeRawFrame(content);
+            return;
+        }
+        const frame = try std.fmt.allocPrint(self.alloc, "Content-Length: {d}\r\n\r\n{s}", .{ content.len, content });
+        self.out.push(self.alloc, .{ .raw = frame }) catch |e| {
+            self.alloc.free(frame);
+            return e;
+        };
+    }
+
+    /// Writer thread: drain the outbound queue to the server's stdin. A write
+    /// error means the server's pipe is broken — the reader thread's EOF
+    /// handling (server_died) reports it; the frame is just dropped.
+    fn writerMain(self: *Client) void {
+        while (!self.stop.load(.acquire)) {
+            const frame = self.out.popTimeout(50 * std.time.ns_per_ms) orelse continue;
+            defer frame.deinit(self.alloc);
+            switch (frame) {
+                .raw => |f| _ = std.Io.File.writeStreamingAll(self.stdin, self.io, f) catch {},
+                .did_change => |dc| {
+                    // JSON-encode HERE, off the UI thread (per-keystroke
+                    // full-document stringify is the expensive part)
+                    const content = self.encodeDidChange(dc.uri, dc.text, dc.version) catch continue;
+                    defer self.alloc.free(content);
+                    self.writeRawFrame(content) catch {};
+                },
+            }
+        }
+    }
+
+    /// Direct header+body write (writer thread / no-writer fallback).
+    fn writeRawFrame(self: *Client, content: []const u8) !void {
         var hdr_buf: [64]u8 = undefined;
         const hdr = try std.fmt.bufPrint(&hdr_buf, "Content-Length: {d}\r\n\r\n", .{content.len});
         try std.Io.File.writeStreamingAll(self.stdin, self.io, hdr);
         try std.Io.File.writeStreamingAll(self.stdin, self.io, content);
+    }
+
+    /// Build the serialized full-text didChange notification (writer thread).
+    /// Shares the param-graph lifetime rules with didChange (see
+    /// freeDidChangeParams). `uri` is the push-time copy from the frame.
+    fn encodeDidChange(self: *Client, uri: []const u8, text: []const u8, version: i32) ![]u8 {
+        var td = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer td.deinit(self.alloc);
+        const uri_copy = try self.alloc.dupe(u8, uri);
+        errdefer self.alloc.free(uri_copy);
+        try td.put(self.alloc, "uri", .{ .string = uri_copy });
+        try td.put(self.alloc, "version", .{ .integer = version });
+        var change = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer change.deinit(self.alloc);
+        const text_copy = try self.alloc.dupe(u8, text);
+        errdefer self.alloc.free(text_copy);
+        try change.put(self.alloc, "text", .{ .string = text_copy });
+        var changes = std.json.Array.init(self.alloc);
+        errdefer changes.deinit();
+        try changes.append(.{ .object = change });
+        var params = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer params.deinit(self.alloc);
+        try params.put(self.alloc, "textDocument", .{ .object = td });
+        try params.put(self.alloc, "contentChanges", .{ .array = changes });
+        var v = std.json.Value{ .object = params };
+        defer self.freeDidChangeParams(&v);
+        return json_rpc.encodeNotification(self.alloc, "textDocument/didChange", v);
     }
 
     /// Drain all queued messages. Responses fill pending request slots;
@@ -676,7 +894,10 @@ pub const Client = struct {
     /// Synchronous wait for the response with `want_id` (handshake). Used
     /// only for initialize; every other response arrives asynchronously via
     /// `drain`, so the generous 30s cap applies to the handshake alone.
-    fn waitResponse(self: *Client, want_id: u64) !json_rpc.Message {
+    /// `cancel` (async attach): polled each wait cycle — the App sets it when
+    /// the user switches buffers mid-handshake, and the wait aborts instead
+    /// of pinning a worker thread to a server nobody wants anymore.
+    fn waitResponse(self: *Client, want_id: u64, cancel: ?*std.atomic.Value(bool)) !json_rpc.Message {
         const deadline = std.Io.Timestamp.now(self.io, .real).nanoseconds + 30 * std.time.ns_per_s;
         while (std.Io.Timestamp.now(self.io, .real).nanoseconds < deadline) {
             // A server that died before answering (bad binary, crash on
@@ -684,6 +905,9 @@ pub const Client = struct {
             // never respond: bail out instead of freezing the UI for the
             // full 30s.
             if (self.server_died.load(.acquire)) return error.LspServerDied;
+            if (cancel) |c| {
+                if (c.load(.acquire)) return error.Cancelled;
+            }
             const content = self.queue.popTimeout(100 * std.time.ns_per_ms) orelse continue;
             defer self.alloc.free(content);
             var msg = json_rpc.parseMessage(self.alloc, content) catch continue;
@@ -955,6 +1179,31 @@ test "queue: popTimeout returns null on timeout" {
     try std.testing.expect(std.Io.Timestamp.now(std.testing.io, .real).nanoseconds - start < std.time.ns_per_s);
 }
 
+test "out queue: didChange frames coalesce, other frames queue in order" {
+    const alloc = std.testing.allocator;
+    var q = OutQueue{ .io = std.testing.io };
+    defer q.deinit(alloc);
+
+    // two coalescible frames back to back: the second replaces the first
+    try q.push(alloc, .{ .did_change = .{ .uri = try alloc.dupe(u8, "file:///t.zig"), .text = try alloc.dupe(u8, "change-v1"), .version = 1 } });
+    try q.push(alloc, .{ .did_change = .{ .uri = try alloc.dupe(u8, "file:///t.zig"), .text = try alloc.dupe(u8, "change-v2"), .version = 2 } });
+    // a non-coalesced frame keeps its place AFTER the queued change
+    try q.push(alloc, .{ .raw = try alloc.dupe(u8, "request") });
+    // a third change replaces v2 in place (still before the request)
+    try q.push(alloc, .{ .did_change = .{ .uri = try alloc.dupe(u8, "file:///t.zig"), .text = try alloc.dupe(u8, "change-v3"), .version = 3 } });
+
+    const a = q.pop().?;
+    defer a.deinit(alloc);
+    try std.testing.expect(a == .did_change);
+    try std.testing.expectEqualStrings("change-v3", a.did_change.text); // v1/v2 coalesced away
+    try std.testing.expectEqual(@as(i32, 3), a.did_change.version);
+    const b = q.pop().?;
+    defer b.deinit(alloc);
+    try std.testing.expectEqualStrings("request", b.raw); // order preserved
+    try std.testing.expect(q.pop() == null);
+    try std.testing.expect(q.did_change_idx == null);
+}
+
 // ---------------------------------------------------------------------------
 // Client state-machine tests (hand-built Client over pipes, no subprocess)
 // ---------------------------------------------------------------------------
@@ -971,11 +1220,13 @@ fn testClient(alloc: std.mem.Allocator, io: std.Io, stdin: std.Io.File) !Client 
         .proc = undefined,
         .stdin = stdin,
         .queue = .{ .io = io },
+        .out = .{ .io = io },
     };
 }
 
 fn cleanupClient(alloc: std.mem.Allocator, c: *Client) void {
     c.queue.deinit(alloc);
+    c.out.deinit(alloc);
     c.pending.deinit(alloc);
     if (c.open_docs) |*od| od.deinit();
     alloc.free(c.uri);
@@ -1027,7 +1278,7 @@ test "waitResponse: a server request with the same id is not the response" {
     try client.queue.push(alloc, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"workspace/configuration\",\"params\":{\"items\":[]}}");
     try client.queue.push(alloc, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{}}}");
 
-    var msg = try client.waitResponse(1);
+    var msg = try client.waitResponse(1, null);
     defer msg.deinit(alloc);
     try std.testing.expect(msg.method == null);
     try std.testing.expect(msg.result != null);

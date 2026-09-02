@@ -442,6 +442,18 @@ fn atomMatch(c: u8, atom: []const u8, is_class: bool) bool {
     return false;
 }
 
+/// First index into the sorted `items` whose value is > `key` (binary
+/// search); the number of entries ≤ `key`.
+fn upperBound(comptime T: type, items: []const T, key: T) usize {
+    var lo: usize = 0;
+    var hi: usize = items.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (items[mid] <= key) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
 /// Rainbow style for a bracket at `depth`: bracket0 + depth % 7.
 fn bracketStyle(depth: u32) Style {
     const base: u8 = @intFromEnum(Style.bracket0);
@@ -491,7 +503,13 @@ pub const Highlighter = struct {
     /// the OLD text's line/column to place the edit points correctly — zero
     /// points corrupt tree-sitter's internal position metadata and can drift
     /// the highlight spans after a burst of edits.
-    prev_text: ?[]u8 = null,
+    prev_text: std.ArrayList(u8) = .empty,
+    /// Byte offset of every line start in prev_text (line_starts[0] == 0),
+    /// kept in sync by reparse/reparseEdit. Turns the row/col lookup
+    /// tree.edit() needs into a binary search — the naive alternative
+    /// (counting '\n' from byte 0 on every edit) costs O(edit position) per
+    /// keystroke, dwarfing the incremental parse itself on large files.
+    line_starts: std.ArrayList(u32) = .empty,
     /// Reusable query cursor (created on first use; ts_query_cursor_new
     /// mallocs, and spansInRange runs every frame per visible window).
     cursor: ?*treez.Query.Cursor = null,
@@ -528,7 +546,8 @@ pub const Highlighter = struct {
     }
 
     pub fn deinit(self: *Highlighter) void {
-        if (self.prev_text) |t| self.allocator.free(t);
+        self.prev_text.deinit(self.allocator);
+        self.line_starts.deinit(self.allocator);
         if (self.tree) |t| t.destroy();
         if (self.cursor) |c| c.destroy();
         self.query.destroy();
@@ -548,29 +567,49 @@ pub const Highlighter = struct {
         try self.setPrevText(text);
     }
 
+    /// Full reset of the owned text copy and its line index (buffer switch,
+    /// multi-edit fallback). One pass over `text`; per-edit updates use the
+    /// incremental path in reparseEdit instead.
     fn setPrevText(self: *Highlighter, text: []const u8) !void {
-        if (self.prev_text) |t| self.allocator.free(t);
-        self.prev_text = try self.allocator.dupe(u8, text);
+        self.prev_text.clearRetainingCapacity();
+        try self.prev_text.appendSlice(self.allocator, text);
+        self.line_starts.clearRetainingCapacity();
+        try self.line_starts.append(self.allocator, 0);
+        for (text, 0..) |c, i| {
+            if (c == '\n') try self.line_starts.append(self.allocator, @intCast(i + 1));
+        }
     }
 
     /// Incremental reparse: record a single edit [pos, old_end) → [pos,
     /// new_end) on the current tree, then parse the new text reusing the
     /// old tree (tree-sitter's incremental path — the whole point of
-    /// t.edit()). Only byte offsets matter to our consumers — the point
-    /// fields are approximated; tree-sitter needs them only for position
-    /// metadata we never read. On parse failure the old tree may be left
-    /// in an unknown state, so it is dropped and a full reparse is used.
+    /// t.edit()). The edit points come from the line index (O(log lines)
+    /// instead of a per-keystroke O(pos) text scan) and the owned text copy
+    /// is patched in place (a tail memmove instead of a full-document dupe).
+    /// An edit record that doesn't line up with the stored text (undo
+    /// bursts, multi-edit fallbacks) is treated like a buffer switch: the
+    /// old tree is dropped and the text is parsed from scratch — passing an
+    /// old tree without matching edit() records corrupts the parse. On parse
+    /// failure the tree is likewise dropped and a full reparse is used.
     pub fn reparseEdit(self: *Highlighter, pos: u32, old_end: u32, new_end: u32, text: []const u8) !void {
-        if (self.tree) |t| {
-            const old_text = self.prev_text orelse "";
+        var patched = false;
+        if (self.tree != null and self.editConsistent(pos, old_end, new_end, text)) {
+            const t = self.tree.?;
+            const start_point = self.pointOf(pos);
+            const old_end_point = self.pointOf(old_end);
+            try self.applyTextEdit(pos, old_end, new_end, text);
             t.edit(&.{
                 .start_byte = pos,
                 .old_end_byte = old_end,
                 .new_end_byte = new_end,
-                .start_point = pointAt(old_text, pos),
-                .old_end_point = pointAt(old_text, @min(old_end, @as(u32, @intCast(old_text.len)))),
-                .new_end_point = pointAt(text, new_end),
+                .start_point = start_point,
+                .old_end_point = old_end_point,
+                .new_end_point = self.pointOf(new_end),
             });
+            patched = true;
+        } else if (self.tree) |old| {
+            old.destroy();
+            self.tree = null;
         }
         const new_tree = self.parser.parseString(self.tree, text) catch {
             if (self.tree) |old| old.destroy();
@@ -579,23 +618,100 @@ pub const Highlighter = struct {
         };
         if (self.tree) |old| old.destroy();
         self.tree = new_tree;
-        try self.setPrevText(text);
+        if (!patched) try self.setPrevText(text);
     }
 
-    /// Line/column of a byte offset (tree-sitter Point).
-    fn pointAt(text: []const u8, byte: u32) treez.Point {
-        var row: u32 = 0;
-        var col: u32 = 0;
-        const b = @min(byte, @as(u32, @intCast(text.len)));
-        for (text[0..b]) |c| {
-            if (c == '\n') {
-                row += 1;
-                col = 0;
-            } else {
-                col += 1;
+    /// True when the edit record lines up with the owned text copy: applying
+    /// [pos, old_end) → [pos, new_end) to prev_text must yield exactly `text`
+    /// (verified by length — tree.edit() already trusts the same record).
+    fn editConsistent(self: *const Highlighter, pos: u32, old_end: u32, new_end: u32, text: []const u8) bool {
+        const old_len = self.prev_text.items.len;
+        if (pos > old_end or old_end > old_len) return false;
+        if (pos > new_end or new_end > text.len) return false;
+        return old_len - (old_end - pos) + (new_end - pos) == text.len;
+    }
+
+    /// Patch the owned text copy and line index for [pos, old_end) →
+    /// [pos, new_end); callers must have checked editConsistent. Cost is a
+    /// tail memmove plus the line-index shift (u32 adds) — no full-document
+    /// copy or rescan. All fallible capacity reservations happen first, so
+    /// an OOM leaves the old text and its index untouched.
+    fn applyTextEdit(self: *Highlighter, pos: u32, old_end: u32, new_end: u32, text: []const u8) !void {
+        const alloc = self.allocator;
+        const new_len = text.len;
+        const tail_len = new_len - new_end;
+
+        // line-index shape: entries ≤ pos survive as-is (the line holding
+        // pos keeps its start), entries > old_end survive shifted by the
+        // byte delta, and every '\n' in the inserted text adds a line start
+        const ls = &self.line_starts;
+        const old_count = ls.items.len;
+        const front = upperBound(u32, ls.items, pos); // kept: [0, front)
+        const back = upperBound(u32, ls.items, old_end); // shifted: [back, old_count)
+        var inserted: usize = 0;
+        for (text[pos..new_end]) |c| {
+            if (c == '\n') inserted += 1;
+        }
+        const back_count = old_count - back;
+
+        // reservations done; the mutations below cannot fail
+        try self.prev_text.ensureTotalCapacity(alloc, new_len);
+        try ls.ensureTotalCapacity(alloc, front + inserted + back_count);
+
+        // text bytes: move the tail [old_end..) to [new_end..), then drop
+        // the inserted bytes into [pos, new_end). When shrinking the tail
+        // moves BEFORE the shorten (its source would fall past the new
+        // length); when growing the lengthening comes first.
+        if (new_end < old_end) {
+            const buf = self.prev_text.items;
+            std.mem.copyForwards(u8, buf[new_end..][0..tail_len], buf[old_end..][0..tail_len]);
+            self.prev_text.shrinkRetainingCapacity(new_len);
+        } else if (new_end > old_end) {
+            self.prev_text.items.len = new_len;
+            const buf = self.prev_text.items;
+            std.mem.copyBackwards(u8, buf[new_end..][0..tail_len], buf[old_end..][0..tail_len]);
+        }
+        @memcpy(self.prev_text.items[pos..new_end], text[pos..new_end]);
+
+        // shift the surviving tail entries FIRST — when the index grows they
+        // move right (backwards iteration), and the inserted entries below
+        // would clobber them otherwise. Grow the slice before the loop so
+        // the right-shifted destinations are in bounds; shrink it only
+        // after, so the old tail entries stay readable.
+        const new_count = front + inserted + back_count;
+        if (new_count > old_count) ls.items.len = new_count;
+        const delta: i64 = @as(i64, new_end) - @as(i64, old_end);
+        if (front + inserted <= back) {
+            for (0..back_count) |j| {
+                ls.items[front + inserted + j] = @intCast(@as(i64, ls.items[back + j]) + delta);
+            }
+        } else {
+            var j = back_count;
+            while (j > 0) {
+                j -= 1;
+                ls.items[front + inserted + j] = @intCast(@as(i64, ls.items[back + j]) + delta);
             }
         }
-        return .{ .row = row, .column = col };
+        ls.items.len = new_count;
+        var w = front;
+        var i: usize = pos;
+        while (i < new_end) : (i += 1) {
+            if (text[i] == '\n') {
+                ls.items[w] = @intCast(i + 1);
+                w += 1;
+            }
+        }
+    }
+
+    /// Line/column of a byte offset (tree-sitter Point) via the line index —
+    /// O(log lines). Out-of-range bytes clamp to the text length, matching
+    /// the old linear scan.
+    fn pointOf(self: *const Highlighter, byte: u32) treez.Point {
+        const ls = self.line_starts.items;
+        if (ls.len == 0) return .{ .row = 0, .column = byte };
+        const b = @min(byte, @as(u32, @intCast(self.prev_text.items.len)));
+        const line = upperBound(u32, ls, b) - 1; // ls[0] == 0, so never wraps
+        return .{ .row = @intCast(line), .column = b - ls[line] };
     }
 
     /// Run the highlight query over [start_byte, end_byte) and append spans
@@ -609,7 +725,7 @@ pub const Highlighter = struct {
     /// steps ≈ 7ms/frame on token-dense code, the dominant frame cost.
     pub fn spansInRange(self: *Highlighter, start_byte: u32, end_byte: u32, arena: std.mem.Allocator, out: *std.ArrayList(Span)) !void {
         const tree = self.tree orelse return;
-        const text = self.prev_text orelse return;
+        const text = self.prev_text.items;
         // one walk over the visible subtree: ERROR ranges (for the fallback
         // lexer) + node-id → depth (for rainbow brackets)
         var errs = std.ArrayList(ByteRange).empty;
@@ -759,7 +875,7 @@ pub const Highlighter = struct {
     /// × children per level) — never O(file).
     pub fn scopeAt(self: *Highlighter, byte: u32) ?Scope {
         const tree = self.tree orelse return null;
-        const text = self.prev_text orelse return null;
+        const text = self.prev_text.items;
         const root = tree.getRootNode();
         if (root.getEndByte() == 0) return null; // empty file
         var scope: ?treez.Node = null;
@@ -1190,6 +1306,88 @@ fn spanAt(spans: []const Span, byte: u32) ?Style {
         if (sp.start <= byte and byte < sp.end) return sp.style;
     }
     return null;
+}
+
+/// Reference row/col computation: the pre-optimization linear scan.
+fn brutePoint(text: []const u8, byte: u32) treez.Point {
+    var row: u32 = 0;
+    var col: u32 = 0;
+    const b = @min(byte, @as(u32, @intCast(text.len)));
+    for (text[0..b]) |c| {
+        if (c == '\n') {
+            row += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    return .{ .row = row, .column = col };
+}
+
+fn expectPointsEqual(text: []const u8, hl: *const Highlighter) !void {
+    var b: u32 = 0;
+    while (b <= text.len) : (b += 1) {
+        const want = brutePoint(text, b);
+        const got = hl.pointOf(b);
+        try std.testing.expectEqual(want.row, got.row);
+        try std.testing.expectEqual(want.column, got.column);
+    }
+    // beyond EOF clamps to the text end, like the old scan
+    const over: u32 = @intCast(text.len + 100);
+    const want = brutePoint(text, over);
+    const got = hl.pointOf(over);
+    try std.testing.expectEqual(want.row, got.row);
+    try std.testing.expectEqual(want.column, got.column);
+}
+
+test "line index: pointOf matches the brute-force scan at every byte" {
+    const alloc = std.testing.allocator;
+    // empty lines, tabs, an indented fn body, no trailing-newline variant
+    const src = "const a = 1;\n\nconst bb = 22;\n// c\nfn f() void {\n\tconst s = \"some text\";\n}\nlast";
+    var hl = try Highlighter.init(alloc, "zig");
+    defer hl.deinit();
+    try hl.reparse(src);
+    try expectPointsEqual(src, &hl);
+    // the empty document: line_starts == [0], every byte maps to (0, b)
+    try hl.reparse("");
+    try expectPointsEqual("", &hl);
+}
+
+test "line index: incremental edits keep the owned text and pointOf correct" {
+    const alloc = std.testing.allocator;
+    var hl = try Highlighter.init(alloc, "zig");
+    defer hl.deinit();
+    var text = std.ArrayList(u8).empty;
+    defer text.deinit(alloc);
+    try text.appendSlice(alloc, "const a = 1;\nconst b = 2;\nconst c = 3;\n");
+    try hl.reparse(text.items);
+
+    const Edit = struct { pos: u32, del: u32, ins: []const u8 };
+    const edits = [_]Edit{
+        .{ .pos = 6, .del = 0, .ins = "xyz" }, // insert mid-line
+        .{ .pos = 0, .del = 0, .ins = "// head\n" }, // new first line
+        .{ .pos = 3, .del = 5, .ins = "" }, // delete across a newline
+        .{ .pos = 10, .del = 1, .ins = "multi\nline\n" }, // replace with multi-line
+        .{ .pos = 0, .del = 0, .ins = "" }, // no-op edit
+        .{ .pos = 0, .del = 999, .ins = "" }, // clamped delete-all
+    };
+    for (edits) |e| {
+        const pos = @min(e.pos, @as(u32, @intCast(text.items.len)));
+        const old_end = @min(pos + e.del, @as(u32, @intCast(text.items.len)));
+        const new_end = pos + @as(u32, @intCast(e.ins.len));
+        const new_len = text.items.len - (old_end - pos) + e.ins.len;
+        const new_text = try alloc.alloc(u8, new_len);
+        defer alloc.free(new_text);
+        @memcpy(new_text[0..pos], text.items[0..pos]);
+        @memcpy(new_text[pos..][0..e.ins.len], e.ins);
+        @memcpy(new_text[pos + e.ins.len ..], text.items[old_end..]);
+        try hl.reparseEdit(pos, old_end, new_end, new_text);
+        text.clearRetainingCapacity();
+        try text.appendSlice(alloc, new_text);
+        // the owned copy must equal the document and every point must match
+        try std.testing.expectEqualStrings(text.items, hl.prev_text.items);
+        try expectPointsEqual(text.items, &hl);
+    }
 }
 
 test "repro: insert 'j' at end of an indented fn-body line keeps next-line keyword" {
