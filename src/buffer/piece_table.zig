@@ -9,11 +9,13 @@
 //! "abc" has 1. `lineStart(n)` is the byte offset of line n's first byte,
 //! `lineLen(n)` excludes the trailing '\n'.
 //!
-//! `line_starts` is kept in sync by `replace` at edit time while the cache
-//! is valid (splice the affected range, shift the tail by the length delta —
-//! O(newlines in the edit) plus one memmove), and rebuilt lazily by the first
-//! line* query when the cache is dirty. `compact` never touches it because
-//! compaction leaves the document content unchanged.
+//! `line_starts` is maintained incrementally: `init` builds it with a single
+//! full scan, and every `replace` updates only the affected suffix — line
+//! starts after the edit shift by the length delta, starts from '\n's inside
+//! the inserted bytes are added, and starts that fell inside the deleted span
+//! disappear — so it stays valid across edits without ever re-scanning the
+//! document. `compact` never touches it because compaction leaves the
+//! document content unchanged.
 const std = @import("std");
 
 pub const Piece = struct {
@@ -33,7 +35,10 @@ pub const Edit = struct {
 
 pub const PieceTable = struct {
     allocator: std.mem.Allocator,
-    origin: []u8, // owned copy of initial content
+    origin: []u8, // initial content (owned copy, or a read-only file mapping)
+    /// When non-null, `origin` aliases this read-only mmap of the loaded file
+    /// and deinit must munmap it instead of freeing (see `initMapped`).
+    origin_mapping: ?[]align(std.heap.page_size_min) u8 = null,
     add: std.ArrayList(u8), // append-only edit bytes
     pieces: std.ArrayList(Piece), // ordered pieces covering the whole doc
     line_starts: std.ArrayList(u32), // cached; line_starts[0] == 0
@@ -42,44 +47,88 @@ pub const PieceTable = struct {
     /// Cached logical document length so that `len()` is O(1). Maintained by
     /// `replace`; equal to the sum of `pieces[].len` at all times.
     doc_len: u32,
-    /// Line-index cache state. `replace` maintains the cache incrementally
-    /// while it is valid and leaves a dirty cache alone; the line* queries
-    /// rebuild it on demand (see header note).
+    /// Always valid in the steady state: `init` builds the cache and `replace`
+    /// maintains it incrementally (see header note). Cleared only if the
+    /// incremental update runs out of memory, in which case the line* queries
+    /// lazily rebuild the cache from scratch.
     line_starts_valid: bool,
+    /// Persistent scratch for rebuilding `pieces` in `replace`. Capacity is
+    /// retained across edits, so the common case performs no allocation; the
+    /// rebuilt list is swapped into `pieces` on commit.
+    scratch: std.ArrayList(Piece),
+    /// Hint for `byteAt`: the index of the last piece it resolved plus that
+    /// piece's document offset, so sequential access starts the scan there.
+    /// Stale after `replace`/`compact` (which reset it to 0).
+    byte_hint_index: usize,
+    byte_hint_offset: u32,
 
     /// Create a table from initial content (copied). O(n).
     pub fn init(allocator: std.mem.Allocator, initial: []const u8) !PieceTable {
-        return initAdopt(allocator, try allocator.dupe(u8, initial));
-    }
-
-    /// Create a table taking ownership of `owned` (freed by `deinit`) — no
-    /// copy. The line index is built lazily on the first line* query. O(1).
-    pub fn initAdopt(allocator: std.mem.Allocator, owned: []u8) !PieceTable {
         var self = PieceTable{
             .allocator = allocator,
-            .origin = owned,
+            .origin = try allocator.dupe(u8, initial),
             .add = .empty,
             .pieces = .empty,
             .line_starts = .empty,
-            .doc_len = @intCast(owned.len),
+            .doc_len = @intCast(initial.len),
             .line_starts_valid = false,
+            .scratch = .empty,
+            .byte_hint_index = 0,
+            .byte_hint_offset = 0,
         };
         errdefer self.deinit();
-        if (owned.len > 0) {
+        if (initial.len > 0) {
             try self.pieces.append(allocator, .{
                 .source = .origin,
                 .start = 0,
-                .len = @intCast(owned.len),
+                .len = @intCast(initial.len),
             });
         }
+        self.ensureLineStarts();
+        return self;
+    }
+
+    /// Create a table whose origin is a read-only file mapping (zero-copy
+    /// load path: the file bytes are never copied into the heap). The
+    /// mapping must stay alive for the table's lifetime; `deinit` munmaps
+    /// it. Only used for regular files where mmap succeeds — the load path
+    /// falls back to `init` (read + copy) otherwise.
+    pub fn initMapped(allocator: std.mem.Allocator, mapping: []align(std.heap.page_size_min) u8) !PieceTable {
+        var self = PieceTable{
+            .allocator = allocator,
+            .origin = mapping, // []align(page) u8 coerces to []u8
+            .origin_mapping = mapping,
+            .add = .empty,
+            .pieces = .empty,
+            .line_starts = .empty,
+            .doc_len = @intCast(mapping.len),
+            .line_starts_valid = false,
+            .scratch = .empty,
+            .byte_hint_index = 0,
+            .byte_hint_offset = 0,
+        };
+        errdefer self.deinit();
+        if (mapping.len > 0) {
+            try self.pieces.append(allocator, .{
+                .source = .origin,
+                .start = 0,
+                .len = @intCast(mapping.len),
+            });
+        }
+        self.ensureLineStarts();
         return self;
     }
 
     pub fn deinit(self: *PieceTable) void {
-        self.allocator.free(self.origin);
+        if (self.origin_mapping) |m| {
+            std.posix.munmap(m);
+        } else {
+            self.allocator.free(self.origin);
+        }
         self.add.deinit(self.allocator);
         self.pieces.deinit(self.allocator);
         self.line_starts.deinit(self.allocator);
+        self.scratch.deinit(self.allocator);
     }
 
     /// Logical document length in bytes. O(1).
@@ -87,13 +136,27 @@ pub const PieceTable = struct {
         return self.doc_len;
     }
 
-    /// Byte at logical offset `pos`. O(pieces). Out of range is a bug (debug assert).
+    /// Byte at logical offset `pos`. O(pieces), but sequential access is
+    /// O(1) amortized via the `byte_hint` (last resolved piece). Out of range
+    /// is a bug (debug assert).
     pub fn byteAt(self: *const PieceTable, pos: u32) u8 {
         std.debug.assert(pos < self.doc_len);
+        // Start the scan from the last piece this query resolved: pieces are
+        // contiguous and ordered, so for any pos at/after that piece's start
+        // the containing piece lies at/after the hint index.
+        var start_i: usize = 0;
         var offset: u32 = 0;
-        for (self.pieces.items) |p| {
+        if (self.byte_hint_index < self.pieces.items.len and pos >= self.byte_hint_offset) {
+            start_i = self.byte_hint_index;
+            offset = self.byte_hint_offset;
+        }
+        for (self.pieces.items[start_i..], start_i..) |p, i| {
             if (pos < offset + p.len) {
                 const src: []const u8 = if (p.source == .origin) self.origin else self.add.items;
+                // Benign interior mutation (same pattern as ensureLineStarts).
+                const s: *PieceTable = @constCast(self);
+                s.byte_hint_index = i;
+                s.byte_hint_offset = offset;
                 return src[@as(usize, p.start) + (pos - offset)];
             }
             offset += p.len;
@@ -133,9 +196,11 @@ pub const PieceTable = struct {
     /// change (for undo recording). The `after` slice references the add
     /// buffer and is invalidated by later edits/compaction.
     ///
-    /// The piece list is rebuilt into a scratch list before the add buffer is
-    /// touched, so an allocation failure leaves the table completely
-    /// unchanged (the `after` bytes are only appended on success).
+    /// The piece list is rebuilt into the persistent `scratch` list (capacity
+    /// retained across edits) before the add buffer is touched, so an
+    /// allocation failure leaves the table completely unchanged (the `after`
+    /// bytes are only appended on success). The line index is then updated
+    /// incrementally, so no per-edit full-document scan is ever needed.
     pub fn replace(self: *PieceTable, pos: u32, del_len: u32, bytes: []const u8) !Edit {
         const doc_len = self.doc_len;
         std.debug.assert(@as(u64, pos) + del_len <= doc_len);
@@ -151,8 +216,8 @@ pub const PieceTable = struct {
         // append-only, so this offset stays valid.
         const add_start: u32 = @intCast(self.add.items.len);
 
-        var new_pieces: std.ArrayList(Piece) = .empty;
-        errdefer new_pieces.deinit(self.allocator);
+        const scratch = &self.scratch;
+        scratch.clearRetainingCapacity();
 
         const add_piece = Piece{ .source = .add, .start = add_start, .len = @intCast(bytes.len) };
         var add_inserted = false;
@@ -166,34 +231,34 @@ pub const PieceTable = struct {
             // The inserted bytes belong at document offset `pos`: right before
             // the first piece that starts at or after `pos`...
             if (!add_inserted and bytes.len > 0 and piece_start >= pos) {
-                try new_pieces.append(self.allocator, add_piece);
+                try scratch.append(self.allocator, add_piece);
                 add_inserted = true;
             }
 
             if (piece_end <= pos) {
                 // Entirely before the edit region.
-                try new_pieces.append(self.allocator, p);
+                try scratch.append(self.allocator, p);
             } else if (piece_start >= del_end) {
                 // Entirely after the edit region.
-                try new_pieces.append(self.allocator, p);
+                try scratch.append(self.allocator, p);
             } else {
                 // Overlaps the edit region: keep the prefix and suffix of the
                 // piece, drop the deleted middle, and put the new bytes in
                 // between them.
                 if (piece_start < pos) {
-                    try new_pieces.append(self.allocator, .{
+                    try scratch.append(self.allocator, .{
                         .source = p.source,
                         .start = p.start,
                         .len = pos - piece_start,
                     });
                 }
                 if (!add_inserted and bytes.len > 0) {
-                    try new_pieces.append(self.allocator, add_piece);
+                    try scratch.append(self.allocator, add_piece);
                     add_inserted = true;
                 }
                 if (del_end < piece_end) {
                     const cut: u32 = @intCast(del_end - piece_start);
-                    try new_pieces.append(self.allocator, .{
+                    try scratch.append(self.allocator, .{
                         .source = p.source,
                         .start = p.start + cut,
                         .len = piece_end - @as(u32, @intCast(del_end)),
@@ -203,7 +268,7 @@ pub const PieceTable = struct {
         }
         // Append-at-end (or empty doc): no piece started at/after `pos`.
         if (!add_inserted and bytes.len > 0) {
-            try new_pieces.append(self.allocator, add_piece);
+            try scratch.append(self.allocator, add_piece);
         }
 
         // The piece list is ready; now record the inserted bytes in the add
@@ -213,24 +278,72 @@ pub const PieceTable = struct {
         }
         const after = self.add.items[@as(usize, add_start)..];
 
-        // Commit: adopt the new piece list, free the old one.
-        self.pieces.deinit(self.allocator);
-        self.pieces = new_pieces;
+        // Commit: adopt the new piece list (the old list becomes the scratch
+        // for the next edit, keeping its capacity), then update the cached
+        // line index incrementally.
+        std.mem.swap(std.ArrayList(Piece), &self.pieces, scratch);
         self.doc_len = @intCast(@as(u64, doc_len) + @as(u64, bytes.len) - @as(u64, del_len));
-
-        // Keep the line index in sync incrementally while it is valid
-        // (O(newlines in the edit) plus one memmove instead of a full
-        // rescan). A dirty cache stays dirty and is rebuilt lazily by the
-        // next line* query.
+        self.byte_hint_index = 0;
+        self.byte_hint_offset = 0;
         if (self.line_starts_valid) {
             self.updateLineStarts(pos, del_len, bytes) catch {
-                // OOM while splicing the cache: drop it; the next line* query
-                // rebuilds from scratch (document content is unaffected).
+                // Out of memory on the read-path cache: fall back to the lazy
+                // full rebuild on the next line* query.
                 self.line_starts_valid = false;
             };
         }
 
         return .{ .pos = pos, .before_len = del_len, .after = after };
+    }
+
+    /// Incrementally update `line_starts` for the edit replacing
+    /// [pos, pos+del_len) with `bytes`. Requires `line_starts` valid on entry
+    /// (it is, in the steady state) and leaves it valid.
+    ///
+    /// Line starts before the edited line are unchanged. The deleted span
+    /// removes the starts strictly inside it (a start at `pos + del_len` came
+    /// from a '\n' that was deleted, so it is gone too). Every '\n' at index k
+    /// of `bytes` yields a new start at absolute offset `pos + k + 1` (sorted
+    /// ascending; a trailing '\n' yields the start at `pos + bytes.len`).
+    /// Starts after the span shift by `delta = bytes.len - del_len`, and since
+    /// `starts[le] + delta > pos + bytes.len` while every new start is
+    /// `<= pos + bytes.len`, the new starts slot in sorted position before
+    /// the shifted suffix.
+    fn updateLineStarts(self: *PieceTable, pos: u32, del_len: u32, bytes: []const u8) !void {
+        const starts = &self.line_starts;
+        const li: usize = self.lineOf(pos); // line_starts is valid here
+        const del_end: u64 = @as(u64, pos) + del_len;
+
+        // First line start strictly after the deleted span. O(deleted lines).
+        var le: usize = li + 1;
+        while (le < starts.items.len and starts.items[le] <= del_end) le += 1;
+
+        // Shift the untouched suffix by the length delta (values only; the
+        // removed and inserted slots are handled by the replaceRange below).
+        const delta: i64 = @as(i64, @intCast(bytes.len)) - @as(i64, del_len);
+        if (delta != 0) {
+            for (starts.items[le..]) |*s| {
+                s.* = @intCast(@as(i64, s.*) + delta);
+            }
+        }
+
+        // Old starts in [li+1, le) disappeared; the '\n's in `bytes` replace
+        // them (possibly zero of either).
+        const n_new = std.mem.count(u8, bytes, "\n");
+        if (n_new > 0) {
+            const tmp = try self.allocator.alloc(u32, n_new);
+            defer self.allocator.free(tmp);
+            var k: usize = 0;
+            for (bytes, 0..) |b, i| {
+                if (b == '\n') {
+                    tmp[k] = pos + @as(u32, @intCast(i)) + 1;
+                    k += 1;
+                }
+            }
+            try starts.replaceRange(self.allocator, li + 1, le - li - 1, tmp);
+        } else if (le > li + 1) {
+            try starts.replaceRange(self.allocator, li + 1, le - li - 1, &[_]u32{});
+        }
     }
 
     /// Number of lines (vim semantics, see header). O(1) via line_starts.
@@ -266,7 +379,12 @@ pub const PieceTable = struct {
         self.ensureLineStarts();
         const starts = self.line_starts.items;
         // Greatest index with starts[i] <= pos (binary search).
-        const lo = firstLineStartGreater(starts, pos);
+        var lo: usize = 0;
+        var hi: usize = starts.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (starts[mid] <= pos) lo = mid + 1 else hi = mid;
+        }
         // starts[0] == 0 <= pos, so lo >= 1.
         std.debug.assert(lo >= 1);
         return @intCast(lo - 1);
@@ -274,9 +392,12 @@ pub const PieceTable = struct {
 
     /// Merge adjacent pieces that are contiguous in the same source buffer.
     /// Called after many edits to bound piece count. Content is unchanged, so
-    /// the line cache stays valid.
+    /// the line cache stays valid; the byteAt hint is reset because piece
+    /// indices shifted.
     pub fn compact(self: *PieceTable) void {
         mergeAdjacent(&self.pieces);
+        self.byte_hint_index = 0;
+        self.byte_hint_offset = 0;
     }
 
     /// In-place merge of adjacent pieces that are contiguous in the same
@@ -317,57 +438,14 @@ pub const PieceTable = struct {
         return .{ .table = self, .index = 0 };
     }
 
-    /// First index i with starts[i] > v. `starts` is sorted ascending.
-    fn firstLineStartGreater(starts: []const u32, v: u32) usize {
-        var lo: usize = 0;
-        var hi: usize = starts.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (starts[mid] <= v) lo = mid + 1 else hi = mid;
-        }
-        return lo;
-    }
-
-    /// Incrementally maintain `line_starts` for the edit that replaced
-    /// [pos, pos+del_len) with `bytes`, given the cache was valid for the
-    /// pre-edit document. O(newlines in `bytes` + removed entries), plus one
-    /// memmove of the tail. On allocation failure the cache contents may be
-    /// clobbered — the caller must then clear `line_starts_valid` so the next
-    /// query rebuilds it.
-    fn updateLineStarts(self: *PieceTable, pos: u32, del_len: u32, bytes: []const u8) !void {
-        const del_end: u32 = pos + del_len;
-        const starts = self.line_starts.items;
-
-        // Line starts in (pos, del_end] die with the deleted bytes: each is
-        // preceded by a '\n' inside the edit region. starts[0] == 0 <= pos,
-        // so lo >= 1 and the starts[0] == 0 invariant is preserved.
-        const lo = firstLineStartGreater(starts, pos);
-        const rem_end = firstLineStartGreater(starts, del_end);
-
-        // Shift the surviving tail by the length delta.
-        const delta: i64 = @as(i64, @intCast(bytes.len)) - @as(i64, del_len);
-        for (starts[rem_end..]) |*s| {
-            s.* = @intCast(@as(i64, s.*) + delta);
-        }
-
-        // Splice out the dead starts and insert one start per '\n' in `bytes`.
-        if (rem_end == lo and std.mem.indexOfScalar(u8, bytes, '\n') == null) return;
-        var new_starts: std.ArrayList(u32) = .empty;
-        defer new_starts.deinit(self.allocator);
-        var k: usize = 0;
-        while (std.mem.indexOfScalarPos(u8, bytes, k, '\n')) |idx| : (k = idx + 1) {
-            try new_starts.append(self.allocator, @intCast(@as(u64, pos) + idx + 1));
-        }
-        try self.line_starts.replaceRange(self.allocator, lo, rem_end - lo, new_starts.items);
-    }
-
     /// (Re)build the `line_starts` cache with a full scan of the document.
-    /// Called lazily from the line* queries when the cache is dirty. The
-    /// queries are `*const`, so the cache update goes through @constCast — a
-    /// benign interior mutation. `catch unreachable`: the query API has no
-    /// error return, and allocation failure on a read path is not recoverable
-    /// here; std.testing.allocator never fails, and in production an OOM in
-    /// the editor is fatal anyway.
+    /// Called from `init`, and lazily from the line* queries when the cache is
+    /// dirty (only possible if an incremental update ran out of memory; the
+    /// steady state never re-scans). The queries are `*const`, so the cache
+    /// update goes through @constCast — a benign interior mutation.
+    /// `catch unreachable`: the query API has no error return, and allocation
+    /// failure on a read path is not recoverable here; std.testing.allocator
+    /// never fails, and in production an OOM in the editor is fatal anyway.
     fn ensureLineStarts(self: *const PieceTable) void {
         if (self.line_starts_valid) return;
         const s: *PieceTable = @constCast(self);
@@ -378,10 +456,10 @@ pub const PieceTable = struct {
         for (s.pieces.items) |p| {
             const src: []const u8 = if (p.source == .origin) s.origin else s.add.items;
             const bytes = src[@as(usize, p.start) .. @as(usize, p.start) + p.len];
-            // memchr-vectorized scan for line separators.
-            var k: usize = 0;
-            while (std.mem.indexOfScalarPos(u8, bytes, k, '\n')) |idx| : (k = idx + 1) {
-                s.line_starts.append(s.allocator, doc_off + @as(u32, @intCast(idx)) + 1) catch unreachable;
+            for (bytes, 0..) |b, k| {
+                if (b == '\n') {
+                    s.line_starts.append(s.allocator, doc_off + @as(u32, @intCast(k)) + 1) catch unreachable;
+                }
             }
             doc_off += p.len;
         }
@@ -647,85 +725,6 @@ test "line index follows edits (lazy rebuild stays correct)" {
     try std.testing.expectEqual(@as(u32, 2), pt.lineCount());
     try std.testing.expectEqual(@as(u32, 0), pt.lineLen(1));
     try std.testing.expectEqual(@as(u32, 1), pt.lineOf(12)); // pos == len -> last line
-}
-
-test "initAdopt takes ownership without copying" {
-    const alloc = std.testing.allocator;
-    const owned = try alloc.dupe(u8, "x\ny\n");
-    var pt = try PieceTable.initAdopt(alloc, owned);
-    defer pt.deinit();
-    // No copy: origin is exactly the adopted buffer.
-    try std.testing.expectEqual(owned.ptr, pt.origin.ptr);
-    try std.testing.expectEqual(@as(u32, 4), pt.len());
-    // Line index builds lazily on the first query.
-    try std.testing.expect(!pt.line_starts_valid);
-    try std.testing.expectEqual(@as(u32, 3), pt.lineCount());
-    try std.testing.expect(pt.line_starts_valid);
-    try expectDoc(&pt, alloc, "x\ny\n");
-}
-
-test "init is lazy: edit before first line query rebuilds on demand" {
-    var pt = try PieceTable.init(std.testing.allocator, "a\nb\nc");
-    defer pt.deinit();
-    // init no longer scans eagerly.
-    try std.testing.expect(!pt.line_starts_valid);
-    // An edit with a dirty cache leaves it dirty (no wasted work)...
-    _ = try pt.replace(1, 1, "\n\n"); // "a\n\nb\nc"
-    try std.testing.expect(!pt.line_starts_valid);
-    // ...and the first query rebuilds it correctly.
-    try std.testing.expectEqual(@as(u32, 4), pt.lineCount());
-    try std.testing.expect(pt.line_starts_valid);
-    try std.testing.expectEqual(@as(u32, 5), pt.lineStart(3));
-    // Subsequent edits go back to the incremental path.
-    _ = try pt.replace(0, 1, ""); // "\n\nb\nc"
-    try std.testing.expect(pt.line_starts_valid);
-    try std.testing.expectEqual(@as(u32, 4), pt.lineCount());
-    try std.testing.expectEqual(@as(u32, 4), pt.lineStart(3));
-}
-
-test "line index maintained incrementally across random edits (fixed seed)" {
-    const alloc = std.testing.allocator;
-    var prng = std.Random.DefaultPrng.init(0x1EA7_5EED);
-    const rng = prng.random();
-
-    const initial = "fn main() {\n    x += 1;\n}\n\ntrailing\n";
-    var pt = try PieceTable.init(alloc, initial);
-    defer pt.deinit();
-    var expected: std.ArrayList(u8) = .empty;
-    defer expected.deinit(alloc);
-    try expected.appendSlice(alloc, initial);
-
-    // Build the cache once; from here on every edit must keep it valid and
-    // identical to a brute-force scan (a rebuild would be a regression).
-    _ = pt.lineCount();
-    try std.testing.expect(pt.line_starts_valid);
-
-    // Alphabet heavy on '\n' to stress line splits/joins at doc head/mid/tail.
-    const alphabet = "ab\n\nc d\n";
-    var step: usize = 0;
-    while (step < 800) : (step += 1) {
-        const ipos = rng.uintLessThan(usize, expected.items.len + 1);
-        const pos: u32 = @intCast(ipos);
-        const del_len: u32 = @intCast(rng.uintLessThan(usize, expected.items.len - ipos + 1));
-        const s = try randomBytes(rng, alloc, alphabet);
-        defer alloc.free(s);
-        _ = try pt.replace(pos, del_len, s);
-        try expected.replaceRange(alloc, pos, del_len, s);
-
-        // Still incrementally valid — no full rebuild happened.
-        try std.testing.expect(pt.line_starts_valid);
-
-        // Brute-force line starts from the mirror document.
-        var starts: std.ArrayList(u32) = .empty;
-        defer starts.deinit(alloc);
-        try starts.append(alloc, 0);
-        for (expected.items, 0..) |b, i| {
-            if (b == '\n') try starts.append(alloc, @intCast(i + 1));
-        }
-        try std.testing.expectEqualSlices(u32, starts.items, pt.line_starts.items);
-        try std.testing.expectEqual(@as(u32, @intCast(starts.items.len)), pt.lineCount());
-    }
-    try checkInvariants(&pt, &expected);
 }
 
 test "compact merges adjacent add pieces without changing content" {

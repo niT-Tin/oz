@@ -856,6 +856,9 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .hunk_preview => emitAction(state, .hunk_preview),
         .blame_toggle => emitAction(state, .blame_toggle),
         .git_lazygit => emitAction(state, .git_lazygit),
+        .term_float => emitAction(state, .term_float),
+        .term_bottom => emitAction(state, .term_bottom),
+        .term_right => emitAction(state, .term_right),
         .next_buffer => emitAction(state, .next_buffer),
         .prev_buffer => emitAction(state, .prev_buffer),
         .leader => blk: {
@@ -1036,7 +1039,7 @@ fn emitAction(state: *State, action: KeyEvent.ActionId) Result {
     // za/zo/zc/zR/zM fold commands are view/buffer state (no edit), so '.'
     // must not replay them either.
     switch (action) {
-        .undo, .redo, .repeat_last, .normal_mode, .insert_char, .scroll_cursor_center, .scroll_cursor_top, .scroll_cursor_bottom, .fold_toggle, .fold_open, .fold_close, .fold_open_all, .fold_close_all => {},
+        .undo, .redo, .repeat_last, .normal_mode, .insert_char, .scroll_cursor_center, .scroll_cursor_top, .scroll_cursor_bottom, .fold_toggle, .fold_open, .fold_close, .fold_open_all, .fold_close_all, .term_float, .term_bottom, .term_right => {},
         else => {
             state.last_action = action;
             state.last_count = count;

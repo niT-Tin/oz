@@ -20,6 +20,7 @@ const theme = @import("theme.zig");
 const icons = @import("icons.zig");
 const keymap_list = @import("editor/keymap_list.zig");
 const git = @import("git.zig");
+const term = @import("term.zig");
 
 /// Cells a '\t' occupies on screen (vim's shiftwidth-style expansion). The
 /// renderer expands tabs to this many spaces; every width computation that
@@ -138,6 +139,62 @@ const ScopeAnim = struct {
     const duration_ms: i128 = 500;
 };
 
+/// Cached tree-sitter spans for one buffer's visible byte range. The query
+/// result depends only on the tree (identified by the buffer's history
+/// revision) and the byte range, so while both are unchanged the renderer
+/// reuses the previous frame's spans instead of re-running the query — the
+/// common case for cursor movement inside a window and for the ~30 scope-
+/// animation frames that repaint the same viewport. Owned via self.alloc
+/// (the frame arena would free it before the next frame); see
+/// clearSpanCache, which must be called when the buffer's text is replaced.
+const SpanRangeCache = struct {
+    revision: u64, // buf.history.revision when computed
+    start: u32, // byte range the spans cover (inclusive start)
+    end: u32, // byte range the spans cover (exclusive end)
+    spans: []syntax.Span, // owned via self.alloc
+};
+
+/// Cached result of `syntax.Highlighter.scopeAt` for one (window, buffer)
+/// pair. scopeAt walks the tree from the ROOT on every call — on a large
+/// file that is a linear scan of the root's children, which is the single
+/// most expensive thing in the render path. The result depends only on the
+/// tree (identified by the buffer's history revision) and the queried byte,
+/// so it is sound to reuse it while both are unchanged — e.g. the ~30
+/// animation frames after a scope change, or split windows sharing a buffer.
+const ScopeCache = struct {
+    buf: usize, // buffers.items index
+    win: usize, // windows.items index
+    revision: u64, // buf.history.revision when computed
+    cursor: u32, // cursor byte the scope was computed for
+    start_line: u32,
+    end_line: u32,
+    indent_col: u32,
+    has: bool,
+};
+
+/// Cached current-line blame ghost label (owned via self.alloc). The ghost
+/// repaints every idle frame, so the formatted label is rebuilt only when the
+/// blame LINE or the blame DATA changed — the entry pointer identifies both
+/// (entries live in git_blame's own array, which is replaced on refresh).
+const BlameGhostLabel = struct {
+    line: u32,
+    entry: *const git.BlameEntry,
+    label: []u8, // owned
+};
+
+/// Embedded terminal pane (Linux only; `void` elsewhere so the App field
+/// and all references compile on every platform). The vaxis widget's reader
+/// thread holds a *Terminal for its whole life, so the pane lives at a
+/// stable address — a plain App field, never a reallocating list.
+const TermPane = if (builtin.os.tag == .linux) struct {
+    t: *term.Terminal,
+    layout: term.Layout = .floating,
+    focused: bool = false,
+    /// Duped from .title_change events (widget events borrow its own
+    /// buffer, unsafe across frames).
+    title: ?[]u8 = null,
+} else void;
+
 const App = struct {
     /// One open document. `pt`/`history` own their allocations; the struct is
     /// moved between the list and the active slots (never copied-and-deinit'd).
@@ -160,6 +217,22 @@ const App = struct {
         /// history.revision at this buffer's last parse (incremental-parse
         /// bookkeeping; maxInt forces a full reparse).
         syntax_revision: u64 = 0,
+        /// Cached merged visible spans from the last visibleSpansFor call
+        /// (owned by this buffer, alloc'd with the app allocator; spans are
+        /// tiny — one viewport's worth — so the copy is cheaper than the
+        /// query+merge it skips). Valid iff `spans_cache_valid` and the key
+        /// (syntax_revision, byte range) matches — non-scrolling keys then
+        /// cost 0 syntax work instead of a full query+merge per frame.
+        spans_cache: []syntax.Span = &.{},
+        spans_cache_valid: bool = false,
+        spans_cache_start: u32 = 0,
+        spans_cache_end: u32 = 0,
+        spans_cache_rev: u64 = 0,
+        /// history.revision when this buffer's content was last sent to the
+        /// LSP server (didOpen/didChange). Combined with the client's open
+        /// set, equal revision ⇒ the server's copy is current, so a buffer
+        /// switch back to it can skip the re-open and its full-text copy.
+        lsp_synced_rev: u64 = 0,
         /// Closed folds (indent-detected, see editor/fold.zig), sorted by
         /// start line. Kept PER BUFFER, not per window: two splits showing
         /// the same buffer share the fold state, so za in one split is
@@ -168,6 +241,9 @@ const App = struct {
         /// (markDirty) — line numbers drift after edits, and re-folding is
         /// cheap; vim-style fold carryover across edits is out of scope.
         folds: std.ArrayList(editor.fold.Range) = .empty,
+        /// Cached syntax spans for this buffer's last-rendered visible byte
+        /// range (owned; see SpanRangeCache). null until the first render.
+        span_cache: ?SpanRangeCache = null,
     };
 
     /// One split window: which buffer it shows plus its own cursor/viewport.
@@ -400,6 +476,8 @@ const App = struct {
     /// offset seen by the renderer and when it changed.
     blame_last_cursor: u32 = 0,
     blame_move_ms: i64 = 0,
+    /// Cached current-line blame ghost label (see BlameGhostLabel).
+    blame_ghost_label: ?BlameGhostLabel = null,
     /// Hunk preview float (<leader>hp); owned patch text.
     git_preview: ?GitPreview = null,
     /// <leader>hp hit while the diff was stale: show the preview when the
@@ -448,6 +526,15 @@ const App = struct {
     /// Scope-highlight animation state (null when idle / no scope). Restarted
     /// whenever the focused window's scope block changes; see ScopeAnim.
     scope_anim: ?ScopeAnim = null,
+    /// True while the run loop is in the 1ms poll slice (scope animation,
+    /// blame hold, or an open embedded terminal). Cleared the moment the
+    /// loop switches back to blocking pollEvent; the run loop forces one
+    /// render on that transition so the final state (ghost appearing as the
+    /// CursorHold expires, animation's last spread) is never skipped.
+    poll_mode_active: bool = false,
+    /// Cached scopeAt result for the last rendered (window, buffer, cursor,
+    /// revision) — recomputed only when the tree or the cursor byte changed.
+    scope_cache: ?ScopeCache = null,
     /// Set when the inlay data no longer matches the document (after an
     /// insert session ends) until a fresh response arrives: renderers hide
     /// stale hints instead of drawing them at shifted, wrong columns, and
@@ -470,6 +557,13 @@ const App = struct {
     /// recurs several times a frame (status bar, cursor block, completion
     /// menu, ghost text). Invalidated at the top of render().
     cell_col_memo: struct { line: u32 = 0, pos: u32 = 0, col: u32 = 0, valid: bool = false } = .{},
+
+    // ---- M3b embedded terminal (<M-r> float / <M-w> bottom / <M-e> right) ----
+    /// Embedded terminal session; TermPane is void on non-Linux (vaxis PTY
+    /// backend), making this field ?void there. The vaxis widget's reader
+    /// thread holds a *Terminal for its whole life, so the pane lives at a
+    /// stable address — a plain App field, never a reallocating list.
+    term_pane: ?TermPane = null,
 
     /// The active buffer (the focused window's buffer; per-buffer document
     /// state lives here, per-window cursor/viewport in `windows`).
@@ -1139,7 +1233,9 @@ const App = struct {
             buf.history.deinit();
             buf.pt.deinit();
             buf.folds.deinit(self.alloc);
+            if (buf.spans_cache.len > 0) self.alloc.free(buf.spans_cache);
             if (buf.hl) |*h| h.deinit();
+            if (buf.span_cache) |*sc| self.alloc.free(sc.spans);
             if (buf.path) |p| self.alloc.free(p);
         }
         self.buffers.deinit(self.alloc);
@@ -1199,14 +1295,32 @@ const App = struct {
         if (self.git_diff_path) |p| self.alloc.free(p);
         if (self.git_queued) |q| self.alloc.free(q.path);
         self.git_diff.deinit(self.alloc);
+        self.clearBlameGhostLabel();
         if (self.git_blame) |*b| b.deinit(self.alloc);
         if (self.git_blame_path) |bp| self.alloc.free(bp);
         if (self.git_preview) |p| self.alloc.free(p.text);
+        // M3b embedded terminal (kills the child, joins the reader thread)
+        if (builtin.os.tag == .linux) {
+            if (self.term_pane) |*tp| {
+                tp.t.destroy();
+                if (tp.title) |x| self.alloc.free(x);
+            }
+        }
     }
 
     // ---- input ----
 
     fn handleKey(self: *App, key: vaxis.Key) !void {
+        // Terminal focus first: every key belongs to the child (Esc /
+        // Alt+r/w/e are intercepted inside handleTerminalKey).
+        if (builtin.os.tag == .linux) {
+            if (self.term_pane) |*tp| {
+                if (tp.focused) {
+                    try self.handleTerminalKey(key);
+                    return;
+                }
+            }
+        }
         // Command mode first: while the ':' command line is open, Enter/Esc
         // and the rest must reach it — the file-tree and picker overlays
         // would otherwise swallow Enter (opening a file / confirming) and
@@ -1497,6 +1611,9 @@ const App = struct {
                 {
                     if (self.curCursor().* > 0 and self.cur().pt.byteAt(self.curCursor().* - 1) == 'j') {
                         const pos = self.curCursor().* - 1;
+                        // LSP range in the PRE-EDIT document: [pos, pos+1).
+                        const start_pos = self.lspPositionAt(&self.cur().pt, pos);
+                        const end_pos = self.lspPositionAt(&self.cur().pt, pos + 1);
                         try self.cur().history.record(&self.cur().pt, pos, 1, "");
                         self.curCursor().* = pos;
                         // The 'j' was shift-adjusted INTO the hints when it
@@ -1516,7 +1633,7 @@ const App = struct {
                         // response is discarded as stale. (Runs before
                         // exitInsert, so in_insert is still true and the
                         // freshly shifted-back hints are NOT invalidated.)
-                        self.markDirty();
+                        self.markDirtyRange(start_pos, end_pos, "");
                     }
                     self.exitInsert();
                     return;
@@ -2131,13 +2248,16 @@ const App = struct {
         const cursor = self.curCursor().*;
         const line = self.cur().pt.lineOf(start);
         const col = start - self.cur().pt.lineStart(line);
+        // LSP range in the PRE-EDIT document: [start, cursor).
+        const start_pos = self.lspPositionAt(&self.cur().pt, start);
+        const end_pos = self.lspPositionAt(&self.cur().pt, cursor);
         var deleted: [16]u8 = undefined;
         const del_len: usize = @intCast(cursor - start);
         self.cur().pt.copyRange(start, deleted[0..del_len]);
         try self.cur().history.record(&self.cur().pt, start, cursor - start, "");
         self.curCursor().* = start;
         self.adjustInlayHintsDelete(line, col, deleted[0..del_len]);
-        self.markDirty();
+        self.markDirtyRange(start_pos, end_pos, "");
     }
 
     /// Delete the word before the cursor (Ctrl-w). Vim semantics: walk back
@@ -2153,6 +2273,9 @@ const App = struct {
         const cursor = self.curCursor().*;
         const line = self.cur().pt.lineOf(start);
         const col = start - self.cur().pt.lineStart(line);
+        // LSP range in the PRE-EDIT document: [start, cursor).
+        const start_pos = self.lspPositionAt(&self.cur().pt, start);
+        const end_pos = self.lspPositionAt(&self.cur().pt, cursor);
         const del_len: usize = @intCast(cursor - start);
         const deleted = try self.alloc.alloc(u8, del_len);
         defer self.alloc.free(deleted);
@@ -2160,7 +2283,7 @@ const App = struct {
         try self.cur().history.record(&self.cur().pt, start, cursor - start, "");
         self.curCursor().* = start;
         self.adjustInlayHintsDelete(line, col, deleted);
-        self.markDirty();
+        self.markDirtyRange(start_pos, end_pos, "");
     }
 
     // ---- insert-mode keyword completion (Ctrl+n) ----
@@ -2845,9 +2968,12 @@ const App = struct {
             self.cur().history.beginGroup();
             self.in_insert = true;
         }
+        // LSP range in the PRE-EDIT document: [pos, cursor) → word.
+        const start_pos = self.lspPositionAt(pt, pos);
+        const end_pos = self.lspPositionAt(pt, cursor);
         try self.cur().history.record(pt, pos, cursor - pos, word);
         self.curCursor().* = pos + @as(u32, @intCast(word.len));
-        self.markDirty();
+        self.markDirtyRange(start_pos, end_pos, word);
         self.closeCompletion();
     }
 
@@ -2909,20 +3035,26 @@ const App = struct {
         const line_end = line_start + pt.lineLen(line);
         const col = cursor - line_start;
         if (cursor < line_end) {
+            // LSP range in the PRE-EDIT document: [cursor, line_end).
+            const start_pos = self.lspPositionAt(pt, cursor);
+            const end_pos = self.lspPositionAt(pt, line_end);
             const del_len: usize = @intCast(line_end - cursor);
             const deleted = try self.alloc.alloc(u8, del_len);
             defer self.alloc.free(deleted);
             pt.copyRange(cursor, deleted);
             try self.cur().history.record(pt, cursor, line_end - cursor, "");
             self.adjustInlayHintsDelete(line, col, deleted);
+            self.markDirtyRange(start_pos, end_pos, "");
         } else if (line_end < pt.len()) {
             // at end of line: swallow the trailing newline (joins next line)
+            const start_pos = self.lspPositionAt(pt, line_end);
+            const end_pos = self.lspPositionAt(pt, line_end + 1);
             try self.cur().history.record(pt, line_end, 1, "");
             self.adjustInlayHintsDelete(line, col, "\n");
+            self.markDirtyRange(start_pos, end_pos, "");
         } else {
             return; // last line, nothing to delete
         }
-        self.markDirty();
     }
 
     // ---- command line (':') ----
@@ -3307,31 +3439,128 @@ const App = struct {
         try self.searchOnce(q, self.last_search_bwd != flip);
     }
 
+    /// Search `query` in the document byte range [start, end) of `pt`,
+    /// iterating pieces in document order with NO full-document copy. Returns
+    /// the absolute offset of the first (want_last = false) or last
+    /// (want_last = true) match STARTING inside the range, or null.
+    ///
+    /// A match may straddle a piece boundary, so a window of the last
+    /// (query.len - 1) stream bytes is carried between pieces (stack buffer)
+    /// and searched together with the next piece's head. Null when the query
+    /// is empty or longer than the window cap (caller falls back to the
+    /// full-text path for absurdly long patterns).
+    fn findInPieces(
+        pt: *const buffer.PieceTable,
+        start: u32,
+        end: u32,
+        query: []const u8,
+        want_last: bool,
+    ) ?u32 {
+        const qlen = query.len;
+        if (qlen == 0 or end <= start or end - start < qlen) return null;
+        const need: usize = qlen - 1;
+        const max_win = 255;
+        if (need > max_win) return null; // absurd pattern; caller falls back
+        var tail: [max_win]u8 = undefined;
+        var tail_len: usize = 0;
+        var concat: [2 * max_win]u8 = undefined;
+        var result: ?u32 = null;
+        var doc_off: u32 = 0;
+        for (pt.pieces.items) |p| {
+            const piece_end = doc_off + p.len;
+            if (piece_end <= start) {
+                doc_off = piece_end;
+                continue;
+            }
+            if (doc_off >= end) break;
+            const src: []const u8 = if (p.source == .origin) pt.origin else pt.add.items;
+            const skip: u32 = if (start > doc_off) start - doc_off else 0;
+            const take: u32 = @min(p.len - skip, end - doc_off);
+            const bytes = src[@as(usize, p.start) + skip .. @as(usize, p.start) + skip + take];
+            if (bytes.len == 0) {
+                doc_off = piece_end;
+                continue;
+            }
+            // Boundary window: a match can start in the carried tail and
+            // extend into this piece — search tail ++ head together.
+            if (tail_len > 0) {
+                const head: usize = @min(bytes.len, need);
+                @memcpy(concat[0..tail_len], tail[0..tail_len]);
+                @memcpy(concat[tail_len .. tail_len + head], bytes[0..head]);
+                if (std.mem.indexOf(u8, concat[0 .. tail_len + head], query)) |k| {
+                    const abs = doc_off - @as(u32, @intCast(tail_len)) + @as(u32, @intCast(k));
+                    if (!want_last) return abs;
+                    if (result == null or abs > result.?) result = abs;
+                }
+            }
+            if (std.mem.indexOf(u8, bytes, query)) |k| {
+                const abs = doc_off + skip + @as(u32, @intCast(k));
+                if (!want_last) return abs;
+                if (result == null or abs > result.?) result = abs;
+            }
+            // Carry the last `need` stream bytes for the next boundary.
+            if (bytes.len >= need) {
+                @memcpy(tail[0..need], bytes[bytes.len - need ..]);
+                tail_len = need;
+            } else if (need > 0) {
+                if (tail_len + bytes.len > need) {
+                    const drop = tail_len + bytes.len - need;
+                    std.mem.copyForwards(u8, tail[0 .. tail_len - drop], tail[drop..tail_len]);
+                    tail_len -= drop;
+                }
+                @memcpy(tail[tail_len .. tail_len + bytes.len], bytes);
+                tail_len += bytes.len;
+            }
+            doc_off = piece_end;
+        }
+        return result;
+    }
+
     fn searchOnce(self: *App, query: []const u8, backward: bool) !void {
         const len = self.cur().pt.len();
         if (len == 0) return;
-        const text = try self.curText();
-        defer self.alloc.free(text);
         const cursor = self.curCursor().*;
-        var hit: ?usize = null;
-        if (backward) {
-            // last match starting before the cursor, else wrap to the file end
-            hit = std.mem.lastIndexOf(u8, text[0..@min(cursor, len)], query);
-            if (hit == null) {
+        var hit: ?u32 = null;
+        if (query.len - 1 > 255) {
+            // Pathological pattern length: the piece-walker's boundary window
+            // caps at 255 bytes, so fall back to the (rare) full-text path.
+            const text = try self.curText();
+            defer self.alloc.free(text);
+            if (backward) {
+                if (std.mem.lastIndexOf(u8, text[0..@min(cursor, len)], query)) |i| {
+                    hit = @intCast(i);
+                } else {
+                    const from = @min(cursor + 1, len);
+                    if (std.mem.lastIndexOf(u8, text[from..], query)) |i| hit = @intCast(from + i);
+                }
+            } else {
                 const from = @min(cursor + 1, len);
-                if (std.mem.lastIndexOf(u8, text[from..], query)) |i| hit = from + i;
+                if (std.mem.indexOf(u8, text[from..], query)) |i| {
+                    hit = @intCast(from + i);
+                } else {
+                    if (std.mem.indexOf(u8, text[0..from], query)) |i| hit = @intCast(i);
+                }
             }
         } else {
-            // first match starting after the cursor, else wrap to the top
-            const from = @min(cursor + 1, len);
-            if (std.mem.indexOf(u8, text[from..], query)) |i| {
-                hit = from + i;
+            const pt = &self.cur().pt;
+            if (backward) {
+                // last match starting before the cursor, else wrap to the end
+                hit = findInPieces(pt, 0, @min(cursor, len), query, true);
+                if (hit == null) {
+                    const from = @min(cursor + 1, len);
+                    hit = findInPieces(pt, from, len, query, true);
+                }
             } else {
-                hit = std.mem.indexOf(u8, text[0..from], query);
+                // first match starting after the cursor, else wrap to the top
+                const from = @min(cursor + 1, len);
+                hit = findInPieces(pt, from, len, query, false);
+                if (hit == null) {
+                    hit = findInPieces(pt, 0, from, query, false);
+                }
             }
         }
         if (hit) |h| {
-            self.curCursor().* = @intCast(h);
+            self.curCursor().* = h;
             self.clearHover();
         } else {
             try self.setMsg(try std.fmt.allocPrint(self.alloc, "pattern not found: {s}", .{query}));
@@ -3453,6 +3682,9 @@ const App = struct {
     /// arena slices so they live for the frame. Hints with a character inside
     /// the line's text are kept at that column — the renderer splices them in.
     fn lineHints(self: *App, a: std.mem.Allocator, line: u32) ![]InlayHint {
+        // common fast path: no hints in the buffer at all — skip the
+        // ArrayList dance entirely (this is called once per rendered row)
+        if (self.inlay_hints.items.len == 0) return &.{};
         var out = std.ArrayList(InlayHint).empty;
         for (self.inlay_hints.items) |hint| {
             if (hint.line != line) continue;
@@ -3509,13 +3741,28 @@ const App = struct {
     }
 
     fn saveFile(self: *App, path: []const u8) !void {
-        var f = try std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = true });
-        defer f.close(self.io);
         const len = self.cur().pt.len();
         const buf = try self.alloc.alloc(u8, len);
         defer self.alloc.free(buf);
         self.cur().pt.copyRange(0, buf);
+        // Write to a sibling temp file and rename it over `path` — NEVER
+        // truncate the open file in place: the buffer's origin may be an
+        // mmap of it, and truncating a mapped file SIGBUSes every later read
+        // of the mapping (the file no longer backs those pages). Temp+rename
+        // also makes saves atomic for other readers (they never see a
+        // half-written file) and keeps the old inode alive for the mapping.
+        const tmp = try std.fmt.allocPrint(self.alloc, "{s}.oztmp{d}", .{ path, std.c.getpid() });
+        defer self.alloc.free(tmp);
+        var flags: std.Io.Dir.CreateFileOptions = .{ .truncate = true };
+        // Preserve the original file's mode (executable bit etc.) on the
+        // replacement file.
+        if (std.Io.Dir.cwd().statFile(self.io, path, .{})) |st| {
+            flags.permissions = st.permissions;
+        } else |_| {}
+        var f = try std.Io.Dir.cwd().createFile(self.io, tmp, flags);
+        defer f.close(self.io);
         try f.writeStreamingAll(self.io, buf);
+        try std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), path, self.io);
     }
 
     fn openFile(self: *App, path: []const u8) !void {
@@ -3531,13 +3778,17 @@ const App = struct {
         const pos = self.curCursor().*;
         const line = self.cur().pt.lineOf(pos);
         const col = pos - self.cur().pt.lineStart(line);
+        // LSP range for a pure insert: [pos, pos) in the pre-edit document
+        // (an insert changes nothing before `pos`, so the position is the
+        // same before and after the edit).
+        const at = self.lspPositionAt(&self.cur().pt, pos);
         // record() snapshots the pre-edit state and applies the edit itself
         try self.cur().history.record(&self.cur().pt, pos, 0, text);
         self.curCursor().* += @intCast(text.len);
         // keep inlay hints aligned instead of clearing them (insert mode:
         // clearing + re-requesting on every keystroke makes the view flicker)
         self.adjustInlayHintsInsert(line, col, text);
-        self.markDirty();
+        self.markDirtyRange(at, at, text);
     }
 
     // ---- auto-pairs (insert mode): 括号/引号自动闭合与跳过 ----
@@ -3608,10 +3859,12 @@ const App = struct {
         const start = pos - 1;
         const line = self.cur().pt.lineOf(start);
         const col = start - self.cur().pt.lineStart(line);
+        const start_pos = self.lspPositionAt(&self.cur().pt, start);
+        const end_pos = self.lspPositionAt(&self.cur().pt, start + 2);
         try self.cur().history.record(&self.cur().pt, start, 2, "");
         self.curCursor().* = start;
         self.adjustInlayHintsDelete(line, col, &[_]u8{ open, closer });
-        self.markDirty();
+        self.markDirtyRange(start_pos, end_pos, "");
         return true;
     }
 
@@ -3658,6 +3911,9 @@ const App = struct {
         }
         switch (op) {
             .delete => {
+                // LSP range in the PRE-EDIT document: [start, end).
+                const start_pos = self.lspPositionAt(&self.cur().pt, start);
+                const end_pos = self.lspPositionAt(&self.cur().pt, end);
                 try self.setRegister(start, end, linewise);
                 self.cur().history.beginGroup();
                 try self.cur().history.record(&self.cur().pt, start, end - start, "");
@@ -3671,16 +3927,19 @@ const App = struct {
                     const lc = self.cur().pt.lineCount();
                     self.curCursor().* = self.cur().pt.lineStart(lc -| 2);
                 }
-                self.markDirty();
+                self.markDirtyRange(start_pos, end_pos, "");
             },
             .change => {
+                // LSP range in the PRE-EDIT document: [start, end).
+                const start_pos = self.lspPositionAt(&self.cur().pt, start);
+                const end_pos = self.lspPositionAt(&self.cur().pt, end);
                 try self.setRegister(start, end, linewise);
                 self.curCursor().* = start;
                 self.cur().history.beginGroup();
                 try self.cur().history.record(&self.cur().pt, start, end - start, "");
                 self.state.mode = .insert;
                 self.in_insert = true; // keep the group open; exitInsert closes it
-                self.markDirty();
+                self.markDirtyRange(start_pos, end_pos, "");
                 self.cur().syntax_revision = std.math.maxInt(u64);
             },
             .yank => {
@@ -3776,10 +4035,13 @@ const App = struct {
     }
 
     fn applyEdit(self: *App, start: u32, end: u32, text: []const u8) !void {
+        // LSP range in the PRE-EDIT document: [start, end).
+        const start_pos = self.lspPositionAt(&self.cur().pt, start);
+        const end_pos = self.lspPositionAt(&self.cur().pt, end);
         self.cur().history.beginGroup();
         try self.cur().history.record(&self.cur().pt, start, end - start, text);
         self.cur().history.endGroup();
-        self.markDirty();
+        self.markDirtyRange(start_pos, end_pos, text);
     }
 
     fn isVisual(self: *const App) bool {
@@ -4202,6 +4464,7 @@ const App = struct {
                 }
             },
             .blame => {
+                self.clearBlameGhostLabel();
                 if (self.git_blame) |*b| b.deinit(self.alloc);
                 self.git_blame = null;
                 // blame must describe the CURRENT file; a stale response
@@ -4229,6 +4492,7 @@ const App = struct {
                 // and the blame describes the old file — invalidate it so
                 // the status refresh reloads blame for the new content
                 if (self.blame_active) {
+                    self.clearBlameGhostLabel();
                     if (self.git_blame) |*b| b.deinit(self.alloc);
                     self.git_blame = null;
                     if (self.git_blame_path) |bp| self.alloc.free(bp);
@@ -4395,6 +4659,22 @@ const App = struct {
         self.maybeLoadBlame();
     }
 
+    /// Drop the cached blame-ghost label — called whenever git_blame is
+    /// replaced or invalidated so the cache never outlives its data.
+    fn clearBlameGhostLabel(self: *App) void {
+        if (self.blame_ghost_label) |g| self.alloc.free(g.label);
+        self.blame_ghost_label = null;
+    }
+
+    /// Drop `buf`'s cached syntax spans (owned). Called when the buffer's
+    /// text is replaced in place (a new file loaded into the same slot):
+    /// the cache key would otherwise collide across files (a fresh history
+    /// starts at revision 0 with an identical byte range).
+    fn clearSpanCache(self: *App, buf: *Buffer) void {
+        if (buf.span_cache) |*sc| self.alloc.free(sc.spans);
+        buf.span_cache = null;
+    }
+
     /// Load blame for the current file when current-line blame is active,
     /// the repo check has passed (git_branch set), the file is under the
     /// big-file limit, and the cached blame is stale/missing. No-op
@@ -4411,13 +4691,173 @@ const App = struct {
         if (stale) self.spawnGitJob(.blame, path, 0, .stage) catch {};
     }
 
-    /// <leader>lg — launch lazygit in an external terminal emulator
-    /// (design: "外部浮窗先行" — a real PTY pane is M3b). Uses $TERMINAL,
-    /// falling back to x-terminal-emulator / xterm.
+    // ---- M3b embedded terminal (<M-r> float / <M-w> bottom / <M-e> right) ----
+
+    /// Absolute cwd for a new terminal session: the current buffer's
+    /// directory, or null (inherit oz's cwd) when the buffer has no path.
+    fn termCwd(self: *App) ?[]const u8 {
+        if (builtin.os.tag != .linux) return null;
+        const path = if (self.buffers.items.len > 0) self.cur().path else null;
+        if (path) |p| {
+            if (std.fs.path.dirname(p)) |d| return d;
+        }
+        return null;
+    }
+
+    /// Rectangle of the current terminal layout. Sizes are proportions of
+    /// the full area (independent of the pane layout / tab-bar rows) so
+    /// every geometry consumer can compute them without recursion; the
+    /// terminal OVERLAYS the buffer area (drawn after the panes), it does
+    /// not squeeze them.
+    fn termRect(self: *App, a: std.mem.Allocator) term.Rect {
+        if (builtin.os.tag != .linux) return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        const win = self.vx.window();
+        const top = self.contentTop(a);
+        const avail_rows = win.height -| status_row_count -| top;
+        const tp = &self.term_pane.?;
+        return switch (tp.layout) {
+            .floating => blk: {
+                const w = @max(40, @min(win.width * 8 / 10, win.width));
+                const h = @max(12, @min(avail_rows * 6 / 10, avail_rows));
+                break :blk .{
+                    .x = (win.width - w) / 2,
+                    .y = top + (avail_rows - h) / 3,
+                    .w = w,
+                    .h = h,
+                };
+            },
+            .bottom => .{
+                .x = 0,
+                .y = win.height -| status_row_count -| @max(8, @min((win.height -| status_row_count) * 3 / 10, win.height -| status_row_count)),
+                .w = win.width,
+                .h = @max(8, @min((win.height -| status_row_count) * 3 / 10, win.height -| status_row_count)),
+            },
+            .right => .{
+                .x = win.width -| @max(30, @min(win.width * 4 / 10, win.width -| 1)),
+                .y = top,
+                .w = @max(30, @min(win.width * 4 / 10, win.width -| 1)),
+                .h = avail_rows,
+            },
+        };
+    }
+
+    /// Draw the terminal overlay (bottom/right/floating all overlay the
+    /// buffer area; the panes do not shrink). Called on the dashboard too
+    /// (its early return would skip the normal path). resize() no-ops when
+    /// unchanged; draw() is cheap when nothing changed.
+    fn drawTerm(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
+        if (builtin.os.tag != .linux) return;
+        if (self.term_pane) |*tp| {
+            const r = self.termRect(a);
+            if (r.w > 0 and r.h > 0 and r.w <= win.width and r.h <= win.height) {
+                try tp.t.resize(@intCast(r.h), @intCast(r.w));
+                const sub = win.child(.{
+                    .x_off = @intCast(r.x),
+                    .y_off = @intCast(r.y),
+                    .width = @intCast(r.w),
+                    .height = @intCast(r.h),
+                });
+                try tp.t.draw(sub);
+                if (!tp.focused) sub.hideCursor();
+            }
+        }
+    }
+
+    /// <M-r>/<M-w>/<M-e>: toggle the terminal in `layout`. The same key
+    /// again closes it (spec: 开关); a different layout key switches the
+    /// placement of the SAME session (spec: 可复用会话) and refocuses it.
+    fn toggleTerm(self: *App, layout: term.Layout) !void {
+        if (builtin.os.tag != .linux) return;
+        if (self.term_pane) |*tp| {
+            if (tp.layout == layout) {
+                self.closeTerm();
+            } else {
+                tp.layout = layout;
+                tp.focused = true;
+            }
+            return;
+        }
+        const shell = self.env_map.get("SHELL") orelse "/bin/sh";
+        const t = term.Terminal.create(self.io, self.alloc, &.{shell}, self.env_map, .{
+            .winsize = .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 },
+            // vaxis's scrollback is a TODO (its copyTo can't render it);
+            // 0 keeps the back screen the same size as the front so line
+            // scrolling works
+            .scrollback_size = 0,
+            .initial_working_directory = self.termCwd(),
+        }) catch |e| {
+            const m = std.fmt.allocPrint(self.alloc, "terminal: {s}", .{@errorName(e)}) catch return;
+            try self.setMsg(m);
+            return;
+        };
+        self.term_pane = .{ .t = t, .layout = layout, .focused = true };
+    }
+
+    /// Destroy the terminal session (kills the child, joins the reader
+    /// thread, closes the pty).
+    fn closeTerm(self: *App) void {
+        if (builtin.os.tag != .linux) return;
+        if (self.term_pane) |*tp| {
+            tp.t.destroy();
+            if (tp.title) |x| self.alloc.free(x);
+            self.term_pane = null;
+        }
+    }
+
+    /// Keys while the terminal has focus: Esc returns to Normal (the pty
+    /// never sees it — a lone Esc would encode as a bare \x1b and cancel
+    /// whatever the child is doing); Alt+r/w/e switch/close the terminal
+    /// (spec: 终端内 <M-r> 等同一键位可直接退回 Normal/关闭); everything
+    /// else is forwarded to the child.
+    fn handleTerminalKey(self: *App, key: vaxis.Key) !void {
+        if (builtin.os.tag != .linux) return;
+        const tp = &self.term_pane.?;
+        if (key.codepoint == vaxis.Key.escape) {
+            tp.focused = false;
+            return;
+        }
+        if (key.mods.alt) {
+            switch (key.codepoint) {
+                'r' => return self.toggleTerm(.floating),
+                'w' => return self.toggleTerm(.bottom),
+                'e' => return self.toggleTerm(.right),
+                else => {},
+            }
+        }
+        try tp.t.sendKey(key);
+    }
+
+    /// <leader>lg — run lazygit in the embedded FLOATING terminal (spec:
+    /// lazygit 直接跑在浮动终端里). An open session is re-floated and
+    /// focused; otherwise a fresh lazygit session starts.
     fn launchLazygit(self: *App) void {
-        const term = self.env_map.get("TERMINAL") orelse "x-terminal-emulator";
+        // Linux: run lazygit in the embedded floating terminal. Other
+        // platforms fall back to the external $TERMINAL window below.
+        if (builtin.os.tag == .linux) {
+            if (self.term_pane) |*tp| {
+                tp.layout = .floating;
+                tp.focused = true;
+                return;
+            }
+            const t = term.Terminal.create(self.io, self.alloc, &.{"lazygit"}, self.env_map, .{
+                .winsize = .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 },
+                // vaxis's scrollback is a TODO (its copyTo can't render it);
+                // 0 keeps the back screen the same size as the front so line
+                // scrolling works
+                .scrollback_size = 0,
+                .initial_working_directory = self.termCwd(),
+            }) catch |e| {
+                const m = std.fmt.allocPrint(self.alloc, "lazygit: {s}", .{@errorName(e)}) catch return;
+                self.setMsg(m) catch {};
+                return;
+            };
+            self.term_pane = .{ .t = t, .layout = .floating, .focused = true };
+            return;
+        }
+        // non-Linux fallback: external terminal (historical behavior)
+        const term_bin = self.env_map.get("TERMINAL") orelse "x-terminal-emulator";
         var proc = std.process.spawn(self.io, .{
-            .argv = &.{ term, "-e", "lazygit" },
+            .argv = &.{ term_bin, "-e", "lazygit" },
             .stdin = .ignore,
             .stdout = .ignore,
             .stderr = .ignore,
@@ -4426,18 +4866,16 @@ const App = struct {
             self.setMsg(m) catch {};
             return;
         };
-        // reap in a detached thread so a long-lived lazygit never blocks
-        // deinit (a zombie child would linger until oz exits otherwise)
-        const t = std.Thread.spawn(.{}, struct {
+        const t2 = std.Thread.spawn(.{}, struct {
             fn reap(io: std.Io, p: std.process.Child) void {
-                var c = p; // wait() needs a mutable Child
+                var c = p;
                 _ = c.wait(io) catch {};
             }
         }.reap, .{ self.io, proc }) catch {
             proc.kill(self.io);
             return;
         };
-        t.detach();
+        t2.detach();
     }
 
     // ---- fuzzy picker (<leader>sf) ----
@@ -5154,6 +5592,24 @@ const App = struct {
         self.current_win = self.firstLeaf(root);
     }
 
+    /// Load `file` (size bytes) into a PieceTable without copying the file
+    /// into the heap: a read-only PRIVATE mmap backs the origin piece, so a
+    /// 50MB file costs one mapping, not a 50MB heap copy (RSS ~1× the file
+    /// instead of 2×). Falls back to read + copy when the file is empty or
+    /// the mapping fails (special filesystems, quota, …). The caller keeps
+    /// `file` open only until this returns — the mapping survives the close.
+    fn loadPieceTable(self: *App, file: std.Io.File, size: u64) !buffer.PieceTable {
+        if (size == 0) return buffer.PieceTable.init(self.alloc, "");
+        const len: usize = @intCast(size);
+        const mapping = std.posix.mmap(null, len, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0) catch {
+            const bytes = try self.alloc.alloc(u8, len);
+            defer self.alloc.free(bytes);
+            _ = try file.readPositionalAll(self.io, bytes, 0);
+            return buffer.PieceTable.init(self.alloc, bytes);
+        };
+        return buffer.PieceTable.initMapped(self.alloc, mapping);
+    }
+
     /// Open `path` in a new buffer unless it is already open (then switch).
     /// The stored path is ABSOLUTE (like the CLI arg path): LSP uri building,
     /// filetype detection and recent-file dedupe all assume absolute paths, so
@@ -5184,14 +5640,9 @@ const App = struct {
             try self.setMsg(try self.alloc.dupe(u8, "file too large (>4GiB)"));
             return;
         }
-        const bytes = try self.alloc.alloc(u8, @intCast(size));
-        errdefer self.alloc.free(bytes);
-        _ = try file.readPositionalAll(self.io, bytes, 0);
 
         try self.buffers.append(self.alloc, .{
-            // initAdopt takes ownership of `bytes` — no second copy of the
-            // file in memory (init would dupe it)
-            .pt = try buffer.PieceTable.initAdopt(self.alloc, bytes),
+            .pt = try self.loadPieceTable(file, size),
             .history = buffer.History.init(self.alloc),
             .path = try self.alloc.dupe(u8, abs),
         });
@@ -5244,7 +5695,9 @@ const App = struct {
         buf.history.deinit();
         buf.pt.deinit();
         buf.folds.deinit(self.alloc);
+        if (buf.spans_cache.len > 0) self.alloc.free(buf.spans_cache);
         if (buf.hl) |*h| h.deinit();
+        if (buf.span_cache) |*sc| self.alloc.free(sc.spans);
         if (buf.path) |p| self.alloc.free(p);
         if (self.current >= self.buffers.items.len) self.current = self.buffers.items.len - 1;
         if (buf_idx < self.current) self.current -= 1;
@@ -5550,9 +6003,19 @@ const App = struct {
                 const uri = lsp_types.pathToFileUri(self.alloc, path) catch return;
                 defer self.alloc.free(uri);
                 if (!std.mem.eql(u8, c.uri, uri)) {
+                    // The server keeps every opened document, so a switch to a
+                    // document it already has — and whose content is unchanged
+                    // since the last didOpen/didChange (lsp_synced_rev) —
+                    // needs no re-open and no full-text copy: just retarget.
+                    const buf = &self.buffers.items[self.current];
+                    if (c.isDocOpen(uri) and buf.lsp_synced_rev == buf.history.revision) {
+                        c.retarget(uri) catch {};
+                        return;
+                    }
                     const text = self.curText() catch return;
                     defer self.alloc.free(text);
                     c.switchDocument(uri, text) catch {};
+                    buf.lsp_synced_rev = buf.history.revision;
                 }
                 return;
             }
@@ -5672,7 +6135,10 @@ const App = struct {
         // not be lost.
         const text = self.curText() catch return true;
         defer self.alloc.free(text);
-        client.openDocument(text) catch {};
+        client.openDocument(text) catch return true;
+        // The didOpen carried the current text: the server's copy of this
+        // buffer is now current (same contract as the switchDocument path).
+        self.cur().lsp_synced_rev = self.cur().history.revision;
         return true;
     }
 
@@ -5692,6 +6158,81 @@ const App = struct {
         errdefer self.alloc.free(buf);
         self.cur().pt.copyRange(0, buf);
         return buf;
+    }
+
+    /// LSP Position (line + UTF-16 character) of byte offset `byte` in `pt`.
+    /// LSP counts characters in UTF-16 code units; `utf16Units` converts the
+    /// byte column without materializing the document.
+    fn lspPositionAt(self: *App, pt: *const buffer.PieceTable, byte: u32) lsp_types.Position {
+        const line = pt.lineOf(byte);
+        const ls = pt.lineStart(line);
+        return .{ .line = line, .character = self.utf16Units(pt, ls, byte) };
+    }
+
+    /// UTF-16 code units in [from, to) of `pt` (BMP chars = 1, astral = 2).
+    /// Walks the pieces directly — no document copy — carrying a small window
+    /// across piece boundaries for multi-byte sequences split by an edit.
+    fn utf16Units(self: *App, pt: *const buffer.PieceTable, from: u32, to: u32) u32 {
+        _ = self;
+        if (to <= from) return 0;
+        var units: u32 = 0;
+        var carry: [3]u8 = undefined; // lead bytes of a sequence split at a boundary
+        var carry_len: usize = 0;
+        var doc_off: u32 = 0;
+        var first = true;
+        for (pt.pieces.items) |p| {
+            const piece_end = doc_off + p.len;
+            if (piece_end <= from) {
+                doc_off = piece_end;
+                continue;
+            }
+            if (doc_off >= to) break;
+            const src: []const u8 = if (p.source == .origin) pt.origin else pt.add.items;
+            const skip: u32 = if (from > doc_off) from - doc_off else 0;
+            const take: u32 = @min(p.len - skip, to - doc_off);
+            const bytes = src[@as(usize, p.start) + skip .. @as(usize, p.start) + skip + take];
+            var i: usize = 0;
+            if (!first and carry_len > 0 and bytes.len > 0 and (bytes[0] & 0xC0) == 0x80) {
+                // The previous window ended mid-sequence: complete it with the
+                // continuation bytes that start this window.
+                const total: usize = std.unicode.utf8ByteSequenceLength(carry[0]) catch 0;
+                if (total > carry_len) {
+                    const need = total - carry_len;
+                    if (bytes.len >= need) {
+                        units += if (total == 4) 2 else 1;
+                        i = need;
+                    } else {
+                        // Still split (tiny pieces): carry everything over.
+                        @memcpy(carry[carry_len .. carry_len + bytes.len], bytes);
+                        carry_len += bytes.len;
+                        doc_off = piece_end;
+                        first = false;
+                        continue;
+                    }
+                }
+            }
+            carry_len = 0;
+            while (i < bytes.len) {
+                const b = bytes[i];
+                if (b < 0x80) {
+                    units += 1;
+                    i += 1;
+                    continue;
+                }
+                const seq_len: usize = std.unicode.utf8ByteSequenceLength(b) catch 1;
+                if (i + seq_len > bytes.len) {
+                    const left = bytes.len - i;
+                    @memcpy(carry[0..left], bytes[i..]);
+                    carry_len = left;
+                    break;
+                }
+                units += if (seq_len == 4) 2 else 1;
+                i += seq_len;
+            }
+            doc_off = piece_end;
+            first = false;
+        }
+        return units;
     }
 
     /// Free every diagnostic message and empty the list. Messages are dupe'd
@@ -5721,7 +6262,10 @@ const App = struct {
         }
     }
 
-    fn markDirty(self: *App) void {
+    /// Shared edit bookkeeping (dirty flag, edit_seq, fold reset, inlay
+    /// invalidation). The LSP sync is left to the caller: markDirty (full
+    /// text) or markDirtyRange (incremental).
+    fn markDirtyBase(self: *App) void {
         self.cur().dirty = true;
         self.edit_seq += 1;
         // Any edit drops this buffer's fold set (all folds re-open): edit
@@ -5736,12 +6280,39 @@ const App = struct {
         // fresh request once the session ends. One-shot normal-mode ops
         // (dd, x, o…) still invalidate here and let the auto-refresh re-request.
         if (!self.in_insert) self.invalidateInlayHints();
-        // LSP text sync: push the new document content to the server. Cheap
-        // enough per keystroke for now (debounce lands with the M2 UI work).
+    }
+
+    /// Mark the current buffer dirty and push its FULL text to the LSP server
+    /// (fallback for edits without a tracked byte range: undo/redo,
+    /// multi-cursor ops, paste, format, …).
+    fn markDirty(self: *App) void {
+        self.markDirtyBase();
+        self.syncLspFull();
+    }
+
+    /// Mark the current buffer dirty and push an INCREMENTAL didChange to the
+    /// LSP server: `text` replaced [start, end) of the PRE-EDIT document
+    /// (`start`/`end` are LSP positions computed before the edit was applied).
+    /// The per-keystroke path — no full-document copy.
+    fn markDirtyRange(self: *App, start: lsp_types.Position, end: lsp_types.Position, text: []const u8) void {
+        self.markDirtyBase();
+        if (self.lsp_client) |c| {
+            c.didChange(.{ .start = start, .end = end }, text) catch {
+                return;
+            };
+            self.cur().lsp_synced_rev = self.cur().history.revision;
+        }
+    }
+
+    /// Full-text didChange for the current buffer (see markDirty).
+    fn syncLspFull(self: *App) void {
         if (self.lsp_client) |c| {
             const text = self.curText() catch return;
             defer self.alloc.free(text);
-            c.didChange(text) catch {};
+            c.didChange(null, text) catch {
+                return;
+            };
+            self.cur().lsp_synced_rev = self.cur().history.revision;
         }
     }
 
@@ -5794,6 +6365,15 @@ const App = struct {
         const vbottom = @min(view_top + content_rows, line_count);
         // lineStart has no EOF sentinel: the last visible line's end is pt.len()
         const end: u32 = if (vbottom >= line_count) buf.pt.len() else buf.pt.lineStart(vbottom);
+        // Cache hit: no edit since the last query (revision unchanged) and
+        // the same visible byte range — the query+merge below is the
+        // dominant frame cost and would be pure waste (every non-scrolling
+        // key, every cursor move inside the viewport, every repaint).
+        if (buf.spans_cache_valid and buf.spans_cache_rev == rev and
+            buf.spans_cache_start == start and buf.spans_cache_end == end)
+        {
+            return buf.spans_cache;
+        }
         var raw = std.ArrayList(syntax.Span).empty;
         try hl.spansInRange(@intCast(start), @intCast(end), arena, &raw);
         var out = std.ArrayList(syntax.Span).empty;
@@ -5810,7 +6390,16 @@ const App = struct {
             }
             try out.append(arena, sp);
         }
-        return out.items;
+        // own a copy so future cache hits return a stable slice (the arena
+        // is per-frame; the buffer outlives any frame)
+        const cached = try self.alloc.dupe(syntax.Span, out.items);
+        if (buf.spans_cache.len > 0) self.alloc.free(buf.spans_cache);
+        buf.spans_cache = cached;
+        buf.spans_cache_valid = true;
+        buf.spans_cache_start = start;
+        buf.spans_cache_end = end;
+        buf.spans_cache_rev = rev;
+        return buf.spans_cache;
     }
 
     /// Load recent files from ~/.cache/oz/recent (one path per line).
@@ -6195,6 +6784,10 @@ const App = struct {
             .hunk_preview => self.previewHunk(),
             .blame_toggle => self.toggleBlame(),
             .git_lazygit => self.launchLazygit(),
+            // M3b embedded terminal
+            .term_float => if (builtin.os.tag == .linux) try self.toggleTerm(.floating) else {},
+            .term_bottom => if (builtin.os.tag == .linux) try self.toggleTerm(.bottom) else {},
+            .term_right => if (builtin.os.tag == .linux) try self.toggleTerm(.right) else {},
             .paste => try self.pasteBuffer(false, count),
             .paste_before => try self.pasteBuffer(true, count),
             .delete_char => {
@@ -6213,6 +6806,9 @@ const App = struct {
                     reg_end = @min(reg_end + seq, self.cur().pt.len());
                 }
                 if (reg_end > c0) try self.setRegister(c0, reg_end, false);
+                // LSP range in the PRE-EDIT document: [c0, reg_end).
+                const start_pos = self.lspPositionAt(&self.cur().pt, c0);
+                const end_pos = self.lspPositionAt(&self.cur().pt, reg_end);
                 self.cur().history.beginGroup();
                 i = 0;
                 while (i < @max(count, 1)) : (i += 1) {
@@ -6225,7 +6821,7 @@ const App = struct {
                     try self.cur().history.record(pt, c, end - c, "");
                 }
                 self.cur().history.endGroup();
-                self.markDirty();
+                self.markDirtyRange(start_pos, end_pos, "");
             },
             .delete_char_before => {
                 // X: vim dh — delete `count` chars before the cursor (the
@@ -6240,6 +6836,9 @@ const App = struct {
                     while (reg_start > 0 and (self.cur().pt.byteAt(reg_start) & 0xC0) == 0x80) reg_start -= 1;
                 }
                 if (reg_start < c0) try self.setRegister(reg_start, c0, false);
+                // LSP range in the PRE-EDIT document: [reg_start, c0).
+                const start_pos = self.lspPositionAt(&self.cur().pt, reg_start);
+                const end_pos = self.lspPositionAt(&self.cur().pt, c0);
                 self.cur().history.beginGroup();
                 i = 0;
                 while (i < @max(count, 1)) : (i += 1) {
@@ -6253,7 +6852,7 @@ const App = struct {
                     self.curCursor().* = start;
                 }
                 self.cur().history.endGroup();
-                self.markDirty();
+                self.markDirtyRange(start_pos, end_pos, "");
             },
             .delete_to_eol => {
                 // D: delete to end of line (d$), keeping the newline so the
@@ -6267,11 +6866,14 @@ const App = struct {
                 const end = pt.lineStart(end_line) + pt.lineLen(end_line);
                 if (end > c) {
                     try self.setRegister(c, end, false);
+                    // LSP range in the PRE-EDIT document: [c, end).
+                    const start_pos = self.lspPositionAt(&self.cur().pt, c);
+                    const end_pos = self.lspPositionAt(&self.cur().pt, end);
                     self.cur().history.beginGroup();
                     try self.cur().history.record(pt, c, end - c, "");
                     self.cur().history.endGroup();
                     self.curCursor().* = c;
-                    self.markDirty();
+                    self.markDirtyRange(start_pos, end_pos, "");
                 }
             },
             .change_to_eol => {
@@ -6283,13 +6885,22 @@ const App = struct {
                 const line = pt.lineOf(c);
                 const end_line = @min(line + @max(count, 1) - 1, pt.lineCount() - 1);
                 const end = pt.lineStart(end_line) + pt.lineLen(end_line);
+                // LSP range in the PRE-EDIT document: [c, end).
+                const start_pos = self.lspPositionAt(&self.cur().pt, c);
+                const end_pos = self.lspPositionAt(&self.cur().pt, end);
                 self.cur().history.beginGroup();
                 if (end > c) {
                     try self.cur().history.record(pt, c, end - c, "");
                 }
                 self.state.mode = .insert;
                 self.in_insert = true; // group stays open until exitInsert
-                self.markDirty();
+                // markDirty (via markDirtyBase) skips inlay invalidation
+                // while in_insert, matching the pre-edit behavior of C.
+                if (end > c) {
+                    self.markDirtyRange(start_pos, end_pos, "");
+                } else {
+                    self.markDirtyBase(); // no edit; just the bookkeeping
+                }
                 self.cur().syntax_revision = std.math.maxInt(u64);
             },
             .change_line => {
@@ -6301,11 +6912,14 @@ const App = struct {
                 const start = pt.lineStart(line);
                 const end = start + pt.lineLen(line);
                 self.curCursor().* = start;
+                // LSP range in the PRE-EDIT document: [start, end).
+                const start_pos = self.lspPositionAt(&self.cur().pt, start);
+                const end_pos = self.lspPositionAt(&self.cur().pt, end);
                 self.cur().history.beginGroup();
                 try self.cur().history.record(pt, start, end - start, "");
                 self.state.mode = .insert;
                 self.in_insert = true;
-                self.markDirty();
+                self.markDirtyRange(start_pos, end_pos, "");
                 self.cur().syntax_revision = std.math.maxInt(u64);
             },
             .replace_char => {
@@ -6947,46 +7561,80 @@ const App = struct {
     }
 
     /// true when buffer line `l` has no non-whitespace content.
+    /// Reads the line with ONE copyRange into a stack buffer (chunked for
+    /// long lines) instead of per-char byteAt — byteAt is O(pieces) per byte,
+    /// so a per-char scan of a many-piece buffer is quadratic; a copyRange is
+    /// O(pieces + len) total.
     fn isBlankLine(self: *App, buf: *Buffer, l: u32) bool {
         _ = self;
         const ls = buf.pt.lineStart(l);
         const ll = buf.pt.lineLen(l);
-        // chunked copy instead of per-byte byteAt (O(pieces) each)
-        var chunk: [1024]u8 = undefined;
-        var i: u32 = 0;
-        while (i < ll) {
-            const n = @min(ll - i, chunk.len);
-            buf.pt.copyRange(ls + i, chunk[0..n]);
+        var chunk: [128]u8 = undefined;
+        var off: u32 = 0;
+        while (off < ll) {
+            const n = @min(ll - off, @as(u32, chunk.len));
+            buf.pt.copyRange(ls + off, chunk[0..n]);
             for (chunk[0..n]) |b| {
                 if (b != ' ' and b != '\t') return false;
             }
-            i += @intCast(n);
+            off += n;
         }
         return true;
     }
 
     /// Expanded indent levels (columns / tab_width) of buffer line `l`.
+    /// Same single-copyRange read as isBlankLine (the indent region is at the
+    /// line start, so the first chunk almost always decides).
     fn lineIndentLevels(self: *App, buf: *Buffer, l: u32) u32 {
         _ = self;
         const ls = buf.pt.lineStart(l);
         const ll = buf.pt.lineLen(l);
+        var chunk: [128]u8 = undefined;
         var cols: u32 = 0;
-        // chunked copy instead of per-byte byteAt (O(pieces) each)
-        var chunk: [1024]u8 = undefined;
-        var i: u32 = 0;
-        outer: while (i < ll) {
-            const n = @min(ll - i, chunk.len);
-            buf.pt.copyRange(ls + i, chunk[0..n]);
+        var off: u32 = 0;
+        while (off < ll) {
+            const n = @min(ll - off, @as(u32, chunk.len));
+            buf.pt.copyRange(ls + off, chunk[0..n]);
             for (chunk[0..n]) |b| {
                 if (b == ' ') {
                     cols += 1;
                 } else if (b == '\t') {
                     cols += tab_width;
-                } else break :outer;
+                } else return cols / tab_width;
             }
-            i += @intCast(n);
+            off += n;
         }
         return cols / tab_width;
+    }
+
+    /// Indent levels of the nearest non-blank line around `line`, up to 500
+    /// lines out — the context for blank-line indent-guide continuation.
+    /// Scans upward first, then downward from `line + 1` (the original
+    /// per-row semantics). 0 when the 500-line window is all blank.
+    fn blankContextLevels(self: *App, buf: *Buffer, line: u32, line_count: u32) u32 {
+        var ctx_levels: u32 = 0;
+        var ctx: i64 = @as(i64, @intCast(line)) - 1;
+        var dir: i64 = -1;
+        var scanned: usize = 0;
+        const lc: i64 = @as(i64, @intCast(line_count));
+        while (scanned < 500) : (scanned += 1) {
+            if (ctx < 0) {
+                if (dir == -1) {
+                    ctx = @as(i64, @intCast(line)) + 1;
+                    dir = 1;
+                    continue;
+                }
+                break;
+            }
+            if (ctx >= lc) break;
+            const cl: u32 = @intCast(ctx);
+            if (!self.isBlankLine(buf, cl)) {
+                ctx_levels = self.lineIndentLevels(buf, cl);
+                break;
+            }
+            ctx += dir;
+        }
+        return ctx_levels;
     }
 
     /// Render one split window's lines into `rect` (content-area coordinates).
@@ -7039,11 +7687,12 @@ const App = struct {
         // while fewer than `height` visible rows remain below it (without
         // pushing the cursor off-screen)
         {
-            // Count visible rows below the cursor, CAPPED at rect.height:
-            // the pull-up loop below only needs to know whether fewer than
-            // `height` rows remain, so walking to EOF (O(file) per frame)
-            // is wasted work on large files.
             var below: u32 = rows_to_cursor + 1; // + the cursor row itself
+            // Count the visible rows below the cursor, but only up to the
+            // viewport height: the pull-up below only cares whether fewer
+            // than `height` rows remain, and the walk to EOF is O(lines)
+            // per frame (a 135k-line file would scan to the end on every
+            // render). Early-exit keeps this O(height) in the common case.
             var l = cursor_line;
             while (l + 1 < line_count and below < rect.height) {
                 l = foldNextLine(buf, l);
@@ -7068,7 +7717,45 @@ const App = struct {
                 last_visible = foldNextLine(buf, last_visible);
             }
         }
-        const merged = try self.visibleSpansFor(buf, a, w.view_top, last_visible - w.view_top + 1);
+        // Syntax spans covering the visible byte range. The tree-sitter
+        // query is the single most expensive per-frame item (it runs per
+        // visible range), and its result is a pure function of (tree
+        // revision, byte range) — so cache it per buffer and reuse it while
+        // both are unchanged. Cursor movement inside a window keeps the
+        // range fixed, and the ~30 scope-animation frames repaint the same
+        // viewport, so this turns the common case into a pointer fetch.
+        // visibleSpansFor still owns the query + reparse logic (and lazily
+        // initializes buf.hl on the first miss).
+        const span_revision = buf.history.revision;
+        const span_rows = last_visible - w.view_top + 1;
+        const span_start = buf.pt.lineStart(@min(w.view_top, line_count -| 1));
+        const span_vbottom = @min(w.view_top + span_rows, line_count);
+        const span_end: u32 = if (span_vbottom >= line_count) buf.pt.len() else buf.pt.lineStart(span_vbottom);
+        var merged: []syntax.Span = undefined;
+        if (buf.span_cache) |*sc| {
+            if (sc.revision == span_revision and sc.start == span_start and sc.end == span_end) {
+                merged = sc.spans;
+            } else {
+                const fresh = try self.visibleSpansFor(buf, a, w.view_top, span_rows);
+                if (sc.spans.len > 0) self.alloc.free(sc.spans);
+                sc.* = .{
+                    .revision = span_revision,
+                    .start = span_start,
+                    .end = span_end,
+                    .spans = try self.alloc.dupe(syntax.Span, fresh),
+                };
+                merged = sc.spans;
+            }
+        } else {
+            const fresh = try self.visibleSpansFor(buf, a, w.view_top, span_rows);
+            buf.span_cache = .{
+                .revision = span_revision,
+                .start = span_start,
+                .end = span_end,
+                .spans = try self.alloc.dupe(syntax.Span, fresh),
+            };
+            merged = buf.span_cache.?.spans;
+        }
 
         // scope highlight (nvim snacks.indent.scope): the byte range of the
         // block containing this window's cursor, converted to a line range.
@@ -7080,17 +7767,57 @@ const App = struct {
         var scope_indent_col: u32 = 0;
         var has_scope = false;
         if (buf.hl) |*hl| {
-            if (hl.scopeAt(w.cursor)) |sc| {
-                scope_start_line = buf.pt.lineOf(sc.start_byte);
-                // end_byte is exclusive — the last byte inside the scope is
-                // end_byte - 1 (lineOf maps pos == len to the last line, so
-                // either clamp would work; -| guards the empty edge case)
-                scope_end_line = buf.pt.lineOf(sc.end_byte -| 1);
-                // the scope's own guide column: the expanded indent of its
-                // starting line (snacks.indent renders the scope line at
-                // `scope.indent`)
-                scope_indent_col = sc.indent_col;
-                has_scope = true;
+            // scopeAt walks the tree from the root each call — reuse the last
+            // result while the tree (history revision) and the queried cursor
+            // byte are unchanged (sound: scopeAt's result is a pure function
+            // of the tree and the byte). This is the common case for the
+            // scope-animation frames that repaint every 16ms without the
+            // cursor moving, and for split windows showing the same buffer.
+            const revision = buf.history.revision;
+            var cached = false;
+            if (self.scope_cache) |*c| {
+                if (c.buf == w.buf and c.win == rect.win and
+                    c.revision == revision and c.cursor == w.cursor)
+                {
+                    scope_start_line = c.start_line;
+                    scope_end_line = c.end_line;
+                    scope_indent_col = c.indent_col;
+                    has_scope = c.has;
+                    cached = true;
+                }
+            }
+            if (!cached) {
+                var sc_has = false;
+                var sc_start: u32 = 0;
+                var sc_end: u32 = 0;
+                var sc_indent: u32 = 0;
+                if (hl.scopeAt(w.cursor)) |sc| {
+                    sc_start = buf.pt.lineOf(sc.start_byte);
+                    // end_byte is exclusive — the last byte inside the scope
+                    // is end_byte - 1 (lineOf maps pos == len to the last
+                    // line, so either clamp would work; -| guards the empty
+                    // edge case)
+                    sc_end = buf.pt.lineOf(sc.end_byte -| 1);
+                    // the scope's own guide column: the expanded indent of
+                    // its starting line (snacks.indent renders the scope line
+                    // at `scope.indent`)
+                    sc_indent = sc.indent_col;
+                    sc_has = true;
+                }
+                self.scope_cache = .{
+                    .buf = w.buf,
+                    .win = rect.win,
+                    .revision = revision,
+                    .cursor = w.cursor,
+                    .start_line = sc_start,
+                    .end_line = sc_end,
+                    .indent_col = sc_indent,
+                    .has = sc_has,
+                };
+                scope_start_line = sc_start;
+                scope_end_line = sc_end;
+                scope_indent_col = sc_indent;
+                has_scope = sc_has;
             }
         }
         // ---- scope highlight animation (snacks.indent.animate "out") ----
@@ -7132,11 +7859,29 @@ const App = struct {
         var span_i: usize = 0;
         var row: u32 = rect.row;
         var line = w.view_top;
-        // Blank-line indent-guide memo: consecutive blank rows share the exact same
-        // "nearest non-blank line (above, else below) scan result — the scan for line L and
-        // L+1 differs by one blank line at most, so the memo of the previous blank
-        // line's ctx_levels carries over (only reused for consecutive blank lines).
-        var blank_guide_memo: ?struct { line: u32, levels: u32 } = null;
+        // blank-run context cache: consecutive blank rows share the nearest
+        // non-blank line's indent levels (see the scan below)
+        var prev_blank: ?u32 = null;
+        var blank_run_ctx: u32 = 0;
+        // Per-row allocations are a per-frame cost, not a per-row one: one
+        // text buffer (width × height), one gutter-number buffer and one
+        // guide-row buffer for the whole window, and ONE segs ArrayList whose
+        // capacity is reserved once per frame (clearRetainingCapacity per
+        // row). The segments' text slices reference these frame buffers (and
+        // the arena), both alive until vx.render().
+        const text_buf = try a.alloc(u8, @as(usize, rect.width) * rect.height);
+        const num_buf = try a.alloc(u8, @as(usize, gutter) * rect.height);
+        const guide_buf = try a.alloc(u8, rect.width);
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        try segs.ensureTotalCapacity(a, @as(usize, rect.width) * 2 + 64);
+        // diagnostics are sorted by line (sortByLine): a moving pointer keeps
+        // the mark lookup O(rows + diags) instead of O(rows × diags)
+        var diag_i: usize = 0;
+        const diags = self.lsp_diagnostics.items;
+        // git hunks are sorted by construction (git diff output order): the
+        // same moving-pointer trick for the gutter sign
+        var hunk_i: usize = 0;
+        const hunks = self.git_diff.hunks.items;
         while (row < rect.row + rect.height and line < line_count) : ({
             // skip a closed fold's body: it shares its header's screen row
             line = foldNextLine(buf, line);
@@ -7148,10 +7893,14 @@ const App = struct {
                 line - cursor_line
             else
                 cursor_line - line;
-            // allocPrint's width is comptime-only, so pad by hand: digits
-            // right-aligned in the numeric field plus one trailing space
-            const num_raw = try std.fmt.allocPrint(a, "{d}", .{rel});
-            const num_str = try a.alloc(u8, gutter);
+            // relative number, right-aligned in the numeric field plus one
+            // trailing space. allocPrint's width is comptime-only, so pad by
+            // hand; the digits go into a stack buffer, the padded field into
+            // the per-frame num_buf slice for this row.
+            var raw_digits: [32]u8 = undefined;
+            const num_raw = std.fmt.bufPrint(&raw_digits, "{d}", .{rel}) catch unreachable;
+            const row_i: usize = (row - rect.row);
+            const num_str = num_buf[row_i * gutter ..][0..gutter];
             @memset(num_str[0..gutter], ' ');
             @memcpy(num_str[gutter_digits - num_raw.len .. gutter_digits], num_raw);
             num_str[gutter - 1] = ' ';
@@ -7166,21 +7915,22 @@ const App = struct {
             // a bug; the diag_dirty repaint keeps them live while typing.
             var diag_mark: []const u8 = " ";
             var diag_mark_fg: ?vaxis.Style = null;
-            if (w.buf == self.current and self.lsp_diagnostics.items.len > 0) {
-                for (self.lsp_diagnostics.items) |d| {
-                    if (d.range.start.line == line) {
-                        diag_mark = switch (d.severity) {
-                            .err => "\u{f467}", // nf-fa-times_circle ✖
-                            .warning => "\u{f071}", // nf-fa-warning ⚠
-                            else => "\u{f05a}", // nf-fa-info_circle ℹ
-                        };
-                        diag_mark_fg = switch (d.severity) {
-                            .err => .{ .fg = .{ .rgb = self.theme.diag_error } },
-                            .warning => .{ .fg = .{ .rgb = self.theme.diag_warn } },
-                            else => .{ .fg = .{ .rgb = self.theme.diag_info } },
-                        };
-                        break;
-                    }
+            if (w.buf == self.current and diags.len > 0) {
+                // advance to the first diagnostic at/after this row's line
+                // (rows ascend, so diag_i only moves forward)
+                while (diag_i < diags.len and diags[diag_i].range.start.line < line) diag_i += 1;
+                if (diag_i < diags.len and diags[diag_i].range.start.line == line) {
+                    const d = diags[diag_i];
+                    diag_mark = switch (d.severity) {
+                        .err => "\u{f467}", // nf-fa-times_circle ✖
+                        .warning => "\u{f071}", // nf-fa-warning ⚠
+                        else => "\u{f05a}", // nf-fa-info_circle ℹ
+                    };
+                    diag_mark_fg = switch (d.severity) {
+                        .err => .{ .fg = .{ .rgb = self.theme.diag_error } },
+                        .warning => .{ .fg = .{ .rgb = self.theme.diag_warn } },
+                        else => .{ .fg = .{ .rgb = self.theme.diag_info } },
+                    };
                 }
             }
 
@@ -7195,13 +7945,25 @@ const App = struct {
                 if (self.git_diff_path) |dp| {
                     if (buf.path) |cp| {
                         if (std.mem.eql(u8, dp, cp)) {
-                            if (self.git_diff.markAt(line)) |k| {
-                                git_mark = k;
-                                git_mark_fg = switch (k) {
-                                    .added => .{ .fg = .{ .rgb = self.theme.git_add } },
-                                    .modified => .{ .fg = .{ .rgb = self.theme.git_mod } },
-                                    .removed_above, .removed_below => .{ .fg = .{ .rgb = self.theme.git_del } },
-                                };
+                            if (self.git_diff.untracked) {
+                                // untracked file: every line reads as added
+                                git_mark = .added;
+                                git_mark_fg = .{ .fg = .{ .rgb = self.theme.git_add } };
+                            } else {
+                                // advance past hunks whose marked region ends
+                                // before this row's line (hunks sorted; lines[]
+                                // is indexed by absolute line number)
+                                while (hunk_i < hunks.len and hunks[hunk_i].lines.len <= line) hunk_i += 1;
+                                if (hunk_i < hunks.len) {
+                                    if (hunks[hunk_i].markAt(line)) |k| {
+                                        git_mark = k;
+                                        git_mark_fg = switch (k) {
+                                            .added => .{ .fg = .{ .rgb = self.theme.git_add } },
+                                            .modified => .{ .fg = .{ .rgb = self.theme.git_mod } },
+                                            .removed_above, .removed_below => .{ .fg = .{ .rgb = self.theme.git_del } },
+                                        };
+                                    }
+                                }
                             }
                         }
                     }
@@ -7219,7 +7981,9 @@ const App = struct {
             while (n > 0 and n < line_len and (buf.pt.byteAt(line_start + n) & 0xC0) == 0x80) {
                 n -= 1;
             }
-            const text = try a.alloc(u8, n);
+            // line text lives in the per-frame text_buf row slice (valid
+            // until vx.render, like every other segment slice)
+            const text = text_buf[row_i * rect.width ..][0..n];
             buf.pt.copyRange(line_start, text);
 
             // visual selection bounds as local columns (both = n if absent);
@@ -7256,7 +8020,7 @@ const App = struct {
             // split the line into styled runs: syntax fg from the merged
             // spans, cursorline bg on the cursor's row, selection bg wins
             const is_cur_line = line == cursor_line;
-            var segs = std.ArrayList(vaxis.Segment).empty;
+            segs.clearRetainingCapacity();
             // gutter: always painted (bg_alt), cursor line slightly brighter
             const cursorline_style: vaxis.Style = if (is_cur_line)
                 .{ .bg = .{ .rgb = self.theme.bg_curline }, .fg = .{ .rgb = self.theme.fg } }
@@ -7360,39 +8124,20 @@ const App = struct {
             // reach this — a content line at column 0 (fn header,
             // closing brace) has indent_end == 0 but indent_end != n, so
             // the scope's vertical never extends onto those rows.
+            //
+            // Consecutive blank rows share their context: the scan probes
+            // the same blank lines for every row of a run (a run of R rows
+            // would otherwise probe up to R×500 lines), so the context is
+            // computed once per run and reused while the run continues.
             if (indent_end == n) {
                 var ctx_levels: u32 = 0;
-                var have_levels = false;
-                if (blank_guide_memo) |m| {
-                    if (m.line + 1 == line) { // consecutive blank run: reuse the previous line's scan
-                        ctx_levels = m.levels;
-                        have_levels = true;
-                    }
+                if (prev_blank != null and line == prev_blank.? + 1) {
+                    ctx_levels = blank_run_ctx;
+                } else {
+                    ctx_levels = self.blankContextLevels(buf, line, line_count);
+                    blank_run_ctx = ctx_levels;
                 }
-                if (!have_levels) {
-                    var ctx: i64 = @as(i64, @intCast(line)) - 1;
-                    var dir: i64 = -1;
-                    var scanned: usize = 0;
-                    const lc: i64 = @as(i64, @intCast(line_count));
-                    while (scanned < 500) : (scanned += 1) {
-                        if (ctx < 0) {
-                            if (dir == -1) {
-                                ctx = @as(i64, @intCast(line)) + 1;
-                                dir = 1;
-                                continue;
-                            }
-                            break;
-                        }
-                        if (ctx >= lc) break;
-                        const cl: u32 = @intCast(ctx);
-                        if (!self.isBlankLine(buf, cl)) {
-                            ctx_levels = self.lineIndentLevels(buf, cl);
-                            break;
-                        }
-                        ctx += dir;
-                    }
-                }
-                blank_guide_memo = .{ .line = line, .levels = ctx_levels };
+                prev_blank = line;
                 const start_col: u32 = indent_cols;
                 const ctx_cols: u32 = @min(ctx_levels * tab_width, rect.width -| gutter);
                 // the scope's highlighted guide column (only when it lies
@@ -7407,7 +8152,7 @@ const App = struct {
                 const end_col: u32 = @max(ctx_cols, if (scope_col < rect.width) scope_col + 1 else ctx_cols);
                 if (end_col > start_col) {
                     const n_cells = end_col - start_col;
-                    const row_buf = try a.alloc(u8, n_cells);
+                    const row_buf = guide_buf[0..n_cells];
                     @memset(row_buf, ' ');
                     var gc: u32 = start_col;
                     while (gc < end_col) : (gc += 1) {
@@ -7441,6 +8186,8 @@ const App = struct {
                     }
                     if (run_start < n_cells) try segs.append(a, .{ .text = row_buf[run_start..], .style = gstyle });
                 }
+            } else {
+                prev_blank = null;
             }
             var col: u32 = indent_end; // text starts after the indent region
             while (col < n) {
@@ -7706,7 +8453,6 @@ const App = struct {
         }
         return segs.items;
     }
-
     fn render(self: *App) !void {
         // vaxis cells reference the text slices passed to print, so all text
         // must stay alive until vx.render(); a per-frame arena handles that.
@@ -7918,6 +8664,7 @@ const App = struct {
             };
             self.vx.screen.cursor_vis = true;
             self.vx.screen.cursor_shape = .block;
+            if (builtin.os.tag == .linux) try self.drawTerm(a, win);
             try self.vx.render(self.tty.writer());
             return;
         }
@@ -8150,6 +8897,10 @@ const App = struct {
             }
         }
 
+        // embedded terminal overlay: drawn after the panes so it covers
+        // them; the modal overlays below float above it
+        if (builtin.os.tag == .linux) try self.drawTerm(a, win);
+
         // fuzzy picker overlay (telescope/snacks style: a solid bg_float
         // floating window with a border, a title and an in-panel input row,
         // centered on the screen instead of pinned to the bottom-left corner)
@@ -8292,9 +9043,10 @@ const App = struct {
                 try segs.append(a, .{ .text = "│", .style = border_style });
                 if (self.picker_mode == .keymaps) {
                     // segmented keymap row: keys tokens split on spaces —
-                    // "space" / "ctrl-*" / ":*" prefixes render accent, the
-                    // rest keyword; then "  " + desc in fg. The selected row
-                    // keeps the token colors and only swaps the bg.
+                    // "space" / "ctrl-*" / "alt-*" / ":*" prefixes render
+                    // accent, the rest keyword; then "  " + desc in fg. The
+                    // selected row keeps the token colors and only swaps the
+                    // bg.
                     const ei = self.picker_matches.items[ri];
                     const entry = keymap_list.entries[ei];
                     var it = std.mem.splitScalar(u8, entry.keys, ' ');
@@ -8302,7 +9054,7 @@ const App = struct {
                     while (it.next()) |tok| {
                         if (tok.len == 0) continue;
                         if (!first) try segs.append(a, .{ .text = " ", .style = rs });
-                        const is_prefix = first and (std.mem.eql(u8, tok, "space") or std.mem.startsWith(u8, tok, "ctrl-") or tok[0] == ':');
+                        const is_prefix = first and (std.mem.eql(u8, tok, "space") or std.mem.startsWith(u8, tok, "ctrl-") or std.mem.startsWith(u8, tok, "alt-") or tok[0] == ':');
                         const tok_style: vaxis.Style = if (is_prefix)
                             .{ .fg = .{ .rgb = self.theme.accent }, .bg = rs.bg }
                         else
@@ -8779,16 +9531,22 @@ const App = struct {
                         // which would push it away from the word when the
                         // word has a prefix like "b." (b.stand + ghost had a
                         // gap that made the completion look broken)
-                        if (ghost.len > 0 and ghost_col + ghost.len < win.width) {
-                            const seg = [_]vaxis.Segment{.{
-                                .text = ghost,
-                                .style = .{ .dim = true },
-                            }};
-                            _ = win.print(&seg, .{
-                                .row_offset = @intCast(ghost_line - self.curViewTop().* + cur_rect.row),
-                                .col_offset = @intCast(cur_rect.col + gutter + ghost_col),
-                                .wrap = .none,
-                            });
+                        if (ghost.len > 0) {
+                            // keep the ghost inside THIS pane: win.width is
+                            // the whole screen, and a split's neighbor owns
+                            // the columns past the pane's right edge
+                            const ghost_start = cur_rect.col + gutter + ghost_col;
+                            if (ghost_start + ghost.len <= cur_rect.col + cur_rect.width) {
+                                const seg = [_]vaxis.Segment{.{
+                                    .text = ghost,
+                                    .style = .{ .dim = true },
+                                }};
+                                _ = win.print(&seg, .{
+                                    .row_offset = @intCast(ghost_line - self.curViewTop().* + cur_rect.row),
+                                    .col_offset = @intCast(ghost_start),
+                                    .wrap = .none,
+                                });
+                            }
                         }
                     }
                 }
@@ -8816,37 +9574,54 @@ const App = struct {
                     if (fbuf.path == null or !std.mem.eql(u8, bp, fbuf.path.?)) {
                         // cached blame is for another file — no ghost
                     } else if (self.git_blame.?.at(blame_line)) |e| {
-                    var hm_buf: [5]u8 = undefined;
-                    const hm = formatHm(&hm_buf, e.author_time);
-                    const label = try std.fmt.allocPrint(a, " {s}, {s} - {s}", .{ e.author, hm, e.summary });
-                    // anchor at the END of the line's RENDERED text:
-                    // screenCellCol (not lineCellCol) counts the inlay hints
-                    // spliced into the line — anchoring at the raw text end
-                    // would draw the ghost ON TOP of hinted text
-                    const line_end = fbuf.pt.lineStart(blame_line) + fbuf.pt.lineLen(blame_line);
-                    const end_col = self.screenCellCol(win, blame_line, line_end);
-                    var start_col = cur_rect.col + gutter + end_col;
-                    // a closed fold's " … N lines" marker also renders after
-                    // the text — shift the ghost past it
-                    if (foldAt(fbuf, blame_line)) |f| {
-                        const marker = try std.fmt.allocPrint(a, " … {d} lines", .{f.hiddenCount()});
-                        start_col += self.textWidth(win, marker);
-                    }
-                    if (start_col < win.width) {
-                        const fit = cellFitPrefix(win, label, win.width - start_col);
-                        if (fit.cells > 0) {
-                            const seg = [_]vaxis.Segment{.{
-                                .text = fit.slice,
-                                .style = .{ .dim = true },
-                            }};
-                            _ = win.print(&seg, .{
-                                .row_offset = @intCast(blame_line - self.curViewTop().* + cur_rect.row),
-                                .col_offset = @intCast(start_col),
-                                .wrap = .none,
-                            });
+                        // The label is rebuilt only when the blame LINE or the
+                        // blame DATA changed (the entry pointer identifies both:
+                        // entries live in git_blame's own array, replaced on
+                        // refresh) — the ghost repaints every idle frame.
+                        var label: []const u8 = undefined;
+                        if (self.blame_ghost_label) |*g| {
+                            if (g.line == blame_line and g.entry == e) {
+                                label = g.label;
+                            } else {
+                                self.alloc.free(g.label);
+                                self.blame_ghost_label = null;
+                            }
+                        }
+                        if (self.blame_ghost_label == null) {
+                            var hm_buf: [5]u8 = undefined;
+                            const hm = formatHm(&hm_buf, e.author_time);
+                            const lbl = try std.fmt.allocPrint(self.alloc, " {s}, {s} - {s}", .{ e.author, hm, e.summary });
+                            self.blame_ghost_label = .{ .line = blame_line, .entry = e, .label = lbl };
+                            label = lbl;
+                        }
+                        const line_end = fbuf.pt.lineStart(blame_line) + fbuf.pt.lineLen(blame_line);
+                        const end_col = self.screenCellCol(win, blame_line, line_end);
+                        var start_col = cur_rect.col + gutter + end_col;
+                        // a closed fold's " … N lines" marker also renders after
+                        // the text — shift the ghost past it
+                        if (foldAt(fbuf, blame_line)) |f| {
+                            const marker = try std.fmt.allocPrint(a, " … {d} lines", .{f.hiddenCount()});
+                            start_col += self.textWidth(win, marker);
+                        }
+                        // the ghost must stay inside THIS pane: win.width is
+                        // the whole screen, and a split's neighbor owns the
+                        // columns past the pane's right edge
+                        const pane_end = cur_rect.col + cur_rect.width;
+                        if (start_col < pane_end) {
+                            const fit = cellFitPrefix(win, label, pane_end - start_col);
+                            if (fit.cells > 0) {
+                                const seg = [_]vaxis.Segment{.{
+                                    .text = fit.slice,
+                                    .style = .{ .dim = true },
+                                }};
+                                _ = win.print(&seg, .{
+                                    .row_offset = @intCast(blame_line - self.curViewTop().* + cur_rect.row),
+                                    .col_offset = @intCast(start_col),
+                                    .wrap = .none,
+                                });
+                            }
                         }
                     }
-                }
                 }
             }
         }
@@ -9097,6 +9872,16 @@ const App = struct {
             _ = win.print(&branch_seg, .{ .row_offset = @intCast(height - 1), .col_offset = @intCast(status.len), .wrap = .none });
         }
 
+        // terminal focused: the widget's draw() already placed the child's
+        // cursor — the editor cursor must not overwrite it
+        if (builtin.os.tag == .linux) {
+            if (self.term_pane) |*tp| {
+                if (tp.focused) {
+                    try self.vx.render(self.tty.writer());
+                    return;
+                }
+            }
+        }
         // cursor position — in the file tree when the tree has focus,
         // otherwise in the buffer
         if (self.filetree_active and self.focus == .filetree) {
@@ -9159,7 +9944,10 @@ const App = struct {
         try self.vx.enterAltScreen(self.tty.writer());
         try self.loop.start();
         defer self.loop.stop();
-
+        // monotonic ms of the last frame we actually drew — poll-mode
+        // iterations without events skip render() until 16ms have elapsed
+        // (the animation frame cadence), so idle polling costs no renders.
+        var last_render_ms: i64 = 0;
         while (!self.quit) {
             // LSP messages first: responses fill request slots, notifications
             // reach the handler before the frame renders; then consume any
@@ -9196,8 +9984,44 @@ const App = struct {
             // A finished async LSP attach installs its client (and opens the
             // document) — render so diagnostics/inlay requests can start.
             const lsp_ready = self.finishLspStart();
-            if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready or lsp_ready) {
+            // Embedded terminal events (redraw / exited / title_change):
+            // drain before the frame renders. The vaxis widget has no wake
+            // hook — while a terminal is open the loop polls at 16ms below
+            // instead of blocking in pollEvent.
+            var term_ready = false;
+            if (builtin.os.tag == .linux) {
+                if (self.term_pane) |*tp| {
+                    // .exited closes the terminal, freeing `tp` — break out
+                    // of the loop first (the while condition would
+                    // dereference the freed pane) and close after draining.
+                    var term_exited = false;
+                    while (try tp.t.pollEvent()) |ev| {
+                        switch (ev) {
+                            .exited => {
+                                term_exited = true;
+                                break;
+                            },
+                            .redraw => term_ready = true,
+                            .bell => {},
+                            .title_change => |t| {
+                                // event slice borrows the widget's internal
+                                // buffer — dupe before the next event
+                                if (tp.title) |x| self.alloc.free(x);
+                                tp.title = try self.alloc.dupe(u8, t);
+                            },
+                            .pwd_change => {},
+                        }
+                    }
+                    if (term_exited) {
+                        const m = self.alloc.dupe(u8, "terminal exited") catch null;
+                        if (m) |mm| try self.setMsg(mm);
+                        self.closeTerm();
+                    }
+                }
+            }
+            if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready or lsp_ready or term_ready) {
                 try self.render();
+                last_render_ms = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
                 continue;
             }
             // Auto-refresh inlay hints when the view scrolls (LSP available
@@ -9211,15 +10035,36 @@ const App = struct {
             }
             // poll + drain: block until an event arrives (keypress OR an
             // LSP wake posted by the reader thread), then handle the whole
-            // batch and render once. While the scope highlight is animating
-            // or the blame CursorHold is counting, poll at 60fps instead of
-            // blocking — but render only when something actually changed
-            // (events handled / animation frame / blame ghost deadline
-            // reached), not on every poll tick.
-            const scope_was = self.scopeAnimActive();
-            const hold_was = self.blameHoldActive();
-            if (scope_was or hold_was) {
-                std.Io.sleep(self.io, .fromMilliseconds(16), .real) catch {};
+            // batch and render once. While the scope highlight is animating,
+            // the blame hold is counting, or a terminal is open (its reader
+            // thread has no wake hook), poll instead of blocking so the
+            // frame advances without keypresses (16ms ≈ 60fps; vaxis diffs
+            // the output). The poll slice is SHORT (1ms) — a keypress must
+            // wake the loop within ~1ms, not up to 16ms: while the animation
+            // runs, the loop would otherwise sleep past the key and add a
+            // full frame's latency to every keypress (a "G k x20" script
+            // spends its whole run inside the 500ms animation window).
+            // The render pacing below keeps animation frames at ~16ms.
+            // Poll-mode transition guard: while scope-animating / blame-
+            // holding / terminal-open, the loop sleeps in 1ms slices so a
+            // keypress wakes it within ~1ms. When the last such condition
+            // flips false the loop is about to block in pollEvent — the
+            // render pacing below could otherwise skip the FINAL frame (e.g.
+            // the blame ghost appearing as the 1s CursorHold expires, or the
+            // animation's last spread) and the loop would block forever
+            // without ever drawing it. Force that one render.
+            var poll_transition = false;
+            if (self.scopeAnimActive() or self.blameHoldActive() or (builtin.os.tag == .linux and self.term_pane != null)) {
+                std.Io.sleep(self.io, .fromMilliseconds(1), .real) catch {};
+                self.poll_mode_active = true;
+            } else if (self.poll_mode_active) {
+                // Transition out of poll mode: do NOT block in pollEvent
+                // yet — the render below (forced via poll_transition) must
+                // draw the final poll state first (the blame ghost appearing
+                // as the 1s CursorHold expires, the animation's last spread).
+                // The next iteration blocks as usual.
+                self.poll_mode_active = false;
+                poll_transition = true;
             } else {
                 try self.loop.pollEvent();
             }
@@ -9229,6 +10074,15 @@ const App = struct {
                 switch (event) {
                     .key_press => |key| try self.handleKey(key),
                     .paste => |text| {
+                        // terminal focus: forward the paste to the child
+                        if (builtin.os.tag == .linux) {
+                            if (self.term_pane) |*tp| {
+                                if (tp.focused) {
+                                    try tp.t.sendText(text);
+                                    continue;
+                                }
+                            }
+                        }
                         if (self.state.mode == .insert) {
                             if (self.mc_active) try self.mcInsertText(text) else try self.insertText(text);
                         }
@@ -9239,9 +10093,10 @@ const App = struct {
                     else => {},
                 }
             }
-            const blame_due = hold_was and !self.blameHoldActive();
-            if (handled or scope_was or blame_due) {
+            const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
+            if (handled or poll_transition or now_ms - last_render_ms >= 16) {
                 try self.render();
+                last_render_ms = now_ms;
             }
         }
 
@@ -9293,8 +10148,8 @@ fn runGit(self: *GitJob, argv: []const []const u8, stdin_data: ?[]const u8) CmdR
     defer err_buf.deinit(self.alloc);
     if (proc.stdout) |out| gitReadAll(self, out, &out_buf);
     if (proc.stderr) |err| gitReadAll(self, err, &err_buf);
-    const term = proc.wait(self.io) catch return .{ .out = null, .err = null, .ok = false };
-    const ok = term == .exited and term.exited == 0;
+    const term_status = proc.wait(self.io) catch return .{ .out = null, .err = null, .ok = false };
+    const ok = term_status == .exited and term_status.exited == 0;
     return .{
         .out = if (out_buf.items.len > 0) out_buf.toOwnedSlice(self.alloc) catch null else null,
         .err = if (err_buf.items.len > 0) err_buf.toOwnedSlice(self.alloc) catch null else null,
@@ -9681,6 +10536,7 @@ pub fn main(init: std.process.Init) !void {
                     error.FileNotFound => {
                         app.cur().pt.deinit();
                         app.cur().pt = try buffer.PieceTable.init(app.alloc, "");
+                        app.clearSpanCache(app.cur());
                         if (app.cur().path) |p| app.alloc.free(p);
                         app.cur().path = try app.absolutePath(file_path);
                     },
@@ -9704,12 +10560,9 @@ pub fn main(init: std.process.Init) !void {
                 try app.setMsg(try app.alloc.dupe(u8, "file too large (>4GiB)"));
                 continue;
             }
-            const bytes = try app.alloc.alloc(u8, @intCast(size));
-            errdefer app.alloc.free(bytes);
-            _ = try file.readPositionalAll(app.io, bytes, 0);
             app.cur().pt.deinit();
-            // initAdopt takes ownership of `bytes` — no second copy
-            app.cur().pt = try buffer.PieceTable.initAdopt(app.alloc, bytes);
+            app.cur().pt = try app.loadPieceTable(file, size);
+            app.clearSpanCache(app.cur());
             if (app.cur().path) |p| app.alloc.free(p);
             // Store an absolute path so LSP (uri building, server matching)
             // works for relative CLI args like `oz build.zig` — filetypeOf

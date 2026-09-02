@@ -1,4 +1,8 @@
 zig-out/
+.zig-cache
 .zig-cache/
+zig-pkg
 zig-pkg/
+.zig-global-cache
 .zig-global-cache/
+.wt-*/

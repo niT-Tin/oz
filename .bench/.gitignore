@@ -1,0 +1,6 @@
+corpus/*.zig
+corpus/*.log
+corpus/*.txt
+!corpus/gen.py
+results/
+*.log

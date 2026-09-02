@@ -62,18 +62,23 @@ const Queue = struct {
     }
 };
 
-/// One outbound frame. `raw` is a fully serialized JSON-RPC frame;
-/// `did_change` carries the raw document text and is JSON-encoded BY THE
-/// WRITER THREAD — per-keystroke full-text stringification must not run on
-/// the UI thread.
+/// One outbound frame. `raw` is a fully serialized JSON-RPC frame (header +
+/// body); `did_change` carries the raw document text and is JSON-encoded BY
+/// THE WRITER THREAD — per-keystroke full-text stringification must not run
+/// on the UI thread. The uri is captured at push time: the writer thread
+/// must not read `Client.uri`, which the main thread frees and replaces on
+/// every retarget/switchDocument.
 const OutFrame = union(enum) {
     raw: []u8,
-    did_change: struct { text: []u8, version: i32 },
+    did_change: struct { uri: []u8, text: []u8, version: i32 },
 
     fn deinit(self: OutFrame, alloc: std.mem.Allocator) void {
         switch (self) {
             .raw => |f| alloc.free(f),
-            .did_change => |dc| alloc.free(dc.text),
+            .did_change => |dc| {
+                alloc.free(dc.uri);
+                alloc.free(dc.text);
+            },
         }
     }
 };
@@ -169,6 +174,14 @@ pub const Client = struct {
     /// Whether argv_override[0] is a heap-owned copy (resolveServerBinary's
     /// dupe) that deinit must free; OZ_LSP_CMD's entry is a borrowed env slice.
     argv_override_first_owned: bool = false,
+
+    /// Documents currently open in the server (uri hash → {}). didOpen
+    /// inserts, didClose removes. Buffer switches do NOT close the previous
+    /// document (LSP servers track several), so switching back to an open,
+    /// unchanged document costs nothing — the App checks `isDocOpen` and
+    /// skips the re-open (and its full-text copy) entirely. Lazily
+    /// initialized (hand-built test Clients skip it).
+    open_docs: ?std.AutoHashMap(u64, void) = null,
 
     thread: ?std.Thread = null,
     /// Writer thread: post-handshake frames (didChange, requests) are QUEUED
@@ -424,8 +437,8 @@ pub const Client = struct {
         }
         // Handshake done: every frame from now on goes through the writer
         // thread so a slow server (full pipe mid-didChange) never blocks the
-        // UI thread. Nothing past this point can fail, so no errdefer for
-        // the writer thread is needed.
+        // UI thread. A spawn failure here still unwinds through the errdefer
+        // chain above (kill + reader join + destroy).
         self.writer = try std.Thread.spawn(.{}, writerMain, .{self});
         return self;
     }
@@ -473,6 +486,7 @@ pub const Client = struct {
         self.queue.deinit(self.alloc);
         self.out.deinit(self.alloc);
         self.pending.deinit(self.alloc);
+        if (self.open_docs) |*od| od.deinit();
         for (self.completion_triggers.items) |t| self.alloc.free(t);
         self.completion_triggers.deinit(self.alloc);
         if (self.argv_override) |arr| {
@@ -517,6 +531,26 @@ pub const Client = struct {
         var changes = params.get("contentChanges").?;
         const change = &changes.array.items[0].object;
         self.alloc.free(change.get("text").?.string);
+        // An incremental change carries a nested {start, end} range object;
+        // ObjectMap.deinit does not recurse, so free its maps here.
+        if (change.get("range")) |rv| {
+            if (rv == .object) {
+                var r = rv;
+                if (r.object.get("start")) |sv| {
+                    if (sv == .object) {
+                        var s = sv;
+                        s.object.deinit(self.alloc);
+                    }
+                }
+                if (r.object.get("end")) |ev| {
+                    if (ev == .object) {
+                        var e = ev;
+                        e.object.deinit(self.alloc);
+                    }
+                }
+                r.object.deinit(self.alloc);
+            }
+        }
         change.deinit(self.alloc);
         changes.array.deinit();
         params.deinit(self.alloc);
@@ -551,6 +585,26 @@ pub const Client = struct {
 
     // ---- text sync ----
 
+    fn hashUri(uri: []const u8) u64 {
+        return std.hash.Wyhash.hash(0, uri);
+    }
+
+    /// Lazily-created set of documents the server has open.
+    fn docs(self: *Client) *std.AutoHashMap(u64, void) {
+        if (self.open_docs == null) {
+            self.open_docs = std.AutoHashMap(u64, void).init(self.alloc);
+        }
+        return &self.open_docs.?;
+    }
+
+    /// Whether the server currently has `uri` open (a didOpen was sent and no
+    /// didClose since). The App uses this to skip re-opening a document whose
+    /// server copy is still current.
+    pub fn isDocOpen(self: *const Client, uri: []const u8) bool {
+        const d = self.open_docs orelse return false;
+        return d.contains(hashUri(uri));
+    }
+
     fn didOpen(self: *Client, text: []const u8) !void {
         var td = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer td.deinit(self.alloc);
@@ -581,18 +635,29 @@ pub const Client = struct {
         var v = std.json.Value{ .object = params };
         defer self.freeDidOpenParams(&v);
         try self.notify("textDocument/didOpen", v);
+        self.docs().put(hashUri(self.uri), {}) catch {};
     }
 
-    pub fn didChange(self: *Client, text: []const u8) !void {
+    /// Send a textDocument/didChange. `range` non-null sends an incremental
+    /// change ({range, text}: the bytes [range.start, range.end) of the
+    /// PRE-CHANGE document were replaced by `text`) — the per-keystroke path;
+    /// null sends a full-document replacement (the fallback for edits whose
+    /// range is not tracked: undo/redo, multi-cursor ops, paste, …).
+    pub fn didChange(self: *Client, range: ?types.Range, text: []const u8) !void {
         self.version += 1;
-        if (self.writer != null) {
-            // Async path: hand the raw text to the writer thread, which
-            // JSON-encodes off the UI thread and coalesces pre-encode (a
-            // queued full text is replaced by the newer edit before it is
-            // ever stringified).
+        if (self.writer != null and range == null) {
+            // Async full-text path: hand the raw text to the writer thread,
+            // which JSON-encodes off the UI thread and coalesces pre-encode
+            // (a queued full text is replaced by the newer edit before it is
+            // ever stringified). Incremental frames are tiny, so they keep
+            // the inline-encode path below and are queued as raw frames.
+            // The uri is captured now: by the time the writer encodes, the
+            // main thread may have retargeted the client.
+            const uri_copy = try self.alloc.dupe(u8, self.uri);
+            errdefer self.alloc.free(uri_copy);
             const copy = try self.alloc.dupe(u8, text);
             errdefer self.alloc.free(copy);
-            try self.out.push(self.alloc, .{ .did_change = .{ .text = copy, .version = self.version } });
+            try self.out.push(self.alloc, .{ .did_change = .{ .uri = uri_copy, .text = copy, .version = self.version } });
             return;
         }
         var td = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
@@ -603,6 +668,21 @@ pub const Client = struct {
         try td.put(self.alloc, "version", .{ .integer = self.version });
         var change = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer change.deinit(self.alloc);
+        if (range) |r| {
+            var range_obj = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+            errdefer range_obj.deinit(self.alloc);
+            var start_obj = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+            errdefer start_obj.deinit(self.alloc);
+            try start_obj.put(self.alloc, "line", .{ .integer = r.start.line });
+            try start_obj.put(self.alloc, "character", .{ .integer = r.start.character });
+            var end_obj = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+            errdefer end_obj.deinit(self.alloc);
+            try end_obj.put(self.alloc, "line", .{ .integer = r.end.line });
+            try end_obj.put(self.alloc, "character", .{ .integer = r.end.character });
+            try range_obj.put(self.alloc, "start", .{ .object = start_obj });
+            try range_obj.put(self.alloc, "end", .{ .object = end_obj });
+            try change.put(self.alloc, "range", .{ .object = range_obj });
+        }
         const text_copy = try self.alloc.dupe(u8, text);
         errdefer self.alloc.free(text_copy);
         try change.put(self.alloc, "text", .{ .string = text_copy });
@@ -630,17 +710,26 @@ pub const Client = struct {
         var v = std.json.Value{ .object = params };
         defer self.freeDidCloseParams(&v);
         try self.notify("textDocument/didClose", v);
+        if (self.open_docs) |*od| _ = od.remove(hashUri(self.uri));
     }
 
-    /// Switch the client to a new document of the same filetype (the editor
-    /// switched buffers): close the old document, retarget `uri`, open the
-    /// new one. Versions keep increasing across the client's lifetime, which
-    /// LSP requires.
-    pub fn switchDocument(self: *Client, new_uri: []const u8, text: []const u8) !void {
-        try self.didClose();
+    /// Retarget the client's current document without talking to the server
+    /// (used when switching to a document the server already has open with
+    /// current content — no didClose/didOpen needed).
+    pub fn retarget(self: *Client, new_uri: []const u8) !void {
         const copy = try self.alloc.dupe(u8, new_uri);
         self.alloc.free(self.uri);
         self.uri = copy;
+    }
+
+    /// Switch the client to a new document of the same filetype (the editor
+    /// switched buffers): open the new one. The PREVIOUS document is left
+    /// open — LSP servers track several documents at once, and the App
+    /// skips this entirely (via `retarget`) when the target is already open
+    /// and unchanged, so switching back is free. Versions keep increasing
+    /// across the client's lifetime, which LSP requires.
+    pub fn switchDocument(self: *Client, new_uri: []const u8, text: []const u8) !void {
+        try self.retarget(new_uri);
         try self.didOpen(text);
     }
 
@@ -718,7 +807,7 @@ pub const Client = struct {
                 .did_change => |dc| {
                     // JSON-encode HERE, off the UI thread (per-keystroke
                     // full-document stringify is the expensive part)
-                    const content = self.encodeDidChange(dc.text, dc.version) catch continue;
+                    const content = self.encodeDidChange(dc.uri, dc.text, dc.version) catch continue;
                     defer self.alloc.free(content);
                     self.writeRawFrame(content) catch {};
                 },
@@ -734,12 +823,13 @@ pub const Client = struct {
         try std.Io.File.writeStreamingAll(self.stdin, self.io, content);
     }
 
-    /// Build the serialized didChange notification (writer thread). Shares
-    /// the param-graph lifetime rules with didChange (see freeDidChangeParams).
-    fn encodeDidChange(self: *Client, text: []const u8, version: i32) ![]u8 {
+    /// Build the serialized full-text didChange notification (writer thread).
+    /// Shares the param-graph lifetime rules with didChange (see
+    /// freeDidChangeParams). `uri` is the push-time copy from the frame.
+    fn encodeDidChange(self: *Client, uri: []const u8, text: []const u8, version: i32) ![]u8 {
         var td = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer td.deinit(self.alloc);
-        const uri_copy = try self.alloc.dupe(u8, self.uri);
+        const uri_copy = try self.alloc.dupe(u8, uri);
         errdefer self.alloc.free(uri_copy);
         try td.put(self.alloc, "uri", .{ .string = uri_copy });
         try td.put(self.alloc, "version", .{ .integer = version });
@@ -1095,12 +1185,12 @@ test "out queue: didChange frames coalesce, other frames queue in order" {
     defer q.deinit(alloc);
 
     // two coalescible frames back to back: the second replaces the first
-    try q.push(alloc, .{ .did_change = .{ .text = try alloc.dupe(u8, "change-v1"), .version = 1 } });
-    try q.push(alloc, .{ .did_change = .{ .text = try alloc.dupe(u8, "change-v2"), .version = 2 } });
+    try q.push(alloc, .{ .did_change = .{ .uri = try alloc.dupe(u8, "file:///t.zig"), .text = try alloc.dupe(u8, "change-v1"), .version = 1 } });
+    try q.push(alloc, .{ .did_change = .{ .uri = try alloc.dupe(u8, "file:///t.zig"), .text = try alloc.dupe(u8, "change-v2"), .version = 2 } });
     // a non-coalesced frame keeps its place AFTER the queued change
     try q.push(alloc, .{ .raw = try alloc.dupe(u8, "request") });
     // a third change replaces v2 in place (still before the request)
-    try q.push(alloc, .{ .did_change = .{ .text = try alloc.dupe(u8, "change-v3"), .version = 3 } });
+    try q.push(alloc, .{ .did_change = .{ .uri = try alloc.dupe(u8, "file:///t.zig"), .text = try alloc.dupe(u8, "change-v3"), .version = 3 } });
 
     const a = q.pop().?;
     defer a.deinit(alloc);
@@ -1138,6 +1228,7 @@ fn cleanupClient(alloc: std.mem.Allocator, c: *Client) void {
     c.queue.deinit(alloc);
     c.out.deinit(alloc);
     c.pending.deinit(alloc);
+    if (c.open_docs) |*od| od.deinit();
     alloc.free(c.uri);
 }
 
@@ -1154,8 +1245,8 @@ test "didOpen/didChange: document version is monotonic (1, 2, 3, ...)" {
     defer cleanupClient(alloc, &client);
 
     try client.didOpen("hello");
-    try client.didChange("hello!");
-    try client.didChange("hello!!");
+    try client.didChange(null, "hello!");
+    try client.didChange(null, "hello!!");
 
     var reader = FrameReader.init(alloc, read_end, io);
     defer reader.deinit();

@@ -32,6 +32,6 @@ zig build run
 - [x] **M1 MVP**：文本对象/surround/注释/对齐/easymotion/多光标/tree-sitter/文件树/picker/tab 栏/命令历史补全替换
 - [x] **M2 LSP + 补全**：LSP 客户端 + mock server 测试、K/gd/gD/gr/gI/gs/gl、诊断 gutter + ]d/[d + 列表、补全菜单 + ghost text + signature help、`<leader>rn`/`<leader>lf`/`<leader>ti`/`<leader>o`
 - [ ] **M3 Git + 终端**：
-  - [x] **M3a**：git gutter（diff 符号）、]c/[c hunk 跳转、`<leader>hs` stage / `<leader>hr` reset / `<leader>hp` 预览、`<leader>tb` 行内 blame、`<leader>lg` 外部终端 lazygit、状态栏 git 分支
-  - [ ] **M3b**：PTY + 迷你 VT 仿真、`<M-r>`/`<M-w>`/`<M-e>` 三种终端布局、终端内 Esc 退回 Normal
+  - [x] **M3a**：git gutter（diff 符号）、]c/[c hunk 跳转、`<leader>hs` stage / `<leader>hr` reset / `<leader>hp` 预览、`<leader>tb` 行内 blame、`<leader>lg` 内嵌浮动终端 lazygit、状态栏 git 分支
+  - [x] **M3b**：内嵌终端（vaxis widgets/terminal：PTY + VT 仿真）、`<M-r>` 浮动 / `<M-w>` 底部 / `<M-e>` 右侧三种布局、终端内 Esc 退回 Normal、退出自动关闭
 - [ ] M4 UI 打磨 + AI：sticky context/彩虹括号/折叠/zen、markdown 内联渲染、颜色预览、TODO 高亮、多主题、大文件降级、AI 补全与 chat

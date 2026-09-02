@@ -149,7 +149,12 @@ pub const entries: []const Entry = &.{
     .{ .keys = "space hr", .desc = "Reset 当前 hunk", .group = "Git" },
     .{ .keys = "space hp", .desc = "预览当前 hunk 的 diff", .group = "Git" },
     .{ .keys = "space tb", .desc = "行内 blame 开关", .group = "Git" },
-    .{ .keys = "space lg", .desc = "外部终端启动 lazygit", .group = "Git" },
+    .{ .keys = "space lg", .desc = "内嵌浮动终端启动 lazygit", .group = "Git" },
+
+    // ---- 内嵌终端 ----
+    .{ .keys = "alt-r", .desc = "开关浮动终端", .group = "终端" },
+    .{ .keys = "alt-w", .desc = "开关底部水平终端 (30% 高)", .group = "终端" },
+    .{ .keys = "alt-e", .desc = "开关右侧垂直终端 (40% 宽)", .group = "终端" },
 
     // ---- 窗口 ----
     .{ .keys = "ctrl-w h l", .desc = "窗口焦点向左/右（有文件树时切换树焦点）", .group = "窗口" },

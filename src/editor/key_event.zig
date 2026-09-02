@@ -141,7 +141,11 @@ pub const ActionId = enum {
     hunk_reset, // <leader>hr — reset the hunk under the cursor
     hunk_preview, // <leader>hp — preview the hunk under the cursor (float)
     blame_toggle, // <leader>tb — toggle inline blame
-    git_lazygit, // <leader>lg — launch lazygit in an external terminal
+    git_lazygit, // <leader>lg — launch lazygit in the embedded terminal
+    // M3b embedded terminal layouts
+    term_float, // <M-r> — toggle the floating terminal
+    term_bottom, // <M-w> — toggle the bottom terminal (30% height)
+    term_right, // <M-e> — toggle the right terminal (40% width)
     noop,
 };
 
