@@ -8903,8 +8903,9 @@ const App = struct {
                 if (wline < self.curViewTop().* or wline >= self.curViewTop().* + content_rows) continue;
                 var p = w.start;
                 while (p < w.end) {
-                    // byte offset -> cell column (CJK word = 3 bytes/2 cells)
-                    const col = self.lineCellCol(win, wline, p);
+                    // byte offset -> SCREEN cell column (CJK word = 3 bytes/2
+                    // cells; inlay hints before it shift the cells right)
+                    const col = self.screenCellCol(win, wline, p);
                     if (col >= @as(u32, win.width) - gutter) break;
                     var clen: u32 = 1;
                     while (p + clen < w.end and (self.cur().pt.byteAt(p + clen) & 0xC0) == 0x80) : (clen += 1) {}
@@ -8925,10 +8926,12 @@ const App = struct {
             for (self.em_matches) |m| {
                 const mline = self.cur().pt.lineOf(m.pos);
                 if (mline < self.curViewTop().* or mline >= self.curViewTop().* + content_rows) continue;
-                // byte offset -> cell column: a CJK char before the match is
-                // 3 bytes but 2 cells, so a raw byte column would paint the
-                // label on the wrong cell
-                const col_in_line = self.lineCellCol(win, mline, m.pos);
+                // byte offset -> SCREEN cell column: a CJK char before the
+                // match is 3 bytes but 2 cells, and an inlay hint before it
+                // occupies screen cells without buffer bytes — a plain text
+                // column (lineCellCol) paints the label left of the match by
+                // the combined hint width
+                const col_in_line = self.screenCellCol(win, mline, m.pos);
                 const label = try a.dupe(u8, &[_]u8{m.label});
                 win.writeCell(@intCast(cur_rect.col + gutter + col_in_line), @intCast(cur_rect.row + mline - self.curViewTop().*), .{
                     .char = .{ .grapheme = label, .width = 1 },
