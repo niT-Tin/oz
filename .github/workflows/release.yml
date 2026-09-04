@@ -72,6 +72,8 @@ jobs:
             [ "$ok" = 1 ] || { echo "all Zig download sources failed"; exit 1; }
           fi
           tar -xf "$file"
+          # GITHUB_PATH 只影响后续步骤；本步骤内先手动 export 以便校验
+          export PATH="$PWD/zig-${triple}-${ZIG_VERSION}:$PATH"
           echo "$PWD/zig-${triple}-${ZIG_VERSION}" >> "$GITHUB_PATH"
           zig version
 
