@@ -179,9 +179,20 @@ pub fn leadingIndent(self: *App, line: u32) ![]u8 {
 /// to the pre-edit text, so a leftover hint would render at the wrong spot
 /// (an inserted line pushes every hint down by one). The auto-refresh in
 /// the run loop re-requests hints for the new viewport.
+///
+/// Also runs on every buffer/window switch (switchTo, switchWindowTo,
+/// closeBufferAt, teardownLsp): the list then holds the PREVIOUS buffer's
+/// hints, which must never render over the newly focused buffer — the
+/// switch's inlay_buf tag is cleared here so renderers stop drawing them,
+/// and the band fields are reset so the run loop re-requests for the new
+/// buffer. adjustInlayHintsInsert/Delete keep operating on whatever list
+/// is present — by construction it can only hold the CURRENT buffer's
+/// hints (an accepted response is tagged with the buffer it was fetched
+/// for, and any switch that would change that clears the list first).
 pub fn invalidateInlayHints(self: *App) void {
     for (self.inlay_hints.items) |*h| self.alloc.free(h.label);
     self.inlay_hints.clearRetainingCapacity();
+    self.inlay_buf = null;
     self.inlay_view_top = null;
     self.inlay_stale = true;
 }

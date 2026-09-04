@@ -155,17 +155,29 @@ pub fn processFormat(self: *App) bool {
     return true;
 }
 
-/// <leader>ti: request inlay hints for the current line.
+/// <leader>ti (and the run loop's auto-refresh): request inlay hints for
+/// the focused window's visible lines. The request range covers the whole
+/// viewport plus a margin above and below (a "band"): the hints arrive in
+/// one round trip and small scrolls inside the band render from the
+/// stored set instead of re-requesting per row. The end line is clamped
+/// below the document's line count — naming the past-the-last-line
+/// position stalls strict servers (zls).
 pub fn requestInlayHints(self: *App) !void {
     const client = self.lsp_client orelse return;
     if (!client.caps_inlay) return; // server doesn't support inlay hints
     const uri = lsp_types.pathToFileUri(self.alloc, self.cur().path orelse return) catch return;
     defer self.alloc.free(uri);
-    // request the visible line range; clamp the end to a real line so
-    // strict servers (zls) don't stall on an out-of-range end line
     const top = self.curViewTop().*;
     const line_count = self.cur().pt.lineCount();
-    const bottom = if (line_count == 0) 0 else @min(top + 24, line_count) - 1;
+    if (line_count == 0) return;
+    const height = self.focusedWinHeight();
+    const margin: u32 = 12;
+    const band_top = top -| margin;
+    // exclusive end line; clamped so the request never names the
+    // lineCount-th line (a "real line" only, see above). Lines
+    // [band_top, band_end) are covered.
+    const want_end = @as(u64, top) + height + margin;
+    const band_end: u32 = @intCast(@min(want_end, line_count - 1));
     var td = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
     errdefer td.deinit(self.alloc);
     const uri_copy = try self.alloc.dupe(u8, uri);
@@ -175,11 +187,11 @@ pub fn requestInlayHints(self: *App) !void {
     errdefer range.deinit(self.alloc);
     var start = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
     errdefer start.deinit(self.alloc);
-    try start.put(self.alloc, "line", .{ .integer = top });
+    try start.put(self.alloc, "line", .{ .integer = band_top });
     try start.put(self.alloc, "character", .{ .integer = 0 });
     var end = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
     errdefer end.deinit(self.alloc);
-    try end.put(self.alloc, "line", .{ .integer = bottom });
+    try end.put(self.alloc, "line", .{ .integer = band_end });
     try end.put(self.alloc, "character", .{ .integer = 0 });
     try range.put(self.alloc, "start", .{ .object = start });
     try range.put(self.alloc, "end", .{ .object = end });
@@ -191,6 +203,12 @@ pub fn requestInlayHints(self: *App) !void {
     defer self.freeSimpleDocParams(&params_value);
     client.request("textDocument/inlayHint", params_value, &self.inlay_slot) catch return;
     self.inlay_req_seq = self.edit_seq;
+    self.inlay_inflight = true;
+    // the request describes the FOCUSED buffer: its response may only be
+    // installed while that buffer is still current (see processInlay)
+    self.inlay_req_buf = self.current;
+    self.inlay_view_top = band_top;
+    self.inlay_view_end = band_end;
 }
 
 /// Consume an inlayHint response: collect (line, character, label) hints
@@ -199,6 +217,11 @@ pub fn processInlay(self: *App) bool {
     var result = self.inlay_slot orelse {
         return false;
     };
+    // The in-flight request is over (its response — or error — arrived).
+    // The run loop's auto-refresh may issue the next request again; if the
+    // response was for an older band than the current viewport, that check
+    // re-requests immediately.
+    self.inlay_inflight = false;
     defer {
         json_rpc.freeValue(self.alloc, &result);
         self.inlay_slot = null;
@@ -208,9 +231,21 @@ pub fn processInlay(self: *App) bool {
     // hints stay rendered, and the next quiescent request replaces them.
     // Applying it would jump the hints to pre-edit positions (flicker).
     if (self.edit_seq != self.inlay_req_seq) return true;
+    // The response is for a request sent while a DIFFERENT buffer was
+    // current (a buffer/window switch happened mid-flight — the request's
+    // doc no longer matches cur()). Its hints describe that buffer's
+    // lines, so installing them would let foreign hints into the list;
+    // invalidateInlayHints (run by the switch) already cleared the list
+    // and the band, and dropping here lets the run loop's band check
+    // issue the re-request for the now-focused buffer.
+    const req_buf = self.inlay_req_buf orelse return true;
+    if (req_buf != self.current) return true;
     // The response matches the current document: the hints are no longer
-    // stale, so renderers may draw them again.
+    // stale, so renderers may draw them again. The list now belongs to
+    // the current buffer — record that so other windows showing a
+    // different buffer do not splice these hints into their own text.
     self.inlay_stale = false;
+    self.inlay_buf = self.current;
     for (self.inlay_hints.items) |*h| self.alloc.free(h.label);
     self.inlay_hints.clearRetainingCapacity();
     if (result != .array) {

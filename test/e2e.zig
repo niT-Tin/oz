@@ -37,6 +37,13 @@ const Pty = struct {
     slave: std.posix.fd_t,
 
     fn open() !Pty {
+        return openRows(24);
+    }
+
+    /// Open a pty with a custom height (rows). Most tests use the default
+    /// 24-row terminal; the inlay-viewport tests need a taller one so the
+    /// request window's coverage of the visible rows is observable.
+    fn openRows(rows: u16) !Pty {
         const master = try std.posix.openat(
             std.posix.AT.FDCWD,
             "/dev/ptmx",
@@ -58,7 +65,7 @@ const Pty = struct {
         );
         errdefer _ = linux.close(slave);
         // give the pty a window size so the child's terminal queries succeed
-        const ws = Winsize{ .ws_row = 24, .ws_col = 80, .ws_xpixel = 0, .ws_ypixel = 0 };
+        const ws = Winsize{ .ws_row = rows, .ws_col = 80, .ws_xpixel = 0, .ws_ypixel = 0 };
         _ = linux.ioctl(master, TIOCSWINSZ, @intFromPtr(&ws));
         return .{ .master = master, .slave = slave };
     }
@@ -226,7 +233,12 @@ const Session = struct {
     }
 
     fn spawnEnv(io: Io, argv: []const []const u8, env_extra: ?[]const []const u8) !Session {
-        var pty = try Pty.open();
+        return spawnEnvRows(io, argv, env_extra, 24);
+    }
+
+    /// spawnEnv with a custom pty height (rows).
+    fn spawnEnvRows(io: Io, argv: []const []const u8, env_extra: ?[]const []const u8, rows: u16) !Session {
+        var pty = try Pty.openRows(rows);
         errdefer pty.close();
         const pid = spawnChildEnv(io, &pty, argv, env_extra) catch |e| {
             pty.close();
@@ -382,13 +394,20 @@ const Grid = struct {
     pending_len: usize = 0,
 
     fn init(alloc: std.mem.Allocator) !Grid {
-        const buf = try alloc.alloc(u8, 24 * 80 * 4);
+        return initSized(alloc, 24);
+    }
+
+    /// init with a custom terminal height (rows); the inlay-viewport tests
+    /// run a 40-row terminal so a request window narrower than the viewport
+    /// leaves visible rows without hints.
+    fn initSized(alloc: std.mem.Allocator, rows: usize) !Grid {
+        const buf = try alloc.alloc(u8, rows * 80 * 4);
         @memset(buf, 0);
-        const fg_buf = try alloc.alloc(u32, 24 * 80);
+        const fg_buf = try alloc.alloc(u32, rows * 80);
         @memset(fg_buf, 0);
-        const bg_buf = try alloc.alloc(u32, 24 * 80);
+        const bg_buf = try alloc.alloc(u32, rows * 80);
         @memset(bg_buf, 0);
-        return .{ .buf = buf, .fg_buf = fg_buf, .bg_buf = bg_buf, .alloc = alloc };
+        return .{ .rows = rows, .buf = buf, .fg_buf = fg_buf, .bg_buf = bg_buf, .alloc = alloc };
     }
 
     fn deinit(self: *Grid, alloc: std.mem.Allocator) void {
@@ -10700,6 +10719,501 @@ test "lsp: editing — rename, format, inlay hints, outline" {
         sess.used += n;
     }
     try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
+}
+
+// Inlay-viewport coverage regression: the inlayHint request must span the
+// FOCUSED WINDOW's full height (not a hard-coded 24 lines). A 40-row
+// terminal shows 38 content rows; after G to the bottom of a 130-line
+// file, lines ~92-129 are visible and hints must appear on lines far
+// below the old top+24 request window (rows 25+ of the viewport used to
+// stay hintless forever — the "below ~100 lines nothing has inlay hints"
+// report).
+test "lsp: inlay hints cover the whole viewport in a tall window" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}tall.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        var content = std.ArrayList(u8).empty;
+        defer content.deinit(alloc);
+        var line_buf: [64]u8 = undefined;
+        var i: u32 = 0;
+        while (i < 130) : (i += 1) {
+            const line = try std.fmt.bufPrint(&line_buf, "const v{d} = {d};\n", .{ i, i });
+            try content.appendSlice(alloc, line);
+        }
+        try f.writeStreamingAll(io, content.items);
+    }
+
+    var sess = try Session.spawnEnvRows(io, &.{ oz_exe_path, name }, &.{ "OZ_LSP_CMD=zig-out/bin/mock_lsp", "OZ_MOCK_SCRIPT=inlay_range" }, 40);
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.initSized(alloc, 40);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // LSP up: the auto-request for the top viewport band returns hints
+    // echoing the mock's recorded text (": v0 = 0;" on line 0).
+    waited = 0;
+    while (!grid.contains(": v0 = 0;const")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains(": v0 = 0;const")) break;
+    }
+    if (!grid.contains(": v0 = 0;const")) {
+        std.debug.print("inlay hint missing at top:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains(": v0 = 0;const"));
+
+    // G → the file bottom. The viewport now shows lines ~92-129; hints for
+    // lines below the old top+24 window (e.g. v125/v128) must appear —
+    // before the fix the request covered only top..top+23, leaving every
+    // lower row of a tall window without hints.
+    try sess.send("G");
+    waited = 0;
+    while (!grid.contains("v129 = 129;")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains("v129 = 129;")) break;
+    }
+    if (!grid.contains("v129 = 129;")) {
+        std.debug.print("G did not reach the file bottom:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("v129 = 129;"));
+
+    waited = 0;
+    var bottom_hints = false;
+    while (!bottom_hints) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains(": v125") and grid.contains(": v128")) bottom_hints = true;
+    }
+    if (!bottom_hints) {
+        std.debug.print("bottom-of-viewport inlay hints missing:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(bottom_hints);
+
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+// Focus-switch LSP regression: switching windows with Ctrl-w (windows
+// showing DIFFERENT buffers) must retarget the single LSP client to the
+// newly focused buffer. Without that, the client's current document stays
+// the previous window's file: didChange edits from the focused window
+// reach the WRONG document on the server, whose copy of the edited file
+// goes stale — so its inlay hints (and hover/diagnostics) silently refer
+// to old text. Flow: :vs → :e B (lands LEFT) → Ctrl-w l (right = A) →
+// edit A → Ctrl-w h (left = B) → <leader>ti. The mock echoes its
+// recorded text: a didChange that wrongly targeted B leaves B's copy
+// corrupted with A's edit (": b0 = 0;x") while the correct flow leaves
+// it clean (": b0 = 0;").
+test "lsp: Ctrl-w focus switch retargets the client to the window's buffer" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name_a = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}left.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    var name_buf2: [128:0]u8 = undefined;
+    const name_b = try std.fmt.bufPrintZ(&name_buf2, "/tmp/oz_e2e_{d}_{d}right.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name_a) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, name_b) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name_a, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const a0 = 0;\nconst a1 = 1;\nconst a2 = 2;\n");
+    }
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name_b, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const b0 = 0;\nconst b1 = 1;\nconst b2 = 2;\n");
+    }
+
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name_a }, &.{ "OZ_LSP_CMD=zig-out/bin/mock_lsp", "OZ_MOCK_SCRIPT=inlay_range" });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // LSP up on A: the auto-request echoes A's recorded line 0.
+    waited = 0;
+    while (!grid.contains(": a0 = 0;const")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains(": a0 = 0;const")) break;
+    }
+    if (!grid.contains(": a0 = 0;const")) {
+        std.debug.print("LSP never attached on A:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains(": a0 = 0;const"));
+
+    // :vs — both windows show A (focus moves to the right window). The
+    // pane separator column marks the split (row text alone is ambiguous:
+    // inlay labels echo the line content).
+    try sess.send(":vs\r");
+    waited = 0;
+    var split = false;
+    while (!split) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (rowContains(&grid, 1, "│")) split = true;
+    }
+    if (!split) {
+        std.debug.print("after :vs:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(split);
+
+    // :e B — lands in the LEFT window (firstLeaf) and retargets the client
+    // to B (switchTo → ensureLsp). The right window keeps showing A.
+    try sess.send(":e ");
+    try sess.send(name_b);
+    try sess.send("\r");
+    waited = 0;
+    while (!grid.contains("const b0 = 0;")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 6000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains("const b0 = 0;")) break;
+    }
+    if (!grid.contains("const b0 = 0;")) {
+        std.debug.print(":e B did not open:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("const b0 = 0;"));
+
+    // Focus the RIGHT window (A) with Ctrl-w l. This is the regression
+    // step: the focused buffer changes A←B without a buffer switch, so the
+    // LSP client must be retargeted here.
+    try sess.send("\x17l");
+    // append 'x' at the end of A's line 0: "const a0 = 0;x"
+    try sess.send("Ax\x1b");
+    waited = 0;
+    while (!grid.contains("const a0 = 0;x")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 6000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains("const a0 = 0;x")) break;
+    }
+    if (!grid.contains("const a0 = 0;x")) {
+        std.debug.print("edit in the right window did not land:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("const a0 = 0;x"));
+
+    // Focus the LEFT window (B) again — another retarget point — and ask
+    // for hints. The mock answers from its RECORDED copy of B: correct
+    // behavior ("b0 = 0;" — A's edit synced to A) vs. the bug (": b0 = 0;x"
+    // — A's didChange was sent against B's uri and corrupted its copy).
+    try sess.send("\x17h");
+    try sess.send(" ti");
+    waited = 0;
+    var b_hint = false;
+    while (!b_hint) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains(": b0 = 0;const b0")) b_hint = true;
+    }
+    if (!b_hint) {
+        std.debug.print("B's hint missing or corrupted (didChange misrouted):\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(b_hint);
+    try std.testing.expect(!grid.contains(": b0 = 0;x"));
+
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+// Cross-buffer inlay-hint regression (the "right window inlay hints are
+// misaligned" report): the stored hints are homogeneous — they all belong
+// to whichever buffer was FOCUSED when they were fetched — so a split
+// window showing a DIFFERENT buffer must never splice them into its own
+// text (same line numbers, but the labels and byte columns describe the
+// OTHER document). Flow: :vs → :e R (lands LEFT, focused; hints load for
+// R) → the RIGHT window (still showing L) must render NO R hints; then
+// Ctrl-w l (RIGHT = L focused; hints load for L) → the LEFT window
+// (still showing R) must render NO L hints. The mock's `inlay_range`
+// script echoes the requested file's own content as labels (": r0 = 0;"
+// for "const r0 = 0;"), so a foreign splice is directly visible as
+// "<label>const <other file>" text in the wrong pane.
+test "lsp: split windows with different buffers never splice foreign inlay hints" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name_l = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}lft.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    var name_buf2: [128:0]u8 = undefined;
+    const name_r = try std.fmt.bufPrintZ(&name_buf2, "/tmp/oz_e2e_{d}_{d}rgt.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name_l) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, name_r) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name_l, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const l0 = 0;\nconst l1 = 1;\nconst l2 = 2;\n");
+    }
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name_r, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const r0 = 0;\nconst r1 = 1;\nconst r2 = 2;\n");
+    }
+
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name_l }, &.{ "OZ_LSP_CMD=zig-out/bin/mock_lsp", "OZ_MOCK_SCRIPT=inlay_range" });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // LSP up on L: hints echo L's recorded text on the single window.
+    waited = 0;
+    while (!grid.contains(": l0 = 0;const l0")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains(": l0 = 0;const l0")) break;
+    }
+    if (!grid.contains(": l0 = 0;const l0")) {
+        std.debug.print("LSP never attached on L:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains(": l0 = 0;const l0"));
+
+    // :vs — both windows show L; the RIGHT (new, focused) window is the
+    // one whose text must never carry foreign hints later. Content rows
+    // start at grid row 1 (below the tab bar), so the pane separator "│"
+    // lands there — row-scoped to ignore tab-bar separators.
+    try sess.send(":vs\r");
+    waited = 0;
+    var split = false;
+    while (!split) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (rowContains(&grid, 1, "│")) split = true;
+    }
+    if (!split) {
+        std.debug.print("after :vs:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(split);
+
+    // :e R — lands in the LEFT window (firstLeaf) and retargets the LSP
+    // client to R. The LEFT window is focused, so R's hints load there;
+    // the RIGHT window still shows L.
+    try sess.send(":e ");
+    try sess.send(name_r);
+    try sess.send("\r");
+    waited = 0;
+    while (!grid.contains("const r0 = 0;")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 6000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains("const r0 = 0;")) break;
+    }
+    if (!grid.contains("const r0 = 0;")) {
+        std.debug.print(":e R did not open:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("const r0 = 0;"));
+
+    // Wait until R's hints are actually loaded (visible in the LEFT
+    // pane). Once loaded, the RIGHT pane (showing L) must contain NONE of
+    // them: before the fix the whole list is drawn in every window, so L's
+    // "const l0 = 0;" row became ": r0 = 0;const l0 = 0;" — a foreign
+    // label spliced over L's text.
+    waited = 0;
+    var r_hint = false;
+    while (!r_hint) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains(": r0 = 0;const r0")) r_hint = true;
+    }
+    if (!r_hint) {
+        std.debug.print("R's hints never loaded in the left pane:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(r_hint);
+    // Let any trailing repaint land before asserting the absence.
+    waited = 0;
+    while (waited < 600) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+    }
+    // The RIGHT window still shows L's own text (sanity).
+    try std.testing.expect(grid.contains("const l0 = 0;"));
+    // THE FIX: no foreign R label may ever sit in front of L's text.
+    if (grid.contains(": r0 = 0;const l0")) {
+        std.debug.print("foreign R hint spliced into L's text in the right pane:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(!grid.contains(": r0 = 0;const l0"));
+
+    // Focus the RIGHT window (L) with Ctrl-w l — a window-focus buffer
+    // switch; L's hints load there now. The LEFT window (still showing R)
+    // must render none of them.
+    try sess.send("\x17l");
+    waited = 0;
+    var l_hint = false;
+    while (!l_hint) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        if (grid.contains(": l0 = 0;const l0")) l_hint = true;
+    }
+    if (!l_hint) {
+        std.debug.print("L's hints never loaded in the right pane after Ctrl-w l:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(l_hint);
+    waited = 0;
+    while (waited < 600) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+        } else {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+    }
+    // The LEFT window still shows R's own text (sanity).
+    try std.testing.expect(grid.contains("const r0 = 0;"));
+    // THE FIX, mirrored: no foreign L label in front of R's text.
+    if (grid.contains(": l0 = 0;const r0")) {
+        std.debug.print("foreign L hint spliced into R's text in the left pane:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(!grid.contains(": l0 = 0;const r0"));
+
+    const exit_code2 = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code2);
 }
 
 test "command mode: Tab completes command names, cycles, keeps path completion" {

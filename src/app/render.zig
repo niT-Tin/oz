@@ -221,11 +221,17 @@ pub fn screenCellCol(self: *App, win: vaxis.Window, line: u32, byte_pos: u32) u3
     // hints anchored before the cursor widen the cursor's cell column.
     // hint.character is a byte column (see processInlay), so compare it
     // with the cursor's byte offset within the line — not a cell column.
+    // screenCellCol is only ever queried for the FOCUSED window / current
+    // buffer, so count hints only when they belong to that buffer (the
+    // same inlay_buf filter the text renderer applies): a foreign
+    // buffer's hints are not drawn here and must not shift the cursor.
     const ls = self.cur().pt.lineStart(line);
     const in_line = if (byte_pos >= ls) byte_pos - ls else 0;
-    for (self.inlay_hints.items) |hint| {
-        if (hint.line == line and hint.character <= in_line) {
-            col += self.textWidth(win, hint.label);
+    if (!self.inlay_stale and self.inlay_buf == self.current) {
+        for (self.inlay_hints.items) |hint| {
+            if (hint.line == line and hint.character <= in_line) {
+                col += self.textWidth(win, hint.label);
+            }
         }
     }
     self.cell_col_memo = .{ .line = line, .pos = byte_pos, .col = col, .valid = true };
@@ -709,7 +715,18 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         // column. `inlay_stale` only hides them for the brief window
         // after a buffer switch / invalidation until a fresh response
         // lands — NOT on insert exit (that caused the jk vanish flash).
-        const line_hints = if (self.inlay_stale)
+        //
+        // The stored hints are homogeneous — they all describe the buffer
+        // `inlay_buf` names (the last accepted response's buffer, i.e.
+        // whichever buffer was FOCUSED when its hints were fetched). THIS
+        // window renders them only while it shows that buffer: a split
+        // window displaying a DIFFERENT buffer must not splice hints whose
+        // line numbers and byte columns were computed against another
+        // document's text (inlay hints "misaligned" over the wrong text).
+        // Hints for the unfocused window are simply not loaded — only the
+        // focused window requests (single-document LSP client) — so that
+        // window renders none, which is correct.
+        const line_hints = if (self.inlay_stale or self.inlay_buf != w.buf)
             &.{}
         else
             try self.lineHints(a, line);
@@ -2713,13 +2730,35 @@ pub fn run(self: *App) !void {
             last_render_ms = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
             continue;
         }
-        // Auto-refresh inlay hints when the view scrolls (LSP available
-        // and the visible top line changed since the last request).
-        if (self.lsp_client != null) {
-            const top = self.curViewTop().*;
-            if (self.inlay_view_top == null or self.inlay_view_top.? != top) {
-                self.inlay_view_top = top;
-                try self.requestInlayHints();
+        // Auto-refresh inlay hints when the view scrolls (LSP available and
+        // the visible range left the band covered by the last request — see
+        // requestInlayHints). While a request is in flight the refresh is
+        // SKIPPED: fast scrolling must not pile superseded requests into the
+        // server queue (zls would compute and discard each one, delaying the
+        // hints for the viewport the user actually stopped at); the band
+        // check below fires again as soon as the response lands.
+        if (self.lsp_client) |client| {
+            if (client.caps_inlay and !self.inlay_inflight) {
+                const top = self.curViewTop().*;
+                var in_band = false;
+                if (self.inlay_view_top) |band_top| {
+                    if (self.inlay_view_end) |band_end| {
+                        if (top >= band_top) {
+                            // The request reached the last line of the
+                            // document (EOF clamp): nothing more can be
+                            // fetched, so the band is always "enough" no
+                            // matter how tall the viewport is.
+                            const line_count = self.cur().pt.lineCount();
+                            if (band_end + 1 >= line_count) {
+                                in_band = true;
+                            } else {
+                                const viewport_last = @as(u64, top) + self.focusedWinHeight();
+                                in_band = viewport_last <= band_end;
+                            }
+                        }
+                    }
+                }
+                if (!in_band) try self.requestInlayHints();
             }
         }
         // poll + drain: block until an event arrives (keypress OR an

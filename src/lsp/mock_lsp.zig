@@ -56,12 +56,23 @@ pub const Script = enum {
     /// or the server keeps analyzing "jconst …" forever (stale
     /// diagnostics / inlay hints computed against text that never existed).
     jk_sync,
+    /// Range-respecting inlay hints that echo the server's RECORDED text:
+    /// textDocument/inlayHint returns one hint per line of the REQUESTED
+    /// range (clamped to the recorded document), label = ": <line content
+    /// minus its first word>", anchored at character 0. Because the label
+    /// derives from the recorded copy of the REQUESTED uri, a test can
+    /// verify (a) which lines the editor asked for — coverage of the whole
+    /// viewport — and (b) whether didChange edits reached the right
+    /// document (a stale copy yields stale labels). Script `hello` keeps
+    /// its fixed line-0 ": i32" hint for the older tests.
+    inlay_range,
 
     pub fn parse(name: []const u8) ?Script {
         if (std.mem.eql(u8, name, "hello")) return .hello;
         if (std.mem.eql(u8, name, "silent")) return .silent;
         if (std.mem.eql(u8, name, "clear_on_change")) return .clear_on_change;
         if (std.mem.eql(u8, name, "jk_sync")) return .jk_sync;
+        if (std.mem.eql(u8, name, "inlay_range")) return .inlay_range;
         return null;
     }
 };
@@ -99,6 +110,7 @@ pub const State = struct {
 
 /// Result of handling one incoming message: zero or more outgoing frame
 /// *bodies* (allocator-owned JSON content, no headers). Call `deinit`.
+
 pub const Outcome = struct {
     frames: std.ArrayList([]u8) = .empty,
 
@@ -215,7 +227,13 @@ pub fn handleMessage(
             // The mock replaces the whole document with a fixed rename edit.
             try pushResponse(alloc, &out, id, try buildRenameResult(a, state));
         } else if (std.mem.eql(u8, method, "textDocument/inlayHint")) {
-            try pushResponse(alloc, &out, id, try buildInlayResult(a));
+            if (script == .inlay_range) {
+                // Echo the recorded text of the REQUESTED uri, one hint per
+                // line of the requested range (see Script.inlay_range).
+                try pushResponse(alloc, &out, id, try buildRangeInlayResult(a, state, msg.params));
+            } else {
+                try pushResponse(alloc, &out, id, try buildInlayResult(a));
+            }
         } else if (std.mem.eql(u8, method, "textDocument/documentSymbol")) {
             try pushResponse(alloc, &out, id, try buildSymbolResult(a));
         } else {
@@ -590,6 +608,83 @@ fn buildInlayResult(a: std.mem.Allocator) !std.json.Value {
     try hint.put(a, "label", .{ .string = ": i32" });
     var hints = std.json.Array.init(a);
     try hints.append(.{ .object = hint });
+    return .{ .array = hints };
+}
+
+/// The server's latest recorded full text for `uri` (borrowed from state;
+/// seeded by didOpen, updated by every didChange).
+fn recordedTextOf(state: *State, uri: []const u8) ?[]const u8 {
+    var i = state.changed.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (std.mem.eql(u8, state.changed.items[i].uri, uri)) return state.changed.items[i].text;
+    }
+    return null;
+}
+
+/// Parse the `line` member of an LSP position object (tolerates both
+/// `.integer` and the codebase's `.number_string`).
+fn posLineOf(v: std.json.Value, out: *u32) bool {
+    if (v != .object) return false;
+    const line_v = v.object.get("line") orelse return false;
+    const n = jsonInt(line_v) orelse return false;
+    if (n < 0) return false;
+    out.* = @intCast(n);
+    return true;
+}
+
+/// One inlay hint anchored at character 0 of `line`, whose label echoes
+/// `content` minus its first word (": v105 = 105;" for a recorded line
+/// "const v105 = 105;"). Returns false when the line carries nothing to
+/// annotate (blank, single-token, or whitespace-only tail).
+fn appendEchoHint(a: std.mem.Allocator, hints: *std.json.Array, line: u32, content: []const u8) !bool {
+    var i: usize = 0;
+    while (i < content.len and content[i] != ' ' and content[i] != '\t') i += 1; // first word
+    if (i == content.len) return false; // single-token line (brace, etc.)
+    while (i < content.len and (content[i] == ' ' or content[i] == '\t')) i += 1; // gap
+    if (i == content.len) return false; // whitespace-only tail
+    const label = try std.fmt.allocPrint(a, ": {s}", .{content[i..]});
+    var hint = try std.json.ObjectMap.init(a, &.{}, &.{});
+    var pos = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try pos.put(a, "line", .{ .integer = @intCast(line) });
+    try pos.put(a, "character", .{ .integer = 0 });
+    try hint.put(a, "position", .{ .object = pos });
+    try hint.put(a, "label", .{ .string = label });
+    try hints.append(.{ .object = hint });
+    return true;
+}
+
+/// `inlay_range` script: answer textDocument/inlayHint with one echo hint
+/// per line of the REQUESTED range, computed from the server's recorded
+/// copy of the REQUESTED uri. Empty result for a never-opened document or
+/// an unparsable request.
+fn buildRangeInlayResult(a: std.mem.Allocator, state: *State, params: ?std.json.Value) !std.json.Value {
+    var hints = std.json.Array.init(a);
+    errdefer hints.deinit();
+    const p = params orelse return .{ .array = hints };
+    if (p != .object) return .{ .array = hints };
+    const td = p.object.get("textDocument") orelse return .{ .array = hints };
+    if (td != .object) return .{ .array = hints };
+    const uri_v = td.object.get("uri") orelse return .{ .array = hints };
+    if (uri_v != .string) return .{ .array = hints };
+    const range = p.object.get("range") orelse return .{ .array = hints };
+    if (range != .object) return .{ .array = hints };
+    var start_line: u32 = 0;
+    var end_line: u32 = 0;
+    if (!posLineOf(range.object.get("start") orelse return .{ .array = hints }, &start_line)) return .{ .array = hints };
+    if (!posLineOf(range.object.get("end") orelse return .{ .array = hints }, &end_line)) return .{ .array = hints };
+    if (end_line <= start_line) return .{ .array = hints }; // empty range
+    const text = recordedTextOf(state, uri_v.string) orelse return .{ .array = hints };
+    var line: u32 = 0;
+    var line_start: usize = 0;
+    while (line < end_line and line_start <= text.len) : (line += 1) {
+        const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
+        if (line >= start_line) {
+            _ = try appendEchoHint(a, &hints, line, text[line_start..line_end]);
+        }
+        if (line_end == text.len) break;
+        line_start = line_end + 1;
+    }
     return .{ .array = hints };
 }
 

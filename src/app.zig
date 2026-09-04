@@ -426,9 +426,53 @@ pub const App = struct {
     /// <leader>rn: cmdline is collecting the new name; Enter sends rename.
     pending_rename: bool = false,
     /// Owned inlay hints (line/character + label) rendered dim inline.
-    /// Auto-requested for the visible range whenever the view scrolls.
+    /// Auto-requested for the focused window's visible range whenever the
+    /// view scrolls (the request covers a band around the viewport — see
+    /// requestInlayHints — so small scrolls render from the stored hints
+    /// without asking the server again).
+    ///
+    /// The hints in the list are homogeneous: they all describe ONE
+    /// buffer — the one `inlay_buf` names (requestInlayHints fetches for
+    /// the focused window's buffer, and every accepted response REPLACES
+    /// the whole list). A window renders them only while it shows that
+    /// buffer (`inlay_buf == w.buf`); with two split windows showing
+    /// DIFFERENT buffers, the unfocused window must never splice the
+    /// focused buffer's hints — fetched at ITS line numbers/byte columns —
+    /// into its own text (the "right window inlay hints misaligned"
+    /// report). Hints for the other window are simply not loaded: only
+    /// the focused window ever requests (single-document LSP client,
+    /// same "current buffer only" model as diagnostics).
     inlay_hints: std.ArrayList(InlayHint) = .empty,
+    /// buffers.items index of the buffer `inlay_hints` belongs to (the
+    /// buffer the LAST ACCEPTED inlayHint response was fetched for). null
+    /// while the list is empty (never requested, or invalidated by a
+    /// buffer/window switch). lineHints' per-line filter is keyed on
+    /// `line` alone, so this tag is what stops hints fetched for buffer A
+    /// from rendering over buffer B's text at the same line numbers.
+    inlay_buf: ?usize = null,
+    /// Line range [inlay_view_top, inlay_view_end) covered by the LAST
+    /// sent inlayHint request (its response only carries hints inside the
+    /// requested range). The run loop re-requests when the focused
+    /// viewport leaves this band. null until the first request.
     inlay_view_top: ?u32 = null,
+    inlay_view_end: ?u32 = null,
+    /// True while an inlayHint request is in flight (sent, response not
+    /// yet consumed). The run loop skips the auto-refresh while true:
+    /// fast scrolling must not pile superseded requests into the server
+    /// queue (each would be computed and dropped) — the response to the
+    /// newest band is enough, and the band check re-requests when it
+    /// arrives while the viewport has moved outside the band.
+    inlay_inflight: bool = false,
+    /// buffers.items index of the buffer the LAST SENT inlayHint request
+    /// targeted (== self.current when requestInlayHints ran). processInlay
+    /// accepts a response only when this still names the CURRENT buffer:
+    /// a buffer/window switch mid-flight must not install the previous
+    /// buffer's hints (invalidateInlayHints cleared the list on the
+    /// switch, and the re-request for the newly focused buffer has not
+    /// landed yet). Left stale on purpose — invalidate does NOT clear it,
+    /// or a response that raced a switch-then-switch-back could not be
+    /// matched against the buffer it was fetched for.
+    inlay_req_buf: ?usize = null,
     /// Scope-highlight animation state (null when idle / no scope). Restarted
     /// whenever the focused window's scope block changes; see ScopeAnim.
     scope_anim: ?ScopeAnim = null,
@@ -952,14 +996,9 @@ pub const App = struct {
         for (self.windows.items, 0..) |w, wi| {
             self.buffers.items[w.buf].last_win = wi;
         }
-        // sync the current buffer/highlighter with the surviving window
-        const b = self.windows.items[self.current_win].buf;
-        if (b != self.current) {
-            self.current = b;
-        }
-        self.state.mode = .normal;
-        self.visual_anchor = null;
-        self.in_insert = false;
+        // sync the current buffer/highlighter (and LSP client) with the
+        // surviving window — same activation as Ctrl-w focus switches
+        self.switchWindowTo(self.current_win);
     }
 
     /// Last-window :q — vim behavior: closing the last window quits the
@@ -971,11 +1010,31 @@ pub const App = struct {
 
     /// Make window `i` the focused one, syncing the current buffer and the
     /// highlighter (vim: the focused window's buffer is "the" current buffer).
+    /// When the window shows a buffer other than the previously current one,
+    /// the FULL per-buffer activation runs — the same set switchTo applies:
+    /// LSP client retarget (ensureLsp), inlay/diagnostic/hover invalidation,
+    /// git status refresh. Without it the single LSP client stays attached to
+    /// the previous window's document after a Ctrl-w switch: didChange edits
+    /// and lsp_synced_rev bookkeeping would target the wrong file, and the
+    /// newly focused buffer's diagnostics/hints/hover would silently go
+    /// stale or missing (its server copy never sees the edits).
     pub fn switchWindowTo(self: *App, i: usize) void {
-        self.current_win = i;
         const b = self.windows.items[i].buf;
-        if (b != self.current) {
+        const changed = b != self.current;
+        self.current_win = i;
+        if (changed) {
             self.current = b;
+            self.ensureLsp();
+            // the newly focused window's cursor/viewport already belong to
+            // this buffer (it has been showing it) — nothing to clamp
+            self.invalidateInlayHints();
+            self.clearDiagnostics();
+            self.clearHover();
+            self.nav_list_active = false;
+            self.freeGrepPreview();
+            self.closeCompletion();
+            self.closeGitPreview();
+            self.scheduleGitStatus();
         }
         self.visual_anchor = null;
         self.in_insert = false;

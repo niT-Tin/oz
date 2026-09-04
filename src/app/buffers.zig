@@ -157,6 +157,9 @@ pub fn teardownLsp(self: *App, died: bool) void {
         c.deinit();
         self.lsp_client = null;
     }
+    // No inlay request can complete anymore — clear the in-flight flag or
+    // the run loop would never auto-refresh hints for the next server.
+    self.inlay_inflight = false;
     // clear every LSP response slot so stale results are not applied
     if (self.nav_slot) |*v| json_rpc.freeValue(self.alloc, v);
     self.nav_slot = null;
@@ -188,6 +191,7 @@ pub fn closeBufferAt(self: *App, buf_idx: usize) void {
         c.deinit();
         self.lsp_client = null;
     }
+    self.inlay_inflight = false;
     var buf = self.buffers.orderedRemove(buf_idx);
     buf.history.deinit();
     buf.pt.deinit();
