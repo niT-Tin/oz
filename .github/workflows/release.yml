@@ -40,19 +40,25 @@ jobs:
         uses: actions/cache@v4
         with:
           path: zig-*.tar.xz
-          key: zig-${{ matrix.target }}-0.16.0
+          key: zig-${{ runner.os }}-${{ runner.arch }}-0.16.0
 
       # 手动安装 Zig 0.16.0（mlugg/setup-zig 的镜像经常 404/502，
       # 且其 action 基于被弃用的 Node 20）：官方源优先，带重试；
       # 失败后依次尝试备用镜像。tar.xz 命中 actions/cache 时秒装。
+      # 注意：下载的 Zig 必须匹配 RUNNER 架构（交叉编译是让本机 zig
+      # 产出别的 target，不是让 target 的 zig 在 runner 上运行）。
       - name: Install Zig 0.16.0
         env:
-          TARGET: ${{ matrix.target }}
           ZIG_VERSION: 0.16.0
         run: |
           set -euo pipefail
-          # "x86_64-linux-gnu.2.31" -> zig 文件名里的 triple "x86_64-linux"
-          triple="${TARGET%-gnu.*}"
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)   triple="x86_64-linux" ;;
+            Linux-ARM64) triple="aarch64-linux" ;;
+            macOS-X64)   triple="x86_64-macos" ;;
+            macOS-ARM64) triple="aarch64-macos" ;;
+            *) echo "unsupported runner: ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
+          esac
           file="zig-${triple}-${ZIG_VERSION}.tar.xz"
           sources=(
             "https://ziglang.org/download/${ZIG_VERSION}/${file}"
