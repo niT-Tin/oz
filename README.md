@@ -89,3 +89,25 @@ Methodology: pty-driven with screen reconstruction, same machine (Apple Silicon,
 | Type 60 chars with LSP attached | 60 ms | 56 ms |
 
 On par with or faster than nvim in every scenario. Key design choices: mmap-backed lazy file loading, PieceTable with incremental line index, incremental tree-sitter parsing, async LSP handshake + writer thread + incremental sync, atomic saves (temp file + rename).
+
+## Download
+
+Prebuilt binaries for Linux (x86_64/arm64) and macOS (x86_64/arm64) are
+attached to each [GitHub Release](https://github.com/niT-Tin/oz/releases) —
+download, extract and run, no Zig needed. To build from source see
+"Build & Run" above.
+
+## License
+
+[MIT](LICENSE) © niT-Tin
+
+## Maintenance
+
+A personal project maintained in spare time — please set expectations
+accordingly:
+
+- Features are driven by my own daily use; bug reports with repro steps are
+  very welcome;
+- Pull requests are reviewed and merged, but on my own schedule;
+- Keybindings / APIs may still change during 0.x;
+- A star is the nicest encouragement.

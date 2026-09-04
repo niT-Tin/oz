@@ -89,3 +89,20 @@ zig build e2e                                # pty 端到端测试（目前仅 L
 | 带 LSP 连续输入 60 字符 | 60 ms | 56 ms |
 
 全部场景与 nvim 持平或更快。关键设计：mmap 惰性加载文件、PieceTable 增量行索引、tree-sitter 增量解析、LSP 异步握手 + 写入线程 + 增量同步、原子化保存（temp+rename）。
+
+## 下载
+
+预编译二进制见 [GitHub Releases](https://github.com/niT-Tin/oz/releases)（Linux x86_64/arm64、macOS x86_64/arm64，解压即用，无需安装 Zig）。源码构建见上文「构建与运行」。
+
+## License
+
+[MIT](LICENSE) © niT-Tin
+
+## 维护预期
+
+个人项目，业余时间维护，请合理预期：
+
+- 功能按我自己的使用需求驱动；发现 bug 欢迎提 issue（附复现步骤最佳）；
+- PR 会看、会合，但节奏取决于我的时间；
+- 0.x 阶段键位 / 接口可能有不兼容调整；
+- 顺手 star 一下就是最好的鼓励。
