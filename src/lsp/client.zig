@@ -151,8 +151,9 @@ const OutQueue = struct {
 pub const Client = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
-    /// Filetype this client serves (borrowed; App owns the string).
-    lang: []const u8,
+    /// Filetype this client serves (owned — duped in connect and freed in
+    /// deinit; the App's attach-job copy may be freed before the client).
+    lang: []u8,
     /// Document URI currently open in this client (owned).
     uri: []u8,
     /// Incremented on every didChange (LSP version).
@@ -340,13 +341,24 @@ pub const Client = struct {
         var cleanup_proc = true;
         errdefer if (cleanup_proc) proc.kill(io);
 
+        // `lang` is OWNED by the client (a dupe), like `uri`: the caller's
+        // copy (the App's attach-job lang, freed when the job is consumed)
+        // can die before the client does. A borrowed slice would dangle on
+        // the next ensureLsp comparison — freeing a healthy server as a
+        // "filetype change" and re-attaching in a loop. Duped BEFORE the
+        // struct literal so a later alloc failure in the literal (the uri
+        // dupe, the queue) cannot leak the earlier copy.
+        const lang_copy = try alloc.dupe(u8, lang);
+        errdefer alloc.free(lang_copy);
+        const uri_copy = try alloc.dupe(u8, uri);
+        errdefer alloc.free(uri_copy);
         const self = try alloc.create(Client);
         errdefer alloc.destroy(self);
         self.* = .{
             .alloc = alloc,
             .io = io,
-            .lang = lang,
-            .uri = try alloc.dupe(u8, uri),
+            .lang = lang_copy,
+            .uri = uri_copy,
             .proc = proc,
             .stdin = proc.stdin orelse return error.NoStdin,
             .queue = .{ .io = io },
@@ -354,7 +366,6 @@ pub const Client = struct {
             .argv_override = argv_override,
             .argv_override_first_owned = argv_first_owned,
         };
-        errdefer self.alloc.free(self.uri);
 
         // Reader thread first: the initialize response arrives through it.
         self.thread = try std.Thread.spawn(.{}, readerMain, .{self});
@@ -494,6 +505,7 @@ pub const Client = struct {
             self.alloc.free(arr);
         }
         self.alloc.free(self.uri);
+        self.alloc.free(self.lang);
         self.alloc.destroy(self);
     }
 
@@ -745,6 +757,12 @@ pub const Client = struct {
     /// result). Without this, two requests sharing a slot (formatting +
     /// rename, nav requests) could be consumed in arrival order, letting a
     /// stale response clobber the current one.
+    ///
+    /// The superseded request is also CANCELLED server-side via
+    /// $/cancelRequest: the bytes were already written to the server, and a
+    /// slow computation (zls inlay/analysis) would otherwise run to
+    /// completion — and delay every request queued behind it — even though
+    /// its response is destined to be dropped.
     pub fn request(self: *Client, method: []const u8, params: std.json.Value, slot: *?std.json.Value) !void {
         const id = self.next_id;
         self.next_id += 1;
@@ -755,7 +773,9 @@ pub const Client = struct {
         var i: usize = 0;
         while (i < self.pending.items.len) {
             if (self.pending.items[i].slot == slot) {
+                const old_id = self.pending.items[i].id;
                 _ = self.pending.orderedRemove(i);
+                self.cancelRequest(old_id) catch {};
             } else {
                 i += 1;
             }
@@ -766,6 +786,19 @@ pub const Client = struct {
             self.pending.items.len -= 1;
             return e;
         };
+    }
+
+    /// Best-effort $/cancelRequest for a superseded request (see request).
+    /// Servers that already answered — or don't implement cancellation —
+    /// ignore it; the late response is dropped by the id check in drain.
+    fn cancelRequest(self: *Client, id: u64) !void {
+        var params = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        defer params.deinit(self.alloc);
+        // Request ids start at 1 and count per client session; an i64 cast
+        // cannot overflow in practice.
+        try params.put(self.alloc, "id", .{ .integer = @intCast(id) });
+        const v = std.json.Value{ .object = params };
+        try self.notify("$/cancelRequest", v);
     }
 
     /// Send a notification (no id, no response expected).
@@ -1215,7 +1248,7 @@ fn testClient(alloc: std.mem.Allocator, io: std.Io, stdin: std.Io.File) !Client 
     return .{
         .alloc = alloc,
         .io = io,
-        .lang = "mock",
+        .lang = try alloc.dupe(u8, "mock"),
         .uri = try alloc.dupe(u8, "file:///t.zig"),
         .proc = undefined,
         .stdin = stdin,
@@ -1230,6 +1263,7 @@ fn cleanupClient(alloc: std.mem.Allocator, c: *Client) void {
     c.pending.deinit(alloc);
     if (c.open_docs) |*od| od.deinit();
     alloc.free(c.uri);
+    alloc.free(c.lang);
 }
 
 test "didOpen/didChange: document version is monotonic (1, 2, 3, ...)" {
@@ -1405,6 +1439,39 @@ test "request: a new request for a busy slot replaces the old pending one" {
     try std.testing.expectEqual(@as(usize, 0), client.pending.items.len);
     try std.testing.expect(slot != null);
     try std.testing.expectEqualStrings("rename", slot.?.object.get("kind").?.string);
+
+    // The superseded request #1 must ALSO have been cancelled server-side
+    // ($/cancelRequest with id 1): its bytes were already written, and a
+    // slow server would otherwise compute it — and delay the rename behind
+    // it — although its response is destined to be dropped. Outbound order:
+    // request 1, cancel 1, request 2.
+    var reader = FrameReader.init(alloc, read_end, io);
+    defer reader.deinit();
+    const first = (try reader.next()).?;
+    defer alloc.free(first);
+    var m1 = try json_rpc.parseMessage(alloc, first);
+    defer m1.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 1), m1.id);
+    try std.testing.expectEqualStrings("textDocument/formatting", m1.method.?);
+    const cancel = (try reader.next()).?;
+    defer alloc.free(cancel);
+    var mc = try json_rpc.parseMessage(alloc, cancel);
+    defer mc.deinit(alloc);
+    try std.testing.expect(mc.method != null);
+    try std.testing.expectEqualStrings("$/cancelRequest", mc.method.?);
+    const cancel_params = mc.params.?.object.get("id").?;
+    const cancel_id: i64 = switch (cancel_params) {
+        .integer => |n| n,
+        .number_string => |s| std.fmt.parseInt(i64, s, 10) catch -1,
+        else => -1,
+    };
+    try std.testing.expectEqual(@as(i64, 1), cancel_id);
+    const second = (try reader.next()).?;
+    defer alloc.free(second);
+    var m2 = try json_rpc.parseMessage(alloc, second);
+    defer m2.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 2), m2.id);
+    try std.testing.expectEqualStrings("textDocument/rename", m2.method.?);
 }
 
 test "initParams: rootUri/workspaceFolders derive from the document" {
