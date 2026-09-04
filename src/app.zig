@@ -43,6 +43,11 @@ pub const status_row_count: u32 = 1;
 /// ghost appears this long after the cursor settles (<leader>tb).
 pub const blame_hold_ms: i64 = 1000;
 
+/// Live gutter-mark hold (ms): after an edit the buffer-vs-HEAD diff is
+/// refreshed once typing has been quiet this long (gitsigns debounce). The
+/// run loop polls during the hold so the refresh fires without a keypress.
+pub const git_marks_hold_ms: i64 = 500;
+
 /// Files larger than this skip current-line blame entirely (gitsigns'
 /// max_file_length — blame on huge files is slow and useless).
 pub const max_blame_lines: u32 = 40000;
@@ -395,6 +400,18 @@ pub const App = struct {
     /// must NOT be dropped: ` hs` pressed while a blame job runs would
     /// otherwise silently do nothing.
     git_queued: ?QueuedGitJob = null,
+    /// Live gutter marks: the current buffer's text changed after the last
+    /// landed buffer-vs-HEAD diff. While true the marks shown are the last
+    /// quiesced state; the run loop re-diffs once typing pauses
+    /// (git_marks_hold_ms after git_change_ms).
+    git_marks_stale: bool = false,
+    /// Monotonic ms of the edit that made the marks stale (the hold clock).
+    git_change_ms: i64 = 0,
+    /// edit_seq at the moment the in-flight status job's buffer snapshot
+    /// was taken. A landed status reflects the current text only when no
+    /// edit bumped edit_seq after the snapshot — otherwise it stays stale
+    /// and the loop refreshes again.
+    git_status_spawn_seq: u64 = 0,
 
     // insert-mode completion (Ctrl+n and auto-suggest on word chars)
     completion_active: bool = false,
@@ -1251,6 +1268,11 @@ pub const App = struct {
         if (self.git_job) |job| {
             if (job.thread) |t| t.join(); // let the worker finish, then free
             self.alloc.free(job.path);
+            self.alloc.free(job.cwd);
+            if (job.work_path) |w| {
+                std.Io.Dir.cwd().deleteFile(self.io, w) catch {};
+                self.alloc.free(w);
+            }
             if (job.out) |o| self.alloc.free(o);
             if (job.branch) |b| self.alloc.free(b);
             if (job.msg) |m| self.alloc.free(m);
@@ -1323,6 +1345,8 @@ pub const App = struct {
     pub const consumeGitJob = @import("app/git.zig").consumeGitJob;
     pub const finishGitJob = @import("app/git.zig").finishGitJob;
     pub const scheduleGitStatus = @import("app/git.zig").scheduleGitStatus;
+    pub const gitMarksStaleNow = @import("app/git.zig").gitMarksStaleNow;
+    pub const snapshotGitWork = @import("app/git.zig").snapshotGitWork;
     pub const gotoHunk = @import("app/git.zig").gotoHunk;
     pub const applyHunk = @import("app/git.zig").applyHunk;
     pub const previewHunk = @import("app/git.zig").previewHunk;
@@ -1512,6 +1536,7 @@ pub const App = struct {
     pub const hoverLineSegs = @import("app/render.zig").hoverLineSegs;
     pub const render = @import("app/render.zig").render;
     pub const blameHoldActive = @import("app/render.zig").blameHoldActive;
+    pub const gitHoldActive = @import("app/render.zig").gitHoldActive;
     pub const scopeAnimActive = @import("app/render.zig").scopeAnimActive;
     pub const run = @import("app/render.zig").run;
     pub const filetree_width = @import("app/render.zig").filetree_width;

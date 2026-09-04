@@ -314,6 +314,9 @@ pub fn markDirtyBase(self: *App) void {
     // pointing at stale text, and shifting ranges per edit is not worth
     // it — re-folding with zM costs one indent scan.
     self.cur().folds.clearRetainingCapacity();
+    // The visible text changed: the git gutter marks (buffer-vs-HEAD) are
+    // stale until the run loop re-diffs once typing quiesces.
+    self.gitMarksStaleNow();
     // Editing normally invalidates inlay hints: their offsets refer to the
     // pre-edit text. During an insert session we skip that and instead
     // shift the hints for the edit (see adjustInlayHintsInsert/Delete) so

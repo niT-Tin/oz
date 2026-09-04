@@ -20,6 +20,7 @@ const git_job = @import("git_job.zig");
 const tab_width = app_mod.tab_width;
 const status_row_count = app_mod.status_row_count;
 const blame_hold_ms = app_mod.blame_hold_ms;
+const git_marks_hold_ms = app_mod.git_marks_hold_ms;
 const ScopeAnim = app_mod.ScopeAnim;
 const formatHm = git_job.formatHm;
 const gitPreviewLineCount = git_job.gitPreviewLineCount;
@@ -613,13 +614,14 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         }
 
         // Git sign (M3a) for the same last gutter cell, when the line
-        // carries no diagnostic mark. Only for a CLEAN buffer: the diff
-        // describes the file on disk, and while dirty the marks would
-        // lie about the visible text (they return after :w refreshes).
-        // Also only when the diff was computed for THIS buffer's path.
+        // carries no diagnostic mark. The diff describes the VISIBLE
+        // buffer text vs HEAD (the worker diffs a snapshot of the buffer,
+        // not the disk file) — so marks render while the buffer is dirty
+        // too and live-update once an edit quiesces and the async refresh
+        // lands. Only when the diff was computed for THIS buffer's path.
         var git_mark: ?git.LineKind = null;
         var git_mark_fg: ?vaxis.Style = null;
-        if (w.buf == self.current and !buf.dirty) {
+        if (w.buf == self.current) {
             if (self.git_diff_path) |dp| {
                 if (buf.path) |cp| {
                     if (std.mem.eql(u8, dp, cp)) {
@@ -2637,6 +2639,16 @@ pub fn blameHoldActive(self: *App) bool {
     return now - self.blame_move_ms < blame_hold_ms;
 }
 
+/// True while the live gutter-mark hold is still counting after an edit
+/// left the diff stale (the loop then polls instead of blocking, so the
+/// buffer-vs-HEAD refresh fires ~git_marks_hold_ms after the user pauses
+/// typing — no keypress needed, like the blame ghost's CursorHold).
+pub fn gitHoldActive(self: *App) bool {
+    if (!self.git_marks_stale) return false;
+    const now: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
+    return now - self.git_change_ms < git_marks_hold_ms;
+}
+
 /// True while the scope highlight animation is still spreading: the run
 /// loop then polls instead of blocking in pollEvent, so the spread
 /// advances frame by frame without keypresses.
@@ -2782,7 +2794,7 @@ pub fn run(self: *App) !void {
         // animation's last spread) and the loop would block forever
         // without ever drawing it. Force that one render.
         var poll_transition = false;
-        if (self.scopeAnimActive() or self.blameHoldActive() or (term.supported and self.term_pane != null)) {
+        if (self.scopeAnimActive() or self.blameHoldActive() or self.gitHoldActive() or (term.supported and self.term_pane != null)) {
             std.Io.sleep(self.io, .fromMilliseconds(1), .real) catch {};
             self.poll_mode_active = true;
         } else if (self.poll_mode_active) {
@@ -2822,6 +2834,19 @@ pub fn run(self: *App) !void {
             }
         }
         const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
+        // Live gutter marks: an edit left the diff stale. Once the edit
+        // hold has expired (the user paused), refresh the buffer-vs-HEAD
+        // diff async — the job wake re-renders the marks. A status job
+        // already running will settle staleness itself when it lands; a
+        // running blame/apply job gets a pending status so finishGitJob
+        // re-spawns it as soon as the slot frees.
+        if (self.git_marks_stale and !self.gitHoldActive()) {
+            if (self.git_job) |job| {
+                if (job.kind != .status) self.git_refresh_pending = true;
+            } else if (!self.git_refresh_pending) {
+                self.scheduleGitStatus();
+            }
+        }
         if (handled or poll_transition or now_ms - last_render_ms >= 16) {
             try self.render();
             last_render_ms = now_ms;

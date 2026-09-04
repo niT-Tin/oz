@@ -37,6 +37,38 @@ pub const BlameGhostLabel = struct {
 
 // ---- M3a git (async jobs + hunk/blame/lazygit actions) ----
 
+/// Write the CURRENT buffer's text into a fresh temp file (owned path).
+/// The git worker diffs this snapshot against the file's HEAD blob — the
+/// piece table is main-thread state, so the snapshot is taken HERE before
+/// the worker spawns. Returns null on failure (caller falls back to the
+/// disk-based diff).
+pub fn snapshotGitWork(self: *App) ?[]u8 {
+    const path = git_job.makeTempPath(self.alloc, "buf") orelse return null;
+    var f = std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = true }) catch {
+        self.alloc.free(path);
+        return null;
+    };
+    var ok = false;
+    defer {
+        f.close(self.io);
+        if (!ok) {
+            std.Io.Dir.cwd().deleteFile(self.io, path) catch {};
+            self.alloc.free(path);
+        }
+    }
+    var chunk: [16384]u8 = undefined;
+    var off: u32 = 0;
+    const len = self.cur().pt.len();
+    while (off < len) {
+        const n: u32 = @intCast(@min(chunk.len, len - off));
+        self.cur().pt.copyRange(off, chunk[0..n]);
+        f.writeStreamingAll(self.io, chunk[0..n]) catch return null;
+        off += n;
+    }
+    ok = true;
+    return path;
+}
+
 /// Spawn one async git job for `path`. One job at a time: when a job is
 /// already running, a status request is remembered (git_refresh_pending)
 /// and re-spawned after the current one lands; other kinds are queued
@@ -46,32 +78,59 @@ pub fn spawnGitJob(self: *App, kind: GitJobKind, path: []const u8, hunk_start: u
         if (kind == .status) {
             self.git_refresh_pending = true;
         } else {
-            // blame/apply: keep the LATEST request (a stale queued blame
-            // is superseded by a newer one; apply keeps the user's last
-            // hunk action)
-            if (self.git_queued) |q| self.alloc.free(q.path);
-            self.git_queued = .{
-                .kind = kind,
-                .path = try self.alloc.dupe(u8, path),
-                .hunk_start = hunk_start,
-                .op = op,
-            };
+            // A queued hunk stage/reset is the user's EXPLICIT action and
+            // must never be displaced by an auto current-line blame
+            // (status refreshes re-trigger blame once the apply lands, so
+            // the dropped blame request is not lost — only deferred).
+            // Auto-blames supersede each other; applies keep the user's
+            // last hunk action.
+            const apply_queued = (self.git_queued != null and self.git_queued.?.kind == .apply);
+            if (!(kind == .blame and apply_queued)) {
+                if (self.git_queued) |q| self.alloc.free(q.path);
+                self.git_queued = .{
+                    .kind = kind,
+                    .path = try self.alloc.dupe(u8, path),
+                    .hunk_start = hunk_start,
+                    .op = op,
+                };
+            }
         }
         return;
     }
     const job = try self.alloc.create(GitJob);
     errdefer self.alloc.destroy(job);
+    // git must resolve the repo from the FILE's directory, not the
+    // process cwd (an oz launched elsewhere would fail rev-parse and show
+    // no branch / no marks at all). status jobs additionally diff the
+    // CURRENT buffer text vs HEAD, so the marks live-update while editing.
+    const dir = std.fs.path.dirname(path) orelse "/";
+    const cwd = try self.alloc.dupe(u8, dir);
+    errdefer self.alloc.free(cwd);
+    const path_copy = try self.alloc.dupe(u8, path);
+    errdefer self.alloc.free(path_copy);
+    var work: ?[]u8 = null;
+    if (kind == .status) work = self.snapshotGitWork();
+    errdefer {
+        if (work) |w| {
+            std.Io.Dir.cwd().deleteFile(self.io, w) catch {};
+            self.alloc.free(w);
+        }
+    }
     job.* = .{
         .kind = kind,
-        .path = try self.alloc.dupe(u8, path),
+        .path = path_copy,
+        .cwd = cwd,
+        .work_path = work,
         .hunk_start = hunk_start,
         .op = op,
         .alloc = self.alloc,
         .io = self.io,
     };
-    errdefer self.alloc.free(job.path);
     job.wake_ctx = self;
     job.wake_fn = lspWake; // same trick as the LSP reader thread
+    // the status diff's snapshot was taken NOW — record the edit counter
+    // so the landing diff can tell whether edits raced it (stale marks)
+    if (kind == .status) self.git_status_spawn_seq = self.edit_seq;
     job.thread = try std.Thread.spawn(.{}, gitJobMain, .{job});
     self.git_job = job;
 }
@@ -99,6 +158,17 @@ pub fn consumeGitJob(self: *App, job: *GitJob) void {
             // (git diff prints nothing for an untracked file — without
             // this the all-added marks never appeared)
             self.git_diff.untracked = job.untracked;
+            // Live marks staleness: a landed diff reflects the CURRENT
+            // buffer only when the job's snapshot was taken after the last
+            // edit (edit_seq == git_status_spawn_seq) AND the job targeted
+            // the current buffer. Otherwise the text on screen has moved
+            // on — stay stale so the refresh loop diffs it again.
+            if (self.cur().path) |cp| {
+                if (std.mem.eql(u8, cp, job.path)) {
+                    self.git_marks_stale = (self.edit_seq != self.git_status_spawn_seq);
+                    if (!self.git_marks_stale) self.git_change_ms = 0;
+                }
+            }
             // auto current-line blame (nvim current_line_blame=true):
             // the repo is confirmed now — load blame for this file
             self.maybeLoadBlame();
@@ -148,6 +218,11 @@ pub fn consumeGitJob(self: *App, job: *GitJob) void {
 
 pub fn finishGitJob(self: *App, job: *GitJob) void {
     self.alloc.free(job.path);
+    self.alloc.free(job.cwd);
+    if (job.work_path) |w| {
+        std.Io.Dir.cwd().deleteFile(self.io, w) catch {};
+        self.alloc.free(w);
+    }
     if (job.out) |o| self.alloc.free(o);
     if (job.branch) |b| self.alloc.free(b);
     if (job.msg) |m| self.alloc.free(m);
@@ -172,18 +247,33 @@ pub fn finishGitJob(self: *App, job: *GitJob) void {
 }
 
 /// Refresh branch + diff marks for the current buffer (async). Called on
-/// file open/switch and after save. The gutter only ever shows a diff of
-/// what's on disk — a dirty buffer hides the marks anyway.
+/// file open/switch and after save. The diff compares the BUFFER text vs
+/// HEAD (snapshotted at spawn), so the marks describe the visible buffer
+/// even while it is dirty — they refresh again after edits quiesce (see
+/// gitMarksStaleNow / the run loop).
 pub fn scheduleGitStatus(self: *App) void {
     const path = self.cur().path orelse return;
     self.spawnGitJob(.status, path, 0, .stage) catch {};
+}
+
+/// An edit changed the current buffer: the buffer-vs-HEAD diff is stale
+/// until the run loop refreshes it once typing quiesces (git_marks_hold_ms
+/// after the last edit). No-op outside a repo (git_branch == null) — the
+/// initial open/save refresh already probed repo-ness.
+pub fn gitMarksStaleNow(self: *App) void {
+    if (self.git_branch == null) return;
+    self.git_marks_stale = true;
+    self.git_change_ms = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
 }
 
 /// ]c / [c — jump to the next/previous hunk of the current file.
 pub fn gotoHunk(self: *App, forward: bool) void {
     const path = self.cur().path orelse return;
     if (self.cur().dirty) {
-        if (dupOrNull(self.alloc, "save first (marks describe the file on disk)")) |m| self.setMsg(m) catch {};
+        // hunk ops stage/reset the FILE ON DISK, so navigation stays in
+        // sync only on a saved buffer (the live gutter marks, by contrast,
+        // describe the visible text and update while editing)
+        if (dupOrNull(self.alloc, "save first (hunk ops apply to the file on disk)")) |m| self.setMsg(m) catch {};
         return;
     }
     if (self.git_diff_path == null or !std.mem.eql(u8, self.git_diff_path.?, path)) {
@@ -235,7 +325,7 @@ pub fn applyHunk(self: *App, op: GitApplyOp) void {
 pub fn previewHunk(self: *App) void {
     const path = self.cur().path orelse return;
     if (self.cur().dirty) {
-        if (dupOrNull(self.alloc, "save first (the preview describes the file on disk)")) |m| self.setMsg(m) catch {};
+        if (dupOrNull(self.alloc, "save first (hunk ops apply to the file on disk)")) |m| self.setMsg(m) catch {};
         return;
     }
     if (self.git_diff_path == null or !std.mem.eql(u8, self.git_diff_path.?, path)) {

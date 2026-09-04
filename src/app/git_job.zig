@@ -24,7 +24,21 @@ pub const QueuedGitJob = struct {
 /// what it keeps).
 pub const GitJob = struct {
     kind: GitJobKind,
-    path: []u8, // owned (relative path, as git wants it)
+    path: []u8, // owned (absolute path of the file, as the App stores it)
+    /// Directory the git commands run in — the file's parent directory
+    /// (owned). git discovers the repository by walking up from HERE, not
+    /// from the process cwd: an oz launched anywhere (absolute file argv
+    /// from $HOME, :e / picker into another directory) must still find the
+    /// opened file's repo, branch and diff. Without this, rev-parse fails
+    /// whenever oz's cwd is not inside the repo and NO marks ever appear.
+    cwd: []u8,
+    /// status only: temp file holding a snapshot of the BUFFER text
+    /// (owned; deleted by finishGitJob). The status diff compares this
+    /// content against the file's HEAD blob, so the gutter marks describe
+    /// the text on screen — they stay live while the buffer has unsaved
+    /// edits instead of hiding (gitsigns semantics). null = snapshot
+    /// unavailable → the worker falls back to diffing the file on disk.
+    work_path: ?[]u8 = null,
     /// apply: 0-based final-file line where the target hunk STARTS (from the
     /// user's diff view). The worker re-diffs and locates the hunk by this
     /// line — a stale INDEX would otherwise pick the wrong hunk when the
@@ -66,10 +80,19 @@ pub const CmdResult = struct { out: ?[]u8, err: ?[]u8, ok: bool };
 
 /// Run one git command to completion (blocking — worker thread only),
 /// capturing stdout/stderr. Returns owned buffers (null when empty or on
-/// spawn failure).
+/// spawn failure). Exit code 0 counts as success.
 pub fn runGit(self: *GitJob, argv: []const []const u8, stdin_data: ?[]const u8) CmdResult {
+    return runGitEx(self, argv, stdin_data, &.{0});
+}
+
+/// runGit accepting extra exit codes as success: `git diff --no-index`
+/// exits 1 when the two files differ — which IS the result we want.
+pub fn runGitEx(self: *GitJob, argv: []const []const u8, stdin_data: ?[]const u8, ok_exit: []const u8) CmdResult {
     var proc = std.process.spawn(self.io, .{
         .argv = argv,
+        // resolve the repo from the FILE's directory, never the process
+        // cwd (an oz launched anywhere must still find the file's repo)
+        .cwd = .{ .path = self.cwd },
         .stdin = if (stdin_data != null) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -91,7 +114,10 @@ pub fn runGit(self: *GitJob, argv: []const []const u8, stdin_data: ?[]const u8) 
     if (proc.stdout) |out| gitReadAll(self, out, &out_buf);
     if (proc.stderr) |err| gitReadAll(self, err, &err_buf);
     const term_status = proc.wait(self.io) catch return .{ .out = null, .err = null, .ok = false };
-    const ok = term_status == .exited and term_status.exited == 0;
+    const ok = switch (term_status) {
+        .exited => |code| std.mem.indexOfScalar(u8, ok_exit, code) != null,
+        else => false,
+    };
     return .{
         .out = if (out_buf.items.len > 0) out_buf.toOwnedSlice(self.alloc) catch null else null,
         .err = if (err_buf.items.len > 0) err_buf.toOwnedSlice(self.alloc) catch null else null,
@@ -120,7 +146,24 @@ pub fn dupOrNull(alloc: std.mem.Allocator, s: []const u8) ?[]u8 {
     return alloc.dupe(u8, s) catch null;
 }
 
-/// status: branch + untracked flag + working-tree diff for `path`.
+var tmp_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+/// A fresh unique temp-file path under /tmp (owned). Callers create and
+/// delete the file; single job slot + atomic counter keep names unique
+/// across the main thread and the worker.
+pub fn makeTempPath(alloc: std.mem.Allocator, tag: []const u8) ?[]u8 {
+    const n = tmp_seq.fetchAdd(1, .monotonic);
+    return std.fmt.allocPrint(alloc, "/tmp/oz_git_{s}_{d}_{d}.tmp", .{ tag, std.c.getpid(), n }) catch null;
+}
+
+/// status: branch + untracked flag + the diff of the BUFFER text (not the
+/// disk file) vs the file's HEAD blob. The buffer snapshot (job.work_path)
+/// is written by the App before the job spawns — the piece table is
+/// main-thread state, the worker only touches files. Diffing the visible
+/// text keeps the gutter marks truthful while the buffer is dirty: they
+/// live-update as the user edits instead of hiding until :w (gitsigns
+/// semantics). When no snapshot is available the disk file is diffed (the
+/// old fallback: marks describe the file on disk).
 pub fn runStatus(self: *GitJob) void {
     var branch_r = runGit(self, &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" }, null);
     defer freeCmdResult(self, branch_r);
@@ -139,7 +182,40 @@ pub fn runStatus(self: *GitJob) void {
             self.untracked = std.mem.startsWith(u8, o, "??");
         }
     }
-    var diff_r = runGit(self, &.{ "git", "diff", "--no-color", "--no-ext-diff", "--", self.path }, null);
+    if (self.untracked) return; // whole file reads as added — no diff needed
+    const work_path = self.work_path orelse {
+        // snapshot unavailable: fall back to the file on disk (old behavior)
+        var disk_r = runGit(self, &.{ "git", "diff", "--no-color", "--no-ext-diff", "--", self.path }, null);
+        defer freeCmdResult(self, disk_r);
+        if (disk_r.ok) {
+            self.out = disk_r.out;
+            disk_r.out = null;
+        }
+        return;
+    };
+    // base = the HEAD blob of the file. "HEAD:./<name>" resolves the blob
+    // relative to the job's cwd (the file's directory) — git accepts the
+    // repo-relative name only, not the absolute path.
+    const name = std.fs.path.basename(self.path);
+    const spec = std.fmt.allocPrint(self.alloc, "HEAD:./{s}", .{name}) catch return;
+    defer self.alloc.free(spec);
+    const base_r = runGit(self, &.{ "git", "show", spec }, null);
+    defer freeCmdResult(self, base_r);
+    if (!base_r.ok) return; // no HEAD blob (gitignored etc.) — treat as clean
+    const base_path = makeTempPath(self.alloc, "head") orelse return;
+    defer {
+        std.Io.Dir.cwd().deleteFile(self.io, base_path) catch {};
+        self.alloc.free(base_path);
+    }
+    {
+        var f = std.Io.Dir.cwd().createFile(self.io, base_path, .{ .truncate = true }) catch return;
+        defer f.close(self.io);
+        if (base_r.out) |o| {
+            f.writeStreamingAll(self.io, o) catch return;
+        }
+    }
+    // diff the HEAD blob against the buffer snapshot; exit 1 = differ (ok)
+    var diff_r = runGitEx(self, &.{ "git", "diff", "--no-index", "--no-color", "--", base_path, work_path }, null, &.{ 0, 1 });
     defer freeCmdResult(self, diff_r);
     if (diff_r.ok) {
         self.out = diff_r.out;

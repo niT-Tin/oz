@@ -12217,6 +12217,173 @@ test "git: blame ghost stays inside its pane in a split" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+test "git: branch + gutter signs appear when oz is launched OUTSIDE the repo (absolute path)" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    // ---- temp git repo: 20-line file, commit, then modify on DISK ----
+    var dir_buf: [160]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/oz_e2e_gitabs_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().createDir(io, dir, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    _ = try runCmdCapture(io, alloc, &.{ "git", "init", "-q", "-b", "main" }, dir);
+    _ = try runCmdCapture(io, alloc, &.{ "git", "config", "user.email", "e2e@test" }, dir);
+    _ = try runCmdCapture(io, alloc, &.{ "git", "config", "user.name", "E2E Tester" }, dir);
+    var old = std.ArrayList(u8).empty;
+    defer old.deinit(alloc);
+    var n: usize = 1;
+    var line_buf: [32]u8 = undefined;
+    while (n <= 20) : (n += 1) {
+        try old.appendSlice(alloc, try std.fmt.bufPrint(&line_buf, "line{d}\n", .{n}));
+    }
+    try writeTestFile(io, dir, "a.txt", old.items);
+    _ = try runCmdCapture(io, alloc, &.{ "git", "add", "a.txt" }, dir);
+    _ = try runCmdCapture(io, alloc, &.{ "git", "commit", "-qm", "init" }, dir);
+    // modify: line3 → CHANGED; insert NEW after line16; drop lines 19-20
+    var content = std.ArrayList(u8).empty;
+    defer content.deinit(alloc);
+    n = 1;
+    while (n <= 20) : (n += 1) {
+        if (n == 3) {
+            try content.appendSlice(alloc, "CHANGED\n");
+        } else if (n == 17) {
+            try content.appendSlice(alloc, "NEW\n");
+            try content.appendSlice(alloc, "line17\n");
+        } else if (n >= 19) {
+            continue; // deleted
+        } else {
+            try content.appendSlice(alloc, try std.fmt.bufPrint(&line_buf, "line{d}\n", .{n}));
+        }
+    }
+    try writeTestFile(io, dir, "a.txt", content.items);
+
+    // oz is launched from /tmp — NOT inside the repo — with the repo file
+    // as an ABSOLUTE argv path (the real-world `oz ~/repo/file.zig` from
+    // $HOME). git must resolve the repo from the FILE's directory.
+    var abs_buf: [256]u8 = undefined;
+    const abs = try std.fmt.bufPrint(&abs_buf, "{s}/a.txt", .{dir});
+    var sess = try Session.spawnCwd(io, &.{ oz_exe_path, abs }, "/tmp");
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    const Wait = struct {
+        fn until(s: *Session, g: *Grid, needle: []const u8) !bool {
+            var waited: i32 = 0;
+            while (!g.contains(needle)) {
+                const nn = try readAvailable(s.pty.master, s.out[s.used..], 200);
+                if (nn == 0) {
+                    waited += 200;
+                    if (waited >= 6000) return false;
+                    continue;
+                }
+                s.used += nn;
+                g.feed(s.out[s.used - nn .. s.used]);
+            }
+            return true;
+        }
+    };
+
+    try std.testing.expect(try Wait.until(&sess, &grid, "NORMAL"));
+    // branch + gutter signs must appear despite the outside-repo launch
+    try std.testing.expect(try Wait.until(&sess, &grid, "⎇ main"));
+    try std.testing.expect(try Wait.until(&sess, &grid, "\u{258e}")); // ▎
+    try std.testing.expect(try Wait.until(&sess, &grid, "\u{2594}")); // ▔
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "git: gutter marks live-update on UNSAVED edits (buffer vs HEAD, no :w)" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    // ---- temp git repo with a committed 10-line file ----
+    var dir_buf: [160]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/oz_e2e_gitlive_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().createDir(io, dir, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    _ = try runCmdCapture(io, alloc, &.{ "git", "init", "-q", "-b", "main" }, dir);
+    _ = try runCmdCapture(io, alloc, &.{ "git", "config", "user.email", "e2e@test" }, dir);
+    _ = try runCmdCapture(io, alloc, &.{ "git", "config", "user.name", "E2E Tester" }, dir);
+    var old = std.ArrayList(u8).empty;
+    defer old.deinit(alloc);
+    var n: usize = 1;
+    var line_buf: [32]u8 = undefined;
+    while (n <= 10) : (n += 1) {
+        try old.appendSlice(alloc, try std.fmt.bufPrint(&line_buf, "line{d}\n", .{n}));
+    }
+    try writeTestFile(io, dir, "a.txt", old.items);
+    _ = try runCmdCapture(io, alloc, &.{ "git", "add", "a.txt" }, dir);
+    _ = try runCmdCapture(io, alloc, &.{ "git", "commit", "-qm", "init" }, dir);
+
+    var sess = try Session.spawnCwd(io, &.{ oz_exe_path, "a.txt" }, dir);
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    const Wait = struct {
+        fn until(s: *Session, g: *Grid, needle: []const u8) !bool {
+            var waited: i32 = 0;
+            while (!g.contains(needle)) {
+                const nn = try readAvailable(s.pty.master, s.out[s.used..], 200);
+                if (nn == 0) {
+                    waited += 200;
+                    if (waited >= 6000) return false;
+                    continue;
+                }
+                s.used += nn;
+                g.feed(s.out[s.used - nn .. s.used]);
+            }
+            return true;
+        }
+    };
+
+    try std.testing.expect(try Wait.until(&sess, &grid, "NORMAL"));
+    // the initial status lands → repo confirmed; a CLEAN file shows no signs
+    try std.testing.expect(try Wait.until(&sess, &grid, "⎇ main"));
+    try std.testing.expect(!grid.contains("\u{258e}")); // ▎ none yet
+
+    // ---- insert a line at the end: buffer becomes dirty, NEVER saved ----
+    try sess.send("GoAPPENDED");
+    try std.testing.expect(try Wait.until(&sess, &grid, "APPENDED"));
+    try sess.send("\x1b");
+    try std.testing.expect(try Wait.until(&sess, &grid, "NORMAL"));
+    // ~500ms edit hold + async buffer-vs-HEAD diff: ▎ appears WITHOUT :w,
+    // while the tab bar still marks the buffer dirty (●)
+    try std.testing.expect(try Wait.until(&sess, &grid, "\u{258e}")); // ▎
+    try std.testing.expect(grid.contains("a.txt\u{25cf}")); // dirty ● still shown
+
+    // ---- delete the first line: a deletion marker must appear ----
+    try sess.send("ggdd");
+    var waited: i32 = 0;
+    var saw_del = grid.contains("\u{2581}") or grid.contains("\u{2594}"); // ▁ or ▔
+    while (!saw_del and waited < 6000) {
+        const nn = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (nn == 0) {
+            waited += 200;
+            continue;
+        }
+        sess.used += nn;
+        grid.feed(sess.out[sess.used - nn .. sess.used]);
+        saw_del = grid.contains("\u{2581}") or grid.contains("\u{2594}");
+    }
+    try std.testing.expect(saw_del);
+
+    // ---- the DISK file is untouched: marks came from the buffer text ----
+    std.Io.sleep(io, .fromMilliseconds(500), .real) catch {};
+    const disk = try runCmdCapture(io, alloc, &.{ "git", "diff", "--", "a.txt" }, dir);
+    defer alloc.free(disk);
+    try std.testing.expect(disk.len == 0);
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
 test "terminal: <M-r> float opens, keys forward, Esc returns, <M-w>/<M-e> switch, same key closes" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
