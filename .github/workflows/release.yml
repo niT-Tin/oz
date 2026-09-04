@@ -36,10 +36,44 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Zig 0.16.0
-        uses: mlugg/setup-zig@v1
+      - name: Cache Zig toolchain
+        uses: actions/cache@v4
         with:
-          version: 0.16.0
+          path: zig-*.tar.xz
+          key: zig-${{ matrix.target }}-0.16.0
+
+      # 手动安装 Zig 0.16.0（mlugg/setup-zig 的镜像经常 404/502，
+      # 且其 action 基于被弃用的 Node 20）：官方源优先，带重试；
+      # 失败后依次尝试备用镜像。tar.xz 命中 actions/cache 时秒装。
+      - name: Install Zig 0.16.0
+        env:
+          TARGET: ${{ matrix.target }}
+          ZIG_VERSION: 0.16.0
+        run: |
+          set -euo pipefail
+          # "x86_64-linux-gnu.2.31" -> zig 文件名里的 triple "x86_64-linux"
+          triple="${TARGET%-gnu.*}"
+          file="zig-${triple}-${ZIG_VERSION}.tar.xz"
+          sources=(
+            "https://ziglang.org/download/${ZIG_VERSION}/${file}"
+            "https://pkg.machengine.org/zig/${file}"
+            "https://zig.linus.dev/zig/${file}"
+            "https://zigmirror.hryx.net/zig/${file}"
+          )
+          if [ ! -f "$file" ]; then
+            ok=0
+            for u in "${sources[@]}"; do
+              echo "downloading ${u}"
+              if curl -fL --retry 5 --retry-all-errors --connect-timeout 20 -o "$file" "$u"; then
+                ok=1
+                break
+              fi
+            done
+            [ "$ok" = 1 ] || { echo "all Zig download sources failed"; exit 1; }
+          fi
+          tar -xf "$file"
+          echo "$PWD/zig-${triple}-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          zig version
 
       - name: Build (ReleaseFast + strip)
         run: zig build -Doptimize=ReleaseFast -Dstrip -Dtarget=${{ matrix.target }}
