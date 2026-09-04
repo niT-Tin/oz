@@ -43,10 +43,17 @@ pub const status_row_count: u32 = 1;
 /// ghost appears this long after the cursor settles (<leader>tb).
 pub const blame_hold_ms: i64 = 1000;
 
-/// Live gutter-mark hold (ms): after an edit the buffer-vs-HEAD diff is
-/// refreshed once typing has been quiet this long (gitsigns debounce). The
-/// run loop polls during the hold so the refresh fires without a keypress.
-pub const git_marks_hold_ms: i64 = 500;
+/// Live gutter-mark hold (ms): while the user is typing (insert session) the
+/// buffer-vs-HEAD diff is refreshed once typing has been quiet this long
+/// (gitsigns debounce). The run loop polls during the hold so the refresh
+/// fires without a keypress.
+pub const git_marks_hold_ms: i64 = 400;
+
+/// Discrete (non-insert) edit hold (ms): x/dd/o-exit/undo/paste etc. are
+/// one-shot actions — the marks refresh this long after the edit so rapid
+/// successive ops coalesce into one refresh while a single op still feels
+/// near-instant. Insert-exit (Esc/jk) expires the hold immediately.
+pub const git_discrete_hold_ms: i64 = 120;
 
 /// Files larger than this skip current-line blame entirely (gitsigns'
 /// max_file_length — blame on huge files is slow and useless).
@@ -402,11 +409,14 @@ pub const App = struct {
     git_queued: ?QueuedGitJob = null,
     /// Live gutter marks: the current buffer's text changed after the last
     /// landed buffer-vs-HEAD diff. While true the marks shown are the last
-    /// quiesced state; the run loop re-diffs once typing pauses
-    /// (git_marks_hold_ms after git_change_ms).
+    /// quiesced state (positionally shifted along by edits — see
+    /// FileDiff.shiftInsert/shiftDelete); the run loop re-diffs once the
+    /// edit hold expires (git_marks_at).
     git_marks_stale: bool = false,
-    /// Monotonic ms of the edit that made the marks stale (the hold clock).
-    git_change_ms: i64 = 0,
+    /// Monotonic ms DEADLINE: the live-refresh fires once `now` passes this
+    /// (set by gitMarksStaleNow: now + typing/discrete hold; expired to now
+    /// by gitRefreshSoon on insert-exit). 0 = expired.
+    git_marks_at: i64 = 0,
     /// edit_seq at the moment the in-flight status job's buffer snapshot
     /// was taken. A landed status reflects the current text only when no
     /// edit bumped edit_seq after the snapshot — otherwise it stays stale
@@ -1346,6 +1356,9 @@ pub const App = struct {
     pub const finishGitJob = @import("app/git.zig").finishGitJob;
     pub const scheduleGitStatus = @import("app/git.zig").scheduleGitStatus;
     pub const gitMarksStaleNow = @import("app/git.zig").gitMarksStaleNow;
+    pub const gitRefreshSoon = @import("app/git.zig").gitRefreshSoon;
+    pub const gitShiftForEdit = @import("app/git.zig").gitShiftForEdit;
+    pub const gitShiftInsertAt = @import("app/git.zig").gitShiftInsertAt;
     pub const snapshotGitWork = @import("app/git.zig").snapshotGitWork;
     pub const gotoHunk = @import("app/git.zig").gotoHunk;
     pub const applyHunk = @import("app/git.zig").applyHunk;

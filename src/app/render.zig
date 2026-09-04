@@ -631,9 +631,9 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
                             git_mark_fg = .{ .fg = .{ .rgb = self.theme.git_add } };
                         } else {
                             // advance past hunks whose marked region ends
-                            // before this row's line (hunks sorted; lines[]
+                            // before this row's line (hunks sorted; runs[]
                             // is indexed by absolute line number)
-                            while (hunk_i < hunks.len and hunks[hunk_i].lines.len <= line) hunk_i += 1;
+                            while (hunk_i < hunks.len and hunks[hunk_i].end_line <= line) hunk_i += 1;
                             if (hunk_i < hunks.len) {
                                 if (hunks[hunk_i].markAt(line)) |k| {
                                     git_mark = k;
@@ -2641,12 +2641,15 @@ pub fn blameHoldActive(self: *App) bool {
 
 /// True while the live gutter-mark hold is still counting after an edit
 /// left the diff stale (the loop then polls instead of blocking, so the
-/// buffer-vs-HEAD refresh fires ~git_marks_hold_ms after the user pauses
-/// typing — no keypress needed, like the blame ghost's CursorHold).
+/// buffer-vs-HEAD refresh fires once the edit hold expires — no keypress
+/// needed, like the blame ghost's CursorHold). The deadline (git_marks_at)
+/// is set per edit: typing hold while in insert, shorter discrete hold for
+/// normal-mode ops, immediate after insert-exit.
 pub fn gitHoldActive(self: *App) bool {
     if (!self.git_marks_stale) return false;
+    if (self.git_marks_at <= 0) return false;
     const now: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
-    return now - self.git_change_ms < git_marks_hold_ms;
+    return now < self.git_marks_at;
 }
 
 /// True while the scope highlight animation is still spreading: the run

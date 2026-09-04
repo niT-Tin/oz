@@ -7,8 +7,11 @@ const git = @import("../git.zig");
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const git_job = @import("git_job.zig");
+const lsp_types = @import("../lsp/types.zig");
 
 const max_blame_lines = app_mod.max_blame_lines;
+const git_marks_hold_ms = app_mod.git_marks_hold_ms;
+const git_discrete_hold_ms = app_mod.git_discrete_hold_ms;
 const GitJobKind = git_job.GitJobKind;
 const GitApplyOp = git_job.GitApplyOp;
 const GitJob = git_job.GitJob;
@@ -109,7 +112,19 @@ pub fn spawnGitJob(self: *App, kind: GitJobKind, path: []const u8, hunk_start: u
     const path_copy = try self.alloc.dupe(u8, path);
     errdefer self.alloc.free(path_copy);
     var work: ?[]u8 = null;
-    if (kind == .status) work = self.snapshotGitWork();
+    if (kind == .status) {
+        // Live buffer-vs-HEAD marks need a buffer snapshot ONLY while the
+        // buffer differs from the file on disk. For a clean buffer (opened
+        // or just saved) the disk file IS the buffer text: skip the
+        // snapshot (and the worker's git-show + temp-base + no-index steps)
+        // and diff the disk file against HEAD in ONE spawn — identical
+        // output, no /tmp writes, no main-thread copy of the whole file.
+        const buffer_matches = if (self.cur().path) |cp|
+            std.mem.eql(u8, cp, path)
+        else
+            false;
+        if (buffer_matches and self.cur().dirty) work = self.snapshotGitWork();
+    }
     errdefer {
         if (work) |w| {
             std.Io.Dir.cwd().deleteFile(self.io, w) catch {};
@@ -141,32 +156,45 @@ pub fn consumeGitJob(self: *App, job: *GitJob) void {
     defer self.finishGitJob(job);
     switch (job.kind) {
         .status => {
-            // replace the diff/branch state wholesale
+            // A landed status job reflects the buffer text at the moment its
+            // snapshot was taken (git_status_spawn_seq). If the current text
+            // has moved on (edit_seq bumped after the snapshot) the diff is
+            // STALE: the displayed marks were shifted along with the edits
+            // (FileDiff.shiftInsert/shiftDelete) and are closer to the truth
+            // than the job's pre-edit diff — keep them instead of swapping
+            // in a diff that would visibly jump back. Branch/untracked are
+            // repo-level and safe to adopt either way.
             if (self.git_branch) |b| self.alloc.free(b);
-            if (self.git_diff_path) |p| self.alloc.free(p);
-            self.git_diff.deinit(self.alloc);
-            self.git_diff = .{};
-            self.git_diff_path = dupOrNull(self.alloc, job.path);
             self.git_branch = job.branch; // thread-owned → App-owned
             job.branch = null;
-            if (job.out) |o| {
-                // parseDiff copies what it keeps — job.out stays owned by
-                // the job and finishGitJob frees it below
-                self.git_diff = git.parseDiff(self.alloc, o) catch git.FileDiff{};
+            const fresh = if (self.cur().path) |cp|
+                std.mem.eql(u8, cp, job.path) and self.edit_seq == self.git_status_spawn_seq
+            else
+                false;
+            if (fresh or self.cur().path == null or !std.mem.eql(u8, self.cur().path.?, job.path)) {
+                // adopt the job's diff wholesale (exact for the current
+                // buffer — or the previous buffer's state, replaced so the
+                // path bookkeeping stays coherent across switches)
+                if (self.git_diff_path) |p| self.alloc.free(p);
+                self.git_diff.deinit(self.alloc);
+                self.git_diff = .{};
+                self.git_diff_path = dupOrNull(self.alloc, job.path);
+                if (job.out) |o| {
+                    // parseDiff copies what it keeps — job.out stays owned by
+                    // the job and finishGitJob frees it below
+                    self.git_diff = git.parseDiff(self.alloc, o) catch git.FileDiff{};
+                }
             }
             // untracked must land even when the diff output is EMPTY
             // (git diff prints nothing for an untracked file — without
             // this the all-added marks never appeared)
             self.git_diff.untracked = job.untracked;
-            // Live marks staleness: a landed diff reflects the CURRENT
-            // buffer only when the job's snapshot was taken after the last
-            // edit (edit_seq == git_status_spawn_seq) AND the job targeted
-            // the current buffer. Otherwise the text on screen has moved
-            // on — stay stale so the refresh loop diffs it again.
             if (self.cur().path) |cp| {
                 if (std.mem.eql(u8, cp, job.path)) {
+                    // same-buffer job: stale only when edits raced the
+                    // snapshot; the loop re-diffs once the hold expires
                     self.git_marks_stale = (self.edit_seq != self.git_status_spawn_seq);
-                    if (!self.git_marks_stale) self.git_change_ms = 0;
+                    if (!self.git_marks_stale) self.git_marks_at = 0;
                 }
             }
             // auto current-line blame (nvim current_line_blame=true):
@@ -257,13 +285,60 @@ pub fn scheduleGitStatus(self: *App) void {
 }
 
 /// An edit changed the current buffer: the buffer-vs-HEAD diff is stale
-/// until the run loop refreshes it once typing quiesces (git_marks_hold_ms
-/// after the last edit). No-op outside a repo (git_branch == null) — the
-/// initial open/save refresh already probed repo-ness.
+/// until the run loop refreshes it once the edit hold expires. During an
+/// insert session (continuous typing) the hold is git_marks_hold_ms; a
+/// discrete normal-mode edit (x/dd/undo/paste…) uses the shorter
+/// git_discrete_hold_ms so a single op refreshes quickly while rapid ops
+/// still coalesce. No-op outside a repo (git_branch == null) — the initial
+/// open/save refresh already probed repo-ness.
 pub fn gitMarksStaleNow(self: *App) void {
     if (self.git_branch == null) return;
+    const now: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
+    const hold = if (self.in_insert) git_marks_hold_ms else git_discrete_hold_ms;
     self.git_marks_stale = true;
-    self.git_change_ms = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
+    self.git_marks_at = now + hold;
+}
+
+/// The user stopped typing (insert exited) — expire the edit hold so the
+/// run loop spawns the buffer-vs-HEAD refresh on its next pass instead of
+/// waiting out the rest of the typing hold.
+pub fn gitRefreshSoon(self: *App) void {
+    if (!self.git_marks_stale) return;
+    self.git_marks_at = 0;
+}
+
+/// Keep the displayed git marks attached to their lines across an edit.
+/// `start`/`end` are PRE-EDIT LSP positions and `text` the inserted text of
+/// the edit the caller is about to record — exactly the data the ranged edit
+/// paths already carry. Marks for the edited region itself refine when the
+/// async refresh lands; the shift only prevents visible misalignment while
+/// typing. No-op unless the displayed diff describes this buffer.
+pub fn gitShiftForEdit(self: *App, start: lsp_types.Position, end: lsp_types.Position, text: []const u8) void {
+    const cp = self.cur().path orelse return;
+    const dp = self.git_diff_path orelse return;
+    if (!std.mem.eql(u8, dp, cp)) return; // diff describes another buffer
+    const diff = &self.git_diff;
+    if (diff.untracked or diff.hunks.items.len == 0) return;
+    const is_replace = end.line > start.line or end.character > start.character;
+    if (is_replace) {
+        diff.shiftDelete(self.alloc, start.line, start.character, end.line, end.character);
+    }
+    const insert_nl = std.mem.count(u8, text, "\n");
+    if (insert_nl > 0) {
+        diff.shiftInsert(self.alloc, start.line, start.character, @intCast(insert_nl));
+    }
+}
+
+/// Shift hook for line-opening edits that know their own geometry but carry
+/// no LSP range (o/O open a line below/above the cursor and go through
+/// markDirty, not markDirtyRange).
+pub fn gitShiftInsertAt(self: *App, line: u32, col: u32, newlines: u32) void {
+    const cp = self.cur().path orelse return;
+    const dp = self.git_diff_path orelse return;
+    if (!std.mem.eql(u8, dp, cp)) return;
+    const diff = &self.git_diff;
+    if (diff.untracked or diff.hunks.items.len == 0 or newlines == 0) return;
+    diff.shiftInsert(self.alloc, line, col, newlines);
 }
 
 /// ]c / [c — jump to the next/previous hunk of the current file.

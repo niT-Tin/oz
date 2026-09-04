@@ -12384,6 +12384,117 @@ test "git: gutter marks live-update on UNSAVED edits (buffer vs HEAD, no :w)" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+test "git: marks stay glued to their lines while typing (instant shift, no refresh wait)" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    // ---- temp git repo: 20-line committed file, then modify line 10 on disk ----
+    var dir_buf: [160]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/oz_e2e_gitshift_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().createDir(io, dir, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    _ = try runCmdCapture(io, alloc, &.{ "git", "init", "-q", "-b", "main" }, dir);
+    _ = try runCmdCapture(io, alloc, &.{ "git", "config", "user.email", "e2e@test" }, dir);
+    _ = try runCmdCapture(io, alloc, &.{ "git", "config", "user.name", "E2E Tester" }, dir);
+    var old = std.ArrayList(u8).empty;
+    defer old.deinit(alloc);
+    var n: usize = 1;
+    var line_buf: [32]u8 = undefined;
+    while (n <= 20) : (n += 1) {
+        try old.appendSlice(alloc, try std.fmt.bufPrint(&line_buf, "line{d}\n", .{n}));
+    }
+    try writeTestFile(io, dir, "a.txt", old.items);
+    _ = try runCmdCapture(io, alloc, &.{ "git", "add", "a.txt" }, dir);
+    _ = try runCmdCapture(io, alloc, &.{ "git", "commit", "-qm", "init" }, dir);
+    // dirty line 10 on disk (still an unsaved-looking buffer on open)
+    var content = std.ArrayList(u8).empty;
+    defer content.deinit(alloc);
+    n = 1;
+    while (n <= 20) : (n += 1) {
+        if (n == 10) {
+            try content.appendSlice(alloc, "MODIFIED-TEN\n");
+        } else {
+            try content.appendSlice(alloc, try std.fmt.bufPrint(&line_buf, "line{d}\n", .{n}));
+        }
+    }
+    try writeTestFile(io, dir, "a.txt", content.items);
+
+    var sess = try Session.spawnCwd(io, &.{ oz_exe_path, "a.txt" }, dir);
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    const Wait = struct {
+        fn until(s: *Session, g: *Grid, needle: []const u8) !bool {
+            var waited: i32 = 0;
+            while (!g.contains(needle)) {
+                const nn = try readAvailable(s.pty.master, s.out[s.used..], 200);
+                if (nn == 0) {
+                    waited += 200;
+                    if (waited >= 6000) return false;
+                    continue;
+                }
+                s.used += nn;
+                g.feed(s.out[s.used - nn .. s.used]);
+            }
+            return true;
+        }
+        fn markRow(g: *Grid, glyph: []const u8) ?usize {
+            var r: usize = 0;
+            while (r < g.rows) : (r += 1) {
+                if (std.mem.indexOf(u8, g.rowText(r), glyph) != null) return r;
+            }
+            return null;
+        }
+    };
+
+    try std.testing.expect(try Wait.until(&sess, &grid, "⎇ main"));
+    // the modified line 10 shows a ▎ sign
+    try std.testing.expect(try Wait.until(&sess, &grid, "\u{258e}"));
+    const row_before = Wait.markRow(&grid, "\u{258e}").?;
+    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(row_before), "MODIFIED-TEN") != null);
+
+    // ---- type at the TOP of the file WITHOUT leaving insert mode: two
+    // newlines push the marked line (and its sign) down TWO rows INSTANTLY,
+    // long before the async refresh could land (the typing hold is running).
+    try sess.send("ggi");
+    try std.testing.expect(try Wait.until(&sess, &grid, "INSERT"));
+    try sess.send("A\rB\rC");
+    // wait for the last typed char to render — the refresh cannot have
+    // fired yet (still inside the typing hold)
+    var waited: i32 = 0;
+    while (!grid.contains("C")) {
+        const nn = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
+        if (nn == 0) {
+            waited += 50;
+            if (waited >= 3000) break;
+            continue;
+        }
+        sess.used += nn;
+        grid.feed(sess.out[sess.used - nn .. sess.used]);
+    }
+    // the sign for the (now line-12) modified content must have shifted down
+    const row_mid = Wait.markRow(&grid, "\u{258e}") orelse {
+        std.debug.print("mark vanished while typing!\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    std.debug.print("gitshift: sign row before={d} while-typing={d}\n", .{ row_before, row_mid });
+    try std.testing.expect(row_mid == row_before + 2);
+
+    // ---- leave insert: the async refresh lands and confirms the shift ----
+    try sess.send("\x1b");
+    try std.testing.expect(try Wait.until(&sess, &grid, "NORMAL"));
+    try std.testing.expect(try Wait.until(&sess, &grid, "\u{258e}"));
+    const row_after = Wait.markRow(&grid, "\u{258e}").?;
+    std.debug.print("gitshift: sign row after refresh={d}\n", .{ row_after });
+    try std.testing.expect(row_after == row_before + 2);
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
 test "terminal: <M-r> float opens, keys forward, Esc returns, <M-w>/<M-e> switch, same key closes" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;

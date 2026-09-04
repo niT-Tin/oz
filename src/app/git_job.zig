@@ -182,10 +182,16 @@ pub fn runStatus(self: *GitJob) void {
             self.untracked = std.mem.startsWith(u8, o, "??");
         }
     }
-    if (self.untracked) return; // whole file reads as added — no diff needed
+    if (self.untracked) {
+        return; // whole file reads as added — no diff needed
+    }
     const work_path = self.work_path orelse {
-        // snapshot unavailable: fall back to the file on disk (old behavior)
-        var disk_r = runGit(self, &.{ "git", "diff", "--no-color", "--no-ext-diff", "--", self.path }, null);
+        // Clean-buffer fast path (or snapshot unavailable): the file on
+        // disk IS the buffer text, so one `git diff HEAD` spawn gives the
+        // same buffer-vs-HEAD marks the snapshot path computes (diffing vs
+        // HEAD — not the index — keeps staged changes visible, matching
+        // e90066d's buffer-vs-HEAD semantics).
+        var disk_r = runGit(self, &.{ "git", "diff", "HEAD", "--no-color", "--no-ext-diff", "--", self.path }, null);
         defer freeCmdResult(self, disk_r);
         if (disk_r.ok) {
             self.out = disk_r.out;

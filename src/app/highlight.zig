@@ -310,6 +310,9 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             // keep inlay hints aligned (the newline + indent shift lines)
             self.adjustInlayHintsInsert(line, col, "\n");
             self.adjustInlayHintsInsert(line + 1, 0, indent);
+            // keep the git gutter marks glued to their lines (o splits the
+            // line at its end: content below shifts down one)
+            self.gitShiftInsertAt(line, col, 1);
             // structural edit (newline): force a full reparse next frame —
             // incremental parsing of a newline is where highlight drift
             // shows up ("o then type then jk leaves gray chars")
@@ -333,6 +336,9 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             // keep inlay hints aligned (a line was inserted above)
             self.adjustInlayHintsInsert(line, 0, "\n");
             self.adjustInlayHintsInsert(line, 0, indent);
+            // keep the git gutter marks glued to their lines (O pushes the
+            // whole edited line down)
+            self.gitShiftInsertAt(line, 0, 1);
             // structural edit (newline): force a full reparse next frame
             self.cur().syntax_revision = std.math.maxInt(u64);
             self.markDirty();

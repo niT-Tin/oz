@@ -336,6 +336,10 @@ pub fn exitMcInsert(self: *App) void {
     // the mc edits were not position-adjusted (unlike single-cursor
     // insert); fetch fresh hints for the new text
     self.invalidateInlayHints();
+    // typing done: refresh the git gutter marks right away (mc edits do
+    // not go through the per-edit shift hooks — a full re-diff is the
+    // exact fix)
+    self.gitRefreshSoon();
 }
 
 /// Keep the visible (main) cursor on the main multi-cursor's position.

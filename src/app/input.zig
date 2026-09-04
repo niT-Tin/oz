@@ -543,4 +543,8 @@ pub fn exitInsert(self: *App) void {
     // swaps the fresh hints in atomically — no flash, and new code
     // gets its hints.
     self.inlay_view_top = null;
+    // Leaving insert is a natural "typing done" point: expire the git
+    // gutter-mark hold so the buffer-vs-HEAD refresh (marks update) spawns
+    // right away instead of waiting out the rest of the typing debounce.
+    self.gitRefreshSoon();
 }

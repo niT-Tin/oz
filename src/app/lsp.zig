@@ -339,6 +339,10 @@ pub fn markDirty(self: *App) void {
 /// (`start`/`end` are LSP positions computed before the edit was applied).
 /// The per-keystroke path — no full-document copy.
 pub fn markDirtyRange(self: *App, start: lsp_types.Position, end: lsp_types.Position, text: []const u8) void {
+    // The edit shifts line positions: keep the displayed git marks glued to
+    // their content lines (shifted along) instead of leaving them stale at
+    // pre-edit positions while the async refresh is still pending.
+    self.gitShiftForEdit(start, end, text);
     self.markDirtyBase();
     if (self.lsp_client) |c| {
         c.didChange(.{ .start = start, .end = end }, text) catch {
