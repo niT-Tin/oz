@@ -1,0 +1,78 @@
+name: release
+
+# 打 v* 标签（如 git tag v0.1.0 && git push origin v0.1.0）时，
+# 在 4 个平台目标上编译 oz 并发布到 GitHub Release：
+#   x86_64-linux / aarch64-linux（Linux 交叉编译，glibc 2.31 基线兼容老发行版）
+#   x86_64-macos / aarch64-macos（macOS 双架构）
+# 每个产物附带 sha256，用户解压即用，无需安装 Zig。
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # 创建 Release 并上传产物
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false # 一个平台失败不阻塞其他平台
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux-gnu.2.31
+            name: x86_64-linux
+          - os: ubuntu-latest
+            target: aarch64-linux-gnu.2.31
+            name: aarch64-linux
+          - os: macos-15 # Apple Silicon runner
+            target: aarch64-macos
+            name: aarch64-macos
+          - os: macos-15
+            target: x86_64-macos
+            name: x86_64-macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Build (ReleaseFast + strip)
+        run: zig build -Doptimize=ReleaseFast -Dstrip -Dtarget=${{ matrix.target }}
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp zig-out/bin/oz dist/oz
+          tar -C dist -czf oz-${{ matrix.name }}.tar.gz oz
+          sha256sum oz-${{ matrix.name }}.tar.gz > oz-${{ matrix.name }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oz-${{ matrix.name }}
+          path: |
+            oz-${{ matrix.name }}.tar.gz
+            oz-${{ matrix.name }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: assets/*
+          generate_release_notes: true
