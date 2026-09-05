@@ -3534,6 +3534,106 @@ test "tree-sitter: zig keywords/comments/strings get syntax colors" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+test "markdown: inline rendering with conceal, injection and decorations" {
+    // M4 markdown 内联渲染: block + inline highlight via the two-grammar
+    // injection, fence content in the fence's language, and conceal of the
+    // markup chrome with anti-conceal on the cursor line.
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}md.md", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\# Title
+            \\
+            \\A **bold** word and `code` here.
+            \\
+            \\See [ozeditor](https://example.com) now.
+            \\
+            \\- [ ] todo
+            \\- [x] done
+            \\
+            \\```zig
+            \\const zx = 1;
+            \\```
+            \\
+        );
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // The cursor sits on line 0 (the heading): it stays unconcealed
+    // (anti-conceal) but the heading STYLE still applies.
+    // kanagawa accent (carpYellow) for the heading text:
+    try std.testing.expect(grid.containsFg("Title", packRgb(0xE6, 0xC3, 0x84)));
+
+    // inline injection: "**" concealed off the cursor line, code span in
+    // string green, link destination concealed (only the text remains)
+    try std.testing.expect(!grid.contains("**bold**"));
+    try std.testing.expect(grid.contains("bold"));
+    try std.testing.expect(grid.containsFg("code", packRgb(0x98, 0xBB, 0x6C)));
+    try std.testing.expect(!grid.contains("https://example.com"));
+    try std.testing.expect(grid.contains("ozeditor"));
+
+    // task list checkboxes become Nerd Font icons
+    try std.testing.expect(grid.contains("\u{f096}")); // unchecked
+    try std.testing.expect(grid.contains("\u{f046}")); // checked
+    try std.testing.expect(!grid.contains("[ ]"));
+    try std.testing.expect(!grid.contains("[x]"));
+
+    // fence injection: the zig keyword inside ```zig gets keyword gold
+    try std.testing.expect(grid.containsFg("const", packRgb(149, 127, 184)));
+
+    // anti-conceal: move the cursor onto the bold line — its markup chrome
+    // reappears, and the heading marker conceals once line 0 is no longer
+    // the cursor line
+    try sess.send("jj");
+    waited = 0;
+    while (!grid.contains("**bold**")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("**bold**"));
+    try std.testing.expect(!grid.contains("# Title"));
+    try std.testing.expect(grid.contains("Title"));
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("MD EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
+    }
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
 test "tree-sitter: colors stay correct after o + typing + jk exit" {
     // Regression for the "chars turn comment-gray after jk" drift: after an
     // 'o' (structural edit) + typing + jk exit, the incremental reparse must
@@ -6779,7 +6879,7 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
     try std.testing.expect(std.mem.indexOf(u8, grid.rowText(2), "docs") != null);
 
     // j × 4 → README.md (docs → src → test → DESIGN.md → README.md), Enter
-    // opens it (markdown has no zig grammar). The tree STAYS open (only
+    // opens it. The tree STAYS open (only
     // <space>e / Esc close it) — the buffer tab shows README.md (row 0, now
     // NOT covered by the sidebar).
     try sess.send("jjjjj\r");

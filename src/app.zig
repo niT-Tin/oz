@@ -176,6 +176,14 @@ pub const App = struct {
         /// Cached syntax spans for this buffer's last-rendered visible byte
         /// range (owned; see SpanRangeCache). null until the first render.
         span_cache: ?SpanRangeCache = null,
+        /// Cached markdown decorations (syntax.Decor) for the last-rendered
+        /// visible byte range — same (revision, byte range) keying as
+        /// spans_cache. Empty for non-markdown buffers.
+        decors_cache: []syntax.Decor = &.{},
+        decors_cache_valid: bool = false,
+        decors_cache_start: u32 = 0,
+        decors_cache_end: u32 = 0,
+        decors_cache_rev: u64 = 0,
     };
 
     /// One split window: which buffer it shows plus its own cursor/viewport.
@@ -1226,6 +1234,7 @@ pub const App = struct {
             buf.pt.deinit();
             buf.folds.deinit(self.alloc);
             if (buf.spans_cache.len > 0) self.alloc.free(buf.spans_cache);
+            if (buf.decors_cache.len > 0) self.alloc.free(buf.decors_cache);
             if (buf.hl) |*h| h.deinit();
             if (buf.span_cache) |*sc| self.alloc.free(sc.spans);
             if (buf.path) |p| self.alloc.free(p);
@@ -1525,6 +1534,7 @@ pub const App = struct {
     pub const exitInsert = @import("app/input.zig").exitInsert;
     // ---- highlight → src/app/highlight.zig ----
     pub const visibleSpansFor = @import("app/highlight.zig").visibleSpansFor;
+    pub const visibleDecorsFor = @import("app/highlight.zig").visibleDecorsFor;
     pub const loadRecent = @import("app/highlight.zig").loadRecent;
     pub const saveRecent = @import("app/highlight.zig").saveRecent;
     pub const execOpMotion = @import("app/highlight.zig").execOpMotion;

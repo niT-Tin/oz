@@ -40,6 +40,10 @@ extern fn ts_tree_cursor_goto_parent(cursor: *TsTreeCursor) bool;
 extern fn ts_tree_cursor_goto_next_sibling(cursor: *TsTreeCursor) bool;
 extern fn ts_tree_cursor_goto_first_child(cursor: *TsTreeCursor) bool;
 
+/// treez's `Parser.setIncludedRanges` binding is BROKEN (declared void but
+/// returns error.Unknown) — call the extern directly.
+extern fn ts_parser_set_included_ranges(parser: ?*treez.Parser, ranges: [*]const treez.Range, length: u32) bool;
+
 /// Highlight style groups, indexed by `Span.style` (0 = default). The caller
 /// (main.zig) owns the actual vaxis style palette, keyed by this enum's
 /// ordinal — syntax.zig only assigns groups.
@@ -74,6 +78,14 @@ pub const Style = enum(u8) {
     bracket5,
     bracket6,
     builtin,
+    // markdown inline structure (DESIGN.md M4): heading text, bold, italic,
+    // link destinations. Appended AFTER the bracket block — bracket0..6's
+    // ordinals must stay contiguous (the rainbow palette indexes by
+    // ordinal offset from bracket0).
+    heading,
+    strong,
+    emphasis,
+    link,
 };
 
 /// One highlighted byte range. Sorted by `start`, non-overlapping.
@@ -81,6 +93,33 @@ pub const Span = struct {
     start: u32,
     end: u32, // exclusive
     style: Style,
+};
+
+/// A markdown decoration over a byte range (DESIGN.md M4 markdown 内联渲染).
+/// Collected from the decor queries (syntax/queries/markdown{,_inline}.decor.scm,
+/// captures "@md.*") by `decorInRange`; consumed by the renderer, which
+/// applies conceal/replace only under the anti-conceal gating (normal mode,
+/// never on the cursor line).
+pub const Decor = struct {
+    start: u32,
+    end: u32, // exclusive
+    kind: Kind,
+    /// .heading: the heading level (1-6). .replace checkbox: 1 = checked.
+    aux: u8 = 0,
+    /// .replace: the substitute text (a Nerd Font glyph for checkboxes).
+    replacement: []const u8 = "",
+
+    pub const Kind = enum {
+        /// Markup chrome to hide: `**`, backticks, link `[]()` skeletons,
+        /// heading `#` markers.
+        conceal,
+        /// Byte range replaced by `replacement` (task list checkboxes).
+        replace,
+        /// Line-level: this range is an atx heading (band + level).
+        heading,
+        /// Line-level: this range is a fenced code block (band).
+        fence,
+    };
 };
 
 /// A byte range identifying a "code block" scope for cursor-aware features
@@ -224,6 +263,7 @@ pub fn languageFor(ft: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, ft, "lua")) return "lua";
     if (std.mem.eql(u8, ft, "toml")) return "toml";
     if (std.mem.eql(u8, ft, "yaml") or std.mem.eql(u8, ft, "yml")) return "yaml";
+    if (std.mem.eql(u8, ft, "md") or std.mem.eql(u8, ft, "markdown")) return "markdown";
     return null;
 }
 
@@ -246,6 +286,15 @@ pub fn captureStyle(name: []const u8) Style {
     if (std.mem.eql(u8, n, "module.builtin")) return .namespace;
     if (std.mem.eql(u8, n, "string.escape")) return .string;
     if (std.mem.eql(u8, n, "number.float")) return .number;
+    // markdown (M4): the vendored queries use the legacy nvim "text.*"
+    // capture names; "markup.*" is the new tree-sitter standard — accept
+    // both. "@none" deliberately falls through to .default (skipped).
+    if (std.mem.eql(u8, n, "text.title") or std.mem.eql(u8, n, "markup.heading")) return .heading;
+    if (std.mem.eql(u8, n, "text.strong") or std.mem.eql(u8, n, "markup.strong")) return .strong;
+    if (std.mem.eql(u8, n, "text.emphasis") or std.mem.eql(u8, n, "markup.italic")) return .emphasis;
+    if (std.mem.eql(u8, n, "text.uri") or std.mem.eql(u8, n, "markup.link.url")) return .link;
+    if (std.mem.eql(u8, n, "text.reference") or std.mem.eql(u8, n, "markup.link.label")) return .property;
+    if (std.mem.eql(u8, n, "text.literal") or std.mem.eql(u8, n, "markup.raw")) return .string;
     const base = if (std.mem.indexOfScalar(u8, n, '.')) |dot| n[0..dot] else n;
     if (std.mem.eql(u8, base, "comment")) return .comment;
     if (std.mem.eql(u8, base, "keyword")) return .keyword;
@@ -513,12 +562,32 @@ pub const Highlighter = struct {
     /// Reusable query cursor (created on first use; ts_query_cursor_new
     /// mallocs, and spansInRange runs every frame per visible window).
     cursor: ?*treez.Query.Cursor = null,
+    /// Injection children keyed by language name (markdown: markdown_inline
+    /// for (inline) nodes + one per fence language). Owned keys and values.
+    /// One level deep: children never carry injections of their own.
+    children: std.StringHashMap(*Highlighter),
+    /// Injection pattern query (src/syntax/queries/<lang>.injections.scm) —
+    /// null for languages without injections.
+    inj_query: ?*treez.Query = null,
+    /// Reusable cursor for the injection query (created on first sync).
+    inj_cursor: ?*treez.Query.Cursor = null,
+    /// Decoration query (syntax/queries/<lang>.decor.scm, "@md.*" captures)
+    /// — markdown and markdown_inline only, null elsewhere.
+    decor_query: ?*treez.Query = null,
+    /// Reusable cursor for the decoration query.
+    decor_cursor: ?*treez.Query.Cursor = null,
+    /// Injection sync state (see ensureInjections): children re-parse when
+    /// the block tree changed (reparse* set dirty) or the queried byte
+    /// range changed.
+    inj_dirty: bool = true,
+    inj_start: u32 = 0,
+    inj_end: u32 = 0,
 
     /// Grammars with a bundled query file (src/syntax/queries/<lang>.scm).
     const LANGUAGES = [_][]const u8{
-        "zig",        "rust", "go", "python", "typescript", "tsx",
-        "javascript", "json", "c",  "cpp",    "bash",       "lua",
-        "toml",       "yaml",
+        "zig",       "rust",   "go",   "python", "typescript", "tsx",
+        "javascript", "json",  "c",    "cpp",    "bash",        "lua",
+        "toml",      "yaml",   "markdown", "markdown_inline",
     };
 
     pub fn init(allocator: std.mem.Allocator, lang_name: []const u8) !Highlighter {
@@ -537,15 +606,41 @@ pub const Highlighter = struct {
         try parser.setLanguage(language);
         var error_offset: u32 = 0;
         const query = try treez.Query.create(language, @embedFile("syntax/queries/" ++ lang ++ ".scm"), &error_offset);
+        errdefer query.destroy();
+        var inj_query: ?*treez.Query = null;
+        // markdown is a two-parser grammar: the block tree's (inline) nodes
+        // and fenced code blocks are re-parsed by child languages
+        // (markdown_inline, the fence's language) via included ranges.
+        if (comptime std.mem.eql(u8, lang, "markdown")) {
+            inj_query = try treez.Query.create(language, @embedFile("syntax/queries/markdown.injections.scm"), &error_offset);
+        }
+        var decor_query: ?*treez.Query = null;
+        if (comptime std.mem.eql(u8, lang, "markdown") or std.mem.eql(u8, lang, "markdown_inline")) {
+            decor_query = try treez.Query.create(language, @embedFile("syntax/queries/" ++ lang ++ ".decor.scm"), &error_offset);
+        }
         return .{
             .allocator = allocator,
             .parser = parser,
             .query = query,
             .lang_name = lang,
+            .children = std.StringHashMap(*Highlighter).init(allocator),
+            .inj_query = inj_query,
+            .decor_query = decor_query,
         };
     }
 
     pub fn deinit(self: *Highlighter) void {
+        var it = self.children.iterator();
+        while (it.next()) |e| {
+            e.value_ptr.*.deinit();
+            self.allocator.destroy(e.value_ptr.*);
+            self.allocator.free(e.key_ptr.*);
+        }
+        self.children.deinit();
+        if (self.decor_cursor) |c| c.destroy();
+        if (self.decor_query) |q| q.destroy();
+        if (self.inj_cursor) |c| c.destroy();
+        if (self.inj_query) |q| q.destroy();
         self.prev_text.deinit(self.allocator);
         self.line_starts.deinit(self.allocator);
         if (self.tree) |t| t.destroy();
@@ -565,6 +660,17 @@ pub const Highlighter = struct {
         if (self.tree) |old| old.destroy();
         self.tree = new_tree;
         try self.setPrevText(text);
+        // full re-parse: child trees have no matching edit records — drop
+        // them (a stale tree re-parsed without edit records corrupts the
+        // result); they re-parse from scratch at the next ensureInjections
+        var cit = self.children.iterator();
+        while (cit.next()) |e| {
+            if (e.value_ptr.*.tree) |t| {
+                t.destroy();
+                e.value_ptr.*.tree = null;
+            }
+        }
+        self.inj_dirty = true;
     }
 
     /// Full reset of the owned text copy and its line index (buffer switch,
@@ -593,19 +699,20 @@ pub const Highlighter = struct {
     /// failure the tree is likewise dropped and a full reparse is used.
     pub fn reparseEdit(self: *Highlighter, pos: u32, old_end: u32, new_end: u32, text: []const u8) !void {
         var patched = false;
+        var edit_rec: treez.InputEdit = undefined;
         if (self.tree != null and self.editConsistent(pos, old_end, new_end, text)) {
             const t = self.tree.?;
-            const start_point = self.pointOf(pos);
-            const old_end_point = self.pointOf(old_end);
-            try self.applyTextEdit(pos, old_end, new_end, text);
-            t.edit(&.{
+            edit_rec = .{
                 .start_byte = pos,
                 .old_end_byte = old_end,
                 .new_end_byte = new_end,
-                .start_point = start_point,
-                .old_end_point = old_end_point,
-                .new_end_point = self.pointOf(new_end),
-            });
+                .start_point = self.pointOf(pos),
+                .old_end_point = self.pointOf(old_end),
+                .new_end_point = undefined, // set after applyTextEdit
+            };
+            try self.applyTextEdit(pos, old_end, new_end, text);
+            edit_rec.new_end_point = self.pointOf(new_end);
+            t.edit(&edit_rec);
             patched = true;
         } else if (self.tree) |old| {
             old.destroy();
@@ -619,6 +726,24 @@ pub const Highlighter = struct {
         if (self.tree) |old| old.destroy();
         self.tree = new_tree;
         if (!patched) try self.setPrevText(text);
+        // Injection children: keep their trees incrementally VALID (same
+        // InputEdit + text patch) but don't parse yet — the actual child
+        // parse happens lazily in ensureInjections, scoped to the visible
+        // range, so a mid-document keystroke never re-parses every
+        // paragraph/fence of a large markdown file (perf contract §12.7).
+        var cit = self.children.iterator();
+        while (cit.next()) |e| {
+            const child = e.value_ptr.*;
+            if (child.tree == null) continue;
+            if (patched and child.editConsistent(pos, old_end, new_end, text)) {
+                child.applyTextEdit(pos, old_end, new_end, text) catch {};
+                child.tree.?.edit(&edit_rec);
+            } else {
+                child.tree.?.destroy();
+                child.tree = null;
+            }
+        }
+        self.inj_dirty = true;
     }
 
     /// True when the edit record lines up with the owned text copy: applying
@@ -714,6 +839,137 @@ pub const Highlighter = struct {
         return .{ .row = @intCast(line), .column = b - ls[line] };
     }
 
+    /// Injection children: lazily sync to the visible byte range ─────────
+    ///
+    /// Called from spansInRange/decorInRange (never from reparse*): the
+    /// injection query runs with `setByteRange(start, end)` and each child
+    /// parses ONLY the inline/fence nodes intersecting the viewport. This
+    /// keeps the perf contract (§12.7) — a mid-document keystroke in a 90KB
+    /// markdown file must not re-parse every paragraph: an insert shifts
+    /// the byte offsets of ALL following injection ranges, so whole-file
+    /// included ranges defeat tree-sitter's incremental reuse (~270ms/keystroke
+    /// in Debug measured; viewport-scoped ranges restore ~ms).
+    ///
+    /// Child trees stay incrementally valid between syncs because
+    /// reparseEdit patches them with the same InputEdit. Guarded by
+    /// (dirty, range): the render loop's span+decor pair for the same
+    /// viewport syncs once.
+    fn ensureInjections(self: *Highlighter, start_byte: u32, end_byte: u32) !void {
+        const q = self.inj_query orelse return;
+        if (self.tree == null) return;
+        if (!self.inj_dirty and self.inj_start == start_byte and self.inj_end == end_byte) return;
+        self.inj_dirty = false;
+        self.inj_start = start_byte;
+        self.inj_end = end_byte;
+        const text = self.prev_text.items;
+        const alloc = self.allocator;
+        // group content ranges by language: [inline] → markdown_inline,
+        // code_fence_content → the fence's info_string language (a handful
+        // of distinct languages at most — a linear list beats a hashmap)
+        const LangRanges = struct { lang: []const u8, ranges: std.ArrayList(treez.Range) };
+        var by_lang = std.ArrayList(LangRanges).empty;
+        defer {
+            for (by_lang.items) |*e| e.ranges.deinit(alloc);
+            by_lang.deinit(alloc);
+        }
+        const cur = if (self.inj_cursor) |c| c else blk: {
+            self.inj_cursor = try treez.Query.Cursor.create();
+            break :blk self.inj_cursor.?;
+        };
+        // viewport-scoped (see the doc comment); a node intersecting the
+        // range contributes its FULL byte range, so scrolling inside one
+        // fence/paragraph doesn't churn the child's included ranges
+        cur.setByteRange(start_byte, end_byte);
+        cur.execute(q, self.tree.?.getRootNode());
+        while (cur.nextMatch()) |match| {
+            var lang: ?[]const u8 = null;
+            var content: ?treez.Node = null;
+            for (match.captures()) |cap| {
+                const name = q.getCaptureNameForId(cap.id);
+                if (std.mem.eql(u8, name, "injection.language")) {
+                    const s = cap.node.getStartByte();
+                    const e = cap.node.getEndByte();
+                    if (s < e and e <= text.len) lang = text[s..e];
+                } else if (std.mem.eql(u8, name, "injection.content")) {
+                    content = cap.node;
+                }
+            }
+            const c = content orelse continue;
+            const l = lang orelse "markdown_inline"; // bare (inline)
+            const s = c.getStartByte();
+            const e = c.getEndByte();
+            if (e <= s or e > text.len) continue;
+            var entry: ?*LangRanges = null;
+            for (by_lang.items) |*e2| {
+                if (std.mem.eql(u8, e2.lang, l)) {
+                    entry = e2;
+                    break;
+                }
+            }
+            if (entry == null) {
+                try by_lang.append(alloc, .{ .lang = l, .ranges = .empty });
+                entry = &by_lang.items[by_lang.items.len - 1];
+            }
+            try entry.?.ranges.append(alloc, .{
+                .start_point = self.pointOf(s),
+                .end_point = self.pointOf(e),
+                .start_byte = s,
+                .end_byte = e,
+            });
+        }
+        // children whose ranges vanished from the viewport keep the struct
+        // but drop the tree (they re-parse when scrolled back into view)
+        var cit = self.children.iterator();
+        outer: while (cit.next()) |e| {
+            for (by_lang.items) |r| {
+                if (std.mem.eql(u8, r.lang, e.key_ptr.*)) continue :outer;
+            }
+            if (e.value_ptr.*.tree) |t| {
+                t.destroy();
+                e.value_ptr.*.tree = null;
+            }
+        }
+        for (by_lang.items) |e| {
+            // unsupported fence language (no bundled grammar): skip, the
+            // content keeps its plain look (no child spans to merge)
+            const child = self.childFor(e.lang) catch continue;
+            try child.syncRanges(e.ranges.items, text);
+        }
+    }
+
+    /// Get-or-create the injection child for `lang` (fails for languages
+    /// without a bundled grammar). The map key is owned — the caller's
+    /// `lang` slice points into transient document text.
+    fn childFor(self: *Highlighter, lang: []const u8) !*Highlighter {
+        if (self.children.get(lang)) |c| return c;
+        var child = try Highlighter.init(self.allocator, lang);
+        errdefer child.deinit();
+        const key = try self.allocator.dupe(u8, lang);
+        errdefer self.allocator.free(key);
+        const ptr = try self.allocator.create(Highlighter);
+        errdefer self.allocator.destroy(ptr);
+        ptr.* = child;
+        try self.children.put(key, ptr);
+        return ptr;
+    }
+
+    /// (Re)parse this child over `ranges` of the shared document text
+    /// (setIncludedRanges + parse). The child's tree is either null
+    /// (from-scratch parse + text resync) or already carries every edit the
+    /// block tree got (reparseEdit patches child trees in lockstep), so the
+    /// incremental parse is always valid.
+    fn syncRanges(self: *Highlighter, ranges: []const treez.Range, text: []const u8) !void {
+        _ = ts_parser_set_included_ranges(self.parser, ranges.ptr, @intCast(ranges.len));
+        if (self.tree == null) try self.setPrevText(text);
+        const new_tree = self.parser.parseString(self.tree, text) catch {
+            if (self.tree) |old| old.destroy();
+            self.tree = null;
+            return; // leave the child tree-less: spansInRange just skips it
+        };
+        if (self.tree) |old| old.destroy();
+        self.tree = new_tree;
+    }
+
     /// Run the highlight query over [start_byte, end_byte) and append spans
     /// to `out` (allocated from `arena`, e.g. the render frame arena). The
     /// query cursor is byte-range limited — the O(visible) contract.
@@ -724,8 +980,9 @@ pub const Highlighter = struct {
     /// (O(children) per level), which cost ~6µs/step — 46 brackets × 25
     /// steps ≈ 7ms/frame on token-dense code, the dominant frame cost.
     pub fn spansInRange(self: *Highlighter, start_byte: u32, end_byte: u32, arena: std.mem.Allocator, out: *std.ArrayList(Span)) !void {
-        const tree = self.tree orelse return;
+        if (self.tree == null) return;
         const text = self.prev_text.items;
+        try self.ensureInjections(start_byte, end_byte);
         // one walk over the visible subtree: ERROR ranges (for the fallback
         // lexer) + node-id → depth (for rainbow brackets)
         var errs = std.ArrayList(ByteRange).empty;
@@ -733,34 +990,23 @@ pub const Highlighter = struct {
         var depths = std.AutoHashMap(*const anyopaque, u32).init(arena);
         defer depths.deinit();
         try self.walkVisible(start_byte, end_byte, arena, &errs, &depths);
-        const cursor = if (self.cursor) |c| c else blk: {
-            self.cursor = try treez.Query.Cursor.create();
-            break :blk self.cursor.?;
-        };
-        cursor.setByteRange(start_byte, end_byte);
-        cursor.execute(self.query, tree.getRootNode());
-        while (cursor.nextCapture()) |nc| {
-            const match = nc[0];
-            const cap = match.captures()[nc[1]];
-            // query predicates (#lua-match?/#eq?/#any-of?): the pattern only
-            // applies when they hold — treez's own validation only supports
-            // #eq? and is not wired in here, so evaluate them ourselves
-            // (see matchPredicates). Without this, "@type" with a
-            // `#lua-match? "^[A-Z_]..."` predicate matches EVERY identifier.
-            if (!matchPredicates(self, match, text)) continue;
-            const name = self.query.getCaptureNameForId(cap.id);
-            // rainbow brackets: "@punctuation.bracket" spans get bracketN
-            // instead of the plain .punctuation that captureStyle() would
-            // fold them to (it collapses dotted suffixes onto the base).
-            const style: Style = if (isBracketCapture(name))
-                bracketStyle(depthOf(cap.node, &depths))
-            else
-                captureStyle(name);
-            if (style == .default) continue;
-            const s = cap.node.getStartByte();
-            const e = cap.node.getEndByte();
-            if (s == e) continue;
-            try out.append(arena, .{ .start = s, .end = e, .style = style });
+        try self.queryInto(start_byte, end_byte, arena, out, &depths);
+        // Injection children (markdown_inline, fence languages): their spans
+        // append AFTER the parent's, so the same-range dedup below and the
+        // caller's "later wins" merge both favor the child (bold inside a
+        // heading, fence-language colors inside the @none'd code content).
+        // Children get NO fallbackLex pass — the cross-language keyword set
+        // misfires on markdown ('#' is a heading, not a comment).
+        var cit = self.children.iterator();
+        while (cit.next()) |e| {
+            const child = e.value_ptr.*;
+            if (child.tree == null) continue;
+            var cerrs = std.ArrayList(ByteRange).empty;
+            defer cerrs.deinit(arena);
+            var cdepths = std.AutoHashMap(*const anyopaque, u32).init(arena);
+            defer cdepths.deinit();
+            try child.walkVisible(start_byte, end_byte, arena, &cerrs, &cdepths);
+            try child.queryInto(start_byte, end_byte, arena, out, &cdepths);
         }
         // Same byte range can be captured by several patterns (the catch-all
         // `(identifier) @variable` plus the specific one). Our query files
@@ -806,6 +1052,109 @@ pub const Highlighter = struct {
             try fallbackLex(text[lo..hi], lo, arena, out);
         }
         std.mem.sort(Span, out.items, {}, lessThan);
+    }
+
+    /// The highlight-query pass over [start_byte, end_byte): one span per
+    /// capture, predicates evaluated, rainbow brackets depth-mapped via
+    /// `depths` (from walkVisible over THIS highlighter's tree). Factored
+    /// out of spansInRange so injection children run the identical pass
+    /// over their own tree and query.
+    fn queryInto(self: *Highlighter, start_byte: u32, end_byte: u32, arena: std.mem.Allocator, out: *std.ArrayList(Span), depths: *const std.AutoHashMap(*const anyopaque, u32)) !void {
+        const tree = self.tree orelse return;
+        const text = self.prev_text.items;
+        const cursor = if (self.cursor) |c| c else blk: {
+            self.cursor = try treez.Query.Cursor.create();
+            break :blk self.cursor.?;
+        };
+        cursor.setByteRange(start_byte, end_byte);
+        cursor.execute(self.query, tree.getRootNode());
+        while (cursor.nextCapture()) |nc| {
+            const match = nc[0];
+            const cap = match.captures()[nc[1]];
+            // query predicates (#lua-match?/#eq?/#any-of?): the pattern only
+            // applies when they hold — treez's own validation only supports
+            // #eq? and is not wired in here, so evaluate them ourselves
+            // (see matchPredicates). Without this, "@type" with a
+            // `#lua-match? "^[A-Z_]..."` predicate matches EVERY identifier.
+            if (!matchPredicates(self, match, text)) continue;
+            const name = self.query.getCaptureNameForId(cap.id);
+            // rainbow brackets: "@punctuation.bracket" spans get bracketN
+            // instead of the plain .punctuation that captureStyle() would
+            // fold them to (it collapses dotted suffixes onto the base).
+            const style: Style = if (isBracketCapture(name))
+                bracketStyle(depthOf(cap.node, depths))
+            else
+                captureStyle(name);
+            if (style == .default) continue;
+            const s = cap.node.getStartByte();
+            const e = cap.node.getEndByte();
+            if (s == e) continue;
+            try out.append(arena, .{ .start = s, .end = e, .style = style });
+        }
+    }
+
+    /// Markdown decorations over [start_byte, end_byte): conceal ranges
+    /// (markup chrome), checkbox replacements, and heading/fence line
+    /// props. Collected from this highlighter's decor query plus the
+    /// injection children's (inline chrome lives in the markdown_inline
+    /// child). Sorted by (start, end). Arena-allocated.
+    pub fn decorInRange(self: *Highlighter, start_byte: u32, end_byte: u32, arena: std.mem.Allocator, out: *std.ArrayList(Decor)) !void {
+        try self.ensureInjections(start_byte, end_byte);
+        try self.decorQueryInto(start_byte, end_byte, arena, out);
+        var cit = self.children.iterator();
+        while (cit.next()) |e| {
+            const child = e.value_ptr.*;
+            if (child.tree == null) continue;
+            try child.decorQueryInto(start_byte, end_byte, arena, out);
+        }
+        std.mem.sort(Decor, out.items, {}, struct {
+            fn lt(_: void, x: Decor, y: Decor) bool {
+                return x.start < y.start or (x.start == y.start and x.end < y.end);
+            }
+        }.lt);
+    }
+
+    /// The decoration-query pass over [start_byte, end_byte) for ONE tree.
+    /// No predicates in the decor queries, so no matchPredicates here.
+    fn decorQueryInto(self: *Highlighter, start_byte: u32, end_byte: u32, arena: std.mem.Allocator, out: *std.ArrayList(Decor)) !void {
+        const q = self.decor_query orelse return;
+        const tree = self.tree orelse return;
+        const text = self.prev_text.items;
+        const cursor = if (self.decor_cursor) |c| c else blk: {
+            self.decor_cursor = try treez.Query.Cursor.create();
+            break :blk self.decor_cursor.?;
+        };
+        cursor.setByteRange(start_byte, end_byte);
+        cursor.execute(q, tree.getRootNode());
+        while (cursor.nextCapture()) |nc| {
+            const match = nc[0];
+            const cap = match.captures()[nc[1]];
+            const name = q.getCaptureNameForId(cap.id);
+            const s = cap.node.getStartByte();
+            var e = cap.node.getEndByte();
+            if (e <= s or e > text.len) continue;
+            if (std.mem.eql(u8, name, "md.conceal")) {
+                try out.append(arena, .{ .start = s, .end = e, .kind = .conceal });
+            } else if (std.mem.eql(u8, name, "md.heading_marker")) {
+                // swallow the single space after the marker ("## " → "")
+                if (e < text.len and text[e] == ' ') e += 1;
+                try out.append(arena, .{ .start = s, .end = e, .kind = .conceal });
+            } else if (std.mem.eql(u8, name, "md.heading")) {
+                // the heading level = the count of '#' (atx markers may
+                // follow up to 3 spaces of indentation)
+                var i = s;
+                while (i < e and text[i] != '#') i += 1;
+                var level: u8 = 0;
+                while (i + level < e and text[i + level] == '#') level += 1;
+                try out.append(arena, .{ .start = s, .end = e, .kind = .heading, .aux = level });
+            } else if (std.mem.eql(u8, name, "md.fence")) {
+                try out.append(arena, .{ .start = s, .end = e, .kind = .fence });
+            } else if (std.mem.eql(u8, name, "md.checkbox_on")) {
+                try out.append(arena, .{ .start = s, .end = e, .kind = .replace, .aux = 1, .replacement = "\u{f046}" });
+            } else if (std.mem.eql(u8, name, "md.checkbox_off")) {
+                try out.append(arena, .{ .start = s, .end = e, .kind = .replace, .replacement = "\u{f096}" });
+            }
+        }
     }
 
     /// One DFS over the subtree intersecting [start, end): records ERROR
@@ -857,7 +1206,10 @@ pub const Highlighter = struct {
     }
 
     fn lessThan(_: void, a: Span, b: Span) bool {
-        return a.start < b.start;
+        // same start: the LONGER span first — with the "later wins" merge in
+        // highlight.zig the shorter (more specific) span then wins its
+        // subrange while the container keeps the head and tail
+        return a.start < b.start or (a.start == b.start and a.end > b.end);
     }
 
     /// Deepest multi-line "code block" node containing `byte`, as a byte
@@ -1148,8 +1500,151 @@ test "languageFor: filetype to grammar" {
     try std.testing.expectEqualStrings("tsx", languageFor("tsx").?);
     try std.testing.expectEqualStrings("javascript", languageFor("js").?);
     try std.testing.expectEqualStrings("json", languageFor("json").?);
-    try std.testing.expect(languageFor("md") == null);
+    try std.testing.expectEqualStrings("markdown", languageFor("md").?);
+    try std.testing.expectEqualStrings("markdown", languageFor("markdown").?);
     try std.testing.expect(languageFor("txt") == null);
+}
+
+test "highlight: markdown headings, list markers and quotes get styled spans" {
+    const alloc = std.testing.allocator;
+    const src =
+        \\# Title
+        \\
+        \\- item
+        \\> quote
+        \\
+    ;
+    var hl = try Highlighter.init(alloc, "markdown");
+    defer hl.deinit();
+    try hl.reparse(src);
+    var spans = std.ArrayList(Span).empty;
+    defer spans.deinit(alloc);
+    try hl.spansInRange(0, @intCast(src.len), std.testing.allocator, &spans);
+
+    // "Title" is (atx_heading (inline) @text.title) → heading
+    const title_at: u32 = @intCast(std.mem.indexOf(u8, src, "Title").?);
+    try std.testing.expectEqual(Style.heading, spanAt(spans.items, title_at).?);
+    // the "#" marker, the "-" list marker and the ">" quote marker are
+    // @punctuation.special → punctuation
+    try std.testing.expectEqual(Style.punctuation, spanAt(spans.items, 0).?);
+    const dash_at: u32 = @intCast(std.mem.indexOf(u8, src, "- item").?);
+    try std.testing.expectEqual(Style.punctuation, spanAt(spans.items, dash_at).?);
+    const gt_at: u32 = @intCast(std.mem.indexOf(u8, src, "> quote").?);
+    try std.testing.expectEqual(Style.punctuation, spanAt(spans.items, gt_at).?);
+}
+
+test "highlight: markdown inline injection — bold, code span and link" {
+    const alloc = std.testing.allocator;
+    const src = "A **bold** and `code` and [t](https://x.y) here\n";
+    var hl = try Highlighter.init(alloc, "markdown");
+    defer hl.deinit();
+    try hl.reparse(src);
+    var spans = std.ArrayList(Span).empty;
+    defer spans.deinit(alloc);
+    try hl.spansInRange(0, @intCast(src.len), std.testing.allocator, &spans);
+
+    // the markdown_inline child styles the inline content
+    const bold_at: u32 = @intCast(std.mem.indexOf(u8, src, "bold").?);
+    try std.testing.expectEqual(Style.strong, spanAt(spans.items, bold_at).?);
+    const code_at: u32 = @intCast(std.mem.indexOf(u8, src, "code").?);
+    try std.testing.expectEqual(Style.string, spanAt(spans.items, code_at).?);
+    const url_at: u32 = @intCast(std.mem.indexOf(u8, src, "https").?);
+    try std.testing.expectEqual(Style.link, spanAt(spans.items, url_at).?);
+}
+
+test "highlight: markdown fence injection — zig fence content gets zig colors" {
+    const alloc = std.testing.allocator;
+    const src = "# T\n\n```zig\nconst x = 1;\n```\n";
+    var hl = try Highlighter.init(alloc, "markdown");
+    defer hl.deinit();
+    try hl.reparse(src);
+    var spans = std.ArrayList(Span).empty;
+    defer spans.deinit(alloc);
+    try hl.spansInRange(0, @intCast(src.len), std.testing.allocator, &spans);
+
+    // the zig child highlighter owns the code_fence_content range
+    const const_at: u32 = @intCast(std.mem.indexOf(u8, src, "const").?);
+    try std.testing.expectEqual(Style.keyword, spanAt(spans.items, const_at).?);
+    const one_at: u32 = @intCast(std.mem.indexOf(u8, src, "1").?);
+    try std.testing.expectEqual(Style.number, spanAt(spans.items, one_at).?);
+}
+
+test "highlight: markdown inline injection survives incremental edits" {
+    const alloc = std.testing.allocator;
+    const src = "A **bold** word\n";
+    var hl = try Highlighter.init(alloc, "markdown");
+    defer hl.deinit();
+    try hl.reparse(src);
+
+    // insert "very " before "bold" (single incremental edit): the bold
+    // span must shift and stay strong
+    const new_src = "A **very bold** word\n";
+    try hl.reparseEdit(4, 4, 9, new_src);
+    var spans = std.ArrayList(Span).empty;
+    defer spans.deinit(alloc);
+    try hl.spansInRange(0, @intCast(new_src.len), std.testing.allocator, &spans);
+    const bold_at: u32 = @intCast(std.mem.indexOf(u8, new_src, "bold").?);
+    try std.testing.expectEqual(Style.strong, spanAt(spans.items, bold_at).?);
+}
+
+test "decor: markdown conceal/replace/heading/fence ranges" {
+    const alloc = std.testing.allocator;
+    const src =
+        \\## Head
+        \\
+        \\A **bold** `code` [t](https://x.y)
+        \\- [ ] todo
+        \\- [x] done
+        \\
+        \\```zig
+        \\const x = 1;
+        \\```
+        \\
+    ;
+    var hl = try Highlighter.init(alloc, "markdown");
+    defer hl.deinit();
+    try hl.reparse(src);
+    var decors = std.ArrayList(Decor).empty;
+    defer decors.deinit(alloc);
+    try hl.decorInRange(0, @intCast(src.len), alloc, &decors);
+
+    var heading: ?Decor = null;
+    var marker = false;
+    var stars: u32 = 0;
+    var backticks: u32 = 0;
+    var dest = false;
+    var cb_off = false;
+    var cb_on = false;
+    var fence: ?Decor = null;
+    for (decors.items) |d| {
+        const dtext = src[d.start..d.end];
+        switch (d.kind) {
+            .heading => heading = d,
+            .fence => fence = d,
+            .conceal => {
+                if (std.mem.eql(u8, dtext, "## ")) marker = true; // space swallowed
+                if (std.mem.eql(u8, dtext, "*")) stars += 1; // emphasis_delimiter is per-'*'
+                if (std.mem.eql(u8, dtext, "`")) backticks += 1;
+                if (std.mem.eql(u8, dtext, "https://x.y")) dest = true;
+            },
+            .replace => {
+                if (std.mem.eql(u8, dtext, "[ ]") and d.aux == 0) cb_off = true;
+                if (std.mem.eql(u8, dtext, "[x]") and d.aux == 1) cb_on = true;
+            },
+        }
+    }
+    try std.testing.expect(heading != null);
+    try std.testing.expectEqual(@as(u8, 2), heading.?.aux);
+    try std.testing.expect(marker);
+    try std.testing.expectEqual(@as(u32, 4), stars); // "**bold**" = 4 single-'*' delimiters
+    try std.testing.expectEqual(@as(u32, 2), backticks);
+    try std.testing.expect(dest);
+    try std.testing.expect(cb_off);
+    try std.testing.expect(cb_on);
+    try std.testing.expect(fence != null);
+    // the fence decor covers the code line
+    const code_at: u32 = @intCast(std.mem.indexOf(u8, src, "const x").?);
+    try std.testing.expect(fence.?.start <= code_at and fence.?.end > code_at);
 }
 
 test "highlight: zig keywords and strings get styled spans" {
@@ -1584,3 +2079,6 @@ test "scopeAt: nested call/initializer wrappers are transparent (build.zig case)
     const sc2 = hl.scopeAt(@intCast(in_imports)).?;
     try std.testing.expectEqual(@as(u32, 12), sc2.indent_col);
 }
+
+
+

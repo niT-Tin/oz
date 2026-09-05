@@ -206,6 +206,14 @@ pub fn syntaxStyle(style: syntax.Style, t: theme.Theme) vaxis.Style {
         .attribute => .{ .fg = .{ .rgb = t.attribute } },
         .builtin => .{ .fg = .{ .rgb = t.builtin } },
         .punctuation => .{ .fg = .{ .rgb = t.punctuation } },
+        // markdown (M4): headings get the accent color in bold; strong /
+        // emphasis are attribute-only (the surrounding span keeps its fg);
+        // links take the function color + underline (merged through in
+        // render.zig, which copies fg/bold/italic/ul from this style)
+        .heading => .{ .fg = .{ .rgb = t.accent }, .bold = true },
+        .strong => .{ .fg = .{ .rgb = t.fg }, .bold = true },
+        .emphasis => .{ .fg = .{ .rgb = t.fg }, .italic = true },
+        .link => .{ .fg = .{ .rgb = t.function }, .ul = .{ .rgb = t.function }, .ul_style = .single },
         // rainbow brackets: bracketN -> rainbow[N] (ordinal offset from
         // bracket0, exactly the bracket depth % 7 the highlighter assigned)
         .bracket0, .bracket1, .bracket2, .bracket3, .bracket4, .bracket5, .bracket6 => blk: {

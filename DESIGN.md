@@ -552,8 +552,9 @@ Client = {
 | 大文件降级 | >100KB 完全跳过语法 pass（与 nvim 缓解报告同阈值） | cabac.zig(124KB) 零语法开销 |
 | 行索引 | 每编辑后全量重建（O(文件) 字节扫描，M1 现状）；B-tree 缓存行偏移是 M2+ 优化项 | 12MB 打字 ~30ms/键；源码级 <1MB 时 <3ms/键 |
 | 渲染 | vaxis diff 渲染只发变更 cell + 颜色连续段合并 SGR | 滚动 30 屏任意文件 <50ms |
+| markdown injection（M4） | 双 grammar（block + markdown_inline/fence 语言）经 `setIncludedRanges` 注入；**子树解析限定在视口相交的 inline/fence 节点**（编辑会使后续所有注入区间位移，全文 included ranges 会让增量复用失效）；子树与主树用同一 InputEdit 保持增量有效 | 90KB md 打字：全量 included ranges 274ms/键 → 视口限定后 **~10ms/键**（ReleaseFast；block parser 本身偏慢是 tree-sitter-markdown 已知问题）；视口 span/decor query ~1.5ms |
 
-**验证方式**（防退化）：`zig build e2e` 含两条语法契约测试——zig 文件关键字/注释颜色断言（Grid 解析器记录 SGR fg），以及 >100KB 文件零颜色断言。人工基准：造 ~90KB zig 文件跑 `script` 会话测打字/滚动墙钟。
+**验证方式**（防退化）：`zig build e2e` 含两条语法契约测试——zig 文件关键字/注释颜色断言（Grid 解析器记录 SGR fg），以及 >100KB 文件零颜色断言。markdown 渲染有专门 e2e（标题/粗体/code span/链接/fence 注入/checkbox 图标 + 光标行 anti-conceal）。人工基准：造 ~90KB zig 文件跑 `script` 会话测打字/滚动墙钟。
 
 ---
 
@@ -613,8 +614,10 @@ Client = {
 
 ### M4 — UI 打磨 + AI（≈3-4 周）
 
-- sticky context、彩虹括号、折叠（ts 驱动 + 摘要行）、zen 模式
-- markdown 内联渲染、颜色预览（#rrggbb）、TODO/FIXME 高亮 + leader tt 列表
+- sticky context、折叠（缩进驱动 + 摘要行，ts 精化为可选优化）、zen 模式
+- [x] 彩虹括号 + indent guide/scope 高亮动画（M4 前已落地）
+- [x] markdown 内联渲染（块级+行内高亮走 markdown/markdown_inline 双 grammar injection；fence 代码按 fence 语言注入上色；conceal 隐藏 `**`/`` ` ``/链接骨架/标题 `#` 前缀，光标行 anti-conceal，Insert/Visual/多光标/easymotion 时禁用；checkbox → Nerd Font 图标；标题/代码块整行背景带；表格仅上色，strikethrough 不做）
+- 颜色预览（#rrggbb）、TODO/FIXME 高亮 + leader tt 列表
 - CursorHold 单词自动高亮（120ms）、多主题切换（kanagawa-wave 默认）
 - 大文件降级策略落地
 - AI（spec §9）：行内补全源（Copilot/兼容 API，限 3 条与补全菜单合并）、chat 浮窗（选区提问）、外部 LLM API（DeepSeek 等）滚动翻译等内置能力

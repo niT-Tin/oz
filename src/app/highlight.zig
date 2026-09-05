@@ -71,19 +71,42 @@ pub fn visibleSpansFor(self: *App, buf: *Buffer, arena: std.mem.Allocator, view_
     }
     var raw = std.ArrayList(syntax.Span).empty;
     try hl.spansInRange(@intCast(start), @intCast(end), arena, &raw);
+    // "Later wins" overlap merge with SPLITTING: a nested span takes its
+    // subrange while the covered container keeps its head and tail (the
+    // tail is re-appended after the nested span so still-later spans can
+    // beat it). The old merge truncated or popped the container, which was
+    // invisible for dense code captures but dropped whole prose styles once
+    // markdown injections nested emphasis/links inside headings.
     var out = std.ArrayList(syntax.Span).empty;
-    for (raw.items) |sp| {
+    raw_loop: for (raw.items) |sp| {
+        const s = sp;
         while (out.items.len > 0) {
-            var last = &out.items[out.items.len - 1];
-            if (sp.start >= last.end) break; // disjoint
-            if (sp.start <= last.start) {
-                _ = out.pop(); // covers the previous span wholly
+            const last = &out.items[out.items.len - 1];
+            if (last.end <= s.start) break; // disjoint
+            if (last.start < s.start) {
+                if (last.end > s.end) {
+                    // s punches a hole in last: head keeps last's style
+                    const tail = syntax.Span{ .start = s.end, .end = last.end, .style = last.style };
+                    last.end = s.start;
+                    try out.append(arena, s);
+                    try out.append(arena, tail);
+                    continue :raw_loop;
+                }
+                last.end = s.start; // s covers last's tail
+                break;
+            }
+            // last.start == s.start (raw is sorted by start): s wins the head
+            if (s.end >= last.end) {
+                _ = out.pop(); // s covers last wholly
                 continue;
             }
-            last.end = sp.start; // later span wins the overlap
-            break;
+            // same start, s shorter: s takes the head, last keeps its tail
+            const tail = syntax.Span{ .start = s.end, .end = last.end, .style = last.style };
+            last.* = s;
+            try out.append(arena, tail);
+            continue :raw_loop;
         }
-        try out.append(arena, sp);
+        try out.append(arena, s);
     }
     // own a copy so future cache hits return a stable slice (the arena
     // is per-frame; the buffer outlives any frame)
@@ -95,6 +118,39 @@ pub fn visibleSpansFor(self: *App, buf: *Buffer, arena: std.mem.Allocator, view_
     buf.spans_cache_end = end;
     buf.spans_cache_rev = rev;
     return buf.spans_cache;
+}
+
+/// Markdown decorations (conceal / checkbox replace / heading & fence
+/// bands) for the visible byte range of `buf` — same (revision, byte
+/// range) caching as visibleSpansFor. Empty for non-markdown buffers (only
+/// markdown highlighters carry a decor query) and before the first parse.
+/// Call AFTER visibleSpansFor so the tree is fresh.
+pub fn visibleDecorsFor(self: *App, buf: *Buffer, arena: std.mem.Allocator, view_top: u32, content_rows: u32) ![]syntax.Decor {
+    const hl = if (buf.hl) |*h| h else return &.{};
+    if (hl.decor_query == null or hl.tree == null) return &.{};
+    const rev = buf.history.revision;
+    const line_count = buf.pt.lineCount();
+    const start = buf.pt.lineStart(@min(view_top, line_count -| 1));
+    const vbottom = @min(view_top + content_rows, line_count);
+    // lineStart has no EOF sentinel: the last visible line's end is pt.len()
+    const end: u32 = if (vbottom >= line_count) buf.pt.len() else buf.pt.lineStart(vbottom);
+    if (buf.decors_cache_valid and buf.decors_cache_rev == rev and
+        buf.decors_cache_start == start and buf.decors_cache_end == end)
+    {
+        return buf.decors_cache;
+    }
+    var out = std.ArrayList(syntax.Decor).empty;
+    try hl.decorInRange(@intCast(start), @intCast(end), arena, &out);
+    // own a copy so future cache hits return a stable slice (the arena is
+    // per-frame; the buffer outlives any frame)
+    const cached = try self.alloc.dupe(syntax.Decor, out.items);
+    if (buf.decors_cache.len > 0) self.alloc.free(buf.decors_cache);
+    buf.decors_cache = cached;
+    buf.decors_cache_valid = true;
+    buf.decors_cache_start = start;
+    buf.decors_cache_end = end;
+    buf.decors_cache_rev = rev;
+    return buf.decors_cache;
 }
 
 /// Load recent files from ~/.cache/oz/recent (one path per line).

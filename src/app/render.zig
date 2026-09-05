@@ -436,6 +436,16 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         merged = buf.span_cache.?.spans;
     }
 
+    // markdown decorations (M4): conceal ranges, checkbox replacements and
+    // heading/fence band props over the same visible range — empty for
+    // non-markdown buffers. Conceal gating (anti-conceal): byte-column math
+    // (cursor placement, selection, easymotion labels) must never meet a
+    // concealed line, so conceal applies only in normal mode with no
+    // multi-cursor or easymotion overlay, and never on the window's cursor
+    // line (checked per row below). Bands are display-only: always on.
+    const decors: []syntax.Decor = try self.visibleDecorsFor(buf, a, w.view_top, span_rows);
+    const conceal_mode = self.state.mode == .normal and !self.mc_active and !self.em_active;
+
     // scope highlight (nvim snacks.indent.scope): the byte range of the
     // block containing this window's cursor, converted to a line range.
     // Skipped when the buffer has no highlighter (no grammar for the
@@ -536,6 +546,7 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
     }
 
     var span_i: usize = 0;
+    var decor_i: usize = 0; // moving pointer into `decors` (rows ascend)
     var row: u32 = rect.row;
     var line = w.view_top;
     // blank-run context cache: consecutive blank rows share the nearest
@@ -551,6 +562,10 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
     const text_buf = try a.alloc(u8, @as(usize, rect.width) * rect.height);
     const num_buf = try a.alloc(u8, @as(usize, gutter) * rect.height);
     const guide_buf = try a.alloc(u8, rect.width);
+    // markdown band fill (heading/fence rows): padding spaces past the
+    // line text. NOT guide_buf — blank-line guide segments reference
+    // guide_buf and must survive until win.print.
+    const pad_buf = try a.alloc(u8, rect.width);
     var segs = std.ArrayList(vaxis.Segment).empty;
     try segs.ensureTotalCapacity(a, @as(usize, rect.width) * 2 + 64);
     // diagnostics are sorted by line (sortByLine): a moving pointer keeps
@@ -665,6 +680,24 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         // until vx.render, like every other segment slice)
         const text = text_buf[row_i * rect.width ..][0..n];
         buf.pt.copyRange(line_start, text);
+
+        // markdown decorations (M4): advance the row pointer and derive
+        // this row's band prop (heading/fence). Conceal per row: never on
+        // the window's cursor line (anti-conceal — the cursor's byte column
+        // must match what is on screen).
+        const line_end_byte = line_start + n;
+        while (decor_i < decors.len and decors[decor_i].end <= line_start) decor_i += 1;
+        var band = false;
+        {
+            var di = decor_i;
+            while (di < decors.len and decors[di].start < line_end_byte) : (di += 1) {
+                switch (decors[di].kind) {
+                    .heading, .fence => band = true,
+                    else => {},
+                }
+            }
+        }
+        const conceal_on = conceal_mode and line != cursor_line;
 
         // visual selection bounds as local columns (both = n if absent);
         // only the focused window carries the selection
@@ -882,6 +915,33 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         }
         var col: u32 = indent_end; // text starts after the indent region
         while (col < n) {
+            // markdown conceal/replace (M4): drop decors this row has
+            // passed, then act on the one covering col. With conceal off
+            // (cursor line, insert/visual mode) the decor is inert and the
+            // markup chrome renders as plain text.
+            while (decor_i < decors.len and decors[decor_i].end <= line_start + col) decor_i += 1;
+            if (decor_i < decors.len) {
+                const d = decors[decor_i];
+                const ds: u32 = if (d.start > line_start) d.start - line_start else 0;
+                const de: u32 = @min(d.end -| line_start, n);
+                if (conceal_on and ds <= col and col < de) {
+                    switch (d.kind) {
+                        .conceal => {
+                            col = de;
+                            continue;
+                        },
+                        .replace => {
+                            try segs.append(a, .{ .text = d.replacement, .style = .{
+                                .fg = .{ .rgb = if (d.aux == 1) self.theme.git_add else self.theme.fg_dim },
+                                .bg = .{ .rgb = if (is_cur_line) self.theme.bg_curline else self.theme.bg },
+                            } });
+                            col = de;
+                            continue;
+                        },
+                        else => {},
+                    }
+                }
+            }
             // emit any hint whose insertion column is at/just passed col
             // (before the next text segment, so it reads token+hint)
             while (hint_i < line_hints.len and line_hints[hint_i].character <= col) {
@@ -900,9 +960,13 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
             if (span_i < merged.len) {
                 const sp = merged[span_i];
                 if (sp.start < line_start + n and sp.end > line_start + col) {
-                    fg = autil.syntaxStyle(sp.style, self.theme);
                     const sp_start: u32 = if (sp.start > line_start) sp.start - line_start else 0;
                     const sp_end: u32 = if (sp.end < line_start + n) sp.end - line_start else n;
+                    // the span's style applies only where the span COVERS
+                    // the column — a span starting further right must not
+                    // tint the uncovered gap before it (invisible for
+                    // dense code captures, glaring for markdown prose)
+                    if (sp_start <= col) fg = autil.syntaxStyle(sp.style, self.theme);
                     next = if (sp_start > col) sp_start else sp_end;
                 }
             }
@@ -914,6 +978,12 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
                 const hc = line_hints[hint_i].character;
                 if (hc > col and hc < next) next = hc;
             }
+            // stop at the next decoration boundary so concealed/replaced
+            // chrome is never mixed into a text run
+            if (decor_i < decors.len and decors[decor_i].start > line_start) {
+                const dnext = decors[decor_i].start - line_start;
+                if (dnext > col and dnext < next) next = dnext;
+            }
             const in_sel = col >= sel_s and col < sel_e;
             var style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg } };
             if (is_cur_line) style.bg = .{ .rgb = self.theme.bg_curline };
@@ -924,6 +994,8 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
                 style.fg = f.fg;
                 style.bold = f.bold;
                 style.italic = f.italic;
+                style.ul = f.ul;
+                style.ul_style = f.ul_style;
             }
             // snacks.indent.scope underline: the scope's FIRST line (its
             // declaration/opening line) is underlined from the text start
@@ -978,6 +1050,35 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
                 .fg = .{ .rgb = self.theme.fg_dim },
                 .bg = .{ .rgb = if (is_cur_line) self.theme.bg_curline else self.theme.bg },
             } });
+        }
+
+        // markdown heading/fence band (M4): repaint the row background —
+        // text cells and the empty rest of the line alike — with bg_alt.
+        // Selection/cursorline keep priority: their segments already carry
+        // a non-default bg and stay untouched (and the cursor line itself
+        // keeps its plain cursorline look, no band).
+        if (band and !is_cur_line) {
+            const brgb = self.theme.bg_alt;
+            var used: u32 = 0;
+            for (segs.items) |*seg| {
+                switch (seg.style.bg) {
+                    .rgb => |rgb| {
+                        if (rgb[0] == self.theme.bg[0] and
+                            rgb[1] == self.theme.bg[1] and
+                            rgb[2] == self.theme.bg[2])
+                        {
+                            seg.style.bg = .{ .rgb = brgb };
+                        }
+                    },
+                    else => seg.style.bg = .{ .rgb = brgb },
+                }
+                used += self.textWidth(win, seg.text);
+            }
+            if (used < rect.width) {
+                const pad = pad_buf[0 .. rect.width - used];
+                @memset(pad, ' ');
+                try segs.append(a, .{ .text = pad, .style = .{ .bg = .{ .rgb = brgb } } });
+            }
         }
 
         _ = win.print(segs.items, .{
