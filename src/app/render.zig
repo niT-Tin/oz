@@ -1951,6 +1951,9 @@ pub fn render(self: *App) !void {
                 } else if (self.picker_mode == .themes) blk: {
                     const ti = self.picker_matches.items[ri];
                     break :blk theme.themes[ti].name;
+                } else if (self.picker_mode == .workspaces) blk: {
+                    const wi = self.picker_matches.items[ri];
+                    break :blk self.workspaces.items[wi].name;
                 } else self.picker_files.items[self.picker_matches.items[ri]];
                 const icon_len: usize = switch (self.picker_mode) {
                     .files, .recent, .buffers => 2,
@@ -1982,6 +1985,7 @@ pub fn render(self: *App) !void {
             .recent => " Recent ",
             .keymaps => " Keymaps ",
             .themes => " Themes ",
+            .workspaces => " Workspaces ",
             else => " Files ",
         };
         // centered floating window: title + input row + list + bottom
@@ -2179,6 +2183,9 @@ pub fn render(self: *App) !void {
                 } else if (self.picker_mode == .recent) blk: {
                     const ri2 = self.picker_matches.items[ri];
                     break :blk self.recent_files.items[ri2];
+                } else if (self.picker_mode == .workspaces) blk: {
+                    const wi = self.picker_matches.items[ri];
+                    break :blk self.workspaces.items[wi].name;
                 } else self.picker_files.items[self.picker_matches.items[ri]];
                 // file/recent/buffer rows: leading icon + space, then the
                 // label
@@ -2858,6 +2865,7 @@ pub fn render(self: *App) !void {
         .command => " COMMAND ",
     };
     const status_col = self.screenCellCol(win, cursor_line, self.curCursor().*);
+    const ws_name = self.curWsName();
     // a completion request is in flight (zls can take many seconds on
     // build.zig while its build_runner analyses the project) — show "…"
     // so a slow response isn't mistaken for a dead completion that
@@ -2865,20 +2873,20 @@ pub fn render(self: *App) !void {
     const status = if (self.completion_slot != null)
         try std.fmt.allocPrint(
             a,
-            "{s} line {d}/{d} col {d}  …",
-            .{ mode_str, cursor_line + 1, line_count, status_col },
+            "[{s}] {s} line {d}/{d} col {d}  …",
+            .{ ws_name, mode_str, cursor_line + 1, line_count, status_col },
         )
     else if (self.msg) |m|
         try std.fmt.allocPrint(
             a,
-            "{s} line {d}/{d} col {d}  {s}",
-            .{ mode_str, cursor_line + 1, line_count, status_col, m },
+            "[{s}] {s} line {d}/{d} col {d}  {s}",
+            .{ ws_name, mode_str, cursor_line + 1, line_count, status_col, m },
         )
     else
         try std.fmt.allocPrint(
             a,
-            "{s} line {d}/{d} col {d}",
-            .{ mode_str, cursor_line + 1, line_count, status_col },
+            "[{s}] {s} line {d}/{d} col {d}",
+            .{ ws_name, mode_str, cursor_line + 1, line_count, status_col },
         );
     const status_seg = [_]vaxis.Segment{.{
         .text = status,

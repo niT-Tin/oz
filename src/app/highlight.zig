@@ -791,6 +791,14 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
         .scroll_cursor_center => self.scrollCursorTo(.center),
         .scroll_cursor_top => self.scrollCursorTo(.top),
         .scroll_cursor_bottom => self.scrollCursorTo(.bottom),
+        // SPC TAB workspace family (M5)
+        .workspace_new => try self.wsNew(),
+        .workspace_pick => try self.wsOpenPicker(),
+        .workspace_rename => try self.wsRenameStart(),
+        .workspace_delete => self.wsDelete(),
+        .workspace_kill_session => try self.wsKillSession(),
+        .workspace_prev => self.wsSwitchDelta(-1),
+        .workspace_next => self.wsSwitchDelta(1),
         // za/zo/zc/zR/zM — buffer fold state (not edits; no markDirty)
         .fold_toggle, .fold_open, .fold_close, .fold_open_all, .fold_close_all => try self.execFold(action),
         else => {},

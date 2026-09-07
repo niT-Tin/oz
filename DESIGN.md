@@ -21,6 +21,7 @@
 | D9 | 配置 | 配置即代码（Zig 编译期键位表 + 少量启动期常量） | spec §0 明确要求，不做运行时脚本 |
 | D10 | 模式集 | **六模式**：在 spec 五模式上补充 vim 命令模式（`:` 命令行） | 用户补充：命令模式是 vim 工作流支柱（:w/:q/:s/:e/…），历史+补全+替换预览是效率关键 |
 | D11 | 测试 | **四层**：L1 纯逻辑单测 + L2 Cell 网格快照 + L3 pty E2E + L4 外部 mock；golden 显式更新 | 解决 TUI "看不见结果"的验证问题（nvim Screen expectation 同款思路，见 §12） |
+| D12 | workspace | **workspace = 运行时 buffer+窗口分组**，swap-on-switch（App 的 buffers/windows/win_root/current/current_win 字段即"当前 workspace"，其余槽位存完整状态）；纯运行时、不落盘 | 不属于 §1.2 排除的 "session 持久化/项目管理"；Doom Emacs 风格多 workspace 视图分组（见 §6.8） |
 
 ---
 
@@ -45,6 +46,8 @@
 ### 1.2 明确不做（摘自 spec §11）
 
 DAP、插件系统/运行时脚本、宏与寄存器（用 yank 历史替代）、session 持久化/项目管理、非模态输入、鼠标之外 GUI。
+
+> 补充：§6.8 的 Workspace 是纯运行时的 buffer+窗口分组（不落盘），不属于此处排除的 "session 持久化/项目管理"；后者指跨启动恢复会话状态。
 
 ### 1.3 非功能约束
 
@@ -316,6 +319,35 @@ vim 的 `:` 命令行是工作流的支柱（保存/退出/替换/跳转），�
 | 范围 | 行号范围 `:1,5d`、`:%d`、`:'<,'>s`（Visual 选区自动注入范围） |
 | 显示 | `:noh` `:set <opt>`（tabstop/shiftwidth/expandtab/relativenumber…，与 config.zig 打通） |
 | 终端 | `:term`（M3 后，等价 `<M-r>`） |
+
+---
+
+### 6.8 Workspace（Doom Emacs 风格）
+
+像 Doom Emacs 的 workspace：每个 workspace 独立持有自己的 buffer 集合与窗口布局，互不打扰、随时切换。键位走 `<leader>`（Space）的 pending 状态机（`SPC` → `TAB` → 第三键）：
+
+| 键位 | 动作 |
+|------|------|
+| `SPC TAB n` | 新建 workspace |
+| `SPC TAB .` | picker 选择切换 workspace |
+| `SPC TAB r` | 重命名 workspace（cmdline 预填当前名） |
+| `SPC TAB d` | 删除当前 workspace |
+| `SPC TAB x` | 清空当前 session（杀所有 workspace 和 buffer，回到全新状态） |
+| `SPC TAB [` | 前一个 workspace |
+| `SPC TAB ]` | 后一个 workspace |
+
+**语义（swap-on-switch）**：App 的 `buffers`/`windows`/`win_root`/`current`/`current_win` 字段即"当前 workspace"的实时状态；每个非当前 workspace 把这五个字段存在自己的槽位里。切换 = 把 App 字段存回旧槽位、从目标槽位装入。因此 App 里所有 `self.buffers`/`self.windows` 引用（tab 栏、H/M/L、picker buffers 模式等）自动只作用于当前 workspace。槽位 `current_ws` 恒为 moved-from 空壳（仅名字）；其余槽位持有完整状态。启动槽位名 `main`，新建取第一个空闲 `ws{N}`（N 从 2 起）。
+
+| 状态分类 | 内容 | 切换时处理 |
+|---------|------|-----------|
+| 每 workspace | buffers、windows、win_root、current/current_win | 随 swap 走 |
+| 切换时重置 | visual_anchor、in_insert、state.mode→normal、mc_active、easymotion、picker/completion/hover/nav_list/diag_list、inlay、diagnostics、scope_anim/scope_cache | 全部关闭/失效 |
+| LSP/git | 单 client 绑定当前 buffer | teardownLsp(false) + ensureLsp()；git diff/blame 由 scheduleGitStatus 重算（路径检查天然防串） |
+| 全局共享 | yank_buffer、cmd、内嵌终端面板、picker_files 缓存 | 不动 |
+
+**保护规则**：① 防双开——`openInBuffer` 只查当前 workspace，文件已在其他 workspace 打开则拒绝（`已在 workspace '<name>' 中打开`）；② dirty 保护——`SPC TAB d`/`SPC TAB x` 时任一 dirty buffer 拒绝并报数量（vim E37 风格）。
+
+> 本里程碑不做：session 落盘持久化（§1.2 排除）；workspace 间移动/共享 buffer（以防双开拒绝代替）。
 
 ---
 
@@ -623,6 +655,15 @@ Client = {
 - AI（spec §9）：行内补全源（Copilot/兼容 API，限 3 条与补全菜单合并）、chat 浮窗（选区提问）、外部 LLM API（DeepSeek 等）滚动翻译等内置能力
 
 **M4 通过 = spec 全量功能落地。**
+
+### M5 — Workspace（Doom Emacs 风格，≈1 周）
+
+- **W1 核心模型**：Workspace 结构 + App 字段 + swap-on-switch 切换/新建/前后切换 + 内存管理（create/deinit）+ 键位管线（mode/key_event/execAction）
+- **W2 交互**：workspace picker（`SPC TAB .`）、重命名（cmdline 预填）、状态栏 `[name]`、keymap_list 条目
+- **W3 生命周期**：`SPC TAB d` 删除（dirty/最后一个拒绝）、`SPC TAB x` 清空 session
+- **W4 测试与文档**：e2e + 单测 + 本节文档
+
+**M5 通过 = Doom 风格多 workspace 日常可用。**
 
 ---
 

@@ -66,6 +66,18 @@ pub fn openBufferPicker(self: *App) !void {
     self.picker_active = true;
 }
 
+/// <leader> tab . — workspace picker. Reads self.workspaces directly
+/// (never picker_files — that cache feeds <leader>sf exclusively);
+/// matches index into the workspaces slot list.
+pub fn wsOpenPicker(self: *App) !void {
+    self.picker_mode = .workspaces;
+    self.picker_input.clearRetainingCapacity();
+    self.picker_sel = 0;
+    self.picker_top = 0;
+    try self.pickerRefilter();
+    self.picker_active = true;
+}
+
 pub fn openRecentPicker(self: *App) !void {
     self.picker_mode = .recent;
     self.picker_input.clearRetainingCapacity();
@@ -447,6 +459,14 @@ pub fn handlePickerKey(self: *App, key: vaxis.Key) !void {
                 }
                 return;
             }
+            if (self.picker_mode == .workspaces) {
+                if (self.picker_matches.items.len > 0) {
+                    const wi = self.picker_matches.items[self.picker_sel];
+                    self.closePicker();
+                    self.wsSwitchTo(wi);
+                }
+                return;
+            }
             if (self.picker_mode == .themes) {
                 // Enter confirms the previewed theme: keep it, persist it, report it
                 // and close (the preview already applied it on move).
@@ -576,6 +596,24 @@ pub fn pickerRefilter(self: *App) !void {
             const m = try util.fzy.match(self.alloc, name, needle) orelse continue;
             defer self.alloc.free(m.positions);
             try self.picker_matches.append(self.alloc, bi);
+            if (self.picker_matches.items.len >= 20) break;
+        }
+        if (self.picker_sel >= self.picker_matches.items.len) self.picker_sel = 0;
+        return;
+    }
+    if (self.picker_mode == .workspaces) {
+        // match against workspace names; matches index into workspaces
+        const needle = self.picker_input.items;
+        var wi: usize = 0;
+        while (wi < self.workspaces.items.len) : (wi += 1) {
+            const name = self.workspaces.items[wi].name;
+            if (needle.len == 0) {
+                try self.picker_matches.append(self.alloc, wi);
+                continue;
+            }
+            const m = try util.fzy.match(self.alloc, name, needle) orelse continue;
+            defer self.alloc.free(m.positions);
+            try self.picker_matches.append(self.alloc, wi);
             if (self.picker_matches.items.len >= 20) break;
         }
         if (self.picker_sel >= self.picker_matches.items.len) self.picker_sel = 0;

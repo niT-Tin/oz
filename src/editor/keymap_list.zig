@@ -161,6 +161,15 @@ pub const entries: []const Entry = &.{
     .{ .keys = "ctrl-w j k", .desc = "窗口焦点向下/上", .group = "窗口" },
     .{ .keys = "gt gT", .desc = "下一个/上一个标签页（Buffer）", .group = "窗口" },
 
+    // ---- Workspace ----
+    .{ .keys = "space tab n", .desc = "新建 workspace", .group = "Workspace" },
+    .{ .keys = "space tab .", .desc = "workspace picker 选择切换", .group = "Workspace" },
+    .{ .keys = "space tab r", .desc = "重命名 workspace", .group = "Workspace" },
+    .{ .keys = "space tab d", .desc = "删除当前 workspace", .group = "Workspace" },
+    .{ .keys = "space tab x", .desc = "清空当前 session（杀所有 workspace/buffer）", .group = "Workspace" },
+    .{ .keys = "space tab [", .desc = "前一个 workspace", .group = "Workspace" },
+    .{ .keys = "space tab ]", .desc = "后一个 workspace", .group = "Workspace" },
+
     // ---- LSP ----
     .{ .keys = "K", .desc = "Hover 悬停文档", .group = "LSP" },
     .{ .keys = "gd", .desc = "跳转到定义", .group = "LSP" },

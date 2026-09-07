@@ -201,6 +201,8 @@ pub const State = struct {
     pending_leader_t: bool = false,
     /// <leader>h seen (git hunk family, M3a), awaiting s/r/p
     pending_leader_h: bool = false,
+    /// <leader> tab seen (workspace family, M5), awaiting n/./r/d/x/[ /]
+    pending_leader_tab: bool = false,
     /// surround sequence (ys/ds/cs) in progress
     pending_surround: ?SurroundPending = null,
     /// 'g' + 'c' seen (comment sequence), awaiting 'c' (line) — gc in visual
@@ -391,6 +393,29 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         }
     }
 
+    // 0a3) <leader> tab pending (workspace family): n new / . pick / r rename /
+    //      d delete / x kill session / [ prev / ] next.
+    if (state.pending_leader_tab) {
+        state.pending_leader_tab = false;
+        if (isEscape(key)) {
+            resetPending(state);
+            return .pending;
+        }
+        switch (key.codepoint) {
+            'n' => return emitAction(state, .workspace_new),
+            '.' => return emitAction(state, .workspace_pick),
+            'r' => return emitAction(state, .workspace_rename),
+            'd' => return emitAction(state, .workspace_delete),
+            'x' => return emitAction(state, .workspace_kill_session),
+            '[' => return emitAction(state, .workspace_prev),
+            ']' => return emitAction(state, .workspace_next),
+            else => {
+                resetPending(state);
+                return .pending;
+            },
+        }
+    }
+
     // 0a3) <leader>b pending (buffer family): bb prev / bn next / bj pick /
     //     bk close / bh move to left window / bl move to right window.
     if (state.pending_leader_b) {
@@ -468,6 +493,10 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
             return .pending;
         }
         switch (key.codepoint) {
+            vaxis.Key.tab => {
+                state.pending_leader_tab = true;
+                return .pending;
+            },
             'f' => return emitAction(state, .leader_find), // <leader>f easymotion
             'e' => return emitAction(state, .filetree_toggle), // <leader>e tree
             'E' => return emitAction(state, .filetree_locate), // <leader>E locate
@@ -866,8 +895,9 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
             break :blk .pending;
         },
         // never produced by the keymap tables (the fold actions come from
-        // the pending_z handler directly, never through dispatchNormal)
-        .insert_char, .insert_exit, .fold_toggle, .fold_open, .fold_close, .fold_open_all, .fold_close_all, .noop => .pending,
+        // the pending_z handler and the workspace actions from the
+        // pending_leader_tab handler, never through dispatchNormal)
+        .insert_char, .insert_exit, .fold_toggle, .fold_open, .fold_close, .fold_open_all, .fold_close_all, .workspace_new, .workspace_pick, .workspace_rename, .workspace_delete, .workspace_kill_session, .workspace_prev, .workspace_next, .noop => .pending,
     };
 }
 
@@ -1039,7 +1069,7 @@ fn emitAction(state: *State, action: KeyEvent.ActionId) Result {
     // za/zo/zc/zR/zM fold commands are view/buffer state (no edit), so '.'
     // must not replay them either.
     switch (action) {
-        .undo, .redo, .repeat_last, .normal_mode, .insert_char, .scroll_cursor_center, .scroll_cursor_top, .scroll_cursor_bottom, .fold_toggle, .fold_open, .fold_close, .fold_open_all, .fold_close_all, .term_float, .term_bottom, .term_right => {},
+        .undo, .redo, .repeat_last, .normal_mode, .insert_char, .scroll_cursor_center, .scroll_cursor_top, .scroll_cursor_bottom, .fold_toggle, .fold_open, .fold_close, .fold_open_all, .fold_close_all, .term_float, .term_bottom, .term_right, .workspace_new, .workspace_pick, .workspace_rename, .workspace_delete, .workspace_kill_session, .workspace_prev, .workspace_next => {},
         else => {
             state.last_action = action;
             state.last_count = count;
@@ -1170,6 +1200,7 @@ fn resetPending(state: *State) void {
     state.pending_leader_l = false;
     state.pending_leader_t = false;
     state.pending_leader_h = false;
+    state.pending_leader_tab = false;
     state.pending_surround = null;
     state.pending_align = null;
     state.pending_bracket = null;
@@ -1431,6 +1462,27 @@ test "z prefix: za/zo/zc/zR/zM fold actions; not '.'-repeatable" {
         try testing.expectEqual(.action, tag(r));
         try testing.expectEqual(c[1], r.action.action);
         // folds are buffer/view state, not edits: '.' must not replay them
+        try testing.expectEqual(@as(?Repeat, null), s.last_repeat);
+    }
+}
+
+test "SPC TAB dispatches the 7 workspace actions (not '.'-repeatable)" {
+    const cases = .{
+        .{ 'n', KeyEvent.ActionId.workspace_new },
+        .{ '.', KeyEvent.ActionId.workspace_pick },
+        .{ 'r', KeyEvent.ActionId.workspace_rename },
+        .{ 'd', KeyEvent.ActionId.workspace_delete },
+        .{ 'x', KeyEvent.ActionId.workspace_kill_session },
+        .{ '[', KeyEvent.ActionId.workspace_prev },
+        .{ ']', KeyEvent.ActionId.workspace_next },
+    };
+    inline for (cases) |c| {
+        var s = State.init();
+        try testing.expectEqual(.pending, tag(handle(&s, press(' '), Keymaps.normal)));
+        try testing.expectEqual(.pending, tag(handle(&s, .{ .codepoint = vaxis.Key.tab }, Keymaps.normal)));
+        const r = handle(&s, press(c[0]), Keymaps.normal);
+        try testing.expectEqual(.action, tag(r));
+        try testing.expectEqual(c[1], r.action.action);
         try testing.expectEqual(@as(?Repeat, null), s.last_repeat);
     }
 }

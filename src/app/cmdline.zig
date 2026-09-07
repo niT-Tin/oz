@@ -19,6 +19,7 @@ pub fn handleCommandKey(self: *App, key: vaxis.Key) !void {
         // (it was kept so :'<,'>s could resolve the range on Enter).
         self.visual_anchor = null;
         self.pending_rename = false;
+        self.pending_ws_rename = false;
         self.cmdline_kind = .ex;
         self.cmdline.clearRetainingCapacity();
         self.cmd_hist_idx = null;
@@ -34,6 +35,14 @@ pub fn handleCommandKey(self: *App, key: vaxis.Key) !void {
                 self.state.mode = .normal;
                 self.cmd_hist_idx = null;
                 try self.execRename();
+                self.cmdline.clearRetainingCapacity();
+                return;
+            }
+            if (self.pending_ws_rename) {
+                // <leader> tab r collected the new workspace name — apply it
+                self.state.mode = .normal;
+                self.cmd_hist_idx = null;
+                try self.execWsRename();
                 self.cmdline.clearRetainingCapacity();
                 return;
             }

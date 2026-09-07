@@ -216,6 +216,25 @@ pub const App = struct {
         },
     };
 
+    /// Doom-Emacs-style workspace: one independent buffer set + window
+    /// layout (swap-on-switch model, see docs/workspace-plan.md §2). The
+    /// App fields `buffers`/`windows`/`win_root`/`current`/`current_win`
+    /// ARE the current workspace's live state; the slot at
+    /// `workspaces.items[current_ws]` is that workspace's moved-from shell
+    /// holding only the owned `name`. Every OTHER slot stores a complete
+    /// workspace (its five fields bitwise-copied from the App fields when it
+    /// was last active). Switching = store the App fields back into
+    /// slot[cur], load slot[target] into the App fields and reset the target
+    /// slot to a shell — see wsSwitchTo (src/app/workspace.zig).
+    pub const Workspace = struct {
+        name: []u8, // owned
+        // non-current slots only; the current slot's are a moved-from shell
+        buffers: std.ArrayList(Buffer),
+        windows: std.ArrayList(Window),
+        win_root: ?*WinNode,
+        current: usize,
+        current_win: usize,
+    };
 
 
     io: std.Io,
@@ -238,6 +257,19 @@ pub const App = struct {
     windows: std.ArrayList(Window) = .empty,
     win_root: ?*WinNode = null,
     current_win: usize = 0,
+
+    // ---- workspaces (Doom-Emacs style; see src/app/workspace.zig) ----
+    /// Every workspace (never empty — always ≥1). The slot at `current_ws`
+    /// is the CURRENT workspace's moved-from shell (name only); its live
+    /// state lives in the `buffers`/`windows`/`win_root`/`current`/
+    /// `current_win` fields above. Every other slot holds a complete
+    /// workspace state. The startup slot is named "main".
+    workspaces: std.ArrayList(Workspace) = .empty,
+    current_ws: usize = 0,
+    /// <leader>wsr: the cmdline is collecting the new workspace name; Enter
+    /// dispatches execWsRename. The cmdline dispatch is wired by the W2/W3
+    /// tasks; this flag mirrors pending_rename.
+    pending_ws_rename: bool = false,
     in_insert: bool = false,
     quit: bool = false,
 
@@ -344,7 +376,7 @@ pub const App = struct {
     filetree_rows: std.ArrayList(FiletreeRow) = .empty,
 
     // fuzzy picker (<leader>sf / <leader>st / <leader>sb / <leader>sr / <leader>sk / <leader>sp)
-    picker_mode: enum { files, grep, buffers, recent, keymaps, themes } = .files,
+    picker_mode: enum { files, grep, buffers, recent, keymaps, themes, workspaces } = .files,
     picker_active: bool = false,
     picker_files: std.ArrayList([]u8) = .empty, // owned paths
     picker_input: std.ArrayList(u8) = .empty,
@@ -1258,6 +1290,21 @@ pub const App = struct {
         leaf.* = .{ .leaf = 0 };
         self.win_root = leaf;
         errdefer init.gpa.destroy(leaf);
+        // Register the startup workspace slot "main": a moved-from shell
+        // (name only) — the live initial state above stays in the App
+        // fields, which ARE the current workspace (swap-on-switch model).
+        {
+            const main_name = try init.gpa.dupe(u8, "main");
+            errdefer init.gpa.free(main_name);
+            try self.workspaces.append(init.gpa, .{
+                .name = main_name,
+                .buffers = .empty,
+                .windows = .empty,
+                .win_root = null,
+                .current = 0,
+                .current_win = 0,
+            });
+        }
         // NOTE: loop holds pointers to self.tty / self.vx, so the App must
         // stay at a stable address (heap) — never move it after this.
         self.loop = vaxis.Loop(vaxis.Event).init(init.io, &self.tty, &self.vx);
@@ -1279,19 +1326,25 @@ pub const App = struct {
         self.vx.deinit(self.alloc, self.tty.writer());
         self.tty.deinit();
         self.alloc.free(self.tty_buffer);
-        for (self.buffers.items) |*buf| {
-            buf.history.deinit();
-            buf.pt.deinit();
-            buf.folds.deinit(self.alloc);
-            if (buf.spans_cache.len > 0) self.alloc.free(buf.spans_cache);
-            if (buf.decors_cache.len > 0) self.alloc.free(buf.decors_cache);
-            if (buf.hl) |*h| h.deinit();
-            if (buf.span_cache) |*sc| self.alloc.free(sc.spans);
-            if (buf.path) |p| self.alloc.free(p);
-        }
+        // current workspace state (the App fields)
+        for (self.buffers.items) |*buf| self.deinitBuffer(buf);
         self.buffers.deinit(self.alloc);
         if (self.win_root) |root| self.freeWinTree(root);
         self.windows.deinit(self.alloc);
+        // every non-current workspace slot holds a complete state of its
+        // own (buffers/windows/win_root); the current slot is a moved-from
+        // shell whose buffers/windows are already empty. All slots own
+        // their `name`.
+        for (self.workspaces.items, 0..) |*ws, i| {
+            if (i != self.current_ws) {
+                for (ws.buffers.items) |*buf| self.deinitBuffer(buf);
+                ws.buffers.deinit(self.alloc);
+                if (ws.win_root) |root| self.freeWinTree(root);
+                ws.windows.deinit(self.alloc);
+            }
+            self.alloc.free(ws.name);
+        }
+        self.workspaces.deinit(self.alloc);
         self.cmdline.deinit(self.alloc);
         for (self.cmd_history.items) |h| self.alloc.free(h);
         self.cmd_history.deinit(self.alloc);
@@ -1442,6 +1495,16 @@ pub const App = struct {
     pub const contentHash = @import("app/buffers.zig").contentHash;
     pub const beginInsertSession = @import("app/buffers.zig").beginInsertSession;
     pub const endInsertSession = @import("app/buffers.zig").endInsertSession;
+    // ---- workspace → src/app/workspace.zig ----
+    pub const deinitBuffer = @import("app/workspace.zig").deinitBuffer;
+    pub const wsSwitchTo = @import("app/workspace.zig").wsSwitchTo;
+    pub const wsNew = @import("app/workspace.zig").wsNew;
+    pub const wsSwitchDelta = @import("app/workspace.zig").wsSwitchDelta;
+    pub const wsRenameStart = @import("app/workspace.zig").wsRenameStart;
+    pub const execWsRename = @import("app/workspace.zig").execWsRename;
+    pub const wsDelete = @import("app/workspace.zig").wsDelete;
+    pub const wsKillSession = @import("app/workspace.zig").wsKillSession;
+    pub const curWsName = @import("app/workspace.zig").curWsName;
     // ---- cmdline → src/app/cmdline.zig ----
     pub const handleCommandKey = @import("app/cmdline.zig").handleCommandKey;
     pub const completeCommandName = @import("app/cmdline.zig").completeCommandName;
@@ -1581,6 +1644,7 @@ pub const App = struct {
     pub const applyThemePreview = @import("app/picker.zig").applyThemePreview;
     pub const pickerRefilter = @import("app/picker.zig").pickerRefilter;
     pub const closePicker = @import("app/picker.zig").closePicker;
+    pub const wsOpenPicker = @import("app/picker.zig").wsOpenPicker;
     pub const GrepResult = @import("app/picker.zig").GrepResult;
     // ---- input → src/app/input.zig ----
     pub const handleKey = @import("app/input.zig").handleKey;

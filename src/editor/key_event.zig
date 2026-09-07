@@ -146,6 +146,14 @@ pub const ActionId = enum {
     term_float, // <M-r> — toggle the floating terminal
     term_bottom, // <M-w> — toggle the bottom terminal (30% height)
     term_right, // <M-e> — toggle the right terminal (40% width)
+    // M5 workspace (SPC TAB family)
+    workspace_new, // <leader> tab n — new workspace
+    workspace_pick, // <leader> tab . — workspace picker
+    workspace_rename, // <leader> tab r — rename workspace (cmdline)
+    workspace_delete, // <leader> tab d — delete current workspace
+    workspace_kill_session, // <leader> tab x — clear the whole session
+    workspace_prev, // <leader> tab [ — previous workspace
+    workspace_next, // <leader> tab ] — next workspace
     noop,
 };
 

@@ -124,6 +124,23 @@ pub fn openInBuffer(self: *App, path: []const u8) !void {
             }
         }
     }
+    // Anti-double-open ACROSS workspaces: each workspace keeps its own
+    // buffer list, so without this the same file could be loaded as two
+    // independent piece tables editing one on-disk file (undo history,
+    // dirty flag and the single LSP document copy would diverge). Scanned
+    // after absolutePath (every stored path is absolute) and before any
+    // load; the current workspace was checked above.
+    for (self.workspaces.items, 0..) |ws, i| {
+        if (i == self.current_ws) continue;
+        for (ws.buffers.items) |buf| {
+            if (buf.path) |p| {
+                if (std.mem.eql(u8, p, abs)) {
+                    try self.setMsg(try std.fmt.allocPrint(self.alloc, "已在 workspace '{s}' 中打开", .{ws.name}));
+                    return;
+                }
+            }
+        }
+    }
     // load the file
     var file = std.Io.Dir.cwd().openFile(self.io, abs, .{ .mode = .read_only }) catch |e| {
         try self.setMsg(try std.fmt.allocPrint(self.alloc, "E484: cannot open {s}: {s}", .{ abs, @errorName(e) }));
@@ -193,13 +210,7 @@ pub fn closeBufferAt(self: *App, buf_idx: usize) void {
     }
     self.inlay_inflight = false;
     var buf = self.buffers.orderedRemove(buf_idx);
-    buf.history.deinit();
-    buf.pt.deinit();
-    buf.folds.deinit(self.alloc);
-    if (buf.spans_cache.len > 0) self.alloc.free(buf.spans_cache);
-    if (buf.hl) |*h| h.deinit();
-    if (buf.span_cache) |*sc| self.alloc.free(sc.spans);
-    if (buf.path) |p| self.alloc.free(p);
+    self.deinitBuffer(&buf);
     if (self.current >= self.buffers.items.len) self.current = self.buffers.items.len - 1;
     if (buf_idx < self.current) self.current -= 1;
     // point every window at the surviving buffer, fixing up shifted indices

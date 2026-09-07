@@ -12826,3 +12826,467 @@ test "terminal: :q! quits cleanly while the terminal is still open" {
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
+
+// ================= workspace e2e (M5) =================
+//
+// Shared feed-loop helpers for the workspace tests below (same shape as the
+// smoke test's inline loop, factored out because these tests wait a lot).
+// SPC TAB is the leader chord: bytes " \t" followed by n/./r/d/x/[ /].
+//
+// NOTE on the status bar: it only renders while the current buffer is a
+// real file view. A fresh workspace's empty buffer hits the dashboard
+// (workspace-plan §8.6), and the dashboard draws no status bar — so the
+// tests below always give the workspace under test a file to display
+// before asserting on its "[name]" indicator.
+
+/// Feed the pty until `needle` appears anywhere in the grid; false on
+/// timeout (ms).
+fn wsWait(sess: *Session, grid: *Grid, needle: []const u8, timeout_ms: i32) !bool {
+    var waited: i32 = 0;
+    while (!grid.contains(needle)) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= timeout_ms) return false;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    return true;
+}
+
+/// Feed until BOTH needles are present (one frame can carry both).
+fn wsWaitBoth(sess: *Session, grid: *Grid, a: []const u8, b: []const u8) !bool {
+    var waited: i32 = 0;
+    while (!grid.contains(a) or !grid.contains(b)) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) return false;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    return true;
+}
+
+/// Feed until `needle` disappears from the grid (drains the rest of the
+/// frame that overwrote it — a negative assert must not race a
+/// partially-read frame).
+fn wsWaitGone(sess: *Session, grid: *Grid, needle: []const u8) !bool {
+    var waited: i32 = 0;
+    while (grid.contains(needle)) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) return false;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    return true;
+}
+
+/// Feed until ROW `r` no longer contains `needle`. Tab-bar isolation
+/// checks are row-scoped because the dashboard's recent-file list may
+/// legitimately render a full path with the same basename on other rows
+/// (CLI-opened files are added to the recent list at startup).
+fn wsRowWaitGone(sess: *Session, grid: *Grid, r: usize, needle: []const u8) !bool {
+    var waited: i32 = 0;
+    while (rowContains(grid, r, needle)) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) return false;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    return true;
+}
+
+/// :q! and expect exit 0; dump the grid + stream tail on failure.
+fn wsQuit(sess: *Session, grid: *Grid) !void {
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    if (exit_code != 0) {
+        std.debug.print("oz exited with code {d}\n", .{exit_code});
+        grid.dump();
+        const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
+        const start = if (idx) |i| i -| 300 else sess.used -| 2000;
+        std.debug.print("stream tail:\n{s}\n", .{sess.out[start..sess.used]});
+    }
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+/// Create a unique temp file (smoke-test pattern); returns the path into
+/// `name_buf`. The CALLER must delete it after the child has opened it
+/// (the smoke test defers the delete at test scope, not here — deleting
+/// here would remove the file before oz ever opens it).
+fn wsTempFile(io: Io, name_buf: *[128:0]u8, suffix: []const u8, content: []const u8) ![:0]const u8 {
+    const name = try std.fmt.bufPrintZ(name_buf, "/tmp/oz_e2e_{d}_{d}{s}", .{ linux.getpid(), tmp_counter, suffix });
+    tmp_counter += 1;
+    const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+    defer f.close(io);
+    try f.writeStreamingAll(io, content);
+    return name;
+}
+
+test "workspace: SPC TAB n creates ws2, status bar follows, [ ] wrap between" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var na_buf: [128:0]u8 = undefined;
+    const na = try wsTempFile(io, &na_buf, "wna.txt", "AAA1 first\nAAA1 second\nAAA1 third\n");
+    defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
+    var nb_buf: [128:0]u8 = undefined;
+    const nb = try wsTempFile(io, &nb_buf, "wnb.txt", "BBB1 first\n");
+    defer std.Io.Dir.cwd().deleteFile(io, nb) catch {};
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, na });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+
+    // main renders the first file: status bar carries [main]
+    const started = try wsWaitBoth(&sess, &grid, "[main]", "AAA1");
+    if (!started) grid.dump();
+    try std.testing.expect(started);
+    try std.testing.expect(rowContains(&grid, 0, "wna.txt"));
+
+    // SPC TAB n — new workspace ws2 (its empty buffer is a dashboard, so
+    // open a second file there to make the workspace name observable)
+    try sess.send(" \tn");
+    try sess.send(":e ");
+    try sess.send(nb);
+    try sess.send("\r");
+    const on_ws2 = try wsWaitBoth(&sess, &grid, "[ws2]", "BBB1");
+    if (!on_ws2) grid.dump();
+    try std.testing.expect(on_ws2);
+    // the ws2 frame fully overwrote the [main] status row
+    const main_gone = try wsWaitGone(&sess, &grid, "[main]");
+    if (!main_gone) grid.dump();
+    try std.testing.expect(main_gone);
+
+    // SPC TAB ] — next workspace wraps back to main
+    try sess.send(" \t]");
+    const back_main = try wsWaitBoth(&sess, &grid, "[main]", "AAA1");
+    if (!back_main) grid.dump();
+    try std.testing.expect(back_main);
+    const ws2_gone = try wsWaitGone(&sess, &grid, "[ws2]");
+    if (!ws2_gone) grid.dump();
+    try std.testing.expect(ws2_gone);
+
+    // SPC TAB ] again — next wraps forward to ws2
+    try sess.send(" \t]");
+    const fwd_ws2 = try wsWaitBoth(&sess, &grid, "[ws2]", "BBB1");
+    if (!fwd_ws2) grid.dump();
+    try std.testing.expect(fwd_ws2);
+
+    // SPC TAB [ — previous wraps back to main
+    try sess.send(" \t[");
+    const prev_main = try wsWaitBoth(&sess, &grid, "[main]", "AAA1");
+    if (!prev_main) grid.dump();
+    try std.testing.expect(prev_main);
+
+    try wsQuit(&sess, &grid);
+}
+
+test "workspace: ws2's tab bar and content are isolated from main's file" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var na_buf: [128:0]u8 = undefined;
+    const na = try wsTempFile(io, &na_buf, "wsa.txt", "IZW alpha\nIZW beta\nIZW gamma\n");
+    defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, na });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+
+    // main renders the file: tab row 0 carries the basename, content below
+    const started = try wsWaitBoth(&sess, &grid, "[main]", "IZW");
+    if (!started) grid.dump();
+    try std.testing.expect(started);
+    try std.testing.expect(rowContains(&grid, 0, "wsa.txt"));
+
+    // SPC TAB n — ws2 keeps its OWN buffer set: main's tab is gone from
+    // row 0 and the file's text is gone from the content area
+    try sess.send(" \tn");
+    // ws2's empty buffer is a dashboard (workspace-plan §8.6)
+    const dash = try wsWait(&sess, &grid, "终端文本编辑器", 5000);
+    if (!dash) grid.dump();
+    try std.testing.expect(dash);
+    const tab_gone = try wsRowWaitGone(&sess, &grid, 0, "wsa.txt");
+    if (!tab_gone) grid.dump();
+    try std.testing.expect(tab_gone);
+    try std.testing.expect(!rowContains(&grid, 0, "wsa.txt"));
+    const content_gone = try wsWaitGone(&sess, &grid, "IZW");
+    if (!content_gone) grid.dump();
+    try std.testing.expect(content_gone);
+
+    // SPC TAB [ — back to main: tab and content return
+    try sess.send(" \t[");
+    const back_main = try wsWaitBoth(&sess, &grid, "[main]", "wsa.txt");
+    if (!back_main) grid.dump();
+    try std.testing.expect(back_main);
+    try std.testing.expect(rowContains(&grid, 0, "wsa.txt"));
+    const content_back = try wsWait(&sess, &grid, "IZW", 5000);
+    if (!content_back) grid.dump();
+    try std.testing.expect(content_back);
+
+    try wsQuit(&sess, &grid);
+}
+
+test "workspace: SPC TAB r renames via cmdline prefilled with the current name" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var na_buf: [128:0]u8 = undefined;
+    const na = try wsTempFile(io, &na_buf, "wsr.txt", "RNM content line\n");
+    defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, na });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+
+    try std.testing.expect(try wsWait(&sess, &grid, "[main]", 5000));
+
+    // SPC TAB r — command mode with the cmdline PREFILLED "main" (the
+    // status row is replaced by the ":"-prefixed cmdline in command mode)
+    try sess.send(" \tr");
+    const prefilled = try wsWait(&sess, &grid, ":main", 5000);
+    if (!prefilled) grid.dump();
+    try std.testing.expect(prefilled);
+
+    // typed chars append to the prefilled name → ":mainX"
+    try sess.send("X");
+    const typed = try wsWait(&sess, &grid, ":mainX", 5000);
+    if (!typed) grid.dump();
+    try std.testing.expect(typed);
+
+    // Enter applies the rename and returns to normal mode
+    try sess.send("\r");
+    const renamed = try wsWait(&sess, &grid, "[mainX]", 5000);
+    if (!renamed) grid.dump();
+    try std.testing.expect(renamed);
+    try std.testing.expect(!grid.contains("[main]"));
+
+    try wsQuit(&sess, &grid);
+}
+
+test "workspace: SPC TAB d deletes the workspace; the last one is refused" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var na_buf: [128:0]u8 = undefined;
+    const na = try wsTempFile(io, &na_buf, "wda.txt", "AAA4 line\n");
+    defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
+    var nb_buf: [128:0]u8 = undefined;
+    const nb = try wsTempFile(io, &nb_buf, "wdb.txt", "BBB4 line\n");
+    defer std.Io.Dir.cwd().deleteFile(io, nb) catch {};
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, na });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+
+    const started = try wsWaitBoth(&sess, &grid, "[main]", "AAA4");
+    if (!started) grid.dump();
+    try std.testing.expect(started);
+
+    // second workspace with its own file, then delete THAT workspace
+    try sess.send(" \tn");
+    try sess.send(":e ");
+    try sess.send(nb);
+    try sess.send("\r");
+    const on_ws2 = try wsWaitBoth(&sess, &grid, "[ws2]", "BBB4");
+    if (!on_ws2) grid.dump();
+    try std.testing.expect(on_ws2);
+
+    try sess.send(" \td");
+    const back_main = try wsWaitBoth(&sess, &grid, "[main]", "AAA4");
+    if (!back_main) grid.dump();
+    try std.testing.expect(back_main);
+    // the deleted workspace's buffer died with it
+    const ws2_gone = try wsWaitGone(&sess, &grid, "[ws2]");
+    if (!ws2_gone) grid.dump();
+    try std.testing.expect(ws2_gone);
+    const nb_gone = try wsWaitGone(&sess, &grid, "BBB4");
+    if (!nb_gone) grid.dump();
+    try std.testing.expect(nb_gone);
+
+    // deleting the LAST workspace is refused with a message, not a crash
+    try sess.send(" \td");
+    const refused = try wsWait(&sess, &grid, "cannot delete the last workspace", 5000);
+    if (!refused) grid.dump();
+    try std.testing.expect(refused);
+    try std.testing.expect(grid.contains("[main]"));
+
+    try wsQuit(&sess, &grid);
+}
+
+test "workspace: SPC TAB x clears the session back to a fresh single main" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var na_buf: [128:0]u8 = undefined;
+    const na = try wsTempFile(io, &na_buf, "wka.txt", "AAA5 line\n");
+    defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
+    var nb_buf: [128:0]u8 = undefined;
+    const nb = try wsTempFile(io, &nb_buf, "wkb.txt", "BBB5 line\n");
+    defer std.Io.Dir.cwd().deleteFile(io, nb) catch {};
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, na });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+
+    const started = try wsWaitBoth(&sess, &grid, "[main]", "AAA5");
+    if (!started) grid.dump();
+    try std.testing.expect(started);
+
+    // two workspaces with files, then kill the whole session
+    try sess.send(" \tn");
+    try sess.send(":e ");
+    try sess.send(nb);
+    try sess.send("\r");
+    const on_ws2 = try wsWaitBoth(&sess, &grid, "[ws2]", "BBB5");
+    if (!on_ws2) grid.dump();
+    try std.testing.expect(on_ws2);
+
+    // SPC TAB x — clean session → ONE fresh empty main workspace (its
+    // dashboard). Every workspace's buffers are gone.
+    try sess.send(" \tx");
+    const cleared = try wsWait(&sess, &grid, "终端文本编辑器", 5000);
+    if (!cleared) grid.dump();
+    try std.testing.expect(cleared);
+    const ws2_gone = try wsWaitGone(&sess, &grid, "[ws2]");
+    if (!ws2_gone) grid.dump();
+    try std.testing.expect(ws2_gone);
+    const na_gone = try wsWaitGone(&sess, &grid, "AAA5");
+    if (!na_gone) grid.dump();
+    try std.testing.expect(na_gone);
+    const nb_gone = try wsWaitGone(&sess, &grid, "BBB5");
+    if (!nb_gone) grid.dump();
+    try std.testing.expect(nb_gone);
+    // only the fresh unnamed buffer remains in the tab bar
+    const tab_gone = try wsRowWaitGone(&sess, &grid, 0, "wkb.txt");
+    if (!tab_gone) grid.dump();
+    try std.testing.expect(tab_gone);
+
+    // the reset session is functional: reopen a file on the fresh main
+    try sess.send(":e ");
+    try sess.send(na);
+    try sess.send("\r");
+    const reopened = try wsWaitBoth(&sess, &grid, "[main]", "AAA5");
+    if (!reopened) grid.dump();
+    try std.testing.expect(reopened);
+
+    try wsQuit(&sess, &grid);
+}
+
+test "workspace: SPC TAB x refuses with E37 while a buffer is dirty" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var na_buf: [128:0]u8 = undefined;
+    const na = try wsTempFile(io, &na_buf, "wdi.txt", "AAA6 first\nAAA6 second\n");
+    defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, na });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+
+    const started = try wsWaitBoth(&sess, &grid, "[main]", "AAA6");
+    if (!started) grid.dump();
+    try std.testing.expect(started);
+
+    // i X Esc — insert a char so the buffer is dirty (nothing saved)
+    try sess.send("iX\x1b");
+    const insert_done = try wsWaitGone(&sess, &grid, "INSERT");
+    if (!insert_done) grid.dump();
+    try std.testing.expect(insert_done);
+    const edited = try wsWait(&sess, &grid, "XAAA6", 5000);
+    if (!edited) grid.dump();
+    try std.testing.expect(edited);
+
+    // killing the session with an unsaved buffer is refused: E37 message,
+    // no crash, still on main with the file still open
+    try sess.send(" \tx");
+    const refused = try wsWaitBoth(&sess, &grid, "E37", "unsaved");
+    if (!refused) grid.dump();
+    try std.testing.expect(refused);
+    try std.testing.expect(grid.contains("[main]"));
+    try std.testing.expect(grid.contains("AAA6"));
+
+    try wsQuit(&sess, &grid);
+}
+
+test "workspace: :e refuses a file already open in another workspace" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var na_buf: [128:0]u8 = undefined;
+    const na = try wsTempFile(io, &na_buf, "woa.txt", "AAA7 line\n");
+    defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
+    var nb_buf: [128:0]u8 = undefined;
+    const nb = try wsTempFile(io, &nb_buf, "wob.txt", "BBB7 line\n");
+    defer std.Io.Dir.cwd().deleteFile(io, nb) catch {};
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, na });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+
+    // main has the file open
+    const started = try wsWaitBoth(&sess, &grid, "[main]", "AAA7");
+    if (!started) grid.dump();
+    try std.testing.expect(started);
+
+    // ws2 opens its own file first (so its status bar renders)
+    try sess.send(" \tn");
+    try sess.send(":e ");
+    try sess.send(nb);
+    try sess.send("\r");
+    const on_ws2 = try wsWaitBoth(&sess, &grid, "[ws2]", "BBB7");
+    if (!on_ws2) grid.dump();
+    try std.testing.expect(on_ws2);
+
+    // ws2 tries to :e the SAME file (absolute path) → refused, naming the
+    // owning workspace; ws2 keeps its own file and no second copy is loaded
+    try sess.send(":e ");
+    try sess.send(na);
+    try sess.send("\r");
+    const refused = try wsWait(&sess, &grid, "已在 workspace 'main' 中打开", 5000);
+    if (!refused) grid.dump();
+    try std.testing.expect(refused);
+    try std.testing.expect(grid.contains("[ws2]"));
+    try std.testing.expect(grid.contains("BBB7"));
+    const not_loaded = try wsWaitGone(&sess, &grid, "AAA7");
+    if (!not_loaded) grid.dump();
+    try std.testing.expect(not_loaded);
+    try std.testing.expect(!rowContains(&grid, 0, "woa.txt"));
+
+    try wsQuit(&sess, &grid);
+}
