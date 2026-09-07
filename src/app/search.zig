@@ -1,6 +1,7 @@
 //! search — App method group split out of src/main.zig (physical move).
 
 const std = @import("std");
+const vaxis = @import("vaxis");
 const buffer = @import("../buffer/root.zig");
 
 const app_mod = @import("../app.zig");
@@ -392,4 +393,62 @@ pub fn insertText(self: *App, text: []const u8) !void {
     // clearing + re-requesting on every keystroke makes the view flicker)
     self.adjustInlayHintsInsert(line, col, text);
     self.markDirtyRange(at, at, text);
+}
+
+/// Bracketed paste: insert `text` VERBATIM at the cursor — none of the
+/// typed-input transforms apply (no auto-indent on newlines, no auto-pairs,
+/// no completion triggers; they would mangle pasted content — an Enter per
+/// pasted line re-adds the previous line's indentation on top of the
+/// pasted line's own). Line endings are normalized (\r\n / \r -> \n). In
+/// insert mode the paste joins the session's undo group; in normal mode it
+/// is one undo group of its own and the mode stays normal.
+pub fn pasteText(self: *App, text: []const u8) !void {
+    if (text.len == 0) return;
+    var norm: []const u8 = text;
+    var norm_buf: ?[]u8 = null;
+    defer if (norm_buf) |nb| self.alloc.free(nb);
+    if (std.mem.indexOfScalar(u8, text, '\r') != null) {
+        const nb = try self.alloc.alloc(u8, text.len);
+        var len: usize = 0;
+        var i: usize = 0;
+        while (i < text.len) : (i += 1) {
+            if (text[i] == '\r') {
+                if (i + 1 >= text.len or text[i + 1] != '\n') {
+                    nb[len] = '\n';
+                    len += 1;
+                }
+            } else {
+                nb[len] = text[i];
+                len += 1;
+            }
+        }
+        norm = nb[0..len];
+        norm_buf = nb;
+    }
+    if (self.in_insert) {
+        try self.insertText(norm);
+        return;
+    }
+    self.cur().history.beginGroup();
+    try self.insertText(norm);
+    self.cur().history.endGroup();
+    self.in_insert = false; // insertText opened an insert session; close it
+}
+
+/// One key event arriving between paste_start/paste_end: append the bytes
+/// it stands for to paste_buf. The parser maps pasted C0 bytes to key
+/// codes (0x0A -> Ctrl+j, 0x0D -> Enter, 0x09 -> Tab) — inside a paste
+/// they are TEXT, so translate them back; anything else without text
+/// (escape sequences that were part of the pasted content) is dropped
+/// rather than executed as an editor command.
+pub fn pasteAccumulate(self: *App, key: vaxis.Key) !void {
+    if (key.text) |t| {
+        try self.paste_buf.appendSlice(self.alloc, t);
+    } else if (key.codepoint == vaxis.Key.enter or
+        (key.codepoint == 'j' and key.mods.ctrl))
+    {
+        try self.paste_buf.append(self.alloc, '\n');
+    } else if (key.codepoint == vaxis.Key.tab) {
+        try self.paste_buf.append(self.alloc, '\t');
+    }
 }

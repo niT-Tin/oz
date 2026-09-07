@@ -316,6 +316,83 @@ pub fn blankContextLevels(self: *App, buf: *Buffer, line: u32, line_count: u32) 
     return ctx_levels;
 }
 
+/// Screen rows `line` occupies in a pane `content_width` cells wide with
+/// soft wrap (always ≥ 1): the line text's display cells (grapheme widths,
+/// tab = tab_width — matching the text the renderer emits after tab
+/// expansion) plus the inlay hints spliced into the line and a closed
+/// fold's " … N lines" marker, ceiling-divided by the width. Markdown
+/// conceal is NOT subtracted: it only shrinks rows, so the estimate never
+/// scrolls the cursor off — at worst it scrolls one row early.
+pub fn lineDisplayRows(self: *App, win: vaxis.Window, buf: *Buffer, buf_index: usize, line: u32, content_width: u32) u32 {
+    const cw = @max(content_width, 1);
+    const ls = buf.pt.lineStart(line);
+    const ll = buf.pt.lineLen(line);
+    var cells: u32 = 0;
+    // chunked copyRange scan (per-byte byteAt is O(pieces) — see lineCellCol)
+    var chunk: [4096]u8 = undefined;
+    var off: u32 = 0;
+    while (off < ll) {
+        const cn: u32 = @min(ll - off, chunk.len);
+        buf.pt.copyRange(ls + off, chunk[0..cn]);
+        var p: u32 = 0;
+        while (p < cn) {
+            const b = chunk[p];
+            if (b == '\t') {
+                cells += tab_width;
+                p += 1;
+                continue;
+            }
+            const seq_len: u32 = if (b < 0x80) 1 else (std.unicode.utf8ByteSequenceLength(b) catch 1);
+            // a multi-byte sequence split by the chunk edge: re-read from
+            // its start instead of feeding gwidth a truncated sequence
+            if (p + seq_len > cn and off + cn < ll) break;
+            const avail: usize = @intCast(@min(seq_len, cn - p));
+            cells += win.gwidth(chunk[p..][0..avail]);
+            p += @intCast(avail);
+        }
+        off += p;
+    }
+    // inlay hints occupy screen cells without buffer bytes
+    if (!self.inlay_stale and self.inlay_buf == buf_index) {
+        for (self.inlay_hints.items) |hint| {
+            if (hint.line == line) cells += self.textWidth(win, hint.label);
+        }
+    }
+    // a closed fold's header row also carries the " … N lines" marker
+    if (foldAt(buf, line)) |f| {
+        var mbuf: [24]u8 = undefined;
+        const marker = std.fmt.bufPrint(&mbuf, " … {d} lines", .{f.hiddenCount()}) catch "";
+        cells += self.textWidth(win, marker);
+    }
+    return @max(1, (cells + cw - 1) / cw);
+}
+
+/// On-screen position of byte `pos` (on buffer line `line`) in the FOCUSED
+/// window: `row` counts the soft-wrapped rows of the visible lines in
+/// [view_top, line) plus the wrap chunk holding the byte; `col` is the
+/// cell column within that chunk (text-area relative — the gutter is NOT
+/// included). With soft wrap a buffer line no longer maps to exactly one
+/// screen row, so every overlay (multicursor highlights, easymotion
+/// labels, completion menu, ghost/blame text, the cursor itself) must go
+/// through this instead of `line - view_top`.
+pub const ScreenPos = struct { row: u32, col: u32 };
+pub fn focusedScreenPos(self: *App, win: vaxis.Window, rect: LeafRect, line: u32, pos: u32) ScreenPos {
+    const buf = self.cur();
+    const cw: u32 = @max(rect.width -| self.gutterWidth(buf.pt.lineCount()), 1);
+    var row: u32 = 0;
+    var l = self.curViewTop().*;
+    while (l < line) : (l = foldNextLine(buf, l)) {
+        row += self.lineDisplayRows(win, buf, self.current, l, cw);
+    }
+    const col_cells = self.screenCellCol(win, line, pos);
+    const rows = self.lineDisplayRows(win, buf, self.current, line, cw);
+    const wrap_row = @min(col_cells / cw, rows - 1);
+    return .{
+        .row = row + wrap_row,
+        .col = @min(col_cells -| wrap_row * cw, cw - 1),
+    };
+}
+
 /// Render one split window's lines into `rect` (content-area coordinates).
 /// The highlighter is bound to the current buffer, so only the focused
 /// window gets syntax highlighting and the (single) visual selection.
@@ -341,32 +418,69 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
     // relative-number gutter: computed once per frame per window
     const gutter = self.gutterWidth(line_count);
     const gutter_digits = gutter - 1;
+    // text columns per screen row: soft wrap splits a line every
+    // content_width cells (long lines wrap instead of clipping)
+    const content_width: u32 = @max(rect.width -| gutter, 1);
+    if (rect.height == 0) return;
 
-    // keep cursor line visible (per-window viewport). Fold-aware: a
-    // closed fold occupies ONE screen row, so screen distances are
-    // counted by walking visible lines, not by line-number arithmetic.
+    // keep cursor line visible (per-window viewport). Fold- AND wrap-aware:
+    // a closed fold occupies ONE screen row, a long line as many rows as
+    // its cells need, so screen distances are counted in display rows.
     // view_top itself must be a visible line — snap it up out of any
     // closed fold it fell into.
+    const view_top_before = w.view_top;
     if (foldCovering(buf, w.view_top)) |f| w.view_top = f.start;
     if (cursor_line < w.view_top) {
         w.view_top = cursor_line;
     }
-    // rows between view_top and the cursor line (cursor inclusive of
-    // itself, view_top row counts as row 0)
+    // the cursor's cell column decides which wrap chunk of its line it
+    // sits on — that chunk must be visible, not just the line's first row
+    const cursor_col_cells: u32 = if (w.buf == self.current)
+        self.screenCellCol(win, cursor_line, w.cursor)
+    else
+        self.lineCellCol(win, cursor_line, w.cursor);
+    const cur_line_rows = self.lineDisplayRows(win, buf, w.buf, cursor_line, content_width);
+    const cursor_wrap_row: u32 = @min(cursor_col_cells / content_width, cur_line_rows - 1);
+    // Rows between view_top and the cursor's row (view_top row counts as
+    // row 0). Single forward pass with a ring of per-line row counts: as
+    // the walk advances, view_top follows so the window never spans more
+    // than rect.height rows — the pass ends with view_top at the highest
+    // line for which the cursor's row is still visible.
     var rows_to_cursor: u32 = 0;
     {
+        const ring = try a.alloc(u32, rect.height);
+        var head: u32 = 0; // ring slot of view_top's row count
+        var cnt: u32 = 0; // lines in the ring
+        var sum: u32 = 0; // their rows
         var l = w.view_top;
-        while (l < cursor_line) : (rows_to_cursor += 1) l = foldNextLine(buf, l);
+        while (l < cursor_line) {
+            const r = self.lineDisplayRows(win, buf, w.buf, l, content_width);
+            ring[(head + cnt) % rect.height] = r;
+            cnt += 1;
+            sum += r;
+            while (sum + cursor_wrap_row >= rect.height and cnt > 0) {
+                sum -= ring[head];
+                head = (head + 1) % rect.height;
+                cnt -= 1;
+                w.view_top = foldNextLine(buf, w.view_top);
+            }
+            l = foldNextLine(buf, l);
+        }
+        rows_to_cursor = sum + cursor_wrap_row;
     }
-    while (rows_to_cursor >= rect.height and w.view_top < cursor_line) {
-        w.view_top = foldNextLine(buf, w.view_top);
-        rows_to_cursor -= 1;
-    }
+    // The cursor (or a fold snap) forced the view to scroll: an explicit
+    // zz/zt/zb pin no longer applies and normal scroll rules resume.
+    // Moving the cursor INSIDE the viewport never reaches this — the pin
+    // and the "~" filler rows below EOF stay put (vim behavior).
+    if (w.view_top != view_top_before) w.view_pinned = false;
     // don't scroll past the end leaving blank rows: pull view_top up
     // while fewer than `height` visible rows remain below it (without
-    // pushing the cursor off-screen)
-    {
-        var below: u32 = rows_to_cursor + 1; // + the cursor row itself
+    // pushing the cursor's row off-screen). Skipped while the view is
+    // pinned by an explicit zz/zt/zb: those MAY legitimately scroll past
+    // EOF, showing "~" filler rows below the last line (vim behavior).
+    if (!w.view_pinned) {
+        // rows from view_top through the END of the cursor line
+        var below: u32 = rows_to_cursor + (cur_line_rows - cursor_wrap_row);
         // Count the visible rows below the cursor, but only up to the
         // viewport height: the pull-up below only cares whether fewer
         // than `height` rows remain, and the walk to EOF is O(lines)
@@ -375,12 +489,17 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         var l = cursor_line;
         while (l + 1 < line_count and below < rect.height) {
             l = foldNextLine(buf, l);
-            below += 1;
+            below += self.lineDisplayRows(win, buf, w.buf, l, content_width);
         }
-        while (below < rect.height and w.view_top > 0 and rows_to_cursor + 1 < rect.height) {
-            w.view_top = foldPrevLine(buf, w.view_top);
-            below += 1;
-            rows_to_cursor += 1;
+        while (below < rect.height and w.view_top > 0) {
+            const prev = foldPrevLine(buf, w.view_top);
+            const r = self.lineDisplayRows(win, buf, w.buf, prev, content_width);
+            // pulling `prev` in adds r rows above the cursor — stop before
+            // its row would scroll off the bottom
+            if (rows_to_cursor + r >= rect.height) break;
+            w.view_top = prev;
+            below += r;
+            rows_to_cursor += r;
         }
     }
 
@@ -554,12 +673,13 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
     var prev_blank: ?u32 = null;
     var blank_run_ctx: u32 = 0;
     // Per-row allocations are a per-frame cost, not a per-row one: one
-    // text buffer (width × height), one gutter-number buffer and one
-    // guide-row buffer for the whole window, and ONE segs ArrayList whose
-    // capacity is reserved once per frame (clearRetainingCapacity per
-    // row). The segments' text slices reference these frame buffers (and
-    // the arena), both alive until vx.render().
-    const text_buf = try a.alloc(u8, @as(usize, rect.width) * rect.height);
+    // gutter-number buffer and one guide-row buffer for the whole window,
+    // and ONE segs ArrayList whose capacity is reserved once per frame
+    // (clearRetainingCapacity per row). The segments' text slices reference
+    // these frame buffers (and the arena), both alive until vx.render().
+    // The line text itself is arena-allocated per line: with soft wrap a
+    // line can be longer than rect.width, so a fixed width×height grid no
+    // longer bounds it.
     const num_buf = try a.alloc(u8, @as(usize, gutter) * rect.height);
     const guide_buf = try a.alloc(u8, rect.width);
     // markdown band fill (heading/fence rows): padding spaces past the
@@ -568,6 +688,9 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
     const pad_buf = try a.alloc(u8, rect.width);
     var segs = std.ArrayList(vaxis.Segment).empty;
     try segs.ensureTotalCapacity(a, @as(usize, rect.width) * 2 + 64);
+    // one wrapped chunk (screen row) of the line's segments
+    var chunk_segs = std.ArrayList(vaxis.Segment).empty;
+    try chunk_segs.ensureTotalCapacity(a, 64);
     // diagnostics are sorted by line (sortByLine): a moving pointer keeps
     // the mark lookup O(rows + diags) instead of O(rows × diags)
     var diag_i: usize = 0;
@@ -578,8 +701,8 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
     const hunks = self.git_diff.hunks.items;
     while (row < rect.row + rect.height and line < line_count) : ({
         // skip a closed fold's body: it shares its header's screen row
+        // (row is advanced per WRAPPED CHUNK inside the body, not here)
         line = foldNextLine(buf, line);
-        row += 1;
     }) {
         const rel: u32 = if (line == cursor_line)
             line + 1
@@ -667,18 +790,48 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
 
         const line_len = buf.pt.lineLen(line);
         const line_start = buf.pt.lineStart(line);
-        // the row also carries the gutter (rect.col + gutter), so the
-        // content width is rect.width minus the gutter — otherwise long
-        // lines are clipped on the right by the gutter width
-        var n: u32 = @min(line_len, rect.width -| gutter);
-        // don't cut a multibyte char in half at the line end — a lone
-        // UTF-8 continuation byte renders as U+FFFD ("box with ?")
-        while (n > 0 and n < line_len and (buf.pt.byteAt(line_start + n) & 0xC0) == 0x80) {
-            n -= 1;
+        // Soft wrap: the WHOLE line renders over as many screen rows as
+        // its display cells need — no right-edge clipping. Only the bytes
+        // that can still fit on the rows remaining below this one are read
+        // at all, so a huge (minified) line near the window bottom doesn't
+        // cost a full scan (tabs count tab_width cells, like the cursor
+        // math — the text segment builder expands them to spaces).
+        var n: u32 = line_len;
+        {
+            const max_cells: u32 = content_width * (rect.row + rect.height - row);
+            var cells: u32 = 0;
+            var chunk: [4096]u8 = undefined;
+            var off: u32 = 0;
+            var done = false;
+            while (off < n and !done) {
+                const cn: u32 = @min(n - off, chunk.len);
+                buf.pt.copyRange(line_start + off, chunk[0..cn]);
+                var p: u32 = 0;
+                while (p < cn) {
+                    const b = chunk[p];
+                    if (b == '\t') {
+                        cells += tab_width;
+                        p += 1;
+                    } else {
+                        const seq_len: u32 = if (b < 0x80) 1 else (std.unicode.utf8ByteSequenceLength(b) catch 1);
+                        // re-read a multi-byte sequence split by the chunk edge
+                        if (p + seq_len > cn and off + cn < n) break;
+                        const avail: usize = @intCast(@min(seq_len, cn - p));
+                        cells += win.gwidth(chunk[p..][0..avail]);
+                        p += @intCast(avail);
+                    }
+                    if (cells >= max_cells) {
+                        done = true;
+                        break;
+                    }
+                }
+                off += p;
+            }
+            n = off; // whole graphemes only — never a split UTF-8 sequence
         }
-        // line text lives in the per-frame text_buf row slice (valid
-        // until vx.render, like every other segment slice)
-        const text = text_buf[row_i * rect.width ..][0..n];
+        // line text lives in a per-line arena slice (valid until vx.render,
+        // like every other segment slice)
+        const text = try a.alloc(u8, n);
         buf.pt.copyRange(line_start, text);
 
         // markdown decorations (M4): advance the row pointer and derive
@@ -1081,17 +1234,66 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
             }
         }
 
-        _ = win.print(segs.items, .{
-            .row_offset = @intCast(row),
-            .col_offset = @intCast(rect.col),
-            .wrap = .none,
-        });
+        // Soft wrap: split the content segments (everything past the two
+        // gutter segments) into content_width-cell chunks, one screen row
+        // each. The gutter shows the line number on the first chunk row
+        // and blanks on continuation rows (vim 'wrap' + 'number').
+        const line_row = row; // first chunk row: number + diag/git marks
+        var seg_i: usize = 2; // skip the two gutter segments
+        var seg_off: usize = 0; // grapheme-aligned byte offset into seg.text
+        while (row < rect.row + rect.height) {
+            if (row == line_row) {
+                const gseg = [_]vaxis.Segment{.{ .text = num_str, .style = cursorline_style }};
+                _ = win.print(&gseg, .{ .row_offset = @intCast(row), .col_offset = @intCast(rect.col), .wrap = .none });
+            } else {
+                const blank = num_buf[(row - rect.row) * gutter ..][0..gutter];
+                @memset(blank, ' ');
+                const gseg = [_]vaxis.Segment{.{ .text = blank, .style = cursorline_style }};
+                _ = win.print(&gseg, .{ .row_offset = @intCast(row), .col_offset = @intCast(rect.col), .wrap = .none });
+            }
+            chunk_segs.clearRetainingCapacity();
+            var used: u32 = 0;
+            var consumed = true;
+            while (seg_i < segs.items.len) {
+                const seg = segs.items[seg_i];
+                const rest = seg.text[seg_off..];
+                var take: usize = 0;
+                var iter = vaxis.unicode.graphemeIterator(rest);
+                while (iter.next()) |g| {
+                    const gw: u32 = win.gwidth(g.bytes(rest));
+                    // a wide grapheme that would straddle the edge goes to
+                    // the next row whole — but always take at least one per
+                    // row or the loop never advances (narrow pane)
+                    if (used + gw > content_width and take > 0) break;
+                    used += gw;
+                    take = g.start + g.len;
+                }
+                if (take > 0) try chunk_segs.append(a, .{ .text = rest[0..take], .style = seg.style });
+                if (take < rest.len) {
+                    // row full: resume this segment on the next row
+                    seg_off += take;
+                    consumed = false;
+                    break;
+                }
+                seg_i += 1;
+                seg_off = 0;
+            }
+            if (chunk_segs.items.len > 0) {
+                _ = win.print(chunk_segs.items, .{
+                    .row_offset = @intCast(row),
+                    .col_offset = @intCast(rect.col + gutter),
+                    .wrap = .none,
+                });
+            }
+            row += 1;
+            if (consumed) break;
+        }
         // diagnostic mark: writeCell AFTER the line print so the glyph is
-        // not overwritten by the gutter segment
+        // not overwritten by the gutter segment (on the line's FIRST row)
         if (diag_mark.len > 1) { // Nerd Font icon (multi-byte); " " = none
             var mark_style = cursorline_style;
             if (diag_mark_fg) |f| mark_style.fg = f.fg;
-            win.writeCell(@intCast(rect.col + gutter - 1), @intCast(row), .{
+            win.writeCell(@intCast(rect.col + gutter - 1), @intCast(line_row), .{
                 .char = .{ .grapheme = diag_mark, .width = 1 },
                 .style = mark_style,
             });
@@ -1106,11 +1308,18 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
                 .removed_above => "\u{2581}", // ▁ lower eighth block
                 .removed_below => "\u{2594}", // ▔ upper eighth block
             };
-            win.writeCell(@intCast(rect.col + gutter - 1), @intCast(row), .{
+            win.writeCell(@intCast(rect.col + gutter - 1), @intCast(line_row), .{
                 .char = .{ .grapheme = glyph, .width = 1 },
                 .style = mark_style,
             });
         }
+    }
+    // Rows past the last buffer line: vim's "~" filler (NonText), so an
+    // explicit scroll past EOF (a pinned zz/zt/zb view) is legible instead
+    // of looking like the file simply ends higher up.
+    const tilde = [_]vaxis.Segment{.{ .text = "~", .style = .{ .fg = .{ .rgb = self.theme.fg_dim } } }};
+    while (row < rect.row + rect.height) : (row += 1) {
+        _ = win.print(&tilde, .{ .row_offset = @intCast(row), .col_offset = @intCast(rect.col), .wrap = .none });
     }
 }
 
@@ -1655,16 +1864,17 @@ pub fn render(self: *App) !void {
             if (wline < self.curViewTop().* or wline >= self.curViewTop().* + content_rows) continue;
             var p = w.start;
             while (p < w.end) {
-                // byte offset -> SCREEN cell column (CJK word = 3 bytes/2
-                // cells; inlay hints before it shift the cells right)
-                const col = self.screenCellCol(win, wline, p);
-                if (col >= @as(u32, win.width) - gutter) break;
+                // byte offset -> SCREEN position (CJK word = 3 bytes/2
+                // cells; inlay hints before it shift the cells right; a
+                // soft-wrapped line's tail cells sit on lower rows)
+                const sp = self.focusedScreenPos(win, cur_rect, wline, p);
+                if (sp.row >= cur_rect.height) break;
                 var clen: u32 = 1;
                 while (p + clen < w.end and (self.cur().pt.byteAt(p + clen) & 0xC0) == 0x80) : (clen += 1) {}
                 var char_buf: [4]u8 = undefined;
                 self.cur().pt.copyRange(p, char_buf[0..clen]);
                 const g = try a.dupe(u8, char_buf[0..clen]);
-                win.writeCell(@intCast(cur_rect.col + gutter + col), @intCast(cur_rect.row + wline - self.curViewTop().*), .{
+                win.writeCell(@intCast(cur_rect.col + gutter + sp.col), @intCast(cur_rect.row + sp.row), .{
                     .char = .{ .grapheme = g, .width = 1 },
                     .style = .{ .bg = .{ .rgb = self.theme.bg_sel } },
                 });
@@ -1678,14 +1888,15 @@ pub fn render(self: *App) !void {
         for (self.em_matches) |m| {
             const mline = self.cur().pt.lineOf(m.pos);
             if (mline < self.curViewTop().* or mline >= self.curViewTop().* + content_rows) continue;
-            // byte offset -> SCREEN cell column: a CJK char before the
-            // match is 3 bytes but 2 cells, and an inlay hint before it
-            // occupies screen cells without buffer bytes — a plain text
-            // column (lineCellCol) paints the label left of the match by
-            // the combined hint width
-            const col_in_line = self.screenCellCol(win, mline, m.pos);
+            // byte offset -> SCREEN position: a CJK char before the match
+            // is 3 bytes but 2 cells, an inlay hint before it occupies
+            // screen cells without buffer bytes, and a soft-wrapped line's
+            // tail cells sit on lower rows — a plain line-relative row and
+            // text column would paint the label off the match
+            const sp = self.focusedScreenPos(win, cur_rect, mline, m.pos);
+            if (sp.row >= cur_rect.height) continue;
             const label = try a.dupe(u8, &[_]u8{m.label});
-            win.writeCell(@intCast(cur_rect.col + gutter + col_in_line), @intCast(cur_rect.row + mline - self.curViewTop().*), .{
+            win.writeCell(@intCast(cur_rect.col + gutter + sp.col), @intCast(cur_rect.row + sp.row), .{
                 .char = .{ .grapheme = label, .width = 1 },
                 .style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_sel } },
             });
@@ -2255,7 +2466,7 @@ pub fn render(self: *App) !void {
             var top: usize = 0;
             if (self.completion_sel >= list_rows) top = self.completion_sel - list_rows + 1;
             const c_line = self.cur().pt.lineOf(self.curCursor().*);
-            const c_col = self.screenCellCol(win, c_line, self.curCursor().*);
+            const c_sp = self.focusedScreenPos(win, cur_rect, c_line, self.curCursor().*);
             // box width in cells: borders + icon + pad + longest label
             var max_label: usize = 0;
             var k: usize = 0;
@@ -2265,15 +2476,15 @@ pub fn render(self: *App) !void {
             max_label = @min(max_label, 46);
             const inner_cells: u32 = @intCast(2 + max_label);
             const box_w = inner_cells + 2;
-            var start_row = c_line - self.curViewTop().* + cur_rect.row + 1;
+            var start_row = cur_rect.row + c_sp.row + 1;
             if (start_row + list_rows + 2 > height) {
                 // near the bottom: show the menu above the cursor; the
                 // saturating minus keeps short terminals from underflowing
                 // (a 4.29e9 row would draw the menu off-screen silently)
-                start_row = (c_line - self.curViewTop().* + cur_rect.row) -| (list_rows + 2);
+                start_row = (cur_rect.row + c_sp.row) -| (list_rows + 2);
             }
             // anchor the menu at the cursor column (not pinned left)
-            var box_col = cur_rect.col + gutter + c_col;
+            var box_col = cur_rect.col + gutter + c_sp.col;
             if (box_col + box_w > win.width) box_col = win.width -| box_w;
             const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
             const sel_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_sel }, .fg = .{ .rgb = self.theme.fg } };
@@ -2329,8 +2540,8 @@ pub fn render(self: *App) !void {
             const item = self.completion_words.items[self.completion_sel].text;
             const typed_len = self.curCursor().* - self.completion_pos;
             const ghost_line = self.cur().pt.lineOf(self.curCursor().*);
-            const ghost_col = self.screenCellCol(win, ghost_line, self.curCursor().*);
-            if (item.len > typed_len and typed_len > 0 and typed_len < 256) {
+            const g_sp = self.focusedScreenPos(win, cur_rect, ghost_line, self.curCursor().*);
+            if (item.len > typed_len and typed_len > 0 and typed_len < 256 and g_sp.row < cur_rect.height) {
                 var prefix_buf: [256]u8 = undefined;
                 self.cur().pt.copyRange(self.completion_pos, prefix_buf[0..typed_len]);
                 if (std.mem.startsWith(u8, item, prefix_buf[0..typed_len])) {
@@ -2344,14 +2555,14 @@ pub fn render(self: *App) !void {
                         // keep the ghost inside THIS pane: win.width is
                         // the whole screen, and a split's neighbor owns
                         // the columns past the pane's right edge
-                        const ghost_start = cur_rect.col + gutter + ghost_col;
+                        const ghost_start = cur_rect.col + gutter + g_sp.col;
                         if (ghost_start + ghost.len <= cur_rect.col + cur_rect.width) {
                             const seg = [_]vaxis.Segment{.{
                                 .text = ghost,
                                 .style = .{ .dim = true },
                             }};
                             _ = win.print(&seg, .{
-                                .row_offset = @intCast(ghost_line - self.curViewTop().* + cur_rect.row),
+                                .row_offset = @intCast(cur_rect.row + g_sp.row),
                                 .col_offset = @intCast(ghost_start),
                                 .wrap = .none,
                             });
@@ -2404,8 +2615,10 @@ pub fn render(self: *App) !void {
                         label = lbl;
                     }
                     const line_end = fbuf.pt.lineStart(blame_line) + fbuf.pt.lineLen(blame_line);
-                    const end_col = self.screenCellCol(win, blame_line, line_end);
-                    var start_col = cur_rect.col + gutter + end_col;
+                    // the ghost follows the line END — on a soft-wrapped
+                    // line that's the last chunk's row, not the first
+                    const b_sp = self.focusedScreenPos(win, cur_rect, blame_line, line_end);
+                    var start_col = cur_rect.col + gutter + b_sp.col;
                     // a closed fold's " … N lines" marker also renders after
                     // the text — shift the ghost past it
                     if (foldAt(fbuf, blame_line)) |f| {
@@ -2416,7 +2629,7 @@ pub fn render(self: *App) !void {
                     // the whole screen, and a split's neighbor owns the
                     // columns past the pane's right edge
                     const pane_end = cur_rect.col + cur_rect.width;
-                    if (start_col < pane_end) {
+                    if (b_sp.row < cur_rect.height and start_col < pane_end) {
                         const fit = autil.cellFitPrefix(win, label, pane_end - start_col);
                         if (fit.cells > 0) {
                             const seg = [_]vaxis.Segment{.{
@@ -2424,7 +2637,7 @@ pub fn render(self: *App) !void {
                                 .style = .{ .dim = true },
                             }};
                             _ = win.print(&seg, .{
-                                .row_offset = @intCast(blame_line - self.curViewTop().* + cur_rect.row),
+                                .row_offset = @intCast(cur_rect.row + b_sp.row),
                                 .col_offset = @intCast(start_col),
                                 .wrap = .none,
                             });
@@ -2453,9 +2666,10 @@ pub fn render(self: *App) !void {
                 if (c == '\n') hrows += 1;
             }
             hrows = @min(hrows, 6);
-            var start_row = h_line - self.curViewTop().* + cur_rect.row + 1;
+            const h_sp = self.focusedScreenPos(win, cur_rect, h_line, self.curCursor().*);
+            var start_row = cur_rect.row + h_sp.row + 1;
             if (start_row + hrows >= height) {
-                start_row = (h_line - self.curViewTop().* + cur_rect.row) -| hrows;
+                start_row = (cur_rect.row + h_sp.row) -| hrows;
             }
             const col0 = cur_rect.col + gutter + 1;
             const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
@@ -2711,18 +2925,14 @@ pub fn render(self: *App) !void {
             .col = @intCast(self.nav_float_col + 1),
         };
     } else {
-        const cursor_col = self.screenCellCol(win, cursor_line, self.curCursor().*);
-        // screen row = count of VISIBLE lines between view_top and the
-        // cursor (a closed fold's hidden body occupies zero rows)
-        var cursor_row: u32 = cur_rect.row;
-        {
-            const fbuf = self.cur();
-            var l = self.curViewTop().*;
-            while (l < cursor_line) : (cursor_row += 1) l = foldNextLine(fbuf, l);
-        }
+        // screen position = soft-wrapped rows of the visible lines above
+        // the cursor line + the wrap chunk holding the cursor's cell
+        // column (clamped into the pane: a single line taller than the
+        // window can't show its deep chunks)
+        const c_sp = self.focusedScreenPos(win, cur_rect, cursor_line, self.curCursor().*);
         self.vx.screen.cursor = .{
-            .row = @intCast(cursor_row),
-            .col = @intCast(cur_rect.col + gutter + cursor_col), // window offset + gutter
+            .row = @intCast(cur_rect.row + @min(c_sp.row, cur_rect.height -| 1)),
+            .col = @intCast(cur_rect.col + gutter + c_sp.col), // window offset + gutter
         };
     }
     self.vx.screen.cursor_vis = true;
@@ -2764,6 +2974,12 @@ pub fn scopeAnimActive(self: *App) bool {
 
 pub fn run(self: *App) !void {
     try self.vx.enterAltScreen(self.tty.writer());
+    // Bracketed paste (DECSET 2004): the terminal wraps pasted text in
+    // paste_start/paste_end markers so it can be told apart from typed
+    // keys (without it a paste IS a burst of keystrokes — each pasted
+    // newline triggers Enter's auto-indent and wrecks the indentation).
+    // vx.deinit resets the mode (state.bracketed_paste check there).
+    try self.vx.setBracketedPaste(self.tty.writer(), true);
     try self.loop.start();
     defer self.loop.stop();
     // monotonic ms of the last frame we actually drew — poll-mode
@@ -2913,12 +3129,45 @@ pub fn run(self: *App) !void {
             try self.loop.pollEvent();
         }
         var handled = false;
+        // terminal pane focused: pasted keys are forwarded to the child
+        // one by one (handleKey), byte-faithful — no accumulation needed
+        const term_focused = term.supported and self.term_pane != null and self.term_pane.?.focused;
         while (try self.loop.tryEvent()) |event| {
             handled = true;
             switch (event) {
-                .key_press => |key| try self.handleKey(key),
+                .key_press => |key| {
+                    // mid-paste keystrokes are paste content, not input:
+                    // buffer them (paste_end inserts the whole thing) so
+                    // auto-indent/auto-pairs can't mangle pasted text
+                    if (self.pasting and !term_focused) {
+                        try self.pasteAccumulate(key);
+                        continue;
+                    }
+                    try self.handleKey(key);
+                },
+                .paste_start => {
+                    self.pasting = true;
+                    self.paste_buf.clearRetainingCapacity();
+                },
+                .paste_end => {
+                    if (!self.pasting) continue;
+                    self.pasting = false;
+                    if (term_focused) continue; // child got the keys already
+                    switch (self.state.mode) {
+                        .insert => if (self.mc_active)
+                            try self.mcInsertText(self.paste_buf.items)
+                        else
+                            try self.pasteText(self.paste_buf.items),
+                        // normal mode: insert the paste at the cursor as one
+                        // undo group (before, the paste was dropped here)
+                        .normal => try self.pasteText(self.paste_buf.items),
+                        // command/visual: drop, as before
+                        else => {},
+                    }
+                },
                 .paste => |text| {
-                    // terminal focus: forward the paste to the child
+                    // OSC 52 clipboard reply — terminal focus: forward the
+                    // paste to the child
                     if (term.supported) {
                         if (self.term_pane) |*tp| {
                             if (tp.focused) {

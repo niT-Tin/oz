@@ -191,6 +191,14 @@ pub const App = struct {
         buf: usize = 0,
         cursor: u32 = 0,
         view_top: u32 = 0,
+        /// Set by zz/zt/zb (explicit scrolls): the render loop's
+        /// "don't scroll past EOF leaving blank rows" pull-up is skipped
+        /// while pinned, so zz near EOF still centers the cursor line
+        /// with "~" filler rows below (vim behavior). The pin survives
+        /// cursor movement INSIDE the viewport and clears only when the
+        /// cursor forces the view to scroll — vim never snaps the window
+        /// back just because the cursor moved.
+        view_pinned: bool = false,
     };
 
     /// Split orientation (vim: :sp = horizontal split = stacked rows,
@@ -255,6 +263,15 @@ pub const App = struct {
     cmd_complete_names: std.ArrayList([]const u8) = .empty,
     prev_insert_key: ?vaxis.Key = null,
     msg: ?[]u8 = null, // transient status message (owned)
+
+    /// Bracketed paste (DECSET 2004): pasted bytes arrive as ordinary key
+    /// events between paste_start/paste_end markers. They accumulate here
+    /// and land as ONE verbatim insert on paste_end — routed through the
+    /// typed-input path instead, each pasted '\n' would trigger Enter's
+    /// auto-indent (stacking the previous line's indent onto the pasted
+    /// line's own) and pasted brackets would auto-pair.
+    paste_buf: std.ArrayList(u8) = .empty,
+    pasting: bool = false,
 
     // visual selection
     visual_anchor: ?u32 = null,
@@ -583,6 +600,25 @@ pub const App = struct {
         return content_rows;
     }
 
+    /// Width (in cells) of the focused window's TEXT area: the leaf width
+    /// minus the relative-number gutter — the soft-wrap width. Same layout
+    /// math as focusedWinHeight so H/M/L and zz/zt/zb count wrapped rows
+    /// the way the renderer draws them.
+    pub fn focusedContentWidth(self: *App) u32 {
+        const gutter = self.gutterWidth(self.cur().pt.lineCount());
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const win = self.vx.window();
+        const height: u32 = win.height;
+        if (height <= status_row_count) return @max(win.width -| gutter, 1);
+        const content_rows = height - status_row_count - self.tabBarRows(arena.allocator());
+        const layout = self.layoutWindows(arena.allocator(), self.contentTop(arena.allocator()), content_rows, self.contentCol(), win.width) catch return @max(win.width -| gutter, 1);
+        for (layout.leaves) |leaf| {
+            if (leaf.win == self.current_win) return @max(leaf.width -| gutter, 1);
+        }
+        return @max(win.width -| gutter, 1);
+    }
+
     /// H/M/L: resolve a viewport motion to a document LINE using the focused
     /// window's view_top and height (the pure motion layer knows neither).
     /// Returns null for non-viewport motions. The count is ignored, like
@@ -593,43 +629,57 @@ pub const App = struct {
         const line_count = buf.pt.lineCount();
         const height = self.focusedWinHeight();
         const top = @min(w.view_top, line_count - 1);
-        // walk VISIBLE lines from the top: a closed fold is one screen row,
-        // so M/L can't be top + height (they'd overshoot past hidden lines)
+        // walk VISIBLE lines from the top, counting soft-WRAPPED rows: a
+        // closed fold is one screen row and a long line is several, so
+        // M/L can't be top + height (they'd overshoot past hidden lines
+        // and wrapped rows alike)
         const steps: u32 = switch (motion) {
             .view_top_line => return top,
             .view_middle_line => (height -| 1) / 2,
             .view_bottom_line => height -| 1,
             else => return null,
         };
+        const win = self.vx.window();
+        const cw = self.focusedContentWidth();
         var line = top;
-        var i: u32 = 0;
-        while (i < steps and line + 1 < line_count) : (i += 1) {
+        var rows: u32 = 0;
+        while (rows < steps and line + 1 < line_count) {
             line = foldNextLine(buf, line);
+            rows += self.lineDisplayRows(win, buf, w.buf, line, cw);
         }
         return @min(line, line_count - 1);
     }
 
     /// zz/zt/zb: scroll so the cursor line sits at the middle/top/bottom of
-    /// the focused window; the cursor itself does not move. Clamped like the
-    /// render loop's ensure-visible logic: no negative scroll, and never past
-    /// "last line at the window bottom".
+    /// the focused window; the cursor itself does not move. Row counts are
+    /// wrap-aware (a long line is several screen rows); the render loop's
+    /// ensure-visible logic corrects any residual overscroll.
     pub fn scrollCursorTo(self: *App, where: enum { top, center, bottom }) void {
         const w = &self.windows.items[self.current_win];
         const buf = &self.buffers.items[w.buf];
         const line_count = buf.pt.lineCount();
         const height = self.focusedWinHeight();
         const cursor_line = buf.pt.lineOf(w.cursor);
-        var top: u32 = switch (where) {
-            .top => cursor_line,
-            .center => cursor_line -| (height / 2),
-            .bottom => cursor_line -| (height -| 1),
-        };
-        if (line_count > height) {
-            top = @min(top, line_count - height);
-        } else {
-            top = 0;
+        var top: u32 = cursor_line;
+        if (where != .top) {
+            // walk back until the rows above the cursor fill the budget
+            const budget: u32 = if (where == .center) height / 2 else height -| 1;
+            const win = self.vx.window();
+            const cw = self.focusedContentWidth();
+            var rows: u32 = 0;
+            while (top > 0 and rows < budget) {
+                const prev = foldPrevLine(buf, top);
+                rows += self.lineDisplayRows(win, buf, w.buf, prev, cw);
+                top = prev;
+            }
         }
-        w.view_top = top;
+        w.view_top = @min(top, line_count -| 1);
+        // pin the view: explicit scrolls may legitimately leave "~" filler
+        // rows below EOF (zz near the file end still centers the cursor
+        // line), so the render loop's pull-up must not undo them. The pin
+        // survives cursor movement inside the viewport; the render loop
+        // clears it only when the cursor forces the view to scroll.
+        w.view_pinned = true;
     }
 
     // ---- folds (za/zo/zc/zR/zM; detection lives in editor/fold.zig) ----
@@ -1249,6 +1299,7 @@ pub const App = struct {
         self.cmd_complete_names.deinit(self.alloc);
         if (self.msg) |m| self.alloc.free(m);
         if (self.last_search) |q| self.alloc.free(q);
+        self.paste_buf.deinit(self.alloc);
         if (self.yank_buffer) |b| self.alloc.free(b);
         if (self.em_matches.len > 0) self.alloc.free(self.em_matches);
         self.mc.deinit();
@@ -1420,6 +1471,8 @@ pub const App = struct {
     pub const saveFile = @import("app/search.zig").saveFile;
     pub const openFile = @import("app/search.zig").openFile;
     pub const insertText = @import("app/search.zig").insertText;
+    pub const pasteText = @import("app/search.zig").pasteText;
+    pub const pasteAccumulate = @import("app/search.zig").pasteAccumulate;
     // ---- completion → src/app/completion.zig ----
     pub const isWordByte = @import("app/completion.zig").isWordByte;
     pub const containsIgnoreCase = @import("app/completion.zig").containsIgnoreCase;
@@ -1550,6 +1603,9 @@ pub const App = struct {
     pub const utf16Column = @import("app/render.zig").utf16Column;
     pub const byteColumnFromUtf16 = @import("app/render.zig").byteColumnFromUtf16;
     pub const screenCellCol = @import("app/render.zig").screenCellCol;
+    pub const lineDisplayRows = @import("app/render.zig").lineDisplayRows;
+    pub const focusedScreenPos = @import("app/render.zig").focusedScreenPos;
+    pub const ScreenPos = @import("app/render.zig").ScreenPos;
     pub const isBlankLine = @import("app/render.zig").isBlankLine;
     pub const lineIndentLevels = @import("app/render.zig").lineIndentLevels;
     pub const blankContextLevels = @import("app/render.zig").blankContextLevels;
