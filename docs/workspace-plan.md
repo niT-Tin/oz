@@ -45,7 +45,7 @@ App 新增字段：`workspaces: std.ArrayList(Workspace)`（恒 ≥1，启动槽
 | 每 workspace | buffers、windows、win_root、current/current_win | 随 swap 走 |
 | 切换时重置 | visual_anchor、in_insert、state.mode→normal、mc_active、easymotion、picker/completion/hover/nav_list/diag_list、inlay、diagnostics、scope_anim/scope_cache | 全部关闭/失效 |
 | LSP/git | 单 client 绑定当前 buffer | teardownLsp(false) + ensureLsp()；git diff/blame 由 scheduleGitStatus 重算（路径检查天然防串） |
-| 全局共享 | yank_buffer、cmd 历史、recent_files、搜索历史、主题、filetree（cwd 维度）、内嵌终端面板、picker_files 缓存 | 不动 |
+| 全局共享 | yank_buffer、cmd 、内嵌终端面板、picker_files 缓存 | 不动 |
 
 ### 2.2 两条保护规则
 
@@ -122,7 +122,6 @@ App 新增字段：`workspaces: std.ArrayList(Workspace)`（恒 ≥1，启动槽
 
 - session 落盘持久化（DESIGN.md §1.2 排除；如需以后单独立项）。
 - workspace 间移动/共享 buffer（以防双开拒绝代替）。
-- 每 workspace 独立 filetree 根 / 独立终端面板（当前全局共享，文档注明）。
 
 ## 8. 易踩的坑（给执行者）
 
