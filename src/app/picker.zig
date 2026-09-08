@@ -17,18 +17,39 @@ pub const GrepResult = struct { path: []u8, line: u32, text: []u8 };
 // ---- fuzzy picker (<leader>sf) ----
 
 pub fn openPicker(self: *App) !void {
-    if (self.picker_files.items.len == 0) {
-        // cwd() has fd == AT.FDCWD (-100), which the dir iterator can't
-        // getdents on — open a real directory handle first.
-        var root = try std.Io.Dir.cwd().openDir(self.io, ".", .{ .iterate = true });
-        defer root.close(self.io);
-        try self.walkDir(root, "");
+    // The fuzzy file picker walks the workspace's project root (or the
+    // process cwd when none is set). The cache is global/shared, so it is
+    // re-walked whenever the root changed since the last walk — files from
+    // one workspace's project must not leak into another's picker.
+    const root_dir = try self.currentRootDir();
+    defer self.alloc.free(root_dir);
+    if (self.picker_files.items.len == 0 or
+        self.picker_root == null or
+        !std.mem.eql(u8, self.picker_root.?, root_dir))
+    {
+        for (self.picker_files.items) |f| self.alloc.free(f);
+        self.picker_files.clearRetainingCapacity();
+        var dir = try std.Io.Dir.cwd().openDir(self.io, root_dir, .{ .iterate = true });
+        defer dir.close(self.io);
+        try self.walkDir(dir, "");
+        if (self.picker_root) |p| self.alloc.free(p);
+        self.picker_root = try self.alloc.dupe(u8, root_dir);
     }
     self.picker_input.clearRetainingCapacity();
     self.picker_sel = 0;
     self.picker_top = 0;
     try self.pickerRefilter();
     self.picker_active = true;
+}
+
+/// Absolute path for a fuzzy-file picker entry `rel` (relative to
+/// picker_root, or the process cwd when picker_root is null). Owned.
+fn resolvePickerPath(self: *App, rel: []const u8) ![]u8 {
+    if (self.picker_root) |root| {
+        return std.Io.Dir.path.resolve(self.alloc, &.{ root, rel }) catch
+            self.alloc.dupe(u8, rel);
+    }
+    return self.alloc.dupe(u8, rel);
 }
 
 pub fn walkDir(self: *App, dir: std.Io.Dir, prefix: []const u8) !void {
@@ -480,9 +501,11 @@ pub fn handlePickerKey(self: *App, key: vaxis.Key) !void {
                 return;
             }
             if (self.picker_matches.items.len > 0) {
-                const f = self.picker_files.items[self.picker_matches.items[self.picker_sel]];
+                const rel = self.picker_files.items[self.picker_matches.items[self.picker_sel]];
+                const abs = try resolvePickerPath(self, rel);
                 self.closePicker();
-                try self.openFile(f);
+                try self.openFile(abs);
+                self.alloc.free(abs);
             }
         },
         vaxis.Key.backspace => {

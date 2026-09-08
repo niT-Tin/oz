@@ -261,6 +261,12 @@ pub const App = struct {
         filetree_sel: usize = 0,
         filetree_top: usize = 0,
         focus: Focus = .buffer,
+        /// Absolute project root (owned, no trailing slash) the workspace's
+        /// file tree / fuzzy file picker are rooted at. null = unset → fall
+        /// back to the process cwd. Set when a file is opened interactively
+        /// (openInBuffer); each workspace keeps its own, swapped exactly
+        /// like the tree state.
+        project_root: ?[]u8 = null,
     };
 
 
@@ -412,17 +418,30 @@ pub const App = struct {
     insert_base_hash: u64 = 0,
     insert_was_dirty: bool = false,
     /// cwd root node; its children are the first level (built on first open).
+    /// The root node's `path` now holds the ABSOLUTE directory the tree is
+    /// rooted at (its own `project_root` at build time), and every child
+    /// path is absolute — so opening a file / expanding a dir works no
+    /// matter which directory the tree shows.
     filetree_root: ?*TreeNode = null,
     /// Visible rows (expanded subtree in DFS order), rebuilt whenever the
     /// tree structure changes (open / expand / collapse / locate). The
     /// selection indexes into this list, so it must stay in sync with the
     /// tree — rebuild is the only mutation path.
     filetree_rows: std.ArrayList(FiletreeRow) = .empty,
+    /// Absolute project root (owned, no trailing slash) for the current
+    /// workspace — the directory the file tree and fuzzy file picker open
+    /// from. null = unset → the process cwd. Set in openInBuffer to the
+    /// project root of the opened file; per workspace (see Workspace).
+    project_root: ?[]u8 = null,
 
     // fuzzy picker (<leader>sf / <leader>st / <leader>sb / <leader>sr / <leader>sk / <leader>sp)
     picker_mode: enum { files, grep, buffers, recent, keymaps, themes, workspaces } = .files,
     picker_active: bool = false,
-    picker_files: std.ArrayList([]u8) = .empty, // owned paths
+    picker_files: std.ArrayList([]u8) = .empty, // owned paths (relative to picker_root)
+    /// Absolute directory `picker_files` was walked for (owned); null = the
+    /// process cwd. The cache is global/shared across workspaces (plan §2.1),
+    /// so a workspace with a different project root re-walks on open.
+    picker_root: ?[]u8 = null,
     picker_input: std.ArrayList(u8) = .empty,
     picker_matches: std.ArrayList(usize) = .empty, // indices into picker_files
     picker_sel: usize = 0,
@@ -1391,6 +1410,7 @@ pub const App = struct {
                 ws.windows.deinit(self.alloc);
                 if (ws.filetree_root) |root| self.freeFiletreeNode(root);
                 ws.filetree_rows.deinit(self.alloc);
+                if (ws.project_root) |p| self.alloc.free(p);
             }
             self.alloc.free(ws.name);
         }
@@ -1412,10 +1432,12 @@ pub const App = struct {
         self.mc.deinit();
         if (self.filetree_root) |root| self.freeFiletreeNode(root);
         self.filetree_rows.deinit(self.alloc);
+        if (self.project_root) |p| self.alloc.free(p);
         for (self.recent_files.items) |f| self.alloc.free(f);
         self.recent_files.deinit(self.alloc);
         for (self.picker_files.items) |f| self.alloc.free(f);
         self.picker_files.deinit(self.alloc);
+        if (self.picker_root) |p| self.alloc.free(p);
         for (self.grep_results.items) |g| {
             self.alloc.free(g.path);
             self.alloc.free(g.text);
@@ -1650,6 +1672,10 @@ pub const App = struct {
     pub const revealPath = @import("app/filetree.zig").revealPath;
     pub const filetreeKey = @import("app/filetree.zig").filetreeKey;
     pub const freeFiletreeNode = @import("app/filetree.zig").freeFiletreeNode;
+    pub const detectProjectRoot = @import("app/filetree.zig").detectProjectRoot;
+    pub const currentRootDir = @import("app/filetree.zig").currentRootDir;
+    pub const cwdPath = @import("app/filetree.zig").cwdPath;
+    pub const setProjectRoot = @import("app/filetree.zig").setProjectRoot;
     pub const TreeNode = @import("app/filetree.zig").TreeNode;
     pub const FiletreeRow = @import("app/filetree.zig").FiletreeRow;
     // ---- lsp_edit → src/app/lsp_edit.zig ----

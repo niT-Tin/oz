@@ -13305,10 +13305,10 @@ test "workspace: filetree expansion state is per-workspace" {
     defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
     var p_buf: [160:0]u8 = undefined;
     const p_aa = try std.fmt.bufPrintZ(&p_buf, "{s}/aa", .{root});
-    try std.Io.Dir.cwd().makePath(io, p_aa);
+    try std.Io.Dir.cwd().createDirPath(io, p_aa);
     var p2_buf: [160:0]u8 = undefined;
     const p_bb = try std.fmt.bufPrintZ(&p2_buf, "{s}/bb", .{root});
-    try std.Io.Dir.cwd().makePath(io, p_bb);
+    try std.Io.Dir.cwd().createDirPath(io, p_bb);
     var pf_buf: [176:0]u8 = undefined;
     const p_leaf = try std.fmt.bufPrintZ(&pf_buf, "{s}/aa/leaf.txt", .{root});
     {
@@ -13353,6 +13353,96 @@ test "workspace: filetree expansion state is per-workspace" {
     if (!back) grid.dump();
     try std.testing.expect(back);
 
+    try wsQuit(&sess, &grid);
+}
+
+test "workspace: <leader>e roots the file tree at the opened file's directory" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    // A controlled project dir OUTSIDE the test cwd (the oz repo root). If
+    // the tree were still cwd-rooted it would show build.zig/src/…; rooted
+    // at the opened file's directory it shows only this project's file.
+    var ra_buf: [128:0]u8 = undefined;
+    const ra = try std.fmt.bufPrintZ(&ra_buf, "/tmp/oz_pf_{d}", .{linux.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, ra) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, ra);
+    try writeTestFile(io, ra, "pfr_marker.txt", "PFR-MARKER\n");
+
+    var sess = try Session.spawn(io, &.{oz_exe_path});
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+
+    const dash = try wsWait(&sess, &grid, "终端文本编辑器", 5000);
+    if (!dash) grid.dump();
+    try std.testing.expect(dash);
+
+    // Open a file in the project dir: the workspace's root becomes that dir.
+    var pa_buf: [176:0]u8 = undefined;
+    const pa = try std.fmt.bufPrintZ(&pa_buf, "{s}/pfr_marker.txt", .{ra});
+    try sess.send(":e ");
+    try sess.send(pa);
+    try sess.send("\r");
+    const opened = try wsWait(&sess, &grid, "PFR-MARKER", 5000);
+    if (!opened) grid.dump();
+    try std.testing.expect(opened);
+
+    // <leader>e shows the project's tree (pfr_marker.txt), NOT the cwd tree
+    // (build.zig lives only in the process cwd).
+    try sess.send(" e");
+    const tree = try wsWait(&sess, &grid, "pfr_marker.txt", 5000);
+    if (!tree) grid.dump();
+    try std.testing.expect(tree);
+    try std.testing.expect(!grid.contains("build.zig"));
+
+    try wsQuit(&sess, &grid);
+}
+
+test "workspace: <leader>sf fuzzy-searches the opened file's project" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    // Same setup: a project dir outside cwd with a distinctive file name.
+    var ra_buf: [128:0]u8 = undefined;
+    const ra = try std.fmt.bufPrintZ(&ra_buf, "/tmp/oz_pp_{d}", .{linux.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, ra) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, ra);
+    try writeTestFile(io, ra, "ppr_unique.txt", "PPR-UNIQUE\n");
+
+    var sess = try Session.spawn(io, &.{oz_exe_path});
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+
+    const dash = try wsWait(&sess, &grid, "终端文本编辑器", 5000);
+    if (!dash) grid.dump();
+    try std.testing.expect(dash);
+
+    var pa_buf: [176:0]u8 = undefined;
+    const pa = try std.fmt.bufPrintZ(&pa_buf, "{s}/ppr_unique.txt", .{ra});
+    try sess.send(":e ");
+    try sess.send(pa);
+    try sess.send("\r");
+    const opened = try wsWait(&sess, &grid, "PPR-UNIQUE", 5000);
+    if (!opened) grid.dump();
+    try std.testing.expect(opened);
+
+    // <leader>sf re-walks at the project root: the project's file shows up
+    // (it is not under cwd, so a cwd-rooted picker would never list it).
+    try sess.send(" sfppr_unique");
+    const picker = try wsWait(&sess, &grid, "ppr_unique.txt", 5000);
+    if (!picker) grid.dump();
+    try std.testing.expect(picker);
+
+    // Enter confirms (the file is already open → switch), closing the picker
+    // so the trailing :q! reaches the buffer, not the picker's filter.
+    try sess.send("\r");
+    const closed = try wsWaitGone(&sess, &grid, " Files ");
+    if (!closed) grid.dump();
+    try std.testing.expect(closed);
     try wsQuit(&sess, &grid);
 }
 

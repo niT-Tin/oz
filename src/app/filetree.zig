@@ -24,6 +24,87 @@ pub const FiletreeRow = struct { node: *TreeNode, depth: usize };
 
 // ---- file tree (<leader>e / <leader>E) ----
 
+/// Process cwd as an owned absolute path (no trailing slash).
+pub fn cwdPath(self: *App) ![]u8 {
+    var buf: [4096:0]u8 = undefined;
+    if (std.c.getcwd(&buf, buf.len) == null) return self.alloc.dupe(u8, "/");
+    var n: usize = 0;
+    while (n < buf.len and buf[n] != 0) : (n += 1) {}
+    return self.alloc.dupe(u8, buf[0..n]);
+}
+
+/// Absolute directory the current workspace operates in (owned, no trailing
+/// slash): its project root when one has been set (a file was opened), else
+/// the process cwd.
+pub fn currentRootDir(self: *App) ![]u8 {
+    if (self.project_root) |p| return self.alloc.dupe(u8, p);
+    return self.cwdPath();
+}
+
+/// True when directory `dir` contains a `.git` entry (a directory in a
+/// normal clone, a file in a worktree). Used to find a project's root.
+fn dirHasGit(self: *App, dir: []const u8) bool {
+    var d = std.Io.Dir.cwd().openDir(self.io, dir, .{}) catch return false;
+    defer d.close(self.io);
+    _ = d.statFile(self.io, ".git", .{}) catch return false;
+    return true;
+}
+
+/// Absolute project root for an opened file: walk up from its directory to
+/// the nearest ancestor with a `.git` entry; with none, the file's own
+/// directory is the root. Returns an owned path (no trailing slash).
+pub fn detectProjectRoot(self: *App, file_path: []const u8) ![]u8 {
+    const dir = std.fs.path.dirname(file_path) orelse "/";
+    var cur = try self.alloc.dupe(u8, dir);
+    const fallback = try self.alloc.dupe(u8, dir);
+    errdefer self.alloc.free(fallback);
+    while (true) {
+        if (dirHasGit(self, cur)) {
+            self.alloc.free(fallback);
+            return cur;
+        }
+        const parent = std.fs.path.dirname(cur);
+        if (parent == null or std.mem.eql(u8, parent.?, cur)) break;
+        const next = try self.alloc.dupe(u8, parent.?);
+        self.alloc.free(cur);
+        cur = next;
+    }
+    self.alloc.free(cur);
+    return fallback;
+}
+
+/// Adopt an opened file's project root as the workspace root, invalidating
+/// the file tree and the fuzzy-file picker cache when it actually changes.
+/// Called by openInBuffer after the path is resolved to absolute form.
+pub fn setProjectRoot(self: *App, file_path: []const u8) void {
+    const root = self.detectProjectRoot(file_path) catch return;
+    defer self.alloc.free(root);
+    // Compare against the EFFECTIVE root — project_root, or the process cwd
+    // while project_root is unset. Opening a file under the current tree's
+    // directory (e.g. the first open in cwd) must NOT invalidate the tree.
+    const effective = self.currentRootDir() catch return;
+    defer self.alloc.free(effective);
+    if (std.mem.eql(u8, root, effective)) return; // no change — keep tree/cache
+    if (self.project_root) |p| self.alloc.free(p);
+    self.project_root = self.alloc.dupe(u8, root) catch return;
+    // The file tree is rooted at the OLD directory: drop it so <leader>e
+    // rebuilds at the new root (it is built lazily, per workspace).
+    if (self.filetree_root) |old| self.freeFiletreeNode(old);
+    self.filetree_root = null;
+    self.filetree_rows.clearRetainingCapacity();
+    self.filetree_active = false;
+    self.filetree_sel = 0;
+    self.filetree_top = 0;
+    self.focus = .buffer;
+    // The picker cache was walked under the OLD root: drop it so the next
+    // <leader>sf re-walks (the cache is global, so it must not leak files
+    // from another workspace's project).
+    for (self.picker_files.items) |f| self.alloc.free(f);
+    self.picker_files.clearRetainingCapacity();
+    if (self.picker_root) |p| self.alloc.free(p);
+    self.picker_root = null;
+}
+
 pub fn toggleFiletree(self: *App) !void {
     if (self.filetree_active) {
         self.filetree_active = false;
@@ -32,29 +113,38 @@ pub fn toggleFiletree(self: *App) !void {
     self.filetree_top = 0;
     self.filetree_sel = 0;
     self.focus = .filetree;
-    if (self.filetree_root == null) {
-        // Build the cwd node; only its first level is scanned — deeper
-        // directories are walked lazily when expanded (snacks style).
+    // Root the tree at the workspace's project root (or the process cwd
+    // when none is set). Rebuild when the stored root differs, so opening a
+    // file in a different directory switches <leader>e to that directory.
+    const root_dir = try self.currentRootDir();
+    if (self.filetree_root == null or !std.mem.eql(u8, self.filetree_root.?.path, root_dir)) {
+        if (self.filetree_root) |old| self.freeFiletreeNode(old);
+        self.filetree_root = null; // never leave a dangling pointer on failure
         const root = try self.alloc.create(TreeNode);
         root.* = .{
             .name = try self.alloc.dupe(u8, ""),
-            .path = try self.alloc.dupe(u8, ""),
+            .path = root_dir, // owned by the node from here on
             .is_dir = true,
-            .expanded = true, // the cwd's own children are visible
+            .expanded = true, // the root's own children are visible
             .children = .empty,
             .parent = null,
         };
-        var dir = try std.Io.Dir.cwd().openDir(self.io, ".", .{ .iterate = true });
+        var dir = try std.Io.Dir.cwd().openDir(self.io, root_dir, .{ .iterate = true });
         defer dir.close(self.io);
         try self.walkTreeLevel(dir, root);
         self.sortTreeChildren(root);
         self.filetree_root = root;
+    } else {
+        self.alloc.free(root_dir); // already rooted here — drop the duplicate
     }
     try self.rebuildFiletreeRows();
     self.filetree_active = true;
 }
 
-/// Walk one directory level into `node.children` (lazy expansion).
+/// Walk one directory level into `node.children` (lazy expansion). Child
+/// paths are ABSOLUTE (node.path + "/" + name, no trailing slash), so a file
+/// opens / a dir expands correctly regardless of which directory the tree is
+/// rooted at.
 pub fn walkTreeLevel(self: *App, dir: std.Io.Dir, node: *TreeNode) !void {
     var it = dir.iterate();
     while (try it.next(self.io)) |entry| {
@@ -62,7 +152,7 @@ pub fn walkTreeLevel(self: *App, dir: std.Io.Dir, node: *TreeNode) !void {
         if (name.len == 0 or name[0] == '.') continue;
         if (std.mem.eql(u8, name, "zig-out") or std.mem.eql(u8, name, "zig-pkg") or std.mem.eql(u8, name, "node_modules")) continue;
         const is_dir = (entry.kind == .directory);
-        const child_path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{ node.path, name, if (is_dir) "/" else "" });
+        const child_path = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ node.path, name });
         errdefer self.alloc.free(child_path);
         const child_name = try self.alloc.dupe(u8, name);
         errdefer self.alloc.free(child_name);
@@ -165,11 +255,19 @@ pub fn locateInFiletree(self: *App) !void {
 }
 
 /// Walk the tree along `path`'s components, expanding any ancestor dir,
-/// and return the node matching the final component (or null).
+/// and return the node matching the final component (or null). `path` is the
+/// buffer's ABSOLUTE path; the tree is rooted at `root.path` (absolute), so
+/// the root prefix is stripped before walking. A relative `path` (should not
+/// happen from locateInFiletree) is walked from the root's children directly.
 pub fn revealPath(self: *App, path: []const u8) !?*TreeNode {
     const root = self.filetree_root orelse return null;
-    var cur_node = root;
+    const prefix = root.path;
     var rest = path;
+    if (std.mem.eql(u8, prefix, path)) return null; // path IS the root itself
+    if (std.mem.startsWith(u8, path, prefix) and path.len > prefix.len and path[prefix.len] == '/') {
+        rest = path[prefix.len + 1 ..];
+    }
+    var cur_node = root;
     while (rest.len > 0) {
         const slash = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
         const comp = rest[0..slash];

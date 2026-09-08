@@ -129,6 +129,7 @@ fn storeFiletree(self: *App, ws: *Workspace) void {
     ws.filetree_sel = self.filetree_sel;
     ws.filetree_top = self.filetree_top;
     ws.focus = self.focus;
+    ws.project_root = self.project_root;
 }
 
 /// Load slot `ws`'s file-tree state into the App fields and reduce the
@@ -142,12 +143,14 @@ fn loadFiletree(self: *App, ws: *Workspace) void {
     self.filetree_sel = ws.filetree_sel;
     self.filetree_top = ws.filetree_top;
     self.focus = ws.focus;
+    self.project_root = ws.project_root;
     ws.filetree_root = null;
     ws.filetree_rows = .empty;
     ws.filetree_active = false;
     ws.filetree_sel = 0;
     ws.filetree_top = 0;
     ws.focus = .buffer;
+    ws.project_root = null;
 }
 
 /// Move `delta` workspaces (wrapping): `[`/`]`.
@@ -240,6 +243,7 @@ pub fn wsNew(self: *App) !void {
     self.filetree_sel = 0;
     self.filetree_top = 0;
     self.focus = .buffer;
+    self.project_root = null;
     self.current_ws = new_idx;
     afterWsActivate(self);
 }
@@ -312,6 +316,8 @@ pub fn wsDelete(self: *App) void {
     self.filetree_sel = 0;
     self.filetree_top = 0;
     self.focus = .buffer;
+    if (self.project_root) |p| self.alloc.free(p);
+    self.project_root = null;
     // …drop its slot (name included)…
     const removed = self.current_ws;
     self.alloc.free(self.workspaces.items[removed].name);
@@ -392,6 +398,7 @@ pub fn wsKillSession(self: *App) !void {
     // the current workspace's file tree (per workspace)
     if (self.filetree_root) |root| self.freeFiletreeNode(root);
     self.filetree_rows.deinit(self.alloc);
+    if (self.project_root) |p| self.alloc.free(p);
     // free every stored slot (current = shell, others = full states)
     for (self.workspaces.items) |*ws| {
         for (ws.buffers.items) |*b| self.deinitBuffer(b);
@@ -401,6 +408,7 @@ pub fn wsKillSession(self: *App) !void {
         // each stored slot's own file tree
         if (ws.filetree_root) |root| self.freeFiletreeNode(root);
         ws.filetree_rows.deinit(self.alloc);
+        if (ws.project_root) |p| self.alloc.free(p);
         self.alloc.free(ws.name);
     }
     self.workspaces.deinit(self.alloc);
@@ -417,6 +425,7 @@ pub fn wsKillSession(self: *App) !void {
     self.filetree_sel = 0;
     self.filetree_top = 0;
     self.focus = .buffer;
+    self.project_root = null;
     fresh_workspaces.appendAssumeCapacity(.{
         .name = main_name.?,
         .buffers = .empty,
