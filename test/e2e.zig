@@ -13290,3 +13290,137 @@ test "workspace: :e refuses a file already open in another workspace" {
 
     try wsQuit(&sess, &grid);
 }
+
+// ================= workspace filetree + dashboard (M5 follow-ups) =================
+
+test "workspace: filetree expansion state is per-workspace" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    // Controlled project tree so the assertion doesn't depend on oz's own
+    // directory contents: proj/{aa,bb}/leaf.txt — expanding `aa` reveals
+    // exactly one new row ("leaf.txt") under it.
+    var root_buf: [128:0]u8 = undefined;
+    const root = try std.fmt.bufPrintZ(&root_buf, "/tmp/oz_ft_{d}", .{linux.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var p_buf: [160:0]u8 = undefined;
+    const p_aa = try std.fmt.bufPrintZ(&p_buf, "{s}/aa", .{root});
+    try std.Io.Dir.cwd().makePath(io, p_aa);
+    var p2_buf: [160:0]u8 = undefined;
+    const p_bb = try std.fmt.bufPrintZ(&p2_buf, "{s}/bb", .{root});
+    try std.Io.Dir.cwd().makePath(io, p_bb);
+    var pf_buf: [176:0]u8 = undefined;
+    const p_leaf = try std.fmt.bufPrintZ(&pf_buf, "{s}/aa/leaf.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, p_leaf, .{});
+        f.close(io);
+    }
+    var sess = try Session.spawnCwd(io, &.{oz_exe_path}, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+
+    // dashboard in main; open the tree and expand `aa` (first row)
+    const dash = try wsWait(&sess, &grid, "终端文本编辑器", 5000);
+    if (!dash) grid.dump();
+    try std.testing.expect(dash);
+    try sess.send(" e"); // SPC e — open the tree
+    const tree = try wsWait(&sess, &grid, "aa", 5000);
+    if (!tree) grid.dump();
+    try std.testing.expect(tree);
+    try sess.send("l"); // expand the selected first dir (aa)
+    const expanded = try wsWait(&sess, &grid, "leaf.txt", 5000);
+    if (!expanded) grid.dump();
+    try std.testing.expect(expanded);
+
+    // new workspace ws2: its tree must NOT inherit main's expansion
+    try sess.send(" \tn");
+    const ws2 = try wsWait(&sess, &grid, "终端文本编辑器", 5000); // ws2 dashboard
+    if (!ws2) grid.dump();
+    try std.testing.expect(ws2);
+    try sess.send(" e");
+    // ws2's tree is fresh: aa is collapsed, so leaf.txt must not appear
+    const leaked = try wsWaitGone(&sess, &grid, "leaf.txt");
+    if (!leaked) grid.dump();
+    try std.testing.expect(leaked);
+    // but aa itself is listed (collapsed)
+    try std.testing.expect(grid.contains("aa"));
+
+    // back to main: main's own expansion is still there
+    try sess.send(" \t[");
+    const back = try wsWait(&sess, &grid, "leaf.txt", 5000);
+    if (!back) grid.dump();
+    try std.testing.expect(back);
+
+    try wsQuit(&sess, &grid);
+}
+
+test "dashboard: opening the first file replaces the [No Name] scratch buffer" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var na_buf: [128:0]u8 = undefined;
+    const na = try wsTempFile(io, &na_buf, "noname.txt", "SCRATCH-REPLACED\n");
+    defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
+
+    // Launch with NO file arg → dashboard (one unnamed scratch buffer)
+    var sess = try Session.spawn(io, &.{oz_exe_path});
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+
+    const dash = try wsWait(&sess, &grid, "终端文本编辑器", 5000);
+    if (!dash) grid.dump();
+    try std.testing.expect(dash);
+
+    // open a file — vim semantics: it replaces the scratch buffer, so no
+    // orphan [No Name] tab/buffer survives
+    try sess.send(":e ");
+    try sess.send(na);
+    try sess.send("\r");
+    const opened = try wsWait(&sess, &grid, "SCRATCH-REPLACED", 5000);
+    if (!opened) grid.dump();
+    try std.testing.expect(opened);
+    // the tab bar (row 0) shows the file, and NO [No Name] anywhere
+    try std.testing.expect(rowContains(&grid, 0, "noname.txt"));
+    const gone = try wsWaitGone(&sess, &grid, "[No Name]");
+    if (!gone) grid.dump();
+    try std.testing.expect(gone);
+
+    try wsQuit(&sess, &grid);
+}
+
+test "dashboard: snacks-style layout and menu keys" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var sess = try Session.spawn(io, &.{oz_exe_path});
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+
+    // logo + subtitle + all four menu entries
+    const dash = try wsWaitBoth(&sess, &grid, "终端文本编辑器", "████");
+    if (!dash) grid.dump();
+    try std.testing.expect(dash);
+    const menu = try wsWaitBoth(&sess, &grid, "Find File", "New File");
+    if (!menu) grid.dump();
+    try std.testing.expect(menu);
+    try std.testing.expect(grid.contains("Recent Files"));
+    try std.testing.expect(grid.contains("Quit"));
+
+    // 'f' opens the fuzzy file picker from the dashboard
+    try sess.send("f");
+    const picker = try wsWait(&sess, &grid, "Files", 5000);
+    if (!picker) grid.dump();
+    try std.testing.expect(picker);
+    try sess.send("\x1b"); // back to the dashboard
+
+    // 'q' quits straight from the dashboard
+    try sess.send("q");
+    const code = try sess.commandAndWaitExit("");
+    try std.testing.expectEqual(@as(u32, 0), code);
+}

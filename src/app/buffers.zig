@@ -155,6 +155,48 @@ pub fn openInBuffer(self: *App, path: []const u8) !void {
         return;
     }
 
+    // vim semantics: opening the first file REPLACES the startup's unnamed
+    // empty buffer instead of appending a second one — `:e foo` in a fresh
+    // editor loads foo into the [No Name] buffer, so no orphan [No Name]
+    // tab lingers after the first open. Same replacement main()'s CLI open
+    // path does (main.zig): swap the piece table + path of the CURRENT
+    // buffer. Only a pristine scratch buffer qualifies (no path, empty,
+    // unmodified); a dirty or non-empty one is real content and the file
+    // opens as a NEW buffer below.
+    if (self.cur().path == null and self.cur().pt.len() == 0 and !self.cur().dirty) {
+        const idx = self.windows.items[self.current_win].buf;
+        const buf = &self.buffers.items[idx];
+        // load BEFORE swapping so a load failure leaves the scratch buffer
+        // intact (deinit-then-assign would strand a dead piece table)
+        const new_pt = try self.loadPieceTable(file, size);
+        const new_path = try self.alloc.dupe(u8, abs);
+        buf.pt.deinit();
+        buf.pt = new_pt;
+        buf.history.deinit();
+        buf.history = buffer.History.init(self.alloc);
+        self.clearSpanCache(buf);
+        buf.path = new_path;
+        try self.addRecent(abs);
+        // the buffer's tab stays in this pane; it is already the current
+        // buffer, so just re-run the per-buffer activation (LSP attach,
+        // inlay/diagnostic invalidation, git status) exactly like switchTo.
+        self.ensureLsp();
+        self.state.mode = .normal;
+        self.visual_anchor = null;
+        self.in_insert = false;
+        self.curCursor().* = 0;
+        self.curViewTop().* = 0;
+        self.invalidateInlayHints();
+        self.clearDiagnostics();
+        self.clearHover();
+        self.nav_list_active = false;
+        self.freeGrepPreview();
+        self.closeCompletion();
+        self.closeGitPreview();
+        self.scheduleGitStatus();
+        return;
+    }
+
     try self.buffers.append(self.alloc, .{
         .pt = try self.loadPieceTable(file, size),
         .history = buffer.History.init(self.alloc),

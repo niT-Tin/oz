@@ -86,7 +86,8 @@ fn afterWsActivate(self: *App) void {
 /// Switch to the workspace at slot `idx` (no-op for out-of-range / the
 /// current one): store the current App fields back into slot[cur]
 /// (overwriting its moved-from shell — no leak), then load slot[idx] into
-/// the App fields and reduce slot[idx] to a shell.
+/// the App fields and reduce slot[idx] to a shell. The file tree travels
+/// with the swap exactly like buffers/windows (per-workspace tree, §2.1).
 pub fn wsSwitchTo(self: *App, idx: usize) void {
     if (idx >= self.workspaces.items.len or idx == self.current_ws) return;
     // 1. transient UI first — their indices point into the outgoing
@@ -99,12 +100,14 @@ pub fn wsSwitchTo(self: *App, idx: usize) void {
     self.workspaces.items[cur].win_root = self.win_root;
     self.workspaces.items[cur].current = self.current;
     self.workspaces.items[cur].current_win = self.current_win;
+    storeFiletree(self, &self.workspaces.items[cur]);
     // 3. load the target slot into the App fields…
     self.buffers = self.workspaces.items[idx].buffers;
     self.windows = self.workspaces.items[idx].windows;
     self.win_root = self.workspaces.items[idx].win_root;
     self.current = self.workspaces.items[idx].current;
     self.current_win = self.workspaces.items[idx].current_win;
+    loadFiletree(self, &self.workspaces.items[idx]);
     // 4. …and reduce slot[idx] to a shell (bitwise copy ≠ move: without
     //    this both the App and the slot would own the same memory)
     self.workspaces.items[idx].buffers = .empty;
@@ -113,6 +116,38 @@ pub fn wsSwitchTo(self: *App, idx: usize) void {
     self.current_ws = idx;
     // 5. global cleanup for the newly active workspace
     afterWsActivate(self);
+}
+
+/// Store the App's live file-tree state into slot `ws` (overwriting its
+/// moved-from shell — the shell's root is null and its rows are empty, so
+/// nothing leaks). The tree is per workspace: each workspace keeps its own
+/// root/rows/selection/scroll, swapped exactly like buffers/windows.
+fn storeFiletree(self: *App, ws: *Workspace) void {
+    ws.filetree_root = self.filetree_root;
+    ws.filetree_rows = self.filetree_rows;
+    ws.filetree_active = self.filetree_active;
+    ws.filetree_sel = self.filetree_sel;
+    ws.filetree_top = self.filetree_top;
+    ws.focus = self.focus;
+}
+
+/// Load slot `ws`'s file-tree state into the App fields and reduce the
+/// slot's to a moved-from shell (root null, rows empty) so deinit/wsDelete
+/// never double-frees. Called by every swap path after the buffers/windows
+/// load, before the slot's other fields are reset.
+fn loadFiletree(self: *App, ws: *Workspace) void {
+    self.filetree_root = ws.filetree_root;
+    self.filetree_rows = ws.filetree_rows;
+    self.filetree_active = ws.filetree_active;
+    self.filetree_sel = ws.filetree_sel;
+    self.filetree_top = ws.filetree_top;
+    self.focus = ws.focus;
+    ws.filetree_root = null;
+    ws.filetree_rows = .empty;
+    ws.filetree_active = false;
+    ws.filetree_sel = 0;
+    ws.filetree_top = 0;
+    ws.focus = .buffer;
 }
 
 /// Move `delta` workspaces (wrapping): `[`/`]`.
@@ -190,11 +225,21 @@ pub fn wsNew(self: *App) !void {
     self.workspaces.items[old].win_root = self.win_root;
     self.workspaces.items[old].current = self.current;
     self.workspaces.items[old].current_win = self.current_win;
+    storeFiletree(self, &self.workspaces.items[old]);
     self.buffers = fresh_bufs;
     self.windows = fresh_wins;
     self.win_root = fresh_root;
     self.current = 0;
     self.current_win = 0;
+    // the fresh workspace starts with NO file tree: a clean root (built
+    // lazily on the first <leader>e), its own selection/scroll — not a
+    // share of the outgoing workspace's tree (the tree is per workspace).
+    self.filetree_root = null;
+    self.filetree_rows = .empty;
+    self.filetree_active = false;
+    self.filetree_sel = 0;
+    self.filetree_top = 0;
+    self.focus = .buffer;
     self.current_ws = new_idx;
     afterWsActivate(self);
 }
@@ -257,6 +302,16 @@ pub fn wsDelete(self: *App) void {
     self.buffers = .empty;
     self.windows = .empty;
     self.win_root = null;
+    // …and its file tree (per workspace: the dying workspace's own root
+    // and rows die with it)
+    if (self.filetree_root) |root| self.freeFiletreeNode(root);
+    self.filetree_rows.deinit(self.alloc);
+    self.filetree_root = null;
+    self.filetree_rows = .empty;
+    self.filetree_active = false;
+    self.filetree_sel = 0;
+    self.filetree_top = 0;
+    self.focus = .buffer;
     // …drop its slot (name included)…
     const removed = self.current_ws;
     self.alloc.free(self.workspaces.items[removed].name);
@@ -269,6 +324,7 @@ pub fn wsDelete(self: *App) void {
     self.win_root = self.workspaces.items[adj].win_root;
     self.current = self.workspaces.items[adj].current;
     self.current_win = self.workspaces.items[adj].current_win;
+    loadFiletree(self, &self.workspaces.items[adj]);
     self.workspaces.items[adj].buffers = .empty;
     self.workspaces.items[adj].windows = .empty;
     self.workspaces.items[adj].win_root = null;
@@ -333,12 +389,18 @@ pub fn wsKillSession(self: *App) !void {
     self.buffers.deinit(self.alloc);
     if (self.win_root) |root| self.freeWinTree(root);
     self.windows.deinit(self.alloc);
+    // the current workspace's file tree (per workspace)
+    if (self.filetree_root) |root| self.freeFiletreeNode(root);
+    self.filetree_rows.deinit(self.alloc);
     // free every stored slot (current = shell, others = full states)
     for (self.workspaces.items) |*ws| {
         for (ws.buffers.items) |*b| self.deinitBuffer(b);
         ws.buffers.deinit(self.alloc);
         if (ws.win_root) |root| self.freeWinTree(root);
         ws.windows.deinit(self.alloc);
+        // each stored slot's own file tree
+        if (ws.filetree_root) |root| self.freeFiletreeNode(root);
+        ws.filetree_rows.deinit(self.alloc);
         self.alloc.free(ws.name);
     }
     self.workspaces.deinit(self.alloc);
@@ -348,6 +410,13 @@ pub fn wsKillSession(self: *App) !void {
     self.win_root = fresh_root;
     self.current = 0;
     self.current_win = 0;
+    // the fresh main starts with a clean file tree (per workspace)
+    self.filetree_root = null;
+    self.filetree_rows = .empty;
+    self.filetree_active = false;
+    self.filetree_sel = 0;
+    self.filetree_top = 0;
+    self.focus = .buffer;
     fresh_workspaces.appendAssumeCapacity(.{
         .name = main_name.?,
         .buffers = .empty,

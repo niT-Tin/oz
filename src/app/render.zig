@@ -1454,6 +1454,147 @@ pub fn hoverLineSegs(self: *App, a: std.mem.Allocator, line: []const u8, cols: u
     }
     return segs.items;
 }
+/// Render the file-tree sidebar into `win`. Extracted from render() so the
+/// dashboard path (which returns before the window loop) can draw the tree too.
+pub fn renderFiletree(self: *App, a: std.mem.Allocator, win: vaxis.Window, height: u32) !void {
+    const ft_col: u32 = 0;
+    const ft_width = filetree_width;
+    const ft_top = self.contentTop(a);
+    const ft_bottom = height - status_row_count; // above the status bar
+    const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg } };
+    // Paint the whole panel with the editor background first — without
+    // this only the border columns and the text-width of each item
+    // got the bg, leaving the interior terminal-default (patchy).
+    const panel = win.child(.{
+        .x_off = @intCast(ft_col),
+        .y_off = @intCast(ft_top),
+        .width = @intCast(ft_width),
+        .height = @intCast(ft_bottom - ft_top),
+    });
+    panel.fill(.{ .style = .{ .bg = .{ .rgb = self.theme.bg } } });
+    // left border column and panel background
+    const left_col = ft_col;
+    const inner_left = ft_col + 1;
+    const inner_w = ft_width -| 1;
+    var brow: u32 = ft_top;
+    while (brow < ft_bottom) : (brow += 1) {
+        const border_seg = [_]vaxis.Segment{.{
+            .text = "│",
+            .style = border_style,
+        }};
+        _ = win.print(&border_seg, .{ .row_offset = @intCast(brow), .col_offset = @intCast(left_col), .wrap = .none });
+    }
+    // title row: " files " with a top border (╭─ files ────╮)
+    {
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        try segs.append(a, .{ .text = "╭─ files ", .style = border_style });
+        // inner_w cells between the borders; "╭─ files " is 9 cells
+        var cx: u32 = 9;
+        while (cx < inner_w) : (cx += 1) {
+            try segs.append(a, .{ .text = "─", .style = border_style });
+        }
+        try segs.append(a, .{ .text = "╮", .style = border_style });
+        _ = win.print(segs.items, .{ .row_offset = @intCast(ft_top), .col_offset = @intCast(left_col), .wrap = .none });
+    }
+    // vim-style scroll window (same semantics as the picker)
+    const ft_len = self.filetree_rows.items.len;
+    // clamp the selection when the tree shrank (collapse) BEFORE the
+    // scroll math, or a stale sel >= len would drive ft_top past the
+    // end of the visible list (out of bounds on the row loop below)
+    if (ft_len == 0) {
+        self.filetree_sel = 0;
+    } else if (self.filetree_sel >= ft_len) {
+        self.filetree_sel = ft_len - 1;
+    }
+    const ft_vis = @min(ft_len, @as(usize, ft_bottom - ft_top - 2));
+    if (ft_len > ft_vis) {
+        if (self.filetree_top + ft_vis > ft_len) self.filetree_top = ft_len - ft_vis;
+        if (self.filetree_sel < self.filetree_top) self.filetree_top = self.filetree_sel;
+        if (self.filetree_sel >= self.filetree_top + ft_vis) self.filetree_top = self.filetree_sel - ft_vis + 1;
+    } else self.filetree_top = 0;
+    const ft_top_i = self.filetree_top;
+    var k: usize = 0;
+    while (k < ft_vis) : (k += 1) {
+        const ri = ft_top_i + k;
+        const frow = self.filetree_rows.items[ri];
+        const node = frow.node;
+        const indent = frow.depth * 2;
+        // content = indent + icon (1 cell) + space + name; a
+        // too-wide name is truncated from the RIGHT with "…" (never
+        // head-truncated). The name budget excludes the right-border
+        // column (the last inner cell), which the border draws over
+        // afterwards, and the gap cell between icon and name — the
+        // gap keeps the glyph from crowding the text (a Nerd Font
+        // icon right against a name reads as a tiny broken glyph).
+        const icon = if (node.is_dir) icons.folder(node.expanded) else icons.forPath(node.path, false);
+        const avail = (inner_w -| 1) -| @as(usize, indent) -| 1 -| 1;
+        var name = node.name;
+        var ellipsized = false;
+        if (name.len > avail) {
+            name = name[0..avail -| 1];
+            ellipsized = true;
+        }
+        const style: vaxis.Style = if (ri == self.filetree_sel)
+            .{ .bg = .{ .rgb = self.theme.bg_sel }, .fg = .{ .rgb = self.theme.fg } }
+        else
+            .{ .bg = .{ .rgb = self.theme.bg }, .fg = .{ .rgb = self.theme.fg } };
+        // Pad to the full inner width: the row background (plain and
+        // selected alike) must span the panel edge to edge. NOTE:
+        // vaxis cells REFERENCE the segment text — it must outlive
+        // vx.render() — so the padding is arena-allocated, never a
+        // stack buffer (a stack row_buf made every row render the
+        // LAST file's name).
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        if (indent > 0) {
+            const pad = try a.alloc(u8, indent);
+            @memset(pad, ' ');
+            try segs.append(a, .{ .text = pad, .style = style });
+        }
+        try segs.append(a, .{ .text = icon.glyph, .style = .{ .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) }, .bg = style.bg } });
+        if (name.len > 0) {
+            try segs.append(a, .{ .text = " ", .style = style });
+            try segs.append(a, .{ .text = name, .style = style });
+        }
+        if (ellipsized) try segs.append(a, .{ .text = "…", .style = style });
+        // count cells: indent spaces + icon (1) + gap (1) + name + "…"
+        const content_len = indent + 2 + name.len + @as(usize, if (ellipsized) 1 else 0);
+        const pads = try a.alloc(u8, inner_w -| @min(content_len, inner_w));
+        @memset(pads, ' ');
+        if (pads.len > 0) try segs.append(a, .{ .text = pads, .style = style });
+        _ = win.print(segs.items, .{ .row_offset = @intCast(ft_top + 1 + k), .col_offset = @intCast(inner_left), .wrap = .none });
+    }
+    // right border column — mirrors the left one so the panel is a
+    // closed box. The title row's "╮" and the bottom row's "╯"
+    // already cap the two corners, so only the interior rows need the
+    // "│" (the item rows' trailing padding is what it covers).
+    {
+        const right_col = ft_col + ft_width - 1;
+        var rrow: u32 = ft_top + 1;
+        const rlast = ft_bottom - 1; // bottom border row
+        while (rrow < rlast) : (rrow += 1) {
+            const border_seg = [_]vaxis.Segment{.{
+                .text = "│",
+                .style = border_style,
+            }};
+            _ = win.print(&border_seg, .{ .row_offset = @intCast(rrow), .col_offset = @intCast(right_col), .wrap = .none });
+        }
+    }
+    // bottom border
+    {
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        try segs.append(a, .{ .text = "╰", .style = border_style });
+        // inner_w - 1 dashes: "╰" takes the left border column and
+        // "╯" must land ON the right border column (ft_width-1) —
+        // inner_w dashes would push it one cell past the edge
+        var cx: u32 = 0;
+        while (cx < inner_w -| 1) : (cx += 1) {
+            try segs.append(a, .{ .text = "─", .style = border_style });
+        }
+        try segs.append(a, .{ .text = "╯", .style = border_style });
+        _ = win.print(segs.items, .{ .row_offset = @intCast(ft_bottom - 1), .col_offset = @intCast(left_col), .wrap = .none });
+    }
+}
+
 pub fn render(self: *App) !void {
     // vaxis cells reference the text slices passed to print, so all text
     // must stay alive until vx.render(); a per-frame arena handles that.
@@ -1619,52 +1760,118 @@ pub fn render(self: *App) !void {
         }
     } else |_| {}
 
-    // dashboard (no file open): title + recent files + hints
+    // dashboard (no file open): snacks.nvim style — a big ASCII logo, a
+    // subtitle, a centered key menu, then the recent-files list (j/k/Enter).
     if (self.isDashboard()) {
-        const title_seg = [_]vaxis.Segment{.{
-            .text = " oz  ",
-            .style = .{ .fg = .{ .rgb = self.theme.accent }, .bold = true },
-        }};
-        _ = win.print(&title_seg, .{ .row_offset = @intCast(self.contentTop(a) + 2), .col_offset = 2, .wrap = .none });
-        // key-hint line, segmented so the bindings get token colors while
-        // the prose stays faint (the text content is unchanged, so e2e
-        // `contains` assertions on the line still hold)
-        const hint_segs = [_]vaxis.Segment{
-            .{ .text = " 终端文本编辑器  —  ", .style = .{ .fg = .{ .rgb = self.theme.fg_faint } } },
-            .{ .text = "j/k", .style = .{ .fg = .{ .rgb = self.theme.keyword } } },
-            .{ .text = " 选择 · ", .style = .{ .fg = .{ .rgb = self.theme.fg_faint } } },
-            .{ .text = "Enter", .style = .{ .fg = .{ .rgb = self.theme.keyword } } },
-            .{ .text = " 打开 · ", .style = .{ .fg = .{ .rgb = self.theme.fg_faint } } },
-            .{ .text = "<leader>", .style = .{ .fg = .{ .rgb = self.theme.accent } } },
-            .{ .text = "sf", .style = .{ .fg = .{ .rgb = self.theme.keyword } } },
-            .{ .text = " 找文件 · ", .style = .{ .fg = .{ .rgb = self.theme.fg_faint } } },
-            .{ .text = ":e", .style = .{ .fg = .{ .rgb = self.theme.accent } } },
-            .{ .text = " 打开 · ", .style = .{ .fg = .{ .rgb = self.theme.fg_faint } } },
-            .{ .text = ":q", .style = .{ .fg = .{ .rgb = self.theme.accent } } },
-            .{ .text = " 退出", .style = .{ .fg = .{ .rgb = self.theme.fg_faint } } },
+        const t = self.theme;
+        const faint: vaxis.Style = .{ .fg = .{ .rgb = t.fg_faint } };
+        const logo_style: vaxis.Style = .{ .fg = .{ .rgb = t.accent }, .bold = true };
+        const key_style: vaxis.Style = .{ .fg = .{ .rgb = t.accent }, .bold = true };
+        const label_style: vaxis.Style = .{ .fg = .{ .rgb = t.fg } };
+        // content area between the sidebar and the right edge
+        const area_col: u32 = self.contentCol();
+        const area_w: u32 = win.width -| area_col;
+        // horizontal centering helper: the column that centers a `width`-cell
+        // block inside the content area (never negative)
+        const centerCol = struct {
+            fn c(col: u32, w: u32, width: u32) u32 {
+                return col + (w -| width) / 2;
+            }
+        }.c;
+
+        // ANSI-Shadow "OZ" logo (FIGlet), 6 rows
+        const logo = [_][]const u8{
+            " ██████╗ ███████╗",
+            "██╔═══██╗╚══███╔╝",
+            "██║   ██║  ███╔╝ ",
+            "██║   ██║ ███╔╝  ",
+            "╚██████╔╝███████╗",
+            " ╚═════╝ ╚══════╝",
         };
-        _ = win.print(&hint_segs, .{ .row_offset = @intCast(self.contentTop(a) + 3), .col_offset = 2, .wrap = .none });
+        var row: u32 = self.contentTop(a) + 1;
+        for (logo) |line| {
+            const lw: u32 = @intCast(line.len);
+            const seg = [_]vaxis.Segment{.{ .text = line, .style = logo_style }};
+            _ = win.print(&seg, .{ .row_offset = @intCast(row), .col_offset = @intCast(centerCol(area_col, area_w, lw)), .wrap = .none });
+            row += 1;
+        }
+        // subtitle (kept verbatim: e2e keys on this string)
+        {
+            const seg = [_]vaxis.Segment{.{ .text = "终端文本编辑器", .style = faint }};
+            // 8 CJK cells wide (each glyph is 2 cells)
+            _ = win.print(&seg, .{ .row_offset = @intCast(row), .col_offset = @intCast(centerCol(area_col, area_w, 14)), .wrap = .none });
+            row += 2;
+        }
+
+        // centered key menu: two columns of "[key] Label"
+        const menu = [_]struct { key: []const u8, label: []const u8 }{
+            .{ .key = "f", .label = "Find File" },
+            .{ .key = "n", .label = "New File" },
+            .{ .key = "r", .label = "Recent Files" },
+            .{ .key = "q", .label = "Quit" },
+        };
+        // each item renders as "[k] Label" (3 + label cells); two per row
+        // with a fixed gap, the pair centered as one block
+        const item_w: u32 = 3 + 12; // "[f] " + widest label ("Recent Files")
+        const pair_w: u32 = item_w * 2 + 4;
+        var mi: usize = 0;
+        while (mi < menu.len) : (mi += 2) {
+            const base_col = centerCol(area_col, area_w, pair_w);
+            var col: u32 = base_col;
+            var k: usize = 0;
+            while (k < 2 and mi + k < menu.len) : (k += 1) {
+                const item = menu[mi + k];
+                const key_seg = [_]vaxis.Segment{
+                    .{ .text = "[", .style = faint },
+                    .{ .text = item.key, .style = key_style },
+                    .{ .text = "] ", .style = faint },
+                };
+                _ = win.print(&key_seg, .{ .row_offset = @intCast(row), .col_offset = @intCast(col), .wrap = .none });
+                const label_seg = [_]vaxis.Segment{.{ .text = item.label, .style = label_style }};
+                _ = win.print(&label_seg, .{ .row_offset = @intCast(row), .col_offset = @intCast(col + 4), .wrap = .none });
+                col += item_w + 4;
+            }
+            row += 1;
+        }
+        row += 1;
+
+        // recent files: a left-aligned block centered as a whole
+        const recents_n = @min(self.recent_files.items.len, 8);
+        // the block's left edge: center a fixed 56-cell column
+        const list_col = centerCol(area_col, area_w, 56);
+        {
+            const seg = [_]vaxis.Segment{.{ .text = "Recent:", .style = faint }};
+            _ = win.print(&seg, .{ .row_offset = @intCast(row), .col_offset = @intCast(list_col), .wrap = .none });
+            row += 1;
+        }
+        const recent_first_row = row; // the row recent item 0 lands on
         var ri: usize = 0;
-        while (ri < @min(self.recent_files.items.len, 8)) : (ri += 1) {
+        while (ri < recents_n) : (ri += 1) {
             const fname = self.recent_files.items[ri];
-            const row: u32 = 5 + @as(u32, @intCast(ri));
             const sel = (ri == self.recent_sel);
-            const bg: vaxis.Color = if (sel) .{ .rgb = self.theme.bg_sel } else .default;
-            const fg: vaxis.Color = if (sel) .default else .{ .rgb = self.theme.function };
+            const bg: vaxis.Color = if (sel) .{ .rgb = t.bg_sel } else .default;
+            const fg: vaxis.Color = if (sel) .default else .{ .rgb = t.function };
             const icon = icons.forPath(fname, false);
             const segs = [_]vaxis.Segment{
-                .{ .text = icon.glyph, .style = .{ .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) }, .bg = bg } },
+                .{ .text = if (sel) "▸ " else "  ", .style = .{ .fg = .{ .rgb = t.accent }, .bg = bg } },
+                .{ .text = icon.glyph, .style = .{ .fg = .{ .rgb = icons.rgbOf(t, icon.color) }, .bg = bg } },
                 .{ .text = " ", .style = .{ .bg = bg } },
                 .{ .text = fname, .style = .{ .fg = fg, .bg = bg } },
             };
-            _ = win.print(&segs, .{ .row_offset = @intCast(self.contentTop(a) + row), .col_offset = 2, .wrap = .none });
+            _ = win.print(&segs, .{ .row_offset = @intCast(row), .col_offset = @intCast(list_col), .wrap = .none });
+            row += 1;
         }
+        // the block cursor sits on the selected recent row
         self.vx.screen.cursor = .{
-            .row = @intCast(self.contentTop(a) + 5 + @as(u32, @intCast(@min(self.recent_sel, 7)))),
-            .col = 2,
+            .row = @intCast(recent_first_row + @as(u32, @intCast(@min(self.recent_sel, 7)))),
+            .col = @intCast(list_col),
         };
         self.vx.screen.cursor_vis = true;
         self.vx.screen.cursor_shape = .block;
+        // the dashboard returns before the window loop, so the file tree
+        // (rendered after that loop) would never draw over it — draw it
+        // here too, or <leader>e on the dashboard shows a stale screen
+        if (self.filetree_active) try renderFiletree(self, a, win, height);
         if (term.supported) try self.drawTerm(a, win);
         try self.vx.render(self.tty.writer());
         return;
@@ -1716,144 +1923,7 @@ pub fn render(self: *App) !void {
     // file tree sidebar (nvim neo-tree style: the panel shares the
     // EDITOR background — Normal bg, not a float — so sidebar and text
     // area read as one surface; only the fg_faint border separates them)
-    if (self.filetree_active) {
-        const ft_col: u32 = 0;
-        const ft_width = filetree_width;
-        const ft_top = self.contentTop(a);
-        const ft_bottom = height - status_row_count; // above the status bar
-        const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg } };
-        // Paint the whole panel with the editor background first — without
-        // this only the border columns and the text-width of each item
-        // got the bg, leaving the interior terminal-default (patchy).
-        const panel = win.child(.{
-            .x_off = @intCast(ft_col),
-            .y_off = @intCast(ft_top),
-            .width = @intCast(ft_width),
-            .height = @intCast(ft_bottom - ft_top),
-        });
-        panel.fill(.{ .style = .{ .bg = .{ .rgb = self.theme.bg } } });
-        // left border column and panel background
-        const left_col = ft_col;
-        const inner_left = ft_col + 1;
-        const inner_w = ft_width -| 1;
-        var brow: u32 = ft_top;
-        while (brow < ft_bottom) : (brow += 1) {
-            const border_seg = [_]vaxis.Segment{.{
-                .text = "│",
-                .style = border_style,
-            }};
-            _ = win.print(&border_seg, .{ .row_offset = @intCast(brow), .col_offset = @intCast(left_col), .wrap = .none });
-        }
-        // title row: " files " with a top border (╭─ files ────╮)
-        {
-            var segs = std.ArrayList(vaxis.Segment).empty;
-            try segs.append(a, .{ .text = "╭─ files ", .style = border_style });
-            // inner_w cells between the borders; "╭─ files " is 9 cells
-            var cx: u32 = 9;
-            while (cx < inner_w) : (cx += 1) {
-                try segs.append(a, .{ .text = "─", .style = border_style });
-            }
-            try segs.append(a, .{ .text = "╮", .style = border_style });
-            _ = win.print(segs.items, .{ .row_offset = @intCast(ft_top), .col_offset = @intCast(left_col), .wrap = .none });
-        }
-        // vim-style scroll window (same semantics as the picker)
-        const ft_len = self.filetree_rows.items.len;
-        // clamp the selection when the tree shrank (collapse) BEFORE the
-        // scroll math, or a stale sel >= len would drive ft_top past the
-        // end of the visible list (out of bounds on the row loop below)
-        if (ft_len == 0) {
-            self.filetree_sel = 0;
-        } else if (self.filetree_sel >= ft_len) {
-            self.filetree_sel = ft_len - 1;
-        }
-        const ft_vis = @min(ft_len, @as(usize, ft_bottom - ft_top - 2));
-        if (ft_len > ft_vis) {
-            if (self.filetree_top + ft_vis > ft_len) self.filetree_top = ft_len - ft_vis;
-            if (self.filetree_sel < self.filetree_top) self.filetree_top = self.filetree_sel;
-            if (self.filetree_sel >= self.filetree_top + ft_vis) self.filetree_top = self.filetree_sel - ft_vis + 1;
-        } else self.filetree_top = 0;
-        const ft_top_i = self.filetree_top;
-        var k: usize = 0;
-        while (k < ft_vis) : (k += 1) {
-            const ri = ft_top_i + k;
-            const frow = self.filetree_rows.items[ri];
-            const node = frow.node;
-            const indent = frow.depth * 2;
-            // content = indent + icon (1 cell) + space + name; a
-            // too-wide name is truncated from the RIGHT with "…" (never
-            // head-truncated). The name budget excludes the right-border
-            // column (the last inner cell), which the border draws over
-            // afterwards, and the gap cell between icon and name — the
-            // gap keeps the glyph from crowding the text (a Nerd Font
-            // icon right against a name reads as a tiny broken glyph).
-            const icon = if (node.is_dir) icons.folder(node.expanded) else icons.forPath(node.path, false);
-            const avail = (inner_w -| 1) -| @as(usize, indent) -| 1 -| 1;
-            var name = node.name;
-            var ellipsized = false;
-            if (name.len > avail) {
-                name = name[0..avail -| 1];
-                ellipsized = true;
-            }
-            const style: vaxis.Style = if (ri == self.filetree_sel)
-                .{ .bg = .{ .rgb = self.theme.bg_sel }, .fg = .{ .rgb = self.theme.fg } }
-            else
-                .{ .bg = .{ .rgb = self.theme.bg }, .fg = .{ .rgb = self.theme.fg } };
-            // Pad to the full inner width: the row background (plain and
-            // selected alike) must span the panel edge to edge. NOTE:
-            // vaxis cells REFERENCE the segment text — it must outlive
-            // vx.render() — so the padding is arena-allocated, never a
-            // stack buffer (a stack row_buf made every row render the
-            // LAST file's name).
-            var segs = std.ArrayList(vaxis.Segment).empty;
-            if (indent > 0) {
-                const pad = try a.alloc(u8, indent);
-                @memset(pad, ' ');
-                try segs.append(a, .{ .text = pad, .style = style });
-            }
-            try segs.append(a, .{ .text = icon.glyph, .style = .{ .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) }, .bg = style.bg } });
-            if (name.len > 0) {
-                try segs.append(a, .{ .text = " ", .style = style });
-                try segs.append(a, .{ .text = name, .style = style });
-            }
-            if (ellipsized) try segs.append(a, .{ .text = "…", .style = style });
-            // count cells: indent spaces + icon (1) + gap (1) + name + "…"
-            const content_len = indent + 2 + name.len + @as(usize, if (ellipsized) 1 else 0);
-            const pads = try a.alloc(u8, inner_w -| @min(content_len, inner_w));
-            @memset(pads, ' ');
-            if (pads.len > 0) try segs.append(a, .{ .text = pads, .style = style });
-            _ = win.print(segs.items, .{ .row_offset = @intCast(ft_top + 1 + k), .col_offset = @intCast(inner_left), .wrap = .none });
-        }
-        // right border column — mirrors the left one so the panel is a
-        // closed box. The title row's "╮" and the bottom row's "╯"
-        // already cap the two corners, so only the interior rows need the
-        // "│" (the item rows' trailing padding is what it covers).
-        {
-            const right_col = ft_col + ft_width - 1;
-            var rrow: u32 = ft_top + 1;
-            const rlast = ft_bottom - 1; // bottom border row
-            while (rrow < rlast) : (rrow += 1) {
-                const border_seg = [_]vaxis.Segment{.{
-                    .text = "│",
-                    .style = border_style,
-                }};
-                _ = win.print(&border_seg, .{ .row_offset = @intCast(rrow), .col_offset = @intCast(right_col), .wrap = .none });
-            }
-        }
-        // bottom border
-        {
-            var segs = std.ArrayList(vaxis.Segment).empty;
-            try segs.append(a, .{ .text = "╰", .style = border_style });
-            // inner_w - 1 dashes: "╰" takes the left border column and
-            // "╯" must land ON the right border column (ft_width-1) —
-            // inner_w dashes would push it one cell past the edge
-            var cx: u32 = 0;
-            while (cx < inner_w -| 1) : (cx += 1) {
-                try segs.append(a, .{ .text = "─", .style = border_style });
-            }
-            try segs.append(a, .{ .text = "╯", .style = border_style });
-            _ = win.print(segs.items, .{ .row_offset = @intCast(ft_bottom - 1), .col_offset = @intCast(left_col), .wrap = .none });
-        }
-    }
+    if (self.filetree_active) try renderFiletree(self, a, win, height);
 
     // multi-cursor word highlights (overlay)
     if (self.mc_active) {

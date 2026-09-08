@@ -152,8 +152,13 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
         if (try self.filetreeKey(key)) return;
     }
 
-    // Dashboard (no file open): j/k/Enter navigate recent files
-    if (self.isDashboard()) {
+    // Dashboard (no file open): j/k/Enter navigate recent files and the
+    // snacks-style menu keys (f/n/r/q) fire — but ONLY while the mode state
+    // machine is idle. A pending leader sequence (SPC TAB n → workspace_new)
+    // must reach Mode.handle first: intercepting its final 'n' as the
+    // dashboard's "New File" key would hijack every leader binding whose
+    // tail is one of f/n/r/q.
+    if (self.isDashboard() and editor.Mode.idle(&self.state)) {
         if (try self.dashboardKey(key)) return;
     }
 

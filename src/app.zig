@@ -220,16 +220,32 @@ pub const App = struct {
         },
     };
 
+    /// Window focus (vim Ctrl-w hjkl): which pane receives hjkl — the
+    /// file-tree sidebar or the buffer. The sidebar keeps rendering either
+    /// way; only the focused pane reacts to keys. Named `Focus` so the
+    /// Workspace struct can swap it alongside the rest of the file-tree
+    /// state (the tree is per workspace; see Workspace).
+    pub const Focus = enum { buffer, filetree };
+
     /// Doom-Emacs-style workspace: one independent buffer set + window
-    /// layout (swap-on-switch model, see docs/workspace-plan.md §2). The
-    /// App fields `buffers`/`windows`/`win_root`/`current`/`current_win`
-    /// ARE the current workspace's live state; the slot at
+    /// layout + file tree (swap-on-switch model, see docs/workspace-plan.md
+    /// §2). The App fields `buffers`/`windows`/`win_root`/`current`/
+    /// `current_win` and the file-tree fields (`filetree_root`/
+    /// `filetree_rows`/`filetree_active`/`filetree_sel`/`filetree_top`/
+    /// `focus`) ARE the current workspace's live state; the slot at
     /// `workspaces.items[current_ws]` is that workspace's moved-from shell
     /// holding only the owned `name`. Every OTHER slot stores a complete
-    /// workspace (its five fields bitwise-copied from the App fields when it
+    /// workspace (its fields bitwise-copied from the App fields when it
     /// was last active). Switching = store the App fields back into
     /// slot[cur], load slot[target] into the App fields and reset the target
     /// slot to a shell — see wsSwitchTo (src/app/workspace.zig).
+    ///
+    /// The file tree is PER WORKSPACE (workspace-plan §2.1: not shared):
+    /// each workspace explores its own expansion/selection state, so the
+    /// tree must travel with the swap exactly like buffers/windows. The
+    /// rows list holds `*TreeNode` pointers into THIS workspace's own root,
+    /// so root and rows are always stored/loaded together — never mixed
+    /// across the swap.
     pub const Workspace = struct {
         name: []u8, // owned
         // non-current slots only; the current slot's are a moved-from shell
@@ -238,6 +254,13 @@ pub const App = struct {
         win_root: ?*WinNode,
         current: usize,
         current_win: usize,
+        // file tree (per workspace; see above)
+        filetree_root: ?*TreeNode = null,
+        filetree_rows: std.ArrayList(FiletreeRow) = .empty,
+        filetree_active: bool = false,
+        filetree_sel: usize = 0,
+        filetree_top: usize = 0,
+        focus: Focus = .buffer,
     };
 
 
@@ -380,10 +403,7 @@ pub const App = struct {
     /// Scroll-window top for the sidebar: the selection moves freely inside
     /// the window; the window scrolls only when it crosses an edge.
     filetree_top: usize = 0,
-    /// Window focus (vim Ctrl-w hjkl): which pane receives hjkl — the
-    /// file-tree sidebar or the buffer. The sidebar keeps rendering either
-    /// way; only the focused pane reacts to keys.
-    focus: enum { buffer, filetree } = .buffer,
+    focus: Focus = .buffer,
     /// Ctrl-w seen, awaiting the window-motion key (h/l/j/k).
     pending_window: bool = false,
     /// Content hash at insert-session entry, so an insert session that ends
@@ -1360,15 +1380,17 @@ pub const App = struct {
         if (self.win_root) |root| self.freeWinTree(root);
         self.windows.deinit(self.alloc);
         // every non-current workspace slot holds a complete state of its
-        // own (buffers/windows/win_root); the current slot is a moved-from
-        // shell whose buffers/windows are already empty. All slots own
-        // their `name`.
+        // own (buffers/windows/win_root plus its own file tree); the
+        // current slot is a moved-from shell whose buffers/windows are
+        // already empty. All slots own their `name`.
         for (self.workspaces.items, 0..) |*ws, i| {
             if (i != self.current_ws) {
                 for (ws.buffers.items) |*buf| self.deinitBuffer(buf);
                 ws.buffers.deinit(self.alloc);
                 if (ws.win_root) |root| self.freeWinTree(root);
                 ws.windows.deinit(self.alloc);
+                if (ws.filetree_root) |root| self.freeFiletreeNode(root);
+                ws.filetree_rows.deinit(self.alloc);
             }
             self.alloc.free(ws.name);
         }
