@@ -19,7 +19,7 @@
 
 - tree-sitter 语法高亮（内置多种语言 grammar）、彩虹括号、indent guide + scope 高亮动画
 - markdown 内联渲染：标题/粗体/斜体/链接/行内代码高亮，fence 代码块按语言上色，光标行之外隐藏标记符号（conceal），checkbox 图标，标题/代码块背景带
-- 多主题（`<leader>sp` 主题选择器，实时预览；选择自动持久化，无需任何配置或环境变量）
+- 多主题（`<leader>sp` 主题选择器，实时预览；选择自动持久化，无需任何配置或环境变量）：kanagawa-wave、kanagawa-dragon、catppuccin（latte / frappe / macchiato / mocha）、tokyonight（night / storm / moon）、everforest、onedark、melange、doom-one、sonokai-shusia、flexoki-dark、flexoki-light
 - 大文件降级：超过 100KB 自动关闭高亮，保证流畅
 
 ![语法高亮、indent guide、inlay hints](docs/screenshots/editor.png)

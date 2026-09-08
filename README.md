@@ -19,7 +19,7 @@ A terminal text editor written in Zig.
 
 - tree-sitter syntax highlighting (multiple bundled grammars), rainbow brackets, indent guides + scope highlight animation
 - Inline markdown rendering: headings/bold/italic/links/code, fence code highlighted in its own language, markup concealed off the cursor line, checkbox icons, heading/code-block background bands
-- Multiple themes (`<leader>sp` theme picker with live preview; the choice persists automatically — no config or env var needed)
+- Multiple themes (`<leader>sp` theme picker with live preview; the choice persists automatically — no config or env var needed): kanagawa-wave, kanagawa-dragon, catppuccin (latte / frappe / macchiato / mocha), tokyonight (night / storm / moon), everforest, onedark, melange, doom-one, sonokai-shusia, flexoki-dark, flexoki-light
 - Large-file degradation: highlighting turns off above 100 KB to stay smooth
 
 ![Syntax highlighting, indent guides, inlay hints](docs/screenshots/editor.png)
