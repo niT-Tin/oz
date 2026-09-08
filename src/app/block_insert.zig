@@ -114,6 +114,9 @@ pub fn applyBlockOp(self: *App, op: editor.KeyEvent.ActionId) !void {
             if (self.yank_buffer) |b| self.alloc.free(b);
             self.yank_buffer = try buf.toOwnedSlice(self.alloc);
             self.yank_linewise = false; // blockwise yank pastes inline (no blockwise put yet)
+            // clipboard=unnamedplus: block yanks reach the system
+            // clipboard too (same as setRegister)
+            self.pushSystemClipboard(self.yank_buffer.?);
             try self.setMsg(try std.fmt.allocPrint(self.alloc, "yanked block {d} bytes", .{self.yank_buffer.?.len}));
         },
         else => {},

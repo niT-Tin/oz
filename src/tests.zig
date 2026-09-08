@@ -35,6 +35,7 @@ pub const lsp_navigation = @import("lsp/navigation.zig");
 pub const icons = @import("icons.zig");
 pub const git = @import("git.zig");
 pub const term = @import("term.zig");
+pub const app_macro = @import("app/macro.zig");
 
 test {
     std.testing.refAllDecls(@This());

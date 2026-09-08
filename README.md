@@ -11,7 +11,8 @@ A terminal text editor written in Zig.
 - Six modes: Normal / Insert / Visual / Visual Line / Visual Block / Command
 - Full motions with counts: hjkl, w/e/b/ge, ^/0/$, gg/G, {/}, %, f/F/t/T, Ctrl-u/d/f/b
 - Text objects, surround, comments, alignment, EasyMotion (s / `<leader>f`), multi-cursor (Ctrl+n)
-- Undo/redo (grouped + branch semantics), register semantics (linewise/charwise yank & put)
+- Undo/redo (grouped + branch semantics), register semantics (linewise/charwise yank & put) with system clipboard interop (OSC52 + pbcopy/wl-copy/xclip/xsel, nvim `clipboard=unnamedplus` style)
+- Keyboard macros: `q{reg}` records (q stops), `@{reg}` replays with count support (`3@a`, `@@`); in Visual mode `@` runs the macro once per selected line (`:'<,'>normal!` semantics); `recording @x` status indicator
 - Splits (:sp/:vs + Ctrl-w family), buffer tab bar, relative line numbers, code folding
 
 **Syntax & UI**

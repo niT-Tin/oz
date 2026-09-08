@@ -96,6 +96,8 @@ pub const entries: []const Entry = &.{
     .{ .keys = "ga", .desc = "按分隔符对齐 ga{motion}{char}", .group = "编辑" },
     .{ .keys = "ys ds cs", .desc = "包围操作：ys{motion}{char} 添加 / ds{char} 删除 / cs{old}{new} 更改", .group = "编辑" },
     .{ .keys = "ctrl-n", .desc = "多光标：选中单词 / 添加下一个匹配", .group = "编辑" },
+    .{ .keys = "q", .desc = "录制宏 q{reg}（a-z），录制中再按 q 停止", .group = "编辑" },
+    .{ .keys = "@", .desc = "回放宏 @{reg}（@@ 重复上次，可带次数 3@a；可视模式逐行回放选区）", .group = "编辑" },
     .{ .keys = "( [ { \" ' `", .desc = "自动配对：输入开括号/引号自动补全闭合符，成对退格删除", .group = "编辑" },
 
     // ---- 模式 ----

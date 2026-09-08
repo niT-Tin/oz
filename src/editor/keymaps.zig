@@ -58,6 +58,8 @@ pub const normal: KeyMap = &.{
     // editing
     act(.{ .codepoint = 'u' }, .undo),
     act(.{ .codepoint = '.' }, .repeat_last),
+    act(.{ .codepoint = 'q' }, .record_macro), // q{reg} — start recording (q stops)
+    act(.{ .codepoint = '@' }, .play_macro), // @{reg} / @@ — replay (takes a count)
     act(.{ .codepoint = 'p' }, .paste),
     act(.{ .codepoint = 'P' }, .paste_before),
     act(.{ .codepoint = 'd' }, .delete),
@@ -141,6 +143,8 @@ test "normal keymap covers the M0 key set" {
     try std.testing.expectEqual(.repeat_find_back, L(normal, .{ .codepoint = ',' }));
     try std.testing.expectEqual(.undo, L(normal, .{ .codepoint = 'u' }));
     try std.testing.expectEqual(.repeat_last, L(normal, .{ .codepoint = '.' }));
+    try std.testing.expectEqual(.record_macro, L(normal, .{ .codepoint = 'q' }));
+    try std.testing.expectEqual(.play_macro, L(normal, .{ .codepoint = '@' }));
     try std.testing.expectEqual(.delete, L(normal, .{ .codepoint = 'd' }));
     try std.testing.expectEqual(.change, L(normal, .{ .codepoint = 'c' }));
     try std.testing.expectEqual(.yank, L(normal, .{ .codepoint = 'y' }));

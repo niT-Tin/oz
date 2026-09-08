@@ -7,6 +7,7 @@ const term = @import("../term.zig");
 
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
+const RecordedKey = app_mod.RecordedKey;
 
 const foldNextLine = App.foldNextLine;
 const foldPrevLine = App.foldPrevLine;
@@ -26,6 +27,32 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
             }
         }
     }
+
+    // Macro recording (vim q): a bare 'q' stops recording — but only as a
+    // top-level normal-mode command. 'q' as a find target, a replace char,
+    // an operator argument, … is recorded like any other key (Mode.idle
+    // reports "no count/operator/prefix pending"). Intercepted BEFORE
+    // capture so the stop key never lands in the register, and before the
+    // state machine (which would read 'q' as "start recording"). During
+    // playback (depth > 0) a replayed 'q' is not user input: it must not
+    // stop an outer recording.
+    if (self.macro_rec != null and self.macro_play_depth == 0 and
+        self.state.mode == .normal and editor.Mode.idle(&self.state) and
+        self.pending_replace == null and !self.pending_window and
+        !self.picker_active and !self.em_active and
+        key.codepoint == 'q' and key.mods.eql(.{}))
+    {
+        try self.macroStopRecord();
+        return;
+    }
+    // Capture every key while recording. The point sits above the
+    // cmdline/picker/insert branches, so cross-mode sequences (insert
+    // text, ':' commands, searches) replay verbatim. Keys fed back by
+    // playback (depth > 0) are NOT re-captured.
+    if (self.macro_rec != null and self.macro_play_depth == 0) {
+        try self.macro_rec_buf.append(self.alloc, RecordedKey.from(key));
+    }
+
     // Command mode first: while the ':' command line is open, Enter/Esc
     // and the rest must reach it — the file-tree and picker overlays
     // would otherwise swallow Enter (opening a file / confirming) and
@@ -478,6 +505,7 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
         .op_motion => |m| try self.execOpMotion(m),
         .surround => |s| try self.execSurround(s),
         .align_lines => |a| try self.execAlign(a),
+        .macro => |m| try self.execMacro(m),
         .command_mode => {
             // ':' pressed: open the command line (Mode already set .command)
             self.cmdline.clearRetainingCapacity();

@@ -11,7 +11,8 @@
 - Normal / Insert / Visual / Visual Line / Visual Block / Command 六种模式
 - 完整移动与 count：hjkl、w/e/b/ge、^/0/$、gg/G、{/}、%、f/F/t/T、Ctrl-u/d/f/b
 - 文本对象、surround、注释、对齐、EasyMotion（s / `<leader>f`）、多光标（Ctrl+n）
-- 撤销/重做（分组 + 分支语义）、寄存器语义（linewise/charwise yank & put）
+- 撤销/重做（分组 + 分支语义）、寄存器语义（linewise/charwise yank & put）并与系统剪贴板互通（OSC52 + pbcopy/wl-copy/xclip/xsel，对齐 nvim `clipboard=unnamedplus`）
+- 键盘宏：`q{reg}` 录制（再按 q 停止）、`@{reg}` 回放（支持 `3@a` 次数与 `@@` 重复），可视模式下 `@` 对选区逐行回放（`:'<,'>normal!` 语义），状态栏显示 `recording @x`
 - 分屏（:sp/:vs + Ctrl-w 系列）、buffer 标签栏、相对行号、代码折叠
 
 **语法与界面**

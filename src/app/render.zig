@@ -2866,6 +2866,13 @@ pub fn render(self: *App) !void {
     };
     const status_col = self.screenCellCol(win, cursor_line, self.curCursor().*);
     const ws_name = self.curWsName();
+    // vim-style macro recording indicator: "recording @x" while q is live
+    // (the transient message set at q{reg} vanishes on the next keystroke;
+    // this one persists for the whole recording).
+    const rec: []const u8 = if (self.macro_rec) |r|
+        try std.fmt.allocPrint(a, "  recording @{c}", .{@as(u8, @intCast('a' + r))})
+    else
+        "";
     // a completion request is in flight (zls can take many seconds on
     // build.zig while its build_runner analyses the project) — show "…"
     // so a slow response isn't mistaken for a dead completion that
@@ -2873,20 +2880,20 @@ pub fn render(self: *App) !void {
     const status = if (self.completion_slot != null)
         try std.fmt.allocPrint(
             a,
-            "[{s}] {s} line {d}/{d} col {d}  …",
-            .{ ws_name, mode_str, cursor_line + 1, line_count, status_col },
+            "[{s}] {s} line {d}/{d} col {d}  …{s}",
+            .{ ws_name, mode_str, cursor_line + 1, line_count, status_col, rec },
         )
     else if (self.msg) |m|
         try std.fmt.allocPrint(
             a,
-            "[{s}] {s} line {d}/{d} col {d}  {s}",
-            .{ ws_name, mode_str, cursor_line + 1, line_count, status_col, m },
+            "[{s}] {s} line {d}/{d} col {d}  {s}{s}",
+            .{ ws_name, mode_str, cursor_line + 1, line_count, status_col, m, rec },
         )
     else
         try std.fmt.allocPrint(
             a,
-            "[{s}] {s} line {d}/{d} col {d}",
-            .{ ws_name, mode_str, cursor_line + 1, line_count, status_col },
+            "[{s}] {s} line {d}/{d} col {d}{s}",
+            .{ ws_name, mode_str, cursor_line + 1, line_count, status_col, rec },
         );
     const status_seg = [_]vaxis.Segment{.{
         .text = status,

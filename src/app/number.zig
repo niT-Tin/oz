@@ -206,14 +206,41 @@ pub fn execSelectionNumberColumn(self: *App, delta: i64) !void {
 /// / at (P) the cursor and leaves the cursor on the last pasted char.
 /// `count` pastes that many times (vim 5p), one undo group.
 pub fn pasteBuffer(self: *App, before: bool, count: u32) !void {
+    // clipboard=unnamedplus: a system clipboard holding DIFFERENT content
+    // than the register (an external copy) wins and is put instead. When
+    // the contents match — the common case right after a yank, which
+    // pushed the same text out — the internal path runs so the register's
+    // linewise flag (and with it p/P's whole-line behavior) survives the
+    // round trip through the clipboard. No native tool (SSH/headless) or
+    // a failed read degrades to the plain register path.
+    if (self.readSystemClipboard()) |sys| {
+        defer self.alloc.free(sys);
+        const same = if (self.yank_buffer) |b| std.mem.eql(u8, b, sys) else false;
+        if (!same) {
+            // external content has no register type: a trailing '\n' means
+            // whole lines were copied, so put linewise (nvim does the
+            // same when the clipboard provider reports no regtype)
+            const linewise = sys[sys.len - 1] == '\n';
+            try self.putRegister(sys, linewise, before, count);
+            return;
+        }
+    }
     const buf = self.yank_buffer orelse {
         try self.setMsg(try self.alloc.dupe(u8, "E353: Nothing in register"));
         return;
     };
-    if (buf.len == 0 and !self.yank_linewise) return;
+    try self.putRegister(buf, self.yank_linewise, before, count);
+}
+
+/// The put itself: paste `buf` with register type `linewise`. Split out
+/// of pasteBuffer so the system-clipboard path reuses it without touching
+/// the unnamed register (a foreign copy must not clobber the register's
+/// own content/type).
+pub fn putRegister(self: *App, buf: []const u8, linewise: bool, before: bool, count: u32) !void {
+    if (buf.len == 0 and !linewise) return;
     const pt = &self.cur().pt;
     const n = @max(count, 1);
-    if (self.yank_linewise) {
+    if (linewise) {
         // normalize: the register must end with '\n' so every copy lands
         // as complete lines (yy on a final line without a trailing
         // newline yanks none; yy on an empty line yanks zero bytes —

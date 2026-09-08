@@ -127,6 +127,10 @@ pub const BlameGhostLabel = @import("app/git.zig").BlameGhostLabel;
 
 pub const TermPane = @import("app/terminal.zig").TermPane;
 
+pub const ClipTool = @import("app/clipboard.zig").ClipTool;
+
+pub const RecordedKey = @import("app/macro.zig").RecordedKey;
+
 pub const App = struct {
     /// One open document. `pt`/`history` own their allocations; the struct is
     /// moved between the list and the active slots (never copied-and-deinit'd).
@@ -307,18 +311,38 @@ pub const App = struct {
 
     // visual selection
     visual_anchor: ?u32 = null,
-    // yank buffer (M0: in-memory; OSC52 system clipboard is a later step)
+    // yank buffer (the unnamed register); every write is mirrored to the
+    // system clipboard — see pushSystemClipboard (clipboard.zig)
     yank_buffer: ?[]u8 = null,
     /// Register type (vim regtype): yy/dd/V{y,d} and linewise operator
     /// motions yank LINEWISE — p/P then put whole lines below/above the
     /// cursor line; charwise yanks (yw, vey, …) paste inline after/at the
     /// cursor. nvim's unnamed register behaves exactly this way.
     yank_linewise: bool = false,
+    /// Native clipboard tool probed once at startup (detectClipboardTool):
+    /// macOS pbcopy/pbpaste; Linux wl-clipboard → xclip → xsel. .none on
+    /// headless/SSH — yanks then reach the system clipboard only through
+    /// OSC52, and p/P fall back to the unnamed register alone.
+    clip_tool: ClipTool = .none,
 
     /// 'r' seen; the next plain key is the replacement character (normal
     /// mode), applied `count` times (vim 3rx). Cleared by execAction when
     /// 'r' is pressed / by handleKey.
     pending_replace: ?ReplacePending = null,
+
+    // keyboard macros (vim q/@, registers a-z)
+    /// Recorded register contents (owned), freed in deinit. vaxis.Key.text
+    /// is transient, so keys are stored as RecordedKey (inline text copy).
+    macros: [26]?[]RecordedKey = .{null} ** 26,
+    /// Register index (0-25) currently recording into, null when idle.
+    macro_rec: ?usize = null,
+    /// Keys captured since recording started; moved into macros[i] on stop.
+    macro_rec_buf: std.ArrayList(RecordedKey) = .empty,
+    /// >0 while handleKey is re-entered by macro playback: suppresses
+    /// capture of the replayed keys and bounds @ recursion (macro.zig).
+    macro_play_depth: u32 = 0,
+    /// Last played register index, for @@.
+    macro_last: ?usize = null,
 
     // easymotion (s / <leader>f) state
     em_active: bool = false,
@@ -1309,6 +1333,10 @@ pub const App = struct {
         // stay at a stable address (heap) — never move it after this.
         self.loop = vaxis.Loop(vaxis.Event).init(init.io, &self.tty, &self.vx);
         try self.loop.installResizeHandler();
+        // Probe the native clipboard tool once (pbcopy / wl-copy / xclip /
+        // xsel); the cached result gates the native half of every register
+        // push and the p/P clipboard read.
+        self.detectClipboardTool();
         return self;
     }
 
@@ -1354,6 +1382,10 @@ pub const App = struct {
         if (self.last_search) |q| self.alloc.free(q);
         self.paste_buf.deinit(self.alloc);
         if (self.yank_buffer) |b| self.alloc.free(b);
+        for (self.macros) |m| {
+            if (m) |keys| self.alloc.free(keys);
+        }
+        self.macro_rec_buf.deinit(self.alloc);
         if (self.em_matches.len > 0) self.alloc.free(self.em_matches);
         self.mc.deinit();
         if (self.filetree_root) |root| self.freeFiletreeNode(root);
@@ -1442,7 +1474,12 @@ pub const App = struct {
     pub const execSelectionNumberDelta = @import("app/number.zig").execSelectionNumberDelta;
     pub const execSelectionNumberColumn = @import("app/number.zig").execSelectionNumberColumn;
     pub const pasteBuffer = @import("app/number.zig").pasteBuffer;
+    pub const putRegister = @import("app/number.zig").putRegister;
     pub const Number = @import("app/number.zig").Number;
+    // ---- clipboard → src/app/clipboard.zig ----
+    pub const detectClipboardTool = @import("app/clipboard.zig").detectClipboardTool;
+    pub const pushSystemClipboard = @import("app/clipboard.zig").pushSystemClipboard;
+    pub const readSystemClipboard = @import("app/clipboard.zig").readSystemClipboard;
     // ---- diagnostics → src/app/diagnostics.zig ----
     pub const gotoDiagnostic = @import("app/diagnostics.zig").gotoDiagnostic;
     pub const showLineDiagnostics = @import("app/diagnostics.zig").showLineDiagnostics;
@@ -1649,6 +1686,9 @@ pub const App = struct {
     // ---- input → src/app/input.zig ----
     pub const handleKey = @import("app/input.zig").handleKey;
     pub const exitInsert = @import("app/input.zig").exitInsert;
+    // ---- macro → src/app/macro.zig ----
+    pub const execMacro = @import("app/macro.zig").execMacro;
+    pub const macroStopRecord = @import("app/macro.zig").macroStopRecord;
     // ---- highlight → src/app/highlight.zig ----
     pub const visibleSpansFor = @import("app/highlight.zig").visibleSpansFor;
     pub const visibleDecorsFor = @import("app/highlight.zig").visibleDecorsFor;

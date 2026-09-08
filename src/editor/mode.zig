@@ -53,6 +53,15 @@ pub const OpMotion = struct {
     text_object: ?TextObject.Kind = null,
 };
 
+/// Payload of Result.macro (q{reg} / [count]@{reg}). `reg` is the register
+/// letter (a-z); '@' means "the last played register" (from @@) — only the
+/// caller knows the playback history, so it resolves the sentinel.
+pub const MacroOp = struct {
+    op: enum { record, play },
+    reg: u8,
+    count: u32 = 1,
+};
+
 /// Snapshot of the last repeatable edit, replayed by '.'.
 pub const Repeat = union(enum) {
     /// Plain action (x, ~, p, …) with its count.
@@ -124,6 +133,11 @@ pub const Result = union(enum) {
         text_object: ?TextObject.Kind = null,
         selection: bool = false, // visual-mode ga: align the selection
     },
+    /// Keyboard macro (vim q/@): start recording into register `reg`, or
+    /// replay register `reg` `count` times. Whether a recording is ALREADY
+    /// running (and hence a bare 'q' means stop) is caller state — the App
+    /// intercepts the stop key before it reaches this state machine.
+    macro: MacroOp,
 };
 
 /// Pending surround sequence state (after y/d/c + 's').
@@ -187,6 +201,9 @@ pub const State = struct {
     pending_bracket: ?u8 = null,
     /// f/F/t/T seen, awaiting the target char (stores the find action)
     pending_find: ?KeyEvent.ActionId = null,
+    /// q/@ seen, awaiting the register char a-z (stores .record_macro /
+    /// .play_macro; like pending_find it holds the arming action)
+    pending_macro: ?KeyEvent.ActionId = null,
     /// operator + 'i'/'a' seen (text-object inner/around), awaiting the target
     /// char (w ( ) [ { < ' " `); stores 'i' or 'a'
     pending_text_object: ?u8 = null,
@@ -530,6 +547,35 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
                 return .pending;
             },
         }
+    }
+
+    // 0f) q/@ register char pending — the next plain key IS the register.
+    if (state.pending_macro) |macro_action| {
+        state.pending_macro = null;
+        if (isEscape(key)) {
+            resetPending(state);
+            return .pending;
+        }
+        if (isPlain(key)) {
+            // @@ replays the last played register (the caller resolves it)
+            if (macro_action == .play_macro and key.codepoint == '@') {
+                const count = countValue(state);
+                resetCount(state);
+                return .{ .macro = .{ .op = .play, .reg = '@', .count = count } };
+            }
+            if (key.codepoint >= 'a' and key.codepoint <= 'z') {
+                const count = countValue(state);
+                resetCount(state);
+                return .{ .macro = .{
+                    .op = if (macro_action == .record_macro) .record else .play,
+                    .reg = @intCast(key.codepoint),
+                    .count = count,
+                } };
+            }
+        }
+        // not a register name: the whole sequence is cancelled, like vim
+        resetPending(state);
+        return .pending;
     }
 
     // 1) f/F/t/T target char pending — the next key IS the target.
@@ -894,6 +940,19 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
             state.pending_leader = true;
             break :blk .pending;
         },
+        // q / @ arm the register-char sequence. Recording is a normal-mode
+        // command only (vim has no visual q); @ IS allowed in visual mode —
+        // the caller replays the register once per selected line (vim
+        // :'<,'>normal! @{reg} semantics).
+        .record_macro => blk: {
+            if (state.mode != .normal) break :blk .pending;
+            state.pending_macro = action;
+            break :blk .pending;
+        },
+        .play_macro => blk: {
+            state.pending_macro = action;
+            break :blk .pending;
+        },
         // never produced by the keymap tables (the fold actions come from
         // the pending_z handler and the workspace actions from the
         // pending_leader_tab handler, never through dispatchNormal)
@@ -934,6 +993,13 @@ fn handleVisual(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         state.mode = .normal;
         resetPending(state);
         return .to_normal;
+    }
+    // A pending char-consuming sequence (f/F/t/T target, q/@ register)
+    // takes the next key RAW — delegate before the visual shortcuts below
+    // swallow it (visual @y/@d/@c/@o must not read as yank/delete/flip;
+    // same for find targets like fd).
+    if (state.pending_find != null or state.pending_macro != null) {
+        return handleNormal(state, key, keymap);
     }
     // visual 'o': flip the selection (swap anchor and cursor)
     if (isPlain(key) and key.codepoint == 'o') {
@@ -1186,6 +1252,22 @@ fn countValue(state: *const State) u32 {
     }
     return if (v == 0) 1 else v;
 }
+/// True when no count/operator/prefix sequence is pending — the next key
+/// starts a fresh command. The macro-recording caller uses this to decide
+/// whether a bare 'q' STOPS recording: vim only treats 'q' as stop when it
+/// is a top-level normal-mode command; 'q' as a find target (fq), a motion
+/// (dq), a count continuation, … is recorded like any other key.
+pub fn idle(state: *const State) bool {
+    return state.pending_op == null and !state.pending_g and !state.pending_z and
+        state.pending_bracket == null and state.pending_find == null and
+        state.pending_text_object == null and !state.pending_leader and
+        !state.pending_leader_s and !state.pending_leader_b and
+        !state.pending_leader_r and !state.pending_leader_l and
+        !state.pending_leader_t and !state.pending_leader_h and
+        !state.pending_leader_tab and state.pending_surround == null and
+        !state.pending_gc and state.pending_align == null and
+        state.pending_macro == null and state.count_len == 0;
+}
 
 fn resetPending(state: *State) void {
     state.pending_op = null;
@@ -1205,6 +1287,7 @@ fn resetPending(state: *State) void {
     state.pending_align = null;
     state.pending_bracket = null;
     state.pending_gc = false;
+    state.pending_macro = null;
     resetCount(state);
 }
 
@@ -1913,4 +1996,120 @@ test "g Ctrl+a: visual → increment_visual, normal → increment; g Ctrl+x → 
     _ = handle(&s5, press('g'), Keymaps.normal);
     const r5 = handle(&s5, press('a'), Keymaps.normal);
     try testing.expectEqual(.pending, tag(r5));
+}
+
+test "macro: q{reg} emits record; invalid register cancels the sequence" {
+    var s = State.init();
+    try testing.expectEqual(.pending, tag(handle(&s, press('q'), Keymaps.normal)));
+    const r = handle(&s, press('a'), Keymaps.normal);
+    try testing.expectEqual(.macro, tag(r));
+    try testing.expect(r.macro.op == .record);
+    try testing.expectEqual(@as(u8, 'a'), r.macro.reg);
+
+    // not a register name: the whole sequence is cancelled, like vim, and
+    // the bad key does not leak through as its own command
+    var s2 = State.init();
+    _ = handle(&s2, press('q'), Keymaps.normal);
+    try testing.expectEqual(.pending, tag(handle(&s2, press('1'), Keymaps.normal)));
+    const r2 = handle(&s2, press('j'), Keymaps.normal);
+    try testing.expectEqual(.motion, tag(r2)); // fresh command, count 1
+    try testing.expectEqual(@as(u32, 1), r2.motion.count);
+
+    // Esc cancels the pending register
+    var s3 = State.init();
+    _ = handle(&s3, press('@'), Keymaps.normal);
+    try testing.expectEqual(.pending, tag(handle(&s3, esc(), Keymaps.normal)));
+    try testing.expectEqual(@as(?KeyEvent.ActionId, null), s3.pending_macro);
+}
+
+test "macro: @a plays, 3@a carries the count, @@ repeats the last register" {
+    var s = State.init();
+    try testing.expectEqual(.pending, tag(handle(&s, press('@'), Keymaps.normal)));
+    const r = handle(&s, press('a'), Keymaps.normal);
+    try testing.expectEqual(.macro, tag(r));
+    try testing.expect(r.macro.op == .play);
+    try testing.expectEqual(@as(u8, 'a'), r.macro.reg);
+    try testing.expectEqual(@as(u32, 1), r.macro.count);
+
+    // count prefix applies to playback (3@b plays b three times)
+    var s2 = State.init();
+    _ = handle(&s2, press('3'), Keymaps.normal);
+    _ = handle(&s2, press('@'), Keymaps.normal);
+    const r2 = handle(&s2, press('b'), Keymaps.normal);
+    try testing.expectEqual(.macro, tag(r2));
+    try testing.expectEqual(@as(u8, 'b'), r2.macro.reg);
+    try testing.expectEqual(@as(u32, 3), r2.macro.count);
+
+    // @@ — the '@' sentinel; the caller resolves the last played register
+    var s3 = State.init();
+    _ = handle(&s3, press('@'), Keymaps.normal);
+    const r3 = handle(&s3, press('@'), Keymaps.normal);
+    try testing.expectEqual(.macro, tag(r3));
+    try testing.expect(r3.macro.op == .play);
+    try testing.expectEqual(@as(u8, '@'), r3.macro.reg);
+
+    // q stays normal-mode only (swallowed in visual), but @ arms the
+    // register sequence in visual too (vim :'<,'>normal! @{reg})
+    var s4 = State.init();
+    s4.mode = .visual_char;
+    try testing.expectEqual(.pending, tag(handle(&s4, press('q'), Keymaps.normal)));
+    try testing.expectEqual(@as(?KeyEvent.ActionId, null), s4.pending_macro);
+    try testing.expectEqual(.pending, tag(handle(&s4, press('@'), Keymaps.normal)));
+    const r4 = handle(&s4, press('q'), Keymaps.normal);
+    try testing.expectEqual(.macro, tag(r4));
+    try testing.expect(r4.macro.op == .play);
+    try testing.expectEqual(@as(u8, 'q'), r4.macro.reg);
+
+    // visual-line mode: count prefix still applies (3@a → 3 plays per line)
+    var s5 = State.init();
+    s5.mode = .visual_line;
+    _ = handle(&s5, press('3'), Keymaps.normal);
+    _ = handle(&s5, press('@'), Keymaps.normal);
+    const r5 = handle(&s5, press('a'), Keymaps.normal);
+    try testing.expectEqual(.macro, tag(r5));
+    try testing.expect(r5.macro.op == .play);
+    try testing.expectEqual(@as(u8, 'a'), r5.macro.reg);
+    try testing.expectEqual(@as(u32, 3), r5.macro.count);
+
+    // invalid register in visual cancels the sequence, selection intact
+    var s6 = State.init();
+    s6.mode = .visual_char;
+    _ = handle(&s6, press('@'), Keymaps.normal);
+    try testing.expectEqual(.pending, tag(handle(&s6, press('1'), Keymaps.normal)));
+    try testing.expectEqual(Mode.visual_char, s6.mode);
+
+    // register letters colliding with the visual shortcuts (y/d/c/o) still
+    // reach the pending register slot, not the yank/delete/flip handlers
+    var s7 = State.init();
+    s7.mode = .visual_line;
+    _ = handle(&s7, press('@'), Keymaps.normal);
+    const r7 = handle(&s7, press('y'), Keymaps.normal);
+    try testing.expectEqual(.macro, tag(r7));
+    try testing.expect(r7.macro.op == .play);
+    try testing.expectEqual(@as(u8, 'y'), r7.macro.reg);
+
+    // same precedence for find targets: visual fd finds 'd', not deletes
+    var s8 = State.init();
+    s8.mode = .visual_char;
+    _ = handle(&s8, press('f'), Keymaps.normal);
+    const r8 = handle(&s8, press('d'), Keymaps.normal);
+    try testing.expectEqual(.motion, tag(r8));
+    try testing.expectEqual(Motion.Motion.find, r8.motion.motion);
+    try testing.expectEqual(@as(u8, 'd'), r8.motion.args.ch);
+}
+
+test "macro: q as an operator argument does not arm the register sequence" {
+    // dq — q is not a motion: the pending operator is cancelled (vim), and
+    // no register char is awaited afterwards
+    var s = State.init();
+    _ = handle(&s, press('d'), Keymaps.normal);
+    try testing.expectEqual(.pending, tag(handle(&s, press('q'), Keymaps.normal)));
+    try testing.expectEqual(@as(?KeyEvent.ActionId, null), s.pending_op);
+    try testing.expectEqual(@as(?KeyEvent.ActionId, null), s.pending_macro);
+    // idle() reports the clean state, so the NEXT q would be a top-level
+    // command (the recording stop key)
+    try testing.expect(idle(&s));
+    // while a sequence is pending (f awaiting its target), not idle
+    _ = handle(&s, press('f'), Keymaps.normal);
+    try testing.expect(!idle(&s));
 }
