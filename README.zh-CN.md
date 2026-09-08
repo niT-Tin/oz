@@ -20,6 +20,7 @@
 - tree-sitter 语法高亮（内置多种语言 grammar）、彩虹括号、indent guide + scope 高亮动画
 - markdown 内联渲染：标题/粗体/斜体/链接/行内代码高亮，fence 代码块按语言上色，光标行之外隐藏标记符号（conceal），checkbox 图标，标题/代码块背景带
 - 多主题（`<leader>sp` 主题选择器，实时预览；选择自动持久化，无需任何配置或环境变量）：kanagawa-wave、kanagawa-dragon、catppuccin（latte / frappe / macchiato / mocha）、tokyonight（night / storm / moon）、everforest、onedark、melange、doom-one、sonokai-shusia、flexoki-dark、flexoki-light
+- 长行软换行：超过窗口宽度的行折行显示（grapheme/CJK 宽度感知）
 - 大文件降级：超过 100KB 自动关闭高亮，保证流畅
 
 ![语法高亮、indent guide、inlay hints](docs/screenshots/editor.png)
@@ -37,7 +38,7 @@
 **导航与查找**
 
 - 模糊查找 picker：文件（`<leader>sf`）、grep（`<leader>st`）、buffer（`<leader>sb`）、最近文件（`<leader>sr`）、快捷键（`<leader>sk`）
-- 文件树（`<leader>e` 开关，`<leader>E` 定位当前文件）
+- 文件树（`<leader>e` 开关，`<leader>E` 定位当前文件），根目录跟随当前 workspace 的项目目录
 - buffer 内搜索（`/`、`?`、n/N）
 
 ![模糊查找文件（leader sf）](docs/screenshots/picker.png)
@@ -45,6 +46,17 @@
 ![grep 搜索（leader st，带实时预览）](docs/screenshots/grep.png)
 
 ![文件树](docs/screenshots/filetree.png)
+
+**Workspace（Doom Emacs 风格）**
+
+- swap-on-switch 工作区：`SPC TAB n` 新建 / `.` 选择切换 / `r` 重命名 / `d` 删除 / `x` 清空 session / `[` `]` 前后切换
+- 每个 workspace 独立的 buffer、窗口布局与文件树；打开已在其他 workspace 打开的文件会被拒绝（防止双重编辑）
+- 文件树与模糊查找按各自 workspace 的项目根目录搜索（打开文件的最近 `.git` 目录，无 git 则为文件所在目录）
+- 状态栏显示当前 workspace 名；新 workspace 显示 snacks 风格 dashboard
+
+![Workspace picker（SPC TAB .）](docs/screenshots/workspace.png)
+
+![启动 dashboard](docs/screenshots/dashboard.png)
 
 **Git**
 

@@ -20,6 +20,7 @@ A terminal text editor written in Zig.
 - tree-sitter syntax highlighting (multiple bundled grammars), rainbow brackets, indent guides + scope highlight animation
 - Inline markdown rendering: headings/bold/italic/links/code, fence code highlighted in its own language, markup concealed off the cursor line, checkbox icons, heading/code-block background bands
 - Multiple themes (`<leader>sp` theme picker with live preview; the choice persists automatically — no config or env var needed): kanagawa-wave, kanagawa-dragon, catppuccin (latte / frappe / macchiato / mocha), tokyonight (night / storm / moon), everforest, onedark, melange, doom-one, sonokai-shusia, flexoki-dark, flexoki-light
+- Soft-wrap: lines wider than the window wrap onto continuation rows (grapheme/CJK-width aware)
 - Large-file degradation: highlighting turns off above 100 KB to stay smooth
 
 ![Syntax highlighting, indent guides, inlay hints](docs/screenshots/editor.png)
@@ -37,7 +38,7 @@ A terminal text editor written in Zig.
 **Navigation & search**
 
 - Fuzzy pickers: files (`<leader>sf`), grep (`<leader>st`), buffers (`<leader>sb`), recent files (`<leader>sr`), keymaps (`<leader>sk`)
-- File tree (`<leader>e` toggle, `<leader>E` locate current file)
+- File tree (`<leader>e` toggle, `<leader>E` locate current file) rooted at the workspace's project directory
 - In-buffer search (`/`, `?`, n/N)
 
 ![Fuzzy file picker (leader sf)](docs/screenshots/picker.png)
@@ -45,6 +46,17 @@ A terminal text editor written in Zig.
 ![Grep search (leader st, with live preview)](docs/screenshots/grep.png)
 
 ![File tree](docs/screenshots/filetree.png)
+
+**Workspaces (Doom-Emacs style)**
+
+- Swap-on-switch workspaces: `SPC TAB n` new / `.` pick / `r` rename / `d` delete / `x` clear session / `[` `]` prev · next
+- Independent buffers, window layout and file tree per workspace; opening a file already open in another workspace is refused (no double-edit)
+- The file tree and fuzzy file picker follow each workspace's project root — the opened file's nearest `.git` directory, else its own directory
+- Status bar shows the current workspace name; a snacks-style dashboard greets a fresh workspace
+
+![Workspace picker (SPC TAB .)](docs/screenshots/workspace.png)
+
+![Startup dashboard](docs/screenshots/dashboard.png)
 
 **Git**
 
