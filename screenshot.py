@@ -119,11 +119,9 @@ class Session:
             pass
 
 
-def render(screen, out_path):
+def frame(screen, font_size=FONT_SIZE):
     cols, rows = screen.columns, screen.lines
-    font = ImageFont.truetype(FONT, FONT_SIZE)
-    # monospace advance + font line height
-    tmp = Image.new("RGB", (8, 8)); d = ImageDraw.Draw(tmp)
+    font = ImageFont.truetype(FONT, font_size)
     cw = int(round(font.getlength("M"))) or 1
     asc, desc = font.getmetrics()
     ch = asc + desc
@@ -145,8 +143,59 @@ def render(screen, out_path):
                 d.rectangle([px, py, px + cw - 1, py + ch - 1], fill=bg)
             if chch != " ":
                 d.text((px, py), chch, font=font, fill=fg)
+    return img
+
+
+def render(screen, out_path):
+    img = frame(screen)
     img.save(out_path)
     print("wrote", out_path, img.size)
+
+
+def record_gif(out_path, font_size=18):
+    """Drive a short feature tour and save it as an animated GIF."""
+    seed_recent()
+    frames = []
+    s = Session(30, 100, ["build.zig"])
+    s.wait_for("build.zig", 6.0)
+    s.pump(0.5)
+    frames.append(frame(s.screen, font_size))      # 1: highlighted Zig code
+
+    s.send(" e")                                   # 2: file tree
+    s.wait_for(" files ", 4.0)
+    s.pump(0.3)
+    frames.append(frame(s.screen, font_size))
+
+    s.send(" e")                                   # 3: fuzzy file picker
+    s.pump(0.2)
+    s.send(" sf")
+    s.wait_for("Files", 4.0)
+    s.pump(0.3)
+    frames.append(frame(s.screen, font_size))
+    s.send("main")                                 # 4: filter → src/main.zig
+    s.wait_for("src/main.zig", 4.0)
+    s.pump(0.3)
+    frames.append(frame(s.screen, font_size))
+
+    s.send("\x1b")                                 # 5: new workspace → dashboard
+    s.pump(0.2)
+    s.send(" \tn")
+    s.wait_for("Find File", 4.0)
+    s.pump(0.3)
+    frames.append(frame(s.screen, font_size))
+
+    s.send(" \t[")                                 # 6: back to main + workspace picker
+    s.wait_for("build.zig", 4.0)
+    s.pump(0.2)
+    s.send(" \t.")
+    s.wait_for("Workspaces", 4.0)
+    s.pump(0.3)
+    frames.append(frame(s.screen, font_size))
+    s.close()
+
+    frames[0].save(out_path, save_all=True, append_images=frames[1:],
+                   duration=900, loop=0, optimize=True)
+    print("wrote", out_path, frames[0].size, "frames:", len(frames))
 
 
 def seed_recent():
@@ -193,3 +242,5 @@ if __name__ == "__main__":
         shot_dashboard()
     if which in ("all", "workspace"):
         shot_workspace_picker()
+    if which in ("all", "gif"):
+        record_gif("docs/screenshots/demo.gif")
