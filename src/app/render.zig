@@ -1998,6 +1998,17 @@ pub fn render(self: *App) !void {
                     // buffer keeps the pane that last showed it
                     var owner: usize = self.buffers.items[tab_i].last_win;
                     if (owner >= self.windows.items.len) owner = self.windows.items.len - 1;
+                    // last_win is only a hint for buffers hidden from every
+                    // pane: a buffer that IS displayed belongs to a pane that
+                    // displays it. Without this, a buffer visible only in the
+                    // right pane kept its tab on the left if last_win still
+                    // pointed there (the split tab-bar race).
+                    for (self.windows.items, 0..) |w, wi| {
+                        if (w.buf == tab_i) {
+                            owner = wi;
+                            break;
+                        }
+                    }
                     if (self.windows.items[self.current_win].buf == tab_i) owner = self.current_win;
                     if (owner != lr.win) continue;
                     const buf = &self.buffers.items[tab_i];

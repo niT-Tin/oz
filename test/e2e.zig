@@ -1307,7 +1307,12 @@ test ":theme lists themes, switches colors, rejects unknown names" {
     }
 
     // isolated HOME: :theme switches are persisted now, keep them out of the shared /tmp
-    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{"HOME=/tmp/oz_e2e_th"});
+    // unique HOME: :theme persists the choice on exit, so a fixed path
+    // poisons the next run's "default is kanagawa" assertion
+    var home_buf: [96]u8 = undefined;
+    const home = try std.fmt.bufPrint(&home_buf, "HOME=/tmp/oz_e2e_th_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{home});
     defer sess.close();
     defer killPid(sess.pid);
 
@@ -1399,7 +1404,10 @@ test "theme picker: <leader>sp lists themes, previews live, Esc restores" {
     }
 
     // isolated HOME: Enter persists the theme now, keep it out of the shared /tmp
-    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{"HOME=/tmp/oz_e2e_thp"});
+    var home_buf: [96]u8 = undefined;
+    const home = try std.fmt.bufPrint(&home_buf, "HOME=/tmp/oz_e2e_thp_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{home});
     defer sess.close();
     defer killPid(sess.pid);
 
@@ -1437,7 +1445,20 @@ test "theme picker: <leader>sp lists themes, previews live, Esc restores" {
     try std.testing.expect(grid.contains("kanagawa-wave"));
     try std.testing.expect(grid.contains("catppuccin-macchiato"));
     try std.testing.expect(grid.contains("tokyonight-moon"));
-    // default theme is kanagawa: the whole screen (row 23 included) is its bg
+    // default theme is kanagawa: the whole screen (row 23 included) is its bg.
+    // The picker's first frame may still have the old status-bar cells on
+    // row 23; wait for the full repaint before asserting.
+    waited = 0;
+    while (!grid.rowAllBg(23, packRgb(0x1F, 0x1F, 0x28))) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
     try std.testing.expect(grid.rowAllBg(23, packRgb(0x1F, 0x1F, 0x28)));
 
     // ↓ (ESC[B) previews catppuccin-macchiato LIVE: the entire UI repaints
