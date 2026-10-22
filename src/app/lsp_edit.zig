@@ -462,7 +462,7 @@ pub fn collectCompletionWords(self: *App, keep_sel: bool) !void {
     const limit = @min(max_words, pairs.items.len);
     try self.completion_words.ensureTotalCapacity(self.alloc, limit);
     errdefer {
-        for (self.completion_words.items) |it| self.alloc.free(it.text);
+        for (self.completion_words.items) |*it| it.deinit(self.alloc);
         self.completion_words.clearRetainingCapacity();
     }
     var k: usize = 0;
@@ -533,7 +533,7 @@ pub fn acceptCompletion(self: *App) !void {
 /// its capacity for the next trigger).
 pub fn closeCompletion(self: *App) void {
     if (!self.completion_active and self.completion_words.items.len == 0) return;
-    for (self.completion_words.items) |it| self.alloc.free(it.text);
+    for (self.completion_words.items) |*it| it.deinit(self.alloc);
     self.completion_words.clearRetainingCapacity();
     self.completion_active = false;
     self.completion_sel = 0;

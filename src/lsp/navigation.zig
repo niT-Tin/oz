@@ -247,7 +247,35 @@ pub fn parseSignature(alloc: std.mem.Allocator, result: std.json.Value) !?[]u8 {
 pub const CompletionItem = struct {
     text: []u8, // owned
     kind: u8,
+    /// CompletionItem.detail (owned, optional): a one-line signature hint
+    /// shown in the documentation pane when the server supplies no docs.
+    detail: ?[]u8 = null,
+    /// CompletionItem.documentation (owned, optional): markdown (or plain
+    /// text) rendered by the completion documentation popup.
+    doc: ?[]u8 = null,
+
+    pub fn deinit(self: *CompletionItem, alloc: std.mem.Allocator) void {
+        alloc.free(self.text);
+        if (self.detail) |d| alloc.free(d);
+        if (self.doc) |d| alloc.free(d);
+    }
 };
+
+/// Duplicate a CompletionItem.documentation value: either a plain string or
+/// a MarkupContent object `{kind, value}`. Returns null for absent/other
+/// shapes.
+fn dupeDocumentation(alloc: std.mem.Allocator, v: std.json.Value) !?[]u8 {
+    switch (v) {
+        .string => |s| return try alloc.dupe(u8, s),
+        .object => |o| {
+            if (o.get("value")) |val| {
+                if (val == .string) return try alloc.dupe(u8, val.string);
+            }
+        },
+        else => {},
+    }
+    return null;
+}
 
 /// Parse a textDocument/completion response (CompletionList | CompletionItem[])
 /// into owned items appended to `out`. The label (or insertText /
@@ -312,9 +340,19 @@ pub fn parseCompletionItems(alloc: std.mem.Allocator, result: std.json.Value, ou
                 if (n >= 1 and n <= 255) kind = @intCast(n);
             }
         }
+        var detail: ?[]u8 = null;
+        if (item.object.get("detail")) |d| {
+            if (d == .string) detail = try alloc.dupe(u8, d.string);
+        }
+        errdefer if (detail) |d| alloc.free(d);
+        var doc: ?[]u8 = null;
+        if (item.object.get("documentation")) |d| {
+            doc = try dupeDocumentation(alloc, d);
+        }
+        errdefer if (doc) |d| alloc.free(d);
         const copy = try alloc.dupe(u8, t);
         errdefer alloc.free(copy);
-        try out.append(alloc, .{ .text = copy, .kind = kind });
+        try out.append(alloc, .{ .text = copy, .kind = kind, .detail = detail, .doc = doc });
     }
 }
 
@@ -451,7 +489,7 @@ test "navigation: completion items from CompletionList and raw array" {
     defer p1.deinit();
     var out1 = std.ArrayList(CompletionItem).empty;
     defer {
-        for (out1.items) |it| alloc.free(it.text);
+        for (out1.items) |*it| it.deinit(alloc);
         out1.deinit(alloc);
     }
     try parseCompletionItems(alloc, p1.value, &out1);
@@ -467,13 +505,31 @@ test "navigation: completion items from CompletionList and raw array" {
     defer p2.deinit();
     var out2 = std.ArrayList(CompletionItem).empty;
     defer {
-        for (out2.items) |it| alloc.free(it.text);
+        for (out2.items) |*it| it.deinit(alloc);
         out2.deinit(alloc);
     }
     try parseCompletionItems(alloc, p2.value, &out2);
     try std.testing.expectEqual(@as(usize, 2), out2.items.len);
     try std.testing.expectEqualStrings("x", out2.items[0].text);
     try std.testing.expectEqualStrings("y", out2.items[1].text);
+}
+
+test "navigation: completion detail and documentation are parsed" {
+    const alloc = std.testing.allocator;
+    const j = "{\"items\":[{\"label\":\"alpha\",\"kind\":3,\"detail\":\"fn() void\",\"documentation\":{\"kind\":\"markdown\",\"value\":\"**docs**\"}},{\"label\":\"beta\",\"documentation\":\"plain docs\"}]}";
+    var p = try std.json.parseFromSlice(std.json.Value, alloc, j, .{ .allocate = .alloc_always });
+    defer p.deinit();
+    var out = std.ArrayList(CompletionItem).empty;
+    defer {
+        for (out.items) |*it| it.deinit(alloc);
+        out.deinit(alloc);
+    }
+    try parseCompletionItems(alloc, p.value, &out);
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try std.testing.expectEqualStrings("fn() void", out.items[0].detail.?);
+    try std.testing.expectEqualStrings("**docs**", out.items[0].doc.?);
+    try std.testing.expect(out.items[1].detail == null);
+    try std.testing.expectEqualStrings("plain docs", out.items[1].doc.?);
 }
 
 test "navigation: snippet completion items degrade to their label" {
@@ -486,7 +542,7 @@ test "navigation: snippet completion items degrade to their label" {
     defer p.deinit();
     var out = std.ArrayList(CompletionItem).empty;
     defer {
-        for (out.items) |it| alloc.free(it.text);
+        for (out.items) |*it| it.deinit(alloc);
         out.deinit(alloc);
     }
     try parseCompletionItems(alloc, p.value, &out);

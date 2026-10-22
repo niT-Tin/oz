@@ -402,6 +402,38 @@ pub fn charWidthAt(bytes: []const u8, i: usize) u8 {
     return charWidth(decodeAt(bytes, i).cp);
 }
 
+/// Total terminal cell width of `bytes` (the sum of `charWidth` over its
+/// codepoints). Popup layout must use this, never `bytes.len`: UTF-8 bytes
+/// and terminal cells differ for every non-ASCII glyph (e.g. "→" is 3 bytes
+/// but one cell, "中" is 3 bytes but two), and a byte-counted pad moves a
+/// floating window's right border off its top/bottom corners.
+pub fn displayWidth(bytes: []const u8) u32 {
+    var w: u32 = 0;
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const d = decodeAt(bytes, i);
+        w += charWidth(d.cp);
+        i += d.len;
+    }
+    return w;
+}
+
+/// Largest prefix of `bytes` that fits in `max_cells` terminal cells.
+/// Never splits a UTF-8 sequence; zero-width codepoints (combining marks)
+/// stay attached to the base character even when the cell budget is full.
+pub fn truncateWidth(bytes: []const u8, max_cells: u32) []const u8 {
+    var w: u32 = 0;
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const d = decodeAt(bytes, i);
+        const cw = charWidth(d.cp);
+        if (cw > 0 and w + cw > max_cells) break;
+        w += cw;
+        i += d.len;
+    }
+    return bytes[0..i];
+}
+
 /// Start offset of the character containing byte position `p` (0 <= p < len).
 /// Robust for invalid bytes: a run of continuation bytes that is not consumed
 /// by a valid leading byte is treated as one character.
@@ -698,4 +730,36 @@ test "utf8 count and total width" {
         cols += charWidthAt(s, i);
     }
     try std.testing.expectEqual(@as(usize, 3), cols);
+}
+
+test "utf8 displayWidth: bytes != cells" {
+    // The hover-window regression: "→" is 3 UTF-8 bytes but ONE terminal
+    // cell. Padding by bytes made the row 2 cells short and moved the right
+    // border left of the top/bottom corners (the notch in the screenshot).
+    try std.testing.expectEqual(@as(u32, 6), displayWidth("→ void"));
+    try std.testing.expectEqual(@as(u32, 8), @as(u32, @intCast("→ void".len)));
+    // CJK is 3 bytes / 2 cells per glyph.
+    try std.testing.expectEqual(@as(u32, 4), displayWidth("日本"));
+    try std.testing.expectEqual(@as(u32, 6), @as(u32, @intCast("日本".len)));
+    // Combining marks occupy no cells; ASCII stays 1:1.
+    try std.testing.expectEqual(@as(u32, 1), displayWidth("e\xCC\x81"));
+    try std.testing.expectEqual(@as(u32, 0), displayWidth(""));
+    try std.testing.expectEqual(@as(u32, 5), displayWidth("hello"));
+}
+
+test "utf8 truncateWidth never splits a glyph" {
+    // widest prefix that fits: "→" (1 cell) fits, the space does not.
+    try std.testing.expectEqualStrings("→", truncateWidth("→ void", 1));
+    try std.testing.expectEqualStrings("→ ", truncateWidth("→ void", 2));
+    // 3 cells fit one 2-cell CJK glyph, not two.
+    try std.testing.expectEqualStrings("日", truncateWidth("日本", 3));
+    try std.testing.expectEqualStrings("日本", truncateWidth("日本", 4));
+    try std.testing.expectEqualStrings("", truncateWidth("日本", 1));
+    // A zero-width combining mark stays attached even at the budget edge.
+    try std.testing.expectEqualStrings("e\xCC\x81", truncateWidth("e\xCC\x81x", 1));
+    // ASCII mix.
+    try std.testing.expectEqualStrings("a→", truncateWidth("a→b", 2));
+    try std.testing.expectEqualStrings("abc", truncateWidth("abc", 99));
+    // Invalid bytes decode to width 1, so they are never silently dropped.
+    try std.testing.expectEqualStrings("\xFF", truncateWidth("\xFF", 1));
 }

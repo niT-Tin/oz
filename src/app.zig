@@ -1461,7 +1461,7 @@ pub const App = struct {
         if (self.outline_slot) |*v| json_rpc.freeValue(self.alloc, v);
         for (self.inlay_hints.items) |*h| self.alloc.free(h.label);
         self.inlay_hints.deinit(self.alloc);
-        for (self.completion_words.items) |it| self.alloc.free(it.text);
+        for (self.completion_words.items) |*it| it.deinit(self.alloc);
         self.completion_words.deinit(self.alloc);
         // M3a git state
         if (self.git_job) |job| {
@@ -1763,8 +1763,10 @@ pub const App = struct {
     pub const blankContextLevels = @import("app/render.zig").blankContextLevels;
     pub const renderWindowLines = @import("app/render.zig").renderWindowLines;
     pub const hoverFenceSegs = @import("app/render.zig").hoverFenceSegs;
+    pub const hoverBlankSegs = @import("app/render.zig").hoverBlankSegs;
     pub const hoverCodeLineSegs = @import("app/render.zig").hoverCodeLineSegs;
     pub const hoverLineSegs = @import("app/render.zig").hoverLineSegs;
+    pub const drawRichPopup = @import("app/render.zig").drawRichPopup;
     pub const render = @import("app/render.zig").render;
     pub const blameHoldActive = @import("app/render.zig").blameHoldActive;
     pub const gitHoldActive = @import("app/render.zig").gitHoldActive;

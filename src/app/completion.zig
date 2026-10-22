@@ -168,7 +168,7 @@ pub fn processCompletion(self: *App) bool {
         self.completion_waiting_enter = false;
         return true;
     }
-    for (self.completion_words.items) |it| self.alloc.free(it.text);
+    for (self.completion_words.items) |*it| it.deinit(self.alloc);
     self.completion_words.clearRetainingCapacity();
     lsp_nav.parseCompletionItems(self.alloc, result, &self.completion_words) catch {};
     // Client-side filter: servers like zls return the FULL candidate set
@@ -188,7 +188,7 @@ pub fn processCompletion(self: *App) bool {
                     self.completion_words.items[write] = it.*;
                     write += 1;
                 } else {
-                    self.alloc.free(it.text);
+                    it.deinit(self.alloc);
                 }
             }
             self.completion_words.shrinkRetainingCapacity(write);

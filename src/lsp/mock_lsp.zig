@@ -66,6 +66,11 @@ pub const Script = enum {
     /// document (a stale copy yields stale labels). Script `hello` keeps
     /// its fixed line-0 ": i32" hint for the older tests.
     inlay_range,
+    /// Rich popup fixture: hover markdown with a heading, an arrow glyph
+    /// ("→", 3 bytes / 1 cell), a fenced zig block and CJK text; completion
+    /// items with detail + markdown documentation and a wide label. Used by
+    /// the popup-geometry/markdown e2e tests.
+    rich,
 
     pub fn parse(name: []const u8) ?Script {
         if (std.mem.eql(u8, name, "hello")) return .hello;
@@ -73,6 +78,7 @@ pub const Script = enum {
         if (std.mem.eql(u8, name, "clear_on_change")) return .clear_on_change;
         if (std.mem.eql(u8, name, "jk_sync")) return .jk_sync;
         if (std.mem.eql(u8, name, "inlay_range")) return .inlay_range;
+        if (std.mem.eql(u8, name, "rich")) return .rich;
         return null;
     }
 };
@@ -197,9 +203,9 @@ pub fn handleMessage(
                 }
             }
             const prefix = completionPrefix(a, state, uri, line, col);
-            try pushResponse(alloc, &out, id, try buildCompletionResult(a, prefix));
+            try pushResponse(alloc, &out, id, try buildCompletionResult(a, prefix, script));
         } else if (std.mem.eql(u8, method, "textDocument/hover")) {
-            try pushResponse(alloc, &out, id, try buildHoverResult(a));
+            try pushResponse(alloc, &out, id, try buildHoverResult(a, script));
         } else if (std.mem.eql(u8, method, "textDocument/definition") or
             std.mem.eql(u8, method, "textDocument/declaration"))
         {
@@ -499,11 +505,20 @@ fn completionPrefix(a: std.mem.Allocator, state: *State, uri: ?[]const u8, line:
     return a.dupe(u8, "") catch return "";
 }
 
-fn buildCompletionResult(a: std.mem.Allocator, prefix: []const u8) !std.json.Value {
+fn buildCompletionResult(a: std.mem.Allocator, prefix: []const u8, script: Script) !std.json.Value {
     var item = try std.json.ObjectMap.init(a, &.{}, &.{});
     const item_label = try std.fmt.allocPrint(a, "mockItem{s}", .{prefix});
     try item.put(a, "label", .{ .string = item_label });
     try item.put(a, "kind", .{ .integer = 6 }); // CompletionItemKind.Function
+    if (script == .rich) {
+        // Renderable documentation: bold prose + a fenced zig block whose
+        // body must get real syntax colors in the completion docs pane.
+        try item.put(a, "detail", .{ .string = "fn(e: i32) void" });
+        var docs = try std.json.ObjectMap.init(a, &.{}, &.{});
+        try docs.put(a, "kind", .{ .string = "markdown" });
+        try docs.put(a, "value", .{ .string = "**mock docs**\n```zig\nconst q = 7;\n```" });
+        try item.put(a, "documentation", .{ .object = docs });
+    }
     var item2 = try std.json.ObjectMap.init(a, &.{}, &.{});
     const item2_label = try std.fmt.allocPrint(a, "mockAlpha{s}", .{prefix});
     try item2.put(a, "label", .{ .string = item2_label });
@@ -521,14 +536,33 @@ fn buildCompletionResult(a: std.mem.Allocator, prefix: []const u8) !std.json.Val
     try items.append(.{ .object = item });
     try items.append(.{ .object = item2 });
     try items.append(.{ .object = item3 });
+    if (script == .rich) {
+        // A label whose UTF-8 bytes (9) exceed its terminal cells (6):
+        // byte-counted row widths shifted the menu's right border.
+        var wide = try std.json.ObjectMap.init(a, &.{}, &.{});
+        const wide_label = try std.fmt.allocPrint(a, "日本語{s}", .{prefix});
+        try wide.put(a, "label", .{ .string = wide_label });
+        try wide.put(a, "kind", .{ .integer = 6 });
+        try items.append(.{ .object = wide });
+    }
     var result = try std.json.ObjectMap.init(a, &.{}, &.{});
     try result.put(a, "items", .{ .array = items });
     return .{ .object = result };
 }
 
-fn buildHoverResult(a: std.mem.Allocator) !std.json.Value {
+fn buildHoverResult(a: std.mem.Allocator, script: Script) !std.json.Value {
     var contents = try std.json.ObjectMap.init(a, &.{}, &.{});
     try contents.put(a, "kind", .{ .string = "markdown" });
+    if (script == .rich) {
+        // Six lines (the hover cap): heading (markers concealed), an arrow
+        // (byte/cell mismatch), a fenced zig block (syntax colors), and CJK
+        // at EOL (3 bytes / 2 cells). Any byte-counted row pad misaligns
+        // the right border of exactly these rows.
+        try contents.put(a, "value", .{ .string = "## mock hover\n→ `second line`\n```zig\nconst b = 2;\n```\nhttp://example.com third line 第三行" });
+        var result = try std.json.ObjectMap.init(a, &.{}, &.{});
+        try result.put(a, "contents", .{ .object = contents });
+        return .{ .object = result };
+    }
     // Multi-line hover: exercises the floating window's row wrapping and
     // its token styling — markdown inline tokens (bold, code span, URL) on
     // the prose lines and a ```zig fenced block whose content must get real
@@ -941,6 +975,9 @@ fn printUsage(io: std.Io) void {
         \\           document starts with 'j', else an empty list — detects
         \\           a didChange for a 'j' insertion whose jk-exit removal
         \\           was never synced.
+        \\  rich    hover/completion fixture for popup geometry: markdown
+        \\           heading + arrow + fenced code + CJK hover; completion
+        \\           items with detail/docs and a wide label.
         \\
         \\options:
         \\  --verbose  log received/sent messages to stderr

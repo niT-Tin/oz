@@ -368,6 +368,29 @@ fn packRgb(r: u8, g: u8, b: u8) u32 {
 /// mode and OSC sequences; ASCII only — good enough for M0 assertions.
 /// Diff-rendered streams only emit changed cells, so raw byte matching is
 /// unreliable; the grid is not.
+/// Terminal cell width of a decoded codepoint, for the screen
+/// reconstruction. Grid slots are cells, not codepoints: a CJK glyph is one
+/// UTF-8 character but occupies TWO columns, so advancing one column per
+/// codepoint shifted every border to the right of it three cells left for
+/// "第三行". Nerd Font icons live in the Private Use Area and stay width 1.
+fn glyphCells(cp: u21) usize {
+    if (cp >= 0x1100 and cp <= 0x115F) return 2;
+    if (cp >= 0x2E80 and cp <= 0x303E) return 2;
+    if (cp >= 0x3041 and cp <= 0x33FF) return 2;
+    if (cp >= 0x3400 and cp <= 0x4DBF) return 2;
+    if (cp >= 0x4E00 and cp <= 0x9FFF) return 2;
+    if (cp >= 0xA000 and cp <= 0xA4CF) return 2;
+    if (cp >= 0xAC00 and cp <= 0xD7A3) return 2;
+    if (cp >= 0xF900 and cp <= 0xFAFF) return 2;
+    if (cp >= 0xFE10 and cp <= 0xFE19) return 2;
+    if (cp >= 0xFE30 and cp <= 0xFE6B) return 2;
+    if (cp >= 0xFF00 and cp <= 0xFF60) return 2;
+    if (cp >= 0xFFE0 and cp <= 0xFFE6) return 2;
+    if (cp >= 0x1F000 and cp <= 0x1FAFF) return 2;
+    if (cp >= 0x20000 and cp <= 0x3FFFD) return 2;
+    return 1;
+}
+
 const Grid = struct {
     rows: usize = 24,
     cols: usize = 80,
@@ -536,14 +559,37 @@ const Grid = struct {
                         self.stashPending(bytes[i..]);
                         return;
                     }
+                    // Decode the codepoint so wide glyphs advance two
+                    // cells (the second cell is left blank, as a terminal
+                    // does: the glyph covers both columns).
+                    var cp: u21 = b;
+                    if (ln == 2) {
+                        cp = (@as(u21, b & 0x1F) << 6) | @as(u21, bytes[i + 1] & 0x3F);
+                    } else if (ln == 3) {
+                        cp = (@as(u21, b & 0x0F) << 12) |
+                            (@as(u21, bytes[i + 1] & 0x3F) << 6) |
+                            @as(u21, bytes[i + 2] & 0x3F);
+                    } else if (ln == 4) {
+                        cp = (@as(u21, b & 0x07) << 18) |
+                            (@as(u21, bytes[i + 1] & 0x3F) << 12) |
+                            (@as(u21, bytes[i + 2] & 0x3F) << 6) |
+                            @as(u21, bytes[i + 3] & 0x3F);
+                    }
+                    const cells = glyphCells(cp);
                     if (self.row < self.rows and self.col < self.cols) {
                         const slot = self.cell(self.row, self.col);
                         @memset(slot, 0);
                         @memcpy(slot[0..ln], bytes[i .. i + ln]);
                         self.fg_buf[self.row * self.cols + self.col] = self.fg;
                         self.bg_buf[self.row * self.cols + self.col] = self.bg;
+                        var extra: usize = 1;
+                        while (extra < cells and self.col + extra < self.cols) : (extra += 1) {
+                            @memset(self.cell(self.row, self.col + extra), 0);
+                            self.fg_buf[self.row * self.cols + self.col + extra] = self.fg;
+                            self.bg_buf[self.row * self.cols + self.col + extra] = self.bg;
+                        }
                     }
-                    self.col += 1;
+                    self.col += cells;
                     i += ln;
                 },
             }
@@ -781,6 +827,95 @@ fn nthPipeCol(grid: *Grid, r: usize, n: usize) ?usize {
         }
     }
     return null;
+}
+
+/// Column of the one-cell `glyph` on row `r`, starting at `from`, or null.
+/// Compares whole CELLS (a Nerd Font/CJK glyph is up to 4 UTF-8 bytes but
+/// occupies exactly one grid slot), which is what border alignment needs.
+fn glyphCol(grid: *Grid, r: usize, glyph: []const u8, from: usize) ?usize {
+    var c = from;
+    while (c < grid.cols) : (c += 1) {
+        const slot = grid.buf[(r * grid.cols + c) * 4 ..][0..4];
+        var k: usize = 0;
+        while (k < 4 and slot[k] != 0) : (k += 1) {}
+        if (std.mem.eql(u8, slot[0..k], glyph)) return c;
+    }
+    return null;
+}
+
+fn lastGlyphCol(grid: *Grid, r: usize, glyph: []const u8) ?usize {
+    var c: usize = grid.cols;
+    while (c > 0) {
+        c -= 1;
+        const slot = grid.buf[(r * grid.cols + c) * 4 ..][0..4];
+        var k: usize = 0;
+        while (k < 4 and slot[k] != 0) : (k += 1) {}
+        if (std.mem.eql(u8, slot[0..k], glyph)) return c;
+    }
+    return null;
+}
+
+/// Assert that the rounded box whose top border is on `top` is rectangular:
+/// every content row's left/right │ sit exactly under ╭/╮, and the bottom
+/// ╰/╯ closes at the same columns. Returns the bottom-border row.
+/// This is the screenshot regression: a row whose padding is counted in
+/// BYTES ("→" = 3 bytes / 1 cell) ends short, so its right │ drifts left of
+/// the corner and the panel gets a notch.
+fn assertPopupBox(grid: *Grid, top: usize) !usize {
+    const left = glyphCol(grid, top, "╭", 0) orelse return error.TestUnexpectedResult;
+    const right = glyphCol(grid, top, "╮", 0) orelse return error.TestUnexpectedResult;
+    var r = top + 1;
+    while (r < grid.rows) : (r += 1) {
+        if (glyphCol(grid, r, "╯", 0)) |bottom| {
+            try std.testing.expectEqual(right, bottom);
+            return r;
+        }
+        const l = glyphCol(grid, r, "│", 0) orelse return error.TestUnexpectedResult;
+        const rr = lastGlyphCol(grid, r, "│") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(left, l);
+        try std.testing.expectEqual(right, rr);
+    }
+    return error.TestUnexpectedResult;
+}
+
+/// Feed the pty until `needle` disappears from the screen (or timeout).
+fn gridWaitGone(sess: *Session, grid: *Grid, needle: []const u8, timeout_ms: i32) !void {
+    var waited: i32 = 0;
+    while (grid.contains(needle)) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= timeout_ms) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (grid.contains(needle)) {
+        std.debug.print("'{s}' still visible:\n", .{needle});
+        grid.dump();
+    }
+    try std.testing.expect(!grid.contains(needle));
+}
+
+/// Feed the pty into `grid` until `needle` is on screen (or timeout).
+fn gridWaitFor(sess: *Session, grid: *Grid, needle: []const u8, timeout_ms: i32) !void {
+    var waited: i32 = 0;
+    while (!grid.contains(needle)) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= timeout_ms) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!grid.contains(needle)) {
+        std.debug.print("missing '{s}':\n", .{needle});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains(needle));
 }
 
 test "smoke: spawn oz, render a file, quit cleanly" {
@@ -13513,4 +13648,135 @@ test "dashboard: snacks-style layout and menu keys" {
     try sess.send("q");
     const code = try sess.commandAndWaitExit("");
     try std.testing.expectEqual(@as(u32, 0), code);
+}
+
+test "popup geometry: hover/completion borders align; markdown rendered" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}popup.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const a = 1;\nconst b = 2;\nmo");
+    }
+
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{
+        "OZ_LSP_CMD=zig-out/bin/mock_lsp",
+        "OZ_MOCK_SCRIPT=rich",
+    });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+
+    // --- hover: heading + arrow + fenced code + CJK, six rows ---
+    try sess.send("K");
+    try gridWaitFor(&sess, &grid, "mock hover", 8000);
+    try gridWaitFor(&sess, &grid, "第三行", 8000);
+
+    {
+        var top: ?usize = null;
+        var r: usize = 0;
+        while (r < grid.rows) : (r += 1) {
+            if (glyphCol(&grid, r, "╭", 0) != null and glyphCol(&grid, r, "╮", 0) != null) {
+                top = r;
+                break;
+            }
+        }
+        const t = top orelse {
+            std.debug.print("hover box missing:\n", .{});
+            grid.dump();
+            return error.TestUnexpectedResult;
+        };
+        _ = try assertPopupBox(&grid, t);
+        // Solid bg_float panel: every cell between the borders, including
+        // the padding after short/wide rows.
+        const hline_fg: u32 = packRgb(0x22, 0x32, 0x49);
+        const left = glyphCol(&grid, t, "╭", 0).?;
+        const right = glyphCol(&grid, t, "╮", 0).?;
+        r = t + 1;
+        while (r <= t + 6) : (r += 1) {
+            var c = left;
+            while (c <= right) : (c += 1) {
+                if (grid.bg_buf[r * grid.cols + c] != hline_fg) {
+                    std.debug.print("hover row {d} cell {d} bg={x} (want {x})\n", .{ r, c, grid.bg_buf[r * grid.cols + c], hline_fg });
+                    grid.dump();
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+    }
+
+    // Markdown is RENDERED: heading/fence/backtick markers concealed, and
+    // the fenced zig body keeps its tree-sitter colors.
+    try std.testing.expect(!grid.contains("## mock hover"));
+    try std.testing.expect(!grid.contains("```"));
+    try std.testing.expect(!grid.contains("`second line`"));
+    {
+        var code_row: ?usize = null;
+        var r: usize = 0;
+        while (r < grid.rows) : (r += 1) {
+            if (std.mem.indexOf(u8, grid.rowText(r), "const b = 2;") != null) {
+                code_row = r;
+                break;
+            }
+        }
+        const cr = code_row orelse {
+            std.debug.print("hover fenced code row missing:\n", .{});
+            grid.dump();
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(rowContainsFg(&grid, cr, "const", packRgb(0x95, 0x7F, 0xB8)));
+        try std.testing.expect(rowContainsFg(&grid, cr, "2", packRgb(0xD2, 0x7E, 0x99)));
+    }
+
+    // --- completion menu + markdown documentation pane ---
+    try sess.send("jjA\x0e");
+    try gridWaitFor(&sess, &grid, "mockItem", 8000);
+    try gridWaitFor(&sess, &grid, "日本語", 8000);
+    try gridWaitFor(&sess, &grid, "mock docs", 8000);
+    try gridWaitFor(&sess, &grid, "const q = 7;", 8000);
+
+    {
+        var boxes: usize = 0;
+        var r: usize = 0;
+        while (r < grid.rows) : (r += 1) {
+            if (glyphCol(&grid, r, "╭", 0) != null and glyphCol(&grid, r, "╮", 0) != null) {
+                const bottom = try assertPopupBox(&grid, r);
+                boxes += 1;
+                r = bottom;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 2), boxes);
+    }
+    {
+        var code_row: ?usize = null;
+        var r: usize = 0;
+        while (r < grid.rows) : (r += 1) {
+            if (std.mem.indexOf(u8, grid.rowText(r), "const q = 7;") != null) {
+                code_row = r;
+                break;
+            }
+        }
+        const cr = code_row orelse return error.TestUnexpectedResult;
+        try std.testing.expect(rowContainsFg(&grid, cr, "const", packRgb(0x95, 0x7F, 0xB8)));
+    }
+    try std.testing.expect(!grid.contains("**mock docs**"));
+    try std.testing.expect(!grid.contains("```"));
+
+    // The first Esc closes the completion menu/docs, the second leaves
+    // insert mode; only then does ":qa" reach the cmdline. Send them as
+    // separate key events (a single write can be read as an alt sequence).
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "mock docs", 3000);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
 }

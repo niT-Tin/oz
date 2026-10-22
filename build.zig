@@ -66,6 +66,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const strip = b.option(bool, "strip", "Strip debug info from the installed binaries") orelse false;
+    // `-Dtest-filter=NAME` narrows `zig build test` / `zig build e2e` to
+    // tests whose name contains NAME (Zig's runner has no runtime filter).
+    const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this string");
+    const test_filters: []const []const u8 = if (test_filter) |f| &.{f} else &.{};
     // re-apply the vendored vaxis terminal-widget fixes before compiling
     applyVaxisPatch(b);
 
@@ -134,6 +138,7 @@ pub fn build(b: *std.Build) void {
 
     // ---- L1 + L2 unit tests ----
     const tests = b.addTest(.{
+        .filters = test_filters,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/tests.zig"),
             .target = target,
@@ -152,6 +157,7 @@ pub fn build(b: *std.Build) void {
 
     // ---- L3 end-to-end tests (pty) ----
     const e2e = b.addTest(.{
+        .filters = test_filters,
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/e2e.zig"),
             .target = target,
