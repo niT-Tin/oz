@@ -35,13 +35,13 @@
         // Terminal abstraction used by flow: screen grid, kitty keyboard,
         // mouse, resize. Pure Zig, statically linked.
         .vaxis = .{
-            .path = "vendor/vaxis",
+            .path = ".vendor/vaxis",
         },
         // tree-sitter C runtime + 90 grammars + the treez Zig binding
         // (neurocyte fork, same source flow-syntax consumes). Cached locally,
         // no network at build time.
         .tree_sitter = .{
-            .path = "vendor/tree-sitter",
+            .path = ".vendor/tree-sitter",
         },
     },
     // Specifies the set of files and directories that are included in this package.

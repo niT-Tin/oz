@@ -77,7 +77,7 @@
 需要 Zig 0.17.0：
 
 ```sh
-./scripts/bootstrap-deps.sh                # 首次拉取 tree-sitter（下载 ~50MB，解压 ~1GB）
+./.scripts/bootstrap-deps.sh                # 首次拉取 tree-sitter（下载 ~50MB，解压 ~1GB）
 zig build                                    # 开发构建
 zig build -Doptimize=ReleaseFast -Dstrip     # 发布构建（日常用这个）
 zig build test                               # 单元测试

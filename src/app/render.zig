@@ -1317,7 +1317,10 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
     // Rows past the last buffer line: vim's "~" filler (NonText), so an
     // explicit scroll past EOF (a pinned zz/zt/zb view) is legible instead
     // of looking like the file simply ends higher up.
-    const tilde = [_]vaxis.Segment{.{ .text = "~", .style = .{ .fg = .{ .rgb = self.theme.fg_dim } } }};
+    const tilde = [_]vaxis.Segment{.{ .text = "~", .style = .{
+        .fg = .{ .rgb = self.theme.fg_dim },
+        .bg = .{ .rgb = self.theme.bg },
+    } }};
     while (row < rect.row + rect.height) : (row += 1) {
         _ = win.print(&tilde, .{ .row_offset = @intCast(row), .col_offset = @intCast(rect.col), .wrap = .none });
     }
@@ -2495,7 +2498,13 @@ pub fn render(self: *App) !void {
                     try segs.append(a, .{ .text = " ", .style = sep_pad_style });
                     try segs.append(a, .{ .text = "│", .style = sep_style });
                     try segs.append(a, .{ .text = " ", .style = sep_pad_style });
-                    try self.renderGrepPreviewRow(&segs, a, win, k, list_rows, preview_w, r.path, r.line);
+                    // The preview column is one file (the selected result),
+                    // not the result of whatever row k happens to be: pass
+                    // the selected path/line for every row. Using r.line
+                    // here shifted/blanked the content rows whenever the
+                    // selection was not row 0.
+                    const selr = self.grep_results.items[@min(self.picker_sel, self.grep_results.items.len - 1)];
+                    try self.renderGrepPreviewRow(&segs, a, win, k, list_rows, preview_w, selr.path, selr.line);
                 }
             } else if (self.picker_mode == .themes) {
                 // color-swatch row: 3 cells painted with the theme's OWN

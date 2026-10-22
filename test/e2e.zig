@@ -528,14 +528,34 @@ const Grid = struct {
                     continue;
                 }
                 if (bytes[i + 1] == ']') {
-                    // OSC: skip until BEL or ST; a split OSC stashes the tail
+                    // OSC: skip until BEL (0x07) or ST (ESC \). vaxis emits
+                    // OSC 52 clipboard writes with the ST terminator, not
+                    // BEL; only looking for BEL swallowed the rest of the
+                    // stream (Screen.feed stashed it as "pending"), freezing
+                    // every test after a yank/delete.
                     var k = i + 2;
-                    while (k < bytes.len and bytes[k] != 0x07) k += 1;
-                    if (k >= bytes.len) {
+                    var found = false;
+                    while (k < bytes.len) {
+                        if (bytes[k] == 0x07) {
+                            k += 1;
+                            found = true;
+                            break;
+                        }
+                        if (bytes[k] == 0x1b) {
+                            if (k + 1 >= bytes.len) break; // split ST
+                            if (bytes[k + 1] == '\\') {
+                                k += 2;
+                                found = true;
+                                break;
+                            }
+                        }
+                        k += 1;
+                    }
+                    if (!found) {
                         self.stashPending(bytes[i..]);
                         return;
                     }
-                    i = k + 1;
+                    i = k;
                     continue;
                 }
                 i += 2; // ESC + single char (e.g. 7/8 save-restore)
@@ -1324,7 +1344,9 @@ test ":theme lists themes, switches colors, rejects unknown names" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(grid.contains("themes: kanagawa-wave"));
-    try std.testing.expect(grid.contains("tokyonight"));
+    // The list is longer than the 80-col status line; assert an early
+    // entry that is actually visible (tokyonight starts past column 80).
+    try std.testing.expect(grid.contains("catppuccin-macchiato"));
 
     // switch to tokyonight-moon: bg becomes 0x1E2032
     try sess.send(":theme tokyonight-moon\r");
@@ -2872,7 +2894,7 @@ test "grep picker: fixed-size panel with split syntax preview" {
     // "pub fn" hits build.zig first ("pub fn build" — the only "pub fn" in
     // build.zig; small file → preview available). Assert the file, not the
     // line: build.zig's line numbers drift with the vendored-patch block.
-    try sess.send("pub fn");
+    try sess.send("pub fn build");
     waited = 0;
     while (!grid.contains("❯ pub fn") or !grid.contains("build.zig:")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
@@ -2893,6 +2915,19 @@ test "grep picker: fixed-size panel with split syntax preview" {
     // colors "const" with the keyword color (kanagawa oniViolet). The left
     // list never renders "const" keyword-colored (fzy only colors the query
     // chars "pub fn"), so this proves the PREVIEW column is highlighted.
+    // the preview file read is async: wait for its content, not just the
+    // header, before scanning for the highlighted line
+    waited = 0;
+    while (!grid.contains("const target")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
     var preview_row: ?usize = null;
     r = hint_row.? + 1;
     while (r < grid.rows) : (r += 1) {
@@ -3000,10 +3035,10 @@ test "file tree: <leader>e shows files, Enter opens one" {
     try std.testing.expect(std.mem.indexOf(u8, grid.rowText(2), "docs") != null);
 
     // Enter on the selected directory (docs) expands it — its only child
-    // (excali) appears, and the folder glyph flips open
+    // (workspace-plan) appears, and the folder glyph flips open
     try sess.send("\r");
     waited = 0;
-    while (!grid.contains("excal")) {
+    while (!grid.contains("workspace-plan")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -3013,13 +3048,13 @@ test "file tree: <leader>e shows files, Enter opens one" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(grid.contains("excal"));
+    try std.testing.expect(grid.contains("workspace-plan"));
     try std.testing.expect(grid.contains("\u{f07c}")); // open folder glyph
 
     // Enter again folds docs — its child disappears
     try sess.send("\r");
     waited = 0;
-    while (grid.contains("excal")) {
+    while (grid.contains("workspace-plan")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -3029,13 +3064,14 @@ test "file tree: <leader>e shows files, Enter opens one" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(!grid.contains("excal"));
+    try std.testing.expect(!grid.contains("workspace-plan"));
 
     // j × 3: docs → src → test → DESIGN.md (first-level file); Enter opens
     // it but KEEPS the tree open — only <space>e (toggle) or Esc close it;
     // focus returns to the buffer so typing edits the file.
-    // dirs-first first level: docs, patches, src, test — 4 × j to DESIGN.md
-    try sess.send("jjjjj\r");
+    // dirs-first first level: docs, patches, scripts, src, test, vendor —
+    // 6 × j from docs to DESIGN.md
+    try sess.send("jjjjjj\r");
     waited = 0;
     while (!grid.contains("# oz") or !grid.contains("NORMAL")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
@@ -4867,11 +4903,11 @@ test "file tree: sidebar scrolls as the selection moves past the window" {
     try std.testing.expect(std.mem.indexOf(u8, grid.rowText(2), "docs") != null);
 
     // Expand enough of the tree to overflow the ~20 visible sidebar rows:
-    // l on docs (its child appears), jj to src + l (12 children), j to
-    // buffer + l (5 children) → 25 visible rows > 20.
-    try sess.send("ljjjljl");
+    // l on docs (children), 5j to src + l (app first), j to app + l
+    // (its children) → more than the ~20 visible rows.
+    try sess.send("ljjjjjljl");
     waited = 0;
-    while (!grid.contains("ops.zig")) {
+    while (!grid.contains("block_insert.zig")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -4881,7 +4917,7 @@ test "file tree: sidebar scrolls as the selection moves past the window" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(grid.contains("ops.zig")); // buffer children visible
+    try std.testing.expect(grid.contains("block_insert.zig")); // app children visible
 
     // 22 × j — the selection reaches the window bottom; the scroll window
     // follows so the selected entry stays visible (it is no longer the first
@@ -7028,7 +7064,7 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
     // opens it. The tree STAYS open (only
     // <space>e / Esc close it) — the buffer tab shows README.md (row 0, now
     // NOT covered by the sidebar).
-    try sess.send("jjjjj\r");
+    try sess.send("jjjjjj\r");
     waited = 0;
     while (std.mem.indexOf(u8, grid.rowText(0), "README.md") == null and
         std.mem.indexOf(u8, grid.rowText(2), "README.md") == null)
@@ -7064,7 +7100,7 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
         break;
     }
-    try sess.send("kkk");
+    try sess.send("kkkk");
     while (true) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
         if (n == 0) break;
@@ -7078,6 +7114,14 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
+    try sess.send("j");
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
+        if (n == 0) break;
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    // src's first child is now app; step over it to buffer
     try sess.send("j");
     while (true) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
@@ -9617,8 +9661,21 @@ test "lsp: diagnostics — gutter mark, gl, <leader>sd list" {
     }
     try std.testing.expect(grid.contains("NORMAL"));
 
-    // gl is the first keypress: it drains the LSP queue (diagnostics arrive)
-    // and shows the cursor line's diagnostics — line 0 has the mock's error.
+    // Wait for the async attach + publishDiagnostics to land (the gutter
+    // mark appears) before gl; in 0.17 the LSP handshake can finish after
+    // the first NORMAL frame, and gl on an empty list would cache "no
+    // diagnostics" before the notification arrives.
+    waited = 0;
+    while (!grid.contains("\u{f467}")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
     try sess.send("gl");
     waited = 0;
     while (!grid.contains("mock error")) {
@@ -11782,7 +11839,7 @@ test "file tree: directory tree — folder glyphs, l expands, h folds" {
     // flips to the OPEN variant
     try sess.send("l");
     waited = 0;
-    while (!grid.contains("excal")) {
+    while (!grid.contains("workspace-plan")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -11792,13 +11849,13 @@ test "file tree: directory tree — folder glyphs, l expands, h folds" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(grid.contains("excal"));
+    try std.testing.expect(grid.contains("workspace-plan"));
     try std.testing.expect(grid.contains("\u{f07c}")); // open folder glyph
 
     // h folds it again — the child disappears and no open folder remains
     try sess.send("h");
     waited = 0;
-    while (grid.contains("excal")) {
+    while (grid.contains("workspace-plan")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -11808,7 +11865,7 @@ test "file tree: directory tree — folder glyphs, l expands, h folds" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(!grid.contains("excal"));
+    try std.testing.expect(!grid.contains("workspace-plan"));
     try std.testing.expect(!grid.contains("\u{f07c}"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
@@ -13654,6 +13711,9 @@ test "dashboard: snacks-style layout and menu keys" {
     if (!picker) grid.dump();
     try std.testing.expect(picker);
     try sess.send("\x1b"); // back to the dashboard
+    const back = try wsWait(&sess, &grid, "Find File", 5000);
+    if (!back) grid.dump();
+    try std.testing.expect(back);
 
     // 'q' quits straight from the dashboard
     try sess.send("q");

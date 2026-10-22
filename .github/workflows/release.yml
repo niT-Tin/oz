@@ -84,7 +84,7 @@ jobs:
           zig version
 
       - name: Fetch vendored tree-sitter
-        run: ./scripts/bootstrap-deps.sh
+        run: ./.scripts/bootstrap-deps.sh
 
       - name: Build (ReleaseFast + strip)
         run: zig build -Doptimize=ReleaseFast -Dstrip -Dtarget=${{ matrix.target }}

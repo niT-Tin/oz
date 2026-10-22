@@ -47,6 +47,10 @@ pub var global_io: std.Io = undefined;
 pub var global_io_initialized: bool = false;
 pub var global_vt_mutex: std.Io.Mutex = .init;
 pub var global_vts: std.AutoHashMapUnmanaged(i32, *Terminal) = .empty;
+/// False once the last terminal's deinit freed `global_vts`; the SIGCHLD
+/// handler must not touch the map then (a kill() racing the deinit would
+/// otherwise iterate freed memory and trip "incorrect alignment").
+pub var global_vts_alive: bool = false;
 pub var global_sigchild_installed: bool = false;
 
 io: std.Io,
@@ -140,7 +144,11 @@ pub fn deinit(self: *Terminal) void {
         if (self.cmd.pid) |pid|
             _ = global_vts.remove(pid);
         if (global_vts.count() == 0) {
-            global_vts.deinit(self.allocator);
+            global_vts_alive = false;
+            // NOT deinit(): HashMapUnmanaged.deinit leaves the struct
+            // undefined, and the next spawn's put() would trip its
+            // pointer-stability assert. Keep the map empty-but-usable.
+            global_vts.clearRetainingCapacity();
         }
     }
     self.cmd.kill();
@@ -181,6 +189,7 @@ pub fn spawn(self: *Terminal) !void {
         defer global_vt_mutex.unlock(self.io);
         if (self.cmd.pid) |pid|
             try global_vts.put(self.allocator, pid, self);
+        global_vts_alive = true;
     }
 
     self.thread = try self.io.concurrent(Terminal.run, .{self});

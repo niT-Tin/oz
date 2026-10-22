@@ -9,7 +9,7 @@ zig-pkg/
 
 # local toolchains / large vendored sources / agent worktrees
 .tools/
-vendor/tree-sitter/
+.vendor/tree-sitter/
 .zig-cache-*/
 .zig-global-cache-*/
 .zig-*.log

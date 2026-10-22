@@ -101,17 +101,28 @@ pub fn spawn(self: *Command, io: std.Io, allocator: std.mem.Allocator) !void {
 }
 
 fn handleSigChild(_: posix.SIG) callconv(.c) void {
-    var status: i32 = undefined;
-    const rc = linux.waitpid(-1, &status, 0);
-    const pid: i32 = switch (linux.errno(rc)) {
-        .SUCCESS => @intCast(rc),
-        else => return,
-    };
-
+    // Only reap the terminal's own children. waitpid(-1) here would also
+    // reap the app's other children (git/grep/LSP jobs), making their own
+    // wait() fail with ECHILD. Reap each registered terminal pid
+    // non-blocking instead, and never touch a map that deinit already freed.
     Terminal.global_vt_mutex.lock(Terminal.global_io) catch return;
     defer Terminal.global_vt_mutex.unlock(Terminal.global_io);
-    var vt = Terminal.global_vts.get(pid) orelse return;
-    vt.event_queue.push(.exited) catch {};
+    if (!Terminal.global_vts_alive) return;
+    var it = Terminal.global_vts.iterator();
+    while (it.next()) |entry| {
+        if (reapExited(entry.key_ptr.*)) {
+            entry.value_ptr.*.event_queue.push(.exited) catch {};
+        }
+    }
+}
+
+/// True if `pid` has exited or was signalled (non-blocking).
+fn reapExited(pid: i32) bool {
+    var status: i32 = 0;
+    const rc = linux.waitpid(pid, &status, linux.W.NOHANG);
+    if (linux.errno(rc) != .SUCCESS or rc != @as(usize, @intCast(pid))) return false;
+    const bits: u32 = @bitCast(status);
+    return linux.W.IFEXITED(bits) or linux.W.IFSIGNALED(bits);
 }
 
 pub fn kill(self: *Command) void {
