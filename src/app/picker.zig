@@ -321,7 +321,7 @@ pub fn renderGrepPreviewRow(
         // content row, blank rows below
         if (k == 1) {
             const hint = "preview unavailable";
-            const ids = [_]u8{0} ** 64;
+            const ids: [64]u8 = @splat(0);
             try autil.appendRowSegs(segs, a, win, hint, &ids, &[_]vaxis.Style{.{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = float_bg.bg }}, preview_w, float_bg);
         } else {
             try autil.appendRowSegs(segs, a, win, "", &.{}, &[_]vaxis.Style{}, preview_w, float_bg);

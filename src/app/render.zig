@@ -2438,7 +2438,7 @@ pub fn render(self: *App) !void {
                     // "no matches" hint (dim); the preview column stays a
                     // blank bg_float block so the panel is continuous
                     const hint = "no matches";
-                    const ids = [_]u8{0} ** 64;
+                    const ids: [64]u8 = @splat(0);
                     try autil.appendRowSegs(&segs, a, win, hint, &ids, &[_]vaxis.Style{.{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg_float } }}, left_w, .{ .bg = .{ .rgb = self.theme.bg_float } });
                     try segs.append(a, .{ .text = " ", .style = sep_pad_style });
                     try segs.append(a, .{ .text = "│", .style = sep_style });

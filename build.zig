@@ -1,7 +1,7 @@
 const std = @import("std");
 
 // oz build: one source tree (src/) with relative imports only — no nested
-// oz-* modules (Zig 0.16 forbids a file belonging to two modules; relative
+// oz-* modules (Zig forbids a file belonging to two modules; relative
 // imports inside src/ keep every file in exactly one module per binary).
 //
 //   exe   src/main.zig   vaxis event loop + integration   (zig build / run)
@@ -11,57 +11,6 @@ const std = @import("std");
 // The test root imports each module file directly so its `test` blocks are
 // collected; refAllDecls forces analysis of every public decl.
 
-/// Overwrite a vendored dependency file with the patched copy from
-/// patches/ when they differ. zig-pkg/ is a gitignored dependency cache
-/// (re-fetched on fresh checkouts), so the vaxis terminal-widget fixes
-/// (Zig 0.16 ioctl constants, SIGCHLD map lifecycle, copyTo scrollback
-/// bounds, non-blocking event pushes, teardown drain) must be re-applied
-/// on every build. Idempotent: an already-patched tree is left alone.
-fn applyVaxisPatch(b: *std.Build) void {
-    const fixes = [_]struct { target: []const u8, patch: []const u8 }{
-        .{
-            .target = "zig-pkg/vaxis-0.6.0-BWNV_ALfCQCcOilT8JtOaYa4gzMl_9oApKk0HfxNFo5Z/src/widgets/terminal/Pty.zig",
-            .patch = "patches/vaxis-Pty.zig",
-        },
-        .{
-            .target = "zig-pkg/vaxis-0.6.0-BWNV_ALfCQCcOilT8JtOaYa4gzMl_9oApKk0HfxNFo5Z/src/widgets/terminal/Command.zig",
-            .patch = "patches/vaxis-Command.zig",
-        },
-        .{
-            .target = "zig-pkg/vaxis-0.6.0-BWNV_ALfCQCcOilT8JtOaYa4gzMl_9oApKk0HfxNFo5Z/src/widgets/terminal/Screen.zig",
-            .patch = "patches/vaxis-Screen.zig",
-        },
-        .{
-            .target = "zig-pkg/vaxis-0.6.0-BWNV_ALfCQCcOilT8JtOaYa4gzMl_9oApKk0HfxNFo5Z/src/widgets/terminal/Terminal.zig",
-            .patch = "patches/vaxis-Terminal.zig",
-        },
-    };
-    const io = b.graph.io;
-    const dir = std.Io.Dir.cwd();
-    for (fixes) |fix| {
-        const target_path = b.pathFromRoot(fix.target);
-        const patch_path = b.pathFromRoot(fix.patch);
-        const patched = dir.readFileAlloc(io, patch_path, b.allocator, @enumFromInt(1 << 20)) catch |e| {
-            std.debug.print("oz: cannot read patch {s}: {s}\n", .{ fix.patch, @errorName(e) });
-            std.process.exit(1);
-        };
-        defer b.allocator.free(patched);
-        const current = dir.readFileAlloc(io, target_path, b.allocator, @enumFromInt(1 << 20)) catch {
-            // target missing (dependency not fetched yet — the build will
-            // fail later with a clearer error); nothing to patch
-            continue;
-        };
-        defer b.allocator.free(current);
-        if (!std.mem.eql(u8, current, patched)) {
-            dir.writeFile(io, .{ .sub_path = target_path, .data = patched }) catch |e| {
-                std.debug.print("oz: cannot apply {s} to {s}: {s}\n", .{ fix.patch, fix.target, @errorName(e) });
-                std.process.exit(1);
-            };
-            std.debug.print("oz: applied {s} -> {s}\n", .{ fix.patch, fix.target });
-        }
-    }
-}
-
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -70,8 +19,6 @@ pub fn build(b: *std.Build) void {
     // tests whose name contains NAME (Zig's runner has no runtime filter).
     const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this string");
     const test_filters: []const []const u8 = if (test_filter) |f| &.{f} else &.{};
-    // re-apply the vendored vaxis terminal-widget fixes before compiling
-    applyVaxisPatch(b);
 
     // ---- dependencies ----
     const vaxis_dep = b.dependency("vaxis", .{
@@ -132,9 +79,6 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
 
     // ---- L1 + L2 unit tests ----
     const tests = b.addTest(.{

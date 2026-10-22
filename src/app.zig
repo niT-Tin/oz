@@ -362,7 +362,7 @@ pub const App = struct {
     // keyboard macros (vim q/@, registers a-z)
     /// Recorded register contents (owned), freed in deinit. vaxis.Key.text
     /// is transient, so keys are stored as RecordedKey (inline text copy).
-    macros: [26]?[]RecordedKey = .{null} ** 26,
+    macros: [26]?[]RecordedKey = @splat(null),
     /// Register index (0-25) currently recording into, null when idle.
     macro_rec: ?usize = null,
     /// Keys captured since recording started; moved into macros[i] on stop.

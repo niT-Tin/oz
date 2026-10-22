@@ -154,19 +154,19 @@ fn spawnChildEnvCwd(io: Io, pty: *Pty, argv: []const []const u8, env_extra: ?[]c
     const exe_path: [:0]const u8 = path_buf[0..path_len :0];
 
     var arg_bufs: [8][256:0]u8 = undefined;
-    var arg_ptrs: [8]?[*:0]const u8 = .{null} ** 8;
+    var arg_ptrs: [8]?[*:0]const u8 = @splat(null);
     var nargs: usize = 0;
     arg_ptrs[nargs] = exe_path.ptr;
     nargs += 1;
     for (argv[1..]) |a| {
-        const az: [:0]u8 = try std.fmt.bufPrintZ(&arg_bufs[nargs - 1], "{s}", .{a});
+        const az: [:0]u8 = try bufPrintZ(&arg_bufs[nargs - 1], "{s}", .{a});
         arg_ptrs[nargs] = az.ptr;
         nargs += 1;
     }
     const argv_z: [*:null]const ?[*:0]const u8 = @ptrCast(&arg_ptrs);
 
     var env_bufs: [12][256:0]u8 = undefined;
-    var env_ptrs: [13]?[*:0]const u8 = .{null} ** 13;
+    var env_ptrs: [13]?[*:0]const u8 = @splat(null);
     var nenv: usize = 0;
     const base_env = [_][]const u8{ "TERM=xterm-256color", "PATH=/usr/bin:/bin:/usr/local/bin", "HOME=/tmp" };
     outer: for (base_env) |e| {
@@ -179,13 +179,13 @@ fn spawnChildEnvCwd(io: Io, pty: *Pty, argv: []const []const u8, env_extra: ?[]c
                 if (std.mem.eql(u8, xkey, key)) continue :outer;
             }
         }
-        const ez: [:0]u8 = try std.fmt.bufPrintZ(&env_bufs[nenv], "{s}", .{e});
+        const ez: [:0]u8 = try bufPrintZ(&env_bufs[nenv], "{s}", .{e});
         env_ptrs[nenv] = ez.ptr;
         nenv += 1;
     }
     if (env_extra) |extra| {
         for (extra) |e| {
-            const ez: [:0]u8 = try std.fmt.bufPrintZ(&env_bufs[nenv], "{s}", .{e});
+            const ez: [:0]u8 = try bufPrintZ(&env_bufs[nenv], "{s}", .{e});
             env_ptrs[nenv] = ez.ptr;
             nenv += 1;
         }
@@ -200,7 +200,7 @@ fn spawnChildEnvCwd(io: Io, pty: *Pty, argv: []const []const u8, env_extra: ?[]c
     if (pid == 0) {
         if (cwd) |c| {
             var cwd_buf: [256:0]u8 = undefined;
-            const cwd_z: [:0]u8 = std.fmt.bufPrintZ(&cwd_buf, "{s}", .{c}) catch linux.exit(126);
+            const cwd_z: [:0]u8 = bufPrintZ(&cwd_buf, "{s}", .{c}) catch linux.exit(126);
             _ = linux.chdir(cwd_z.ptr); // raw syscall in the forked child
         }
         _ = linux.setsid();
@@ -292,7 +292,7 @@ const Session = struct {
     /// Block until the child exits; returns its exit code (or 0x100+ if
     /// signaled).
     fn waitExit(self: *Session) !u32 {
-        var status: u32 = 0;
+        var status: i32 = 0;
         while (true) {
             const rc = linux.waitpid(self.pid, &status, 0);
             switch (linux.errno(rc)) {
@@ -301,21 +301,21 @@ const Session = struct {
                 else => return error.WaitFailed,
             }
         }
-        if (linux.W.IFEXITED(status)) {
-            return linux.W.EXITSTATUS(status);
+        if (linux.W.IFEXITED(waitStatusBits(status))) {
+            return linux.W.EXITSTATUS(waitStatusBits(status));
         }
-        return 0x100 + (status & 0x7f);
+        return 0x100 + (waitStatusBits(status) & 0x7f);
     }
 
     /// Non-blocking wait; null while the child still runs.
     fn tryWaitExit(self: *Session) !?u32 {
-        var status: u32 = 0;
+        var status: i32 = 0;
         const rc = linux.waitpid(self.pid, &status, linux.W.NOHANG);
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 if (rc == 0) return null;
-                if (linux.W.IFEXITED(status)) return linux.W.EXITSTATUS(status);
-                return 0x100 + (status & 0x7f);
+                if (linux.W.IFEXITED(waitStatusBits(status))) return linux.W.EXITSTATUS(waitStatusBits(status));
+                return 0x100 + (waitStatusBits(status) & 0x7f);
             },
             .INTR => return try self.tryWaitExit(),
             else => return error.WaitFailed,
@@ -389,6 +389,17 @@ fn glyphCells(cp: u21) usize {
     if (cp >= 0x1F000 and cp <= 0x1FAFF) return 2;
     if (cp >= 0x20000 and cp <= 0x3FFFD) return 2;
     return 1;
+}
+
+/// Zig 0.16's std.fmt.bufPrintZ became bufPrintSentinel(buf, fmt, args, 0)
+/// in 0.17; every e2e path/argv construction wants a NUL-terminated slice.
+fn bufPrintZ(buf: []u8, comptime fmt: []const u8, args: anytype) ![:0]u8 {
+    return std.fmt.bufPrintSentinel(buf, fmt, args, 0);
+}
+
+/// waitpid(2) writes an int, but Zig 0.17's W* helpers still take u32.
+fn waitStatusBits(status: i32) u32 {
+    return @bitCast(status);
 }
 
 const Grid = struct {
@@ -481,7 +492,7 @@ const Grid = struct {
                 if (bytes[i + 1] == '[') {
                     // CSI: params up to final byte 0x40-0x7e
                     var j = i + 2;
-                    var params: [16]i64 = .{0} ** 16;
+                    var params: [16]i64 = @splat(0);
                     var np: usize = 0;
                     var cur: i64 = -1; // -1 = no digit seen yet
                     while (j < bytes.len) {
@@ -924,7 +935,7 @@ test "smoke: spawn oz, render a file, quit cleanly" {
 
     // temp input file (deleted at test end, after the child has read it)
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -973,7 +984,7 @@ test "insert text in insert mode, esc back to normal" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -1051,7 +1062,7 @@ test ":wq writes the buffer to disk and exits" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -1134,11 +1145,11 @@ test "relative CLI path: :w saves without BadPathName" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const abs = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}rel.txt", .{ linux.getpid(), tmp_counter });
+    const abs = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}rel.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     // relative path from the project root to the same file
     var rel_path_buf: [256:0]u8 = undefined;
-    const rel_path = try std.fmt.bufPrintZ(&rel_path_buf, "../../../../tmp/{s}", .{abs["/tmp/".len..]});
+    const rel_path = try bufPrintZ(&rel_path_buf, "../../../../tmp/{s}", .{abs["/tmp/".len..]});
     defer std.Io.Dir.cwd().deleteFile(io, abs) catch {};
     {
         const f = try std.Io.Dir.cwd().createFile(io, abs, .{ .truncate = true });
@@ -1202,7 +1213,7 @@ test "path with spaces: :w saves (no BadPathName)" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz e2e sp {d} {d}.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz e2e sp {d} {d}.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -1266,7 +1277,7 @@ test ":theme lists themes, switches colors, rejects unknown names" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}th.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}th.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -1356,7 +1367,7 @@ test "theme picker: <leader>sp lists themes, previews live, Esc restores" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}thp.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}thp.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -1491,7 +1502,7 @@ test "insert mode: jk leaves no chars, backspace and ctrl-w delete" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -1596,7 +1607,7 @@ test "auto-pairs: openers close, closers skip, backspace deletes empty pair" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -1689,7 +1700,7 @@ test "search: / ? n N jump between matches; :<number> jumps to line" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}search.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}search.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -1811,7 +1822,7 @@ test "M1a: text objects, visual ops, yank/paste, easymotion" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -1931,7 +1942,7 @@ test "surround: ysw' wraps, ds( deletes, cs(->[ changes" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -2030,7 +2041,7 @@ test "gcc toggles line comments; Ctrl+n multi-cursor deletes words" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}.zig", .{linux.getpid()});
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}.zig", .{linux.getpid()});
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
         const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
@@ -2129,7 +2140,7 @@ test "visual ga= aligns delimiter columns" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -2189,7 +2200,7 @@ test "picker: <leader>sf fuzzy-finds and opens a file" {
     // Spawn with a temp file so the editor starts in normal mode (not the
     // dashboard); the picker still walks the project root cwd.
     var fname_buf: [128:0]u8 = undefined;
-    const fname = try std.fmt.bufPrintZ(&fname_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    const fname = try bufPrintZ(&fname_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, fname) catch {};
     {
@@ -2264,7 +2275,7 @@ test ":%s substitutes across the file, :s on the current line" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -2343,7 +2354,7 @@ test "'.' repeats dw and x from the current cursor" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -2417,7 +2428,7 @@ test "tabs render expanded; cursor column accounts for tab width" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -2464,7 +2475,7 @@ test "vim editing keys: x X D C S r ~ J >>" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -2631,7 +2642,7 @@ test "dashboard shows recent files; Enter reopens" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -2708,7 +2719,7 @@ test "grep picker: <leader>st finds matches and jumps" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -2797,7 +2808,7 @@ test "grep picker: fixed-size panel with split syntax preview" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}g.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}g.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -2939,7 +2950,7 @@ test "file tree: <leader>e shows files, Enter opens one" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -3073,7 +3084,7 @@ test "file tree: sidebar background matches the editor" {
     // row there is uniformly the editor bg, proving the panel no longer
     // paints itself with the float background
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}ftb.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}ftb.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -3144,7 +3155,7 @@ test "multi-buffer: :e opens a tab, gt/:bn switch, :bd closes" {
     const alloc = std.testing.allocator;
 
     var na_buf: [128:0]u8 = undefined;
-    const na = try std.fmt.bufPrintZ(&na_buf, "/tmp/oz_e2e_{d}_{d}a.txt", .{ linux.getpid(), tmp_counter });
+    const na = try bufPrintZ(&na_buf, "/tmp/oz_e2e_{d}_{d}a.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
     {
@@ -3153,7 +3164,7 @@ test "multi-buffer: :e opens a tab, gt/:bn switch, :bd closes" {
         try f.writeStreamingAll(io, "AAA\n");
     }
     var nb_buf: [128:0]u8 = undefined;
-    const nb = try std.fmt.bufPrintZ(&nb_buf, "/tmp/oz_e2e_{d}_{d}b.txt", .{ linux.getpid(), tmp_counter });
+    const nb = try bufPrintZ(&nb_buf, "/tmp/oz_e2e_{d}_{d}b.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, nb) catch {};
     {
@@ -3244,7 +3255,7 @@ test "buffer picker: <leader>sb lists open buffers, Enter switches" {
     const alloc = std.testing.allocator;
 
     var na_buf: [128:0]u8 = undefined;
-    const na = try std.fmt.bufPrintZ(&na_buf, "/tmp/oz_e2e_{d}_{d}pa.txt", .{ linux.getpid(), tmp_counter });
+    const na = try bufPrintZ(&na_buf, "/tmp/oz_e2e_{d}_{d}pa.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
     {
@@ -3253,7 +3264,7 @@ test "buffer picker: <leader>sb lists open buffers, Enter switches" {
         try f.writeStreamingAll(io, "AAA\n");
     }
     var nb_buf: [128:0]u8 = undefined;
-    const nb = try std.fmt.bufPrintZ(&nb_buf, "/tmp/oz_e2e_{d}_{d}pb.txt", .{ linux.getpid(), tmp_counter });
+    const nb = try bufPrintZ(&nb_buf, "/tmp/oz_e2e_{d}_{d}pb.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, nb) catch {};
     {
@@ -3351,7 +3362,7 @@ test "buffer keys: <leader>bn switches, <leader>bk closes" {
     const alloc = std.testing.allocator;
 
     var na_buf: [128:0]u8 = undefined;
-    const na = try std.fmt.bufPrintZ(&na_buf, "/tmp/oz_e2e_{d}_{d}ka.txt", .{ linux.getpid(), tmp_counter });
+    const na = try bufPrintZ(&na_buf, "/tmp/oz_e2e_{d}_{d}ka.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
     {
@@ -3360,7 +3371,7 @@ test "buffer keys: <leader>bn switches, <leader>bk closes" {
         try f.writeStreamingAll(io, "AAA\n");
     }
     var nb_buf: [128:0]u8 = undefined;
-    const nb = try std.fmt.bufPrintZ(&nb_buf, "/tmp/oz_e2e_{d}_{d}kb.txt", .{ linux.getpid(), tmp_counter });
+    const nb = try bufPrintZ(&nb_buf, "/tmp/oz_e2e_{d}_{d}kb.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, nb) catch {};
     {
@@ -3450,7 +3461,7 @@ test ":'<,'>s substitutes within the visual range only" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}vs.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}vs.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -3531,7 +3542,7 @@ test "recent picker: <leader>sr lists and reopens a recent file" {
     const alloc = std.testing.allocator;
 
     var na_buf: [128:0]u8 = undefined;
-    const na = try std.fmt.bufPrintZ(&na_buf, "/tmp/oz_e2e_{d}_{d}ra.txt", .{ linux.getpid(), tmp_counter });
+    const na = try bufPrintZ(&na_buf, "/tmp/oz_e2e_{d}_{d}ra.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
     {
@@ -3540,7 +3551,7 @@ test "recent picker: <leader>sr lists and reopens a recent file" {
         try f.writeStreamingAll(io, "AAA\n");
     }
     var nb_buf: [128:0]u8 = undefined;
-    const nb = try std.fmt.bufPrintZ(&nb_buf, "/tmp/oz_e2e_{d}_{d}rb.txt", .{ linux.getpid(), tmp_counter });
+    const nb = try bufPrintZ(&nb_buf, "/tmp/oz_e2e_{d}_{d}rb.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, nb) catch {};
     {
@@ -3626,7 +3637,7 @@ test "tree-sitter: zig keywords/comments/strings get syntax colors" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}syn.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}syn.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -3677,7 +3688,7 @@ test "markdown: inline rendering with conceal, injection and decorations" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}md.md", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}md.md", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -3779,7 +3790,7 @@ test "tree-sitter: colors stay correct after o + typing + jk exit" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}drift.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}drift.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -3848,7 +3859,7 @@ test "tree-sitter: files over the size limit get no highlight pass" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}big.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}big.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -3896,7 +3907,7 @@ test "visual: rainbow brackets, indent guides and scope highlight" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}vis.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}vis.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -4061,7 +4072,7 @@ test "indent: scope vertical skips its first line and runs through blank rows" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -4124,7 +4135,7 @@ test "indent: blank rows carry gray context guides plus the scope column" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -4189,7 +4200,7 @@ test "visual block: <C-v> block + I/A inserts on every line" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -4344,7 +4355,7 @@ test "visual block: rectangle semantics — highlight and d delete per column" {
     // row 1 the whole line). vim semantics: every covered row shares the
     // same single-column slice.
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}blk.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}blk.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -4448,7 +4459,7 @@ test "visual block: c deletes the rectangle and types at the top-left cursor" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}blkc.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}blkc.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -4536,7 +4547,7 @@ test "visual block: multi-cursor backspace, ctrl-w and jk stay in sync" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -4693,7 +4704,7 @@ test "visual block: 非 0 列块 / 空行 clamp / 单行块边界" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -4811,7 +4822,7 @@ test "file tree: sidebar scrolls as the selection moves past the window" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}f.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}f.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -4920,7 +4931,7 @@ test "picker: list scrolls with the selection; the highlighted row stays visible
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}p.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}p.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -5030,7 +5041,7 @@ test "visual line: Esc exits and clears the stale selection highlight" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}vl.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}vl.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -5173,7 +5184,7 @@ test "picker: keys win over the file tree while both are open" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}ft2.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}ft2.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -5301,7 +5312,7 @@ test "visual line: gt buffer switch drops the selection highlight" {
     const alloc = std.testing.allocator;
 
     var na_buf: [128:0]u8 = undefined;
-    const na = try std.fmt.bufPrintZ(&na_buf, "/tmp/oz_e2e_{d}_{d}gta.txt", .{ linux.getpid(), tmp_counter });
+    const na = try bufPrintZ(&na_buf, "/tmp/oz_e2e_{d}_{d}gta.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
     {
@@ -5310,7 +5321,7 @@ test "visual line: gt buffer switch drops the selection highlight" {
         try f.writeStreamingAll(io, "AAA\nAAA\nAAA\n");
     }
     var nb_buf: [128:0]u8 = undefined;
-    const nb = try std.fmt.bufPrintZ(&nb_buf, "/tmp/oz_e2e_{d}_{d}gtb.txt", .{ linux.getpid(), tmp_counter });
+    const nb = try bufPrintZ(&nb_buf, "/tmp/oz_e2e_{d}_{d}gtb.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, nb) catch {};
     {
@@ -5438,7 +5449,7 @@ test "insert Enter: splits the line at the cursor" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}ent.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}ent.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -5522,7 +5533,7 @@ test "insert Enter: carries the current line's leading indentation" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}enti.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}enti.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -5601,7 +5612,7 @@ test "insert Ctrl-k: kills to end of line, then joins the next line" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}ctl.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}ctl.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -5704,7 +5715,7 @@ test "insert Alt-b/Alt-f: emacs word motion moves the cursor" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}alt.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}alt.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -5834,7 +5845,7 @@ test "picker confirm leaves file-tree mode; j/k control the buffer" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}g.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}g.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -5942,7 +5953,7 @@ test "visual line V selects whole lines from mid-line" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}v.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}v.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -6044,7 +6055,7 @@ test "visual line: V + d/c deletes ALL selected lines (incl. the last one)" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}vld.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}vld.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -6108,7 +6119,7 @@ test "visual line: V + c consumes ALL selected lines (incl. the last one)" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}vlc.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}vlc.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -6181,7 +6192,7 @@ test "e2e: Ctrl+a / Ctrl+x increment and decrement the number at the cursor" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}num.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}num.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -6266,7 +6277,7 @@ test "e2e: visual g Ctrl+a increments each line's first number by line offset" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}col.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}col.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -6334,7 +6345,7 @@ test "e2e: visual block g Ctrl+a respects the block columns (vim column incremen
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}colb.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}colb.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -6407,7 +6418,7 @@ test "e2e: visual block g Ctrl+a on 0..4 gives vim's 1,3,5,7,9 (line offset)" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}colc.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}colc.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -6477,7 +6488,7 @@ test "e2e: insert mode arrow keys move the cursor" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}arr.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}arr.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -6553,7 +6564,7 @@ test "e2e: counts — 5p pastes five times, 3x deletes three, 2ciw changes two w
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}cnt.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}cnt.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -6659,7 +6670,7 @@ test "e2e: multi-cursor n extends the selection; c changes words synchronously" 
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}mc.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}mc.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -6744,7 +6755,7 @@ test "e2e: multi-cursor Ctrl+n moves the main cursor and scrolls the viewport" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}mcscroll.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}mcscroll.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -6830,7 +6841,7 @@ test "e2e: visual Ctrl+a increments every number in the selection" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}vis.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}vis.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -6898,7 +6909,7 @@ test "gutter: relative line numbers never overlap content on deep files" {
     // wider than the old fixed 4-digit gutter (5 digits + space = 6 cells).
     // (piece_table: every '\n' starts a line, so 14999 × "x\n" + "x" = 15000)
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}gutter.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}gutter.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -7143,7 +7154,7 @@ test "e2e: insert undo — delete-first session (backspace then typing) reverts 
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}ud1.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}ud1.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -7232,7 +7243,7 @@ test "e2e: insert undo — type-then-delete session reverts with one u" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}ud2.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}ud2.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -7320,7 +7331,7 @@ test "e2e: dd deletes the whole line under the cursor" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}dd.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}dd.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -7382,7 +7393,7 @@ test "e2e: 2dd deletes two whole lines" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}2dd.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}2dd.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -7443,7 +7454,7 @@ test "e2e: cc replaces the whole line and enters insert" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}cc.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}cc.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -7520,7 +7531,7 @@ test "e2e: yy/dd/p/P linewise register matches nvim (lines below/above, cursor o
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}yank.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}yank.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -7607,7 +7618,7 @@ test "e2e: xp swaps two characters (x fills the charwise register)" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}xp.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}xp.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -7661,7 +7672,7 @@ test "file tree: Ctrl-w h/l switches focus between sidebar and buffer" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}foc.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}foc.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -7827,7 +7838,7 @@ test "insert Ctrl+n: keyword completion inserts the top candidate" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}comp.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}comp.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -7939,7 +7950,7 @@ test "insert Ctrl+n: Esc dismisses the menu and stays in insert" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}compc.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}compc.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -8065,7 +8076,7 @@ test "insert Ctrl+n: no candidates when the cursor is not inside a word" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}compn.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}compn.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -8164,7 +8175,7 @@ test "insert: typing 'j' at end of a line keeps the next line's first word color
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}jcol.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}jcol.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -8324,7 +8335,7 @@ test "windows: :vs splits side-by-side; Ctrl-w l/h switch; :q closes one; :qa qu
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}win.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}win.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -8461,7 +8472,7 @@ test "windows: :sp splits stacked; each window scrolls independently" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}winsp.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}winsp.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -8545,7 +8556,7 @@ test "TMP: tab-bar fuzz — every open buffer's tab appears exactly once" {
     // three short-named files in a unique dir (short basenames keep tabs
     // unclipped even when several stack in one 40-col pane)
     var dir_buf: [128:0]u8 = undefined;
-    const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/ozfz_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    const dir = try bufPrintZ(&dir_buf, "/tmp/ozfz_{d}_{d}", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteDir(io, dir) catch {};
     try std.Io.Dir.cwd().createDir(io, dir, .default_dir);
@@ -8553,7 +8564,7 @@ test "TMP: tab-bar fuzz — every open buffer's tab appears exactly once" {
     const contents = [_][]const u8{ "AAAA\n", "BBBB\n", "CCCC\n" };
     const names = [_][]const u8{ "a.txt", "b.txt", "c.txt" };
     for (0..3) |i| {
-        const p = try std.fmt.bufPrintZ(&paths[i], "{s}/{s}", .{ dir, names[i] });
+        const p = try bufPrintZ(&paths[i], "{s}/{s}", .{ dir, names[i] });
         const f = try std.Io.Dir.cwd().createFile(io, p, .{ .truncate = true });
         defer f.close(io);
         try f.writeStreamingAll(io, contents[i]);
@@ -8727,7 +8738,7 @@ test "windows: :vs keeps the old window left; :e lands in the left window when s
     const alloc = std.testing.allocator;
 
     var na_buf: [128:0]u8 = undefined;
-    const na = try std.fmt.bufPrintZ(&na_buf, "/tmp/oz_{d}_{d}a.txt", .{ linux.getpid(), tmp_counter });
+    const na = try bufPrintZ(&na_buf, "/tmp/oz_{d}_{d}a.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
     {
@@ -8736,7 +8747,7 @@ test "windows: :vs keeps the old window left; :e lands in the left window when s
         try f.writeStreamingAll(io, "AAA\n");
     }
     var nb_buf: [128:0]u8 = undefined;
-    const nb = try std.fmt.bufPrintZ(&nb_buf, "/tmp/oz_{d}_{d}b.txt", .{ linux.getpid(), tmp_counter });
+    const nb = try bufPrintZ(&nb_buf, "/tmp/oz_{d}_{d}b.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, nb) catch {};
     {
@@ -8745,7 +8756,7 @@ test "windows: :vs keeps the old window left; :e lands in the left window when s
         try f.writeStreamingAll(io, "BBB\n");
     }
     var nc_buf: [128:0]u8 = undefined;
-    const nc = try std.fmt.bufPrintZ(&nc_buf, "/tmp/oz_{d}_{d}c.txt", .{ linux.getpid(), tmp_counter });
+    const nc = try bufPrintZ(&nc_buf, "/tmp/oz_{d}_{d}c.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, nc) catch {};
     {
@@ -8919,7 +8930,7 @@ test "windows: <leader>bh/bl move the buffer to the left/right window; last buff
     const alloc = std.testing.allocator;
 
     var na_buf: [128:0]u8 = undefined;
-    const na = try std.fmt.bufPrintZ(&na_buf, "/tmp/oz_e2e_{d}_{d}bha.txt", .{ linux.getpid(), tmp_counter });
+    const na = try bufPrintZ(&na_buf, "/tmp/oz_e2e_{d}_{d}bha.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
     {
@@ -8928,7 +8939,7 @@ test "windows: <leader>bh/bl move the buffer to the left/right window; last buff
         try f.writeStreamingAll(io, "WAA\n");
     }
     var nb_buf: [128:0]u8 = undefined;
-    const nb = try std.fmt.bufPrintZ(&nb_buf, "/tmp/oz_e2e_{d}_{d}bhb.txt", .{ linux.getpid(), tmp_counter });
+    const nb = try bufPrintZ(&nb_buf, "/tmp/oz_e2e_{d}_{d}bhb.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, nb) catch {};
     {
@@ -9247,7 +9258,7 @@ test "lsp: smoke with real gopls (no crash on start/didChange)" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}lsp.go", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}lsp.go", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -9303,7 +9314,7 @@ test "lsp: mock server handshake + didChange round-trip (OZ_LSP_CMD)" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}lspm.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}lspm.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -9375,7 +9386,7 @@ test "lsp: diagnostics push repaints without a keypress (stale mark cleared)" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}diagc.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}diagc.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -9466,7 +9477,7 @@ test "lsp: jk exit re-syncs the phantom 'j' removal (no stale diagnostic)" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}jksync.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}jksync.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -9578,7 +9589,7 @@ test "lsp: diagnostics — gutter mark, gl, <leader>sd list" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}diag.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}diag.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -9708,7 +9719,7 @@ test "lsp: navigation — K hover, gd jump, gr list, gs signature" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}nav.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}nav.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -9958,7 +9969,7 @@ test "lsp: completion — Ctrl+n lists server items, Enter accepts" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}comp.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}comp.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -10059,7 +10070,7 @@ test "lsp: auto-suggest — typing a word char opens the menu (blink style)" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}auto.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}auto.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -10161,7 +10172,7 @@ test "lsp: auto-suggest fires on '.' (trigger character, e.g. 'b.')" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}trig.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}trig.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -10261,7 +10272,7 @@ test "lsp: auto-suggest updates the menu as you type (dynamic)" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}dyn.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}dyn.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -10368,7 +10379,7 @@ test "lsp: accepting a snippet candidate inserts its clean label" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}snp.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}snp.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -10476,7 +10487,7 @@ test "lsp: user flow — b. Ctrl+n stand Enter jk A keeps the cursor at EOL" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}flow.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}flow.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -10612,7 +10623,7 @@ test "lsp: signature help — typing ( shows the callee signature" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}sig.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}sig.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -10690,7 +10701,7 @@ test "lsp: editing — rename, format, inlay hints, outline" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}edit.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}edit.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -10968,7 +10979,7 @@ test "lsp: inlay hints cover the whole viewport in a tall window" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}tall.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}tall.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -11086,10 +11097,10 @@ test "lsp: Ctrl-w focus switch retargets the client to the window's buffer" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name_a = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}left.zig", .{ linux.getpid(), tmp_counter });
+    const name_a = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}left.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     var name_buf2: [128:0]u8 = undefined;
-    const name_b = try std.fmt.bufPrintZ(&name_buf2, "/tmp/oz_e2e_{d}_{d}right.zig", .{ linux.getpid(), tmp_counter });
+    const name_b = try bufPrintZ(&name_buf2, "/tmp/oz_e2e_{d}_{d}right.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name_a) catch {};
     defer std.Io.Dir.cwd().deleteFile(io, name_b) catch {};
@@ -11259,10 +11270,10 @@ test "lsp: split windows with different buffers never splice foreign inlay hints
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name_l = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}lft.zig", .{ linux.getpid(), tmp_counter });
+    const name_l = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}lft.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     var name_buf2: [128:0]u8 = undefined;
-    const name_r = try std.fmt.bufPrintZ(&name_buf2, "/tmp/oz_e2e_{d}_{d}rgt.zig", .{ linux.getpid(), tmp_counter });
+    const name_r = try bufPrintZ(&name_buf2, "/tmp/oz_e2e_{d}_{d}rgt.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name_l) catch {};
     defer std.Io.Dir.cwd().deleteFile(io, name_r) catch {};
@@ -11455,7 +11466,7 @@ test "command mode: Tab completes command names, cycles, keeps path completion" 
     const io = std.testing.io;
     const alloc = std.testing.allocator;
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}cmdt.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}cmdt.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -11604,7 +11615,7 @@ test "keymap picker: <leader>sk filters, token colors, Esc closes" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}km.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}km.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -11722,7 +11733,7 @@ test "file tree: directory tree — folder glyphs, l expands, h folds" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}tr.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}tr.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -11891,7 +11902,7 @@ test "nonexistent CLI file opens as an empty named buffer; :w creates it" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}_newfile.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}_newfile.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     std.Io.Dir.cwd().deleteFile(io, name) catch {}; // make sure it's missing
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
@@ -11972,7 +11983,7 @@ test "H/M/L move in the viewport; zz/zt/zb scroll around the cursor" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}_view.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}_view.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -12061,7 +12072,7 @@ test "folds: za toggles, zM/zR close/open all, j/k skip closed folds" {
 
     // two foldable blocks (indent-based detection) + non-foldable top line
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}fold.py", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}fold.py", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -12738,7 +12749,7 @@ test "terminal: <M-r> float opens, keys forward, Esc returns, <M-w>/<M-e> switch
     // screen while the embedded terminal is open. The terminal spawns with
     // cwd = the buffer's directory (/tmp).
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}term.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}term.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -12916,7 +12927,7 @@ test "terminal: :q! quits cleanly while the terminal is still open" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}termq.txt", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}termq.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
@@ -13062,7 +13073,7 @@ fn wsQuit(sess: *Session, grid: *Grid) !void {
 /// (the smoke test defers the delete at test scope, not here — deleting
 /// here would remove the file before oz ever opens it).
 fn wsTempFile(io: Io, name_buf: *[128:0]u8, suffix: []const u8, content: []const u8) ![:0]const u8 {
-    const name = try std.fmt.bufPrintZ(name_buf, "/tmp/oz_e2e_{d}_{d}{s}", .{ linux.getpid(), tmp_counter, suffix });
+    const name = try bufPrintZ(name_buf, "/tmp/oz_e2e_{d}_{d}{s}", .{ linux.getpid(), tmp_counter, suffix });
     tmp_counter += 1;
     const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
     defer f.close(io);
@@ -13436,16 +13447,16 @@ test "workspace: filetree expansion state is per-workspace" {
     // directory contents: proj/{aa,bb}/leaf.txt — expanding `aa` reveals
     // exactly one new row ("leaf.txt") under it.
     var root_buf: [128:0]u8 = undefined;
-    const root = try std.fmt.bufPrintZ(&root_buf, "/tmp/oz_ft_{d}", .{linux.getpid()});
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_ft_{d}", .{linux.getpid()});
     defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
     var p_buf: [160:0]u8 = undefined;
-    const p_aa = try std.fmt.bufPrintZ(&p_buf, "{s}/aa", .{root});
+    const p_aa = try bufPrintZ(&p_buf, "{s}/aa", .{root});
     try std.Io.Dir.cwd().createDirPath(io, p_aa);
     var p2_buf: [160:0]u8 = undefined;
-    const p_bb = try std.fmt.bufPrintZ(&p2_buf, "{s}/bb", .{root});
+    const p_bb = try bufPrintZ(&p2_buf, "{s}/bb", .{root});
     try std.Io.Dir.cwd().createDirPath(io, p_bb);
     var pf_buf: [176:0]u8 = undefined;
-    const p_leaf = try std.fmt.bufPrintZ(&pf_buf, "{s}/aa/leaf.txt", .{root});
+    const p_leaf = try bufPrintZ(&pf_buf, "{s}/aa/leaf.txt", .{root});
     {
         const f = try std.Io.Dir.cwd().createFile(io, p_leaf, .{});
         f.close(io);
@@ -13499,7 +13510,7 @@ test "workspace: <leader>e roots the file tree at the opened file's directory" {
     // the tree were still cwd-rooted it would show build.zig/src/…; rooted
     // at the opened file's directory it shows only this project's file.
     var ra_buf: [128:0]u8 = undefined;
-    const ra = try std.fmt.bufPrintZ(&ra_buf, "/tmp/oz_pf_{d}", .{linux.getpid()});
+    const ra = try bufPrintZ(&ra_buf, "/tmp/oz_pf_{d}", .{linux.getpid()});
     defer std.Io.Dir.cwd().deleteTree(io, ra) catch {};
     try std.Io.Dir.cwd().createDirPath(io, ra);
     try writeTestFile(io, ra, "pfr_marker.txt", "PFR-MARKER\n");
@@ -13516,7 +13527,7 @@ test "workspace: <leader>e roots the file tree at the opened file's directory" {
 
     // Open a file in the project dir: the workspace's root becomes that dir.
     var pa_buf: [176:0]u8 = undefined;
-    const pa = try std.fmt.bufPrintZ(&pa_buf, "{s}/pfr_marker.txt", .{ra});
+    const pa = try bufPrintZ(&pa_buf, "{s}/pfr_marker.txt", .{ra});
     try sess.send(":e ");
     try sess.send(pa);
     try sess.send("\r");
@@ -13541,7 +13552,7 @@ test "workspace: <leader>sf fuzzy-searches the opened file's project" {
 
     // Same setup: a project dir outside cwd with a distinctive file name.
     var ra_buf: [128:0]u8 = undefined;
-    const ra = try std.fmt.bufPrintZ(&ra_buf, "/tmp/oz_pp_{d}", .{linux.getpid()});
+    const ra = try bufPrintZ(&ra_buf, "/tmp/oz_pp_{d}", .{linux.getpid()});
     defer std.Io.Dir.cwd().deleteTree(io, ra) catch {};
     try std.Io.Dir.cwd().createDirPath(io, ra);
     try writeTestFile(io, ra, "ppr_unique.txt", "PPR-UNIQUE\n");
@@ -13557,7 +13568,7 @@ test "workspace: <leader>sf fuzzy-searches the opened file's project" {
     try std.testing.expect(dash);
 
     var pa_buf: [176:0]u8 = undefined;
-    const pa = try std.fmt.bufPrintZ(&pa_buf, "{s}/ppr_unique.txt", .{ra});
+    const pa = try bufPrintZ(&pa_buf, "{s}/ppr_unique.txt", .{ra});
     try sess.send(":e ");
     try sess.send(pa);
     try sess.send("\r");
@@ -13655,7 +13666,7 @@ test "popup geometry: hover/completion borders align; markdown rendered" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}popup.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}popup.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {

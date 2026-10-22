@@ -10,7 +10,7 @@
 
 | # | 决策 | 结论 | 理由 |
 |---|------|------|------|
-| D1 | 终端层 | **用 vaxis**（flow 同款，neurocyte fork，Zig 0.16） | 纯 Zig、静态链接；自带 kitty 键盘协议、鼠标、24bit 色、屏幕 diff 渲染。省下数月工作量，把精力放在编辑核心 |
+| D1 | 终端层 | **用 vaxis**（flow 同款，neurocyte fork，Zig 0.17） | 纯 Zig、静态链接；自带 kitty 键盘协议、鼠标、24bit 色、屏幕 diff 渲染。省下数月工作量，把精力放在编辑核心 |
 | D2 | 依赖策略 | **允许精选第三方库**，业务核心自研 | tree-sitter 绑定、JSON 解析等成熟组件直接用；buffer/undo/模式系统/LSP 状态机自己写 |
 | D3 | 文档存储 | **PieceTable**（参考 flow 的 hybrid rope/piece-table） | 大文件友好、编辑 O(1) 局部更新、undo 记录片段级操作代价小 |
 | D4 | Undo | 线性栈 + 操作合并，预留 undo tree | spec 只要求"无限 undo/redo + `.` 重复"，不做 vim 式分支撤销 |
@@ -62,7 +62,7 @@ DAP、插件系统/运行时脚本、宏与寄存器（用 yank 历史替代）�
 
 | 组件 | 选择 | 说明 |
 |------|------|------|
-| 语言/工具链 | Zig 0.16.0 | 与 flow 同版本，`std.Io` API |
+| 语言/工具链 | Zig 0.17.0 | `std.Io` API；vaxis 走 0.17 兼容的 vendor |
 | 终端层 | `vaxis` 0.6（neurocyte fork） | 屏幕网格、diff 渲染、kitty 键盘协议、鼠标、resize、光标形状 |
 | 语法高亮 | tree-sitter C runtime + vendored parsers | 集成方式参考 flow 的 `flow-syntax` 模块与 build 选项 `use_tree_sitter` |
 | JSON | `std.json`（Zig 内置） | LSP JSON-RPC、配置 |

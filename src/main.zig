@@ -32,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
     // The libc allocator keeps dev builds responsive; safety checks in the
     // code itself are unaffected. Release builds already use c_allocator.
     var app_init = init;
-    if (builtin.mode == .Debug and builtin.link_libc) app_init.gpa = std.heap.c_allocator;
+    if (builtin.mode == .debug and builtin.link_libc) app_init.gpa = std.heap.c_allocator;
     var app = try App.create(app_init);
     defer app.destroy();
 

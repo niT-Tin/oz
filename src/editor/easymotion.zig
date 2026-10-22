@@ -161,14 +161,16 @@ test "easymotion find: two-char query, no cross-line, repeats" {
 
 test "easymotion find: labels a..z then A..Z in reading order, capped at 52" {
     // 30 matches -> 'a'..'z' then 'A','B','C','D'
-    var pt = try PieceTable.init(t.allocator, "a" ** 30);
+    const rep30: [30]u8 = @splat('a');
+    var pt = try PieceTable.init(t.allocator, &rep30);
     defer pt.deinit();
     var pos30: [30]u32 = undefined;
     for (&pos30, 0..) |*p, i| p.* = @intCast(i);
     try expectFind(&pt, "a", &pos30);
 
     // 60 matches -> only the first 52 ('a'..'z' then 'A'..'Z'), extras dropped
-    var pt2 = try PieceTable.init(t.allocator, "a" ** 60);
+    const rep60: [60]u8 = @splat('a');
+    var pt2 = try PieceTable.init(t.allocator, &rep60);
     defer pt2.deinit();
     var pos52: [52]u32 = undefined;
     for (&pos52, 0..) |*p, i| p.* = @intCast(i);

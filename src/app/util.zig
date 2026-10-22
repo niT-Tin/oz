@@ -32,7 +32,7 @@ pub fn replaceLiteral(out: *std.ArrayList(u8), allocator: std.mem.Allocator, hay
 
 /// Number of syntax.Style variants — sizes the per-frame style palette used
 /// by the grep picker preview (styles keyed by the enum's ordinal).
-pub const syntax_style_count = @typeInfo(syntax.Style).@"enum".fields.len;
+pub const syntax_style_count = @typeInfo(syntax.Style).@"enum".field_names.len;
 
 /// Snap a byte offset back to the start of the UTF-8 char containing it.
 /// fzy match positions are byte indices that can land on a continuation byte

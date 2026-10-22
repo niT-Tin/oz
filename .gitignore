@@ -6,3 +6,10 @@ zig-pkg/
 .zig-global-cache
 .zig-global-cache/
 .wt-*/
+
+# local toolchains / large vendored sources / agent worktrees
+.tools/
+vendor/tree-sitter/
+.zig-cache-*/
+.zig-global-cache-*/
+.zig-*.log

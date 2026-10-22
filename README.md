@@ -74,9 +74,10 @@ A terminal text editor written in Zig.
 
 ## Build & run
 
-Requires Zig 0.16.0:
+Requires Zig 0.17.0:
 
 ```sh
+./scripts/bootstrap-deps.sh                # fetch tree-sitter (~50MB download, ~1GB on disk; once)
 zig build                                    # dev build
 zig build -Doptimize=ReleaseFast -Dstrip     # release build (daily driver)
 zig build test                               # unit tests
