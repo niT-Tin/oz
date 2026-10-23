@@ -35,7 +35,7 @@ const kindGlyph = App.kindGlyph;
 
 // ---- rendering ----
 
-pub const filetree_width: u32 = 25;
+pub const filetree_width: u32 = 30;
 
 /// Tab-bar rows: one per column-overlap layer of the pane layout.
 /// Panes whose column spans overlap (horizontal splits stack
@@ -1589,47 +1589,68 @@ pub fn renderFiletree(self: *App, a: std.mem.Allocator, win: vaxis.Window, heigh
         const ri = ft_top_i + k;
         const frow = self.filetree_rows.items[ri];
         const node = frow.node;
-        const indent = frow.depth * 2;
-        // content = indent + icon (1 cell) + space + name; a
-        // too-wide name is truncated from the RIGHT with "…" (never
-        // head-truncated). The name budget excludes the right-border
-        // column (the last inner cell), which the border draws over
-        // afterwards, and the gap cell between icon and name — the
-        // gap keeps the glyph from crowding the text (a Nerd Font
-        // icon right against a name reads as a tiny broken glyph).
+        // nvim/snacks-explorer geometry: one cell of padding inside the
+        // border, then per-level guides ("│ " or "  "), then the branch
+        // ("├╴"/"└╴"), then icon + space + name. The terminal cursor sits
+        // on the padding cell (col 1), not on the icon, so the block cursor
+        // no longer touches the glyph.
+        const usable = ft_width - 2; // cells between the two borders
         const icon = if (node.is_dir) icons.folder(node.expanded) else icons.forPath(node.path, false);
-        const avail = (inner_w -| 1) -| @as(usize, indent) -| 1 -| 1;
-        var name = node.name;
-        var ellipsized = false;
-        if (name.len > avail) {
-            name = name[0..avail -| 1];
-            ellipsized = true;
+
+        // ancestors, top-down. frow.depth is the number of visible
+        // ancestors (the root itself is not a row).
+        var anc_stack: [256]@TypeOf(node) = undefined;
+        const an = @min(frow.depth, anc_stack.len);
+        var p = node.parent;
+        var ai: usize = 0;
+        while (ai < an) : (ai += 1) {
+            anc_stack[an - 1 - ai] = p.?;
+            p = p.?.parent;
         }
+
+        const last_sibling = blk: {
+            const par = node.parent orelse break :blk true;
+            if (par.children.items.len == 0) break :blk true;
+            break :blk par.children.items[par.children.items.len - 1] == node;
+        };
+
+        var line = std.ArrayList(u8).empty;
+        try line.append(a, ' '); // leading padding (cursor cell)
+        for (anc_stack[0..an]) |anc| {
+            const anc_last = blk: {
+                const par = anc.parent orelse break :blk true;
+                if (par.children.items.len == 0) break :blk true;
+                break :blk par.children.items[par.children.items.len - 1] == anc;
+            };
+            try line.appendSlice(a, if (anc_last) "  " else "│ ");
+        }
+        try line.appendSlice(a, if (last_sibling) "└╴" else "├╴");
+        const prefix_cells: u32 = 1 + 2 * @as(u32, @intCast(an)) + 2;
+
+        // name budget in CELLS (CJK names are 2 cells/glyph)
+        const avail_name: u32 = usable -| prefix_cells -| 1 -| 1;
+        var shown = buffer.utf8.truncateWidth(node.name, avail_name);
+        const ellipsized = shown.len < node.name.len;
+        if (ellipsized and avail_name > 0) {
+            shown = buffer.utf8.truncateWidth(node.name, avail_name - 1);
+        }
+        const shown_cells = buffer.utf8.displayWidth(shown);
+        const content_cells: u32 = prefix_cells + 1 + (if (shown_cells > 0) 1 + shown_cells + @as(u32, if (ellipsized) 1 else 0) else 0);
+
         const style: vaxis.Style = if (ri == self.filetree_sel)
             .{ .bg = .{ .rgb = self.theme.bg_sel }, .fg = .{ .rgb = self.theme.fg } }
         else
             .{ .bg = .{ .rgb = self.theme.bg }, .fg = .{ .rgb = self.theme.fg } };
-        // Pad to the full inner width: the row background (plain and
-        // selected alike) must span the panel edge to edge. NOTE:
-        // vaxis cells REFERENCE the segment text — it must outlive
-        // vx.render() — so the padding is arena-allocated, never a
-        // stack buffer (a stack row_buf made every row render the
-        // LAST file's name).
+
         var segs = std.ArrayList(vaxis.Segment).empty;
-        if (indent > 0) {
-            const pad = try a.alloc(u8, indent);
-            @memset(pad, ' ');
-            try segs.append(a, .{ .text = pad, .style = style });
-        }
+        try segs.append(a, .{ .text = line.items, .style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = style.bg } });
         try segs.append(a, .{ .text = icon.glyph, .style = .{ .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) }, .bg = style.bg } });
-        if (name.len > 0) {
+        if (shown_cells > 0) {
             try segs.append(a, .{ .text = " ", .style = style });
-            try segs.append(a, .{ .text = name, .style = style });
+            try segs.append(a, .{ .text = shown, .style = style });
+            if (ellipsized) try segs.append(a, .{ .text = "…", .style = style });
         }
-        if (ellipsized) try segs.append(a, .{ .text = "…", .style = style });
-        // count cells: indent spaces + icon (1) + gap (1) + name + "…"
-        const content_len = indent + 2 + name.len + @as(usize, if (ellipsized) 1 else 0);
-        const pads = try a.alloc(u8, inner_w -| @min(content_len, inner_w));
+        const pads = try a.alloc(u8, usable -| content_cells);
         @memset(pads, ' ');
         if (pads.len > 0) try segs.append(a, .{ .text = pads, .style = style });
         _ = win.print(segs.items, .{ .row_offset = @intCast(ft_top + 1 + k), .col_offset = @intCast(inner_left), .wrap = .none });

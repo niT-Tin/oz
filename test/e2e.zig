@@ -3054,6 +3054,9 @@ test "file tree: <leader>e shows files, Enter opens one" {
     // dirs come first: row 2 (first entry row) is a directory with the
     // closed folder glyph; "docs" is the first sorted first-level dir
     try std.testing.expect(std.mem.indexOf(u8, grid.rowText(2), "docs") != null);
+    // nvim/snacks geometry: border, one padding cell (the cursor sits here),
+    // then the tree branch and the icon — cursor and glyph never share a cell.
+    try std.testing.expect(std.mem.startsWith(u8, grid.rowText(2), "│ ├╴"));
 
     // Enter on the selected directory (docs) expands it — its only child
     // (workspace-plan) appears, and the folder glyph flips open
