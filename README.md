@@ -72,6 +72,23 @@ A terminal text editor written in Zig.
 
 ![Embedded terminal (Alt+r floating layout)](docs/screenshots/terminal.png)
 
+**AI chat (M1)**
+
+- `<leader>a` toggles a centered, modal chat panel (chat only — no tools, file edits or inline suggestions yet)
+- Streaming OpenAI-compatible completions (`POST {base_url}/chat/completions`, SSE); Markdown + fenced code rendering, auto-scroll
+- Editor context is attached automatically: current file path, visual selection with its 1-based line range, otherwise the cursor line ± a small window (capped at 8 KB)
+- Keys: Enter send · Esc close (conversation stays in memory) · Ctrl+c cancel stream · Ctrl+n clear thread · Ctrl+j/k scroll one line · PageUp/PageDown scroll a page
+- Configuration via env (read when the panel opens):
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `OZ_AI_BASE_URL` | `http://127.0.0.1:11434/v1` | OpenAI-compatible base URL (Ollama / LM Studio / DeepSeek / gateways) |
+  | `OZ_AI_MODEL` | `qwen2.5-coder:7b` | Model name |
+  | `OZ_AI_API_KEY` | unset | Optional `Authorization: Bearer …`; never logged or persisted |
+  | `OZ_AI_SYSTEM` | built-in | Optional system-prompt override |
+
+  Example: `OZ_AI_BASE_URL=https://api.deepseek.com/v1 OZ_AI_MODEL=deepseek-chat OZ_AI_API_KEY=sk-… oz`.
+
 ## Build & run
 
 Requires Zig 0.17.0:

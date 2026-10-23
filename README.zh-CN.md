@@ -72,6 +72,23 @@
 
 ![内嵌终端（Alt+r 浮动布局）](docs/screenshots/terminal.png)
 
+**AI Chat（M1）**
+
+- `<leader>a` 打开居中的模态聊天面板（仅聊天：暂不支持 tools、改文件或行内补全）
+- 流式 OpenAI 兼容补全（`POST {base_url}/chat/completions`，SSE）；支持 Markdown 与 fenced 代码块渲染、自动滚动
+- 自动附带编辑器上下文：当前文件路径；有可视选区时附带选中文本与 1-based 行号范围；否则附带光标行 ± 少量上下文（总上限 8 KB）
+- 按键：Enter 发送 · Esc 关闭（会话保留在内存中）· Ctrl+c 取消流 · Ctrl+n 清空会话 · Ctrl+j/k 单行滚动 · PageUp/PageDown 翻页
+- 通过环境变量配置（打开面板时读取）：
+
+  | 变量 | 默认值 | 含义 |
+  |---|---|---|
+  | `OZ_AI_BASE_URL` | `http://127.0.0.1:11434/v1` | OpenAI 兼容 base URL（Ollama / LM Studio / DeepSeek / 网关） |
+  | `OZ_AI_MODEL` | `qwen2.5-coder:7b` | 模型名 |
+  | `OZ_AI_API_KEY` | 未设置 | 可选 `Authorization: Bearer …`，不会记录或持久化 |
+  | `OZ_AI_SYSTEM` | 内置 | 可选 system prompt 覆盖 |
+
+  示例：`OZ_AI_BASE_URL=https://api.deepseek.com/v1 OZ_AI_MODEL=deepseek-chat OZ_AI_API_KEY=sk-… oz`。
+
 ## 构建与运行
 
 需要 Zig 0.17.0：

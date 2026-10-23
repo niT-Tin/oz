@@ -653,6 +653,7 @@ Client = {
 - CursorHold 单词自动高亮（120ms）、多主题切换（kanagawa-wave 默认）
 - 大文件降级策略落地
 - AI（spec §9）：行内补全源（Copilot/兼容 API，限 3 条与补全菜单合并）、chat 浮窗（选区提问）、外部 LLM API（DeepSeek 等）滚动翻译等内置能力
+  - [x] M1 chat 已提前落地（`<leader>a`、流式 OpenAI 兼容 API、选区上下文、取消/错误降级；详见 §17）
 
 **M4 通过 = spec 全量功能落地。**
 
@@ -705,3 +706,57 @@ Client = {
 1. 评审本设计（重点：§2 选型、§3 架构、§13 顺序）
 2. 确认后开始 **M0**：先搭 build（vaxis 依赖）+ 事件循环骨架，把当前 `src/main.zig` 的 kilo 风格代码迁移进新结构
 3. 每个 Milestone 结束提交一次可运行版本（git tag）
+
+---
+
+## 17. AI Chat（M1，`feat/ai-chat`）
+
+> 目标：先交付一个可日常使用的 **chat-first** 面板；tools / 自动改文件 / inline assistant 留到 M2/M3。与 spec §9 的"AI 能力"相比，本节只覆盖 M1 范围。
+
+### 17.1 模块划分
+
+```
+src/ai/
+  sse.zig      增量 SSE 解析（data: 多行、CRLF/LF、[DONE]、任意字节切分）
+  openai.zig   request JSON 构造、delta 解析、API error body 解析
+  context.zig  有界编辑器上下文（路径 / 选区 / 光标窗口，UTF-8 安全截断）
+  config.zig   纯环境变量解析（OZ_AI_*）
+  client.zig   单条在飞流：后台线程 + Mutex 队列 + 原子取消
+  panel.zig   模态面板按键分类（纯函数，可单测）
+src/app/ai.zig  会话状态 / 键处理 / 请求生命周期 / 渲染
+```
+
+- `src/ai/*` 不依赖 App，全部可单测；`app/ai.zig` 通过 App 字段方法组接入（`Aliases` 在 `app.zig`）。
+- 会话状态 `App.ai` 是 **session 级**（不随 workspace 切换）：关闭面板保留会话，workspace 切换不动 AI thread。
+- UI：居中 float，宽 `min(96, cols-4)`、高 `min(28, rows-4)`；圆角边框 + ` AI ` 标题 + 一行状态（model + idle/streaming…/cancelled/error）+ transcript + 底部 `❯ ` prompt。所有面板 cell 统一 `bg_float`，逐行按 **cell** 补齐，边框复用 filetree/picker 的宽度对齐经验。
+
+### 17.2 Provider 协议
+
+- `POST {OZ_AI_BASE_URL}/chat/completions`，body：
+  `{"model": ..., "stream": true, "messages":[{"role":"system"|"user"|"assistant","content":...}]}`。
+- SSE：只消费 `data:` 行；`[DONE]` 或 `choices[0].finish_reason` 结束；解析 `choices[0].delta.content`；malformed JSON 忽略（不让一条坏 chunk 终止整条流）。
+- 非 2xx：优先解析 `{"error":{"message":...}}`，否则用响应体前 8 KiB，面板显示一行 `HTTP <code>: <message>`。
+- TLS：`std.http.Client` + 标准 CA bundle（`rescan`），**不关闭证书校验**。API key 仅存在于 request 头 / 进程内存，不写日志、不落盘。
+- 每帧由 `App.run` 的 `drainAi()` 排空事件；后台 worker 只把 **owned bytes**（job spec / delta / error）跨线程传递，UI 线程永不阻塞。
+
+### 17.3 取消与上下文
+
+- Ctrl+c：主线程立刻置 `cancelled` 并 `client.requestCancel()`；此后排空到的事件全部丢弃，worker 在下一个 chunk 边界退出。Ctrl+n 清空会话并同样取消。
+- 上下文：始终 `Current file: <path>`；有 visual 选区时 `Selected lines A-B:` + 选中文本；否则 `Cursor line: N` + `Context (lines A-B):`（光标 ±10 行）。总输出 ≤8 KiB，按 UTF-8 边界截断，追加 `… [truncated]`。
+- 自动滚动：streaming 时跟随底部；Ctrl+j/k 或 PageUp/PageDown 手动滚动后关闭自动跟随，下一次发送重新开启。
+
+### 17.4 测试接缝（test-only，不对外文档化）
+
+`OZ_AI_MOCK_DIR=<dir>`：client 完全跳过 HTTP，改为
+
+1. 把**原始 request body** 原子写入 `<dir>/request.json`（temp + rename）；
+2. 若 `<dir>/error.txt` 存在，推送该文本为 error 事件并结束；
+3. 以 32 B / ~8 ms 的节奏回放 `<dir>/stream.sse`，让 e2e 能观察到真正的增量帧。
+
+该接缝用于 `zig build e2e` 的确定性断言（request body 含 model/prompt/选区、流式增量、取消、error）；生产路径仍是真实 HTTP。
+
+### 17.5 Roadmap
+
+- **M1（本次）**：chat 面板、流式 SSE、上下文、取消、错误降级、mock e2e。
+- **M2**：inline assistant / ghost suggestion；chat 中展示 diff 预览并以 hunk 为单位接受/拒绝（复用 git preview 的 diff 解析与 float 几何）；多轮上下文压缩。
+- **M3**：agent tools（read/search/apply edit，带权限确认）、ACP client、MCP server 接入；tool-call streaming 复用同一 SSE/队列骨架。

@@ -4927,9 +4927,9 @@ test "file tree: sidebar scrolls as the selection moves past the window" {
     try std.testing.expect(std.mem.indexOf(u8, grid.rowText(2), "docs") != null);
 
     // Expand enough of the tree to overflow the ~20 visible sidebar rows:
-    // l on docs (children), 5j to src + l (app first), j to app + l
-    // (its children) → more than the ~20 visible rows.
-    try sess.send("ljjjjjljl");
+    // l on docs (children), 5j to src + l, j to src/ai (new M1 module),
+    // j to app + l (its children) → more than the ~20 visible rows.
+    try sess.send("ljjjjjljjl");
     waited = 0;
     while (!grid.contains("block_insert.zig")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
@@ -7145,7 +7145,14 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    // src's first child is now app; step over it to buffer
+    // src's first child is now ai; step over it and app to buffer
+    try sess.send("j");
+    while (true) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
+        if (n == 0) break;
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
     try sess.send("j");
     while (true) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
@@ -13873,5 +13880,355 @@ test "popup geometry: hover/completion borders align; markdown rendered" {
     try sess.send("\x1b");
     try gridWaitFor(&sess, &grid, "NORMAL", 5000);
     const exit_code = try sess.commandAndWaitExit(":qa\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+// ---------------------------------------------------------------------------
+// M1 AI chat
+// ---------------------------------------------------------------------------
+
+fn aiMockDir(io: Io, buf: []u8) ![:0]u8 {
+    const dir = try bufPrintZ(buf, "/tmp/oz_ai_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    try std.Io.Dir.createDirAbsolute(io, dir, .default_dir);
+    return dir;
+}
+
+fn aiWriteFile(io: Io, dir: []const u8, name: []const u8, text: []const u8) !void {
+    var buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name });
+    var f = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+    defer f.close(io);
+    try f.writeStreamingAll(io, text);
+}
+
+fn aiReadFile(io: Io, alloc: std.mem.Allocator, dir: []const u8, name: []const u8) ![]u8 {
+    var buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name });
+    return std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, path, alloc, .limited(64 * 1024));
+}
+
+/// Top border row of the AI panel (the row containing the " AI " title).
+fn aiPanelTop(grid: *Grid) ?usize {
+    var r: usize = 0;
+    while (r < grid.rows) : (r += 1) {
+        if (std.mem.indexOf(u8, grid.rowText(r), " AI ") != null) return r;
+    }
+    return null;
+}
+
+/// Panel geometry: (top, bottom, left, right) from the drawn rounded box.
+fn aiPanelRect(grid: *Grid, top: usize) !struct { top: usize, bottom: usize, left: usize, right: usize } {
+    const left = glyphCol(grid, top, "╭", 0) orelse return error.TestUnexpectedResult;
+    const right = glyphCol(grid, top, "╮", 0) orelse return error.TestUnexpectedResult;
+    const bottom = try assertPopupBox(grid, top);
+    return .{ .top = top, .bottom = bottom, .left = left, .right = right };
+}
+
+fn aiAssertSolidBg(grid: *Grid, rect: anytype, bg: u32) !void {
+    var r = rect.top;
+    while (r <= rect.bottom) : (r += 1) {
+        var c = rect.left;
+        while (c <= rect.right) : (c += 1) {
+            if (grid.bg_buf[r * grid.cols + c] != bg) {
+                std.debug.print("panel bg gap at row {d} col {d}\n", .{ r, c });
+                grid.dump();
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
+fn aiCountInRows(grid: *Grid, from: usize, to: usize, needle: u8) usize {
+    var n: usize = 0;
+    var r = from;
+    while (r < to and r < grid.rows) : (r += 1) {
+        for (grid.rowText(r)) |c| {
+            if (c == needle) n += 1;
+        }
+    }
+    return n;
+}
+
+test "ai: mock stream renders the panel, streams a reply, request has model/prompt/context" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}ai.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const answer = 42;\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try aiWriteFile(io, dir, "stream.sse", "data: {\"choices\":[{\"delta\":{\"content\":\"mock \"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\"reply\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
+
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{ mock_env, "OZ_AI_MODEL=mock-model" });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+
+    // <leader>a opens the centered panel.
+    try sess.send(" a");
+    try gridWaitFor(&sess, &grid, " AI ", 4000);
+    try gridWaitFor(&sess, &grid, "mock-model", 4000);
+    try gridWaitFor(&sess, &grid, "❯ ", 2000);
+    var top = aiPanelTop(&grid).?;
+    var rect = try aiPanelRect(&grid, top);
+    // width = min(96, 80-4) = 76, height = min(28, 24-4) = 20, centered
+    try std.testing.expectEqual(@as(usize, 76), rect.right - rect.left + 1);
+    try std.testing.expectEqual(@as(usize, 20), rect.bottom - rect.top + 1);
+    try aiAssertSolidBg(&grid, rect, packRgb(0x22, 0x32, 0x49));
+
+    // Type a prompt (modal: it must not reach the editor buffer) and send.
+    try sess.send("hello");
+    try gridWaitFor(&sess, &grid, "hello", 2000);
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "mock reply", 8000);
+    try gridWaitFor(&sess, &grid, "idle", 4000);
+
+    // Still rectangular after the transcript grew.
+    top = aiPanelTop(&grid).?;
+    rect = try aiPanelRect(&grid, top);
+    try aiAssertSolidBg(&grid, rect, packRgb(0x22, 0x32, 0x49));
+
+    const req = try aiReadFile(io, alloc, dir, "request.json");
+    defer alloc.free(req);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"model\":\"mock-model\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"stream\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, name) != null);
+    // The editor buffer is untouched.
+    try std.testing.expect(!grid.contains("helloconst"));
+    try std.testing.expect(grid.contains("const answer = 42"));
+
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, " AI ", 3000);
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "ai: visual selection context is included in the request body" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}aiv.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "alpha\nbeta\ngamma\ndelta\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try aiWriteFile(io, dir, "stream.sse", "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n");
+
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{mock_env});
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+
+    // V j selects lines 1-2, then <leader>a opens the panel with the
+    // selection still active.
+    try sess.send("Vj a");
+    try gridWaitFor(&sess, &grid, " AI ", 4000);
+    try sess.send("what");
+    try gridWaitFor(&sess, &grid, "what", 2000);
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "ok", 6000);
+    try gridWaitFor(&sess, &grid, "idle", 4000);
+
+    const req = try aiReadFile(io, alloc, dir, "request.json");
+    defer alloc.free(req);
+    try std.testing.expect(std.mem.indexOf(u8, req, name) != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "Selected lines 1-2:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "alpha\\nbeta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "what") != null);
+
+    // Esc closes the panel (separate writes: ESC + ':' would be parsed as
+    // an alt sequence), Esc leaves visual, then :q exits.
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, " AI ", 3000);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "NORMAL", 3000);
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "ai: Ctrl+c cancels a stream without further transcript changes" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}aic.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "cancel me\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var stream = std.ArrayList(u8).empty;
+    defer stream.deinit(alloc);
+    var i: usize = 0;
+    while (i < 600) : (i += 1) {
+        try stream.appendSlice(alloc, "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n");
+    }
+    try aiWriteFile(io, dir, "stream.sse", stream.items);
+
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{mock_env});
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try sess.send(" a");
+    try gridWaitFor(&sess, &grid, " AI ", 4000);
+    try sess.send("go\r");
+    try gridWaitFor(&sess, &grid, "streaming…", 4000);
+    // Let some chunks land, then cancel.
+    var waited: i32 = 0;
+    while (waited < 400) : (waited += 100) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n > 0) {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+    }
+    try sess.send("\x03");
+    try gridWaitFor(&sess, &grid, "cancelled", 4000);
+    const rect = try aiPanelRect(&grid, aiPanelTop(&grid).?);
+    const transcript_from = rect.top + 2;
+    const transcript_to = rect.bottom - 2;
+    const before = aiCountInRows(&grid, transcript_from, transcript_to, 'x');
+    // Drain anything the UI paints after the cancel; the transcript must
+    // not change any more.
+    var ticks: usize = 0;
+    while (ticks < 6) : (ticks += 1) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n > 0) {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+    }
+    const after = aiCountInRows(&grid, transcript_from, transcript_to, 'x');
+    try std.testing.expectEqual(before, after);
+    try std.testing.expect(before > 0);
+
+    // Panel remains usable.
+    try sess.send("still");
+    try gridWaitFor(&sess, &grid, "still", 2000);
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, " AI ", 3000);
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "ai: mock error shows a one-line error and leaves the editor usable" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}aie.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "error test\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try aiWriteFile(io, dir, "error.txt", "mock boom\n");
+    try aiWriteFile(io, dir, "stream.sse", "data: [DONE]\n\n");
+
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{mock_env});
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try sess.send(" a");
+    try gridWaitFor(&sess, &grid, " AI ", 4000);
+    try sess.send("hi\r");
+    try gridWaitFor(&sess, &grid, "mock boom", 6000);
+    try std.testing.expect(grid.contains("error:"));
+    // Single line: the panel is still rectangular and the editor works.
+    _ = try aiPanelRect(&grid, aiPanelTop(&grid).?);
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, " AI ", 3000);
+    const exit_code = try sess.commandAndWaitExit(":q\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "ai: Esc closes the panel and :q quits" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}aix.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "escape test\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try aiWriteFile(io, dir, "stream.sse", "data: [DONE]\n\n");
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{mock_env});
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+
+    try sess.send(" a");
+    try gridWaitFor(&sess, &grid, " AI ", 4000);
+    try gridWaitFor(&sess, &grid, "❯ ", 2000);
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "❯ ", 3000);
+    try std.testing.expect(!grid.contains(" AI "));
+
+    const exit_code = try sess.commandAndWaitExit(":q\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
