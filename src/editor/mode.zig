@@ -538,6 +538,7 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
                 return .pending;
             },
             'o' => return emitAction(state, .document_outline), // <leader>o outline
+            'a' => return emitAction(state, .ai_toggle), // <leader>a AI chat
             'h' => {
                 state.pending_leader_h = true; // <leader>h — git hunk family
                 return .pending;
@@ -934,6 +935,7 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .term_float => emitAction(state, .term_float),
         .term_bottom => emitAction(state, .term_bottom),
         .term_right => emitAction(state, .term_right),
+        .ai_toggle => emitAction(state, .ai_toggle),
         .next_buffer => emitAction(state, .next_buffer),
         .prev_buffer => emitAction(state, .prev_buffer),
         .leader => blk: {
@@ -1135,7 +1137,7 @@ fn emitAction(state: *State, action: KeyEvent.ActionId) Result {
     // za/zo/zc/zR/zM fold commands are view/buffer state (no edit), so '.'
     // must not replay them either.
     switch (action) {
-        .undo, .redo, .repeat_last, .normal_mode, .insert_char, .scroll_cursor_center, .scroll_cursor_top, .scroll_cursor_bottom, .fold_toggle, .fold_open, .fold_close, .fold_open_all, .fold_close_all, .term_float, .term_bottom, .term_right, .workspace_new, .workspace_pick, .workspace_rename, .workspace_delete, .workspace_kill_session, .workspace_prev, .workspace_next => {},
+        .undo, .redo, .repeat_last, .normal_mode, .insert_char, .scroll_cursor_center, .scroll_cursor_top, .scroll_cursor_bottom, .fold_toggle, .fold_open, .fold_close, .fold_open_all, .fold_close_all, .term_float, .term_bottom, .term_right, .ai_toggle, .workspace_new, .workspace_pick, .workspace_rename, .workspace_delete, .workspace_kill_session, .workspace_prev, .workspace_next => {},
         else => {
             state.last_action = action;
             state.last_count = count;
@@ -1568,6 +1570,15 @@ test "SPC TAB dispatches the 7 workspace actions (not '.'-repeatable)" {
         try testing.expectEqual(c[1], r.action.action);
         try testing.expectEqual(@as(?Repeat, null), s.last_repeat);
     }
+}
+
+test "SPC a dispatches the AI chat toggle (not '.'-repeatable)" {
+    var s = State.init();
+    try testing.expectEqual(.pending, tag(handle(&s, press(' '), Keymaps.normal)));
+    const r = handle(&s, press('a'), Keymaps.normal);
+    try testing.expectEqual(.action, tag(r));
+    try testing.expectEqual(KeyEvent.ActionId.ai_toggle, r.action.action);
+    try testing.expectEqual(@as(?Repeat, null), s.last_repeat);
 }
 
 test "surround: ysw' adds with motion, ds( deletes, cs'\" changes" {

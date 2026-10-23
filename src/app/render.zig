@@ -2177,6 +2177,9 @@ pub fn render(self: *App) !void {
         // here too, or <leader>e on the dashboard shows a stale screen
         if (self.filetree_active) try renderFiletree(self, a, win, height);
         if (term.supported) try self.drawTerm(a, win);
+        // <leader>a works on the dashboard too: draw the modal AI panel
+        // last and let it place the cursor in its prompt.
+        if (self.ai.active) try self.drawAiPanel(a, win);
         try self.vx.render(self.tty.writer());
         return;
     }
@@ -3156,6 +3159,15 @@ pub fn render(self: *App) !void {
         _ = win.print(&branch_seg, .{ .row_offset = @intCast(height - 1), .col_offset = @intCast(status.len), .wrap = .none });
     }
 
+    // AI chat panel: modal and topmost (above hover/pickers), drawn after
+    // the status bar so its own rows stay a solid bg_float block. Its prompt
+    // owns the terminal cursor while open.
+    if (self.ai.active) {
+        try self.drawAiPanel(a, win);
+        try self.vx.render(self.tty.writer());
+        return;
+    }
+
     // terminal focused: the widget's draw() already placed the child's
     // cursor — the editor cursor must not overwrite it
     if (term.supported) {
@@ -3280,6 +3292,10 @@ pub fn run(self: *App) !void {
                 git_ready = true;
             }
         }
+        // AI stream events: append deltas / settle status before the frame
+        // renders, like the LSP/git slots above. Repaint immediately so
+        // tokens appear incrementally.
+        const ai_ready = self.drainAi() catch false;
         // A finished async LSP attach installs its client (and opens the
         // document) — render so diagnostics/inlay requests can start.
         const lsp_ready = self.finishLspStart();
@@ -3318,7 +3334,7 @@ pub fn run(self: *App) !void {
                 }
             }
         }
-        if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready or lsp_ready or term_ready) {
+        if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready or lsp_ready or term_ready or ai_ready) {
             try self.render();
             last_render_ms = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
             continue;
@@ -3375,7 +3391,7 @@ pub fn run(self: *App) !void {
         // animation's last spread) and the loop would block forever
         // without ever drawing it. Force that one render.
         var poll_transition = false;
-        if (self.scopeAnimActive() or self.blameHoldActive() or self.gitHoldActive() or (term.supported and self.term_pane != null)) {
+        if (self.scopeAnimActive() or self.blameHoldActive() or self.gitHoldActive() or self.aiStreaming() or (term.supported and self.term_pane != null)) {
             std.Io.sleep(self.io, .fromMilliseconds(1), .real) catch {};
             self.poll_mode_active = true;
         } else if (self.poll_mode_active) {
@@ -3401,6 +3417,10 @@ pub fn run(self: *App) !void {
                     // buffer them (paste_end inserts the whole thing) so
                     // auto-indent/auto-pairs can't mangle pasted text
                     if (self.pasting and !term_focused) {
+                        if (self.ai.active) {
+                            if (key.text) |text| try self.ai.input.appendSlice(self.alloc, text);
+                            continue;
+                        }
                         try self.pasteAccumulate(key);
                         continue;
                     }
@@ -3414,6 +3434,11 @@ pub fn run(self: *App) !void {
                     if (!self.pasting) continue;
                     self.pasting = false;
                     if (term_focused) continue; // child got the keys already
+                    if (self.ai.active) {
+                        try self.ai.input.appendSlice(self.alloc, self.paste_buf.items);
+                        self.paste_buf.clearRetainingCapacity();
+                        continue;
+                    }
                     switch (self.state.mode) {
                         .insert => if (self.mc_active)
                             try self.mcInsertText(self.paste_buf.items)
@@ -3437,7 +3462,9 @@ pub fn run(self: *App) !void {
                             }
                         }
                     }
-                    if (self.state.mode == .insert) {
+                    if (self.ai.active) {
+                        try self.ai.input.appendSlice(self.alloc, text);
+                    } else if (self.state.mode == .insert) {
                         if (self.mc_active) try self.mcInsertText(text) else try self.insertText(text);
                     }
                 },

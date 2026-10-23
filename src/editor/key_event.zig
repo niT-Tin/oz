@@ -154,6 +154,8 @@ pub const ActionId = enum {
     workspace_kill_session, // <leader> tab x — clear the whole session
     workspace_prev, // <leader> tab [ — previous workspace
     workspace_next, // <leader> tab ] — next workspace
+    // M1 AI chat
+    ai_toggle, // <leader>a — toggle the AI chat panel
     // keyboard macros (vim q/@, registers a-z). q starts recording, a bare
     // q stops it (the stop key is intercepted by the caller — see
     // App.handleKey — so the state machine only ever arms the record

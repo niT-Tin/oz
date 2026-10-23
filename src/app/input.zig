@@ -28,6 +28,15 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
         }
     }
 
+    // AI chat is modal: every key belongs to the prompt. Placed before the
+    // macro recorder so AI typing never lands in a register, and before the
+    // command line / pickers / file tree (opening the panel from normal mode
+    // is the only entry; while it is open those overlays cannot be reached).
+    if (self.ai.active) {
+        try self.handleAiKey(key);
+        return;
+    }
+
     // Macro recording (vim q): a bare 'q' stops recording — but only as a
     // top-level normal-mode command. 'q' as a find target, a replace char,
     // an operator argument, … is recorded like any other key (Mode.idle

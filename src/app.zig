@@ -22,6 +22,7 @@ const term = @import("term.zig");
 
 const autil = @import("app/util.zig");
 const git_job = @import("app/git_job.zig");
+const app_ai = @import("app/ai.zig");
 
 const GitJobKind = git_job.GitJobKind;
 const GitApplyOp = git_job.GitApplyOp;
@@ -661,6 +662,12 @@ pub const App = struct {
     /// thread holds a *Terminal for its whole life, so the pane lives at a
     /// stable address — a plain App field, never a reallocating list.
     term_pane: ?TermPane = null,
+
+    // ---- M1 AI chat (<leader>a) ----
+    /// Session-wide chat state (panel visibility, conversation, stream
+    /// status). Not per workspace: the thread survives panel close and
+    /// workspace switches.
+    ai: app_ai.Session = .{},
 
     /// The active buffer (the focused window's buffer; per-buffer document
     /// state lives here, per-window cursor/viewport in `windows`).
@@ -1390,6 +1397,9 @@ pub const App = struct {
         // pieces it borrows (env_map, io, the vaxis loop its wake posts to)
         // go away.
         self.cancelLspStart();
+        // Stop and join the AI stream worker before the io/env it borrowed
+        // and the vaxis loop it renders into go away.
+        self.deinitAi();
         self.vx.deinit(self.alloc, self.tty.writer());
         self.tty.deinit();
         self.alloc.free(self.tty_buffer);
@@ -1745,6 +1755,23 @@ pub const App = struct {
     pub const execOpMotion = @import("app/highlight.zig").execOpMotion;
     pub const execAction = @import("app/highlight.zig").execAction;
     pub const replaceCharsAtCursor = @import("app/highlight.zig").replaceCharsAtCursor;
+    // ---- AI chat → src/app/ai.zig ----
+    pub const toggleAiPanel = app_ai.toggleAiPanel;
+    pub const aiLoadConfig = app_ai.aiLoadConfig;
+    pub const aiSetError = app_ai.aiSetError;
+    pub const aiSetErrorFmt = app_ai.aiSetErrorFmt;
+    pub const aiStreaming = app_ai.aiStreaming;
+    pub const deinitAi = app_ai.deinitAi;
+    pub const handleAiKey = app_ai.handleAiKey;
+    pub const aiScroll = app_ai.aiScroll;
+    pub const aiCancel = app_ai.aiCancel;
+    pub const aiClear = app_ai.aiClear;
+    pub const aiSend = app_ai.aiSend;
+    pub const drainAi = app_ai.drainAi;
+    pub const drawAiPanel = app_ai.drawAiPanel;
+    pub const AiSession = app_ai.Session;
+    pub const AiMessage = app_ai.Message;
+    pub const AiStatus = app_ai.Status;
     // ---- render → src/app/render.zig ----
     pub const tabBarRows = @import("app/render.zig").tabBarRows;
     pub const contentTop = @import("app/render.zig").contentTop;

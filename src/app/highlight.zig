@@ -545,6 +545,8 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
         .term_float => if (term.supported) try self.toggleTerm(.floating) else {},
         .term_bottom => if (term.supported) try self.toggleTerm(.bottom) else {},
         .term_right => if (term.supported) try self.toggleTerm(.right) else {},
+        // M1 AI chat
+        .ai_toggle => try self.toggleAiPanel(),
         .paste => try self.pasteBuffer(false, count),
         .paste_before => try self.pasteBuffer(true, count),
         .delete_char => {
