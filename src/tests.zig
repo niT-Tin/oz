@@ -36,6 +36,13 @@ pub const icons = @import("icons.zig");
 pub const git = @import("git.zig");
 pub const term = @import("term.zig");
 pub const app_macro = @import("app/macro.zig");
+// M1 AI chat (pure modules; app/ai.zig is exercised by e2e)
+pub const ai_sse = @import("ai/sse.zig");
+pub const ai_openai = @import("ai/openai.zig");
+pub const ai_context = @import("ai/context.zig");
+pub const ai_config = @import("ai/config.zig");
+pub const ai_client = @import("ai/client.zig");
+pub const ai_panel = @import("ai/panel.zig");
 
 test {
     std.testing.refAllDecls(@This());
