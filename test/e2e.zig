@@ -15476,6 +15476,13 @@ fn aiJsonQuote(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
 
 const AiToolSpec = struct { id: []const u8, name: []const u8, args: []const u8 };
 
+/// Build the JSON arguments for one `apply_patch` tool call from patch text.
+fn aiPatchArgs(alloc: std.mem.Allocator, patch_text: []const u8) ![]u8 {
+    const quoted = try aiJsonQuote(alloc, patch_text);
+    defer alloc.free(quoted);
+    return std.fmt.allocPrint(alloc, "{{\"patch\":{s}}}", .{quoted});
+}
+
 /// One OpenAI tool-call stream chunk sequence with `specs` as parallel calls
 /// in a single delta (index = position). `arguments` is JSON-escaped here.
 fn aiToolCallsSse(alloc: std.mem.Allocator, specs: []const AiToolSpec) ![]u8 {
@@ -16200,12 +16207,12 @@ test "approval: second write while pending is refused; pending survives a thread
     try aiQuit(&sess);
 }
 
-test "approval: apply_patch, terminal and unknown tools stay unsupported and never execute" {
+test "approval: apply_patch stages while terminal and unknown stay unsupported" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
     var root_buf: [160:0]u8 = undefined;
-    const root = try bufPrintZ(&root_buf, "/tmp/oz_appr_unsup_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_appr_patch_unsup_{d}_{d}", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
     try std.Io.Dir.cwd().createDirPath(io, root);
@@ -16220,8 +16227,17 @@ test "approval: apply_patch, terminal and unknown tools stay unsupported and nev
     var dir_buf: [128]u8 = undefined;
     const dir = try aiMockDir(io, &dir_buf);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const patch_args = try aiPatchArgs(alloc,
+        \\--- a/unsup.txt
+        \\+++ b/unsup.txt
+        \\@@ -1 +1 @@
+        \\-UNSUP editor marker
+        \\+UNSUP STAGED marker
+        \\
+    );
+    defer alloc.free(patch_args);
     const round1 = try aiToolCallsSse(alloc, &.{
-        .{ .id = "call_patch", .name = "apply_patch", .args = "{\"patch\":\"--- a/unsup.txt\\n+++ b/unsup.txt\\n@@ -1 +1 @@\\n-UNSUP\\n+HACKED\\n\"}" },
+        .{ .id = "call_patch", .name = "apply_patch", .args = patch_args },
         .{ .id = "call_term", .name = "terminal", .args = "{\"command\":\"rm -rf /\"}" },
         .{ .id = "call_unknown", .name = "mystery", .args = "{}" },
     });
@@ -16243,42 +16259,582 @@ test "approval: apply_patch, terminal and unknown tools stay unsupported and nev
     try sess.send("try the blocked tools");
     try sess.send("\r");
 
-    try gridWaitFor(&sess, &grid, "apply_patch", 10000);
+    // apply_patch is now a real staged review; the other two never execute.
+    try gridWaitFor(&sess, &grid, "changes 1", 10000);
+    try gridWaitFor(&sess, &grid, "- UNSUP editor marker", 5000);
+    try gridWaitFor(&sess, &grid, "+ UNSUP STAGED marker", 5000);
+    try gridWaitFor(&sess, &grid, "idle", 10000);
+    try std.testing.expect(!grid.contains("HACKED"));
+    try expectNoDirtyMarker(&grid);
+
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "apply_patch", 8000);
     try gridWaitFor(&sess, &grid, "terminal", 8000);
     try gridWaitFor(&sess, &grid, "mystery", 8000);
+    try gridWaitFor(&sess, &grid, "approval required", 8000);
     try gridWaitFor(&sess, &grid, "unsupported", 8000);
     try gridWaitFor(&sess, &grid, "BLOCKED_DONE", 10000);
     try gridWaitFor(&sess, &grid, "idle", 5000);
     try frame.expectNoHorizontalOverflow(&grid, grid.cols);
-    try std.testing.expect(!grid.contains("HACKED"));
-    // No approval was staged for any of these calls.
-    try std.testing.expect(grid.contains("changes 0"));
-    try std.testing.expect(!grid.contains("approval required"));
 
     const req2 = try aiReadFile(io, alloc, dir, "request-2.json");
     defer alloc.free(req2);
-    try std.testing.expect(std.mem.indexOf(u8, req2, "apply_patch approval is not available") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "approval required: apply_patch staged for review; not applied") != null);
     try std.testing.expect(std.mem.indexOf(u8, req2, "terminal execution is not available") != null);
     try std.testing.expect(std.mem.indexOf(u8, req2, "unsupported tool: mystery") != null);
     try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_patch\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_term\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_unknown\"") != null);
 
-    const on_disk = try absFileText(io, alloc, editor);
-    defer alloc.free(on_disk);
-    try std.testing.expectEqualStrings("UNSUP editor marker\n", on_disk);
+    // Nothing touched the file or the buffer before a human decision.
+    const before = try absFileText(io, alloc, editor);
+    defer alloc.free(before);
+    try std.testing.expectEqualStrings("UNSUP editor marker\n", before);
+    try sess.send("d");
+    try gridWaitFor(&sess, &grid, "[r] reject", 5000);
+    try sess.send("r");
+    try gridWaitFor(&sess, &grid, "changes 0", 5000);
+    try gridWaitFor(&sess, &grid, "no pending changes", 4000);
+    try gridWaitFor(&sess, &grid, "UNSUP editor marker", 4000);
+    try std.testing.expect(!grid.contains("STAGED"));
+    try expectNoDirtyMarker(&grid);
 
-    try sess.send("\t");
+    // Rejected patch + unsupported terminal/unknown all show real metrics.
+    try sess.send("\x17a");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), true, 3000);
     try sess.send("t");
     try gridWaitFor(&sess, &grid, "3 calls", 5000);
     try gridWaitFor(&sess, &grid, "apply_patch", 3000);
     try gridWaitFor(&sess, &grid, "terminal", 3000);
     try gridWaitFor(&sess, &grid, "mystery", 3000);
+    try gridWaitFor(&sess, &grid, "appr 1", 3000);
+    try gridWaitFor(&sess, &grid, "denied 1", 3000);
     try gridWaitFor(&sess, &grid, "unsup 1", 3000);
-    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    const after = try absFileText(io, alloc, editor);
+    defer alloc.free(after);
+    try std.testing.expectEqualStrings("UNSUP editor marker\n", after);
 
     try sess.send("\x1b");
     try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+
+test "approval: apply_patch stages, approve patches the buffer, undo and :w behave" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_appr_patch_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/patch.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "alpha one\nbeta two\ngamma three\ndelta four\nepsilon five\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const patch_args = try aiPatchArgs(alloc,
+        \\--- a/patch.txt
+        \\+++ b/patch.txt
+        \\@@ -1,2 +1,2 @@
+        \\ alpha one
+        \\-beta two
+        \\+BETA two
+        \\@@ -4,2 +4,2 @@
+        \\ delta four
+        \\-epsilon five
+        \\+EPSILON five
+        \\
+    );
+    defer alloc.free(patch_args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_patch_appr", .name = "apply_patch", .args = patch_args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "PATCH_APPROVAL_DONE follow-up");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "alpha one", 5000);
+    try expectNoDirtyMarker(&grid);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("patch the file");
+    try sess.send("\r");
+
+    // Review, never a write: both hunks are shown and the buffer/file are
+    // untouched until the human approves.
+    try gridWaitFor(&sess, &grid, "changes 1", 10000);
+    try gridWaitFor(&sess, &grid, "-2 +2", 5000);
+    try gridWaitFor(&sess, &grid, "- beta two", 5000);
+    try gridWaitFor(&sess, &grid, "+ BETA two", 5000);
+    try gridWaitFor(&sess, &grid, "- epsilon five", 5000);
+    try gridWaitFor(&sess, &grid, "+ EPSILON five", 5000);
+    try gridWaitFor(&sess, &grid, "approve", 5000);
+    try gridWaitFor(&sess, &grid, "idle", 10000);
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+    try expectNoDirtyMarker(&grid);
+
+    const disk_before = try absFileText(io, alloc, editor);
+    defer alloc.free(disk_before);
+    try std.testing.expectEqualStrings("alpha one\nbeta two\ngamma three\ndelta four\nepsilon five\n", disk_before);
+
+    // Chat card: approval required and the staged tool result. The follow-up
+    // stream already told the model "not applied".
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "apply_patch", 8000);
+    try gridWaitFor(&sess, &grid, "approval required", 8000);
+    try gridWaitFor(&sess, &grid, "staged · review", 5000);
+    try gridWaitFor(&sess, &grid, "PATCH_APPROVAL_DONE follow-up", 10000);
+    try gridWaitFor(&sess, &grid, "idle", 5000);
+
+    const req2 = try aiReadFile(io, alloc, dir, "request-2.json");
+    defer alloc.free(req2);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "approval required: apply_patch staged for review; not applied") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"role\":\"tool\"") != null);
+
+    // Approve: the whole patch becomes ONE buffer change (dirty), the file on
+    // disk still waits for the user's `:w`.
+    try sess.send("d");
+    try gridWaitFor(&sess, &grid, "approve", 4000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "changes 0", 5000);
+    try gridWaitFor(&sess, &grid, "no pending changes", 4000);
+    try gridWaitFor(&sess, &grid, "BETA two", 5000);
+    try gridWaitFor(&sess, &grid, "EPSILON five", 5000);
+    try std.testing.expect(grid.contains("\u{25cf}"));
+    const disk_after_approve = try absFileText(io, alloc, editor);
+    defer alloc.free(disk_after_approve);
+    try std.testing.expectEqualStrings("alpha one\nbeta two\ngamma three\ndelta four\nepsilon five\n", disk_after_approve);
+
+    // One `u` restores both hunks (one undo group); redo brings them back.
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "beta two", 5000);
+    try std.testing.expect(!grid.contains("BETA two"));
+    try std.testing.expect(!grid.contains("EPSILON five"));
+    try sess.send("\x12"); // Ctrl+r redo
+    try gridWaitFor(&sess, &grid, "BETA two", 5000);
+    try sess.send(":w\r");
+    try gridWaitFor(&sess, &grid, "written:", 5000);
+    const disk_after_save = try absFileText(io, alloc, editor);
+    defer alloc.free(disk_after_save);
+    try std.testing.expectEqualStrings("alpha one\nBETA two\ngamma three\ndelta four\nEPSILON five\n", disk_after_save);
+
+    // Staged call + approve decision, no fabricated latency sample.
+    try sess.send("\x17a");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), true, 3000);
+    try sess.send("t");
+    try gridWaitFor(&sess, &grid, "calls 1", 5000);
+    try gridWaitFor(&sess, &grid, "ok 1 · err 0 · appr 1", 5000);
+    try gridWaitFor(&sess, &grid, "apply_patch", 3000);
+    try gridWaitFor(&sess, &grid, "no latency samples", 3000);
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+
+    try aiQuit(&sess);
+}
+
+test "approval: apply_patch reject through its hint leaves buffer/history/file untouched" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_appr_patch_rej_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/reject_patch.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "KEEP untouched line\nsecond line\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const patch_args = try aiPatchArgs(alloc,
+        \\--- a/reject_patch.txt
+        \\+++ b/reject_patch.txt
+        \\@@ -1,2 +1,2 @@
+        \\ KEEP untouched line
+        \\-second line
+        \\+MUTATED second line
+        \\
+    );
+    defer alloc.free(patch_args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_patch_rej", .name = "apply_patch", .args = patch_args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "PATCH_REJECT_DONE follow-up");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "KEEP untouched line", 5000);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("patch then reject");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "changes 1", 10000);
+    try gridWaitFor(&sess, &grid, "-1 +1", 5000);
+    try gridWaitFor(&sess, &grid, "- second line", 5000);
+    try gridWaitFor(&sess, &grid, "+ MUTATED second line", 5000);
+    try gridWaitFor(&sess, &grid, "idle", 10000);
+    try expectNoDirtyMarker(&grid);
+
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "approval required", 8000);
+    try gridWaitFor(&sess, &grid, "PATCH_REJECT_DONE follow-up", 10000);
+    try gridWaitFor(&sess, &grid, "idle", 5000);
+
+    // Reject through the drawn hint label (same path as `r`).
+    try sess.send("d");
+    try gridWaitFor(&sess, &grid, "[r] reject", 5000);
+    const reject_cell = aiFindCell(&grid, "[r] reject") orelse {
+        std.debug.print("patch reject: no reject button\n", .{});
+        grid.dump();
+        return error.TestUnexpectedResult;
+    };
+    try sess.send(" j");
+    try gridWaitFor(&sess, &grid, "HINTS ·", 5000);
+    const want = hintLabelLenFor(hintTargetCount(&grid) orelse return error.TestUnexpectedResult);
+    var label_buf: [3]u8 = undefined;
+    const label = hintLabelAt(&grid, &label_buf, reject_cell.row, reject_cell.col, want);
+    if (label.len != want) {
+        std.debug.print("patch reject: no hint label ({d}/{d})\n", .{ label.len, want });
+        grid.dump();
+        return error.TestUnexpectedResult;
+    }
+    try sess.send(label);
+    try gridWaitFor(&sess, &grid, "changes 0", 5000);
+    try gridWaitFor(&sess, &grid, "no pending changes", 4000);
+    try gridWaitFor(&sess, &grid, "KEEP untouched line", 4000);
+    try std.testing.expect(!grid.contains("MUTATED"));
+    try expectNoDirtyMarker(&grid);
+
+    // The card is rejected and metrics count a real denied decision.
+    try sess.send("\x17a");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), true, 3000);
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "rejected", 5000);
+    try sess.send("t");
+    try gridWaitFor(&sess, &grid, "calls 1", 5000);
+    try gridWaitFor(&sess, &grid, "ok 0 · err 0 · appr 1 · denied 1", 5000);
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "KEEP untouched line", 3000);
+    try std.testing.expect(!grid.contains("MUTATED"));
+
+    const on_disk = try absFileText(io, alloc, editor);
+    defer alloc.free(on_disk);
+    try std.testing.expectEqualStrings("KEEP untouched line\nsecond line\n", on_disk);
+
+    try aiQuit(&sess);
+}
+
+test "approval: stale apply_patch refuses with stale patch and keeps the diff reviewable" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_appr_patch_stale_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/stale_patch.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "one original\nsecond original\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const patch_args = try aiPatchArgs(alloc,
+        \\--- a/stale_patch.txt
+        \\+++ b/stale_patch.txt
+        \\@@ -1 +1 @@
+        \\-one original
+        \\+PATCHED one
+        \\
+    );
+    defer alloc.free(patch_args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_patch_stale", .name = "apply_patch", .args = patch_args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "PATCH_STALE_DONE follow-up");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "one original", 5000);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("stage a patch then edit");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "changes 1", 10000);
+    try gridWaitFor(&sess, &grid, "+ PATCHED one", 5000);
+    try gridWaitFor(&sess, &grid, "idle", 10000);
+
+    // Leave the review and edit the target buffer; revision + full text no
+    // longer match the staging snapshot.
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try sess.send("iX\x1b");
+    try gridWaitFor(&sess, &grid, "Xone original", 5000);
+
+    try sess.send("\x17a");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), true, 3000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "stale patch", 5000);
+    try gridWaitFor(&sess, &grid, "changes 1", 3000);
+    try std.testing.expect(grid.contains("Xone original"));
+    // The patch preview lives in the rail only; the edited buffer was not
+    // replaced by the staged result.
+    const preview = aiFindCell(&grid, "PATCHED one") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(preview.col >= aiRailCol(120));
+
+    try sess.send("r");
+    try gridWaitFor(&sess, &grid, "changes 0", 4000);
+    try gridWaitFor(&sess, &grid, "Xone original", 3000);
+    try std.testing.expect(!grid.contains("PATCHED one"));
+
+    const on_disk = try absFileText(io, alloc, editor);
+    defer alloc.free(on_disk);
+    try std.testing.expectEqualStrings("one original\nsecond original\n", on_disk);
+
+    try aiQuit(&sess);
+}
+
+test "approval: 80x24 apply_patch drawer diff/buttons fit and the approve hint applies" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_appr_patch_80_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/small_patch.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "tiny old line\nsecond\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const patch_args = try aiPatchArgs(alloc,
+        \\--- a/small_patch.txt
+        \\+++ b/small_patch.txt
+        \\@@ -1,2 +1,2 @@
+        \\-tiny old line
+        \\+tiny NEW line
+        \\ second
+        \\
+    );
+    defer alloc.free(patch_args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_patch_80", .name = "apply_patch", .args = patch_args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "SMALL_PATCH_DONE");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "tiny old line", 5000);
+
+    try sess.send(" a");
+    try gridWaitFor(&sess, &grid, "agents", 5000);
+    try sess.send("stage a patch at 80");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "changes 1", 10000);
+    try gridWaitFor(&sess, &grid, "+ tiny NEW line", 5000);
+    try gridWaitFor(&sess, &grid, "[a] approve", 5000);
+    try gridWaitFor(&sess, &grid, "idle", 10000);
+    try frame.expectNoHorizontalOverflow(&grid, 80);
+
+    const approve_cell = aiFindCell(&grid, "[a] approve") orelse {
+        std.debug.print("patch 80: no approve button\n", .{});
+        grid.dump();
+        return error.TestUnexpectedResult;
+    };
+    try sess.send(" j");
+    try gridWaitFor(&sess, &grid, "HINTS ·", 5000);
+    const want = hintLabelLenFor(hintTargetCount(&grid) orelse return error.TestUnexpectedResult);
+    var label_buf: [3]u8 = undefined;
+    const label = hintLabelAt(&grid, &label_buf, approve_cell.row, approve_cell.col, want);
+    if (label.len != want) {
+        std.debug.print("patch 80: no approve label ({d}/{d})\n", .{ label.len, want });
+        grid.dump();
+        return error.TestUnexpectedResult;
+    }
+    try sess.send(label);
+    try gridWaitFor(&sess, &grid, "tiny NEW line", 5000);
+    try gridWaitFor(&sess, &grid, "changes 0", 4000);
+    try std.testing.expect(!grid.contains("HINTS ·"));
+    try frame.expectNoHorizontalOverflow(&grid, 80);
+
+    try aiQuit(&sess);
+}
+
+test "approval: malformed or missing-target apply_patch calls never stage" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_appr_patch_bad_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/guard.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "guard line\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const multi_args = try aiPatchArgs(alloc,
+        \\--- a/guard.txt
+        \\+++ b/guard.txt
+        \\@@ -1 +1 @@
+        \\-guard line
+        \\+GUARD
+        \\--- a/other.txt
+        \\+++ b/other.txt
+        \\@@ -1 +1 @@
+        \\-x
+        \\+y
+        \\
+    );
+    defer alloc.free(multi_args);
+    const mismatch_args = try aiPatchArgs(alloc,
+        \\--- a/guard.txt
+        \\+++ b/guard.txt
+        \\@@ -1 +1 @@
+        \\-wrong line
+        \\+GUARD
+        \\
+    );
+    defer alloc.free(mismatch_args);
+    const missing_args = try aiPatchArgs(alloc,
+        \\--- a/missing.txt
+        \\+++ b/missing.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+b
+        \\
+    );
+    defer alloc.free(missing_args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_patch_multi", .name = "apply_patch", .args = multi_args },
+        .{ .id = "call_patch_ctx", .name = "apply_patch", .args = mismatch_args },
+        .{ .id = "call_patch_missing", .name = "apply_patch", .args = missing_args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "BAD_PATCH_DONE follow-up");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try aiEnterRail(&sess, &grid);
+    try sess.send("try malformed patches");
+    try sess.send("\r");
+
+    // Compact cards clip the message; the full text is asserted on the
+    // follow-up request body below.
+    try gridWaitFor(&sess, &grid, "multi-file patches", 10000);
+    try gridWaitFor(&sess, &grid, "patch context does not", 8000);
+    try gridWaitFor(&sess, &grid, "not found: missing.txt", 8000);
+    try gridWaitFor(&sess, &grid, "BAD_PATCH_DONE follow-up", 10000);
+    try gridWaitFor(&sess, &grid, "idle", 5000);
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+    try expectNoDirtyMarker(&grid);
+    try std.testing.expect(!grid.contains("changes 1"));
+    try std.testing.expect(!grid.contains("approval required"));
+
+    const req2 = try aiReadFile(io, alloc, dir, "request-2.json");
+    defer alloc.free(req2);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "error: multi-file patches are not supported") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "error: patch context does not match guard.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "error: not found: missing.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_patch_multi\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_patch_ctx\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_patch_missing\"") != null);
+
+    try sess.send("\t");
+    try sess.send("t");
+    try gridWaitFor(&sess, &grid, "3 calls", 5000);
+    try gridWaitFor(&sess, &grid, "ok 0 · err 3", 5000);
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+
+    const on_disk = try absFileText(io, alloc, editor);
+    defer alloc.free(on_disk);
+    try std.testing.expectEqualStrings("guard line\n", on_disk);
+
     try aiQuit(&sess);
 }
 
@@ -17124,6 +17680,9 @@ const Scenario = struct {
     /// M3b1: round 1 stages an edit_file on the scenario's own opened buffer;
     /// the scenario presses `a` and expects the applied buffer.
     approval_fixture: bool = false,
+    /// M3b2: round 1 stages an apply_patch on the scenario's own opened
+    /// buffer; the scenario approves and expects the patched buffer.
+    patch_approval_fixture: bool = false,
 };
 
 /// Pairwise layout matrix: 3 widths × filetree {closed,open} × rail
@@ -17326,6 +17885,31 @@ const scenario_matrix = [_]Scenario{
             "approval required: edit_file staged for review; not applied",
             "\"role\":\"tool\"",
             "edit_file",
+        },
+    },
+    .{
+        .name = "ai patch approval 120x30",
+        .tags = &.{ "@layout", "@ai", "@tools", "@approval", "@120col" },
+        .rows = 30,
+        .cols = 120,
+        .setup = .ai_mock,
+        .patch_approval_fixture = true,
+        .rail = .docked,
+        .steps = &.{
+            .{ .keys = "patch the approval fixture\r", .wait_for = "changes 1" },
+            .{ .keys = "", .wait_for = "+ second line PATCH_SCENARIO_NEW" },
+            .{ .keys = "", .wait_for = "idle" },
+            .{ .keys = "c", .wait_for = "approval required" },
+            .{ .keys = "d", .wait_for = "[a] approve" },
+            .{ .keys = "a", .wait_for = "changes 0" },
+            .{ .keys = "\x17a", .wait_for = "chat changes 0" },
+            .{ .keys = "c", .wait_for = "approved" },
+        },
+        .expect_text = &.{ "approved", "changes 0", "PATCH_SCENARIO_NEW", "GOLDEN_EDITOR_MARKER" },
+        .request_contains = &.{
+            "approval required: apply_patch staged for review; not applied",
+            "\"role\":\"tool\"",
+            "apply_patch",
         },
     },
     .{
@@ -17583,6 +18167,26 @@ fn runScenario(sc: Scenario) !void {
             const round2 = try aiTextSse(alloc, "mock reply approval scenario done");
             defer alloc.free(round2);
             try aiWriteFile(io, d, "stream-2.sse", round2);
+        } else if (sc.patch_approval_fixture) {
+            // Stage a patch on the scenario's own opened buffer: the target
+            // path is its basename and /tmp is the detected project root.
+            const base = std.fs.path.basename(name);
+            const patch_text = try std.fmt.allocPrint(
+                alloc,
+                "--- a/{s}\n+++ b/{s}\n@@ -1,2 +1,2 @@\n GOLDEN_EDITOR_MARKER\n-second line for the layout matrix\n+second line PATCH_SCENARIO_NEW\n",
+                .{ base, base },
+            );
+            defer alloc.free(patch_text);
+            const args = try aiPatchArgs(alloc, patch_text);
+            defer alloc.free(args);
+            const round1 = try aiToolCallsSse(alloc, &.{
+                .{ .id = "call_scenario_patch", .name = "apply_patch", .args = args },
+            });
+            defer alloc.free(round1);
+            try aiWriteFile(io, d, "stream-1.sse", round1);
+            const round2 = try aiTextSse(alloc, "mock reply patch approval scenario done");
+            defer alloc.free(round2);
+            try aiWriteFile(io, d, "stream-2.sse", round2);
         } else if (sc.tool_fixture) {
             // The scenario's opened file lives in /tmp, so /tmp is its
             // project root; the tool path is relative and fixed.
@@ -17632,7 +18236,7 @@ fn runScenario(sc: Scenario) !void {
 
     // Tool scenarios run with cwd=/tmp so the workspace root is exactly the
     // directory holding the opened fixture (no dependency on repo .git).
-    var sess = if (sc.tool_fixture or sc.approval_fixture)
+    var sess = if (sc.tool_fixture or sc.approval_fixture or sc.patch_approval_fixture)
         try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, name }, env_extra, sc.rows, sc.cols, "/tmp")
     else
         try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, env_extra, sc.rows, sc.cols);

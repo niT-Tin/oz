@@ -787,9 +787,9 @@ fn mapOutcomeStatus(status: ai.tool_exec.Status) agent.CardStatus {
 /// Handle one streamed assistant turn's tool calls: attach the OpenAI
 /// tool-call turn to the transcript, create compact cards, execute only the
 /// admitted read-only prefix on a worker, and leave the rest truthfully
-/// unexecuted. `edit_file` is intercepted and staged for human review; it is
-/// never sent to the executor, so no write can happen here. Ownership of
-/// `calls` is consumed in every branch.
+/// unexecuted. `edit_file` and `apply_patch` are intercepted and staged for
+/// human review; they are never sent to the executor, so no write can happen
+/// here. Ownership of `calls` is consumed in every branch.
 fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
     const t = &self.ai.threads.items.items[idx];
     const st = toolState(self, idx);
@@ -907,10 +907,16 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
                     st.?.pending_card_count += 1;
                 }
             },
-            .edit_file => {
-                // M3b1: stage a reviewable diff instead of executing. The
-                // executor/worker never sees this call.
-                const result = app_agent_edit.stageToolCall(self, idx, msg_index, call);
+            .edit_file, .apply_patch => {
+                // M3b: stage a reviewable diff instead of executing. The
+                // executor/worker never sees this call, and the staged patch
+                // is applied to the in-memory buffer only after an explicit
+                // human approve.
+                const result = switch (kind) {
+                    .edit_file => app_agent_edit.stageToolCall(self, idx, msg_index, call),
+                    .apply_patch => app_agent_edit.stagePatchToolCall(self, idx, msg_index, call),
+                    else => unreachable,
+                };
                 switch (result) {
                     .staged => |staged| {
                         const text = std.fmt.allocPrint(
@@ -919,13 +925,19 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
                             .{ staged.removed, staged.added },
                         ) catch null;
                         defer if (text) |x| self.alloc.free(x);
+                        const api_text = std.fmt.allocPrint(
+                            self.alloc,
+                            "approval required: {s} staged for review; not applied",
+                            .{call.name},
+                        ) catch null;
+                        defer if (api_text) |x| self.alloc.free(x);
                         self.ai.threads.setToolOutcome(
                             self.alloc,
                             idx,
                             msg_index,
                             .approval_required,
                             text orelse "staged · review in Changes",
-                            "approval required: edit_file staged for review; not applied",
+                            api_text orelse "approval required: staged for review; not applied",
                             0,
                         ) catch {
                             t.messages.items[msg_index].tool_status = .err;
@@ -963,9 +975,10 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
                 call.deinit(self.alloc);
                 freed[i] = true;
             },
-            .apply_patch, .terminal => {
-                // No execution and no fake approval: this slice implements
-                // edit_file only. The card/result say exactly that.
+            .terminal => {
+                // No execution and no fake approval: terminal is not
+                // implemented (there is no sandbox in this slice). The
+                // card/result say exactly that.
                 const text_owned = tryUnsupportedToolText(self.alloc, call.name);
                 defer if (text_owned) |x| self.alloc.free(x);
                 const text = text_owned orelse "not executed";
@@ -1071,11 +1084,8 @@ fn setLocalToolCard(
     };
 }
 
-/// Owned, truthful text for apply_patch/terminal/unknown in M3b1.
+/// Owned, truthful text for terminal/unknown tools.
 fn tryUnsupportedToolText(alloc: std.mem.Allocator, name: []const u8) ?[]u8 {
-    if (std.mem.eql(u8, name, "apply_patch")) {
-        return alloc.dupe(u8, "not executed — apply_patch approval is not available in M3b1") catch null;
-    }
     if (std.mem.eql(u8, name, "terminal")) {
         return alloc.dupe(u8, "not executed — terminal execution is not available") catch null;
     }

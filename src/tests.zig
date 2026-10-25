@@ -45,6 +45,8 @@ pub const app_note_store = @import("app/note_store.zig");
 pub const app_inline = @import("app/inline.zig");
 // M3b1 staged agent edits (pure args/occurrence/preview/pending model)
 pub const app_agent_edit = @import("app/agent_edit.zig");
+// M3b2 apply_patch single-file unified diff parser/applier (pure)
+pub const app_agent_patch = @import("app/agent_patch.zig");
 // M3b tool-metrics chart (pure cell renderer; no App/vaxis dependency)
 pub const chart = @import("chart.zig");
 // M1 AI chat (pure modules; app/ai.zig is exercised by e2e)

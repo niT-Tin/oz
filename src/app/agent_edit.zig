@@ -20,11 +20,13 @@
 //!     inline edit in the App).
 const std = @import("std");
 const inline_model = @import("inline.zig");
+const patch_model = @import("agent_patch.zig");
 const tool_exec = @import("../ai/tool_exec.zig");
 
 /// Maximum target file/buffer size staged for review. Bounded so one tool
-/// call cannot copy an arbitrarily large file into the UI process.
-pub const max_stage_bytes: usize = 256 * 1024;
+/// call cannot copy an arbitrarily large file into the UI process. Shared
+/// with `apply_patch` so its reconstructed result obeys the same cap.
+pub const max_stage_bytes: usize = patch_model.max_stage_bytes;
 
 /// Maximum occurrences in a `replace_all` edit. Prevents a pathological
 /// `old_string` from creating an unbounded preview/application workload.
@@ -41,6 +43,29 @@ pub const max_preview_lines: u32 = 240;
 pub const max_preview_hunks: usize = 16;
 
 pub const stale_label = "stale edit";
+pub const stale_patch_label = "stale patch";
+
+/// Which staged write produced a `Pending`. `apply_patch` is still a
+/// whole-file replacement (one contiguous span, one undo group); only the
+/// staging/verification rules differ.
+pub const Kind = enum {
+    edit_file,
+    apply_patch,
+
+    pub fn toolName(self: Kind) []const u8 {
+        return switch (self) {
+            .edit_file => "edit_file",
+            .apply_patch => "apply_patch",
+        };
+    }
+
+    pub fn staleLabel(self: Kind) []const u8 {
+        return switch (self) {
+            .edit_file => stale_label,
+            .apply_patch => stale_patch_label,
+        };
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -422,12 +447,14 @@ pub const PlanError = error{
 };
 
 pub const Pending = struct {
+    kind: Kind = .edit_file,
     thread_index: usize,
     card_index: usize,
     root: []u8,
     path: []u8,
     display_path: []u8,
     text: []u8,
+    /// Empty for `apply_patch` (the whole text is the replacement span).
     old_string: []u8,
     new_string: []u8,
     replace_all: bool,
@@ -436,10 +463,14 @@ pub const Pending = struct {
     occurrence_count: u32,
     /// One contiguous span from the first occurrence's start to the last
     /// occurrence's end. `applyEdit(span_start, span_end, span_replacement)`
-    /// is therefore a single undo group even for `replace_all`.
+    /// is therefore a single undo group even for `replace_all`; an
+    /// `apply_patch` pending is the whole-file span `[0, text.len)`.
     span_start: u32,
     span_end: u32,
     span_replacement: []u8,
+    /// Parsed patch retained for apply-time re-verification (`apply_patch`
+    /// only). Owned; `null` for `edit_file`.
+    patch: ?patch_model.Patch = null,
     diff: []inline_model.DiffLine,
     removed: u32,
     added: u32,
@@ -459,6 +490,7 @@ pub const Pending = struct {
         alloc.free(self.old_string);
         alloc.free(self.new_string);
         alloc.free(self.span_replacement);
+        if (self.patch) |*patch| patch.deinit(alloc);
         freePreview(alloc, self.diff);
         self.* = undefined;
     }
@@ -467,13 +499,19 @@ pub const Pending = struct {
         return self.thread_index == thread_index;
     }
 
+    pub fn staleLabel(self: *const Pending) []const u8 {
+        return self.kind.staleLabel();
+    }
+
     /// True only when the current text is byte-identical to the staging
     /// snapshot and the exact occurrence count is unchanged. The caller
     /// still checks the buffer history revision (when the edit was staged
-    /// from a buffer).
+    /// from a buffer). For `apply_patch` the occurrence check is replaced by
+    /// `verifyPatch` (the whole text is the replacement span).
     pub fn verify(self: *const Pending, current_text: []const u8) bool {
         if (!std.mem.eql(u8, self.text, current_text)) return false;
         if (self.span_start > self.span_end or self.span_end > current_text.len) return false;
+        if (self.kind == .apply_patch) return true;
         var count: u32 = 0;
         var pos: usize = 0;
         while (pos + self.old_string.len <= current_text.len) {
@@ -483,6 +521,18 @@ pub const Pending = struct {
             pos = found + self.old_string.len;
         }
         return count == self.occurrence_count;
+    }
+
+    /// Re-apply the retained patch to `current_text` and require the exact
+    /// staged new text. This is the "the patch still applies" check that runs
+    /// on top of full-text/revision equality before an approve mutates the
+    /// buffer. Always true for `edit_file`.
+    pub fn verifyPatch(self: *const Pending, alloc: std.mem.Allocator, current_text: []const u8) bool {
+        if (self.kind != .apply_patch) return true;
+        const patch = if (self.patch) |*p| p else return false;
+        const applied = patch_model.apply(alloc, patch, current_text) catch return false;
+        defer alloc.free(applied);
+        return std.mem.eql(u8, applied, self.span_replacement);
     }
 };
 
@@ -544,6 +594,71 @@ pub fn createPending(alloc: std.mem.Allocator, meta: Meta) PlanError!Pending {
     pending.first_line = preview.first_line;
     pending.last_line = preview.last_line;
     pending.preview_partial = preview.partial;
+    return pending;
+}
+
+pub const PatchMeta = struct {
+    thread_index: usize,
+    card_index: usize,
+    root: []const u8,
+    /// Canonical absolute target path (inside `root`).
+    path: []const u8,
+    /// Workspace-relative display path.
+    display_path: []const u8,
+    /// Full target text at staging time (buffer or disk).
+    old_text: []const u8,
+    /// Full text produced by applying every hunk in order.
+    new_text: []const u8,
+    buffer_index: ?usize = null,
+    revision: ?u64 = null,
+    /// Parsed patch. Ownership moves into the returned `Pending` on success;
+    /// on error the caller still owns it and must free it.
+    patch: *patch_model.Patch,
+};
+
+pub const PatchPlanError = error{OutOfMemory};
+
+/// Build a whole-file replacement pending from a validated single-file patch.
+/// All fallible work (duplication + bounded preview) happens before the patch
+/// ownership move, so a failed call never consumes the caller's patch.
+pub fn createPatchPending(alloc: std.mem.Allocator, meta: PatchMeta) PatchPlanError!Pending {
+    var pending = Pending{
+        .kind = .apply_patch,
+        .thread_index = meta.thread_index,
+        .card_index = meta.card_index,
+        .root = try alloc.dupe(u8, meta.root),
+        .path = try alloc.dupe(u8, meta.path),
+        .display_path = try alloc.dupe(u8, meta.display_path),
+        .text = try alloc.dupe(u8, meta.old_text),
+        .old_string = &.{},
+        .new_string = &.{},
+        .replace_all = false,
+        .buffer_index = meta.buffer_index,
+        .revision = meta.revision,
+        .occurrence_count = 1,
+        .span_start = 0,
+        .span_end = @intCast(meta.old_text.len),
+        .span_replacement = try alloc.dupe(u8, meta.new_text),
+        .diff = &.{},
+        .removed = 0,
+        .added = 0,
+        .first_line = 1,
+        .last_line = 1,
+        .preview_partial = false,
+    };
+    errdefer pending.deinit(alloc);
+
+    const preview = try patch_model.buildPreview(alloc, meta.patch);
+    pending.diff = preview.lines;
+    pending.removed = preview.removed;
+    pending.added = preview.added;
+    pending.first_line = preview.first_line;
+    pending.last_line = preview.last_line;
+    pending.preview_partial = preview.partial;
+
+    // Ownership move is the final (infallible) step.
+    pending.patch = meta.patch.*;
+    meta.patch.* = undefined;
     return pending;
 }
 
@@ -732,4 +847,86 @@ test "agent_edit: pending is thread-scoped and one review at a time" {
     try testing.expect(!canStage(true, false));
     try testing.expect(!canStage(false, true));
     try testing.expect(!canStage(true, true));
+}
+
+test "agent_edit: patch pending is one whole-file span and re-verifies exactly" {
+    const alloc = testing.allocator;
+    var patch = try patch_model.parse(alloc,
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1,3 +1,3 @@
+        \\ alpha
+        \\-beta
+        \\+BETA
+        \\ gamma
+        \\
+    );
+    const old_text = "alpha\nbeta\ngamma\n";
+    const new_text = try patch_model.apply(alloc, &patch, old_text);
+    defer alloc.free(new_text);
+
+    var pending = try createPatchPending(alloc, .{
+        .thread_index = 2,
+        .card_index = 5,
+        .root = "/workspace",
+        .path = "/workspace/a.txt",
+        .display_path = "a.txt",
+        .old_text = old_text,
+        .new_text = new_text,
+        .patch = &patch,
+    });
+    defer pending.deinit(alloc);
+
+    try testing.expectEqual(Kind.apply_patch, pending.kind);
+    try testing.expectEqualStrings("apply_patch", pending.kind.toolName());
+    try testing.expectEqualStrings(stale_patch_label, pending.staleLabel());
+    try testing.expectEqual(@as(u32, 0), pending.span_start);
+    try testing.expectEqual(@as(u32, @intCast(old_text.len)), pending.span_end);
+    try testing.expectEqualStrings(new_text, pending.span_replacement);
+    try testing.expectEqual(@as(u32, 1), pending.removed);
+    try testing.expectEqual(@as(u32, 1), pending.added);
+    try testing.expectEqual(@as(u32, 1), pending.first_line);
+    try testing.expectEqual(@as(u32, 3), pending.last_line);
+    try testing.expect(!pending.preview_partial);
+    try testing.expect(pending.isVisibleFor(2));
+
+    // Full-text snapshots must be byte-identical; the retained patch is then
+    // re-applied to prove it still produces the staged result.
+    try testing.expect(pending.verify(old_text));
+    try testing.expect(pending.verifyPatch(alloc, old_text));
+    try testing.expect(!pending.verify("alpha\nBETA\ngamma\n"));
+    try testing.expect(!pending.verifyPatch(alloc, "alpha\nBETA\ngamma\n"));
+    try testing.expect(!pending.verifyPatch(alloc, "alpha\nbeta\n"));
+}
+
+test "agent_edit: patch pending from an empty file and preview truncation" {
+    const alloc = testing.allocator;
+    var patch = try patch_model.parse(alloc,
+        \\--- a/empty.txt
+        \\+++ b/empty.txt
+        \\@@ -0,0 +1,2 @@
+        \\+first
+        \\+second
+        \\
+    );
+    const new_text = try patch_model.apply(alloc, &patch, "");
+    defer alloc.free(new_text);
+    try testing.expectEqualStrings("first\nsecond\n", new_text);
+
+    var pending = try createPatchPending(alloc, .{
+        .thread_index = 0,
+        .card_index = 0,
+        .root = "/workspace",
+        .path = "/workspace/empty.txt",
+        .display_path = "empty.txt",
+        .old_text = "",
+        .new_text = new_text,
+        .patch = &patch,
+    });
+    defer pending.deinit(alloc);
+    try testing.expect(pending.verify(""));
+    try testing.expect(pending.verifyPatch(alloc, ""));
+    try testing.expectEqual(@as(u32, 0), pending.removed);
+    try testing.expectEqual(@as(u32, 2), pending.added);
+    try testing.expect(!pending.verify("x\n"));
 }

@@ -147,7 +147,7 @@ const apply_patch_parameters =
     \\    "patch": {
     \\      "type": "string",
     \\      "minLength": 1,
-    \\      "description": "Unified diff text with ---/+++ headers and @@ hunks; paths are relative to the workspace root."
+    \\      "description": "Single-file unified diff text with optional git-style headers and @@ hunks; the path is relative to the workspace root."
     \\    }
     \\  },
     \\  "required": ["patch"]
@@ -184,7 +184,7 @@ pub const definitions = [_]Definition{
     .{
         .kind = .apply_patch,
         .name = "apply_patch",
-        .description = "Apply a unified diff patch to workspace files. Requires user confirmation by default.",
+        .description = "Apply a single-file unified diff patch. Requires user confirmation by default.",
         .parameters_json = apply_patch_parameters,
     },
 };

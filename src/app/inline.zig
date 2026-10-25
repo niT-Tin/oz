@@ -233,8 +233,9 @@ fn freeDiff(alloc: std.mem.Allocator, diff: []DiffLine) void {
 
 /// Diff lines are terminal display text: expand tabs (same four-space width
 /// as the editor) and replace other control bytes so a CRLF file or an
-/// accidental escape cannot break the rail's cell grid.
-fn dupeDisplayLine(alloc: std.mem.Allocator, line: []const u8) ![]u8 {
+/// accidental escape cannot break the rail's cell grid. Shared with the
+/// `apply_patch` review preview (`agent_patch.zig`).
+pub fn dupeDisplayLine(alloc: std.mem.Allocator, line: []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(alloc);
     for (line) |c| {
