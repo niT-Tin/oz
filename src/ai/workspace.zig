@@ -634,3 +634,176 @@ test "threads: cancel only affects a live stream and late done leaves status alo
     ts.finish(0);
     try std.testing.expectEqual(Status.cancelled, ts.activeStatus());
 }
+
+// ---------------------------------------------------------------------------
+// Property-style invariants (M2.5)
+//
+// These are deterministic sweeps, not randomized: the layout model is pure
+// and the state space is tiny, so checking every width/height in the useful
+// range gives complete coverage with a fast, reproducible test.
+// ---------------------------------------------------------------------------
+
+test "property: layout partitions the width for every 40..200 columns" {
+    var cols: u32 = 40;
+    while (cols <= 200) : (cols += 1) {
+        const open = layout(cols, true);
+        const closed = layout(cols, false);
+        try std.testing.expectEqual(RailMode.hidden, closed.mode);
+        try std.testing.expectEqual(cols, closed.editor_width);
+        try std.testing.expectEqual(@as(u32, 0), closed.rail_width);
+        try std.testing.expectEqual(@as(u32, 0), closed.rail_col);
+
+        try std.testing.expect(open.rail_width > 0);
+        try std.testing.expect(open.rail_width <= cols);
+        try std.testing.expectEqual(cols, open.rail_col + open.rail_width);
+        switch (open.mode) {
+            .hidden => return error.TestUnexpectedResult,
+            .docked => {
+                try std.testing.expect(cols >= 90);
+                try std.testing.expectEqual(cols, open.editor_width + open.rail_width);
+                try std.testing.expectEqual(open.editor_width, open.rail_col);
+                try std.testing.expect(open.editor_width > 0);
+                const expected: u32 = if (cols >= 110) 38 else 34;
+                try std.testing.expectEqual(expected, open.rail_width);
+            },
+            .drawer => {
+                try std.testing.expect(cols < 90);
+                try std.testing.expectEqual(cols, open.editor_width);
+                try std.testing.expect(open.rail_col >= 8);
+                try std.testing.expectEqual(@min(@as(u32, 34), cols - 8), open.rail_width);
+            },
+        }
+
+        // Breakpoint monotonicity: the reserved rail width never shrinks as
+        // the terminal gets wider.
+        if (cols < 200) {
+            try std.testing.expect(railWidth(cols) <= railWidth(cols + 1));
+        }
+    }
+}
+
+test "property: rail breakpoints are exactly 90 and 110" {
+    try std.testing.expectEqual(RailMode.drawer, layout(89, true).mode);
+    try std.testing.expectEqual(@as(u32, 34), layout(89, true).rail_width);
+    try std.testing.expectEqual(RailMode.docked, layout(90, true).mode);
+    try std.testing.expectEqual(@as(u32, 34), layout(90, true).rail_width);
+    try std.testing.expectEqual(RailMode.docked, layout(109, true).mode);
+    try std.testing.expectEqual(@as(u32, 34), layout(109, true).rail_width);
+    try std.testing.expectEqual(RailMode.docked, layout(110, true).mode);
+    try std.testing.expectEqual(@as(u32, 38), layout(110, true).rail_width);
+}
+
+test "property: rail metrics stay inside the rail for 0..200 rows" {
+    const tabs = [_]WorkboxTab{ .chat, .changes, .tools, .terminal };
+    var rows: u32 = 0;
+    while (rows <= 200) : (rows += 1) {
+        for (tabs) |tab| {
+            const m = metrics(rows, tab);
+            try std.testing.expectEqual(rows, m.rail_rows);
+            if (rows == 0) {
+                try std.testing.expectEqual(@as(u32, 0), m.thread_rows);
+                try std.testing.expectEqual(@as(u32, 0), m.body_rows);
+                try std.testing.expect(m.prompt_row == null);
+                continue;
+            }
+            if (rows < 8) {
+                // Defensive metrics for terminals too short to render the
+                // rail; the renderer refuses to draw below 8 rows, but the
+                // model must still be arithmetic-safe.
+                try std.testing.expect(m.divider_row < rows);
+                try std.testing.expect(m.workbox_header_row < rows);
+                try std.testing.expect(m.tabs_row < rows);
+                try std.testing.expect(m.body_top <= rows);
+                try std.testing.expectEqual(@as(u32, 0), m.body_rows);
+                try std.testing.expect(m.prompt_row == null);
+                continue;
+            }
+            try std.testing.expect(m.thread_rows >= 3 and m.thread_rows <= 8);
+            try std.testing.expectEqual(@as(u32, 2), m.thread_top);
+            try std.testing.expectEqual(m.thread_top + m.thread_rows, m.divider_row);
+            try std.testing.expectEqual(m.divider_row + 1, m.workbox_header_row);
+            try std.testing.expectEqual(m.workbox_header_row + 1, m.tabs_row);
+            try std.testing.expectEqual(m.tabs_row + 1, m.body_top);
+            try std.testing.expect(m.body_top <= m.rail_rows);
+            try std.testing.expect(m.body_top + m.body_rows <= m.rail_rows);
+            if (m.prompt_row) |p| {
+                try std.testing.expect(p < m.rail_rows);
+                try std.testing.expect(p >= m.body_top);
+                try std.testing.expectEqual(m.rail_rows - 1, p);
+                try std.testing.expect(tab == .chat);
+            }
+        }
+    }
+}
+
+test "property: extreme dimensions never panic or overflow" {
+    const widths = [_]u32{ 0, 1, 7, 8, 9, 39, 40, std.math.maxInt(u32) - 1, std.math.maxInt(u32) };
+    const heights = [_]u32{ 0, 1, 2, 3, 7, 8, 9, std.math.maxInt(u32) - 1, std.math.maxInt(u32) };
+    const tabs = [_]WorkboxTab{ .chat, .changes, .tools, .terminal };
+    for (widths) |cols| {
+        const open = layout(cols, true);
+        if (cols >= 12) {
+            try std.testing.expectEqual(cols, open.rail_col + open.rail_width);
+        } else {
+            // Below the drawer's 8-column margin the model still yields a
+            // non-empty rail; the renderer refuses to draw it at all, so the
+            // only contract here is "no panic and a usable width".
+            try std.testing.expect(open.rail_width >= 1);
+        }
+        try std.testing.expect(open.rail_width <= cols or cols < 12);
+        const hidden = layout(cols, false);
+        try std.testing.expectEqual(cols, hidden.editor_width);
+        try std.testing.expectEqual(@as(u32, 0), hidden.rail_width);
+    }
+    for (heights) |rows| {
+        for (tabs) |tab| {
+            const m = metrics(rows, tab);
+            try std.testing.expectEqual(rows, m.rail_rows);
+            if (rows >= 8) {
+                try std.testing.expect(m.body_top + m.body_rows <= rows);
+                if (m.prompt_row) |p| try std.testing.expect(p < rows);
+            }
+        }
+    }
+}
+
+fn validFocusState(open: bool, focus: Focus) bool {
+    // A closed rail always owns no focus; an open rail may be navigated
+    // from the editor (non-modal dock) or own a rail/prompt focus.
+    if (!open) return focus == .editor;
+    return switch (focus) {
+        .editor, .rail, .prompt => true,
+    };
+}
+
+test "property: focus transitions never produce an invalid state" {
+    for ([_]bool{ false, true }) |open| {
+        for ([_]Focus{ .editor, .rail, .prompt }) |focus| {
+            for ([_]bool{ false, true }) |narrow| {
+                const toggled = toggleRail(open, focus);
+                try std.testing.expect(validFocusState(toggled.open, toggled.focus));
+                try std.testing.expectEqual(!open, toggled.open);
+                try std.testing.expectEqual(if (open) Focus.editor else Focus.prompt, toggled.focus);
+
+                const left = leaveRail(open, focus, narrow);
+                try std.testing.expect(validFocusState(left.open, left.focus));
+                try std.testing.expectEqual(Focus.editor, left.focus);
+                if (!open or focus == .editor) {
+                    try std.testing.expectEqual(open, left.open);
+                } else if (narrow) {
+                    try std.testing.expect(!left.open);
+                } else {
+                    try std.testing.expect(left.open);
+                }
+
+                const focused = focusRail();
+                try std.testing.expect(validFocusState(focused.open, focused.focus));
+                try std.testing.expect(focused.open);
+                try std.testing.expectEqual(Focus.rail, focused.focus);
+            }
+        }
+    }
+    // Prompt -> thread list -> prompt round trip.
+    try std.testing.expectEqual(Focus.rail, fromPromptTab());
+    try std.testing.expectEqual(Focus.prompt, fromRailEnter());
+}

@@ -249,9 +249,22 @@ const Session = struct {
 
     /// spawnEnv with a custom pty size (AI workspace tests).
     fn spawnEnvSize(io: Io, argv: []const []const u8, env_extra: ?[]const []const u8, rows: u16, cols: u16) !Session {
+        return spawnEnvSizeCwd(io, argv, env_extra, rows, cols, null);
+    }
+
+    /// spawnEnvSize plus a cwd. Golden frames run in a fixed, non-git temp
+    /// directory so status-bar/workspace metadata is deterministic.
+    fn spawnEnvSizeCwd(
+        io: Io,
+        argv: []const []const u8,
+        env_extra: ?[]const []const u8,
+        rows: u16,
+        cols: u16,
+        cwd: ?[]const u8,
+    ) !Session {
         var pty = try Pty.openSize(rows, cols);
         errdefer pty.close();
-        const pid = spawnChildEnv(io, &pty, argv, env_extra) catch |e| {
+        const pid = spawnChildEnvCwd(io, &pty, argv, env_extra, cwd) catch |e| {
             pty.close();
             return e;
         };
@@ -3108,12 +3121,11 @@ test "file tree: <leader>e shows files, Enter opens one" {
     }
     try std.testing.expect(!grid.contains("workspace-plan"));
 
-    // j × 3: docs → src → test → DESIGN.md (first-level file); Enter opens
-    // it but KEEPS the tree open — only <space>e (toggle) or Esc close it;
-    // focus returns to the buffer so typing edits the file.
-    // dirs-first first level: docs, patches, scripts, src, test, vendor —
-    // 6 × j from docs to DESIGN.md
-    try sess.send("jjjjjj\r");
+    // j × 5 → DESIGN.md (first-level file); Enter opens it but KEEPS the
+    // tree open — only <space>e (toggle) or Esc close it; focus returns to
+    // the buffer so typing edits the file.
+    // dirs-first first level: docs, patches, src, test, tools, DESIGN.md.
+    try sess.send("jjjjj\r");
     waited = 0;
     while (!grid.contains("# oz") or !grid.contains("NORMAL")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
@@ -7102,11 +7114,12 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
     }
     try std.testing.expect(std.mem.indexOf(u8, grid.rowText(2), "docs") != null);
 
-    // j × 4 → README.md (docs → src → test → DESIGN.md → README.md), Enter
-    // opens it. The tree STAYS open (only
-    // <space>e / Esc close it) — the buffer tab shows README.md (row 0, now
-    // NOT covered by the sidebar).
-    try sess.send("jjjjjj\r");
+    // j × 7 → README.md. Current first level (dirs first, then uppercase
+    // names before lowercase in byte order): docs, patches, src, test,
+    // tools, DESIGN.md, LICENSE, README.md. Enter opens it. The tree STAYS
+    // open (only <space>e / Esc close it) — the buffer tab shows README.md
+    // (row 0, now NOT covered by the sidebar).
+    try sess.send("jjjjjjj\r");
     waited = 0;
     while (std.mem.indexOf(u8, grid.rowText(0), "README.md") == null and
         std.mem.indexOf(u8, grid.rowText(2), "README.md") == null)
@@ -7126,7 +7139,7 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
     // The tree is still open with focus on the buffer (Enter moves focus).
     // Ctrl-w h → sidebar focus (the tree is the leftmost pane; h moves left
     // from the buffer into it); the selection is still on README.md's row.
-    // kkk → src, l expands it, j → buffer, l expands it, jj → ops.zig,
+    // kkkkk → src, l expands it, j → buffer, l expands it, jj → ops.zig,
     // then Enter opens it (zig → md → zig, the chain that rebuilds the
     // highlighter via ensureSyntax).
     try sess.send("\x17h");
@@ -7142,7 +7155,7 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
         break;
     }
-    try sess.send("kkkk");
+    try sess.send("kkkkk");
     while (true) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
         if (n == 0) break;
@@ -12840,7 +12853,7 @@ test "git: marks stay glued to their lines while typing (instant shift, no refre
     try std.testing.expect(try Wait.until(&sess, &grid, "NORMAL"));
     try std.testing.expect(try Wait.until(&sess, &grid, "\u{258e}"));
     const row_after = Wait.markRow(&grid, "\u{258e}").?;
-    std.debug.print("gitshift: sign row after refresh={d}\n", .{ row_after });
+    std.debug.print("gitshift: sign row after refresh={d}\n", .{row_after});
     try std.testing.expect(row_after == row_before + 2);
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
@@ -14561,4 +14574,439 @@ test "ai workspace: error surfaces in the thread and leaves the editor usable" {
     try sess.send("\x1b");
     try gridWaitGone(&sess, &grid, "changes 0", 4000);
     try aiQuit(&sess);
+}
+
+// ---------------------------------------------------------------------------
+// Scenario matrix (M2.5): data-driven layout + AI workspace coverage
+// ---------------------------------------------------------------------------
+const frame = @import("frame.zig");
+const ai_ws = @import("ai_workspace");
+
+const scenario_fixture =
+    "GOLDEN_EDITOR_MARKER\n" ++
+    "second line for the layout matrix\n" ++
+    "third line\n";
+
+const scenario_sse =
+    "data: {\"choices\":[{\"delta\":{\"content\":\"mock \"}}]}\n\n" ++
+    "data: {\"choices\":[{\"delta\":{\"content\":\"reply\"}}]}\n\n" ++
+    "data: [DONE]\n\n";
+
+const ScenarioSetup = enum { plain, ai_mock };
+const ScenarioRail = enum { hidden, docked, drawer };
+
+const ScenarioStep = struct {
+    keys: []const u8,
+    wait_for: ?[]const u8 = null,
+    timeout_ms: i32 = 5000,
+};
+
+const Scenario = struct {
+    name: []const u8,
+    tags: []const []const u8,
+    rows: u16,
+    cols: u16,
+    setup: ScenarioSetup = .plain,
+    filetree: bool = false,
+    rail: ScenarioRail = .hidden,
+    /// Extra keystrokes after the state setup (filetree/rail/prompt).
+    steps: []const ScenarioStep = &.{},
+    /// Sends `prompt`, Enter, then waits for the mock stream + idle.
+    prompt: ?[]const u8 = null,
+    expect_text: []const []const u8 = &.{},
+    expect_absent: []const []const u8 = &.{},
+    /// Substrings that must be present in the mock request body.
+    request_contains: []const []const u8 = &.{},
+};
+
+/// Pairwise layout matrix: 3 widths × filetree {closed,open} × rail
+/// {closed,open}, plus the two streaming sizes. 80 cols uses the drawer;
+/// 100/120 use the docked rail.
+const scenario_matrix = [_]Scenario{
+    .{
+        .name = "editor 80x24",
+        .tags = &.{ "@layout", "@80col" },
+        .rows = 24,
+        .cols = 80,
+        .expect_text = &.{"GOLDEN_EDITOR_MARKER"},
+    },
+    .{
+        .name = "editor 100x30",
+        .tags = &.{ "@layout", "@100col" },
+        .rows = 30,
+        .cols = 100,
+        .expect_text = &.{"GOLDEN_EDITOR_MARKER"},
+    },
+    .{
+        .name = "editor 120x30",
+        .tags = &.{ "@layout", "@120col" },
+        .rows = 30,
+        .cols = 120,
+        .expect_text = &.{"GOLDEN_EDITOR_MARKER"},
+    },
+    .{
+        .name = "filetree 80x24",
+        .tags = &.{ "@layout", "@filetree", "@80col" },
+        .rows = 24,
+        .cols = 80,
+        .filetree = true,
+        .expect_text = &.{"files"},
+    },
+    .{
+        .name = "filetree 100x30",
+        .tags = &.{ "@layout", "@filetree", "@100col" },
+        .rows = 30,
+        .cols = 100,
+        .filetree = true,
+        .expect_text = &.{ "files", "GOLDEN_EDITOR_MARKER" },
+    },
+    .{
+        .name = "filetree 120x30",
+        .tags = &.{ "@layout", "@filetree", "@120col" },
+        .rows = 30,
+        .cols = 120,
+        .filetree = true,
+        .expect_text = &.{ "files", "GOLDEN_EDITOR_MARKER" },
+    },
+    .{
+        .name = "ai rail 80x24 drawer",
+        .tags = &.{ "@layout", "@ai", "@drawer", "@80col" },
+        .rows = 24,
+        .cols = 80,
+        .rail = .drawer,
+        .expect_text = &.{ "agents", "thread 1", "changes 0", "GOLDEN_EDITOR_MARKER" },
+    },
+    .{
+        .name = "ai rail 100x30 dock",
+        .tags = &.{ "@layout", "@ai", "@docked", "@100col" },
+        .rows = 30,
+        .cols = 100,
+        .rail = .docked,
+        .expect_text = &.{ "agents", "thread 1", "changes 0", "GOLDEN_EDITOR_MARKER" },
+    },
+    .{
+        .name = "ai rail 120x30 dock",
+        .tags = &.{ "@layout", "@ai", "@docked", "@120col" },
+        .rows = 30,
+        .cols = 120,
+        .rail = .docked,
+        .expect_text = &.{ "agents", "thread 1", "changes 0", "GOLDEN_EDITOR_MARKER" },
+    },
+    .{
+        .name = "ai rail + filetree 80x24",
+        .tags = &.{ "@layout", "@ai", "@filetree", "@drawer", "@80col" },
+        .rows = 24,
+        .cols = 80,
+        .filetree = true,
+        .rail = .drawer,
+        .expect_text = &.{ "files", "agents", "changes 0" },
+    },
+    .{
+        .name = "ai rail + filetree 100x30",
+        .tags = &.{ "@layout", "@ai", "@filetree", "@docked", "@100col" },
+        .rows = 30,
+        .cols = 100,
+        .filetree = true,
+        .rail = .docked,
+        .expect_text = &.{ "files", "agents", "changes 0", "GOLDEN_EDITOR_MARKER" },
+    },
+    .{
+        .name = "ai rail + filetree 120x30",
+        .tags = &.{ "@layout", "@ai", "@filetree", "@docked", "@120col" },
+        .rows = 30,
+        .cols = 120,
+        .filetree = true,
+        .rail = .docked,
+        .expect_text = &.{ "files", "agents", "changes 0", "GOLDEN_EDITOR_MARKER" },
+    },
+    .{
+        .name = "ai chat stream 120x30 dock",
+        .tags = &.{ "@layout", "@ai", "@stream", "@docked", "@120col" },
+        .rows = 30,
+        .cols = 120,
+        .setup = .ai_mock,
+        .rail = .docked,
+        .prompt = "hello",
+        .expect_text = &.{ "mock reply", "hello", "idle" },
+        .request_contains = &.{ "hello", "mock-model" },
+    },
+    .{
+        .name = "ai chat stream 80x24 drawer",
+        .tags = &.{ "@layout", "@ai", "@stream", "@drawer", "@80col" },
+        .rows = 24,
+        .cols = 80,
+        .setup = .ai_mock,
+        .rail = .drawer,
+        .prompt = "hello",
+        .expect_text = &.{ "mock reply", "hello", "idle" },
+        .request_contains = &.{ "hello", "mock-model" },
+    },
+};
+
+/// Every feature tag that must have at least one scenario. A new layout/AI
+/// feature adds its tag here and to at least one Scenario; the coverage test
+/// fails with a clear message otherwise (instead of silently dropping it).
+const required_scenario_tags = [_][]const u8{
+    "@layout", "@ai", "@filetree", "@stream", "@80col", "@100col", "@120col", "@drawer", "@docked",
+};
+
+fn expectedRailMode(rail: ScenarioRail) ai_ws.RailMode {
+    return switch (rail) {
+        .hidden => .hidden,
+        .docked => .docked,
+        .drawer => .drawer,
+    };
+}
+
+/// Read whatever is pending until the stream has been quiet for `quiet_ms`.
+fn gridSettle(sess: *Session, grid: *Grid, quiet_ms: i32, timeout_ms: i32) !void {
+    var waited: i32 = 0;
+    var quiet: i32 = 0;
+    while (waited < timeout_ms) : (waited += 50) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
+        if (n == 0) {
+            quiet += 50;
+            if (quiet >= quiet_ms) return;
+            continue;
+        }
+        quiet = 0;
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+}
+
+fn assertScenario(sc: Scenario, grid: *Grid) !void {
+    try std.testing.expectEqual(@as(usize, sc.rows), grid.rows);
+    try std.testing.expectEqual(@as(usize, sc.cols), grid.cols);
+
+    const cols: u32 = sc.cols;
+    const rows: u32 = sc.rows;
+    const lay = ai_ws.layout(cols, sc.rail != .hidden);
+    try std.testing.expectEqual(expectedRailMode(sc.rail), lay.mode);
+
+    // Layout algebra: the rail and editor partition the width exactly.
+    if (lay.mode == .docked) {
+        try std.testing.expectEqual(cols, lay.editor_width + lay.rail_width);
+        try std.testing.expectEqual(cols, lay.rail_col + lay.rail_width);
+    } else if (lay.mode == .drawer) {
+        try std.testing.expectEqual(cols, lay.editor_width);
+        try std.testing.expectEqual(cols, lay.rail_col + lay.rail_width);
+        try std.testing.expect(lay.rail_width <= cols);
+        try std.testing.expect(lay.rail_col >= 8);
+    } else {
+        try std.testing.expectEqual(cols, lay.editor_width);
+        try std.testing.expectEqual(@as(u32, 0), lay.rail_width);
+    }
+
+    const status_rect = frame.Rect{
+        .top = @as(usize, rows) - 1,
+        .left = 0,
+        .right = @as(usize, cols) - 1,
+        .bottom = @as(usize, rows) - 1,
+    };
+    // The status bar owns the last row; only the right-aligned AI status
+    // block paints a solid status background (the left status text does not
+    // extend to the screen edge).
+    try frame.expectTextInRegion(grid, status_rect, "NORMAL");
+
+    var rail_rect: ?frame.Rect = null;
+    if (lay.mode != .hidden) {
+        const rr = frame.Rect{
+            .top = 0,
+            .left = @intCast(lay.rail_col),
+            .right = @as(usize, cols) - 1,
+            .bottom = @as(usize, rows) - 2,
+        };
+        rail_rect = rr;
+        // The rail is a solid panel: no unpainted holes, top-left and
+        // top-right cells have the float background, and the left border is
+        // a continuous vertical line.
+        try frame.expectRegionPainted(grid, rr);
+        try frame.expectCellBg(grid, 0, rr.left, aiRailBg());
+        try frame.expectCellBg(grid, 0, rr.right, aiRailBg());
+        try std.testing.expectEqualStrings("│", frame.cellText(grid, 0, rr.left));
+        try std.testing.expectEqualStrings("│", frame.cellText(grid, rr.bottom, rr.left));
+        try frame.expectTextInRegion(grid, rr, "agents");
+        try frame.expectTextInRegion(grid, rr, "thread 1");
+        try frame.expectTextInRegion(grid, rr, "changes 0");
+        try frame.expectCellBg(grid, @as(usize, rows) - 1, @as(usize, cols) - 1, aiStatusBg());
+        // The rail stops above the status bar and never shares a cell with
+        // it; the editor keeps its reserved width to the left.
+        try frame.expectNoOverlap(rr, status_rect);
+        try frame.expectNoHorizontalOverflow(grid, @as(usize, cols));
+
+        // The editor content is visible to the left of the rail (in drawer
+        // mode the rail overlays the right side only).
+        const visible_editor = frame.Rect{
+            .top = 0,
+            .left = 0,
+            .right = if (lay.mode == .drawer) rr.left - 1 else @as(usize, lay.editor_width) - 1,
+            .bottom = @as(usize, rows) - 1,
+        };
+        try frame.expectTextInRegion(grid, visible_editor, "GOLDEN_EDITOR");
+    } else {
+        try frame.expectNoHorizontalOverflow(grid, @as(usize, cols));
+    }
+
+    if (sc.filetree) {
+        const ft = frame.findBoxByTitle(grid, "files") orelse {
+            std.debug.print("scenario {s}: no filetree box with title 'files' in {d}x{d}\n", .{
+                sc.name, sc.rows, sc.cols,
+            });
+            return error.TestUnexpectedResult;
+        };
+        try frame.expectBorderBox(grid, ft, null);
+        try frame.expectTextInRegion(grid, ft, "files");
+        if (rail_rect) |rr| try frame.expectNoOverlap(ft, rr);
+        try frame.expectNoOverlap(ft, status_rect);
+        try std.testing.expect(ft.bottom <= @as(usize, rows) - 2);
+    }
+
+    for (sc.expect_text) |needle| {
+        const whole = frame.Rect{
+            .top = 0,
+            .left = 0,
+            .right = @as(usize, cols) - 1,
+            .bottom = @as(usize, rows) - 1,
+        };
+        try frame.expectTextInRegion(grid, whole, needle);
+    }
+    for (sc.expect_absent) |needle| {
+        if (grid.contains(needle)) {
+            std.debug.print("scenario {s}: unexpected text '{s}'\n", .{ sc.name, needle });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+fn runScenario(sc: Scenario) !void {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [160:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_scenario_{d}_{d}.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, scenario_fixture);
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    var mock_dir: ?[:0]const u8 = null;
+    var mock_env: ?[]u8 = null;
+    defer {
+        if (mock_env) |e| alloc.free(e);
+    }
+    defer {
+        if (mock_dir) |d| std.Io.Dir.cwd().deleteTree(io, d) catch {};
+    }
+    if (sc.setup == .ai_mock) {
+        const d = try aiMockDir(io, &dir_buf);
+        mock_dir = d;
+        try aiWriteFile(io, d, "stream.sse", scenario_sse);
+        mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{d});
+    }
+    var env_storage: [2][]const u8 = undefined;
+    var env_extra: ?[]const []const u8 = null;
+    if (mock_env) |e| {
+        env_storage[0] = e;
+        env_storage[1] = "OZ_AI_MODEL=mock-model";
+        env_extra = env_storage[0..];
+    }
+
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, env_extra, sc.rows, sc.cols);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, sc.rows, sc.cols);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+
+    if (sc.filetree) {
+        try sess.send(" e");
+        try gridWaitFor(&sess, &grid, "files", 5000);
+    }
+    if (sc.rail != .hidden) {
+        // From the file tree, Ctrl+w a is the documented re-entry path;
+        // from the editor, <leader>a opens the rail focused on the prompt.
+        if (sc.filetree) try sess.send("\x17a") else try sess.send(" a");
+        try gridWaitFor(&sess, &grid, "agents", 5000);
+        try gridWaitFor(&sess, &grid, "thread 1", 4000);
+        try gridWaitFor(&sess, &grid, "changes 0", 4000);
+    }
+    if (sc.prompt) |prompt| {
+        try sess.send(prompt);
+        try gridWaitFor(&sess, &grid, prompt, 3000);
+        try sess.send("\r");
+        try gridWaitFor(&sess, &grid, "mock reply", 8000);
+        try gridWaitFor(&sess, &grid, "idle", 5000);
+    }
+    for (sc.steps) |step| {
+        if (step.keys.len > 0) try sess.send(step.keys);
+        if (step.wait_for) |needle| try gridWaitFor(&sess, &grid, needle, step.timeout_ms);
+    }
+    try gridSettle(&sess, &grid, 250, 5000);
+
+    assertScenario(sc, &grid) catch |err| {
+        std.debug.print("scenario failed: {s} (tags:", .{sc.name});
+        for (sc.tags) |tag| std.debug.print(" {s}", .{tag});
+        std.debug.print(")\n", .{});
+        grid.dump();
+        return err;
+    };
+
+    if (mock_dir) |d| {
+        for (sc.request_contains) |needle| {
+            const req = try aiReadFile(io, alloc, d, "request.json");
+            defer alloc.free(req);
+            if (std.mem.indexOf(u8, req, needle) == null) {
+                std.debug.print("scenario {s}: request body missing '{s}'\n", .{ sc.name, needle });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
+test "scenario matrix: layout and AI workspace combinations" {
+    for (scenario_matrix) |sc| {
+        try runScenario(sc);
+    }
+}
+
+test "scenario matrix: every required tag is covered" {
+    for (required_scenario_tags) |tag| {
+        var found = false;
+        for (scenario_matrix) |sc| {
+            for (sc.tags) |t| {
+                if (std.mem.eql(u8, t, tag)) found = true;
+            }
+        }
+        if (!found) {
+            std.debug.print(
+                "scenario matrix: tag '{s}' has no scenario (add one to scenario_matrix)\n",
+                .{tag},
+            );
+            return error.UncoveredScenarioTag;
+        }
+    }
+    for (scenario_matrix) |sc| {
+        if (sc.tags.len == 0) {
+            std.debug.print("scenario matrix: scenario '{s}' has no tags\n", .{sc.name});
+            return error.UntaggedScenario;
+        }
+        for (sc.tags) |tag| {
+            var declared = false;
+            for (required_scenario_tags) |t| {
+                if (std.mem.eql(u8, t, tag)) declared = true;
+            }
+            if (!declared) {
+                std.debug.print(
+                    "scenario matrix: scenario '{s}' uses undeclared tag '{s}' (add it to required_scenario_tags)\n",
+                    .{ sc.name, tag },
+                );
+                return error.UndeclaredScenarioTag;
+            }
+        }
+    }
 }
