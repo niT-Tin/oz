@@ -17,8 +17,8 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-Current counts at the M3a implementation commit: **466 unit tests** and
-**165 e2e tests**. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
+Current counts at the M3b1 implementation commit: **474 unit tests** and
+**170 e2e tests**. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
 `.verify/verify.json` (schema version 1, git commit/dirty flag, exact command
 strings, timestamps, exit codes, log SHA-256s, parsed pass/fail counts). It
 runs every command even after a failure and exits non-zero if any command
@@ -36,7 +36,7 @@ replaying a cached successful run.
 
 | Layer | What it covers | Where |
 |---|---|---|
-| **Model/unit (L1)** | Pure logic: piece table, motions, keymaps, SSE/OpenAI config parsing, AI workspace layout/focus/thread model, navigator tab model, note store (paths/titles/sorting/creation), inline selection mapping/fences/diff/pending policy, M3a agent loop bounds/card formatting/metrics/chart cache key + transcript→request assembly | `src/**/*.zig` `test` blocks, aggregated by `src/tests.zig` |
+| **Model/unit (L1)** | Pure logic: piece table, motions, keymaps, SSE/OpenAI config parsing, AI workspace layout/focus/thread model, navigator tab model, note store (paths/titles/sorting/creation), inline selection mapping/fences/diff/pending policy, M3a agent loop bounds/card formatting/metrics/chart cache key + transcript→request assembly, M3b1 staged `edit_file` args/occurrence/span/bounded-preview/pending policy and approval decision metrics | `src/**/*.zig` `test` blocks, aggregated by `src/tests.zig` |
 | **Protocol fixtures** | SSE chunking, request JSON (incl. assistant tool-call turns and `role:"tool"` results), streamed `tool_calls` fragments/parallel calls/malformed protocol, config env parsing, AI client cancellation/error paths; mock LSP JSON-RPC | `src/ai/sse.zig`, `src/ai/openai.zig`, `src/ai/tools.zig`, `src/ai/client.zig`, `src/ai/config.zig`, mock LSP tests |
 | **Semantic frames (L3)** | Real `oz` binary in a pty; ANSI stream reconstructed into a cell grid; assertions on regions, borders, text, overlap, overflow | `test/e2e.zig` + `test/frame.zig` |
 | **Scenario matrix** | Data-driven pairwise matrix over terminal widths, filetree, and AI rail states; fresh pty per scenario; tags enforced | `test/e2e.zig` (`scenario_matrix`) |
@@ -81,7 +81,7 @@ fixture note; the navigator box is located without its title text (hint labels
 intentionally cover the tab words).
 
 Scenario tags: `@layout @ai @filetree @stream @hints @navigator @notes
-@inline @tools @80col @100col @120col @drawer @docked`. A new feature adds
+@inline @tools @approval @80col @100col @120col @drawer @docked`. A new feature adds
 its tag here and to at least one scenario.
 
 Every scenario must carry tags; `required_scenario_tags` is the declared
@@ -149,8 +149,8 @@ The M3a pty tests (`test/e2e.zig`, filter `tools:`) cover:
   `tool_call_id`s in the follow-up, `2 calls`, chart;
 - a missing file: real `error:` card and `ok 0 · err 1`, while the follow-up
   final text still arrives;
-- `edit_file`: `approval required (M3b)`, the file bytes on disk are unchanged,
-  the tool result says "not executed", no latency samples/chart;
+- `edit_file` is no longer an M3a block: it is staged by the M3b1 path below
+  (the old placeholder test was replaced, not deleted);
 - four tool rounds: execution stops, the transcript note names the bound, the
   fifth request is the final **no-tools** request (no `tools`/`tool_choice`),
   and no sixth request exists; Tools tab `calls 4`;
@@ -175,11 +175,59 @@ the transcript message order used by the follow-up request.
 
 Known gaps at M3a (intentional, documented in DESIGN §20.8): metrics are
 session/per-thread only (no cross-session persistence, no p95); calls
-cancelled before their worker result is applied are not counted; writes and
-approval buttons are M3b; tool-card expansion is hint-only (no mouse/card
-cursor); the chart legend lists tool names but has no per-series average
-annotation. The `stream-<n>.sse` seam is test-only and never used against a
+cancelled before their worker result is applied are not counted; `edit_file`
+approval is M3b1 while `apply_patch`/terminal remain M3b; tool-card expansion
+is hint-only (no mouse/card cursor); the chart legend lists tool names but has
+no per-series average annotation. The `stream-<n>.sse` seam is test-only and never used against a
 real provider.
+
+### M3b1 staged edit approval fixtures and e2e
+
+The M3b1 pty tests (`test/e2e.zig`, filter `approval:`) cover the complete
+stage → review → decide path with real disk fixtures:
+
+- an `edit_file` call stages a diff (`changes 1`, `-1 +1`, removed/added lines),
+  the Chat card says `approval required`, the follow-up `role:"tool"` result
+  says `staged for review; not applied`, the target file on disk and the
+  buffer/dirty flag are untouched;
+- approve applies the replacement to the in-memory buffer (dirty), leaves the
+  file unchanged, `u` restores the whole edit as one undo group, Ctrl+r redoes
+  it, and `:w` is the only step that rewrites the file;
+- reject through the drawn `[r] reject` hint label clears the review, leaves
+  buffer/history/file byte-identical and marks the card `rejected`; Tools shows
+  `calls 1` / `ok 0 · err 0 · appr 1 · denied 1`;
+- after approve, Tools shows the same call as `ok 1 · err 0 · appr 1` with no
+  fabricated latency sample;
+- a buffer edit after staging refuses with `stale edit`, keeps the diff
+  reviewable and does not corrupt the user's edited buffer; reject then
+  restores the normal empty state;
+- an 80x24 drawer renders the diff/buttons without horizontal overflow and the
+  drawn Approve hint label applies the edit; the review body stays a closed
+  panel when empty;
+- a second `edit_file` while one is pending produces
+  `resolve the pending edit first` (card/result) instead of a queue; creating
+  a second thread hides the review (`changes 0`) but switching back preserves
+  it and approve still applies to the staging thread's buffer;
+- `apply_patch`/`terminal`/unknown calls in one batch produce truthful
+  `unsupported` cards/results with no worker, no staged diff and no disk
+  write; Tools shows `3 calls` / `unsup 1` per tool.
+
+The scenario matrix adds `ai approval 120x30` (tag `@approval`): it stages an
+edit against the opened scenario buffer, checks the Changes diff/card, approves
+and asserts the applied buffer plus `changes 0`/`approved`.
+
+Unit tests pin the pure half: schema parsing, unique/ambiguous/missing
+`old_string`, `replace_all` span replacement, multi-hunk context merging,
+bounded preview/omitted-occurrence notes, staleness (`verify`), thread-scoped
+visibility/one-review policy, and approval/rejection metrics that do not count
+as a second call.
+
+Known M3b1 gaps (documented in DESIGN §20.9): only `edit_file`; single-file,
+single-contiguous-span apply (replace_all merges occurrences into one undo
+group); no `apply_patch`, terminal, approval queue or cross-session
+persistence; ≤256 KiB stage cap; bounded hunk preview rather than a whole-file
+unified diff; the model transcript keeps the original "staged/not applied"
+tool result even after a later local approval; no mouse.
 
 ### Property tests
 
@@ -235,6 +283,7 @@ real provider.
 | Navigator tabs, notes list/create/save/reopen, agents attach | L1 (`src/app/navigator.zig`, `src/app/note_store.zig`) + L3 `navigator:` tests + `@navigator`/`@notes` matrix scenarios |
 | Notes path fallback/error handling | L1 resolution/creation tests + L3 unavailable-dir e2e (`OZ_NOTES_DIR=/dev/null/notes`) |
 | Inline assistant (selection→prompt→stream→Changes diff→Approve/Reject, stale, cancel, 80-col, hints) | L1 `src/app/inline.zig` + L3 `inline:` tests + `@inline` scenario |
+| Staged agent `edit_file` (args/occurrence/diff/stale/one pending), approve buffer+undo, reject, 80-col hints, thread scoping | L1 `src/app/agent_edit.zig` + `src/ai/agent.zig` decision metrics + L3 `approval:` tests + `@approval` scenario |
 | Mock LSP protocol | L4 mock server e2e |
 | Deterministic build/test run | `tools/verify.sh` + CI |
 
@@ -263,6 +312,15 @@ Known gaps / deliberate limitations:
   Approval is revision/path/range checked; after a workspace switch the pending
   diff has no matching buffer and must be rejected (safe failure, never apply).
   There is no auto-save: approve only edits the buffer.
+- Agent staged edits are M3b1: only `edit_file`, one review at a time (shared
+  with inline), one file/one contiguous span per apply, ≤256 KiB source, bounded
+  hunk preview (context windows + omission notes, not a whole-file unified
+  diff), and no persistence across restarts. `apply_patch`/terminal/unknown
+  still never execute. The automatic follow-up already sent the staged
+  "not applied" tool result, so a later approval updates the local card but not
+  the model transcript. Pending edits are thread-scoped: switching threads hides
+  the badge/review but keeps it, and apply/reject requires returning to that
+  thread.
 - The navigator Agents tab is a view of the same session thread model; it is
   not persisted and is covered through that model's existing tests plus one
   attach/switch e2e, not a second state machine.

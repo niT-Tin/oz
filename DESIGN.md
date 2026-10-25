@@ -1087,6 +1087,7 @@ pub const Target = struct { rect: Rect, action: Action };
 - 鼠标仍未接入；hint 与既有键盘路径共享同一批动作方法，没有第二套业务逻辑。
 - M2b1 追加 `navigator_tab`（复用 `navigatorSetTab`）与 `note_open`（复用 `openNoteAt`）两个动作；`agent_thread_select` 现在先打开 rail，保证从 navigator 的 Agents tab 触发时 attach 可见。navigator 的 tab strip 与 Notes 行都注册为 target，e2e 从画面读取标签后激活。
 - M2b2 追加 `inline_approve` / `inline_reject`：Changes 的 pending diff 渲染 `[a] approve  [r] reject` 两行按钮时注册矩形，动作分别复用 `inlineApprove` / `inlineReject`，与键盘 `a`/Enter、`r`/`d` 是同一条路径。
+- M3b1 追加 `agent_approve` / `agent_reject`：通用 Changes review 渲染器（`inline_ui.drawDiffReview`）把按钮动作作为参数传入，agent edit 走 `agentEditApprove` / `agentEditReject`，与键盘路径一致。
 
 ---
 
@@ -1117,8 +1118,8 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 
 - 读工具默认 allow；`edit_file` / `apply_patch` / terminal 默认 confirm；未知工具 deny。
 - 审批卡片出现在 Chat 内联，并同步到 Workbox Changes/Approval badge；`<leader>j` hint target 可选中 Allow/Deny。
-- M3a 的写入工具只返回 `approval_required`/未实现，不落盘；M3b 才通过 pending diff/apply 路径执行。
-- 审批决定必须绑定 tool_call id + 参数摘要；参数变化/过期不得复用旧批准。
+- M3a 的写入工具只返回 `approval_required`/未实现，不落盘；M3b1 已把 `edit_file` 接到 pending diff/apply 路径（§20.9），`apply_patch`/terminal 仍不执行。
+- 审批决定绑定 stage 时的 tool card/参数摘要；approve 时重新校验路径、整文件文本与 `history.revision`，参数/内容变化不得复用旧批准。
 
 ### 20.5 Tool cards 与 metrics
 
@@ -1135,7 +1136,8 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 ### 20.6 里程碑
 
 - **M3a（已完成，2026-10-25）**：只读 executor + tool loop + Chat tool cards + Tools tab 真实统计 + chart 接入 + 审批占位；e2e mock。实现状态见 §20.8。
-- **M3b**：`edit_file`/`apply_patch` 审批 + pending diff/apply/undo；审批按钮 hint；更多 metrics（p95、跨会话持久化）；性能基准。
+- **M3b1（已完成，2026-10-25）**：`edit_file` staged diff + 人工 approve/reject + buffer-only apply/undo、审批按钮 hint、`approved`/`rejected` 卡片与 decision metrics。实现状态见 §20.9。
+- **M3b 余下**：`apply_patch` 审批（含 hunk 校验）、terminal 沙箱/明确确认、更多 metrics（p95、跨会话持久化）、性能基准。
 - **后续**：terminal tool（独立沙箱/明确确认）、MCP/ACP、跨会话 metrics 持久化。
 
 ### 20.7 测试
@@ -1158,9 +1160,9 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 
 - 每 thread 一个 `ToolThreadState`（与 `threads.items` 平行）：捕获当轮 workspace root（`currentRootDir`，绝对、无 trailing slash）、round/call 计数、in-flight batch、stream terminal、follow-up 状态、generation、当前 batch 的 card message indices、transcript note、`agent.Metrics`。
 - 一轮 user turn：首个请求带 tools；响应结束时若有 tool calls：把 calls 附到本轮 assistant message，为每个 call 建 card（running），按 `agent.planBatch` admission（prefix）：前 N 个交给 worker；超限的立即写为 `unsupported` + `error: ... limit ...; not executed`，并写回一条真实的 `role:"tool"` 结果。`rounds` 按 batch 计，`calls` 按实际 admitted 计。
-- worker 完成后：填 card 的 status/content/duration（`ok`/`error`/`approval required (M3b)`/`unsupported`），记录 metrics，然后自动 follow-up；follow-up 仍是同一 thread 的 client（`joinAfterTerminal` 消除 done/worker 重用的 Busy race），消息序列为 assistant(tool_calls) → tool results → 下一条 assistant。
+- worker 完成后：填 card 的 status/content/duration（`ok`/`error`/`unsupported`；M3a 的 `edit_file` 占位为 `approval required`，M3b1 起改由 App 层 stage，见 §20.9），记录 metrics，然后自动 follow-up；follow-up 仍是同一 thread 的 client（`joinAfterTerminal` 消除 done/worker 重用的 Busy race），消息序列为 assistant(tool_calls) → tool results → 下一条 assistant。
 - **限制**：最多 4 个 tool batch（`agent.max_tool_rounds`）、最多 8 个执行调用（`agent.max_tool_calls_per_turn`）。到达任一上限后下一请求 **不带 tools**（最终 no-tools turn），保证仍能拿到最终文本；若模型在最终轮仍返回 tool calls，只生成 `unsupported` card/结果并停止。超限时 Chat transcript 显示 `tool loop stopped: max rounds/calls (N) ...`；Tools tab 的计数仍是真实值。
-- `edit_file`/`apply_patch` 只走 executor 的 `approval_required`（不落盘），`terminal`/未知工具 `unsupported`；`ai/tool_exec.zig` 内没有任何写 syscall。
+- `edit_file`/`apply_patch` 只走 executor 的 `approval_required`（不落盘），`terminal`/未知工具 `unsupported`；`ai/tool_exec.zig` 内没有任何写 syscall。（M3b1 起 `edit_file` 在 App 层 stage，executor 的 fallback 仍不写；见 §20.9。）
 - 取消/切线程：现有 `cancelClient` 同时 requestCancel transport、`generation += 1`、冻结 running cards 为 `cancelled`、requestCancel worker；随后 worker 的结果因 generation/`cancel_requested` 不匹配被丢弃，绝不写入任何 transcript。`Ctrl+c` 在 stream 已结束但 tool/follow-up 仍活动时也会停止 loop。
 
 **Worker（`src/app/tool_job.zig`）**
@@ -1178,7 +1180,7 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 
 **只读边界与限制**
 
-- 只执行 `read_file`/`list_directory`/`grep`；写入工具在 M3a 永远返回 approval/unsupported，不创建 pending diff、不写盘。没有 terminal/shell/网络工具。
+- 只执行 `read_file`/`list_directory`/`grep`；写入工具在 M3a 永远返回 approval/unsupported，不创建 pending diff、不写盘。没有 terminal/shell/网络工具。（M3b1 扩展见 §20.9：`edit_file` 在 App 层 staged，executor 仍然只读。）
 - `read_file`/`grep` 只读 workspace root（拒绝绝对路径、`..`、NUL、越界 symlink；输出 workspace-relative）。这是 best-effort confinement，不声称 TOCTOU 安全（与 §20.3 一致）。
 - metrics 是 per-thread、session 级、不持久化；被取消/被 generation 丢弃的 in-flight 调用不计数（只统计真正应用回该 thread 的结果）。没有 p95、没有跨会话图表、没有 mock 数据注入发布 UI。
 - tool card 展开只通过 hint（无鼠标/卡片光标）；M3b 再加审批按钮与完整 hint 覆盖。
@@ -1201,3 +1203,52 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 - `zig build test`：466/466 通过（原 449 + 17 个 M3a 单测，未改动既有断言）。
 - `zig build e2e`：165/165 通过（原 156 + 9 个 M3a pty 测试；scenario matrix 新增 `ai tools read 120x30`）。
 - 无 golden 变更（tool cards/metrics 不进入固定 golden 帧）；`tools arrive in M3` 的旧空状态测试更新为 `no tool calls yet`（产品要求变化，断言不回退）。
+
+---
+
+### 20.9 M3b1 实现状态（staged edit approval，2026-10-25）
+
+**范围与策略**
+
+- M3b1 只实现 `edit_file` 的人工审批；`apply_patch`/`terminal`/未知工具仍不执行（本地 `unsupported`）。这是 M3b 的第一个切片，不含 patch 解析、terminal 沙箱、审批队列/持久化。
+- 工具调用不再到达 executor：`src/app/ai.zig:aiHandleToolCalls` 按 `ai.tools.classify` 分流。只有 `read_file`/`list_directory`/`grep` 进入后台 worker；`edit_file` 在 App 线程 stage；`apply_patch`/`terminal`/未知立即生成真实的 unsupported 卡片与 `role:"tool"` 结果，不启动 worker。
+- stage 只读目标：优先使用已打开 buffer 的当前文本（含未保存修改），否则 `readFileAlloc` 上限 256 KiB；**不打开新 buffer、不写临时文件、不改 dirty**。路径复用 `ai/tool_exec.zig` 的 `normalizeWorkspacePath` / `isWithin`：拒绝绝对路径、`..`、NUL、越界 symlink；canonical path 必须位于**当轮捕获**的 workspace root 内（不是当前可见 workspace）。
+- `old_string` 必须非空；未设 `replace_all` 时必须恰好出现一次；`replace_all` 至少一次且最多 512 次。任何失败返回真实 `error:` 卡片，不 stage。
+- diff 复用 `inline.buildDiff`（行级 LCS），不实现第二套 diff 引擎。为避免大文件整文件 diff，预览按“变更行 ±3 行上下文”合并 hunk，总预览 ≤240 行 / ≤16 hunks；超出时显示真实的 `… N more occurrence(s) not shown` 或 `preview truncated`，stats 行标记 `preview`。`-N +M` 是实际展示 hunk 的行级统计。完整 snapshot 只用于 staleness/apply，不逐帧重算。
+- 同一时刻只允许一个 review（agent 或 inline）：agent stage 在 inline prompt/stream/pending 存在时返回 `resolve the pending edit first`；inline start 在 agent pending 存在时同样拒绝。第二笔 `edit_file` 卡片为 `.err` + `error: resolve the pending edit first; not executed`，不排队。
+
+**Pending 与 UI**
+
+- `PendingAgentEdit`（`src/app/agent_edit.zig`）保存 thread/card index、canonical/relative path、完整 target snapshot、old/new、replace_all、单 span `[span_start, span_end)` + `span_replacement`、缓存 diff/stats、staged-from-buffer 的 buffer index + `history.revision`、以及 `stale` 标志。
+- 卡片状态：stage 成功 → `approval required` + `-N +M · staged · review in Changes`；approve → `approved` + `-N +M · applied · u to undo`；reject → `rejected` + `-N +M · discarded`；stale 仍为 `approval required` + `stale edit`。`api_text`（发给模型的 tool result）始终保持 stage 时的 `approval required: edit_file staged for review; not applied`，不篡改历史。
+- stage 成功自动打开 rail、切 **Changes**、badge `changes 1`、焦点 rail。Changes 使用新增的通用 `inline_ui.drawDiffReview(ReviewView)`（inline 与 agent 共用同一渲染/截断/闭合逻辑），`[a] approve  [r] reject` 注册 `agent_approve` / `agent_reject` hint target；`j/k` 滚动缓存 diff。无可见 pending 时 `a/r/d/j/k` 不被消费，`r`/`d` 仍是 Terminal/Changes tab 切换。
+- approve：target 未打开时先重新 canonicalize（必须仍是 captured root 内的同一路径）、只读重读校验，再 `openInBuffer`；已打开则按绝对 path 定位。随后校验 staged-from-buffer 的 `history.revision` 完全相等、当前整个文本与 snapshot 逐字节相等、`old_string` 出现次数仍等于 stage 时数量。任一失败 → toast/stats `stale edit`，pending 保留可 reject，buffer/history 不变。
+- 通过后 `switchTo` + `applyEdit(span_start, span_end, span_replacement)`：整个替换（包括 `replace_all` 的多处）是**一个 undo group**，`u` 一次恢复。dirty 由 `markDirtyRange` 设置；**不调用 save**，`:w` 仍是用户动作。approve 后焦点回 editor，toast `agent edit approved · u to undo`。reject toast `agent edit rejected`，不碰 buffer/history/dirty。
+- pending 线程隔离：badge/review 只在 `pending.thread_index == threads.active` 时可见；切线程隐藏但保留，approve/reject 在别的线程拒绝执行（提示切回）。pending 是 session 级、单实例；退出即丢弃（不持久化）。
+- metrics：stage 记录一次 `approval_required`；approve 通过 `recordDecision(approved)` 计入 `ok`（不增加 calls、不产生 latency sample），reject 计入 `denied`；Tools tab 显示 `appr` / `denied`。只统计真实 stage/decision。
+
+**限制**
+
+- 只支持单文件、单个连续 span 的 `edit_file`；`replace_all` 的多处被合并为一个 span 以便一次 undo，不生成 per-hunk undo。
+- `apply_patch` 仍未实现；terminal/未知工具不执行。没有跨会话/重启的 approval 队列；pending 绑定当前进程的 thread/card index。
+- 预览是有界 hunk，不是整文件 unified diff；超过 256 KiB 的文件拒绝 stage；没有 word-level diff、hunk 折叠或软换行。
+- stage 后自动 follow-up 已把 “staged/not applied” 结果发给模型；之后 approve 只更新本地卡片，模型 transcript 不会追认该批准（M3b 后续可加通知）。这是本切片的明确限制，不是假成功。
+- 路径校验是 best-effort（与 executor 相同，不声称 TOCTOU 安全）；符号链接别名可能被当作不同路径处理。
+- 无鼠标；hint 与键盘共用同一 approve/reject 方法。
+
+**文件**
+
+- `src/app/agent_edit.zig`：纯参数校验、occurrence/span、bounded hunk diff、pending/staleness、one-review policy + 单测。
+- `src/app/agent_edit_ui.zig`：workspace 只读加载、stage/approve/reject、Changes 渲染、按键/hint、thread 可见性。
+- `src/app/ai.zig`：工具调用分流（read-only worker / edit stage / unsupported）、卡片文案/状态、badge、Changes 路由、Tools tab denied。
+- `src/app/inline_ui.zig`：抽取通用 `drawDiffReview` + `ReviewView`；inline 行为不变。
+- `src/ai/agent.zig`、`src/ai/workspace.zig`：`approved`/`rejected` 卡片状态、decision metrics/`denied`、`setToolDecision`。
+- `src/app/hints.zig`、`src/app/hint_ui.zig`：`agent_approve` / `agent_reject`。
+- `src/ai/tool_exec.zig`：公开 workspace path 规则；`apply_patch` 防御性返回 `unsupported`；`edit_file` 的 executor fallback 仍不写。
+- `test/e2e.zig` + TESTING.md：6 个 M3b1 pty 测试、`@approval` scenario。
+
+**验证**
+
+- `zig build test`：474/474 通过（新增 7 个 `agent_edit` 纯模型单测 + 1 个 decision metrics 单测）。
+- `zig build e2e`：170/170 通过（原 M3a 的 edit_file 占位测试替换为 6 个 M3b1 pty 测试；scenario matrix 新增 `ai approval 120x30` 与 required tag `@approval`）。
+- 无 golden 变更（approval diff/卡片不进入固定 golden 帧）。
