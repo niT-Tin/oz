@@ -298,6 +298,17 @@ fn agentsKey(self: *App, key: vaxis.Key) !bool {
     }
 }
 
+/// Wheel over the navigator list: move the active tab's selection (clamped)
+/// through the same helpers the keyboard uses. Wheel never changes tab or
+/// focus; it only scrolls the list under the pointer.
+pub fn navigatorScrollBy(self: *App, delta: i32) void {
+    switch (self.navigator_tab) {
+        .files => self.moveFiletreeCursor(delta),
+        .notes => moveNoteCursor(self, delta),
+        .agents => moveThreadCursor(self, delta),
+    }
+}
+
 /// Navigator key routing, called only while the navigator owns the keyboard.
 /// Tab switching is consumed first (so `h`/`l` remain fold/parent on Files);
 /// every other key goes to the active tab's existing handler. Returns false

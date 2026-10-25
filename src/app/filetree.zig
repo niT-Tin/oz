@@ -314,14 +314,26 @@ pub fn activateFiletreeSelection(self: *App) !void {
 }
 
 /// j/k/Enter/Esc/h/l for the tree; returns true if consumed.
+/// Move the filetree selection by `delta`, clamped to the visible row list.
+/// Shared by j/k and the mouse wheel (one selection policy).
+pub fn moveFiletreeCursor(self: *App, delta: i32) void {
+    const n = self.filetree_rows.items.len;
+    if (n == 0) return;
+    var idx: i32 = @intCast(@min(self.filetree_sel, n - 1));
+    idx += delta;
+    if (idx < 0) idx = 0;
+    if (idx >= @as(i32, @intCast(n))) idx = @intCast(n - 1);
+    self.filetree_sel = @intCast(idx);
+}
+
 pub fn filetreeKey(self: *App, key: vaxis.Key) !bool {
     switch (key.codepoint) {
         'j', vaxis.Key.down => {
-            if (self.filetree_sel + 1 < self.filetree_rows.items.len) self.filetree_sel += 1;
+            moveFiletreeCursor(self, 1);
             return true;
         },
         'k', vaxis.Key.up => {
-            if (self.filetree_sel > 0) self.filetree_sel -= 1;
+            moveFiletreeCursor(self, -1);
             return true;
         },
         // h: fold the current dir; on an already-folded dir jump to its

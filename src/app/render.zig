@@ -1585,6 +1585,15 @@ pub fn renderNavigator(self: *App, a: std.mem.Allocator, win: vaxis.Window, heig
 
     try renderNavigatorTabs(self, a, win, ft_top);
 
+    // Mouse-only wheel region: the list body (below the tab strip, above
+    // the bottom border) scrolls the active tab's selection. Click targets
+    // for rows/tabs are registered by their draw paths.
+    self.addMouseScrollTarget(ft_top + 1, ft_col, ft_width, (ft_bottom - 1) -| (ft_top + 1), switch (self.navigator_tab) {
+        .files => .navigator_files,
+        .notes => .navigator_notes,
+        .agents => .navigator_agents,
+    });
+
     switch (self.navigator_tab) {
         .files => try renderFiletreeRows(self, a, win, ft_top, ft_bottom, usable),
         .notes => try renderNotesRows(self, a, win, ft_top, ft_bottom, usable),
@@ -1664,7 +1673,7 @@ fn renderNavigatorTabs(self: *App, a: std.mem.Allocator, win: vaxis.Window, row:
     try segs.append(a, .{ .text = "╮", .style = border_style });
     _ = win.print(segs.items, .{ .row_offset = @intCast(row), .col_offset = 0, .wrap = .none });
 
-    if (self.hints.collecting) {
+    if (self.mouseTargetsCollecting()) {
         i = 0;
         while (i < nav_tabs.count) : (i += 1) {
             const tab = nav_tabs.all[i];
@@ -1770,7 +1779,7 @@ fn renderFiletreeRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, ft_to
         @memset(pads, ' ');
         if (pads.len > 0) try segs.append(a, .{ .text = pads, .style = style });
         _ = win.print(segs.items, .{ .row_offset = @intCast(ft_top + 1 + k), .col_offset = @intCast(inner_left), .wrap = .none });
-        if (self.hints.collecting) {
+        if (self.mouseTargetsCollecting()) {
             // Inner row rect (starts after the left border so a label never
             // breaks the panel frame). Payload is the absolute row index in
             // filetree_rows, not the visible slot.
@@ -1873,7 +1882,7 @@ fn renderNotesRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, ft_top: 
             try segs.append(a, .{ .text = spaces, .style = base_style });
         }
         _ = win.print(segs.items, .{ .row_offset = @intCast(row1), .col_offset = @intCast(inner_left), .wrap = .none });
-        if (self.hints.collecting) {
+        if (self.mouseTargetsCollecting()) {
             self.addHintTarget(.{
                 .row = row1,
                 .col = inner_left,
@@ -2004,7 +2013,7 @@ fn renderAgentsRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, ft_top:
             try segs.append(a, .{ .text = spaces, .style = .{ .bg = bg } });
         }
         _ = win.print(segs.items, .{ .row_offset = @intCast(row), .col_offset = @intCast(inner_left), .wrap = .none });
-        if (self.hints.collecting) {
+        if (self.mouseTargetsCollecting()) {
             self.addHintTarget(.{
                 .row = row,
                 .col = inner_left,
@@ -2380,7 +2389,7 @@ pub fn drawBufferTabPlan(
                 },
             });
         }
-        if (self.hints.collecting) {
+        if (self.mouseTargetsCollecting()) {
             // The select target starts at the icon so the hint label covers
             // the tab's identity, not its two-cell left padding. The close
             // cell is its own target, wired to the SAME close-buffer path as
@@ -2433,6 +2442,10 @@ pub fn render(self: *App) !void {
     win.fill(.{ .style = .{ .bg = .{ .rgb = self.theme.bg } } });
 
     const height: u32 = win.height;
+    // feat/mouse: reset the hit-test target list for this frame. Cheap (one
+    // branch) unless mouse reporting is enabled; the same registrations that
+    // feed hint labels also feed hit-testing on mouse frames.
+    self.beginMouseFrame(height, win.width);
     if (height <= status_row_count) return;
     // One timestamp for every animated element this frame (streaming dots,
     // tool spinners, badge flash). Idle frames compute it but draw nothing
@@ -2731,6 +2744,10 @@ pub fn render(self: *App) !void {
     while (li < leaves.len) : (li += 1) {
         const lr = leaves[li];
         if (lr.win == self.current_win) cur_rect = lr;
+        // Mouse-only: each split leaf is clickable (focus + cursor
+        // placement) and scrollable. Registered from the SAME layout rect
+        // the pane draws into, so hit geometry cannot drift.
+        self.addMousePaneTarget(lr.win, lr.row, lr.col, lr.height, lr.width);
         try self.renderWindowLines(a, lr, lr.win == self.current_win);
     }
 
@@ -2742,6 +2759,9 @@ pub fn render(self: *App) !void {
     // are dim. The bg is the editor background so the line fully hides
     // whatever buffer text it covers — no ghosting from the window below.
     for (layout.seps) |sep| {
+        // A separator click is an explicit v1 no-op (no resize); its
+        // 1-cell-thick rect wins over the adjacent pane by area.
+        self.addMouseSeparatorTarget(sep.row, sep.col, sep.len, sep.horizontal);
         const sep_style: vaxis.Style = .{
             .fg = .{ .rgb = if (sep.active) self.theme.win_sep_active else self.theme.win_sep },
             .bg = .{ .rgb = self.theme.bg },
@@ -3920,6 +3940,12 @@ pub fn run(self: *App) !void {
     // newline triggers Enter's auto-indent and wrecks the indentation).
     // vx.deinit resets the mode (state.bracketed_paste check there).
     try self.vx.setBracketedPaste(self.tty.writer(), true);
+    // feat/mouse: enable SGR cell mouse reporting (button + wheel). A failure
+    // is non-fatal (keyboard-only startup); the defer guarantees cleanup on
+    // every exit path, and the explicit call before leaving the alt screen
+    // restores the terminal in the normal path.
+    self.enableMouse();
+    defer self.disableMouse();
     try self.loop.start();
     defer self.loop.stop();
     // monotonic ms of the last frame we actually drew — poll-mode
@@ -4084,9 +4110,15 @@ pub fn run(self: *App) !void {
         // one by one (handleKey), byte-faithful — no accumulation needed
         const term_focused = term.supported and self.term_pane != null and self.term_pane.?.focused;
         while (try self.loop.tryEvent()) |event| {
-            handled = true;
             switch (event) {
+                .mouse => |m| {
+                    // Left press = click, wheel = scroll. Motion/drag/
+                    // release/unbound buttons return false, so moving the
+                    // mouse cannot cause renders or steal terminal selection.
+                    if (try self.handleMouse(m)) handled = true;
+                },
                 .key_press => |key| {
+                    handled = true;
                     // mid-paste keystrokes are paste content, not input:
                     // buffer them (paste_end inserts the whole thing) so
                     // auto-indent/auto-pairs can't mangle pasted text
@@ -4103,10 +4135,12 @@ pub fn run(self: *App) !void {
                     try self.handleKey(key);
                 },
                 .paste_start => {
+                    handled = true;
                     self.pasting = true;
                     self.paste_buf.clearRetainingCapacity();
                 },
                 .paste_end => {
+                    handled = true;
                     if (!self.pasting) continue;
                     self.pasting = false;
                     if (term_focused) continue; // child got the keys already
@@ -4133,6 +4167,7 @@ pub fn run(self: *App) !void {
                     }
                 },
                 .paste => |text| {
+                    handled = true;
                     // OSC 52 clipboard reply — terminal focus: forward the
                     // paste to the child
                     if (term.supported) {
@@ -4152,6 +4187,7 @@ pub fn run(self: *App) !void {
                     }
                 },
                 .winsize => |ws| {
+                    handled = true;
                     try self.vx.resize(self.alloc, self.tty.writer(), ws);
                 },
                 else => {},
@@ -4171,11 +4207,17 @@ pub fn run(self: *App) !void {
                 self.scheduleGitStatus();
             }
         }
-        if (handled or poll_transition or now_ms - last_render_ms >= 16) {
+        // Render on a handled event, on the poll-mode → blocking transition,
+        // and on the 16ms animation cadence while polling. In blocking mode
+        // an ignored event (mouse motion/drag/release, focus reports) must
+        // NOT trigger a frame: mouse movement then causes no renders and no
+        // busy loop (feat/mouse).
+        if (handled or poll_transition or (self.poll_mode_active and now_ms - last_render_ms >= 16)) {
             try self.render();
             last_render_ms = now_ms;
         }
     }
 
+    self.disableMouse();
     try self.vx.exitAltScreen(self.tty.writer());
 }

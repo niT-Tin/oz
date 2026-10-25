@@ -528,6 +528,30 @@ pub fn aiPaste(self: *App, text: []const u8) !void {
     try self.ai.threads.activeThread().input.appendSlice(self.alloc, text);
 }
 
+/// Mouse wheel over the workbox body: scroll whatever the active tab shows
+/// (chat transcript, pending diff) using the SAME clamped scroll state the
+/// keyboard j/k path uses. Tabs without scroll state are a no-op.
+pub fn aiScrollWheel(self: *App, delta: i64) void {
+    if (self.ai.threads.items.items.len == 0) return;
+    switch (self.ai.tab) {
+        .chat => aiScroll(self, delta),
+        .changes => {
+            if (self.agentEditVisible()) {
+                self.agentEditScrollBy(delta);
+            } else if (self.inline_edit.pending != null) {
+                self.inlineScrollBy(delta);
+            }
+        },
+        else => {},
+    }
+}
+
+/// Public wrapper for the thread-list selection move (wheel over the rail's
+/// thread list). Same clamp as j/k.
+pub fn aiMoveThreadCursor(self: *App, delta: i32) void {
+    moveThreadCursor(self, delta);
+}
+
 pub fn aiScroll(self: *App, delta: i64) void {
     if (self.ai.threads.items.items.len == 0) return;
     const t = self.ai.threads.activeThread();
@@ -1913,6 +1937,11 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
     // in every theme.
     const border_style = chrome.panelBorderStyle(t, focused, rail_bg);
     const m = ws.metrics(rail_rows, self.ai.tab);
+    // Mouse-only wheel regions: the thread list and the workbox body scroll
+    // the state the keyboard j/k (and aiScroll) already owns. Tabs/prompt
+    // rows keep their click targets; the wheel never steals terminal input.
+    self.addMouseScrollTarget(m.thread_top, x, w, m.thread_rows, .ai_threads);
+    if (m.body_rows > 0) self.addMouseScrollTarget(m.body_top, x, w, m.body_rows, .ai_workbox);
 
     // Solid bg first: every rail cell (including the border/padding) is
     // bg_float, so cell-exactness tests can sample anywhere inside it.
@@ -1981,7 +2010,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
             try segs.append(a, .{ .text = try spaces(a, content_w - used - 1), .style = .{ .bg = header_bg } });
             try segs.append(a, .{ .text = "+", .style = .{ .fg = .{ .rgb = t.accent }, .bg = header_bg, .bold = true } });
             used = content_w;
-            if (self.hints.collecting) {
+            if (self.mouseTargetsCollecting()) {
                 self.addHintTarget(.{
                     .row = m.header_row,
                     .col = x + 2 + content_w - 1,
@@ -2074,7 +2103,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         }
         if (highlight and selected) cursor_row = y;
         try drawRailRow(win, a, y, x, w, "│", border_style, rail_bg, segs.items, used);
-        if (self.hints.collecting) {
+        if (self.mouseTargetsCollecting()) {
             self.addHintTarget(.{
                 .row = y,
                 .col = x + 2,
@@ -2185,7 +2214,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
                 try segs.append(a, .{ .text = ">", .style = chrome.activeTabMarkerStyle(t) });
                 used += 1;
             }
-            if (self.hints.collecting) {
+            if (self.mouseTargetsCollecting()) {
                 // The active tab's `>` marker belongs to the same target as
                 // its label (the label overlay covers the marker).
                 self.addHintTarget(.{
@@ -2259,7 +2288,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         if (fit.cells > 0) try segs.append(a, .{ .text = fit.slice, .style = st.base });
         const used: u32 = prefix_cells + @as(u32, @intCast(fit.cells));
         try drawRailRow(win, a, prompt_row, x, w, "│", border_style, rail_bg, segs.items, used);
-        if (self.hints.collecting) {
+        if (self.mouseTargetsCollecting()) {
             self.addHintTarget(.{
                 .row = prompt_row,
                 .col = x + 2,
@@ -2573,7 +2602,7 @@ fn drawChatBody(
     // Tool cards are interactive through the existing hint API: activating
     // the label toggles the result excerpt open/closed (a real action; no
     // invented controls). Only visible card rows are targets.
-    if (self.hints.collecting) {
+    if (self.mouseTargetsCollecting()) {
         for (card_rows.items) |card| {
             if (card.row < top) continue;
             const rel = card.row - top;

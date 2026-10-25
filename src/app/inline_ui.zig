@@ -501,6 +501,12 @@ fn scrollPending(self: *App, delta: i64) void {
     self.inline_edit.pending_scroll = @intCast(top);
 }
 
+/// Mouse wheel over the Changes body: scroll the cached diff through the
+/// same clamp the keyboard j/k path uses.
+pub fn inlineScrollBy(self: *App, delta: i64) void {
+    scrollPending(self, delta);
+}
+
 /// Changes-tab keys while the rail owns the keyboard. Returns true when the
 /// key was consumed by the pending review.
 pub fn handleInlineChangesKey(self: *App, key: vaxis.Key) !bool {
@@ -848,12 +854,21 @@ pub fn drawDiffReview(
             try segs.append(a, .{ .text = "[r] reject", .style = err_style });
             const used: u32 = @intCast(autil.cellWidth(win, full));
             try drawRow(win, a, row, x, w, "│", border_style, rail_bg, segs.items, used);
-            if (self.hints.collecting) {
-                self.addHintTarget(.{ .row = row, .col = x + 2, .width = 3, .height = 1 }, view.approve_action);
+            if (self.mouseTargetsCollecting()) {
+                // Target the WHOLE drawn button label, not just the 3-cell
+                // hint prefix: pointer users click the word ("approve"),
+                // while `<leader>j` still paints its label at the same
+                // top-left cell. Hint behavior/tests are unchanged.
+                self.addHintTarget(.{
+                    .row = row,
+                    .col = x + 2,
+                    .width = @intCast("[a] approve".len),
+                    .height = 1,
+                }, view.approve_action);
                 self.addHintTarget(.{
                     .row = row,
                     .col = x + 2 + @as(u32, @intCast("[a] approve  ".len)),
-                    .width = 3,
+                    .width = @intCast("[r] reject".len),
                     .height = 1,
                 }, view.reject_action);
             }

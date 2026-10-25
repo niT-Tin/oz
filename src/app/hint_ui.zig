@@ -29,10 +29,13 @@ pub fn beginHintMode(self: *App) void {
     self.ai.rail_pending_leader = false;
 }
 
-/// Register one visible target. Cheap no-op unless this frame is collecting,
-/// so ordinary frames cannot pay O(targets) here.
+/// Register one visible target. Cheap no-op unless a frame is collecting,
+/// so ordinary frames cannot pay O(targets) here. Mouse-enabled frames reuse
+/// the exact same rectangles/actions for hit-testing (labels remain gated on
+/// hint mode), so there is one source of truth for clickable geometry.
 pub fn addHintTarget(self: *App, rect: hints.Rect, action: hints.Action) void {
     self.hints.add(rect, action);
+    self.addMouseHintTarget(rect, action);
 }
 
 /// Final overlay pass: labels at each target's top-left, then the status

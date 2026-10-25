@@ -712,6 +712,12 @@ fn scrollPending(self: *App, delta: i64) void {
     self.agent_edit.scroll = @intCast(top);
 }
 
+/// Mouse wheel over the Changes body: scroll the staged diff through the
+/// same clamp the keyboard j/k path uses.
+pub fn agentEditScrollBy(self: *App, delta: i64) void {
+    scrollPending(self, delta);
+}
+
 /// Changes-tab keys while the rail owns the keyboard. Returns true when the
 /// key was consumed by the staged review. With no visible pending edit the
 /// keys fall through to the normal tab switching (r = Terminal, d = Changes).

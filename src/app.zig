@@ -24,6 +24,7 @@ const autil = @import("app/util.zig");
 const git_job = @import("app/git_job.zig");
 const app_ai = @import("app/ai.zig");
 const app_hints = @import("app/hints.zig");
+const app_mouse = @import("app/mouse.zig");
 const app_inline = @import("app/inline_ui.zig");
 const app_agent_edit = @import("app/agent_edit_ui.zig");
 
@@ -706,6 +707,12 @@ pub const App = struct {
     /// target array, no allocation, no deinit. Inactive frames only pay one
     /// boolean test (`collecting`).
     hints: app_hints.State = .{},
+
+    // ---- feat/mouse: hit-test registry (no allocation) ----
+    /// Mouse support target registry + lifecycle flag. Collection reuses the
+    /// hint target rectangles on every frame while mouse reporting is enabled;
+    /// labels are still drawn only in hint mode. See src/app/mouse_ui.zig.
+    mouse: app_mouse.State = .{},
 
     /// The active buffer (the focused window's buffer; per-buffer document
     /// state lives here, per-window cursor/viewport in `windows`).
@@ -1602,6 +1609,19 @@ pub const App = struct {
     pub const drawHintOverlay = @import("app/hint_ui.zig").drawHintOverlay;
     pub const handleHintKey = @import("app/hint_ui.zig").handleHintKey;
     pub const execHintAction = @import("app/hint_ui.zig").execHintAction;
+    // ---- mouse (feat/mouse) → src/app/mouse_ui.zig ----
+    pub const MouseState = app_mouse.State;
+    pub const MouseClickAction = app_mouse.ClickAction;
+    pub const MouseScroll = app_mouse.Scroll;
+    pub const enableMouse = @import("app/mouse_ui.zig").enableMouse;
+    pub const disableMouse = @import("app/mouse_ui.zig").disableMouse;
+    pub const beginMouseFrame = @import("app/mouse_ui.zig").beginMouseFrame;
+    pub const mouseTargetsCollecting = @import("app/mouse_ui.zig").mouseTargetsCollecting;
+    pub const addMouseHintTarget = @import("app/mouse_ui.zig").addMouseHintTarget;
+    pub const addMousePaneTarget = @import("app/mouse_ui.zig").addMousePaneTarget;
+    pub const addMouseSeparatorTarget = @import("app/mouse_ui.zig").addMouseSeparatorTarget;
+    pub const addMouseScrollTarget = @import("app/mouse_ui.zig").addMouseScrollTarget;
+    pub const handleMouse = @import("app/mouse_ui.zig").handleMouse;
     // ---- terminal → src/app/terminal.zig ----
     pub const termCwd = @import("app/terminal.zig").termCwd;
     pub const termRect = @import("app/terminal.zig").termRect;
@@ -1738,6 +1758,7 @@ pub const App = struct {
     pub const locateInFiletree = @import("app/filetree.zig").locateInFiletree;
     pub const revealPath = @import("app/filetree.zig").revealPath;
     pub const filetreeKey = @import("app/filetree.zig").filetreeKey;
+    pub const moveFiletreeCursor = @import("app/filetree.zig").moveFiletreeCursor;
     pub const activateFiletreeSelection = @import("app/filetree.zig").activateFiletreeSelection;
     pub const freeFiletreeNode = @import("app/filetree.zig").freeFiletreeNode;
     pub const detectProjectRoot = @import("app/filetree.zig").detectProjectRoot;
@@ -1754,6 +1775,7 @@ pub const App = struct {
     pub const openNoteAt = @import("app/notes.zig").openNoteAt;
     pub const createNote = @import("app/notes.zig").createNote;
     pub const navigatorSetTab = @import("app/notes.zig").navigatorSetTab;
+    pub const navigatorScrollBy = @import("app/notes.zig").navigatorScrollBy;
     pub const navigatorCycleTab = @import("app/notes.zig").navigatorCycleTab;
     pub const navigatorKey = @import("app/notes.zig").navigatorKey;
     pub const navigatorAttachSelectedThread = @import("app/notes.zig").navigatorAttachSelectedThread;
@@ -1834,6 +1856,8 @@ pub const App = struct {
     pub const aiFocusPrompt = app_ai.aiFocusPrompt;
     pub const aiSetWorkboxTab = app_ai.aiSetWorkboxTab;
     pub const aiToggleToolCard = app_ai.aiToggleToolCard;
+    pub const aiScrollWheel = app_ai.aiScrollWheel;
+    pub const aiMoveThreadCursor = app_ai.aiMoveThreadCursor;
     pub const ensureAi = app_ai.ensureAi;
     pub const aiLoadConfig = app_ai.aiLoadConfig;
     pub const aiSetError = app_ai.aiSetError;
@@ -1872,6 +1896,7 @@ pub const App = struct {
     pub const drainInline = app_inline.drainInline;
     pub const inlineApprove = app_inline.inlineApprove;
     pub const inlineReject = app_inline.inlineReject;
+    pub const inlineScrollBy = app_inline.inlineScrollBy;
     pub const handleInlineChangesKey = app_inline.handleInlineChangesKey;
     pub const drawInlinePrompt = app_inline.drawInlinePrompt;
     pub const drawInlineChanges = app_inline.drawInlineChanges;
@@ -1884,6 +1909,7 @@ pub const App = struct {
     pub const reviewPendingCount = app_agent_edit.reviewPendingCount;
     pub const agentEditApprove = app_agent_edit.agentEditApprove;
     pub const agentEditReject = app_agent_edit.agentEditReject;
+    pub const agentEditScrollBy = app_agent_edit.agentEditScrollBy;
     pub const handleAgentEditChangesKey = app_agent_edit.handleAgentEditChangesKey;
     pub const drawAgentEditChanges = app_agent_edit.drawAgentEditChanges;
     pub const AgentEditSession = app_agent_edit.Session;
