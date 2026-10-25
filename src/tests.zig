@@ -43,6 +43,8 @@ pub const app_navigator = @import("app/navigator.zig");
 pub const app_note_store = @import("app/note_store.zig");
 // M2b2 inline assistant (pure request/diff/pending model; app/inline_ui.zig is e2e-tested)
 pub const app_inline = @import("app/inline.zig");
+// M3b1 staged agent edits (pure args/occurrence/preview/pending model)
+pub const app_agent_edit = @import("app/agent_edit.zig");
 // M3b tool-metrics chart (pure cell renderer; no App/vaxis dependency)
 pub const chart = @import("chart.zig");
 // M1 AI chat (pure modules; app/ai.zig is exercised by e2e)

@@ -15738,32 +15738,496 @@ test "tools: missing file card is a real error and the follow-up still completes
     try aiQuit(&sess);
 }
 
-test "tools: edit_file is blocked (approval required), file unchanged, follow-up completes" {
+test "approval: edit_file stages a diff, approve applies to buffer, save and undo behave" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
     var root_buf: [160:0]u8 = undefined;
-    const root = try bufPrintZ(&root_buf, "/tmp/oz_tools_write_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_appr_{d}_{d}", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
     try std.Io.Dir.cwd().createDirPath(io, root);
     var editor_buf: [220:0]u8 = undefined;
-    const editor = try bufPrintZ(&editor_buf, "{s}/write_editor.txt", .{root});
+    const editor = try bufPrintZ(&editor_buf, "{s}/appr.txt", .{root});
     {
         const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
         defer f.close(io);
-        try f.writeStreamingAll(io, "EDITOR_MARKER do not change\n");
+        try f.writeStreamingAll(io, "ALPHA old marker\nsecond line\n");
     }
 
     var dir_buf: [128]u8 = undefined;
     const dir = try aiMockDir(io, &dir_buf);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
     const round1 = try aiToolCallsSse(alloc, &.{
-        .{ .id = "call_write", .name = "edit_file", .args = "{\"path\":\"write_editor.txt\",\"old_string\":\"do not change\",\"new_string\":\"HACKED\"}" },
+        .{ .id = "call_appr", .name = "edit_file", .args = "{\"path\":\"appr.txt\",\"old_string\":\"old marker\",\"new_string\":\"NEW marker\"}" },
     });
     defer alloc.free(round1);
     try aiWriteFile(io, dir, "stream-1.sse", round1);
-    const round2 = try aiTextSse(alloc, "WRITE_DONE approval path");
+    const round2 = try aiTextSse(alloc, "APPROVAL_DONE follow-up");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "ALPHA old marker", 5000);
+    try expectNoDirtyMarker(&grid);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("edit the marker");
+    try sess.send("\r");
+
+    // The agent request produced a staged review, not a write: Changes badge
+    // and a real diff are visible before anything is applied.
+    try gridWaitFor(&sess, &grid, "changes 1", 10000);
+    try gridWaitFor(&sess, &grid, "-1 +1", 5000);
+    try gridWaitFor(&sess, &grid, "- ALPHA old marker", 5000);
+    try gridWaitFor(&sess, &grid, "+ ALPHA NEW marker", 5000);
+    try gridWaitFor(&sess, &grid, "approve", 5000);
+    try gridWaitFor(&sess, &grid, "idle", 10000);
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+    try expectNoDirtyMarker(&grid);
+
+    const disk_before = try absFileText(io, alloc, editor);
+    defer alloc.free(disk_before);
+    try std.testing.expectEqualStrings("ALPHA old marker\nsecond line\n", disk_before);
+
+    // Chat card: approval required, staged (never a fake success). The
+    // follow-up text also arrives while the review is still pending.
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "edit_file", 8000);
+    try gridWaitFor(&sess, &grid, "approval required", 8000);
+    try gridWaitFor(&sess, &grid, "staged · review", 5000);
+    try gridWaitFor(&sess, &grid, "APPROVAL_DONE follow-up", 10000);
+    try gridWaitFor(&sess, &grid, "idle", 5000);
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    // The follow-up tool result is truthful: staged, NOT applied.
+    const req2 = try aiReadFile(io, alloc, dir, "request-2.json");
+    defer alloc.free(req2);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "approval required: edit_file staged for review; not applied") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"role\":\"tool\"") != null);
+
+    // Back to Changes; approve. The buffer changes (dirty), the file on disk
+    // does not.
+    try sess.send("d");
+    try gridWaitFor(&sess, &grid, "approve", 4000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "changes 0", 5000);
+    try gridWaitFor(&sess, &grid, "no pending changes", 4000);
+    try gridWaitFor(&sess, &grid, "ALPHA NEW marker", 5000);
+    try std.testing.expect(grid.contains("\u{25cf}"));
+    const disk_after_approve = try absFileText(io, alloc, editor);
+    defer alloc.free(disk_after_approve);
+    try std.testing.expectEqualStrings("ALPHA old marker\nsecond line\n", disk_after_approve);
+
+    // `u` undoes the whole staged replacement (ONE undo group), redo brings
+    // it back, then `:w` is the separate, user-driven disk write.
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "ALPHA old marker", 5000);
+    try std.testing.expect(!grid.contains("ALPHA NEW marker"));
+    try sess.send("\x12"); // Ctrl+r redo
+    try gridWaitFor(&sess, &grid, "ALPHA NEW marker", 5000);
+    try sess.send(":w\r");
+    try gridWaitFor(&sess, &grid, "written:", 5000);
+
+    const disk_after_save = try absFileText(io, alloc, editor);
+    defer alloc.free(disk_after_save);
+    try std.testing.expectEqualStrings("ALPHA NEW marker\nsecond line\n", disk_after_save);
+
+    // Metrics count the staged call once, and the approval as its success.
+    try sess.send("\x17a");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), true, 3000);
+    try sess.send("t");
+    try gridWaitFor(&sess, &grid, "calls 1", 5000);
+    try gridWaitFor(&sess, &grid, "ok 1 · err 0 · appr 1", 5000);
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+
+    try aiQuit(&sess);
+}
+
+test "approval: reject (including its hint) leaves buffer, file and history untouched" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_appr_rej_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/reject.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "KEEP untouched line\nsecond line\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_rej", .name = "edit_file", .args = "{\"path\":\"reject.txt\",\"old_string\":\"untouched\",\"new_string\":\"MUTATED\"}" },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "REJECT_DONE follow-up");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "KEEP untouched line", 5000);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("edit then reject");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "changes 1", 10000);
+    try gridWaitFor(&sess, &grid, "- KEEP untouched line", 5000);
+    try gridWaitFor(&sess, &grid, "+ KEEP MUTATED line", 5000);
+    try gridWaitFor(&sess, &grid, "idle", 10000);
+
+    // The Chat card truthfully says approval required; it is not a success.
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "approval required", 8000);
+    try gridWaitFor(&sess, &grid, "REJECT_DONE follow-up", 10000);
+    try gridWaitFor(&sess, &grid, "idle", 5000);
+    try expectNoDirtyMarker(&grid);
+
+    // Back to Changes; reject through the drawn hint label (same path as r).
+    try sess.send("d");
+    try gridWaitFor(&sess, &grid, "approve", 5000);
+    // Capture the button cell BEFORE hint labels overwrite its first glyph.
+    const reject_cell = aiFindCell(&grid, "[r] reject") orelse {
+        std.debug.print("approval reject: no reject button\n", .{});
+        grid.dump();
+        return error.TestUnexpectedResult;
+    };
+    try sess.send(" j");
+    try gridWaitFor(&sess, &grid, "HINTS ·", 5000);
+    const want = hintLabelLenFor(hintTargetCount(&grid) orelse return error.TestUnexpectedResult);
+    var label_buf: [3]u8 = undefined;
+    const label = hintLabelAt(&grid, &label_buf, reject_cell.row, reject_cell.col, want);
+    if (label.len != want) {
+        std.debug.print("approval reject: no hint label ({d}/{d})\n", .{ label.len, want });
+        grid.dump();
+        return error.TestUnexpectedResult;
+    }
+    try sess.send(label);
+    try gridWaitFor(&sess, &grid, "changes 0", 5000);
+    try gridWaitFor(&sess, &grid, "no pending changes", 4000);
+    try gridWaitFor(&sess, &grid, "KEEP untouched line", 4000);
+    try std.testing.expect(!grid.contains("MUTATED"));
+    try expectNoDirtyMarker(&grid);
+
+    // The card is rejected, not silently forgotten; undo has nothing to undo.
+    try sess.send("\x17a");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), true, 3000);
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "rejected", 5000);
+    try expectNoDirtyMarker(&grid);
+    // The rejection is a real decision in metrics (not an executed call).
+    try sess.send("t");
+    try gridWaitFor(&sess, &grid, "calls 1", 5000);
+    try gridWaitFor(&sess, &grid, "ok 0 · err 0 · appr 1 · denied 1", 5000);
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "KEEP untouched line", 3000);
+    try std.testing.expect(!grid.contains("MUTATED"));
+
+    const on_disk = try absFileText(io, alloc, editor);
+    defer alloc.free(on_disk);
+    try std.testing.expectEqualStrings("KEEP untouched line\nsecond line\n", on_disk);
+
+    try aiQuit(&sess);
+}
+
+test "approval: stale buffer change refuses apply and keeps the diff reviewable" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_appr_stale_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/stale.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "one original\nsecond original\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_stale", .name = "edit_file", .args = "{\"path\":\"stale.txt\",\"old_string\":\"one original\",\"new_string\":\"REPLACED\"}" },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "STALE_DONE follow-up");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "one original", 5000);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("stage then edit");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "changes 1", 10000);
+    try gridWaitFor(&sess, &grid, "+ REPLACED", 5000);
+    try gridWaitFor(&sess, &grid, "idle", 10000);
+
+    // Leave the review, edit the target buffer (revision + text change).
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try sess.send("iX\x1b");
+    try gridWaitFor(&sess, &grid, "Xone original", 5000);
+
+    // Returning to Changes and approving must refuse, not corrupt.
+    try sess.send("\x17a");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), true, 3000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "stale edit", 5000);
+    try gridWaitFor(&sess, &grid, "changes 1", 3000);
+    try std.testing.expect(grid.contains("Xone original"));
+    // The staged diff stays reviewable, but its +REPLACED line lives in the
+    // rail only; the editor's changed buffer was not overwritten.
+    const preview = aiFindCell(&grid, "REPLACED") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(preview.col >= aiRailCol(120));
+
+    // Reject is still available and leaves the user's edit intact.
+    try sess.send("r");
+    try gridWaitFor(&sess, &grid, "changes 0", 4000);
+    try gridWaitFor(&sess, &grid, "Xone original", 3000);
+    try std.testing.expect(!grid.contains("REPLACED"));
+
+    const on_disk = try absFileText(io, alloc, editor);
+    defer alloc.free(on_disk);
+    try std.testing.expectEqualStrings("one original\nsecond original\n", on_disk);
+
+    try aiQuit(&sess);
+}
+
+test "approval: 80x24 drawer diff/buttons fit and the approve hint applies" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_appr_80_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/small.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "tiny old line\nsecond\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_80", .name = "edit_file", .args = "{\"path\":\"small.txt\",\"old_string\":\"tiny old\",\"new_string\":\"tiny NEW\"}" },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "SMALL_APPROVAL_DONE");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "tiny old line", 5000);
+
+    try sess.send(" a");
+    try gridWaitFor(&sess, &grid, "agents", 5000);
+    try sess.send("stage at 80");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "changes 1", 10000);
+    try gridWaitFor(&sess, &grid, "+ tiny NEW line", 5000);
+    try gridWaitFor(&sess, &grid, "[a] approve", 5000);
+    try gridWaitFor(&sess, &grid, "idle", 10000);
+    try frame.expectNoHorizontalOverflow(&grid, 80);
+
+    // Hint labels are drawn on the review buttons; capture the cell first,
+    // then activating the approve label uses the same path as `a`.
+    const approve_cell = aiFindCell(&grid, "[a] approve") orelse {
+        std.debug.print("approval 80: no approve button\n", .{});
+        grid.dump();
+        return error.TestUnexpectedResult;
+    };
+    try sess.send(" j");
+    try gridWaitFor(&sess, &grid, "HINTS ·", 5000);
+    const want = hintLabelLenFor(hintTargetCount(&grid) orelse return error.TestUnexpectedResult);
+    var label_buf: [3]u8 = undefined;
+    const label = hintLabelAt(&grid, &label_buf, approve_cell.row, approve_cell.col, want);
+    if (label.len != want) {
+        std.debug.print("approval 80: no approve label ({d}/{d})\n", .{ label.len, want });
+        grid.dump();
+        return error.TestUnexpectedResult;
+    }
+    try sess.send(label);
+    try gridWaitFor(&sess, &grid, "tiny NEW line", 5000);
+    try gridWaitFor(&sess, &grid, "changes 0", 4000);
+    try std.testing.expect(!grid.contains("HINTS ·"));
+    try frame.expectNoHorizontalOverflow(&grid, 80);
+
+    try aiQuit(&sess);
+}
+
+test "approval: second write while pending is refused; pending survives a thread switch" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_appr_one_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/one.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "first old line\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    // Thread 1's client: request 1 stages, request 2 is the follow-up text,
+    // request 3 is the (refused) second write, request 4 is its follow-up.
+    const stage1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_one", .name = "edit_file", .args = "{\"path\":\"one.txt\",\"old_string\":\"first old\",\"new_string\":\"first ONE\"}" },
+    });
+    defer alloc.free(stage1);
+    try aiWriteFile(io, dir, "stream-1.sse", stage1);
+    const text2 = try aiTextSse(alloc, "FIRST_DONE");
+    defer alloc.free(text2);
+    try aiWriteFile(io, dir, "stream-2.sse", text2);
+    const stage3 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_two", .name = "edit_file", .args = "{\"path\":\"one.txt\",\"old_string\":\"first old\",\"new_string\":\"second TWO\"}" },
+    });
+    defer alloc.free(stage3);
+    try aiWriteFile(io, dir, "stream-3.sse", stage3);
+    const text4 = try aiTextSse(alloc, "SECOND_DONE");
+    defer alloc.free(text4);
+    try aiWriteFile(io, dir, "stream-4.sse", text4);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "first old line", 5000);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("stage the first edit");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "changes 1", 10000);
+    try gridWaitFor(&sess, &grid, "idle", 10000);
+
+    // Chat tab + Enter attaches the prompt; the second edit is refused, not
+    // queued, and the first diff is untouched.
+    try sess.send("c");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "❯ ", 3000);
+    try sess.send("try a second edit");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "resolve the pending edit", 10000);
+    try gridWaitFor(&sess, &grid, "SECOND_DONE", 10000);
+    try gridWaitFor(&sess, &grid, "idle", 5000);
+    try std.testing.expect(grid.contains("changes 1"));
+    try std.testing.expect(!grid.contains("second TWO"));
+
+    // A new thread hides the review (badge 0) but does not lose it.
+    try sess.send("\t");
+    try sess.send("n");
+    try gridWaitFor(&sess, &grid, "thread 2", 5000);
+    try gridWaitFor(&sess, &grid, "changes 0", 5000);
+    try sess.send("\t");
+    try sess.send("d");
+    try gridWaitFor(&sess, &grid, "no pending changes", 4000);
+
+    // Return to thread 1 and approve the surviving diff.
+    try sess.send("k");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "❯ ", 3000);
+    try sess.send("\t");
+    try sess.send("d");
+    try gridWaitFor(&sess, &grid, "changes 1", 5000);
+    try gridWaitFor(&sess, &grid, "approve", 5000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "first ONE line", 5000);
+    try gridWaitFor(&sess, &grid, "changes 0", 4000);
+    try std.testing.expect(!grid.contains("second TWO"));
+
+    try aiQuit(&sess);
+}
+
+test "approval: apply_patch, terminal and unknown tools stay unsupported and never execute" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_appr_unsup_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/unsup.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "UNSUP editor marker\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_patch", .name = "apply_patch", .args = "{\"patch\":\"--- a/unsup.txt\\n+++ b/unsup.txt\\n@@ -1 +1 @@\\n-UNSUP\\n+HACKED\\n\"}" },
+        .{ .id = "call_term", .name = "terminal", .args = "{\"command\":\"rm -rf /\"}" },
+        .{ .id = "call_unknown", .name = "mystery", .args = "{}" },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "BLOCKED_DONE");
     defer alloc.free(round2);
     try aiWriteFile(io, dir, "stream-2.sse", round2);
     const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
@@ -15776,34 +16240,42 @@ test "tools: edit_file is blocked (approval required), file unchanged, follow-up
     defer grid.deinit(alloc);
     try gridWaitFor(&sess, &grid, "NORMAL", 8000);
     try aiEnterRail(&sess, &grid);
-    try sess.send("change the marker");
+    try sess.send("try the blocked tools");
     try sess.send("\r");
 
-    try gridWaitFor(&sess, &grid, "edit_file", 10000);
-    try gridWaitFor(&sess, &grid, "approval required (M3b)", 8000);
-    try gridWaitFor(&sess, &grid, "WRITE_DONE approval path", 10000);
+    try gridWaitFor(&sess, &grid, "apply_patch", 10000);
+    try gridWaitFor(&sess, &grid, "terminal", 8000);
+    try gridWaitFor(&sess, &grid, "mystery", 8000);
+    try gridWaitFor(&sess, &grid, "unsupported", 8000);
+    try gridWaitFor(&sess, &grid, "BLOCKED_DONE", 10000);
     try gridWaitFor(&sess, &grid, "idle", 5000);
-    try std.testing.expect(!grid.contains("HACKED"));
     try frame.expectNoHorizontalOverflow(&grid, grid.cols);
-
-    const on_disk = try absFileText(io, alloc, editor);
-    defer alloc.free(on_disk);
-    try std.testing.expectEqualStrings("EDITOR_MARKER do not change\n", on_disk);
+    try std.testing.expect(!grid.contains("HACKED"));
+    // No approval was staged for any of these calls.
+    try std.testing.expect(grid.contains("changes 0"));
+    try std.testing.expect(!grid.contains("approval required"));
 
     const req2 = try aiReadFile(io, alloc, dir, "request-2.json");
     defer alloc.free(req2);
-    // The assistant turn necessarily echoes the requested arguments (that
-    // is how the provider sees the call); the TOOL RESULT is the security
-    // boundary and must say "not executed". The on-disk assertion above
-    // proves nothing was written.
-    try std.testing.expect(std.mem.indexOf(u8, req2, "approval required: edit_file was not executed") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req2, "\"role\":\"tool\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "apply_patch approval is not available") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "terminal execution is not available") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "unsupported tool: mystery") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_patch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_term\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_unknown\"") != null);
+
+    const on_disk = try absFileText(io, alloc, editor);
+    defer alloc.free(on_disk);
+    try std.testing.expectEqualStrings("UNSUP editor marker\n", on_disk);
 
     try sess.send("\t");
     try sess.send("t");
-    try gridWaitFor(&sess, &grid, "ok 0 · err 0 · appr 1", 5000);
-    try gridWaitFor(&sess, &grid, "no latency samples", 5000);
-    try std.testing.expect(!grid.contains("older"));
+    try gridWaitFor(&sess, &grid, "3 calls", 5000);
+    try gridWaitFor(&sess, &grid, "apply_patch", 3000);
+    try gridWaitFor(&sess, &grid, "terminal", 3000);
+    try gridWaitFor(&sess, &grid, "mystery", 3000);
+    try gridWaitFor(&sess, &grid, "unsup 1", 3000);
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
 
     try sess.send("\x1b");
     try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
@@ -16649,6 +17121,9 @@ const Scenario = struct {
     /// round 2, so the agent loop really executes read_file for this
     /// scenario (instead of a plain text stream).
     tool_fixture: bool = false,
+    /// M3b1: round 1 stages an edit_file on the scenario's own opened buffer;
+    /// the scenario presses `a` and expects the applied buffer.
+    approval_fixture: bool = false,
 };
 
 /// Pairwise layout matrix: 3 widths × filetree {closed,open} × rail
@@ -16826,6 +17301,34 @@ const scenario_matrix = [_]Scenario{
         .request_contains = &.{ "\"tool_choice\":\"auto\"", "\"role\":\"tool\"", "TOOL_SCENARIO_MARKER", "read_file" },
     },
     .{
+        .name = "ai approval 120x30",
+        .tags = &.{ "@layout", "@ai", "@tools", "@approval", "@120col" },
+        .rows = 30,
+        .cols = 120,
+        .setup = .ai_mock,
+        .approval_fixture = true,
+        .rail = .docked,
+        .steps = &.{
+            .{ .keys = "edit the approval fixture\r", .wait_for = "changes 1" },
+            .{ .keys = "", .wait_for = "+ second line APPROVAL_SCENARIO_NEW" },
+            .{ .keys = "", .wait_for = "idle" },
+            // The card is on Chat while the review is on Changes.
+            .{ .keys = "c", .wait_for = "approval required" },
+            .{ .keys = "d", .wait_for = "[a] approve" },
+            .{ .keys = "a", .wait_for = "changes 0" },
+            // Approve returns focus to the editor; re-enter the rail before
+            // switching to the Chat card.
+            .{ .keys = "\x17a", .wait_for = "chat changes 0" },
+            .{ .keys = "c", .wait_for = "approved" },
+        },
+        .expect_text = &.{ "approved", "changes 0", "APPROVAL_SCENARIO_NEW", "GOLDEN_EDITOR_MARKER" },
+        .request_contains = &.{
+            "approval required: edit_file staged for review; not applied",
+            "\"role\":\"tool\"",
+            "edit_file",
+        },
+    },
+    .{
         .name = "navigator notes 120x30",
         .tags = &.{ "@layout", "@navigator", "@notes", "@120col" },
         .rows = 30,
@@ -16850,8 +17353,8 @@ const scenario_matrix = [_]Scenario{
 /// feature adds its tag here and to at least one Scenario; the coverage test
 /// fails with a clear message otherwise (instead of silently dropping it).
 const required_scenario_tags = [_][]const u8{
-    "@layout", "@ai",     "@filetree", "@stream", "@hints",  "@navigator", "@notes", "@inline", "@tools",
-    "@80col",  "@100col", "@120col",   "@drawer", "@docked",
+    "@layout",   "@ai",    "@filetree", "@stream", "@hints",  "@navigator", "@notes", "@inline", "@tools",
+    "@approval", "@80col", "@100col",   "@120col", "@drawer", "@docked",
 };
 
 fn expectedRailMode(rail: ScenarioRail) ai_ws.RailMode {
@@ -17062,7 +17565,25 @@ fn runScenario(sc: Scenario) !void {
     if (sc.setup == .ai_mock) {
         const d = try aiMockDir(io, &dir_buf);
         mock_dir = d;
-        if (sc.tool_fixture) {
+        if (sc.approval_fixture) {
+            // Stage an edit on the scenario's own opened buffer: the target
+            // path is its basename and /tmp is the detected project root.
+            const base = std.fs.path.basename(name);
+            const args = try std.fmt.allocPrint(
+                alloc,
+                "{{\"path\":\"{s}\",\"old_string\":\"second line for the layout matrix\",\"new_string\":\"second line APPROVAL_SCENARIO_NEW\"}}",
+                .{base},
+            );
+            defer alloc.free(args);
+            const round1 = try aiToolCallsSse(alloc, &.{
+                .{ .id = "call_scenario_appr", .name = "edit_file", .args = args },
+            });
+            defer alloc.free(round1);
+            try aiWriteFile(io, d, "stream-1.sse", round1);
+            const round2 = try aiTextSse(alloc, "mock reply approval scenario done");
+            defer alloc.free(round2);
+            try aiWriteFile(io, d, "stream-2.sse", round2);
+        } else if (sc.tool_fixture) {
             // The scenario's opened file lives in /tmp, so /tmp is its
             // project root; the tool path is relative and fixed.
             try aiWriteFile(io, "/tmp", "oz_scenario_tool_fixture.txt", "TOOL_SCENARIO_MARKER matrix line\n");
@@ -17111,7 +17632,7 @@ fn runScenario(sc: Scenario) !void {
 
     // Tool scenarios run with cwd=/tmp so the workspace root is exactly the
     // directory holding the opened fixture (no dependency on repo .git).
-    var sess = if (sc.tool_fixture)
+    var sess = if (sc.tool_fixture or sc.approval_fixture)
         try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, name }, env_extra, sc.rows, sc.cols, "/tmp")
     else
         try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, env_extra, sc.rows, sc.cols);

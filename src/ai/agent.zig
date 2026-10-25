@@ -7,7 +7,7 @@
 //!   - `Limits` / `planBatch`: at most 4 tool rounds and 8 calls per user
 //!     turn. Over-limit calls are reported truthfully and never executed.
 //!   - `CardStatus` + `cardStatusText`: the compact card labels (`ok 3ms`,
-//!     `approval required (M3b)`, …).
+//!     `approval required`, `approved`/`rejected`, …).
 //!   - `summarizeArguments` / `resultExcerpt`: bounded, single-line card
 //!     text. Both cap by display-independent byte limits and never split a
 //!     UTF-8 sequence; the renderer adds the cell-level clipping.
@@ -86,16 +86,28 @@ pub fn limitNote(alloc: std.mem.Allocator, reason: LimitReason, limits: Limits) 
 }
 
 /// Card status. `err` is the keyword-safe spelling of the protocol's
-/// "error" status; `approval_required` / `unsupported` are truthful
-/// non-execution outcomes (M3a never writes).
-pub const CardStatus = enum { running, ok, err, approval_required, unsupported, cancelled };
+/// "error" status; `approval_required` is a staged M3b1 edit awaiting a human
+/// decision, while `approved`/`rejected` are that decision. `unsupported`
+/// remains a truthful non-execution outcome.
+pub const CardStatus = enum {
+    running,
+    ok,
+    err,
+    approval_required,
+    approved,
+    rejected,
+    unsupported,
+    cancelled,
+};
 
 pub fn statusLabel(status: CardStatus) []const u8 {
     return switch (status) {
         .running => "running",
         .ok => "ok",
         .err => "error",
-        .approval_required => "approval required (M3b)",
+        .approval_required => "approval required",
+        .approved => "approved",
+        .rejected => "rejected",
         .unsupported => "unsupported",
         .cancelled => "cancelled",
     };
@@ -110,7 +122,7 @@ pub fn cardStatusText(buf: []u8, status: CardStatus, duration_ms: u32) []const u
     return switch (status) {
         .ok => std.fmt.bufPrint(buf, "ok {d}ms", .{duration_ms}) catch "ok",
         .err => std.fmt.bufPrint(buf, "error {d}ms", .{duration_ms}) catch "error",
-        .approval_required, .unsupported, .running, .cancelled => statusLabel(status),
+        .approval_required, .approved, .rejected, .unsupported, .running, .cancelled => statusLabel(status),
     };
 }
 
@@ -323,6 +335,9 @@ pub const Stats = struct {
     ok: u32 = 0,
     errors: u32 = 0,
     approval_required: u32 = 0,
+    /// Human decisions on staged edits (approved is also counted in `ok`,
+    /// rejected here; neither increments `calls` nor the latency domain).
+    denied: u32 = 0,
     unsupported: u32 = 0,
     /// Executed calls only (ok/error): average/max latency domain.
     duration_count: u32 = 0,
@@ -436,8 +451,41 @@ pub const Metrics = struct {
                 self.addDuration(s, duration_ms);
             },
             .approval_required => s.approval_required += 1,
+            .approved, .rejected => unreachable, // use recordDecision
             .unsupported => s.unsupported += 1,
             .running, .cancelled => unreachable,
+        }
+        self.revision +%= 1;
+    }
+
+    /// The human decision on a staged edit. Deliberately separate from
+    /// `record`: approving/rejecting is not a second tool call and has no
+    /// latency sample. Approved outcomes count as `ok` (the call ultimately
+    /// succeeded); rejection is a distinct `denied` count.
+    pub fn recordDecision(
+        self: *Metrics,
+        alloc: std.mem.Allocator,
+        name: []const u8,
+        verdict: Verdict,
+    ) void {
+        var stats = self.get(name);
+        if (stats == null) {
+            if (self.occupied >= max_metric_tools) return;
+            const owned = alloc.dupe(u8, name) catch return;
+            var idx: usize = 0;
+            while (idx < max_metric_tools and self.items[idx] != null) : (idx += 1) {}
+            if (idx >= max_metric_tools) {
+                alloc.free(owned);
+                return;
+            }
+            self.items[idx] = .{ .name = owned };
+            self.occupied += 1;
+            stats = &self.items[idx].?;
+        }
+        const s = stats.?;
+        switch (verdict) {
+            .approved => s.ok += 1,
+            .rejected => s.denied += 1,
         }
         self.revision +%= 1;
     }
@@ -482,6 +530,9 @@ pub const Metrics = struct {
         return @intCast((total + durations / 2) / durations);
     }
 };
+
+/// Human decision on a staged edit (see `Metrics.recordDecision`).
+pub const Verdict = enum { approved, rejected };
 
 /// Cache identity for the Tools chart. Rendering is only redone when the
 /// active thread, metrics revision, or body dimensions change.
@@ -545,7 +596,9 @@ test "agent: card status text is truthful about execution" {
     try std.testing.expectEqualStrings("ok 3ms", cardStatusText(&buf, .ok, 3));
     try std.testing.expectEqualStrings("error 0ms", cardStatusText(&buf, .err, 0));
     try std.testing.expectEqualStrings("running", cardStatusText(&buf, .running, 0));
-    try std.testing.expectEqualStrings("approval required (M3b)", cardStatusText(&buf, .approval_required, 0));
+    try std.testing.expectEqualStrings("approval required", cardStatusText(&buf, .approval_required, 0));
+    try std.testing.expectEqualStrings("approved", cardStatusText(&buf, .approved, 0));
+    try std.testing.expectEqualStrings("rejected", cardStatusText(&buf, .rejected, 0));
     try std.testing.expectEqualStrings("unsupported", cardStatusText(&buf, .unsupported, 0));
     try std.testing.expectEqualStrings("cancelled", cardStatusText(&buf, .cancelled, 0));
 }
@@ -667,6 +720,37 @@ test "agent: metrics aggregate average, max and a chronological ring" {
     try std.testing.expectEqual(@as(usize, 0), empty.count());
     try std.testing.expectEqual(@as(u32, 0), empty.totalCalls());
     try std.testing.expect(empty.averageMs() == null);
+}
+
+test "agent: approval decisions do not count as a second call" {
+    const alloc = std.testing.allocator;
+    var m: Metrics = .{};
+    defer m.deinit(alloc);
+
+    // One edit_file call was staged: one call, one approval_required, no
+    // latency sample yet.
+    m.record(alloc, "edit_file", .approval_required, 0);
+    const staged = m.get("edit_file").?;
+    try std.testing.expectEqual(@as(u32, 1), staged.calls);
+    try std.testing.expectEqual(@as(u32, 1), staged.approval_required);
+    try std.testing.expectEqual(@as(u32, 0), staged.ok);
+    try std.testing.expectEqual(@as(u32, 0), staged.denied);
+
+    // Approve: the same call becomes ok; it is not counted again.
+    const before = m.revision;
+    m.recordDecision(alloc, "edit_file", .approved);
+    try std.testing.expectEqual(@as(u32, 1), staged.calls);
+    try std.testing.expectEqual(@as(u32, 1), staged.ok);
+    try std.testing.expectEqual(@as(u32, 0), staged.denied);
+    try std.testing.expectEqual(@as(u32, 0), staged.duration_count);
+    try std.testing.expect(m.revision != before);
+
+    // Reject on another staged call: denied, still calls == 1.
+    m.recordDecision(alloc, "edit_file", .rejected);
+    try std.testing.expectEqual(@as(u32, 1), staged.calls);
+    try std.testing.expectEqual(@as(u32, 1), staged.denied);
+    try std.testing.expectEqual(@as(u32, 1), staged.ok);
+    try std.testing.expectEqual(@as(u32, 0), staged.duration_count);
 }
 
 test "agent: chart cache key invalidates on thread/revision/size" {

@@ -152,6 +152,10 @@ pub const Action = union(enum) {
     inline_approve,
     /// Reject the pending inline edit (same path as `r`/`d` in Changes).
     inline_reject,
+    /// Approve the staged agent edit (same path as `a`/Enter in Changes).
+    agent_approve,
+    /// Reject the staged agent edit (same path as `r`/`d` in Changes).
+    agent_reject,
     /// Toggle the expanded result view of the tool card at this message
     /// index in the active thread (M3a). A real action: no new control is
     /// invented, and only visible Chat cards register.

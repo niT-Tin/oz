@@ -12,10 +12,11 @@
 //! or `.git` exclusion); `grep` skips symlink directory entries during
 //! recursion so a link cannot pull an outside tree into a scan.
 //!
-//! Write tools are never executed. `edit_file` and `apply_patch` return
-//! `status = .approval_required`; `terminal` and unknown names return
-//! `status = .unsupported`. There is no shell, no network, and no write
-//! syscall anywhere in this module.
+//! Write tools are never executed. `edit_file` returns
+//! `status = .approval_required` as a defensive fallback (M3b1 stages edits in
+//! the app and never sends them here); `apply_patch`, `terminal` and unknown
+//! names return `status = .unsupported`. There is no shell, no network, and no
+//! write syscall anywhere in this module.
 //!
 //! ## Workspace confinement
 //!
@@ -191,7 +192,8 @@ pub const Executor = struct {
             .read_file => self.readFile(call.arguments_json),
             .list_directory => self.listDirectory(call.arguments_json),
             .grep => self.grep(call.arguments_json),
-            .edit_file, .apply_patch => self.approvalRequired(kind),
+            .edit_file => self.approvalRequired(kind),
+            .apply_patch => self.unsupportedApplyPatch(),
             .terminal => self.unsupportedTerminal(),
         };
     }
@@ -201,14 +203,24 @@ pub const Executor = struct {
     // ------------------------------------------------------------------
 
     fn approvalRequired(self: *Executor, kind: tools.Kind) ExecuteError!Outcome {
+        // M3b1 stages and applies edit_file in the App (pending diff +
+        // explicit approval); the executor never receives it in normal
+        // operation. This fallback stays truthful and non-executing.
         const content = try std.fmt.allocPrint(
             self.alloc,
-            "approval required: {s} was not executed (M3a is read-only)",
+            "approval required: {s} must be staged by the app; not executed by the executor",
             .{@tagName(kind)},
         );
         errdefer self.alloc.free(content);
         const summary = try std.fmt.allocPrint(self.alloc, "approval required: {s}", .{@tagName(kind)});
         return .{ .status = .approval_required, .content = content, .summary = summary };
+    }
+
+    fn unsupportedApplyPatch(self: *Executor) ExecuteError!Outcome {
+        const content = try self.alloc.dupe(u8, "unsupported in M3b1: apply_patch approval is not available");
+        errdefer self.alloc.free(content);
+        const summary = try self.alloc.dupe(u8, "unsupported: apply_patch");
+        return .{ .status = .unsupported, .content = content, .summary = summary };
     }
 
     fn unsupportedTerminal(self: *Executor) ExecuteError!Outcome {
@@ -928,12 +940,15 @@ pub const Executor = struct {
     // Path handling
     // ------------------------------------------------------------------
 
-    const PathError = error{ OutOfMemory, Empty, TooLong, Nul, Absolute, Parent };
+    pub const PathError = error{ OutOfMemory, Empty, TooLong, Nul, Absolute, Parent };
 
     /// Validate a workspace-relative path and normalize redundant separators
     /// and "." components. The result is "." when the path denotes the root.
     /// Any ".." component is rejected even when it would stay inside the root.
-    fn normalizePath(alloc: std.mem.Allocator, raw: []const u8) PathError![]u8 {
+    ///
+    /// Public because the M3b1 staged-edit path uses the same confinement
+    /// rules as the read-only executor instead of duplicating them.
+    pub fn normalizePath(alloc: std.mem.Allocator, raw: []const u8) PathError![]u8 {
         if (raw.len == 0) return error.Empty;
         if (raw.len > max_path_bytes) return error.TooLong;
         if (std.mem.indexOfScalar(u8, raw, 0) != null) return error.Nul;
@@ -1086,7 +1101,15 @@ pub fn execute(
 // Free helper functions
 // ----------------------------------------------------------------------
 
-fn isWithin(root: []const u8, canonical: []const u8) bool {
+/// Top-level aliases for the shared workspace-relative path rules (used by
+/// the M3b1 staged-edit path, which is not an Executor).
+pub const WorkspacePathError = Executor.PathError;
+
+pub fn normalizeWorkspacePath(alloc: std.mem.Allocator, raw: []const u8) WorkspacePathError![]u8 {
+    return Executor.normalizePath(alloc, raw);
+}
+
+pub fn isWithin(root: []const u8, canonical: []const u8) bool {
     if (std.mem.eql(u8, root, canonical)) return true;
     if (root.len == 1 and std.fs.path.isSep(root[0])) {
         return canonical.len > 0 and std.fs.path.isSep(canonical[0]);
@@ -1830,7 +1853,8 @@ test "tool_exec: write and terminal tools never execute" {
         "{\"patch\":\"--- a/editable.txt\\n+++ b/editable.txt\\n@@ -1 +1 @@\\n-original\\n+changed\\n\"}",
     );
     defer patch.deinit(alloc);
-    try expectStatus(&patch, .approval_required);
+    try expectStatus(&patch, .unsupported);
+    try testing.expect(std.mem.indexOf(u8, patch.content, "unsupported") != null);
 
     var terminal = try run(alloc, fixture.ws, "terminal", "{\"command\":\"rm -rf /\"}");
     defer terminal.deinit(alloc);

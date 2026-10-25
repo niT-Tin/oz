@@ -194,7 +194,19 @@ pub const Role = enum { user, assistant, tool };
 
 /// Display/execution state of a tool card. Deliberately a plain enum so the
 /// pure thread model stays independent from the app's worker/metrics.
-pub const ToolStatus = enum { none, running, ok, err, approval_required, unsupported, cancelled };
+pub const ToolStatus = enum {
+    none,
+    running,
+    ok,
+    err,
+    approval_required,
+    /// Human approve/reject outcome of a staged M3b1 edit. These are display
+    /// states, not a second tool call.
+    approved,
+    rejected,
+    unsupported,
+    cancelled,
+};
 
 pub const Message = struct {
     role: Role,
@@ -458,6 +470,29 @@ pub const Threads = struct {
         msg.api_text = api_copy;
         msg.tool_status = status;
         msg.tool_ms = duration_ms;
+    }
+
+    /// Update a staged edit card's status/display text after a human
+    /// decision or a stale refusal. `api_text` is deliberately untouched:
+    /// the provider already received the staged/not-applied tool result and
+    /// rewriting history would misrepresent what was sent.
+    pub fn setToolDecision(
+        self: *Threads,
+        alloc: std.mem.Allocator,
+        idx: usize,
+        msg_index: usize,
+        status: ToolStatus,
+        text: []const u8,
+    ) void {
+        if (idx >= self.items.items.len) return;
+        const t = &self.items.items[idx];
+        if (msg_index >= t.messages.items.len) return;
+        const msg = &t.messages.items[msg_index];
+        if (msg.role != .tool) return;
+        const text_copy = alloc.dupe(u8, text) catch return;
+        alloc.free(msg.text);
+        msg.text = text_copy;
+        msg.tool_status = status;
     }
 
     /// Freeze every running tool card as cancelled (Ctrl+c / thread switch).

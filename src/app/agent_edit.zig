@@ -1,0 +1,735 @@
+//! Staged agent edits (M3b1): pure argument validation, occurrence mapping,
+//! bounded diff preview and pending-review model.
+//!
+//! Deliberately App/vaxis/filesystem-independent: `src/app/agent_edit_ui.zig`
+//! owns workspace confinement, read-only file loading, buffer application,
+//! rendering and key routing. Everything here is unit-testable without an
+//! editor or a terminal.
+//!
+//! Invariants:
+//!   - an `edit_file` call never reaches the executor; the app stages a
+//!     `Pending` and only a human approve mutates the in-memory buffer;
+//!   - `old_string` is byte-exact; without `replace_all` it must occur
+//!     exactly once (ambiguous/missing calls are real errors, never staged);
+//!   - the diff preview is bounded (context windows around the changed
+//!     lines) and reuses `inline_model.buildDiff`'s line-level LCS — this module
+//!     does not implement a second diff engine;
+//!   - the full target text is snapshotted for staleness; applying requires
+//!     the buffer/file text and occurrence count to still match;
+//!   - one agent edit may be pending at a time (checked together with the
+//!     inline edit in the App).
+const std = @import("std");
+const inline_model = @import("inline.zig");
+const tool_exec = @import("../ai/tool_exec.zig");
+
+/// Maximum target file/buffer size staged for review. Bounded so one tool
+/// call cannot copy an arbitrarily large file into the UI process.
+pub const max_stage_bytes: usize = 256 * 1024;
+
+/// Maximum occurrences in a `replace_all` edit. Prevents a pathological
+/// `old_string` from creating an unbounded preview/application workload.
+pub const max_occurrences: usize = 512;
+
+/// Context lines included around each changed line in the preview.
+pub const hunk_context_lines: u32 = 3;
+
+/// Upper bound on previewed lines (all hunks together).
+pub const max_preview_lines: u32 = 240;
+
+/// Upper bound on separate preview hunks. More distant occurrences are
+/// summarized by a truthful "N more occurrences not shown" line.
+pub const max_preview_hunks: usize = 16;
+
+pub const stale_label = "stale edit";
+
+// ---------------------------------------------------------------------------
+// Argument parsing
+// ---------------------------------------------------------------------------
+
+pub const ArgError = error{
+    OutOfMemory,
+    MalformedArguments,
+    MissingPath,
+    PathNotString,
+    MissingOldString,
+    OldStringNotString,
+    OldStringEmpty,
+    MissingNewString,
+    NewStringNotString,
+    ReplaceAllNotBool,
+};
+
+pub const EditArgs = struct {
+    path: []u8,
+    old_string: []u8,
+    new_string: []u8,
+    replace_all: bool,
+
+    pub fn deinit(self: *EditArgs, alloc: std.mem.Allocator) void {
+        alloc.free(self.path);
+        alloc.free(self.old_string);
+        alloc.free(self.new_string);
+        self.* = undefined;
+    }
+};
+
+/// Parse the `edit_file` arguments exactly as advertised by
+/// `ai.tools.definitions` (`path`, `old_string`, `new_string`, optional
+/// `replace_all`). Unknown fields are ignored; wrong types/missing required
+/// fields are typed errors (mapped to a real card error by the UI).
+pub fn parseArgs(alloc: std.mem.Allocator, arguments_json: []const u8) ArgError!EditArgs {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{ .allocate = .alloc_always }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MalformedArguments,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.MalformedArguments;
+    const obj = &parsed.value.object;
+
+    const path_value = obj.get("path") orelse return error.MissingPath;
+    const path = switch (path_value) {
+        .string => |s| s,
+        else => return error.PathNotString,
+    };
+    const old_value = obj.get("old_string") orelse return error.MissingOldString;
+    const old_string = switch (old_value) {
+        .string => |s| s,
+        else => return error.OldStringNotString,
+    };
+    if (old_string.len == 0) return error.OldStringEmpty;
+    const new_value = obj.get("new_string") orelse return error.MissingNewString;
+    const new_string = switch (new_value) {
+        .string => |s| s,
+        else => return error.NewStringNotString,
+    };
+    const replace_all: bool = if (obj.get("replace_all")) |value| switch (value) {
+        .bool => |b| b,
+        .null => false,
+        else => return error.ReplaceAllNotBool,
+    } else false;
+
+    const path_copy = try alloc.dupe(u8, path);
+    errdefer alloc.free(path_copy);
+    const old_copy = try alloc.dupe(u8, old_string);
+    errdefer alloc.free(old_copy);
+    const new_copy = try alloc.dupe(u8, new_string);
+    return .{
+        .path = path_copy,
+        .old_string = old_copy,
+        .new_string = new_copy,
+        .replace_all = replace_all,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Occurrence mapping / span replacement
+// ---------------------------------------------------------------------------
+
+/// Non-overlapping occurrences of `needle` (non-empty). Returns at most
+/// `max_occurrences + 1` entries so callers can distinguish "too many" from
+/// the exact bound.
+fn collectOccurrences(alloc: std.mem.Allocator, text: []const u8, needle: []const u8) ![]u32 {
+    var out: std.ArrayList(u32) = .empty;
+    errdefer out.deinit(alloc);
+    if (needle.len == 0) return out.toOwnedSlice(alloc);
+    var pos: usize = 0;
+    while (pos + needle.len <= text.len) {
+        const found = std.mem.indexOfPos(u8, text, pos, needle) orelse break;
+        try out.append(alloc, @intCast(found));
+        if (out.items.len > max_occurrences) break;
+        pos = found + needle.len;
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Replace every occurrence inside `[span_start, span_end)`. The caller has
+/// verified that `occurrences` lies inside the span and does not overlap.
+fn replaceInSpan(
+    alloc: std.mem.Allocator,
+    text: []const u8,
+    old_string: []const u8,
+    new_string: []const u8,
+    occurrences: []const u32,
+    span_start: u32,
+    span_end: u32,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var cursor: usize = span_start;
+    for (occurrences) |occ| {
+        const start: usize = occ;
+        if (start < cursor or start + old_string.len > span_end) continue;
+        try out.appendSlice(alloc, text[cursor..start]);
+        try out.appendSlice(alloc, new_string);
+        cursor = start + old_string.len;
+    }
+    try out.appendSlice(alloc, text[cursor..span_end]);
+    return out.toOwnedSlice(alloc);
+}
+
+// ---------------------------------------------------------------------------
+// Bounded preview diff
+// ---------------------------------------------------------------------------
+
+const LineIndex = struct {
+    starts: []u32,
+    text_len: usize,
+
+    fn init(alloc: std.mem.Allocator, text: []const u8) !LineIndex {
+        var starts: std.ArrayList(u32) = .empty;
+        errdefer starts.deinit(alloc);
+        if (text.len > 0) {
+            try starts.append(alloc, 0);
+            var i: usize = 0;
+            while (i < text.len) : (i += 1) {
+                if (text[i] == '\n' and i + 1 < text.len) try starts.append(alloc, @intCast(i + 1));
+            }
+        }
+        return .{ .starts = try starts.toOwnedSlice(alloc), .text_len = text.len };
+    }
+
+    fn deinit(self: *LineIndex, alloc: std.mem.Allocator) void {
+        alloc.free(self.starts);
+        self.* = undefined;
+    }
+
+    fn count(self: *const LineIndex) usize {
+        return self.starts.len;
+    }
+
+    fn lineOf(self: *const LineIndex, offset: usize) usize {
+        if (self.count() == 0) return 0;
+        var lo: usize = 0;
+        var hi: usize = self.count();
+        while (lo + 1 < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.starts[mid] <= offset) lo = mid else hi = mid;
+        }
+        return lo;
+    }
+
+    /// End offset of line `line`, excluding its trailing newline for every
+    /// non-final line. The final line may include the file's trailing
+    /// newline; `inline.splitLines` ignores that phantom line.
+    fn lineEnd(self: *const LineIndex, line: usize) usize {
+        if (line + 1 < self.count()) return self.starts[line + 1] - 1;
+        return self.text_len;
+    }
+};
+
+const Window = struct { first: usize, last: usize };
+
+fn appendWindow(alloc: std.mem.Allocator, list: *std.ArrayList(Window), first: usize, last: usize) !void {
+    if (list.items.len > 0) {
+        const tail = &list.items[list.items.len - 1];
+        // Merge overlapping AND adjacent windows: two edits on neighboring
+        // lines read much better as one hunk than as two hunks split by an
+        // empty "…" separator.
+        if (first <= tail.last + 1) {
+            tail.last = @max(tail.last, last);
+            return;
+        }
+    }
+    try list.append(alloc, .{ .first = first, .last = last });
+}
+
+const Preview = struct {
+    diff: []inline_model.DiffLine,
+    removed: u32 = 0,
+    added: u32 = 0,
+    first_line: u32,
+    last_line: u32,
+    partial: bool = false,
+};
+
+fn freePreview(alloc: std.mem.Allocator, diff: []inline_model.DiffLine) void {
+    for (diff) |d| alloc.free(d.text);
+    alloc.free(diff);
+}
+
+fn appendNote(alloc: std.mem.Allocator, list: *std.ArrayList(inline_model.DiffLine), comptime fmt: []const u8, args: anytype) !void {
+    const text = try std.fmt.allocPrint(alloc, fmt, args);
+    errdefer alloc.free(text);
+    try list.append(alloc, .{ .kind = .context, .text = text });
+}
+
+/// Build the bounded review diff. Each changed line range becomes a hunk
+/// with `hunk_context_lines` of context; overlapping hunks merge. When the
+/// requested context would exceed the line/hunk budget it is reduced, and
+/// any occurrences that still do not fit are summarized by a truthful note.
+fn buildPreview(
+    alloc: std.mem.Allocator,
+    text: []const u8,
+    occurrences: []const u32,
+    old_len: usize,
+    new_string: []const u8,
+) !Preview {
+    var index = try LineIndex.init(alloc, text);
+    defer index.deinit(alloc);
+
+    // Change ranges: [start_line, end_line] (0-based, inclusive).
+    var changed: std.ArrayList(Window) = .empty;
+    defer changed.deinit(alloc);
+    for (occurrences) |occ| {
+        const start: usize = occ;
+        const last_byte = start +| old_len -| 1;
+        const first_line = index.lineOf(start);
+        const last_line = index.lineOf(@min(last_byte, text.len -| 1));
+        try appendWindow(alloc, &changed, first_line, last_line);
+    }
+    if (changed.items.len == 0) return error.NotFound;
+
+    // Reduce context until the whole preview fits the budgets.
+    var windows: std.ArrayList(Window) = .empty;
+    defer windows.deinit(alloc);
+    var context: u32 = hunk_context_lines;
+    var total_lines: u32 = 0;
+    while (true) {
+        windows.clearRetainingCapacity();
+        total_lines = 0;
+        for (changed.items) |range| {
+            const first = range.first -| context;
+            const last = @min(index.count() - 1, range.last + context);
+            try appendWindow(alloc, &windows, first, last);
+        }
+        total_lines = 0;
+        for (windows.items) |w| total_lines += @intCast(w.last - w.first + 1);
+        if ((total_lines <= max_preview_lines and windows.items.len <= max_preview_hunks) or context == 0) break;
+        context -= 1;
+    }
+
+    // Last-resort trimming: keep a prefix of hunks and report the rest.
+    var partial = false;
+    var kept: usize = windows.items.len;
+    var kept_lines: u32 = 0;
+    var k: usize = 0;
+    while (k < windows.items.len) : (k += 1) {
+        const lines: u32 = @intCast(windows.items[k].last - windows.items[k].first + 1);
+        if (k >= max_preview_hunks or kept_lines + lines > max_preview_lines) {
+            kept = k;
+            partial = true;
+            break;
+        }
+        kept_lines += lines;
+    }
+    if (kept == 0) {
+        // A single changed line can never exceed max_preview_lines; guard
+        // defensively so a malformed index never returns an empty review.
+        windows.items[0].last = windows.items[0].first;
+        kept = 1;
+        partial = true;
+    }
+    if (kept < windows.items.len) partial = true;
+
+    var out: std.ArrayList(inline_model.DiffLine) = .empty;
+    errdefer {
+        for (out.items) |d| alloc.free(d.text);
+        out.deinit(alloc);
+    }
+
+    var removed: u32 = 0;
+    var added: u32 = 0;
+    var shown_occurrences: usize = 0;
+    var wi: usize = 0;
+    while (wi < kept) : (wi += 1) {
+        const w = windows.items[wi];
+        const start_off = index.starts[w.first];
+        const end_off = index.lineEnd(w.last);
+        const region_old = text[start_off..end_off];
+        var region_new: std.ArrayList(u8) = .empty;
+        defer region_new.deinit(alloc);
+        {
+            var cursor: usize = start_off;
+            for (occurrences) |occ| {
+                const occ_start: usize = occ;
+                if (occ_start < start_off or occ_start + old_len > end_off) continue;
+                try region_new.appendSlice(alloc, text[cursor..occ_start]);
+                try region_new.appendSlice(alloc, new_string);
+                cursor = occ_start + old_len;
+                shown_occurrences += 1;
+            }
+            try region_new.appendSlice(alloc, text[cursor..end_off]);
+        }
+
+        const diff = try inline_model.buildDiff(alloc, region_old, region_new.items);
+        var moved: usize = 0;
+        errdefer {
+            var j = moved;
+            while (j < diff.len) : (j += 1) alloc.free(diff[j].text);
+            alloc.free(diff);
+        }
+        const stats = inline_model.diffStats(diff);
+        removed += stats.removed;
+        added += stats.added;
+        for (diff) |d| {
+            try out.append(alloc, d);
+            moved += 1;
+        }
+        alloc.free(diff);
+        if (wi + 1 < kept) try appendNote(alloc, &out, "…", .{});
+    }
+
+    const omitted = occurrences.len - shown_occurrences;
+    if (partial or omitted > 0) {
+        if (omitted > 0) {
+            try appendNote(alloc, &out, "… {d} more occurrence(s) not shown", .{omitted});
+        } else {
+            try appendNote(alloc, &out, "… preview truncated", .{});
+        }
+    }
+
+    return .{
+        .diff = try out.toOwnedSlice(alloc),
+        .removed = removed,
+        .added = added,
+        .first_line = @intCast(windows.items[0].first + 1),
+        .last_line = @intCast(windows.items[kept - 1].last + 1),
+        .partial = partial or omitted > 0,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Pending edit
+// ---------------------------------------------------------------------------
+
+pub const Meta = struct {
+    thread_index: usize,
+    /// Message index of this call's Chat tool card.
+    card_index: usize,
+    /// Canonical workspace root captured for this agent turn.
+    root: []const u8,
+    /// Canonical absolute target path (inside `root`).
+    path: []const u8,
+    /// Workspace-relative display path.
+    display_path: []const u8,
+    /// Full target text at staging time (buffer or disk).
+    text: []const u8,
+    old_string: []const u8,
+    new_string: []const u8,
+    replace_all: bool,
+    /// Set when staged from an already-open buffer; approve then also checks
+    /// this exact history revision.
+    buffer_index: ?usize = null,
+    revision: ?u64 = null,
+};
+
+pub const PlanError = error{
+    OutOfMemory,
+    OldStringEmpty,
+    NotFound,
+    Ambiguous,
+    TooManyOccurrences,
+};
+
+pub const Pending = struct {
+    thread_index: usize,
+    card_index: usize,
+    root: []u8,
+    path: []u8,
+    display_path: []u8,
+    text: []u8,
+    old_string: []u8,
+    new_string: []u8,
+    replace_all: bool,
+    buffer_index: ?usize,
+    revision: ?u64,
+    occurrence_count: u32,
+    /// One contiguous span from the first occurrence's start to the last
+    /// occurrence's end. `applyEdit(span_start, span_end, span_replacement)`
+    /// is therefore a single undo group even for `replace_all`.
+    span_start: u32,
+    span_end: u32,
+    span_replacement: []u8,
+    diff: []inline_model.DiffLine,
+    removed: u32,
+    added: u32,
+    /// 1-based affected line range of the shown preview.
+    first_line: u32,
+    last_line: u32,
+    preview_partial: bool,
+    /// Set when an approve attempt found the buffer/file changed. Purely a
+    /// display/lifecycle flag: apply is refused either way.
+    stale: bool = false,
+
+    pub fn deinit(self: *Pending, alloc: std.mem.Allocator) void {
+        alloc.free(self.root);
+        alloc.free(self.path);
+        alloc.free(self.display_path);
+        alloc.free(self.text);
+        alloc.free(self.old_string);
+        alloc.free(self.new_string);
+        alloc.free(self.span_replacement);
+        freePreview(alloc, self.diff);
+        self.* = undefined;
+    }
+
+    pub fn isVisibleFor(self: *const Pending, thread_index: usize) bool {
+        return self.thread_index == thread_index;
+    }
+
+    /// True only when the current text is byte-identical to the staging
+    /// snapshot and the exact occurrence count is unchanged. The caller
+    /// still checks the buffer history revision (when the edit was staged
+    /// from a buffer).
+    pub fn verify(self: *const Pending, current_text: []const u8) bool {
+        if (!std.mem.eql(u8, self.text, current_text)) return false;
+        if (self.span_start > self.span_end or self.span_end > current_text.len) return false;
+        var count: u32 = 0;
+        var pos: usize = 0;
+        while (pos + self.old_string.len <= current_text.len) {
+            const found = std.mem.indexOfPos(u8, current_text, pos, self.old_string) orelse break;
+            count += 1;
+            if (count > self.occurrence_count) return false;
+            pos = found + self.old_string.len;
+        }
+        return count == self.occurrence_count;
+    }
+};
+
+/// Build a pending edit from already-validated metadata. Duplicates every
+/// slice so the caller keeps ownership of its staging buffers.
+pub fn createPending(alloc: std.mem.Allocator, meta: Meta) PlanError!Pending {
+    if (meta.old_string.len == 0) return error.OldStringEmpty;
+
+    const occurrences = try collectOccurrences(alloc, meta.text, meta.old_string);
+    defer alloc.free(occurrences);
+    if (occurrences.len == 0) return error.NotFound;
+    if (!meta.replace_all and occurrences.len > 1) return error.Ambiguous;
+    if (occurrences.len > max_occurrences) return error.TooManyOccurrences;
+
+    var pending = Pending{
+        .thread_index = meta.thread_index,
+        .card_index = meta.card_index,
+        .root = try alloc.dupe(u8, meta.root),
+        .path = try alloc.dupe(u8, meta.path),
+        .display_path = try alloc.dupe(u8, meta.display_path),
+        .text = try alloc.dupe(u8, meta.text),
+        .old_string = try alloc.dupe(u8, meta.old_string),
+        .new_string = try alloc.dupe(u8, meta.new_string),
+        .replace_all = meta.replace_all,
+        .buffer_index = meta.buffer_index,
+        .revision = meta.revision,
+        .occurrence_count = @intCast(occurrences.len),
+        .span_start = occurrences[0],
+        .span_end = occurrences[occurrences.len - 1] + @as(u32, @intCast(meta.old_string.len)),
+        .span_replacement = undefined,
+        .diff = &.{},
+        .removed = 0,
+        .added = 0,
+        .first_line = 0,
+        .last_line = 0,
+        .preview_partial = false,
+    };
+    errdefer pending.deinit(alloc);
+
+    pending.span_replacement = try replaceInSpan(
+        alloc,
+        meta.text,
+        meta.old_string,
+        meta.new_string,
+        occurrences,
+        pending.span_start,
+        pending.span_end,
+    );
+    const preview = try buildPreview(
+        alloc,
+        meta.text,
+        occurrences,
+        meta.old_string.len,
+        meta.new_string,
+    );
+    pending.diff = preview.diff;
+    pending.removed = preview.removed;
+    pending.added = preview.added;
+    pending.first_line = preview.first_line;
+    pending.last_line = preview.last_line;
+    pending.preview_partial = preview.partial;
+    return pending;
+}
+
+/// One-review policy shared with the inline assistant: a new agent stage is
+/// refused while any inline prompt/stream/pending is active, and inline
+/// start is refused while an agent edit is pending.
+pub fn canStage(agent_pending: bool, inline_busy: bool) bool {
+    return !agent_pending and !inline_busy;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn makeArgs(alloc: std.mem.Allocator, json: []const u8) !EditArgs {
+    return parseArgs(alloc, json);
+}
+
+fn testMeta(
+    thread: usize,
+    card: usize,
+    text: []const u8,
+    old_string: []const u8,
+    new_string: []const u8,
+    replace_all: bool,
+) Meta {
+    return .{
+        .thread_index = thread,
+        .card_index = card,
+        .root = "/workspace",
+        .path = "/workspace/a.txt",
+        .display_path = "a.txt",
+        .text = text,
+        .old_string = old_string,
+        .new_string = new_string,
+        .replace_all = replace_all,
+    };
+}
+
+test "agent_edit: parses the advertised edit_file schema" {
+    const alloc = testing.allocator;
+    var args = try makeArgs(alloc,
+        \\{"path":"src/a.zig","old_string":"x","new_string":"y","replace_all":true}
+    );
+    defer args.deinit(alloc);
+    try testing.expectEqualStrings("src/a.zig", args.path);
+    try testing.expectEqualStrings("x", args.old_string);
+    try testing.expectEqualStrings("y", args.new_string);
+    try testing.expect(args.replace_all);
+
+    var defaults = try makeArgs(alloc, "{\"path\":\"a\",\"old_string\":\"x\",\"new_string\":\"\"}");
+    defer defaults.deinit(alloc);
+    try testing.expect(!defaults.replace_all);
+    try testing.expectEqual(@as(usize, 0), defaults.new_string.len);
+
+    try testing.expectError(error.MissingOldString, makeArgs(alloc, "{\"path\":\"a\",\"new_string\":\"y\"}"));
+    try testing.expectError(error.OldStringEmpty, makeArgs(alloc, "{\"path\":\"a\",\"old_string\":\"\",\"new_string\":\"y\"}"));
+    try testing.expectError(error.MissingPath, makeArgs(alloc, "{\"old_string\":\"x\",\"new_string\":\"y\"}"));
+    try testing.expectError(error.MalformedArguments, makeArgs(alloc, "not json"));
+    try testing.expectError(error.PathNotString, makeArgs(alloc, "{\"path\":1,\"old_string\":\"x\",\"new_string\":\"y\"}"));
+    try testing.expectError(error.ReplaceAllNotBool, makeArgs(alloc, "{\"path\":\"a\",\"old_string\":\"x\",\"new_string\":\"y\",\"replace_all\":\"yes\"}"));
+}
+
+test "agent_edit: unique old_string stages a real diff and span replacement" {
+    const alloc = testing.allocator;
+    const text = "alpha one\nbeta two\ngamma three\n";
+    var pending = try createPending(alloc, testMeta(2, 7, text, "beta two", "BETA TWO", false));
+    defer pending.deinit(alloc);
+
+    try testing.expectEqual(@as(usize, 2), pending.thread_index);
+    try testing.expectEqual(@as(usize, 7), pending.card_index);
+    try testing.expectEqualStrings("a.txt", pending.display_path);
+    try testing.expectEqual(@as(u32, 1), pending.occurrence_count);
+    try testing.expectEqual(@as(u32, 1), pending.removed);
+    try testing.expectEqual(@as(u32, 1), pending.added);
+    try testing.expect(!pending.preview_partial);
+    try testing.expectEqualStrings("BETA TWO", pending.span_replacement);
+    try testing.expectEqual(@as(u32, 10), pending.span_start);
+    try testing.expectEqual(@as(u32, 18), pending.span_end);
+    try testing.expect(pending.verify(text));
+    try testing.expect(!pending.verify("alpha one\nbeta TWO\ngamma three\n"));
+
+    // The preview is a line diff with context, not a fabricated unified blob.
+    var saw_removed = false;
+    var saw_added = false;
+    for (pending.diff) |d| switch (d.kind) {
+        .removed => {
+            saw_removed = true;
+            try testing.expectEqualStrings("beta two", d.text);
+        },
+        .added => {
+            saw_added = true;
+            try testing.expectEqualStrings("BETA TWO", d.text);
+        },
+        .context => {},
+    };
+    try testing.expect(saw_removed and saw_added);
+}
+
+test "agent_edit: missing and ambiguous old_string are real errors" {
+    const alloc = testing.allocator;
+    const text = "same\nsame\n";
+    try testing.expectError(error.NotFound, createPending(alloc, testMeta(0, 0, text, "absent", "x", false)));
+    try testing.expectError(error.Ambiguous, createPending(alloc, testMeta(0, 0, text, "same", "x", false)));
+    var all = try createPending(alloc, testMeta(0, 0, text, "same", "x", true));
+    defer all.deinit(alloc);
+    try testing.expectEqual(@as(u32, 2), all.occurrence_count);
+    try testing.expectEqualStrings("x\nx", all.span_replacement);
+}
+
+test "agent_edit: replace_all is one span and a single undo unit" {
+    const alloc = testing.allocator;
+    const text = "one\ntwo alpha\nthree alpha\nfour\n";
+    var pending = try createPending(alloc, testMeta(0, 0, text, "alpha", "ALPHA", true));
+    defer pending.deinit(alloc);
+    try testing.expectEqual(@as(u32, 2), pending.occurrence_count);
+    try testing.expectEqualStrings("ALPHA\nthree ALPHA", pending.span_replacement);
+    // The span starts at the first occurrence and ends after the last one.
+    try testing.expectEqual(@as(u32, 8), pending.span_start);
+    try testing.expectEqual(@as(u32, 25), pending.span_end);
+    try testing.expect(pending.verify(text));
+    // Changing only one occurrence makes the count/text differ -> stale.
+    try testing.expect(!pending.verify("one\ntwo ALPHA\nthree alpha\nfour\n"));
+    try testing.expect(!pending.verify("one\ntwo alpha\nthree alpha\nfour\nfive\n"));
+}
+
+test "agent_edit: distant occurrences produce multiple hunks with context" {
+    const alloc = testing.allocator;
+    const text = "x\n" ++
+        "a1\na2\na3\na4\na5\na6\na7\na8\na9\na10\n" ++
+        "a11\na12\na13\na14\na15\na16\na17\na18\na19\na20\n" ++
+        "x\n";
+    var pending = try createPending(alloc, testMeta(0, 0, text, "x", "Y", true));
+    defer pending.deinit(alloc);
+    try testing.expectEqual(@as(u32, 2), pending.occurrence_count);
+    var removed: u32 = 0;
+    var added: u32 = 0;
+    var separators: usize = 0;
+    for (pending.diff) |d| switch (d.kind) {
+        .removed => removed += 1,
+        .added => added += 1,
+        .context => if (std.mem.eql(u8, d.text, "…")) {
+            separators += 1;
+        },
+    };
+    try testing.expectEqual(@as(u32, 2), removed);
+    try testing.expectEqual(@as(u32, 2), added);
+    try testing.expectEqual(@as(usize, 1), separators);
+    try testing.expect(!pending.preview_partial);
+}
+
+test "agent_edit: preview is bounded and summarizes omitted occurrences" {
+    const alloc = testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    var i: usize = 0;
+    while (i < 400) : (i += 1) {
+        if (i % 10 == 0) {
+            try text.appendSlice(alloc, "needle line\n");
+        } else {
+            const line = try std.fmt.allocPrint(alloc, "filler {d}\n", .{i});
+            defer alloc.free(line);
+            try text.appendSlice(alloc, line);
+        }
+    }
+    var pending = try createPending(alloc, testMeta(0, 0, text.items, "needle", "NEEDLE", true));
+    defer pending.deinit(alloc);
+    try testing.expect(pending.preview_partial);
+    var note_found = false;
+    for (pending.diff) |d| {
+        if (std.mem.indexOf(u8, d.text, "more occurrence(s) not shown") != null) note_found = true;
+    }
+    try testing.expect(note_found);
+    try testing.expect(pending.diff.len <= max_preview_lines + max_preview_hunks + 2);
+}
+
+test "agent_edit: pending is thread-scoped and one review at a time" {
+    const alloc = testing.allocator;
+    var pending = try createPending(alloc, testMeta(3, 0, "a\n", "a", "b", false));
+    defer pending.deinit(alloc);
+    try testing.expect(pending.isVisibleFor(3));
+    try testing.expect(!pending.isVisibleFor(4));
+    try testing.expect(canStage(false, false));
+    try testing.expect(!canStage(true, false));
+    try testing.expect(!canStage(false, true));
+    try testing.expect(!canStage(true, true));
+}

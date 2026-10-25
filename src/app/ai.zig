@@ -17,6 +17,7 @@ const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const ws = ai.workspace;
 const tool_job = @import("tool_job.zig");
+const app_agent_edit = @import("agent_edit_ui.zig");
 
 pub const Status = ws.Status;
 pub const Role = ws.Role;
@@ -498,6 +499,7 @@ fn handleAiRailKey(self: *App, key: vaxis.Key) !void {
     // Changes tab with a pending inline edit: a/Enter approve, r/d reject,
     // j/k scroll the cached diff. These consume the tab-switch keys only
     // while a review is on screen (documented in README/DESIGN).
+    if (try self.handleAgentEditChangesKey(key)) return;
     if (try self.handleInlineChangesKey(key)) return;
     switch (ai.panel.classifyRail(key)) {
         .up => moveThreadCursor(self, -1),
@@ -766,6 +768,8 @@ fn displayToolStatus(status: agent.CardStatus) ws.ToolStatus {
         .ok => .ok,
         .err => .err,
         .approval_required => .approval_required,
+        .approved => .approved,
+        .rejected => .rejected,
         .unsupported => .unsupported,
         .cancelled => .cancelled,
     };
@@ -783,7 +787,9 @@ fn mapOutcomeStatus(status: ai.tool_exec.Status) agent.CardStatus {
 /// Handle one streamed assistant turn's tool calls: attach the OpenAI
 /// tool-call turn to the transcript, create compact cards, execute only the
 /// admitted read-only prefix on a worker, and leave the rest truthfully
-/// unexecuted. Ownership of `calls` is consumed in every branch.
+/// unexecuted. `edit_file` is intercepted and staged for human review; it is
+/// never sent to the executor, so no write can happen here. Ownership of
+/// `calls` is consumed in every branch.
 fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
     const t = &self.ai.threads.items.items[idx];
     const st = toolState(self, idx);
@@ -828,12 +834,19 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
     }
 
     const plan = agent.planBatch(st.?.rounds, st.?.calls, .{}, calls.len);
-    var admitted = self.alloc.alloc(ai.tools.ToolCall, plan.execute) catch {
-        ai.tools.freeCalls(self.alloc, calls);
-        aiSetThreadErrorFmt(self, idx, "tool call protocol: out of memory", .{});
-        return;
-    };
-    var admitted_count: usize = 0;
+    // Read-only calls are admitted to the background worker; write tools are
+    // handled locally. `worker_calls` owns only the read-only subset and is
+    // transferred to `tool_job.Job.start` (which frees it on failure).
+    var worker_calls: []ai.tools.ToolCall = &.{};
+    if (plan.execute > 0) {
+        worker_calls = self.alloc.alloc(ai.tools.ToolCall, plan.execute) catch {
+            ai.tools.freeCalls(self.alloc, calls);
+            aiSetThreadErrorFmt(self, idx, "tool call protocol: out of memory", .{});
+            return;
+        };
+    }
+    var worker_count: usize = 0;
+    var freed: [ai.tools.max_tool_calls]bool = @splat(false);
     st.?.pending_card_count = 0;
 
     const limit_text: ?[]u8 = if (plan.reason) |reason| (switch (reason) {
@@ -846,28 +859,7 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
         const args = agent.summarizeArguments(self.alloc, call.name, call.arguments_json) catch null;
         defer if (args) |a| self.alloc.free(a);
         const args_text = args orelse "{}";
-        if (i < plan.execute) {
-            const msg_index = self.ai.threads.appendToolMessage(
-                self.alloc,
-                idx,
-                call.id,
-                call.name,
-                args_text,
-                .running,
-                "",
-            ) catch {
-                ai.tools.freeCalls(self.alloc, calls);
-                self.alloc.free(admitted);
-                aiSetThreadErrorFmt(self, idx, "tool call protocol: out of memory", .{});
-                return;
-            };
-            admitted[admitted_count] = call;
-            admitted_count += 1;
-            if (st.?.pending_card_count < agent.max_tool_calls_per_turn) {
-                st.?.pending_cards[st.?.pending_card_count] = msg_index;
-                st.?.pending_card_count += 1;
-            }
-        } else {
+        if (i >= plan.execute) {
             _ = self.ai.threads.appendToolMessage(
                 self.alloc,
                 idx,
@@ -878,10 +870,114 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
                 limit_text orelse "error: not executed",
             ) catch {};
             st.?.metrics.record(self.alloc, call.name, .unsupported, 0);
+            continue;
+        }
+
+        const msg_index = self.ai.threads.appendToolMessage(
+            self.alloc,
+            idx,
+            call.id,
+            call.name,
+            args_text,
+            .running,
+            "",
+        ) catch {
+            // Undo ownership: free every call not yet moved/freed, plus the
+            // read-only calls already copied into `worker_calls`.
+            for (worker_calls[0..worker_count]) |wc| wc.deinit(self.alloc);
+            if (worker_calls.len > 0) self.alloc.free(worker_calls);
+            for (calls, 0..) |c, j| {
+                if (!freed[j]) c.deinit(self.alloc);
+            }
+            self.alloc.free(calls);
+            aiSetThreadErrorFmt(self, idx, "tool call protocol: out of memory", .{});
+            return;
+        };
+
+        // Unknown names share the local unsupported path (the card/result
+        // still name the real requested tool).
+        const kind = ai.tools.classify(call.name) orelse .terminal;
+        switch (kind) {
+            .read_file, .list_directory, .grep => {
+                worker_calls[worker_count] = call;
+                worker_count += 1;
+                freed[i] = true;
+                if (st.?.pending_card_count < agent.max_tool_calls_per_turn) {
+                    st.?.pending_cards[st.?.pending_card_count] = msg_index;
+                    st.?.pending_card_count += 1;
+                }
+            },
+            .edit_file => {
+                // M3b1: stage a reviewable diff instead of executing. The
+                // executor/worker never sees this call.
+                const result = app_agent_edit.stageToolCall(self, idx, msg_index, call);
+                switch (result) {
+                    .staged => |staged| {
+                        const text = std.fmt.allocPrint(
+                            self.alloc,
+                            "-{d} +{d} · staged · review in Changes",
+                            .{ staged.removed, staged.added },
+                        ) catch null;
+                        defer if (text) |x| self.alloc.free(x);
+                        self.ai.threads.setToolOutcome(
+                            self.alloc,
+                            idx,
+                            msg_index,
+                            .approval_required,
+                            text orelse "staged · review in Changes",
+                            "approval required: edit_file staged for review; not applied",
+                            0,
+                        ) catch {
+                            t.messages.items[msg_index].tool_status = .err;
+                        };
+                        st.?.metrics.record(self.alloc, call.name, .approval_required, 0);
+                    },
+                    .busy => {
+                        setLocalToolCard(
+                            self,
+                            idx,
+                            msg_index,
+                            .err,
+                            "error: resolve the pending edit first; not executed",
+                            "error: resolve the pending edit first; not executed",
+                        );
+                        st.?.metrics.record(self.alloc, call.name, .err, 0);
+                    },
+                    .failed => |message| {
+                        defer self.alloc.free(message);
+                        setLocalToolCard(self, idx, msg_index, .err, message, message);
+                        st.?.metrics.record(self.alloc, call.name, .err, 0);
+                    },
+                    .oom => {
+                        setLocalToolCard(
+                            self,
+                            idx,
+                            msg_index,
+                            .err,
+                            "error: out of memory",
+                            "error: out of memory",
+                        );
+                        st.?.metrics.record(self.alloc, call.name, .err, 0);
+                    },
+                }
+                call.deinit(self.alloc);
+                freed[i] = true;
+            },
+            .apply_patch, .terminal => {
+                // No execution and no fake approval: this slice implements
+                // edit_file only. The card/result say exactly that.
+                const text_owned = tryUnsupportedToolText(self.alloc, call.name);
+                defer if (text_owned) |x| self.alloc.free(x);
+                const text = text_owned orelse "not executed";
+                setLocalToolCard(self, idx, msg_index, .unsupported, text, text);
+                st.?.metrics.record(self.alloc, call.name, .unsupported, 0);
+                call.deinit(self.alloc);
+                freed[i] = true;
+            },
         }
     }
-    // The call structs are owned by the job (admitted) or must be freed
-    // (skipped); the original slice container is always freed.
+    // Skipped (over-budget) calls are answered truthfully above; their call
+    // structs were not consumed by a card.
     for (calls[plan.execute..]) |call| call.deinit(self.alloc);
     self.alloc.free(calls);
 
@@ -891,14 +987,17 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
     if (st.?.calls >= agent.max_tool_calls_per_turn) stopToolLoop(self, idx, .calls);
     if (st.?.rounds >= agent.max_tool_rounds) stopToolLoop(self, idx, .rounds);
 
-    if (admitted_count == 0) {
-        self.alloc.free(admitted);
+    if (worker_count == 0) {
+        if (worker_calls.len > 0) self.alloc.free(worker_calls);
+        st.?.active = false;
         st.?.pending_followup = true;
         return;
     }
+    std.debug.assert(worker_count == st.?.pending_card_count);
+
     const root = st.?.root orelse {
-        for (admitted) |call| call.deinit(self.alloc);
-        self.alloc.free(admitted);
+        for (worker_calls[0..worker_count]) |call| call.deinit(self.alloc);
+        self.alloc.free(worker_calls);
         for (st.?.pending_cards[0..st.?.pending_card_count]) |msg_index| {
             const name = if (msg_index < t.messages.items.len) (t.messages.items[msg_index].tool_name orelse "?") else "?";
             self.ai.threads.setToolOutcome(
@@ -918,8 +1017,8 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
         setToolNote(self, idx, "tool loop stopped: workspace root unavailable");
         return;
     };
-    const job = tool_job.Job.start(self.alloc, self.io, root, admitted, st.?.generation) catch {
-        // Job.start freed `admitted` on failure.
+    const job = tool_job.Job.start(self.alloc, self.io, root, worker_calls, st.?.generation) catch {
+        // Job.start freed `worker_calls` on failure.
         for (st.?.pending_cards[0..st.?.pending_card_count]) |msg_index| {
             const name = if (msg_index < t.messages.items.len) (t.messages.items[msg_index].tool_name orelse "?") else "?";
             self.ai.threads.setToolOutcome(
@@ -951,6 +1050,36 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
     }
     self.ai.tool_jobs.items[idx] = job;
     st.?.active = true;
+}
+
+/// Card/result for a non-executed local tool. `text` is display-only; `api`
+/// is the bounded tool result the provider sees.
+fn setLocalToolCard(
+    self: *App,
+    idx: usize,
+    msg_index: usize,
+    status: ws.ToolStatus,
+    text: []const u8,
+    api: []const u8,
+) void {
+    self.ai.threads.setToolOutcome(self.alloc, idx, msg_index, status, text, api, 0) catch {
+        if (idx < self.ai.threads.items.items.len and
+            msg_index < self.ai.threads.items.items[idx].messages.items.len)
+        {
+            self.ai.threads.items.items[idx].messages.items[msg_index].tool_status = .err;
+        }
+    };
+}
+
+/// Owned, truthful text for apply_patch/terminal/unknown in M3b1.
+fn tryUnsupportedToolText(alloc: std.mem.Allocator, name: []const u8) ?[]u8 {
+    if (std.mem.eql(u8, name, "apply_patch")) {
+        return alloc.dupe(u8, "not executed — apply_patch approval is not available in M3b1") catch null;
+    }
+    if (std.mem.eql(u8, name, "terminal")) {
+        return alloc.dupe(u8, "not executed — terminal execution is not available") catch null;
+    }
+    return std.fmt.allocPrint(alloc, "not executed — unsupported tool: {s}", .{name}) catch null;
 }
 
 /// Consume finished tool workers. Results apply only to the exact thread and
@@ -1426,6 +1555,8 @@ fn cardStatusStyle(st: Styles, status: ws.ToolStatus) vaxis.Style {
         .ok => st.code,
         .err => st.error_style,
         .approval_required => st.warn,
+        .approved => st.code,
+        .rejected => st.error_style,
         .unsupported => st.dim,
         .cancelled => st.faint,
         .none => st.dim,
@@ -1438,6 +1569,8 @@ fn cardIcon(status: ws.ToolStatus) []const u8 {
         .ok => "✓",
         .err => "✖",
         .approval_required => "!",
+        .approved => "✓",
+        .rejected => "✖",
         .unsupported => "–",
         .cancelled => "◌",
         .none => "·",
@@ -1475,6 +1608,8 @@ fn appendToolCardRows(
         .ok => .ok,
         .err => .err,
         .approval_required => .approval_required,
+        .approved => .approved,
+        .rejected => .rejected,
         .unsupported => .unsupported,
         .cancelled => .cancelled,
         .none => .running,
@@ -1520,10 +1655,36 @@ fn appendToolCardRows(
 
     switch (status) {
         .approval_required => {
-            try appendCardRow(a, rows, inner_w, &.{.{ .text = "  not executed — write tools need M3b approval", .style = st.warn }});
+            if (msg.text.len > 0) {
+                const safe = try displaySafe(a, msg.text);
+                const line = try std.fmt.allocPrint(a, "  {s}", .{safe});
+                try appendCardRow(a, rows, inner_w, &.{.{ .text = line, .style = st.warn }});
+            } else {
+                try appendCardRow(a, rows, inner_w, &.{.{ .text = "  staged — review in Changes", .style = st.warn }});
+            }
+        },
+        .approved => {
+            if (msg.text.len > 0) {
+                const safe = try displaySafe(a, msg.text);
+                const line = try std.fmt.allocPrint(a, "  {s}", .{safe});
+                try appendCardRow(a, rows, inner_w, &.{.{ .text = line, .style = st.code }});
+            }
+        },
+        .rejected => {
+            if (msg.text.len > 0) {
+                const safe = try displaySafe(a, msg.text);
+                const line = try std.fmt.allocPrint(a, "  {s}", .{safe});
+                try appendCardRow(a, rows, inner_w, &.{.{ .text = line, .style = st.error_style }});
+            }
         },
         .unsupported => {
-            try appendCardRow(a, rows, inner_w, &.{.{ .text = "  not executed", .style = st.faint }});
+            if (msg.text.len > 0) {
+                const safe = try displaySafe(a, msg.text);
+                const line = try std.fmt.allocPrint(a, "  {s}", .{safe});
+                try appendCardRow(a, rows, inner_w, &.{.{ .text = line, .style = st.faint }});
+            } else {
+                try appendCardRow(a, rows, inner_w, &.{.{ .text = "  not executed", .style = st.faint }});
+            }
         },
         .cancelled => {
             try appendCardRow(a, rows, inner_w, &.{.{ .text = "  stopped (no result applied)", .style = st.faint }});
@@ -1872,7 +2033,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
 
     // ---- tabs: chat / changes N / tools / terminal ----
     {
-        const changes_label = try std.fmt.allocPrint(a, "changes {d}", .{self.inlinePendingCount()});
+        const changes_label = try std.fmt.allocPrint(a, "changes {d}", .{self.reviewPendingCount()});
         const Tabs = [_]struct { tab: WorkboxTab, label: []const u8 }{
             .{ .tab = .chat, .label = "chat" },
             .{ .tab = .changes, .label = changes_label },
@@ -1911,12 +2072,23 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         switch (self.ai.tab) {
             .chat => try drawChatBody(self, a, win, st, x, w, border_style, rail_bg, &m, active),
             .changes => {
-                if (self.inlinePendingCount() > 0) {
+                if (self.agentEditVisible()) {
+                    try self.drawAgentEditChanges(a, win, x, w, m.body_top, m.body_rows, border_style, rail_bg);
+                } else if (self.inlinePendingCount() > 0) {
                     try self.drawInlineChanges(a, win, x, w, m.body_top, m.body_rows, border_style, rail_bg);
                 } else {
                     try drawRailTextRow(self, win, a, m.body_top, x, w, border_style, rail_bg, "no pending changes", st.dim);
                     if (m.body_rows > 2) {
                         try drawRailTextRow(self, win, a, m.body_top + 2, x, w, border_style, rail_bg, "select lines · <leader>i", st.faint);
+                    }
+                    // Keep the empty review body a closed panel: every row
+                    // between/after the two text rows still draws the rail
+                    // border (the scenario matrix samples the bottom-left
+                    // cell whenever Changes is the active tab).
+                    var fill_y = m.body_top + 1;
+                    while (fill_y < m.body_top + m.body_rows) : (fill_y += 1) {
+                        if (fill_y == m.body_top + 2) continue;
+                        try drawRailTextRow(self, win, a, fill_y, x, w, border_style, rail_bg, "", st.faint);
                     }
                 }
             },
@@ -2146,6 +2318,9 @@ fn drawToolsTab(
         var counts = try std.fmt.allocPrint(a, "ok {d} · err {d}", .{ stats.ok, stats.errors });
         if (stats.approval_required > 0) {
             counts = try std.fmt.allocPrint(a, "{s} · appr {d}", .{ counts, stats.approval_required });
+        }
+        if (stats.denied > 0) {
+            counts = try std.fmt.allocPrint(a, "{s} · denied {d}", .{ counts, stats.denied });
         }
         if (stats.unsupported > 0) {
             counts = try std.fmt.allocPrint(a, "{s} · unsup {d}", .{ counts, stats.unsupported });

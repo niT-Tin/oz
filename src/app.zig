@@ -25,6 +25,7 @@ const git_job = @import("app/git_job.zig");
 const app_ai = @import("app/ai.zig");
 const app_hints = @import("app/hints.zig");
 const app_inline = @import("app/inline_ui.zig");
+const app_agent_edit = @import("app/agent_edit_ui.zig");
 
 const GitJobKind = git_job.GitJobKind;
 const GitApplyOp = git_job.GitApplyOp;
@@ -682,6 +683,8 @@ pub const App = struct {
     ai: app_ai.Session = .{},
     /// M2b2 inline assistant: prompt, dedicated stream client, pending diff.
     inline_edit: app_inline.Session = .{},
+    /// M3b1 staged agent edits: one pending diff, thread-scoped.
+    agent_edit: app_agent_edit.Session = .{},
 
     // ---- M2.6a keyboard hints (<leader>j) ----
     /// Modal target-selection state (DESIGN.md §19). Pure value: fixed
@@ -1421,6 +1424,7 @@ pub const App = struct {
         // and the vaxis loop it renders into go away.
         self.deinitAi();
         self.deinitInline();
+        self.deinitAgentEdit();
         self.vx.deinit(self.alloc, self.tty.writer());
         self.tty.deinit();
         self.alloc.free(self.tty_buffer);
@@ -1849,6 +1853,17 @@ pub const App = struct {
     pub const drawInlinePrompt = app_inline.drawInlinePrompt;
     pub const drawInlineChanges = app_inline.drawInlineChanges;
     pub const InlineSession = app_inline.Session;
+    // ---- staged agent edits (M3b1) → src/app/agent_edit_ui.zig ----
+    pub const deinitAgentEdit = app_agent_edit.deinitAgentEdit;
+    pub const agentEditAnyPending = app_agent_edit.agentEditAnyPending;
+    pub const agentEditVisible = app_agent_edit.agentEditVisible;
+    pub const agentEditPendingCount = app_agent_edit.agentEditPendingCount;
+    pub const reviewPendingCount = app_agent_edit.reviewPendingCount;
+    pub const agentEditApprove = app_agent_edit.agentEditApprove;
+    pub const agentEditReject = app_agent_edit.agentEditReject;
+    pub const handleAgentEditChangesKey = app_agent_edit.handleAgentEditChangesKey;
+    pub const drawAgentEditChanges = app_agent_edit.drawAgentEditChanges;
+    pub const AgentEditSession = app_agent_edit.Session;
     // ---- render → src/app/render.zig ----
     pub const tabBarRows = @import("app/render.zig").tabBarRows;
     pub const contentTop = @import("app/render.zig").contentTop;

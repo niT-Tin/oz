@@ -21,6 +21,7 @@ const ai = @import("../ai/root.zig");
 const ws = @import("../ai/workspace.zig");
 const buffer = @import("../buffer/root.zig");
 const autil = @import("util.zig");
+const hints = @import("hints.zig");
 const inline_model = @import("inline.zig");
 
 pub const Status = enum { idle, prompting, streaming, err };
@@ -130,7 +131,7 @@ fn currentBufferIndex(self: *App) usize {
 /// be resolved first (one-pending policy; never silently replace it).
 pub fn startInlineEdit(self: *App) !void {
     if (self.inline_edit.prompt_open) return;
-    if (self.inline_edit.pending != null) {
+    if (self.inline_edit.pending != null or self.agentEditAnyPending()) {
         inlineMsg(self, "inline edit: reject the pending change first");
         return;
     }
@@ -777,10 +778,28 @@ fn displaySafePrompt(alloc: std.mem.Allocator, text: []const u8) ![]const u8 {
     return out.toOwnedSlice(alloc);
 }
 
-/// Workbox Changes body for the pending inline edit. Fixed rows: header,
-/// stats, approve/reject buttons, blank, then the cached diff lines. Diff
-/// rendering only touches the visible rows (never rebuilds the diff).
-pub fn drawInlineChanges(
+/// Generic staged-diff review body shared by the inline assistant and the
+/// M3b1 agent edit. Fixed rows: header, stats, approve/reject buttons, blank,
+/// then the cached diff lines. Rendering only touches visible rows; the diff
+/// itself is never rebuilt per frame.
+pub const ReviewView = struct {
+    path: []const u8,
+    first_line: u32,
+    last_line: u32,
+    removed: u32,
+    added: u32,
+    stale: bool = false,
+    stale_label: []const u8 = "stale selection",
+    /// True when the diff is a bounded preview rather than the whole edit.
+    partial: bool = false,
+    partial_label: []const u8 = "preview",
+    diff: []const inline_model.DiffLine,
+    scroll: *u32,
+    approve_action: hints.Action,
+    reject_action: hints.Action,
+};
+
+pub fn drawDiffReview(
     self: *App,
     a: std.mem.Allocator,
     win: vaxis.Window,
@@ -790,8 +809,8 @@ pub fn drawInlineChanges(
     body_rows: u32,
     border_style: vaxis.Style,
     rail_bg: vaxis.Color,
+    view: ReviewView,
 ) !void {
-    const p = if (self.inline_edit.pending) |*pp| pp else return;
     if (body_rows == 0) return;
     const t = self.theme;
     const dim: vaxis.Style = .{ .fg = .{ .rgb = t.fg_dim }, .bg = rail_bg };
@@ -804,17 +823,17 @@ pub fn drawInlineChanges(
 
     // header: path · lines A-B
     {
-        const path = p.path orelse "[No Name]";
-        const text = try std.fmt.allocPrint(a, "{s} · lines {d}-{d}", .{ path, p.first_line, p.last_line });
+        const text = try std.fmt.allocPrint(a, "{s} · lines {d}-{d}", .{ view.path, view.first_line, view.last_line });
         try drawTextRow(self, win, a, row, x, w, border_style, rail_bg, text, base);
         row += 1;
     }
     if (row >= bottom) return;
-    // stats + stale marker
+    // stats + stale/partial markers
     {
-        var text = try std.fmt.allocPrint(a, "-{d} +{d}", .{ p.removed, p.added });
-        if (p.stale) text = try std.fmt.allocPrint(a, "{s}  stale selection", .{text});
-        try drawTextRow(self, win, a, row, x, w, border_style, rail_bg, text, if (p.stale) err_style else dim);
+        var text = try std.fmt.allocPrint(a, "-{d} +{d}", .{ view.removed, view.added });
+        if (view.partial) text = try std.fmt.allocPrint(a, "{s}  {s}", .{ text, view.partial_label });
+        if (view.stale) text = try std.fmt.allocPrint(a, "{s}  {s}", .{ text, view.stale_label });
+        try drawTextRow(self, win, a, row, x, w, border_style, rail_bg, text, if (view.stale) err_style else dim);
         row += 1;
     }
     if (row >= bottom) return;
@@ -830,13 +849,13 @@ pub fn drawInlineChanges(
             const used: u32 = @intCast(autil.cellWidth(win, full));
             try drawRow(win, a, row, x, w, "│", border_style, rail_bg, segs.items, used);
             if (self.hints.collecting) {
-                self.addHintTarget(.{ .row = row, .col = x + 2, .width = 3, .height = 1 }, .inline_approve);
+                self.addHintTarget(.{ .row = row, .col = x + 2, .width = 3, .height = 1 }, view.approve_action);
                 self.addHintTarget(.{
                     .row = row,
                     .col = x + 2 + @as(u32, @intCast("[a] approve  ".len)),
                     .width = 3,
                     .height = 1,
-                }, .inline_reject);
+                }, view.reject_action);
             }
         } else {
             try drawTextRow(self, win, a, row, x, w, border_style, rail_bg, "[a] approve  [r] reject", accent);
@@ -849,14 +868,14 @@ pub fn drawInlineChanges(
     row += 1;
     const diff_rows = bottom -| row;
     if (diff_rows == 0) return;
-    const max_top = p.diff.len -| diff_rows;
-    if (self.inline_edit.pending_scroll > max_top) self.inline_edit.pending_scroll = @intCast(max_top);
-    const top = self.inline_edit.pending_scroll;
+    const max_top = view.diff.len -| diff_rows;
+    if (view.scroll.* > max_top) view.scroll.* = @intCast(max_top);
+    const top = view.scroll.*;
     var k: u32 = 0;
     while (k < diff_rows) : (k += 1) {
         const idx = top + k;
-        if (idx >= p.diff.len) break;
-        const d = p.diff[idx];
+        if (idx >= view.diff.len) break;
+        const d = view.diff[idx];
         const prefix: []const u8 = switch (d.kind) {
             .context => "  ",
             .removed => "- ",
@@ -881,8 +900,36 @@ pub fn drawInlineChanges(
     // Fill every remaining body row with the rail border: the Changes body
     // must stay a closed panel even when the diff is shorter than the body
     // (scenario/golden checks sample the bottom-left cell).
-    var y = row + @min(@as(u32, @intCast(p.diff.len -| top)), diff_rows);
+    var y = row + @min(@as(u32, @intCast(view.diff.len -| top)), diff_rows);
     while (y < bottom) : (y += 1) {
         try drawRow(win, a, y, x, w, "│", border_style, rail_bg, &.{}, 0);
     }
+}
+
+/// Workbox Changes body for the pending inline edit.
+pub fn drawInlineChanges(
+    self: *App,
+    a: std.mem.Allocator,
+    win: vaxis.Window,
+    x: u32,
+    w: u32,
+    body_top: u32,
+    body_rows: u32,
+    border_style: vaxis.Style,
+    rail_bg: vaxis.Color,
+) !void {
+    const p = if (self.inline_edit.pending) |*pp| pp else return;
+    try drawDiffReview(self, a, win, x, w, body_top, body_rows, border_style, rail_bg, .{
+        .path = p.path orelse "[No Name]",
+        .first_line = p.first_line,
+        .last_line = p.last_line,
+        .removed = p.removed,
+        .added = p.added,
+        .stale = p.stale,
+        .stale_label = "stale selection",
+        .diff = p.diff,
+        .scroll = &self.inline_edit.pending_scroll,
+        .approve_action = .inline_approve,
+        .reject_action = .inline_reject,
+    });
 }
