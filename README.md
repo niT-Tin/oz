@@ -72,13 +72,19 @@ A terminal text editor written in Zig.
 
 ![Embedded terminal (Alt+r floating layout)](docs/screenshots/terminal.png)
 
-**AI chat (M1)**
+**AI workspace (M2a)**
 
-- `<leader>a` toggles a centered, modal chat panel (chat only — no tools, file edits or inline suggestions yet)
+- `<leader>a` opens the right-hand **Agent Rail + Workbox** and focuses its prompt; from the editor or thread list it closes the rail and returns focus to the editor. A docked rail is non-modal: editing continues beside it.
+- Width behavior: **≥110 cols** reserves a 38-cell docked rail; **90–109** reserves 34; **<90** uses an overlay drawer (`min(34, width-8)`) while the editor keeps its full width underneath. The rail stops above the status bar and never draws over the editor's reserved area. In drawer mode Esc closes the drawer; there is no fake scrim, diff or telemetry.
+- **Threads** are session-level and listed under the current workspace. `j`/`k` select, Enter attaches, `n` (or `+`) creates a new thread and focuses its prompt, Tab from the prompt returns to the thread list. One stream runs at a time: switching away from a streaming thread cancels it (status `cancelled`, transcript frozen); switching back shows that frozen transcript. Each thread has its own request history and client, so deltas can never land in another thread. Threads survive rail close and workspace switches, but are not persisted to disk.
+- **Workbox tabs**: Chat (the M1 transcript, streaming, cancellation, errors, Markdown and prompt), Changes (`no pending changes`, badge 0 for now), Tools (`tools arrive in M3`), Terminal (`agent terminal arrives in M3`; the existing editor terminal is still `Alt+r`). Empty states are real — no fabricated diffs, counts or charts.
+- Keys:
+  - Prompt: Enter send · Ctrl+c cancel · Ctrl+n new thread · Tab → thread list · Ctrl+j/k scroll one line · PageUp/PageDown scroll a page · Esc → editor (drawer: closes)
+  - Thread list / workbox: `j`/`k` select · Enter attach · `n`/`+` new thread · `c`/`d`/`t`/`r` Chat/Changes/Tools/Terminal · Tab/Shift+Tab cycle tabs · `q`/Esc → editor
+  - `<Ctrl-w> a` re-enters the rail at the thread list from the editor (also opens a closed rail)
 - Streaming OpenAI-compatible completions (`POST {base_url}/chat/completions`, SSE); Markdown + fenced code rendering, auto-scroll
 - Editor context is attached automatically: current file path, visual selection with its 1-based line range, otherwise the cursor line ± a small window (capped at 8 KB)
-- Keys: Enter send · Esc close (conversation stays in memory) · Ctrl+c cancel stream · Ctrl+n clear thread · Ctrl+j/k scroll one line · PageUp/PageDown scroll a page
-- Configuration via env (read when the panel opens):
+- Configuration via env (read when the rail opens):
 
   | Variable | Default | Meaning |
   |---|---|---|

@@ -72,13 +72,19 @@
 
 ![内嵌终端（Alt+r 浮动布局）](docs/screenshots/terminal.png)
 
-**AI Chat（M1）**
+**AI Workspace（M2a）**
 
-- `<leader>a` 打开居中的模态聊天面板（仅聊天：暂不支持 tools、改文件或行内补全）
+- `<leader>a` 打开右侧 **Agent Rail + Workbox** 并聚焦输入框；在 editor 或线程列表中再按一次会关闭 rail 并把焦点还给 editor。dock 模式下 rail 不是模态的，可以一边编辑一边使用。
+- 宽度行为：**≥110 列**保留 38 列的右侧 dock；**90–109** 列保留 34；**<90** 列改为右侧 overlay drawer（`min(34, width-8)`），editor 在下方保持全宽。rail 只画到状态栏上方，绝不占用 editor 的保留区域；drawer 模式按 Esc 关闭，没有假遮罩、假 diff 或假遥测。
+- **线程**是会话级的，按当前 workspace 分组显示。`j`/`k` 选择，Enter attach，`n`（或 `+`）新建线程并聚焦其输入框，输入框内 Tab 回到线程列表。同一时间只允许一个流：切换到别的线程会取消正在流式的线程（状态 `cancelled`，transcript 冻结）；切回来看到冻结的 transcript。每个线程有自己的请求历史和 client，delta 不会串到其他线程。线程在 rail 关闭和 workspace 切换后仍保留，但不落盘。
+- **Workbox tabs**：Chat（沿用 M1 的 transcript、流式、取消、错误、Markdown 与输入框）、Changes（`no pending changes`，当前 badge 0）、Tools（`tools arrive in M3`）、Terminal（`agent terminal arrives in M3`；编辑器自己的终端仍是 `Alt+r`）。空状态是真实的，不伪造 diff、计数或图表。
+- 按键：
+  - 输入框：Enter 发送 · Ctrl+c 取消 · Ctrl+n 新建线程 · Tab → 线程列表 · Ctrl+j/k 单行滚动 · PageUp/PageDown 翻页 · Esc → editor（drawer 则关闭）
+  - 线程列表 / workbox：`j`/`k` 选择 · Enter attach · `n`/`+` 新建线程 · `c`/`d`/`t`/`r` 切换 Chat/Changes/Tools/Terminal · Tab/Shift+Tab 循环 tab · `q`/Esc → editor
+  - `<Ctrl-w> a` 从 editor 回到 rail 的线程列表（rail 关闭时也会打开）
 - 流式 OpenAI 兼容补全（`POST {base_url}/chat/completions`，SSE）；支持 Markdown 与 fenced 代码块渲染、自动滚动
 - 自动附带编辑器上下文：当前文件路径；有可视选区时附带选中文本与 1-based 行号范围；否则附带光标行 ± 少量上下文（总上限 8 KB）
-- 按键：Enter 发送 · Esc 关闭（会话保留在内存中）· Ctrl+c 取消流 · Ctrl+n 清空会话 · Ctrl+j/k 单行滚动 · PageUp/PageDown 翻页
-- 通过环境变量配置（打开面板时读取）：
+- 通过环境变量配置（打开 rail 时读取）：
 
   | 变量 | 默认值 | 含义 |
   |---|---|---|

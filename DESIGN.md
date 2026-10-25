@@ -800,12 +800,14 @@ Narrow drawer 必须有遮罩/焦点陷阱，不能挤压编辑器到不可用�
 
 ### 18.4 里程碑拆分
 
-- **M2a（layout shell）**：右侧 dock rail / narrow drawer；线程模型与 thread rail；workbox Chat + Changes（空状态）；现有 `<leader>a` 改为打开/聚焦 rail；保留 M1 streaming/cancel/error。
+- **M2a（layout shell，已完成）**：右侧 dock rail / narrow drawer；线程模型与 thread rail；workbox Chat + Changes（空状态）+ Tools/Terminal 诚实占位；现有 `<leader>a` 改为打开/聚焦 rail；保留 M1 streaming/cancel/error。实现状态见 §18.7。
 - **M2b（notes + inline）**：navigator Notes tab / note buffer；visual 选区 inline assistant；diff float；Approve/Reject + undo。
 - **M3a（tools）**：tool protocol、权限确认、tool cards、read/list/grep/edit/apply_patch；agent loop。
 - **M3b（metrics）**：per-tool count/avg/success/fail；最近 N 次耗时 ring buffer；braille/线条折线图；窄屏 sparkline fallback。
 
 ### 18.5 焦点与按键（草案）
+
+> M2a 已按 §18.7 落地；下面保留最初的草案，实际策略以 §18.7 为准。
 
 - `<leader>a`：打开 rail 并聚焦 workbox 输入；再按 toggle/`Esc` 返回 editor（rail 保持可见）。
 - `Ctrl+w` 在 editor / navigator / rail 之间切换；`Tab` 在 workbox tab 间切换。
@@ -818,4 +820,55 @@ Narrow drawer 必须有遮罩/焦点陷阱，不能挤压编辑器到不可用�
 - 所有布局在 80/100/120 列下边框/背景对齐，无 cell 溢出。
 - 线程创建/切换/流式隔离；切换线程不会把 A 的 delta 写进 B 的 transcript。
 - Chat/Changes badge 联动；空状态真实，不显示假工具/假数据。
-- 现有 134 个 e2e + 单测全绿；新增 M2a e2e 覆盖 dock/drawer、thread 切换、focus guard。
+- 现有 e2e + 单测全绿（M2a 完成后：136 个 e2e、343 个单测）；新增 M2a e2e 覆盖 dock/drawer、thread 切换、focus guard。
+
+### 18.7 M2a 实现状态（已完成，2026-10-25）
+
+**布局（cell 精确，单一来源 `src/ai/workspace.zig: layout()`）**
+
+| 终端宽度 | rail | editor 可用宽度 |
+|---|---|---|
+| ≥ 110 | dock 38 列（含 1 列左边框） | `cols - 38` |
+| 90–109 | dock 34 列 | `cols - 34` |
+| < 90 | overlay drawer `min(34, cols - 8)` | `cols`（rail 覆盖在上层） |
+
+- rail 从第 0 行画到状态栏上方；状态栏始终全宽。dock 模式 rail 左边界即 editor 右边界，`layoutWindows` / tab bar / dashboard / split 全部改用 `aiEditorWidth()`，不会把 editor 画到 rail 上。
+- drawer 模式不挤压 editor，也不画假遮罩；左侧 editor 保持可见，Esc 关闭 drawer。rail 内部全部 cell 填 `bg_float`，左边界聚焦时 accent、失焦时 `fg_faint`。
+- rail 上方为紧凑线程栏：`▥ agents N +`、workspace 分组、线程状态点 + 标题 + 状态；下方为 Workbox：活动线程 header、tabs、body、Chat 的 prompt 行。
+
+**焦点策略（实际实现）**
+
+- `<leader>a` 是可见性 toggle：关闭 → 打开 rail 并聚焦 **prompt**（Workbox 切到 Chat）；已打开（editor 或线程列表聚焦时）→ 关闭 rail 并把焦点还给 editor。prompt 聚焦时所有可打印输入都归 prompt，因此不能在 prompt 内用 leader 关闭；先 Esc（回 editor，rail 保持）再 `<leader>a` 关闭，或 Tab 到线程列表再 `<leader>a`。
+- `<Ctrl-w> a`：从 editor 重新进入 rail 的**线程列表**（rail 关闭时也会打开）。这是 editor → rail 的固定回入口；Ctrl-w hjkl 不变。
+- prompt：Enter 发送，Ctrl+c 取消，Ctrl+n 新建线程，Tab → 线程列表（prompt 是单行，不接收 tab 字符），Ctrl+j/k 单行滚动，PageUp/PageDown 翻页，Esc → editor（narrow：关闭 drawer）。
+- 线程列表 / workbox：`j/k` 移动线程光标，Enter attach 并聚焦 prompt（切回 Chat），`n`/`+` 新建线程并聚焦其 prompt，`c/d/t/r` 切 Chat/Changes/Tools/Terminal，Tab/Shift+Tab 循环 tab，`q`/Esc → editor（narrow 关闭 drawer）。
+- dock 且 editor 聚焦时 rail 非模态：所有 editor 快捷键、pickers、command mode、宏录制、文件树、终端焦点均照旧；rail/prompt 聚焦时按键先在 AI 层消费，终端焦点仍最优先。
+- 焦点可见性：rail 左边框 accent（rail/prompt 聚焦）/ `fg_faint`（editor 聚焦）；prompt 显示 beam cursor，线程列表显示 block cursor。
+
+**线程切换策略（实际实现）**
+
+- `src/ai/workspace.zig: Threads` 持有 session 级 `items` / `active` / `next_number`；`src/app/ai.zig: Session` 另持有一一对应的 `clients`。线程标题由 `next_number` 生成（`thread 1`、`thread 2`…）。
+- 每个线程独立保存 messages、prompt draft、status、error、scroll/auto-scroll、view 尺寸和 cancel_requested；client 与线程索引一一对应。
+- 切换（`select`）离开一个 `streaming` 线程时：该线程 `status = cancelled`、`cancel_requested = true`，App 调 `client.requestCancel()`；transcript 冻结。迟到的 delta 在 `drainAi` 中按线程丢弃（`cancel_requested` 时直接 free，不写入任何 transcript），`applyDelta` 也拒绝非 streaming/已取消线程。
+- 同一时刻最多一个 streaming 线程：新建线程、Ctrl+n、以及 aiSend 的防御性循环都会取消其他 live stream。
+- 切回已取消线程显示冻结的 transcript（含 `[stream cancelled]` 标记），不会被后续事件修改；各线程的请求体只包含自己的 messages（验证见 e2e `thread B streams while A is frozen`）。
+- 关闭 rail 不删除线程、不取消流；workspace 切换也不动 `App.ai`；不落盘。
+
+**范围与限制**
+
+- 仅 M2a：不做 tools、真实文件编辑、diff/Approve、Notes/Navigator tab、inline assistant、工具计数/耗时图、agent shell。Changes 显示 `no pending changes`（badge 0）；Tools 显示 `tools arrive in M3`；Terminal 显示 `agent terminal arrives in M3` 并提示现有 `Alt+r`。
+- 线程 archive 未实现；鼠标操作未接入（`j/k` + Enter）。
+- 现有 `[stream cancelled]` 是 UI 标记，不是协议消息。
+
+**文件**
+
+- `src/ai/workspace.zig`：布局/焦点/线程模型 + 单测。
+- `src/ai/panel.zig`：prompt / rail 按键分类。
+- `src/app/ai.zig`：Session、每线程 client、drain、焦点路由、rail/Workbox 渲染。
+- `src/app/input.zig`、`src/app/render.zig`、`src/app.zig`：焦点路由、editor 宽度、状态栏与 cursor。
+- `test/e2e.zig`：M2a pty 测试（120 dock / 80 drawer / A-B 线程隔离 / tabs / M1 选区、取消、错误）。
+
+**验证**
+
+- `zig build test`：343/343 通过。
+- `zig build e2e`：136 个 pty 测试全部通过（exit 0，无失败输出）。
