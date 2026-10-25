@@ -96,10 +96,23 @@ pub fn build(b: *std.Build) void {
     });
     tests.root_module.link_libc = true;
     const run_tests = b.addRunArtifact(tests);
+    // A test command must execute the test binary, not replay a cached
+    // "run" result from an earlier invocation. Without this, `zig build
+    // test` can report success without running anything (and
+    // `tools/verify.sh` would record no fresh test counts).
+    run_tests.has_side_effects = true;
     const test_step = b.step("test", "Run unit tests (L1 logic + L2 render snapshots)");
     test_step.dependOn(&run_tests.step);
 
     // ---- L3 end-to-end tests (pty) ----
+    // The scenario/golden harness imports the pure layout model so tests
+    // derive rail geometry from the same source as the renderer instead of
+    // duplicating breakpoints.
+    const ai_workspace_mod = b.createModule(.{
+        .root_source_file = b.path("src/ai/workspace.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const e2e = b.addTest(.{
         .filters = test_filters,
         .root_module = b.createModule(.{
@@ -108,10 +121,12 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "vaxis", .module = vaxis_mod },
+                .{ .name = "ai_workspace", .module = ai_workspace_mod },
             },
         }),
     });
     const run_e2e = b.addRunArtifact(e2e);
+    run_e2e.has_side_effects = true;
     const e2e_step = b.step("e2e", "Run end-to-end tests (L3, spawn oz in a pty)");
     e2e_step.dependOn(&run_e2e.step);
     // e2e spawns zig-out/bin/oz (path relative to project root, the run cwd)

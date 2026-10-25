@@ -1,0 +1,94 @@
+name: ci
+
+# Machine verification for pull requests and pushes to master. Tag-only
+# release packaging stays in release.yml and is unaffected by this workflow.
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Zig toolchain
+        uses: actions/cache@v4
+        with:
+          path: zig-*.tar.xz
+          key: zig-${{ runner.os }}-${{ runner.arch }}-0.17.0
+
+      # The compiled tree-sitter objects in the local Zig cache are several
+      # GB, so only the small global cache is restored. The 1 GB
+      # .vendor/tree-sitter sources are fetched fresh by bootstrap-deps.sh.
+      - name: Cache Zig global cache
+        uses: actions/cache@v4
+        with:
+          path: .zig-global-cache-verify
+          key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            zig-global-${{ runner.os }}-${{ runner.arch }}-
+
+      # Same official-source-first, retrying install as release.yml (the
+      # setup-zig action's mirrors often 404/502 and it uses deprecated
+      # Node 20). A cached tarball makes this step a no-op.
+      - name: Install Zig 0.17.0
+        env:
+          ZIG_VERSION: 0.17.0
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)   triple="x86_64-linux" ;;
+            Linux-ARM64) triple="aarch64-linux" ;;
+            *) echo "unsupported runner: ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
+          esac
+          file="zig-${triple}-${ZIG_VERSION}.tar.xz"
+          sources=(
+            "https://ziglang.org/download/${ZIG_VERSION}/${file}"
+            "https://pkg.machengine.org/zig/${file}"
+            "https://zig.linus.dev/zig/${file}"
+            "https://zigmirror.hryx.net/zig/${file}"
+          )
+          if [ ! -f "$file" ]; then
+            ok=0
+            for u in "${sources[@]}"; do
+              echo "downloading ${u}"
+              if curl -fL --retry 5 --retry-all-errors --connect-timeout 20 -o "$file" "$u"; then
+                ok=1
+                break
+              fi
+            done
+            [ "$ok" = 1 ] || { echo "all Zig download sources failed"; exit 1; }
+          fi
+          tar -xf "$file"
+          # GITHUB_PATH only affects later steps; export now for the check.
+          export PATH="$PWD/zig-${triple}-${ZIG_VERSION}:$PATH"
+          echo "$PWD/zig-${triple}-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          zig version
+
+      - name: Fetch vendored tree-sitter
+        run: ./.scripts/bootstrap-deps.sh
+
+      - name: Verify
+        run: ./tools/verify.sh
+
+      # Raw logs + verify.json are the authoritative evidence for a run.
+      # Golden mismatches also write actual/diff frames under .verify/golden/.
+      - name: Upload verification artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-${{ github.run_id }}
+          path: .verify/
+          if-no-files-found: warn
+          retention-days: 14
