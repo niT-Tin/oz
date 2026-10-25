@@ -190,19 +190,42 @@ pub fn statusLabel(status: Status) []const u8 {
     };
 }
 
-pub const Role = enum { user, assistant };
+pub const Role = enum { user, assistant, tool };
+
+/// Display/execution state of a tool card. Deliberately a plain enum so the
+/// pure thread model stays independent from the app's worker/metrics.
+pub const ToolStatus = enum { none, running, ok, err, approval_required, unsupported, cancelled };
 
 pub const Message = struct {
     role: Role,
-    /// What the transcript shows (the user's typed prompt).
+    /// What the transcript shows (the user's typed prompt / assistant text /
+    /// a bounded tool-result excerpt).
     text: []u8,
     /// What is sent to the provider. User messages carry the editor
-    /// context; assistant messages mirror `text`.
+    /// context; assistant messages mirror `text`; tool messages carry the
+    /// bounded result content (with an `error: ` prefix when applicable).
     api_text: []u8,
+    /// Assistant tool-call turn: serialized OpenAI `tool_calls` array
+    /// (owned). Null for a plain assistant message.
+    tool_calls_json: ?[]u8 = null,
+    /// Tool result: the `tool_call_id` this answers (owned).
+    tool_call_id: ?[]u8 = null,
+    /// Tool card identity for rendering (owned).
+    tool_name: ?[]u8 = null,
+    tool_args: ?[]u8 = null,
+    tool_status: ToolStatus = .none,
+    /// Executed-call duration (0 for non-executed outcomes).
+    tool_ms: u32 = 0,
+    /// Expanded card view (hint target toggles this).
+    tool_expanded: bool = false,
 
-    fn deinit(self: *Message, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Message, alloc: std.mem.Allocator) void {
         alloc.free(self.text);
         alloc.free(self.api_text);
+        if (self.tool_calls_json) |v| alloc.free(v);
+        if (self.tool_call_id) |v| alloc.free(v);
+        if (self.tool_name) |v| alloc.free(v);
+        if (self.tool_args) |v| alloc.free(v);
     }
 };
 
@@ -349,9 +372,105 @@ pub const Threads = struct {
         const t = &self.items.items[idx];
         if (t.messages.items.len == 0) return;
         const last = &t.messages.items[t.messages.items.len - 1];
-        if (last.role != .assistant or last.text.len != 0) return;
+        if (last.role != .assistant or last.text.len != 0 or last.tool_calls_json != null) return;
         var msg = t.messages.pop().?;
         msg.deinit(alloc);
+    }
+
+    /// Attach a serialized tool-call array to the current assistant turn.
+    /// The streamed text (if any) stays in the same message, so a request
+    /// can carry OpenAI's `assistant {content, tool_calls}` shape exactly.
+    pub fn setAssistantToolCalls(self: *Threads, alloc: std.mem.Allocator, idx: usize, calls_json: []const u8) !void {
+        const t = &self.items.items[idx];
+        if (t.messages.items.len == 0) {
+            try self.appendMessage(alloc, idx, .assistant, "", "");
+        }
+        const last = &t.messages.items[t.messages.items.len - 1];
+        if (last.role != .assistant) {
+            try self.appendMessage(alloc, idx, .assistant, "", "");
+        }
+        const msg = &t.messages.items[t.messages.items.len - 1];
+        const copy = try alloc.dupe(u8, calls_json);
+        if (msg.tool_calls_json) |old| alloc.free(old);
+        msg.tool_calls_json = copy;
+    }
+
+    /// Append a running tool card/result message. `content` may be empty for
+    /// calls that are about to execute in the worker. Returns the message
+    /// index so the worker's result can fill it in place.
+    pub fn appendToolMessage(
+        self: *Threads,
+        alloc: std.mem.Allocator,
+        idx: usize,
+        call_id: []const u8,
+        name: []const u8,
+        args: []const u8,
+        status: ToolStatus,
+        content: []const u8,
+    ) !usize {
+        const t = &self.items.items[idx];
+        const id_copy = try alloc.dupe(u8, call_id);
+        errdefer alloc.free(id_copy);
+        const name_copy = try alloc.dupe(u8, name);
+        errdefer alloc.free(name_copy);
+        const args_copy = try alloc.dupe(u8, args);
+        errdefer alloc.free(args_copy);
+        const text_copy = try alloc.dupe(u8, content);
+        errdefer alloc.free(text_copy);
+        const api_copy = try alloc.dupe(u8, content);
+        errdefer alloc.free(api_copy);
+        try t.messages.append(alloc, .{
+            .role = .tool,
+            .text = text_copy,
+            .api_text = api_copy,
+            .tool_call_id = id_copy,
+            .tool_name = name_copy,
+            .tool_args = args_copy,
+            .tool_status = status,
+        });
+        return t.messages.items.len - 1;
+    }
+
+    /// Replace a tool card's display/API content and status in place. The
+    /// old buffers are freed exactly once; on OOM the card is left untouched
+    /// (the caller reports the failure instead of corrupting the transcript).
+    pub fn setToolOutcome(
+        self: *Threads,
+        alloc: std.mem.Allocator,
+        idx: usize,
+        msg_index: usize,
+        status: ToolStatus,
+        text: []const u8,
+        api_text: []const u8,
+        duration_ms: u32,
+    ) !void {
+        const t = &self.items.items[idx];
+        if (msg_index >= t.messages.items.len) return;
+        const msg = &t.messages.items[msg_index];
+        if (msg.role != .tool) return;
+        const text_copy = try alloc.dupe(u8, text);
+        errdefer alloc.free(text_copy);
+        const api_copy = try alloc.dupe(u8, api_text);
+        errdefer alloc.free(api_copy);
+        alloc.free(msg.text);
+        alloc.free(msg.api_text);
+        msg.text = text_copy;
+        msg.api_text = api_copy;
+        msg.tool_status = status;
+        msg.tool_ms = duration_ms;
+    }
+
+    /// Freeze every running tool card as cancelled (Ctrl+c / thread switch).
+    /// No result may later overwrite them because the app invalidates the
+    /// job generation first.
+    pub fn cancelRunningTools(self: *Threads, idx: usize) void {
+        if (idx >= self.items.items.len) return;
+        for (self.items.items[idx].messages.items) |*m| {
+            if (m.role == .tool and m.tool_status == .running) {
+                m.tool_status = .cancelled;
+                m.tool_ms = 0;
+            }
+        }
     }
 
     /// Append a delta to thread `idx`. Returns false when the thread is not
@@ -806,4 +925,55 @@ test "property: focus transitions never produce an invalid state" {
     // Prompt -> thread list -> prompt round trip.
     try std.testing.expectEqual(Focus.rail, fromPromptTab());
     try std.testing.expectEqual(Focus.prompt, fromRailEnter());
+}
+
+test "threads: tool messages preserve order, ids and owned content" {
+    const alloc = std.testing.allocator;
+    var ts: Threads = .{};
+    defer ts.deinit(alloc);
+    const a = try ts.create(alloc);
+    try ts.appendUser(alloc, a, "read a file", "ctx");
+    try ts.beginAssistant(alloc, a);
+    ts.items.items[a].status = .streaming;
+    try std.testing.expect(try ts.applyDelta(alloc, a, "let me look"));
+    try ts.setAssistantToolCalls(alloc, a, "[{\"id\":\"call_1\"}]");
+    const card = try ts.appendToolMessage(alloc, a, "call_1", "read_file", "a.zig", .running, "");
+    try ts.setToolOutcome(alloc, a, card, .ok, "const x = 1;", "path: a.zig\n---\nconst x = 1;", 7);
+
+    const msgs = ts.items.items[a].messages.items;
+    try std.testing.expectEqual(@as(usize, 3), msgs.len);
+    try std.testing.expectEqualStrings("let me look", msgs[1].text);
+    try std.testing.expectEqualStrings("[{\"id\":\"call_1\"}]", msgs[1].tool_calls_json.?);
+    try std.testing.expectEqual(Role.tool, msgs[2].role);
+    try std.testing.expectEqualStrings("call_1", msgs[2].tool_call_id.?);
+    try std.testing.expectEqualStrings("read_file", msgs[2].tool_name.?);
+    try std.testing.expectEqualStrings("a.zig", msgs[2].tool_args.?);
+    try std.testing.expectEqual(ToolStatus.ok, msgs[2].tool_status);
+    try std.testing.expectEqual(@as(u32, 7), msgs[2].tool_ms);
+    try std.testing.expectEqualStrings("const x = 1;", msgs[2].text);
+    try std.testing.expectEqualStrings("path: a.zig\n---\nconst x = 1;", msgs[2].api_text);
+    try std.testing.expect(!msgs[2].tool_expanded);
+
+    // Failed updates do not corrupt the card.
+    ts.items.items[a].messages.items[2].tool_expanded = true;
+    ts.cancelRunningTools(a);
+    try std.testing.expectEqual(ToolStatus.ok, ts.items.items[a].messages.items[2].tool_status);
+
+    // A placeholder-only assistant with calls is never dropped as "empty".
+    ts.dropEmptyAssistant(alloc, a);
+    try std.testing.expectEqual(@as(usize, 3), ts.items.items[a].messages.items.len);
+}
+
+test "threads: cancelling tool cards is display-only and idempotent" {
+    const alloc = std.testing.allocator;
+    var ts: Threads = .{};
+    defer ts.deinit(alloc);
+    _ = try ts.create(alloc);
+    try ts.appendUser(alloc, 0, "go", "go");
+    _ = try ts.appendToolMessage(alloc, 0, "c1", "grep", "x", .running, "");
+    _ = try ts.appendToolMessage(alloc, 0, "c2", "grep", "y", .ok, "found");
+    ts.cancelRunningTools(0);
+    ts.cancelRunningTools(0);
+    try std.testing.expectEqual(ToolStatus.cancelled, ts.items.items[0].messages.items[1].tool_status);
+    try std.testing.expectEqual(ToolStatus.ok, ts.items.items[0].messages.items[2].tool_status);
 }
