@@ -1262,7 +1262,7 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 
 - M3b2 只实现 `apply_patch` 的人工审批；`terminal`/未知工具仍不执行（本地 `unsupported`）。不含 terminal 沙箱、审批队列/持久化、多文件 patch、add/delete/rename/binary/mode 变更。
 - `src/app/ai.zig:aiHandleToolCalls` 把 `edit_file` 与 `apply_patch` 都分流到 App 层 stage（`agent_edit_ui.stageToolCall` / `stagePatchToolCall`），executor/worker 仍只看到只读调用；任何工具执行路径都没有写 syscall。
-- `agent_patch.parse` 只接受**单文件 unified diff**：`diff --git`/`index`/`---`/`+++`/`@@` 头可选，但必须至少有一个路径来源；支持同一文件多个 hunk、省略 count（默认 1）、`\ No newline at end of file`、以及后续 hunk 的行号漂移。Markdown 代码围栏与 CRLF 传输会被规范化。
+- `agent_patch.parse` 只接受**单文件 unified diff**：`diff --git`/`index`/`---`/`+++`/`@@` 头可选，但必须至少有一个路径来源；支持同一文件多个 hunk、省略 count（默认 1）、`\ No newline at end of file`、以及后续 hunk 的行号漂移。Markdown 代码围栏与 CRLF 传输会被规范化。`a/`/`b/` 前缀只在 old/new 拼写确实构成 git 前缀对时才剥离；`--no-prefix` 下真实路径以 `a/`/`b/` 开头的文件不会被误改。
 - 明确拒绝（typed error，真实 error card，不 stage、不部分应用）：多文件、增删文件（`/dev/null`/`new file mode`/`deleted file mode`）、binary、rename/copy、mode 变更、malformed header/hunk/counts、context/removal 不匹配、hunk 越界或乱序、`new_start` 与实际应用结果不一致、路径 absolute/`..`/NUL/符号链接逃逸/越出 captured root、文件缺失、patch >256 KiB、>256 hunks、>16K hunk 行、结果 >256 KiB。
 - 路径与目标复用 M3b1 的 confinement：`tool_exec.normalizeWorkspacePath` + `isWithin`，canonical path 必须位于**当轮捕获**的 workspace root；stage 只读，优先使用已打开 buffer（含未保存修改），否则读盘（≤256 KiB）。
 - `agent_patch.apply` 以旧全文为基准，按顺序复制未变行、校验 context/removal、应用全部 hunk，构造新全文；任一 hunk 不匹配即整体失败，绝不部分应用。
@@ -1299,6 +1299,6 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 
 **验证**
 
-- `zig build test`：490/490 通过（新增 16 个 `agent_patch`/`agent_edit` 纯模型单测）。
+- `zig build test`：491/491 通过（新增 17 个 `agent_patch`/`agent_edit` 纯模型单测）。
 - `zig build e2e`：175/175 通过（新增 5 个 M3b2 pty 测试；scenario matrix 新增 `ai patch approval 120x30`）。
 - 无 golden 变更（approval diff/卡片不进入固定 golden 帧）。

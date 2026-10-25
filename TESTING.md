@@ -17,7 +17,7 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-Current counts at the M3b2 implementation commit: **490 unit tests** and
+Current counts at the M3b2 implementation commit: **491 unit tests** and
 **175 e2e tests**. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
 `.verify/verify.json` (schema version 1, git commit/dirty flag, exact command
 strings, timestamps, exit codes, log SHA-256s, parsed pass/fail counts). It
@@ -266,7 +266,7 @@ Unit tests pin the pure half in `src/app/agent_patch.zig` and
 omitted counts, zero-count insert/delete, `\ No newline at end of file` on
 both sides, malformed headers/hunks/counts, context and newline mismatches,
 out-of-range/overlapping hunks, multi-file/add-delete/binary/rename/mode
-rejection, absolute/`..`/NUL/mismatched paths, patch/hunk/line caps, bounded
+rejection, absolute/`..`/NUL/mismatched paths, `a/`/`b/` path-prefix preservation for no-prefix diffs, patch/hunk/line caps, bounded
 and truthful preview truncation, empty-file patches, and the patch pending's
 whole-file span plus `verify`/`verifyPatch` staleness.
 

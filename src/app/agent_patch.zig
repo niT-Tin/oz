@@ -406,6 +406,36 @@ fn stripDiffPrefix(path: []const u8) []const u8 {
     return path;
 }
 
+const FilePair = struct {
+    old: []const u8,
+    new: []const u8,
+    /// Whether the old/new header paths carry their respective git prefixes.
+    old_strip: bool,
+    new_strip: bool,
+};
+
+/// Decide once whether old/new path spellings use git's `a/`+`b/` prefixes.
+/// Identical spellings stay untouched, so a real file named `a/notes.txt`
+/// survives a `--no-prefix` diff; only differing `a/`+`b/` (or same-side)
+/// spellings are stripped. Mixed/renamed spellings are rejected.
+fn splitFilePair(old_raw: []const u8, new_raw: []const u8) ParseError!FilePair {
+    if (std.mem.eql(u8, old_raw, new_raw)) {
+        return .{ .old = old_raw, .new = new_raw, .old_strip = false, .new_strip = false };
+    }
+    const old_a = std.mem.startsWith(u8, old_raw, "a/");
+    const old_b = std.mem.startsWith(u8, old_raw, "b/");
+    const new_a = std.mem.startsWith(u8, new_raw, "a/");
+    const new_b = std.mem.startsWith(u8, new_raw, "b/");
+    if ((old_a and new_b) or (old_a and new_a) or (old_b and new_b)) {
+        const old = old_raw[2..];
+        const new = new_raw[2..];
+        if (std.mem.eql(u8, old, new)) {
+            return .{ .old = old, .new = new, .old_strip = true, .new_strip = true };
+        }
+    }
+    return error.RenameOrCopy;
+}
+
 fn mapPathError(e: tool_exec.WorkspacePathError) ParseError {
     return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
@@ -546,35 +576,25 @@ pub fn parse(alloc: std.mem.Allocator, input: []const u8) ParseError!Patch {
     if (git_old) |go| {
         const gn = git_new.?;
         if (isDevNull(go) or isDevNull(gn)) return error.AddDeleteFile;
-        const base_old = stripDiffPrefix(go);
-        const base_new = stripDiffPrefix(gn);
-        if (!std.mem.eql(u8, base_old, base_new)) return error.RenameOrCopy;
+        const pair = try splitFilePair(go, gn);
         if (hdr_old) |ho| {
             const hn = hdr_new orelse return error.MalformedHeader;
             if (isDevNull(ho) or isDevNull(hn)) return error.AddDeleteFile;
-            const h_old = stripDiffPrefix(ho);
-            const h_new = stripDiffPrefix(hn);
-            if (!std.mem.eql(u8, h_old, base_old) or !std.mem.eql(u8, h_new, base_new)) {
+            const h_old = if (pair.old_strip) stripDiffPrefix(ho) else ho;
+            const h_new = if (pair.new_strip) stripDiffPrefix(hn) else hn;
+            if (!std.mem.eql(u8, h_old, pair.old) or !std.mem.eql(u8, h_new, pair.new)) {
                 return error.PathMismatch;
             }
         } else if (hdr_new != null) {
             return error.MalformedHeader;
         }
-        source = base_old;
+        source = pair.old;
     } else {
         const ho = hdr_old orelse return error.MissingPath;
         const hn = hdr_new orelse return error.MalformedHeader;
         if (isDevNull(ho) or isDevNull(hn)) return error.AddDeleteFile;
-        var candidate_old = ho;
-        var candidate_new = hn;
-        if ((std.mem.startsWith(u8, ho, "a/") and std.mem.startsWith(u8, hn, "b/")) or
-            (std.mem.startsWith(u8, ho, "b/") and std.mem.startsWith(u8, hn, "b/")))
-        {
-            candidate_old = ho[2..];
-            candidate_new = hn[2..];
-        }
-        if (!std.mem.eql(u8, candidate_old, candidate_new)) return error.RenameOrCopy;
-        source = candidate_old;
+        const pair = try splitFilePair(ho, hn);
+        source = pair.old;
     }
 
     const normalized = tool_exec.normalizeWorkspacePath(alloc, source) catch |e| return mapPathError(e);
@@ -1218,6 +1238,51 @@ test "agent_patch: apply_patch arguments are validated" {
     try testing.expectError(error.PatchNotString, parseArgs(alloc, "{\"patch\":1}"));
     try testing.expectError(error.EmptyPatch, parseArgs(alloc, "{\"patch\":\"\"}"));
     try testing.expectError(error.MalformedArguments, parseArgs(alloc, "not json"));
+}
+
+test "agent_patch: paths beginning with a/ or b/ are not mis-stripped" {
+    const alloc = testing.allocator;
+    // Plain diff of a file literally named "a/notes.txt": identical spellings
+    // mean no prefix stripping.
+    const plain =
+        \\--- a/notes.txt
+        \\+++ a/notes.txt
+        \\@@ -1 +1 @@
+        \\-before
+        \\+after
+        \\
+    ;
+    var patch = try parse(alloc, plain);
+    defer patch.deinit(alloc);
+    try testing.expectEqualStrings("a/notes.txt", patch.path);
+
+    // git --no-prefix output for the same file.
+    const no_prefix =
+        \\diff --git a/notes.txt a/notes.txt
+        \\--- a/notes.txt
+        \\+++ a/notes.txt
+        \\@@ -1 +1 @@
+        \\-before
+        \\+after
+        \\
+    ;
+    var patch2 = try parse(alloc, no_prefix);
+    defer patch2.deinit(alloc);
+    try testing.expectEqualStrings("a/notes.txt", patch2.path);
+
+    // Normal git prefixes for a file whose real path is "a/notes.txt".
+    const prefixed =
+        \\diff --git a/a/notes.txt b/a/notes.txt
+        \\--- a/a/notes.txt
+        \\+++ b/a/notes.txt
+        \\@@ -1 +1 @@
+        \\-before
+        \\+after
+        \\
+    ;
+    var patch3 = try parse(alloc, prefixed);
+    defer patch3.deinit(alloc);
+    try testing.expectEqualStrings("a/notes.txt", patch3.path);
 }
 
 test "agent_patch: fenced and no-prefix single-file patches parse" {
