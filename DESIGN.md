@@ -1194,10 +1194,10 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 - `src/app/ai.zig`：Session sidecars、request/follow-up、drain、cards/tools tab/chart cache、hints/status。
 - `src/app/tool_job.zig`：后台 read-only worker。
 - `src/app/render.zig`、`src/app.zig`、`src/app/hints.zig`、`src/app/hint_ui.zig`：run-loop drain、alias、hint action/wiring。
-- `test/e2e.zig` + TESTING.md：8 个 M3a pty 测试、`@tools` scenario、mock 轮次 fixture。
+- `test/e2e.zig` + TESTING.md：9 个 M3a pty 测试、`@tools` scenario、mock 轮次 fixture。
 
 **验证**
 
 - `zig build test`：466/466 通过（原 449 + 17 个 M3a 单测，未改动既有断言）。
-- `zig build e2e`：164/164 通过（原 156 + 8 个 M3a pty 测试；scenario matrix 新增 `ai tools read 120x30`）。
+- `zig build e2e`：165/165 通过（原 156 + 9 个 M3a pty 测试；scenario matrix 新增 `ai tools read 120x30`）。
 - 无 golden 变更（tool cards/metrics 不进入固定 golden 帧）；`tools arrive in M3` 的旧空状态测试更新为 `no tool calls yet`（产品要求变化，断言不回退）。

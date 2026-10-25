@@ -18,7 +18,7 @@ zig build e2e -Dtest-filter="golden"
 ```
 
 Current counts at the M3a implementation commit: **466 unit tests** and
-**164 e2e tests**. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
+**165 e2e tests**. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
 `.verify/verify.json` (schema version 1, git commit/dirty flag, exact command
 strings, timestamps, exit codes, log SHA-256s, parsed pass/fail counts). It
 runs every command even after a failure and exits non-zero if any command
@@ -154,6 +154,10 @@ The M3a pty tests (`test/e2e.zig`, filter `tools:`) cover:
 - four tool rounds: execution stops, the transcript note names the bound, the
   fifth request is the final **no-tools** request (no `tools`/`tool_choice`),
   and no sixth request exists; Tools tab `calls 4`;
+- a nine-call single batch: only the first eight execute, the ninth is a real
+  `unsupported` tool result (`tool call limit (8) reached; not executed`),
+  the follow-up is the final no-tools request, and Tools tab shows
+  `calls 9` / `ok 8 · err 0 · unsup 1`;
 - Ctrl+c during the follow-up stream: `cancelled` + frozen transcript, no
   `request-3.json`, and a second thread's Tools tab is still
   `no tool calls yet` (no cross-thread cards/metrics);
@@ -168,6 +172,14 @@ The unit tests pin the bounded loop admission (`planBatch`), limit notes,
 card status/argument/excerpt formatting, metrics average/max/ring/revision,
 chart cache-key invalidation, `assistant tool_calls`/tool-result wire JSON, and
 the transcript message order used by the follow-up request.
+
+Known gaps at M3a (intentional, documented in DESIGN §20.8): metrics are
+session/per-thread only (no cross-session persistence, no p95); calls
+cancelled before their worker result is applied are not counted; writes and
+approval buttons are M3b; tool-card expansion is hint-only (no mouse/card
+cursor); the chart legend lists tool names but has no per-series average
+annotation. The `stream-<n>.sse` seam is test-only and never used against a
+real provider.
 
 ### Property tests
 
