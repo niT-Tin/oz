@@ -1034,6 +1034,550 @@ fn gridWaitFor(sess: *Session, grid: *Grid, needle: []const u8, timeout_ms: i32)
     try std.testing.expect(grid.contains(needle));
 }
 
+// ---- feat/mouse: pty mouse-sequence helpers (SGR 1006, CELL coordinates) ----
+//
+// vaxis parses SGR mouse reports as 0-based cells; the wire format is
+// 1-based. `press` uses 'M', release 'm'; wheel is a press with button
+// 64 (up) / 65 (down). A real click is press+release.
+fn sendMouseButton(sess: *Session, col: usize, row: usize, button: u32, release: bool) !void {
+    var buf: [64]u8 = undefined;
+    const coord_col = col + 1;
+    const coord_row = row + 1;
+    const seq = if (release)
+        try std.fmt.bufPrint(&buf, "\x1b[<{d};{d};{d}m", .{ button, coord_col, coord_row })
+    else
+        try std.fmt.bufPrint(&buf, "\x1b[<{d};{d};{d}M", .{ button, coord_col, coord_row });
+    try sess.send(seq);
+}
+
+fn mouseClickAt(sess: *Session, col: usize, row: usize) !void {
+    try sendMouseButton(sess, col, row, 0, false);
+    try sendMouseButton(sess, col, row, 0, true);
+}
+
+fn mouseWheelAt(sess: *Session, col: usize, row: usize, direction: i8) !void {
+    const button: u32 = if (direction < 0) 64 else 65;
+    try sendMouseButton(sess, col, row, button, false);
+}
+
+/// Mouse-enable / mouse-reset sequences vaxis emits (ctlseqs.zig). Testing
+/// the raw bytes proves the terminal is restored after quit.
+const mouse_enable_seq = "\x1b[?1002;1003;1004;1006h";
+const mouse_reset_seq = "\x1b[?1002;1003;1004;1006;1016l";
+
+fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, i, needle)) |pos| {
+        n += 1;
+        i = pos + needle.len;
+    }
+    return n;
+}
+
+/// Like gridWaitFor but scoped to one screen row (the rail header names a
+/// thread that also appears in the thread list, so row identity matters).
+fn gridWaitRowContains(sess: *Session, grid: *Grid, row: usize, needle: []const u8, timeout_ms: i32) !void {
+    var waited: i32 = 0;
+    while (waited < timeout_ms) : (waited += 50) {
+        if (row < grid.rows and aiRowContains(grid, row, needle)) return;
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
+        if (n > 0) {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+    }
+    if (row >= grid.rows or !aiRowContains(grid, row, needle)) {
+        std.debug.print("row {d} missing '{s}':\n", .{ row, needle });
+        grid.dump();
+    }
+    try std.testing.expect(row < grid.rows and aiRowContains(grid, row, needle));
+}
+
+/// Buffer-tab body width from tabstrip.plan (fixed chrome 9, min 20,
+/// max 26) for an ASCII basename.
+fn tabBodyWidth(name_cells: usize) usize {
+    const want = 9 + name_cells;
+    return @min(@max(want, 20), 26);
+}
+
+test "mouse: buffer tab click switches, close × closes, at 80/100/120" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    inline for ([_]u16{ 80, 100, 120 }) |cols| {
+        var a_buf: [160:0]u8 = undefined;
+        const path_a = try bufPrintZ(&a_buf, "/tmp/ozmouse_{d}_{d}_a.txt", .{ linux.getpid(), tmp_counter });
+        var b_buf: [160:0]u8 = undefined;
+        const path_b = try bufPrintZ(&b_buf, "/tmp/ozmouse_{d}_{d}_b.txt", .{ linux.getpid(), tmp_counter });
+        tmp_counter += 1;
+        defer std.Io.Dir.cwd().deleteFile(io, path_a) catch {};
+        defer std.Io.Dir.cwd().deleteFile(io, path_b) catch {};
+        {
+            const fa = try std.Io.Dir.cwd().createFile(io, path_a, .{ .truncate = true });
+            defer fa.close(io);
+            try fa.writeStreamingAll(io, "MOUSE_A_MARK\n");
+            const fb = try std.Io.Dir.cwd().createFile(io, path_b, .{ .truncate = true });
+            defer fb.close(io);
+            try fb.writeStreamingAll(io, "MOUSE_B_MARK\n");
+        }
+
+        var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, path_a }, null, 24, cols);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(alloc, 24, cols);
+        defer grid.deinit(alloc);
+        try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+        try gridWaitFor(&sess, &grid, "MOUSE_A_MARK", 5000);
+
+        // Second buffer: two tabs. Geometry comes from tabstrip.plan:
+        // body = clamp(9 fixed cells + filename cells, 20, 26), next tab one
+        // separator cell later, × at body_end-3.
+        var cmd_buf: [256]u8 = undefined;
+        const cmd = try std.fmt.bufPrint(&cmd_buf, ":e {s}\r", .{path_b});
+        try sess.send(cmd);
+        try gridWaitFor(&sess, &grid, "MOUSE_B_MARK", 5000);
+        try std.testing.expect(!grid.contains("MOUSE_A_MARK"));
+
+        const w_a = tabBodyWidth(std.fs.path.basename(path_a).len);
+        const x_b = w_a + 1;
+        const w_b = tabBodyWidth(std.fs.path.basename(path_b).len);
+
+        // Click the first tab body → buffer A.
+        try mouseClickAt(&sess, 5, 0);
+        try gridWaitFor(&sess, &grid, "MOUSE_A_MARK", 5000);
+        // Click the second tab body → buffer B.
+        try mouseClickAt(&sess, x_b + 5, 0);
+        try gridWaitFor(&sess, &grid, "MOUSE_B_MARK", 5000);
+        try frame.expectNoHorizontalOverflow(&grid, cols);
+
+        // Dirty B, then close it through the tab's × (the SAME closeBufferAt
+        // path as :bd).
+        try sess.send("iZ");
+        std.Io.sleep(io, .fromMilliseconds(250), .real) catch {};
+        try sess.send("\x1b");
+        std.Io.sleep(io, .fromMilliseconds(250), .real) catch {};
+        try gridWaitFor(&sess, &grid, "\u{25cf}", 3000);
+        try mouseClickAt(&sess, x_b + w_b - 3, 0);
+        try gridWaitFor(&sess, &grid, "MOUSE_A_MARK", 5000);
+        try std.testing.expect(!grid.contains("MOUSE_B_MARK"));
+        try std.testing.expect(!grid.contains("\u{25cf}"));
+        try frame.expectNoHorizontalOverflow(&grid, cols);
+
+        const exit_code = try sess.commandAndWaitExit(":q!\r");
+        try std.testing.expectEqual(@as(u32, 0), exit_code);
+    }
+}
+
+test "mouse: navigator tabs, filetree row, notes row, wheel move/clamp" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/ozmouse_nav_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var docs_dir_buf: [200]u8 = undefined;
+    const docs_dir = try std.fmt.bufPrint(&docs_dir_buf, "{s}/docs", .{root});
+    try std.Io.Dir.cwd().createDirPath(io, docs_dir);
+    var src_dir_buf: [200]u8 = undefined;
+    const src_dir = try std.fmt.bufPrint(&src_dir_buf, "{s}/src", .{root});
+    try std.Io.Dir.cwd().createDirPath(io, src_dir);
+    var name_buf: [200:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "{s}/root.txt", .{root});
+    try aiWriteFile(io, root, "root.txt", "MOUSE_NAV_MARK\n");
+    try aiWriteFile(io, docs_dir, "workspace-plan.md", "# plan\n");
+    try aiWriteFile(io, src_dir, "main.zig", "// main\n");
+
+    var notes_buf: [128]u8 = undefined;
+    const notes_dir = try notesTestDir(io, &notes_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, notes_dir) catch {};
+    try aiWriteFile(io, notes_dir, "alpha.md", "# Alpha note\n\nsnippet body\n");
+    const notes_env = try std.fmt.allocPrint(alloc, "OZ_NOTES_DIR={s}", .{notes_dir});
+    defer alloc.free(notes_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, name }, &.{notes_env}, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "docs", 5000);
+    try gridWaitFor(&sess, &grid, "root.txt", 5000);
+
+    // Click the notes tab, then the files tab: both tabs are hint-geometry
+    // targets registered during the mouse frame.
+    try mouseClickAt(&sess, navTabCol(1) + 1, navTabsRow());
+    try gridWaitFor(&sess, &grid, "Alpha note", 5000);
+    try mouseClickAt(&sess, navTabCol(0) + 1, navTabsRow());
+    try gridWaitFor(&sess, &grid, "docs", 5000);
+
+    // Row 3 is docs/ (dirs first). Click expands exactly like Enter; click
+    // again collapses.
+    try mouseClickAt(&sess, 5, 3);
+    try gridWaitFor(&sess, &grid, "workspace-plan", 5000);
+    try mouseClickAt(&sess, 5, 3);
+    try gridWaitGone(&sess, &grid, "workspace-plan", 5000);
+
+    // Wheel down selects the next row (src); clamp is proven by scrolling far
+    // up afterwards and toggling the row that must be selected.
+    try mouseWheelAt(&sess, 5, 3, 1);
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "main.zig", 5000);
+    for (0..20) |_| try mouseWheelAt(&sess, 5, 3, -1);
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "workspace-plan", 5000);
+
+    // Notes row click opens the note in the editor (its buffer tab appears;
+    // the editor body owns "# Alpha note", the list only shows the title).
+    try mouseClickAt(&sess, navTabCol(1) + 1, navTabsRow());
+    try gridWaitFor(&sess, &grid, "Alpha note", 5000);
+    try mouseClickAt(&sess, 5, 3);
+    try gridWaitFor(&sess, &grid, "# Alpha note", 5000);
+    try std.testing.expect(aiRowContains(&grid, 0, "alpha.md"));
+    try std.testing.expect(grid.contains("NORMAL"));
+    try frame.expectNoHorizontalOverflow(&grid, 120);
+
+    try aiQuit(&sess);
+}
+
+test "mouse: split pane focuses and places cursor; separator/status are no-ops; wheel clamps" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/ozmouse_{d}_{d}split.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9");
+    }
+
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, null, 30, 100);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 100);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "line1", 5000);
+
+    // :vs — vertical split (left 0..49, separator col 50, right 50..99).
+    try sess.send(":vs\r");
+    var waited: i32 = 0;
+    while (waited < 5000) : (waited += 100) {
+        const row = grid.rowText(2);
+        const first = std.mem.indexOf(u8, row, "line1");
+        const second = if (first) |f| std.mem.indexOfPos(u8, row, f + 1, "line1") else null;
+        if (first != null and second != null) break;
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) continue;
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(2), "│") != null);
+
+    // Left pane click on line 3, text cell 2 (gutter=2 for 9 lines).
+    try mouseClickAt(&sess, 4, 4);
+    try gridWaitFor(&sess, &grid, "line 3/9 col 2", 5000);
+
+    // Right pane click on line 5, text cell 1.
+    try mouseClickAt(&sess, 53, 6);
+    try gridWaitFor(&sess, &grid, "line 5/9 col 1", 5000);
+
+    // Clicking the separator must NOT resize or move the cursor (v1 no-op).
+    try mouseClickAt(&sess, 50, 6);
+    std.Io.sleep(io, .fromMilliseconds(150), .real) catch {};
+    try std.testing.expect(grid.contains("line 5/9 col 1"));
+
+    // Wheel over the right pane: 3 lines per notch, clamped at the file end
+    // and the file start without overflow.
+    try mouseWheelAt(&sess, 53, 6, 1);
+    try gridWaitFor(&sess, &grid, "line 8/9 col 1", 5000);
+    try mouseWheelAt(&sess, 53, 6, 1);
+    try gridWaitFor(&sess, &grid, "line 9/9 col 1", 5000);
+    for (0..5) |_| try mouseWheelAt(&sess, 53, 6, -1);
+    try gridWaitFor(&sess, &grid, "line 1/9 col 1", 5000);
+
+    // Cursor placement: click line 2 cell 3 in the LEFT pane, insert Q at the
+    // mapped byte (line2: l/i/n/e/2 → insert before 'e').
+    try mouseClickAt(&sess, 5, 3);
+    try gridWaitFor(&sess, &grid, "line 2/9 col 3", 5000);
+    try sess.send("iQ");
+    std.Io.sleep(io, .fromMilliseconds(150), .real) catch {};
+    try sess.send("\x1b");
+    std.Io.sleep(io, .fromMilliseconds(250), .real) catch {};
+    try gridWaitFor(&sess, &grid, "linQe2", 5000);
+
+    // Right pane click line 5 cell 1 → insert R after 'l'.
+    try mouseClickAt(&sess, 53, 6);
+    try gridWaitFor(&sess, &grid, "line 5/9 col 1", 5000);
+    try sess.send("iR");
+    std.Io.sleep(io, .fromMilliseconds(150), .real) catch {};
+    try sess.send("\x1b");
+    std.Io.sleep(io, .fromMilliseconds(250), .real) catch {};
+    try gridWaitFor(&sess, &grid, "lRine5", 5000);
+
+    // Clicking the status band (no target) is a no-op.
+    try mouseClickAt(&sess, 80, 29);
+    std.Io.sleep(io, .fromMilliseconds(150), .real) catch {};
+    // The status band has no target: no mode/cursor/layout change.
+    try std.testing.expect(grid.contains("line 5/9"));
+    try std.testing.expect(grid.contains("NORMAL"));
+    try frame.expectNoHorizontalOverflow(&grid, 100);
+
+    // Two split windows: :q! closes one, :qa! quits the editor.
+    const exit_code = try sess.commandAndWaitExit(":qa!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "mouse: AI thread row attach, workbox tabs, prompt focus, transcript wheel" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/ozmouse_{d}_{d}ai.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "MOUSE_AI_MARK\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var reply = std.ArrayList(u8).empty;
+    defer reply.deinit(alloc);
+    for (0..30) |i| {
+        var line_buf: [32]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "L{d:0>2} reply", .{i});
+        try reply.appendSlice(alloc, line);
+        if (i + 1 < 30) try reply.appendSlice(alloc, "\\n");
+    }
+    const stream = try aiTextSse(alloc, reply.items);
+    defer alloc.free(stream);
+    try aiWriteFile(io, dir, "stream-1.sse", stream);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+
+    const rail_col = aiRailCol(120);
+    try aiEnterRail(&sess, &grid);
+    // From the prompt, Tab returns to the thread list; `n` then creates
+    // thread 2 (the prompt would otherwise swallow the key as text).
+    try sess.send("\t");
+    try sess.send("n");
+    try gridWaitFor(&sess, &grid, "thread 2", 5000);
+    try gridWaitRowContains(&sess, &grid, aiWorkboxHeaderRow(30), "thread 2", 3000);
+
+    // Click thread 1 in the rail's thread list (row 2) → attach it.
+    try mouseClickAt(&sess, rail_col + 4, 2);
+    try gridWaitRowContains(&sess, &grid, aiWorkboxHeaderRow(30), "thread 1", 5000);
+
+    // Workbox tab clicks: tools then chat.
+    const tabs_row = aiTabsRow(30);
+    const tools_col = aiCellIndexOf(&grid, tabs_row, "tools").?;
+    try mouseClickAt(&sess, tools_col + 1, tabs_row);
+    try gridWaitFor(&sess, &grid, "no tool calls yet", 5000);
+    const chat_col = aiCellIndexOf(&grid, tabs_row, "chat").?;
+    try mouseClickAt(&sess, chat_col + 1, tabs_row);
+    try gridWaitFor(&sess, &grid, "❯ ", 5000);
+
+    // Prompt row click focuses the input; typing streams the long reply.
+    try mouseClickAt(&sess, rail_col + 6, aiPromptRow(30));
+    try sess.send("hello");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "L29 reply", 10000);
+    try gridWaitFor(&sess, &grid, "idle", 5000);
+    try frame.expectNoHorizontalOverflow(&grid, 120);
+
+    // Wheel over the transcript (3 rows/notch): scroll up to the first line.
+    for (0..6) |_| try mouseWheelAt(&sess, rail_col + 5, aiTabsSepRow(30) + 1, -1);
+    try gridWaitFor(&sess, &grid, "L00 reply", 5000);
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // Leave the prompt focus (Esc) before typing the quit command.
+    try sess.send("\x1b");
+    std.Io.sleep(io, .fromMilliseconds(250), .real) catch {};
+    try aiQuit(&sess);
+}
+
+test "mouse: approve/reject buttons act on the real pending edit and keep disk untouched" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/ozmouse_appr_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/appr.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "ALPHA old marker\nsecond line\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_mouse_a", .name = "edit_file", .args = "{\"path\":\"appr.txt\",\"old_string\":\"old marker\",\"new_string\":\"NEW marker\"}" },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "FIRST staged follow-up");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const round3 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_mouse_b", .name = "edit_file", .args = "{\"path\":\"appr.txt\",\"old_string\":\"second line\",\"new_string\":\"SECOND NEW\"}" },
+    });
+    defer alloc.free(round3);
+    try aiWriteFile(io, dir, "stream-3.sse", round3);
+    const round4 = try aiTextSse(alloc, "SECOND staged follow-up");
+    defer alloc.free(round4);
+    try aiWriteFile(io, dir, "stream-4.sse", round4);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "ALPHA old marker", 5000);
+
+    const rail_col = aiRailCol(120);
+    try aiEnterRail(&sess, &grid);
+    try sess.send("edit the marker");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "changes 1", 10000);
+    try gridWaitFor(&sess, &grid, "approve", 5000);
+
+    // Click the Changes tab (real workbox tab target), then the Approve
+    // button's visible label ("approve" is inside the expanded target).
+    const tabs_row = aiTabsRow(30);
+    try mouseClickAt(&sess, aiCellIndexOf(&grid, tabs_row, "changes").? + 1, tabs_row);
+    try gridWaitFor(&sess, &grid, "[a] approve", 5000);
+    const approve_cell = aiFindCell(&grid, "[a] approve") orelse return error.TestUnexpectedResult;
+    try mouseClickAt(&sess, approve_cell.col + 4, approve_cell.row);
+    try gridWaitFor(&sess, &grid, "changes 0", 5000);
+    try gridWaitFor(&sess, &grid, "ALPHA NEW marker", 5000);
+    try std.testing.expect(!grid.contains("approval required"));
+    const disk_before = try absFileText(io, alloc, editor);
+    defer alloc.free(disk_before);
+    try std.testing.expectEqualStrings("ALPHA old marker\nsecond line\n", disk_before);
+
+    // Stage a second edit through the prompt (mouse focus). The prompt only
+    // exists on the Chat tab, so click Chat first, then the prompt row.
+    const tabs_row2 = aiTabsRow(30);
+    try mouseClickAt(&sess, aiCellIndexOf(&grid, tabs_row2, "chat").? + 1, tabs_row2);
+    try gridWaitFor(&sess, &grid, "❯ ", 5000);
+    try mouseClickAt(&sess, rail_col + 6, aiPromptRow(30));
+    try sess.send("edit the second line");
+    std.Io.sleep(io, .fromMilliseconds(150), .real) catch {};
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "changes 1", 10000);
+    try gridWaitFor(&sess, &grid, "[a] approve", 5000);
+    try mouseClickAt(&sess, aiCellIndexOf(&grid, tabs_row2, "changes").? + 1, tabs_row2);
+    try gridWaitFor(&sess, &grid, "[r] reject", 5000);
+    const reject_cell = aiFindCell(&grid, "[r] reject") orelse return error.TestUnexpectedResult;
+    try mouseClickAt(&sess, reject_cell.col + 4, reject_cell.row);
+    try gridWaitFor(&sess, &grid, "changes 0", 5000);
+    std.Io.sleep(io, .fromMilliseconds(250), .real) catch {};
+    try std.testing.expect(grid.contains("ALPHA NEW marker"));
+    try std.testing.expect(!grid.contains("SECOND NEW"));
+    try frame.expectNoHorizontalOverflow(&grid, 120);
+
+    const disk_after = try absFileText(io, alloc, editor);
+    defer alloc.free(disk_after);
+    try std.testing.expectEqualStrings("ALPHA old marker\nsecond line\n", disk_after);
+
+    try sess.send("\x1b");
+    std.Io.sleep(io, .fromMilliseconds(250), .real) catch {};
+    try aiQuit(&sess);
+}
+
+test "mouse: reporting lifecycle restores the terminal; Alt+r stays clean; no hint labels" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/ozmouse_{d}_{d}life.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "MOUSE_LIFE_MARK\n");
+    }
+
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, null, 24, 80);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "MOUSE_LIFE_MARK", 5000);
+
+    // Mouse reporting is enabled exactly once at startup; no labels are
+    // drawn outside hint mode.
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(sess.captured(), mouse_enable_seq));
+    try std.testing.expect(!grid.contains("HINTS"));
+
+    // Regression from 1b47588: Alt+r opens the embedded terminal with no
+    // vaxis diagnostic spam while mouse reporting is active.
+    try sess.send("\x1br");
+    try gridWaitFor(&sess, &grid, "$", 8000);
+    try std.testing.expect(!grid.contains("warning("));
+    try std.testing.expect(!grid.contains("info("));
+    try std.testing.expect(!grid.contains("couldn't write uri"));
+
+    // Esc returns keyboard focus to the editor; clicking the visible
+    // terminal again focuses it (click target is the overlay rect).
+    try sess.send("\x1b");
+    std.Io.sleep(io, .fromMilliseconds(250), .real) catch {};
+    try mouseClickAt(&sess, 20, 10);
+    try sess.send("echo MOUSE_TERM_FOCUS\r");
+    try gridWaitFor(&sess, &grid, "MOUSE_TERM_FOCUS", 8000);
+
+    // Wheel over the focused terminal is not stolen by the editor: the
+    // cursor/status stay where they were (no scroll behind the overlay).
+    try mouseWheelAt(&sess, 20, 10, 1);
+    try mouseWheelAt(&sess, 20, 10, -1);
+    std.Io.sleep(io, .fromMilliseconds(150), .real) catch {};
+    try std.testing.expect(grid.contains("line 1/2"));
+    try sess.send("\x1b");
+    std.Io.sleep(io, .fromMilliseconds(250), .real) catch {};
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    // Cleanup: exactly one reset, after the enable, and the alt screen is
+    // left. No subsequent enable means no raw mouse reporting is leaked.
+    const captured = sess.captured();
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(captured, mouse_reset_seq));
+    const enable_pos = std.mem.lastIndexOf(u8, captured, mouse_enable_seq) orelse return error.TestUnexpectedResult;
+    const reset_pos = std.mem.lastIndexOf(u8, captured, mouse_reset_seq) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(reset_pos > enable_pos);
+    try std.testing.expect(std.mem.indexOfPos(u8, captured, reset_pos, mouse_enable_seq) == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured, "\x1b[?1049l") != null);
+}
+
 test "smoke: spawn oz, render a file, quit cleanly" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -18806,7 +19350,7 @@ const scenario_matrix = [_]Scenario{
     },
     .{
         .name = "hints 120x30 dock",
-        .tags = &.{ "@layout", "@ai", "@hints", "@docked", "@120col" },
+        .tags = &.{ "@layout", "@ai", "@hints", "@mouse", "@docked", "@120col" },
         .rows = 30,
         .cols = 120,
         .filetree = true,
@@ -18858,7 +19402,7 @@ const scenario_matrix = [_]Scenario{
     },
     .{
         .name = "ai approval 120x30",
-        .tags = &.{ "@layout", "@ai", "@tools", "@approval", "@120col" },
+        .tags = &.{ "@layout", "@ai", "@tools", "@approval", "@mouse", "@120col" },
         .rows = 30,
         .cols = 120,
         .setup = .ai_mock,
@@ -18937,7 +19481,7 @@ const scenario_matrix = [_]Scenario{
 /// feature adds its tag here and to at least one Scenario; the coverage test
 /// fails with a clear message otherwise (instead of silently dropping it).
 const required_scenario_tags = [_][]const u8{
-    "@layout",   "@ai",    "@filetree", "@stream", "@hints",  "@navigator", "@notes", "@inline", "@tools",
+    "@layout",   "@ai",    "@filetree", "@stream", "@hints",  "@mouse",  "@navigator", "@notes", "@inline", "@tools",
     "@approval", "@80col", "@100col",   "@120col", "@drawer", "@docked",
 };
 
