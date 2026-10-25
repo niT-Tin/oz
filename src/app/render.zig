@@ -38,6 +38,8 @@ const kindGlyph = App.kindGlyph;
 // ---- rendering ----
 
 pub const filetree_width: u32 = 30;
+/// Blank column between the navigator's right border and editor content.
+pub const filetree_gutter: u32 = 1;
 
 /// Tab-bar rows: one per column-overlap layer of the pane layout.
 /// Panes whose column spans overlap (horizontal splits stack
@@ -92,7 +94,9 @@ pub fn contentTop(self: *App, a: std.mem.Allocator) u32 {
 }
 
 pub fn contentCol(self: *const App) u32 {
-    return if (self.filetree_active) filetree_width else 0;
+    // Editor content never touches the navigator's right border: one blank
+    // column sits between the 30-cell panel and the first text cell.
+    return if (self.filetree_active) filetree_width + filetree_gutter else 0;
 }
 
 /// Width of the relative-line-number gutter in cells: digits of the
@@ -1530,8 +1534,9 @@ pub fn hoverLineSegs(self: *App, a: std.mem.Allocator, line: []const u8, cols: u
 /// Render the left navigator (M2b1): the existing 30-cell filetree panel
 /// with a top tab strip `files | notes | agents`. Files keeps the tree's
 /// exact rendering/keys; Notes and Agents render from the cached note list
-/// and the real thread model. Geometry is unchanged (`contentCol()` is the
-/// same 30 cells), so the editor/splits/rail math below is untouched.
+/// and the real thread model. The panel stays 30 cells; the editor starts
+/// at `contentCol()` (30 + a one-cell gutter), so text never touches the
+/// navigator's right border.
 pub fn renderNavigator(self: *App, a: std.mem.Allocator, win: vaxis.Window, height: u32) !void {
     const ft_col: u32 = 0;
     const ft_width = filetree_width;
@@ -3453,7 +3458,7 @@ pub fn render(self: *App) !void {
                     var ghost_end = pane_end;
                     if (self.ai.rail_open) {
                         const lay = self.aiLayout();
-                        const rail_limit = lay.rail_col -| 1;
+                        const rail_limit = lay.rail_col -| lay.rail_gutter;
                         if (rail_limit < ghost_end) ghost_end = rail_limit;
                     }
                     if (b_sp.row < cur_rect.height and start_col < ghost_end) {
@@ -3645,6 +3650,7 @@ pub fn render(self: *App) !void {
     }
     // cursor position — drawAiRail already placed the prompt/thread cursor
     // when the rail or prompt owns focus; otherwise the editor cursor wins.
+    var editor_cursor_hidden = false;
     if (self.inlinePromptOpen()) {
         // cursor was placed by drawInlinePrompt
     } else if (self.ai.rail_open and self.ai.focus != .editor) {
@@ -3671,12 +3677,23 @@ pub fn render(self: *App) !void {
         // column (clamped into the pane: a single line taller than the
         // window can't show its deep chunks)
         const c_sp = self.focusedScreenPos(win, cur_rect, cursor_line, self.curCursor().*);
+        const cursor_col = cur_rect.col + gutter + c_sp.col;
+        // In drawer mode the editor keeps its full layout width but the
+        // rail floats over it. A cursor that would sit on the rail's gutter
+        // or underneath the panel is hidden rather than painted on top of
+        // the drawer chrome.
+        if (self.ai.rail_open) {
+            const lay = self.aiLayout();
+            if (lay.mode == .drawer and cursor_col >= lay.rail_col -| lay.rail_gutter) {
+                editor_cursor_hidden = true;
+            }
+        }
         self.vx.screen.cursor = .{
             .row = @intCast(cur_rect.row + @min(c_sp.row, cur_rect.height -| 1)),
-            .col = @intCast(cur_rect.col + gutter + c_sp.col), // window offset + gutter
+            .col = @intCast(cursor_col),
         };
     }
-    self.vx.screen.cursor_vis = true;
+    self.vx.screen.cursor_vis = !editor_cursor_hidden;
     self.vx.screen.cursor_shape = if (self.state.mode == .insert) .beam else .block;
 
     // M2.6a: final overlay pass — labels over every collected target and the

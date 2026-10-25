@@ -14160,14 +14160,28 @@ fn aiTabsContentCol(rail_col: usize) usize {
     return rail_col + 2;
 }
 
+/// 38-cell rails spend two cells after `chat` (the `│ ` separator); 34-cell
+/// rails stay compact (`│`).
+fn aiTabsSpaced(cols: usize) bool {
+    return aiRailWidth(cols) >= 38;
+}
+
 /// Column of the `changes N` label while chat is the active tab:
-/// `>chat│changes 0│...` — `>` + chat + `│`.
-fn aiChangesTabCol(rail_col: usize) usize {
-    return aiTabsContentCol(rail_col) + 1 + "chat".len + 1;
+/// `>chat│ changes 0 │...` at 38 cells, `>chat│changes 0│...` at 34.
+fn aiChangesTabCol(cols: usize) usize {
+    const rail_col = aiRailCol(cols);
+    const after_chat: usize = if (aiTabsSpaced(cols)) 2 else 1;
+    return aiTabsContentCol(rail_col) + 1 + "chat".len + after_chat;
 }
 
 fn aiRowStatusBg(grid: *Grid, row: usize) u32 {
     return aiCellBg(grid, row, grid.cols - 1);
+}
+
+/// A blank gutter cell may be unwritten ("") or an explicit space.
+fn aiCellBlank(grid: *Grid, row: usize, col: usize) bool {
+    const text = aiCellText(grid, row, col);
+    return text.len == 0 or std.mem.eql(u8, text, " ");
 }
 
 /// Count cells holding `ch` in the rail, excluding the bottom chrome (rule
@@ -14255,7 +14269,8 @@ test "ai workspace: 120-col docked rail keeps editor+filetree, streams, focus re
     defer grid.deinit(alloc);
     try gridWaitFor(&sess, &grid, "NORMAL", 8000);
 
-    // Docked rail: 38 cells reserved on the right (editor width 82).
+    // Docked rail: 38 cells reserved on the right (editor width 81 + one
+    // blank gutter column before the rail).
     try aiEnterRail(&sess, &grid);
     const rail_col = aiRailCol(120);
     try std.testing.expectEqual(@as(usize, 82), rail_col);
@@ -14431,7 +14446,12 @@ test "ui chrome: 120x30 rail header, rules, tabs and status boundary" {
     {
         const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
         defer f.close(io);
-        try f.writeStreamingAll(io, "CHROME_MARKER one\nsecond chrome line\n");
+        var long = std.ArrayList(u8).empty;
+        defer long.deinit(alloc);
+        try long.appendSlice(alloc, "CHROME_MARKER ");
+        try long.appendNTimes(alloc, 'x', 120);
+        try long.appendSlice(alloc, "\nsecond chrome line\n");
+        try f.writeStreamingAll(io, long.items);
     }
 
     var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, null, 30, 120);
@@ -14462,6 +14482,13 @@ test "ui chrome: 120x30 rail header, rules, tabs and status boundary" {
     try std.testing.expect(aiRowContains(&grid, 0, "AGENTS  1"));
     try std.testing.expect(aiRowContains(&grid, 2, "> thread 1"));
     try std.testing.expect(aiRowContains(&grid, 1, "main / workspace"));
+    // Blank gutters: one column between the navigator box and editor text,
+    // one between the editor's last text cell and the rail border.
+    try std.testing.expect(aiCellBlank(&grid, 1, 30));
+    try std.testing.expect(!aiCellBlank(&grid, 1, 31));
+    try std.testing.expect(!aiCellBlank(&grid, 1, 80));
+    try std.testing.expect(aiCellBlank(&grid, 1, 81));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 1, 82));
 
     // Divider between the thread list and workbox header; second divider
     // between the tab strip and body.
@@ -14469,15 +14496,15 @@ test "ui chrome: 120x30 rail header, rules, tabs and status boundary" {
     try std.testing.expectEqualStrings("├", aiCellText(&grid, divider_row, rail_col));
     try std.testing.expectEqualStrings("─", aiCellText(&grid, divider_row, rail_col + 2));
     const tabs_row = aiTabsRow(30);
-    try std.testing.expect(aiRowContains(&grid, tabs_row, ">chat│changes 0│tools│terminal"));
+    try std.testing.expect(aiRowContains(&grid, tabs_row, ">chat│ changes 0 │ tools │ terminal"));
     const content_col = aiTabsContentCol(rail_col);
     try std.testing.expectEqualStrings("│", aiCellText(&grid, tabs_row, content_col + 5));
-    try std.testing.expectEqualStrings("│", aiCellText(&grid, tabs_row, content_col + 15));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, tabs_row, content_col + 17));
     // Active chat tab: accent bold text on bg_sel. The inactive badge stays
     // on the rail background.
     try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, tabs_row, content_col + 1));
     try std.testing.expectEqual(packRgb(0xE6, 0xC3, 0x84), grid.fg_buf[tabs_row * grid.cols + content_col + 1]);
-    try std.testing.expectEqual(aiRailBg(), aiCellBg(&grid, tabs_row, content_col + 6));
+    try std.testing.expectEqual(aiRailBg(), aiCellBg(&grid, tabs_row, content_col + 7));
     try std.testing.expectEqualStrings("├", aiCellText(&grid, aiTabsSepRow(30), rail_col));
     try std.testing.expectEqualStrings("─", aiCellText(&grid, aiTabsSepRow(30), rail_col + 2));
 
@@ -14486,11 +14513,11 @@ test "ui chrome: 120x30 rail header, rules, tabs and status boundary" {
     try sess.send("\t");
     try sess.send("d");
     try gridWaitFor(&sess, &grid, "no pending changes", 4000);
-    try std.testing.expect(aiRowContains(&grid, tabs_row, "chat│>changes 0│tools│terminal"));
-    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, tabs_row, content_col + 6));
-    try std.testing.expectEqual(packRgb(0xE6, 0xC3, 0x84), grid.fg_buf[tabs_row * grid.cols + content_col + 5]);
+    try std.testing.expect(aiRowContains(&grid, tabs_row, "chat│ >changes 0 │ tools │ terminal"));
+    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, tabs_row, content_col + 7));
+    try std.testing.expectEqual(packRgb(0xE6, 0xC3, 0x84), grid.fg_buf[tabs_row * grid.cols + content_col + 6]);
     try sess.send("c");
-    try gridWaitFor(&sess, &grid, ">chat│changes 0", 4000);
+    try gridWaitFor(&sess, &grid, ">chat│ changes 0", 4000);
 
     // Status: rule row + section separators + mode badge + layout section.
     try std.testing.expectEqualStrings("─", aiCellText(&grid, 28, 0));
@@ -14523,7 +14550,12 @@ test "ui chrome: 80x24 drawer header, tabs and status boundary" {
     {
         const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
         defer f.close(io);
-        try f.writeStreamingAll(io, "CHROME80_MARKER\n");
+        var long = std.ArrayList(u8).empty;
+        defer long.deinit(alloc);
+        try long.appendSlice(alloc, "CHROME80_MARKER ");
+        try long.appendNTimes(alloc, 'y', 120);
+        try long.append(alloc, '\n');
+        try f.writeStreamingAll(io, long.items);
     }
 
     var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, null, 24, 80);
@@ -14540,6 +14572,11 @@ test "ui chrome: 80x24 drawer header, tabs and status boundary" {
     try std.testing.expectEqualStrings("│", aiCellText(&grid, 0, rail_col));
     try std.testing.expectEqual(aiStatusBg(), aiCellBg(&grid, 0, rail_col));
     try std.testing.expect(aiRowContains(&grid, 0, "AGENTS  1"));
+    // Drawer gutter: the editor keeps its full layout width but its last
+    // visible cell before the rail is blanked, so text never touches `│`.
+    try std.testing.expect(!aiCellBlank(&grid, 1, 44));
+    try std.testing.expect(aiCellBlank(&grid, 1, 45));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 1, 46));
     const tabs_row = aiTabsRow(24);
     try std.testing.expect(aiRowContains(&grid, tabs_row, ">chat│changes 0│tools│terminal"));
     try std.testing.expectEqualStrings("├", aiCellText(&grid, aiTabsSepRow(24), rail_col));
@@ -15124,7 +15161,7 @@ test "hints: 120x30 dock buffer tab, workbox tab and agent thread targets" {
     // the rail's tabs row. Its label activates the tab -> body changes.
     try sess.send(" j");
     try gridWaitFor(&sess, &grid, "HINTS ·", 4000);
-    const changes_col = aiChangesTabCol(aiRailCol(120));
+    const changes_col = aiChangesTabCol(120);
     const want2 = hintLabelLenFor(hintTargetCount(&grid) orelse return error.TestUnexpectedResult);
     var label2_buf: [3]u8 = undefined;
     const changes_label = hintLabelAt(&grid, &label2_buf, aiTabsRow(30), changes_col, want2);
@@ -15202,7 +15239,7 @@ test "hints: 80x24 drawer target works, Esc cancels without side effects" {
     // Activate the changes workbox tab through its drawn label.
     const count = hintTargetCount(&grid) orelse return error.TestUnexpectedResult;
     const want = hintLabelLenFor(count);
-    const changes_col = aiChangesTabCol(rail_col);
+    const changes_col = aiChangesTabCol(80);
     var label_buf: [3]u8 = undefined;
     const changes_label = hintLabelAt(&grid, &label_buf, aiTabsRow(24), changes_col, want);
     if (changes_label.len != want) {
@@ -18158,7 +18195,7 @@ const scenario_matrix = [_]Scenario{
             .{ .keys = "a", .wait_for = "changes 0" },
             // Approve returns focus to the editor; re-enter the rail before
             // switching to the Chat card.
-            .{ .keys = "\x17a", .wait_for = "tools│terminal" },
+            .{ .keys = "\x17a", .wait_for = "tools │ terminal" },
             .{ .keys = "c", .wait_for = "approved" },
         },
         .expect_text = &.{ "approved", "changes 0", "APPROVAL_SCENARIO_NEW", "GOLDEN_EDITOR_MARKER" },
@@ -18183,7 +18220,7 @@ const scenario_matrix = [_]Scenario{
             .{ .keys = "c", .wait_for = "approval required" },
             .{ .keys = "d", .wait_for = "[a] approve" },
             .{ .keys = "a", .wait_for = "changes 0" },
-            .{ .keys = "\x17a", .wait_for = "tools│terminal" },
+            .{ .keys = "\x17a", .wait_for = "tools │ terminal" },
             .{ .keys = "c", .wait_for = "approved" },
             // The approved card shows the real shown-hunk counts, not a
             // fabricated success summary.
@@ -18280,16 +18317,28 @@ fn assertScenario(sc: Scenario, grid: *Grid) !void {
 
     // Layout algebra: the rail and editor partition the width exactly.
     if (lay.mode == .docked) {
-        try std.testing.expectEqual(cols, lay.editor_width + lay.rail_width);
+        // editor + blank gutter + rail partitions the screen.
+        try std.testing.expectEqual(cols, lay.editor_width + lay.rail_gutter + lay.rail_width);
         try std.testing.expectEqual(cols, lay.rail_col + lay.rail_width);
+        try std.testing.expectEqual(lay.editor_width + lay.rail_gutter, lay.rail_col);
+        try std.testing.expectEqual(@as(u32, 1), lay.rail_gutter);
     } else if (lay.mode == .drawer) {
         try std.testing.expectEqual(cols, lay.editor_width);
         try std.testing.expectEqual(cols, lay.rail_col + lay.rail_width);
         try std.testing.expect(lay.rail_width <= cols);
         try std.testing.expect(lay.rail_col >= 8);
+        try std.testing.expectEqual(@as(u32, 1), lay.rail_gutter);
     } else {
         try std.testing.expectEqual(cols, lay.editor_width);
         try std.testing.expectEqual(@as(u32, 0), lay.rail_width);
+    }
+
+    if (sc.filetree) {
+        // One blank column separates the navigator box from editor content;
+        // the editor's first text cell is at column 31.
+        try frame.expectCellBg(grid, 1, 30, aiEditorBg());
+        try std.testing.expectEqual(@as(usize, 0), std.mem.trim(u8, frame.cellText(grid, 1, 30), " ").len);
+        try std.testing.expect(std.mem.trim(u8, frame.cellText(grid, 1, 31), " ").len > 0);
     }
 
     const status_rect = frame.Rect{
@@ -18323,6 +18372,10 @@ fn assertScenario(sc: Scenario, grid: *Grid) !void {
         try frame.expectCellBg(grid, 1, rr.left, aiRailBg());
         try std.testing.expectEqualStrings("│", frame.cellText(grid, 0, rr.left));
         try std.testing.expectEqualStrings("│", frame.cellText(grid, rr.bottom, rr.left));
+        // The column immediately left of the rail border is blank in both
+        // modes (dock reserves it; drawer paints it over the editor).
+        try frame.expectCellBg(grid, 0, rr.left - 1, aiEditorBg());
+        try std.testing.expectEqual(@as(usize, 0), std.mem.trim(u8, frame.cellText(grid, 1, rr.left - 1), " ").len);
         try frame.expectTextInRegion(grid, rr, "AGENTS");
         // Hint labels are drawn on the thread rows / workbox tabs' top-left
         // cells, so those labels cover the first 1-3 text cells. The hint
@@ -18356,10 +18409,14 @@ fn assertScenario(sc: Scenario, grid: *Grid) !void {
         const visible_editor = frame.Rect{
             .top = 0,
             .left = 0,
-            .right = if (lay.mode == .drawer) rr.left - 1 else @as(usize, lay.editor_width) - 1,
+            .right = if (lay.mode == .drawer)
+                rr.left - 1 - lay.rail_gutter
+            else
+                @as(usize, lay.editor_width) - 1,
             .bottom = @as(usize, rows) - 1,
         };
-        try frame.expectTextInRegion(grid, visible_editor, "GOLDEN_EDITOR");
+        const editor_marker = if (lay.mode == .drawer and sc.filetree) "GOLDEN_EDIT" else "GOLDEN_EDITOR";
+        try frame.expectTextInRegion(grid, visible_editor, editor_marker);
     } else {
         try frame.expectNoHorizontalOverflow(grid, @as(usize, cols));
     }

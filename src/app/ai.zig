@@ -1859,6 +1859,20 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
     if (w < 12 or rail_rows < 8 or x + w > cols) return;
 
     const t = self.theme;
+    // One blank column between editor content and the rail's left border.
+    // Docked mode already excludes it from the editor layout; drawer mode
+    // floats over the full-width editor, so paint the gutter over its last
+    // cell here (after every editor/terminal/overlay draw, before the rail).
+    if (lay.rail_gutter > 0 and lay.rail_col >= lay.rail_gutter) {
+        const gutter_col = lay.rail_col - lay.rail_gutter;
+        var gutter_row: u32 = 0;
+        while (gutter_row < rail_rows) : (gutter_row += 1) {
+            win.writeCell(@intCast(gutter_col), @intCast(gutter_row), .{
+                .char = .{ .grapheme = " ", .width = 1 },
+                .style = .{ .bg = .{ .rgb = t.bg } },
+            });
+        }
+    }
     const rail_bg = vaxis.Color{ .rgb = t.bg_float };
     const content_w = w -| 3;
     const focused = self.ai.focus != .editor;
@@ -2083,17 +2097,23 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         };
         var segs = std.ArrayList(vaxis.Segment).empty;
         var used: u32 = 0;
+        // 38-cell rail (content 35): spend the extra cells on separator
+        // breathing room. The first rule keeps its space on the right so the
+        // active `>` marker + all four labels still fit 35 cells; 34-cell
+        // rails (100 dock / 80 drawer) keep the compact 30-cell row.
+        const spaced = content_w >= 35;
         for (Tabs, 0..) |entry, i| {
             const active_tab = self.ai.tab == entry.tab;
             const label_cells: u32 = @intCast(autil.cellWidth(win, entry.label));
             const marker_cells: u32 = if (active_tab) 1 else 0;
-            const sep_cells: u32 = if (i > 0) 1 else 0;
+            const sep_cells: u32 = if (i == 0) 0 else if (spaced) (if (i == 1) 2 else 3) else 1;
             // Extremely narrow rails omit trailing tabs instead of running
             // past the border; all tabs fit at the supported 34/38 widths.
             if (used + sep_cells + marker_cells + label_cells > content_w) break;
             if (i > 0) {
-                try segs.append(a, .{ .text = "│", .style = .{ .fg = .{ .rgb = t.fg_faint }, .bg = rail_bg } });
-                used += 1;
+                const sep_text = if (spaced) (if (i == 1) "│ " else " │ ") else "│";
+                try segs.append(a, .{ .text = sep_text, .style = .{ .fg = .{ .rgb = t.fg_faint }, .bg = rail_bg } });
+                used += sep_cells;
             }
             const style: vaxis.Style = if (active_tab)
                 .{ .fg = .{ .rgb = t.accent }, .bg = .{ .rgb = t.bg_sel }, .bold = true }

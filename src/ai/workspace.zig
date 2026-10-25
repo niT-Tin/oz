@@ -29,11 +29,16 @@ pub const Layout = struct {
     /// Total reserved rail width in cells (including its left border).
     /// 0 when hidden.
     rail_width: u32 = 0,
-    /// Cells the editor/file-tree/splits may use. Equal to the terminal
-    /// width in drawer mode (the drawer floats above it).
+    /// Cells the editor/file-tree/splits may use. In docked mode this
+    /// excludes the rail gutter; in drawer mode it keeps the full terminal
+    /// width (the drawer floats above it) and the gutter is painted over
+    /// the editor's last cell.
     editor_width: u32 = 0,
     /// Screen column of the rail's left border (0 when hidden).
     rail_col: u32 = 0,
+    /// Blank cells between editor content and the rail's left border.
+    /// 1 whenever the rail is open, in both docked and drawer modes.
+    rail_gutter: u32 = 0,
 };
 
 /// Rail width for an OPEN rail at `cols`. Includes the one-cell border.
@@ -50,20 +55,26 @@ pub fn railWidth(cols: u32) u32 {
 pub fn layout(cols: u32, open: bool) Layout {
     if (!open) return .{ .mode = .hidden, .editor_width = cols };
     const rw = railWidth(cols);
+    const rail_col = cols -| rw;
+    const rail_gutter: u32 = 1;
     if (cols >= mid_cols) {
-        const editor_width = cols -| rw;
+        // The editor's rightmost usable cell ends one column before the
+        // rail; `rail_gutter` is the blank column between them.
+        const editor_width = rail_col -| rail_gutter;
         return .{
             .mode = .docked,
             .rail_width = rw,
             .editor_width = editor_width,
-            .rail_col = editor_width,
+            .rail_col = rail_col,
+            .rail_gutter = rail_gutter,
         };
     }
     return .{
         .mode = .drawer,
         .rail_width = rw,
         .editor_width = cols,
-        .rail_col = cols -| rw,
+        .rail_col = rail_col,
+        .rail_gutter = rail_gutter,
     };
 }
 
@@ -587,37 +598,43 @@ test "workspace layout: 120/110/100/90 dock, 89/80 drawer, hidden" {
     const l120 = layout(120, true);
     try std.testing.expectEqual(RailMode.docked, l120.mode);
     try std.testing.expectEqual(@as(u32, 38), l120.rail_width);
-    try std.testing.expectEqual(@as(u32, 82), l120.editor_width);
+    try std.testing.expectEqual(@as(u32, 81), l120.editor_width);
     try std.testing.expectEqual(@as(u32, 82), l120.rail_col);
+    try std.testing.expectEqual(@as(u32, 1), l120.rail_gutter);
 
     const l110 = layout(110, true);
     try std.testing.expectEqual(RailMode.docked, l110.mode);
     try std.testing.expectEqual(@as(u32, 38), l110.rail_width);
-    try std.testing.expectEqual(@as(u32, 72), l110.editor_width);
+    try std.testing.expectEqual(@as(u32, 71), l110.editor_width);
+    try std.testing.expectEqual(@as(u32, 72), l110.rail_col);
 
     const l100 = layout(100, true);
     try std.testing.expectEqual(RailMode.docked, l100.mode);
     try std.testing.expectEqual(@as(u32, 34), l100.rail_width);
-    try std.testing.expectEqual(@as(u32, 66), l100.editor_width);
+    try std.testing.expectEqual(@as(u32, 65), l100.editor_width);
+    try std.testing.expectEqual(@as(u32, 66), l100.rail_col);
 
     const l90 = layout(90, true);
     try std.testing.expectEqual(RailMode.docked, l90.mode);
     try std.testing.expectEqual(@as(u32, 34), l90.rail_width);
-    try std.testing.expectEqual(@as(u32, 56), l90.editor_width);
+    try std.testing.expectEqual(@as(u32, 55), l90.editor_width);
     try std.testing.expectEqual(@as(u32, 56), l90.rail_col);
 
     const l89 = layout(89, true);
     try std.testing.expectEqual(RailMode.drawer, l89.mode);
     try std.testing.expectEqual(@as(u32, 34), l89.rail_width);
-    // The editor keeps its full width underneath the overlay.
+    // The editor keeps its full width underneath the overlay; the gutter is
+    // painted over its last cell at draw time.
     try std.testing.expectEqual(@as(u32, 89), l89.editor_width);
     try std.testing.expectEqual(@as(u32, 55), l89.rail_col);
+    try std.testing.expectEqual(@as(u32, 1), l89.rail_gutter);
 
     const l80 = layout(80, true);
     try std.testing.expectEqual(RailMode.drawer, l80.mode);
     try std.testing.expectEqual(@as(u32, 34), l80.rail_width);
     try std.testing.expectEqual(@as(u32, 80), l80.editor_width);
     try std.testing.expectEqual(@as(u32, 46), l80.rail_col);
+    try std.testing.expectEqual(@as(u32, 1), l80.rail_gutter);
     // The drawer leaves at least 8 columns of text visible.
     try std.testing.expect(l80.rail_col >= 8);
 
@@ -625,6 +642,7 @@ test "workspace layout: 120/110/100/90 dock, 89/80 drawer, hidden" {
     try std.testing.expectEqual(RailMode.hidden, hidden.mode);
     try std.testing.expectEqual(@as(u32, 0), hidden.rail_width);
     try std.testing.expectEqual(@as(u32, 120), hidden.editor_width);
+    try std.testing.expectEqual(@as(u32, 0), hidden.rail_gutter);
 }
 
 test "workspace layout: rail metrics keep a workbox and chat prompt" {
@@ -834,9 +852,11 @@ test "property: layout partitions the width for every 40..200 columns" {
             .hidden => return error.TestUnexpectedResult,
             .docked => {
                 try std.testing.expect(cols >= 90);
-                try std.testing.expectEqual(cols, open.editor_width + open.rail_width);
-                try std.testing.expectEqual(open.editor_width, open.rail_col);
+                // editor + blank gutter + rail partitions the screen.
+                try std.testing.expectEqual(cols, open.editor_width + open.rail_gutter + open.rail_width);
+                try std.testing.expectEqual(open.editor_width + open.rail_gutter, open.rail_col);
                 try std.testing.expect(open.editor_width > 0);
+                try std.testing.expectEqual(@as(u32, 1), open.rail_gutter);
                 const expected: u32 = if (cols >= 110) 38 else 34;
                 try std.testing.expectEqual(expected, open.rail_width);
             },
@@ -844,6 +864,8 @@ test "property: layout partitions the width for every 40..200 columns" {
                 try std.testing.expect(cols < 90);
                 try std.testing.expectEqual(cols, open.editor_width);
                 try std.testing.expect(open.rail_col >= 8);
+                try std.testing.expectEqual(@as(u32, 1), open.rail_gutter);
+                try std.testing.expect(open.rail_col >= open.rail_gutter);
                 try std.testing.expectEqual(@min(@as(u32, 34), cols - 8), open.rail_width);
             },
         }

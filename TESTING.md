@@ -128,10 +128,14 @@ The chrome changes are covered by two focused pty tests (`ui chrome:` filter)
 at 120x30 dock and 80x24 drawer plus the scenario matrix:
 
 - the rail header band (`AGENTS  1`), the two `├──` rules (thread list/workbox
-  header, tab strip/body), the `│`-separated workbox tabs and the active tab's
-  `>` marker + `bg_sel`/accent style (switching to Changes moves the marker);
+  header, tab strip/body), the `│`-separated workbox tabs (spaced at 38 cells,
+  compact at 34/80) and the active tab's `>` marker + `bg_sel`/accent style
+  (switching to Changes moves the marker);
 - the navigator strip `╭─ files │ notes │ agents ───╮`, its `│` separators and
-  active `bg_sel` tab;
+  active `bg_sel` tab, plus the one-cell blank gutter between the navigator box
+  and editor text;
+- the one-cell blank rail gutter in dock and drawer modes (text never touches
+  the rail's `│`, and drawer cursors under the panel are hidden);
 - the bottom status band: full-width rule row, `[MODE]` badge with accent
   background, `│` section separators, and the `dock`/`drawer` layout cell;
 - a scan for tofu-prone chrome glyphs (`▥ ● ○ ◌ ✖ ▸ ▾`) in the rail and
@@ -141,7 +145,8 @@ at 120x30 dock and 80x24 drawer plus the scenario matrix:
   overwritten, and the commit summary never appears in the rail.
 
 The goldens changed only because the chrome moved rows/styles: header band,
-active markers, the two rules and the status band. They were regenerated with
+active markers, the two rules, the status band, and the 38-cell tab separator
+spacing in the final gutter pass. They were regenerated with
 `OZ_UPDATE_GOLDEN=1` and reviewed cell-by-cell.
 
 ### Notes test seam (`OZ_NOTES_DIR`)
@@ -350,7 +355,7 @@ original "staged/not applied" result after a later local approval.
 | AI thread isolation/cancel/error, selection context | existing deep L3 tests |
 | Layout arithmetic / focus state | property sweeps |
 | AI/frame cell colors and borders | goldens + semantic assertions |
-| UI chrome (rail header/rules/tabs, navigator tab separators, status band, blame clipping, tofu-glyph scan) | L3 `ui chrome:` tests + `git: blame ghost clips before the agent rail` + scenario matrix + goldens |
+| UI chrome (rail header/rules/tabs, nav/rail blank gutters, navigator tab separators, status band, blame clipping, tofu-glyph scan) | L3 `ui chrome:` tests + `git: blame ghost clips before the agent rail` + scenario matrix + goldens |
 | Keyboard hints (labels, status, target actions, Esc) | L1 pure model (`src/app/hints.zig`) + L3 `hints:` tests + `@hints` matrix scenarios |
 | Navigator tabs, notes list/create/save/reopen, agents attach | L1 (`src/app/navigator.zig`, `src/app/note_store.zig`) + L3 `navigator:` tests + `@navigator`/`@notes` matrix scenarios |
 | Notes path fallback/error handling | L1 resolution/creation tests + L3 unavailable-dir e2e (`OZ_NOTES_DIR=/dev/null/notes`) |
