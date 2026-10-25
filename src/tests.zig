@@ -38,6 +38,9 @@ pub const term = @import("term.zig");
 pub const app_macro = @import("app/macro.zig");
 // M2.6a keyboard hints (pure label/target model; app/hint_ui.zig is e2e-tested)
 pub const app_hints = @import("app/hints.zig");
+// M2b1 navigator tabs + note store (pure; app/notes.zig is e2e-tested)
+pub const app_navigator = @import("app/navigator.zig");
+pub const app_note_store = @import("app/note_store.zig");
 // M1 AI chat (pure modules; app/ai.zig is exercised by e2e)
 pub const ai_sse = @import("ai/sse.zig");
 pub const ai_openai = @import("ai/openai.zig");
