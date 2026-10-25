@@ -109,6 +109,16 @@ zig build e2e                                # pty end-to-end tests (Linux only 
 
 Run: `oz [file[:line]]`
 
+For the full verification entry point (CI uses it), semantic layout/AI
+scenarios, cell-level golden frames, and the agent/verifier policy, see
+**[TESTING.md](TESTING.md)**. In short:
+
+```sh
+./tools/verify.sh                            # diff check + unit + e2e, writes .verify/verify.json
+zig build e2e -Dtest-filter="scenario matrix"
+OZ_UPDATE_GOLDEN=1 zig build e2e -Dtest-filter="golden"   # explicit golden update
+```
+
 ## Performance
 
 Methodology: pty-driven with screen reconstruction, same machine (Apple Silicon, macOS), same files, median of 3 runs.

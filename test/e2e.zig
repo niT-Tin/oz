@@ -15010,3 +15010,78 @@ test "scenario matrix: every required tag is covered" {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Golden frames (M2.5)
+// ---------------------------------------------------------------------------
+const golden = @import("golden.zig");
+
+/// Run the deterministic AI workspace frame used by both goldens: a fixed
+/// plain-text file in a fixed non-git cwd, a fixed theme/HOME, the mock
+/// stream, and the same key sequence. Volatile inputs (paths, branch, time)
+/// are absent by construction; the frame is stable across runs.
+fn runAiGolden(name: []const u8, rows: u16, cols: u16, golden_rel_path: []const u8) !void {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [128]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_golden_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.createDirAbsolute(io, root, .default_dir);
+
+    var fixture_buf: [192]u8 = undefined;
+    const fixture = try std.fmt.bufPrint(&fixture_buf, "{s}/fixture.txt", .{root});
+    {
+        const f = try std.Io.Dir.createFileAbsolute(io, fixture, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "alpha line one\nbeta line two\ngamma line three\n");
+    }
+    var home_buf: [192]u8 = undefined;
+    const home = try std.fmt.bufPrint(&home_buf, "{s}/home", .{root});
+    try std.Io.Dir.createDirAbsolute(io, home, .default_dir);
+    var mock_buf: [192]u8 = undefined;
+    const mock = try std.fmt.bufPrint(&mock_buf, "{s}/mock", .{root});
+    try std.Io.Dir.createDirAbsolute(io, mock, .default_dir);
+    try aiWriteFile(io, mock, "stream.sse", "data: {\"choices\":[{\"delta\":{\"content\":\"mock \"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\"reply\"}}]}\n\n" ++
+        "data: [DONE]\n\n");
+
+    const home_env = try std.fmt.allocPrint(alloc, "HOME={s}", .{home});
+    defer alloc.free(home_env);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{mock});
+    defer alloc.free(mock_env);
+    const env_extra = [_][]const u8{ home_env, mock_env, "OZ_AI_MODEL=mock-model" };
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "fixture.txt" }, &env_extra, rows, cols, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, rows, cols);
+    defer grid.deinit(alloc);
+
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "alpha line one", 5000);
+    // The text-file LSP probe settles to this deterministic label; waiting
+    // for it keeps the status bar identical between fresh and warm runs.
+    try gridWaitFor(&sess, &grid, "NoLspServer", 5000);
+    try sess.send(" a");
+    try gridWaitFor(&sess, &grid, "agents", 5000);
+    try gridWaitFor(&sess, &grid, "thread 1", 4000);
+    try gridWaitFor(&sess, &grid, "❯ ", 4000);
+    try sess.send("hello");
+    try gridWaitFor(&sess, &grid, "hello", 3000);
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "mock reply", 8000);
+    try gridWaitFor(&sess, &grid, "idle", 5000);
+    try gridSettle(&sess, &grid, 400, 6000);
+
+    try golden.check(io, alloc, &grid, name, golden_rel_path);
+}
+
+test "golden: 120x30 docked AI workspace" {
+    try runAiGolden("ai-dock-120x30", 30, 120, "test/golden/ai-dock-120x30.txt");
+}
+
+test "golden: 80x24 narrow AI drawer" {
+    try runAiGolden("ai-drawer-80x24", 24, 80, "test/golden/ai-drawer-80x24.txt");
+}
