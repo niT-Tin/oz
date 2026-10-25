@@ -314,6 +314,39 @@ pub fn freeCalls(alloc: std.mem.Allocator, calls: []ToolCall) void {
     alloc.free(calls);
 }
 
+/// Serialize an assistant turn's tool calls for the OpenAI wire format:
+/// `[{"id":"call_1","type":"function","function":{"name":...,"arguments":"{...}"}}]`.
+/// `arguments_json` stays a JSON *string* (the provider's encoding); the
+/// caller stores the result on the assistant message so a follow-up request
+/// can reference exactly the `tool_call_id`s its results answer.
+pub fn buildAssistantToolCallsJson(
+    alloc: std.mem.Allocator,
+    calls: []const ToolCall,
+) error{OutOfMemory}![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    var s: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+
+    s.beginArray() catch return error.OutOfMemory;
+    for (calls) |call| {
+        s.beginObject() catch return error.OutOfMemory;
+        s.objectField("id") catch return error.OutOfMemory;
+        s.write(call.id) catch return error.OutOfMemory;
+        s.objectField("type") catch return error.OutOfMemory;
+        s.write("function") catch return error.OutOfMemory;
+        s.objectField("function") catch return error.OutOfMemory;
+        s.beginObject() catch return error.OutOfMemory;
+        s.objectField("name") catch return error.OutOfMemory;
+        s.write(call.name) catch return error.OutOfMemory;
+        s.objectField("arguments") catch return error.OutOfMemory;
+        s.write(call.arguments_json) catch return error.OutOfMemory;
+        s.endObject() catch return error.OutOfMemory;
+        s.endObject() catch return error.OutOfMemory;
+    }
+    s.endArray() catch return error.OutOfMemory;
+    return out.toOwnedSlice() catch error.OutOfMemory;
+}
+
 pub const AccumulateError = error{
     OutOfMemory,
     InvalidJson,
@@ -639,22 +672,8 @@ pub fn buildToolResultMessageWith(
     if (tool_call_id.len == 0 or tool_call_id.len > max_id_bytes) return error.InvalidToolCallId;
     if (!std.unicode.utf8ValidateSlice(tool_call_id)) return error.InvalidToolCallId;
 
-    const cap = @min(@max(options.max_content_bytes, 32), max_result_bytes);
-    const marker = "\n… [truncated]";
-    const budget = cap -| marker.len;
-
-    var content: std.ArrayList(u8) = .empty;
-    defer content.deinit(alloc);
-    try content.ensureTotalCapacity(alloc, cap);
-
-    if (result.is_error) {
-        const prefix = "error: ";
-        _ = try appendBounded(&content, alloc, prefix, budget);
-    }
-    const truncated = try appendLossyBounded(&content, alloc, result.output, budget);
-    if (truncated and content.items.len + marker.len <= cap) {
-        try content.appendSlice(alloc, marker);
-    }
+    const content = try buildToolResultContentWith(alloc, result, options);
+    defer alloc.free(content);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -665,9 +684,46 @@ pub fn buildToolResultMessageWith(
     s.objectField("tool_call_id") catch return error.OutOfMemory;
     s.write(tool_call_id) catch return error.OutOfMemory;
     s.objectField("content") catch return error.OutOfMemory;
-    s.write(content.items) catch return error.OutOfMemory;
+    s.write(content) catch return error.OutOfMemory;
     s.endObject() catch return error.OutOfMemory;
     return out.toOwnedSlice() catch error.OutOfMemory;
+}
+
+/// Build the bounded, UTF-8-safe `content` string for a `role:"tool"`
+/// message. Errors keep an `error: ` prefix; truncation appends the shared
+/// marker. Caller owns the result. Exposed so the agent loop can store the
+/// exact bytes it will later send, and so display code never re-derives a
+/// different truncation.
+pub fn buildToolResultContent(
+    alloc: std.mem.Allocator,
+    result: ToolResult,
+    options: ToolMessageOptions,
+) error{OutOfMemory}![]u8 {
+    return buildToolResultContentWith(alloc, result, options);
+}
+
+fn buildToolResultContentWith(
+    alloc: std.mem.Allocator,
+    result: ToolResult,
+    options: ToolMessageOptions,
+) error{OutOfMemory}![]u8 {
+    const cap = @min(@max(options.max_content_bytes, 32), max_result_bytes);
+    const marker = "\n… [truncated]";
+    const budget = cap -| marker.len;
+
+    var content: std.ArrayList(u8) = .empty;
+    errdefer content.deinit(alloc);
+    try content.ensureTotalCapacity(alloc, cap);
+
+    if (result.is_error) {
+        const prefix = "error: ";
+        _ = try appendBounded(&content, alloc, prefix, budget);
+    }
+    const truncated = try appendLossyBounded(&content, alloc, result.output, budget);
+    if (truncated and content.items.len + marker.len <= cap) {
+        try content.appendSlice(alloc, marker);
+    }
+    return content.toOwnedSlice(alloc);
 }
 
 /// Append ASCII-ish prefix text, never exceeding `budget`.
@@ -1335,4 +1391,50 @@ test "tools: policy overrides are explicit and unknown tools stay denied" {
 
     const permissive: Policy = .{ .allow_reads = true, .allow_writes = true, .allow_terminal = true };
     try std.testing.expectEqual(Permission.deny, decideWith(permissive, "rm_rf", "{}"));
+}
+
+test "tools: assistant tool-call turn serializes id/name/arguments" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        .{ .id = @constCast("call_1"), .name = @constCast("read_file"), .arguments_json = @constCast("{\"path\":\"a.zig\"}") },
+        .{ .id = @constCast("call_2"), .name = @constCast("grep"), .arguments_json = @constCast("{\"pattern\":\"x\\\"y\"}") },
+    };
+    const json = try buildAssistantToolCallsJson(alloc, &calls);
+    defer alloc.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .array);
+    const arr = parsed.value.array.items;
+    try std.testing.expectEqual(@as(usize, 2), arr.len);
+    try std.testing.expectEqualStrings("call_1", arr[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("function", arr[0].object.get("type").?.string);
+    const f0 = arr[0].object.get("function").?.object;
+    try std.testing.expectEqualStrings("read_file", f0.get("name").?.string);
+    // Arguments stay a JSON string, not an inline object.
+    try std.testing.expect(f0.get("arguments").? == .string);
+    try std.testing.expectEqualStrings("{\"path\":\"a.zig\"}", f0.get("arguments").?.string);
+    const f1 = arr[1].object.get("function").?.object;
+    try std.testing.expectEqualStrings("{\"pattern\":\"x\\\"y\"}", f1.get("arguments").?.string);
+
+    const empty = try buildAssistantToolCallsJson(alloc, &.{});
+    defer alloc.free(empty);
+    try std.testing.expectEqualStrings("[]", empty);
+}
+
+test "tools: bounded tool content is shared by message and loop" {
+    const alloc = std.testing.allocator;
+    const huge: [max_result_bytes + 64]u8 = @splat('q');
+    const content = try buildToolResultContent(alloc, .{ .output = &huge }, .{});
+    defer alloc.free(content);
+    try std.testing.expect(content.len <= max_result_bytes);
+    try std.testing.expect(std.mem.endsWith(u8, content, "\n… [truncated]"));
+
+    const err_content = try buildToolResultContent(alloc, .{ .output = "nope", .is_error = true }, .{});
+    defer alloc.free(err_content);
+    try std.testing.expectEqualStrings("error: nope", err_content);
+
+    // The message builder wraps exactly those bytes.
+    const msg = try buildToolResultMessage(alloc, "call_9", .{ .output = "nope", .is_error = true });
+    defer alloc.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"content\":\"error: nope\"") != null);
 }

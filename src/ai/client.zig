@@ -19,6 +19,7 @@
 const std = @import("std");
 const sse = @import("sse.zig");
 const openai = @import("openai.zig");
+const tools = @import("tools.zig");
 
 pub const Event = union(enum) {
     /// A content delta (owned).
@@ -29,11 +30,15 @@ pub const Event = union(enum) {
     err: []u8,
     /// Cancellation acknowledged by the worker.
     cancelled,
+    /// One assistant turn's finalized tool calls (ordered by stream index).
+    /// Ownership transfers to the receiver; free with `tools.freeCalls`.
+    tool_calls: []tools.ToolCall,
 
     pub fn deinit(self: Event, alloc: std.mem.Allocator) void {
         switch (self) {
             .delta => |d| alloc.free(d),
             .err => |e| alloc.free(e),
+            .tool_calls => |calls| tools.freeCalls(alloc, calls),
             .done, .cancelled => {},
         }
     }
@@ -60,6 +65,8 @@ const Job = struct {
     mock_dir: ?[]u8,
     chunk_bytes: usize,
     chunk_delay_ms: u64,
+    /// 1-based request number for this client (OZ_AI_MOCK_DIR fixtures).
+    seq: u32,
 
     fn deinit(self: *Job, alloc: std.mem.Allocator) void {
         alloc.free(self.url);
@@ -79,6 +86,10 @@ pub const Client = struct {
     thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     job: ?Job = null,
+    /// Monotonic request counter. The mock seam uses it to pick
+    /// `stream-<n>.sse` and to keep every round's `request-<n>.json`, which
+    /// is what lets the agent-loop e2e inspect follow-up tool messages.
+    request_seq: u32 = 0,
 
     pub const StartError = error{ Busy, OutOfMemory, ThreadSpawnFailed };
 
@@ -126,6 +137,7 @@ pub const Client = struct {
         }
         errdefer if (mock_dir) |m| self.alloc.free(m);
 
+        self.request_seq +%= 1;
         self.job = .{
             .url = url,
             .api_key = api_key,
@@ -133,6 +145,7 @@ pub const Client = struct {
             .mock_dir = mock_dir,
             .chunk_bytes = @max(spec.chunk_bytes, 1),
             .chunk_delay_ms = spec.chunk_delay_ms,
+            .seq = self.request_seq,
         };
         self.running.store(true, .release);
         self.thread = std.Thread.spawn(.{}, workerMain, .{self}) catch {
@@ -175,6 +188,15 @@ pub const Client = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.events.items.len > 0;
+    }
+
+    /// Join the worker after a terminal event (`done`/`err`/`cancelled`).
+    /// The terminal push is the worker's last significant action, so this is
+    /// a short wait; the App calls it before reusing the client for a tool
+    /// follow-up, which removes the "done seen but worker still alive"
+    /// `error.Busy` race without polling.
+    pub fn joinAfterTerminal(self: *Client) void {
+        self.joinThread();
     }
 
     fn joinThread(self: *Client) void {
@@ -224,25 +246,40 @@ pub const Client = struct {
 
     fn runMock(self: *Client, job: *const Job, dir: []const u8) !void {
         try self.checkCancel();
-        try writeRequestFile(self.alloc, self.io, dir, job.body);
+        const seq_name = try std.fmt.allocPrint(self.alloc, "request-{d}.json", .{job.seq});
+        defer self.alloc.free(seq_name);
+        try writeRequestFile(self.alloc, self.io, dir, "request.json", job.body);
+        try writeRequestFile(self.alloc, self.io, dir, seq_name, job.body);
 
-        if (readOptionalFile(self.alloc, self.io, dir, "error.txt", 4096)) |err_text| {
+        const err_name = try std.fmt.allocPrint(self.alloc, "error-{d}.txt", .{job.seq});
+        defer self.alloc.free(err_name);
+        if (readOptionalFile(self.alloc, self.io, dir, err_name, 4096) orelse
+            readOptionalFile(self.alloc, self.io, dir, "error.txt", 4096)) |err_text|
+        {
             defer self.alloc.free(err_text);
             const trimmed = std.mem.trim(u8, err_text, " \t\r\n");
             self.pushError(if (trimmed.len > 0) trimmed else "mock error");
             return;
         }
 
-        const stream_path = try std.fmt.allocPrint(self.alloc, "{s}/stream.sse", .{dir});
+        const stream_name = try std.fmt.allocPrint(self.alloc, "stream-{d}.sse", .{job.seq});
+        defer self.alloc.free(stream_name);
+        const stream_path = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ dir, stream_name });
         defer self.alloc.free(stream_path);
-        var file = std.Io.Dir.cwd().openFile(self.io, stream_path, .{ .mode = .read_only }) catch {
-            self.pushError("mock: stream.sse not found");
+        const fallback_path = try std.fmt.allocPrint(self.alloc, "{s}/stream.sse", .{dir});
+        defer self.alloc.free(fallback_path);
+        var file = std.Io.Dir.cwd().openFile(self.io, stream_path, .{ .mode = .read_only }) catch
+            std.Io.Dir.cwd().openFile(self.io, fallback_path, .{ .mode = .read_only }) catch {
+            self.pushErrorFmt("mock: {s} not found", .{stream_name});
             return;
         };
         defer file.close(self.io);
 
         var parser = sse.Parser.init(self.alloc);
         defer parser.deinit();
+        var acc = tools.Accumulator.init(self.alloc);
+        defer acc.deinit();
+        var protocol_failed = false;
         var saw_done = false;
         var buf: [256]u8 = undefined;
         const chunk = @min(job.chunk_bytes, buf.len);
@@ -258,16 +295,19 @@ pub const Client = struct {
                 self.pushError("mock: malformed stream.sse");
                 return;
             };
-            try self.drainSse(&parser, &saw_done);
-            if (saw_done) break;
+            try self.drainSse(&parser, &saw_done, &acc, &protocol_failed);
+            if (saw_done or protocol_failed) break;
             if (job.chunk_delay_ms > 0) {
                 std.Io.sleep(self.io, .fromMilliseconds(@intCast(job.chunk_delay_ms)), .real) catch {};
             }
         }
-        if (!saw_done) {
+        if (!saw_done and !protocol_failed) {
             parser.finish() catch {};
-            try self.drainSse(&parser, &saw_done);
+            try self.drainSse(&parser, &saw_done, &acc, &protocol_failed);
         }
+        if (protocol_failed) return;
+        try self.finalizeToolTurn(&acc);
+        if (protocol_failed) return;
         self.push(.done) catch {};
     }
 
@@ -349,6 +389,9 @@ pub const Client = struct {
         const rdr = response.reader(&transfer);
         var parser = sse.Parser.init(self.alloc);
         defer parser.deinit();
+        var acc = tools.Accumulator.init(self.alloc);
+        defer acc.deinit();
+        var protocol_failed = false;
         var saw_done = false;
         var buf: [4096]u8 = undefined;
         while (true) {
@@ -366,17 +409,26 @@ pub const Client = struct {
                 self.pushError("stream parse failed");
                 return;
             };
-            try self.drainSse(&parser, &saw_done);
-            if (saw_done) break;
+            try self.drainSse(&parser, &saw_done, &acc, &protocol_failed);
+            if (saw_done or protocol_failed) break;
         }
-        if (!saw_done) {
+        if (!saw_done and !protocol_failed) {
             parser.finish() catch {};
-            try self.drainSse(&parser, &saw_done);
+            try self.drainSse(&parser, &saw_done, &acc, &protocol_failed);
         }
+        if (protocol_failed) return;
+        try self.finalizeToolTurn(&acc);
+        if (protocol_failed) return;
         self.push(.done) catch {};
     }
 
-    fn drainSse(self: *Client, parser: *sse.Parser, saw_done: *bool) !void {
+    fn drainSse(
+        self: *Client,
+        parser: *sse.Parser,
+        saw_done: *bool,
+        acc: *tools.Accumulator,
+        protocol_failed: *bool,
+    ) !void {
         while (parser.next()) |ev| {
             switch (ev) {
                 .done => {
@@ -386,10 +438,23 @@ pub const Client = struct {
                 .data => |json| {
                     defer ev.deinit(self.alloc);
                     var delta = openai.parseDelta(self.alloc, json) catch |e| switch (e) {
-                        error.InvalidJson => continue, // ignored per wire-format design
+                        // Malformed JSON chunks were ignored before M3
+                        // (gateways send keep-alive/metadata); preserving
+                        // that keeps text-only streams tolerant. Once the
+                        // chunk IS valid JSON, tool-call field errors are
+                        // protocol failures and surface as a chat error.
+                        error.InvalidJson => continue,
                         error.OutOfMemory => return error.OutOfMemory,
                     };
                     defer delta.deinit(self.alloc);
+                    acc.feedChunk(json) catch |e| switch (e) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => {
+                            self.pushErrorFmt("tool call protocol: {s}", .{@errorName(e)});
+                            protocol_failed.* = true;
+                            return;
+                        },
+                    };
                     if (delta.content) |content| {
                         const copy = try self.alloc.dupe(u8, content);
                         self.push(.{ .delta = copy }) catch self.alloc.free(copy);
@@ -399,6 +464,34 @@ pub const Client = struct {
             }
         }
     }
+
+    /// Finalize accumulated calls and queue exactly one `.tool_calls` event.
+    /// Text-only streams (zero calls) behave exactly as before. A malformed
+    /// tool-call turn becomes a plain chat error; no calls are queued.
+    fn finalizeToolTurn(self: *Client, acc: *tools.Accumulator) !void {
+        if (!acc.hasToolCalls()) {
+            if (acc.finishReason() == .tool_calls) {
+                self.pushError("tool call protocol: tool_calls finish without calls");
+            }
+            return;
+        }
+        try self.checkCancel();
+        const calls = acc.finalize() catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                self.pushErrorFmt("tool call protocol: {s}", .{@errorName(e)});
+                return;
+            },
+        };
+        if (calls.len == 0) {
+            tools.freeCalls(self.alloc, calls);
+            return;
+        }
+        self.push(.{ .tool_calls = calls }) catch {
+            tools.freeCalls(self.alloc, calls);
+            return error.OutOfMemory;
+        };
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -407,10 +500,16 @@ pub const Client = struct {
 
 /// Write the request body atomically (temp + rename) so a test reading the
 /// file concurrently never observes a partial write.
-fn writeRequestFile(alloc: std.mem.Allocator, io: std.Io, dir: []const u8, body: []const u8) !void {
-    const dest = try std.fmt.allocPrint(alloc, "{s}/request.json", .{dir});
+fn writeRequestFile(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+    name: []const u8,
+    body: []const u8,
+) !void {
+    const dest = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, name });
     defer alloc.free(dest);
-    const tmp = try std.fmt.allocPrint(alloc, "{s}/.request.json.tmp", .{dir});
+    const tmp = try std.fmt.allocPrint(alloc, "{s}/.{s}.tmp", .{ dir, name });
     defer alloc.free(tmp);
     const cwd = std.Io.Dir.cwd();
     var f = cwd.createFile(io, tmp, .{ .truncate = true }) catch |e| return e;
@@ -487,6 +586,10 @@ test "client: mock stream emits deltas then done and writes request.json" {
                     return error.TestUnexpectedResult;
                 },
                 .cancelled => return error.TestUnexpectedResult,
+                .tool_calls => |calls| {
+                    tools.freeCalls(alloc, calls);
+                    return error.TestUnexpectedResult;
+                },
             }
         } else {
             std.Io.sleep(io, .fromMilliseconds(5), .real) catch {};
@@ -526,6 +629,10 @@ test "client: mock error.txt becomes an error event" {
             switch (ev) {
                 .err => |e| saw_err = e,
                 .delta, .done, .cancelled => ev.deinit(alloc),
+                .tool_calls => |calls| {
+                    tools.freeCalls(alloc, calls);
+                    return error.TestUnexpectedResult;
+                },
             }
         } else {
             std.Io.sleep(io, .fromMilliseconds(5), .real) catch {};
@@ -580,4 +687,188 @@ test "client: cancel stops deltas" {
     std.Io.sleep(io, .fromMilliseconds(60), .real) catch {};
     try std.testing.expect(client.pop() == null);
     try std.testing.expect(!client.isRunning());
+}
+
+test "client: tool_calls fragments accumulate while text deltas still stream" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const stream =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"I will read \"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a\"}}]}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"grep\",\"arguments\":\"{\\\"pattern\\\":\\\"x\\\"}\"}}]}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\".zig\\\"}\"}}]}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" ++
+        "data: [DONE]\n\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "stream.sse", .data = stream });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    var client = Client.init(alloc, io);
+    defer client.deinit();
+    try client.start(.{
+        .url = "http://127.0.0.1:1/v1/chat/completions",
+        .body = "{}",
+        .mock_dir = path_buf[0..n],
+        .chunk_bytes = 3,
+        .chunk_delay_ms = 0,
+    });
+
+    var got = std.ArrayList(u8).empty;
+    defer got.deinit(alloc);
+    var calls: ?[]tools.ToolCall = null;
+    var done = false;
+    var waited_ms: u32 = 0;
+    while (!done and waited_ms < 3000) : (waited_ms += 5) {
+        if (client.pop()) |ev| {
+            switch (ev) {
+                .delta => |d| {
+                    defer alloc.free(d);
+                    try got.appendSlice(alloc, d);
+                },
+                .tool_calls => |c| calls = c,
+                .done => done = true,
+                .err => |e| {
+                    std.debug.print("unexpected client error: {s}\n", .{e});
+                    alloc.free(e);
+                    return error.TestUnexpectedResult;
+                },
+                .cancelled => return error.TestUnexpectedResult,
+            }
+        } else {
+            std.Io.sleep(io, .fromMilliseconds(5), .real) catch {};
+        }
+    }
+    defer if (calls) |c| tools.freeCalls(alloc, c);
+    try std.testing.expect(done);
+    try std.testing.expectEqualStrings("I will read ", got.items);
+    const list = calls orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), list.len);
+    try std.testing.expectEqualStrings("call_a", list[0].id);
+    try std.testing.expectEqualStrings("read_file", list[0].name);
+    try std.testing.expectEqualStrings("{\"path\":\"a.zig\"}", list[0].arguments_json);
+    try std.testing.expectEqualStrings("call_b", list[1].id);
+    try std.testing.expectEqualStrings("{\"pattern\":\"x\"}", list[1].arguments_json);
+}
+
+test "client: malformed tool-call fields become a chat error, not a panic" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Valid JSON, but the tool-call entry lacks `index`.
+    const stream =
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_x\",\"function\":{\"name\":\"grep\",\"arguments\":\"{}\"}}]}}]}\n\n" ++
+        "data: [DONE]\n\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "stream.sse", .data = stream });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    var client = Client.init(alloc, io);
+    defer client.deinit();
+    try client.start(.{
+        .url = "http://127.0.0.1:1/v1/chat/completions",
+        .body = "{}",
+        .mock_dir = path_buf[0..n],
+        .chunk_bytes = 5,
+        .chunk_delay_ms = 0,
+    });
+
+    var err_text: ?[]u8 = null;
+    var waited_ms: u32 = 0;
+    while (err_text == null and waited_ms < 3000) : (waited_ms += 5) {
+        if (client.pop()) |ev| {
+            switch (ev) {
+                .err => |e| err_text = e,
+                else => ev.deinit(alloc),
+            }
+        } else {
+            std.Io.sleep(io, .fromMilliseconds(5), .real) catch {};
+        }
+    }
+    defer if (err_text) |e| alloc.free(e);
+    try std.testing.expect(err_text != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_text.?, "tool call protocol") != null);
+    // Wait for the worker to finish so deinit's join is fast.
+    waited_ms = 0;
+    while (client.isRunning() and waited_ms < 3000) : (waited_ms += 5) {
+        while (client.pop()) |ev| ev.deinit(alloc);
+        std.Io.sleep(io, .fromMilliseconds(5), .real) catch {};
+    }
+}
+
+test "client: per-request mock fixtures and request-<n>.json for follow-ups" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "stream-1.sse",
+        .data = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"grep\",\"arguments\":\"{\\\"pattern\\\":\\\"x\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "stream-2.sse",
+        .data = "data: {\"choices\":[{\"delta\":{\"content\":\"final\"}}]}\n\ndata: [DONE]\n\n",
+    });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    var client = Client.init(alloc, io);
+    defer client.deinit();
+
+    // Round 1: tool calls.
+    try client.start(.{ .url = "u", .body = "{\"round\":1}", .mock_dir = path_buf[0..n], .chunk_delay_ms = 0 });
+    var calls: ?[]tools.ToolCall = null;
+    var waited_ms: u32 = 0;
+    while (calls == null and waited_ms < 3000) : (waited_ms += 5) {
+        if (client.pop()) |ev| {
+            switch (ev) {
+                .tool_calls => |c| calls = c,
+                else => ev.deinit(alloc),
+            }
+        } else std.Io.sleep(io, .fromMilliseconds(5), .real) catch {};
+    }
+    defer if (calls) |c| tools.freeCalls(alloc, c);
+    try std.testing.expect(calls != null);
+    // Drain the terminal done, then join before reusing the client.
+    while (client.pop()) |ev| ev.deinit(alloc);
+    client.joinAfterTerminal();
+    try std.testing.expect(!client.isRunning());
+
+    // Round 2: text-only final reply.
+    try client.start(.{ .url = "u", .body = "{\"round\":2}", .mock_dir = path_buf[0..n], .chunk_delay_ms = 0 });
+    var got = std.ArrayList(u8).empty;
+    defer got.deinit(alloc);
+    var done = false;
+    waited_ms = 0;
+    while (!done and waited_ms < 3000) : (waited_ms += 5) {
+        if (client.pop()) |ev| {
+            switch (ev) {
+                .delta => |d| {
+                    defer alloc.free(d);
+                    try got.appendSlice(alloc, d);
+                },
+                .done => done = true,
+                .err => |e| {
+                    std.debug.print("unexpected client error: {s}\n", .{e});
+                    alloc.free(e);
+                    return error.TestUnexpectedResult;
+                },
+                .cancelled, .tool_calls => return error.TestUnexpectedResult,
+            }
+        } else std.Io.sleep(io, .fromMilliseconds(5), .real) catch {};
+    }
+    try std.testing.expect(done);
+    try std.testing.expectEqualStrings("final", got.items);
+
+    const r1 = try tmp.dir.readFileAlloc(io, "request-1.json", alloc, .limited(4096));
+    defer alloc.free(r1);
+    try std.testing.expectEqualStrings("{\"round\":1}", r1);
+    const r2 = try tmp.dir.readFileAlloc(io, "request-2.json", alloc, .limited(4096));
+    defer alloc.free(r2);
+    try std.testing.expectEqualStrings("{\"round\":2}", r2);
+    const latest = try tmp.dir.readFileAlloc(io, "request.json", alloc, .limited(4096));
+    defer alloc.free(latest);
+    try std.testing.expectEqualStrings("{\"round\":2}", latest);
 }
