@@ -17904,8 +17904,11 @@ const scenario_matrix = [_]Scenario{
             .{ .keys = "a", .wait_for = "changes 0" },
             .{ .keys = "\x17a", .wait_for = "chat changes 0" },
             .{ .keys = "c", .wait_for = "approved" },
+            // The approved card shows the real shown-hunk counts, not a
+            // fabricated success summary.
+            .{ .keys = "", .wait_for = "-1 +1 · applied" },
         },
-        .expect_text = &.{ "approved", "changes 0", "PATCH_SCENARIO_NEW", "GOLDEN_EDITOR_MARKER" },
+        .expect_text = &.{ "approved", "u to undo", "changes 0", "PATCH_SCENARIO_NEW", "GOLDEN_EDITOR_MARKER" },
         .request_contains = &.{
             "approval required: apply_patch staged for review; not applied",
             "\"role\":\"tool\"",
