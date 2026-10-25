@@ -897,6 +897,15 @@ fn rowContains(grid: *Grid, r: usize, needle: []const u8) bool {
     return std.mem.indexOf(u8, grid.rowText(r), needle) != null;
 }
 
+/// Index of the first grid row containing `needle`, or null.
+fn findRow(grid: *Grid, needle: []const u8) ?usize {
+    var r: usize = 0;
+    while (r < grid.rows) : (r += 1) {
+        if (rowContains(grid, r, needle)) return r;
+    }
+    return null;
+}
+
 /// true if `needle` appears on row `r` with the given packed fg color on its
 /// first character (row-scoped containsFg). Pins a syntax-color assertion to
 /// one row — e.g. the grep preview column, where the left list may show the
@@ -1772,7 +1781,7 @@ test "auto-pairs: openers close, closers skip, backspace deletes empty pair" {
     try std.testing.expect(!grid.contains("xyz(ab));"));
 
     // quotes pair too, and a second '"' skips over the auto-inserted one.
-    // (Esc twice: the first may only close an open completion menu.)
+    // (Esc closes any open completion menu and exits insert in one press.)
     try sess.send("\x1b\x1bo\"ab\";");
     waited = 0;
     while (!grid.contains("\"ab\";")) {
@@ -1804,7 +1813,7 @@ test "auto-pairs: openers close, closers skip, backspace deletes empty pair" {
     try std.testing.expect(grid.contains("z;"));
     try std.testing.expect(!grid.contains("{z"));
 
-    try sess.send("\x1b\x1b"); // first Esc may only close the completion menu
+    try sess.send("\x1b\x1b"); // Esc exits insert (the extra Esc is a normal-mode no-op)
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     if (exit_code != 0) {
         const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
@@ -8108,7 +8117,7 @@ test "insert Ctrl+n: keyword completion inserts the top candidate" {
     try std.testing.expectEqualStrings("alpha beta gamma\nconst alpha = 1;\nalpha", buf);
 }
 
-test "insert Ctrl+n: Esc dismisses the menu and stays in insert" {
+test "insert Ctrl+n: Ctrl+e hides the menu and stays in insert" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
@@ -8164,9 +8173,11 @@ test "insert Ctrl+n: Esc dismisses the menu and stays in insert" {
     }
     try std.testing.expect(menu_shown);
 
-    // Esc dismisses the menu only — insert mode continues, the typed prefix
-    // stays untouched; further typing still lands in the buffer.
-    try sess.send("\x1b");
+    // Ctrl+e hides the menu only — insert mode continues, the typed prefix
+    // stays untouched; further typing still lands in the buffer. (Esc is the
+    // insert-exit key: it closes the menu AND leaves insert, covered by the
+    // "one Esc leaves insert" regression below.)
+    try sess.send("\x05");
     waited = 0;
     var menu_gone = false;
     while (!menu_gone) {
@@ -10819,6 +10830,251 @@ test "lsp: user flow — b. Ctrl+n stand Enter jk A keeps the cursor at EOL" {
         sess.used += n;
     }
     try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
+}
+
+test "edit: o keeps an EOL inlay hint on its own line (Zig + mock LSP)" {
+    // zls anchors a variable type hint at the end of the declared name,
+    // which is the line end for a legal multiline declaration:
+    //     const foo
+    //         = 1;
+    // `o` inserts a newline at that position without inserting any text
+    // inside the line. The hint must stay on `const foo`; re-anchoring it
+    // to character 0 of the new row made the insert cursor count the stale
+    // label and ride in the middle of the empty line. The mock answers only
+    // the first inlayHint request (slow zls), so the assertions cannot be
+    // repaired by a background refresh.
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}eol.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const foo\n    = 1;\nconst bar = 2;\n");
+    }
+
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{
+        "OZ_LSP_CMD=zig-out/bin/mock_lsp",
+        "OZ_MOCK_SCRIPT=inlay_eol",
+    });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL") or !grid.contains(": eol")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!grid.contains("NORMAL") or !grid.contains(": eol")) {
+        std.debug.print("inlay_eol fixture did not render:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+    try std.testing.expect(grid.contains(": eol"));
+
+    // o on line 0, type a full statement. The new line must be hint-free
+    // and the cursor column must count only the text (no stale label).
+    try sess.send("o");
+    try sess.send("const baz = 3;");
+    try gridWaitFor(&sess, &grid, "const baz = 3;", 5000);
+    {
+        const foo_row = findRow(&grid, "const foo") orelse {
+            std.debug.print("old line vanished after o:\n", .{});
+            grid.dump();
+            return error.TestUnexpectedResult;
+        };
+        const baz_row = findRow(&grid, "const baz = 3;") orelse {
+            std.debug.print("typed line missing after o:\n", .{});
+            grid.dump();
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(rowContains(&grid, foo_row, ": eol"));
+        try std.testing.expect(!rowContains(&grid, baz_row, ": eol"));
+    }
+    try std.testing.expect(grid.contains("line 2/5 col 14"));
+
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+
+    // O above `const bar`: its EOL hint moves down with the line; the new
+    // row stays clean, and the cursor sits on the new row after the indent.
+    try sess.send("jjO");
+    try sess.send("const top = 0;");
+    try gridWaitFor(&sess, &grid, "const top = 0;", 5000);
+    {
+        const top_row = findRow(&grid, "const top = 0;") orelse {
+            std.debug.print("O line missing:\n", .{});
+            grid.dump();
+            return error.TestUnexpectedResult;
+        };
+        const bar_row = findRow(&grid, "const bar = 2;") orelse {
+            std.debug.print("const bar line missing after O:\n", .{});
+            grid.dump();
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(!rowContains(&grid, top_row, ": eol"));
+        try std.testing.expect(rowContains(&grid, bar_row, ": eol"));
+    }
+    try std.testing.expect(grid.contains("line 4/6 col 14"));
+
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    const f = try std.Io.Dir.cwd().openFile(io, name, .{ .mode = .read_only });
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    try std.testing.expectEqualStrings(
+        "const foo\nconst baz = 3;\n    = 1;\nconst top = 0;\nconst bar = 2;\n",
+        buf,
+    );
+}
+
+test "edit: o/O preserve CRLF endings and the cursor row (Zig + mock LSP)" {
+    // A CRLF Zig buffer edited with o/O must stay pure CRLF: the newline is
+    // the line's own terminator (not a bare LF spliced before the old CR),
+    // the cursor lands after the autoindent on the new line, and typing at
+    // EOL never happens between '\r' and '\n'.
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}crlf.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "pub fn main() void {\r\n    const foo = 1;\r\n}\r\n");
+    }
+
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{
+        "OZ_LSP_CMD=zig-out/bin/mock_lsp",
+        "OZ_MOCK_SCRIPT=inlay_eol",
+    });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    // O on the indented line: autoindent 4 + typed 14 = col 18.
+    try sess.send("jO");
+    try sess.send("const top = 0;");
+    try gridWaitFor(&sess, &grid, "const top = 0;", 5000);
+    try std.testing.expect(grid.contains("line 2/5 col 18"));
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+
+    // o below the same line: 4 + 17 = col 21.
+    try sess.send("jo");
+    try sess.send("const bottom = 2;");
+    try gridWaitFor(&sess, &grid, "const bottom = 2;", 5000);
+    try std.testing.expect(grid.contains("line 4/6 col 21"));
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    const f = try std.Io.Dir.cwd().openFile(io, name, .{ .mode = .read_only });
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    try std.testing.expectEqualStrings(
+        "pub fn main() void {\r\n    const top = 0;\r\n    const foo = 1;\r\n    const bottom = 2;\r\n}\r\n",
+        buf,
+    );
+}
+
+test "insert: one Esc leaves insert with an open completion menu" {
+    // With a Zig/zls suggestion menu open, Esc is the insert-exit key (the
+    // menu closes as part of the same press). The old menu-only Esc left a
+    // half-insert state: a following `o` was typed as text, and `:wq` never
+    // reached the command line. Ctrl+e is the stay-in-insert hide mapping.
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}escmenu.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const foo = 1;\n");
+    }
+
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{"OZ_LSP_CMD=zig-out/bin/mock_lsp"});
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    try sess.send("o");
+    // End on a trigger character so the response for the final document
+    // arrives after the last edit and the menu actually opens (typing a
+    // whole word faster than the mock round-trip leaves every response
+    // stale, so no menu ever appears).
+    try sess.send("const target = b.");
+    try gridWaitFor(&sess, &grid, "mockItem", 5000);
+
+    try sess.send("\x1b"); // ONE Esc: close the menu AND leave insert
+    try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    const f = try std.Io.Dir.cwd().openFile(io, name, .{ .mode = .read_only });
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    try std.testing.expectEqualStrings("const foo = 1;\nconst target = b.\n", buf);
 }
 
 test "lsp: signature help — typing ( shows the callee signature" {
@@ -14083,9 +14339,9 @@ test "popup geometry: hover/completion borders align; markdown rendered" {
     try std.testing.expect(!grid.contains("**mock docs**"));
     try std.testing.expect(!grid.contains("```"));
 
-    // The first Esc closes the completion menu/docs, the second leaves
-    // insert mode; only then does ":qa" reach the cmdline. Send them as
-    // separate key events (a single write can be read as an alt sequence).
+    // Esc leaves insert mode AND closes the completion menu/docs in one
+    // press; the second Esc is a normal-mode no-op. Send them as separate
+    // key events (a single write can be read as an alt sequence).
     try sess.send("\x1b");
     try gridWaitGone(&sess, &grid, "mock docs", 3000);
     try sess.send("\x1b");
@@ -19139,8 +19395,6 @@ test "golden: 120x30 docked AI workspace" {
 test "golden: 80x24 narrow AI drawer" {
     try runAiGolden("ai-drawer-80x24", 24, 80, "test/golden/ai-drawer-80x24.txt");
 }
-
-
 
 // ---------------------------------------------------------------------------
 // UI polish: two-row buffer strip (§18.11) and motion (§18.12)

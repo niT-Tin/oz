@@ -1675,6 +1675,7 @@ pub const App = struct {
     pub const invalidateInlayHints = @import("app/search.zig").invalidateInlayHints;
     pub const adjustInlayHintsInsert = @import("app/search.zig").adjustInlayHintsInsert;
     pub const adjustInlayHintsDelete = @import("app/search.zig").adjustInlayHintsDelete;
+    pub const adjustInlayHintsLineOpen = @import("app/search.zig").adjustInlayHintsLineOpen;
     pub const lineHints = @import("app/search.zig").lineHints;
     pub const absolutePath = @import("app/search.zig").absolutePath;
     pub const writeBuffer = @import("app/search.zig").writeBuffer;

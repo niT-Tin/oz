@@ -258,7 +258,7 @@ fn moveLeft(pt: *const PieceTable, pos: u32) u32 {
 fn moveRight(pt: *const PieceTable, pos: u32) u32 {
     const line = pt.lineOf(pos);
     const start = pt.lineStart(line);
-    const line_len = pt.lineLen(line);
+    const line_len = pt.lineTextLen(line);
     // At the last char (multibyte-aware), on the '\n', or past the line
     // end: stay. The byte-based col+1 check would treat a CJK continuation
     // byte as a normal column and walk past the line end.
@@ -279,10 +279,10 @@ fn moveVert(pt: *const PieceTable, pos: u32, dir: i8) u32 {
     const target_line = if (dir > 0) line + 1 else line - 1;
     const start = pt.lineStart(line);
     var col = pos - start;
-    const line_len = pt.lineLen(line);
+    const line_len = pt.lineTextLen(line);
     if (col > line_len) col = line_len; // defensive clamp
     const t_start = pt.lineStart(target_line);
-    const t_len = pt.lineLen(target_line);
+    const t_len = pt.lineTextLen(target_line);
     var t_col = col;
     if (t_col >= t_len) t_col = if (t_len == 0) 0 else lastCharStart(pt, t_start, t_len) - t_start;
     return t_start + t_col;
@@ -296,11 +296,11 @@ pub fn toLineKeepCol(pt: *const PieceTable, pos: u32, target_line: u32) u32 {
     const line = pt.lineOf(@min(pos, pt.len()));
     const start = pt.lineStart(line);
     var col = @min(pos, pt.len()) - start;
-    const line_len = pt.lineLen(line);
+    const line_len = pt.lineTextLen(line);
     if (col > line_len) col = line_len; // defensive clamp
     const tl = @min(target_line, pt.lineCount() - 1);
     const t_start = pt.lineStart(tl);
-    const t_len = pt.lineLen(tl);
+    const t_len = pt.lineTextLen(tl);
     var t_col = col;
     if (t_col >= t_len) t_col = if (t_len == 0) 0 else lastCharStart(pt, t_start, t_len) - t_start;
     return t_start + t_col;
@@ -367,9 +367,9 @@ fn wordNext(pt: *const PieceTable, pos: u32) u32 {
 /// backward (already at/past it: stay).
 fn wordEndFallback(pt: *const PieceTable, pos: u32) u32 {
     var last = pt.lineCount() - 1;
-    if (last > 0 and pt.lineLen(last) == 0) last -= 1;
+    if (last > 0 and pt.lineTextLen(last) == 0) last -= 1;
     const start = pt.lineStart(last);
-    const l = pt.lineLen(last);
+    const l = pt.lineTextLen(last);
     const end_pos = lastCharStart(pt, start, l);
     return if (end_pos > pos) end_pos else pos;
 }
@@ -476,7 +476,7 @@ fn wordPrevEnd(pt: *const PieceTable, pos: u32) u32 {
 fn lineFirstNonBlank(pt: *const PieceTable, pos: u32) u32 {
     const line = pt.lineOf(pos);
     const start = pt.lineStart(line);
-    const line_len = pt.lineLen(line);
+    const line_len = pt.lineTextLen(line);
     var scan = DocScan.init(pt, false);
     var p = start;
     const end = start + line_len;
@@ -492,7 +492,7 @@ fn lineFirstNonBlank(pt: *const PieceTable, pos: u32) u32 {
 fn lineEnd(pt: *const PieceTable, pos: u32) u32 {
     const line = pt.lineOf(pos);
     const start = pt.lineStart(line);
-    const line_len = pt.lineLen(line);
+    const line_len = pt.lineTextLen(line);
     if (line_len == 0) return pos;
     return lastCharStart(pt, start, line_len);
 }
@@ -508,13 +508,13 @@ fn paragraph(pt: *const PieceTable, pos: u32, dir: i8) u32 {
     const line = pt.lineOf(pos);
     const target_line = paragraphTarget(pt, line, dir);
     const start = pt.lineStart(target_line);
-    const len = pt.lineLen(target_line);
+    const len = pt.lineTextLen(target_line);
     if (dir < 0 or len == 0) return start;
     return lastCharStart(pt, start, len);
 }
 
 fn lineIsEmpty(pt: *const PieceTable, line: u32) bool {
-    return pt.lineLen(line) == 0;
+    return pt.lineTextLen(line) == 0;
 }
 
 fn paragraphTarget(pt: *const PieceTable, line: u32, dir: i8) u32 {
@@ -567,7 +567,7 @@ fn findInLine(pt: *const PieceTable, pos: u32, ch: u8, dir: i8, till: bool) u32 
     if (ch == 0) return pos;
     const line = pt.lineOf(pos);
     const start = pt.lineStart(line);
-    const end = start + pt.lineLen(line);
+    const end = start + pt.lineTextLen(line);
     var scan = DocScan.init(pt, dir < 0);
     if (dir > 0) {
         var i = pos + 1;
@@ -603,7 +603,7 @@ fn matchPair(pt: *const PieceTable, pos: u32) u32 {
     if (pos >= len) return pos;
     const line = pt.lineOf(pos);
     const start = pt.lineStart(line);
-    const end = start + pt.lineLen(line);
+    const end = start + pt.lineTextLen(line);
     var scan = DocScan.init(pt, false);
     var p = pos;
     var b = scan.byte(p);

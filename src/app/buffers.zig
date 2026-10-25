@@ -308,8 +308,13 @@ pub fn contentHash(self: *App) u64 {
     return h;
 }
 
-/// Called when an insert session begins (all entry paths).
+/// Called when an insert session begins (all entry paths). A fresh
+/// session must never inherit the previous one's completion menu or its
+/// pending-request bookkeeping (a stale `completion_waiting_enter` made
+/// the first Enter on the new line show "completion pending…" instead of
+/// inserting a newline).
 pub fn beginInsertSession(self: *App) void {
+    self.closeCompletion();
     self.insert_base_hash = self.contentHash();
     self.insert_was_dirty = self.cur().dirty;
 }

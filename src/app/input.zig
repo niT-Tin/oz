@@ -301,12 +301,12 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
             return;
         }
         // ---- insert-mode completion (Ctrl+n and auto-suggest) ----
-        // Esc while the menu is open only dismisses it (stays in insert);
-        // a second Esc exits the insert session as usual.
-        if (self.completion_active and key.codepoint == vaxis.Key.escape) {
-            self.closeCompletion();
-            return;
-        }
+        // Esc always leaves insert, closing an open menu as part of the
+        // same keypress (vim/blink default: Esc is the insert-exit key, not
+        // a menu-only dismiss). The old menu-only Esc left a half-insert
+        // state where the next `o` was typed as text — the report that
+        // `o`/`O` "did the wrong thing" after a Zig/zls suggestion. Ctrl+e
+        // remains the stay-in-insert "hide menu" mapping.
         // Ctrl+e: hide the menu (blink.cmp mapping), stay in insert.
         if (self.completion_active and key.codepoint == 'e' and key.mods.ctrl and !key.mods.alt and !key.mods.super) {
             self.closeCompletion();

@@ -211,8 +211,14 @@ pub fn execOpMotion(self: *App, m: editor.OpMotion) !void {
         var end = self.cur().pt.lineStart(end_line) + self.cur().pt.lineLen(end_line);
         // dd/yy take the trailing newline (the line is gone from the
         // buffer); cc keeps it — vim's change clears the line's TEXT and
-        // puts the cursor on the (now empty) line, not on the next one
-        if (m.op != .change and end_line + 1 < self.cur().pt.lineCount()) end += 1;
+        // puts the cursor on the (now empty) line, not on the next one.
+        // For cc the TEXT end is before a CRLF terminator's '\r', so the
+        // kept terminator is the full "\r\n", not a lone "\r".
+        if (m.op == .change) {
+            end = self.cur().pt.lineStart(end_line) + self.cur().pt.lineTextLen(end_line);
+        } else if (end_line + 1 < self.cur().pt.lineCount()) {
+            end += 1;
+        }
         try self.applyOpRange(m.op, start, end, false, true); // whole-line → linewise register
         return;
     }
@@ -306,13 +312,19 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             self.state.mode = .insert;
         },
         .append => {
-            // a: insert after the character under the cursor
+            // a: insert after the character under the cursor. The EOL is
+            // the end of the line TEXT — never the CR of a CRLF terminator
+            // (typing there would insert between \r and \n and corrupt the
+            // file's line endings).
             const line = self.cur().pt.lineOf(self.curCursor().*);
-            const end = self.cur().pt.lineStart(line) + self.cur().pt.lineLen(line);
+            const ls = self.cur().pt.lineStart(line);
+            const end = ls + self.cur().pt.lineTextLen(line);
             if (self.curCursor().* < end) {
                 var i = self.curCursor().* + 1;
                 while (i < end and (self.cur().pt.byteAt(i) & 0xC0) == 0x80) : (i += 1) {}
                 self.curCursor().* = i;
+            } else if (self.curCursor().* > end) {
+                self.curCursor().* = end;
             }
             self.beginInsertSession();
             self.cur().history.beginGroup();
@@ -323,7 +335,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             // I: first non-blank of the line
             const line = self.cur().pt.lineOf(self.curCursor().*);
             const ls = self.cur().pt.lineStart(line);
-            const end = ls + self.cur().pt.lineLen(line);
+            const end = ls + self.cur().pt.lineTextLen(line);
             var pos = ls;
             while (pos < end) {
                 const c = self.cur().pt.byteAt(pos);
@@ -337,38 +349,44 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             self.state.mode = .insert;
         },
         .append_end => {
-            // A: end of the line
+            // A: end of the line TEXT (before a CRLF terminator's '\r').
             const line = self.cur().pt.lineOf(self.curCursor().*);
-            self.curCursor().* = self.cur().pt.lineStart(line) + self.cur().pt.lineLen(line);
+            self.curCursor().* = self.cur().pt.lineStart(line) + self.cur().pt.lineTextLen(line);
             self.beginInsertSession();
             self.cur().history.beginGroup();
             self.in_insert = true;
             self.state.mode = .insert;
         },
         .insert_line_after => {
-            // o: new line below, cursor on it. The inserted '\n' joins the
-            // insert-session undo group (left open until exitInsert), so
-            // one undo reverts the whole o+typing session.
-            const line = self.cur().pt.lineOf(self.curCursor().*);
-            const pos = self.cur().pt.lineStart(line) + self.cur().pt.lineLen(line);
-            const col = pos - self.cur().pt.lineStart(line);
-            self.beginInsertSession();
-            self.cur().history.beginGroup();
-            try self.cur().history.record(&self.cur().pt, pos, 0, "\n");
-            // Auto-indent: copy the current line's leading whitespace onto
-            // the new line so typing continues at the same indent level.
+            // o: new line below, cursor on it. One record (line ending +
+            // auto-indent) joins the insert-session undo group opened here,
+            // so a single undo reverts the whole o+typing session.
+            const pt = &self.cur().pt;
+            const line = pt.lineOf(self.curCursor().*);
+            const ls = pt.lineStart(line);
+            const text_len = pt.lineTextLen(line);
             const indent = try self.leadingIndent(line);
             defer self.alloc.free(indent);
-            try self.cur().history.record(&self.cur().pt, pos + 1, 0, indent);
-            self.curCursor().* = pos + 1 + @as(u32, @intCast(indent.len));
+            const ending = editor.line_open.preferredEnding(pt, line);
+            const open = try editor.line_open.plan(self.alloc, ending, indent, false);
+            defer open.deinit(self.alloc);
+            // Opening a line is a fresh edit context: drop any completion
+            // menu / pending manual request left by the previous session
+            // (beginInsertSession does this, before the group opens).
+            self.beginInsertSession();
+            self.cur().history.beginGroup();
+            try self.cur().history.record(pt, ls + text_len, 0, open.text);
+            self.curCursor().* = ls + text_len + open.cursor_off;
             self.in_insert = true;
             self.state.mode = .insert;
-            // keep inlay hints aligned (the newline + indent shift lines)
-            self.adjustInlayHintsInsert(line, col, "\n");
-            self.adjustInlayHintsInsert(line + 1, 0, indent);
+            // Re-anchor hints by LINE only: no text was inserted inside the
+            // edited line, so an end-of-line hint belongs to it — moving it
+            // to character 0 of the new row made the insert cursor ride
+            // after stale virtual text. Hints below shift down one line.
+            self.adjustInlayHintsLineOpen(line, false);
             // keep the git gutter marks glued to their lines (o splits the
             // line at its end: content below shifts down one)
-            self.gitShiftInsertAt(line, col, 1);
+            self.gitShiftInsertAt(line, text_len, 1);
             // structural edit (newline): force a full reparse next frame —
             // incremental parsing of a newline is where highlight drift
             // shows up ("o then type then jk leaves gray chars")
@@ -377,21 +395,26 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             self.markDirty();
         },
         .insert_line_before => {
-            // O: new line above, cursor on it (same open-group semantics)
-            const line = self.cur().pt.lineOf(self.curCursor().*);
-            const pos = self.cur().pt.lineStart(line);
-            self.beginInsertSession();
-            self.cur().history.beginGroup();
-            try self.cur().history.record(&self.cur().pt, pos, 0, "\n");
+            // O: new line above, cursor on it (same open-group semantics).
+            // The new row is `indent ++ ending`; the edited line keeps its
+            // own terminator, so a CRLF buffer stays CRLF.
+            const pt = &self.cur().pt;
+            const line = pt.lineOf(self.curCursor().*);
+            const ls = pt.lineStart(line);
             const indent = try self.leadingIndent(line);
             defer self.alloc.free(indent);
-            try self.cur().history.record(&self.cur().pt, pos, 0, indent);
-            self.curCursor().* = pos + @as(u32, @intCast(indent.len));
+            const ending = editor.line_open.preferredEnding(pt, line);
+            const open = try editor.line_open.plan(self.alloc, ending, indent, true);
+            defer open.deinit(self.alloc);
+            self.beginInsertSession();
+            self.cur().history.beginGroup();
+            try self.cur().history.record(pt, ls, 0, open.text);
+            self.curCursor().* = ls + open.cursor_off;
             self.in_insert = true;
             self.state.mode = .insert;
-            // keep inlay hints aligned (a line was inserted above)
-            self.adjustInlayHintsInsert(line, 0, "\n");
-            self.adjustInlayHintsInsert(line, 0, indent);
+            // Hints on the edited line move with it (column unchanged);
+            // nothing is re-anchored onto the new empty row.
+            self.adjustInlayHintsLineOpen(line, true);
             // keep the git gutter marks glued to their lines (O pushes the
             // whole edited line down)
             self.gitShiftInsertAt(line, 0, 1);
@@ -618,15 +641,17 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             self.markDirtyRange(start_pos, end_pos, "");
         },
         .delete_to_eol => {
-            // D: delete to end of line (d$), keeping the newline so the
-            // line is emptied, not removed. vim count: `count` lines
-            // from the cursor (3D = delete to EOL on three lines). The
-            // deleted text fills the unnamed register (charwise).
+            // D: delete to end of line (d$), keeping the terminator so the
+            // line is emptied, not removed. vim count: `count` lines from
+            // the cursor (3D = delete to EOL on three lines). The deleted
+            // text fills the unnamed register (charwise). The TEXT end is
+            // before a CRLF terminator's '\r' (deleting the '\r' would
+            // corrupt the file's line endings).
             const c = self.curCursor().*;
             const pt = &self.cur().pt;
             const line = pt.lineOf(c);
             const end_line = @min(line + @max(count, 1) - 1, pt.lineCount() - 1);
-            const end = pt.lineStart(end_line) + pt.lineLen(end_line);
+            const end = pt.lineStart(end_line) + pt.lineTextLen(end_line);
             if (end > c) {
                 try self.setRegister(c, end, false);
                 // LSP range in the PRE-EDIT document: [c, end).
@@ -647,7 +672,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             const pt = &self.cur().pt;
             const line = pt.lineOf(c);
             const end_line = @min(line + @max(count, 1) - 1, pt.lineCount() - 1);
-            const end = pt.lineStart(end_line) + pt.lineLen(end_line);
+            const end = pt.lineStart(end_line) + pt.lineTextLen(end_line);
             // LSP range in the PRE-EDIT document: [c, end).
             const start_pos = self.lspPositionAt(&self.cur().pt, c);
             const end_pos = self.lspPositionAt(&self.cur().pt, end);
@@ -668,12 +693,13 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
         },
         .change_line => {
             // S: change the whole line (cc) — delete the line's CONTENT
-            // (the newline stays, like vim cc) and enter insert with the
-            // cursor on the emptied line.
+            // (the terminator stays, like vim cc) and enter insert with the
+            // cursor on the emptied line. The content ends before a CRLF
+            // '\r', so the full "\r\n" survives.
             const pt = &self.cur().pt;
             const line = pt.lineOf(self.curCursor().*);
             const start = pt.lineStart(line);
-            const end = start + pt.lineLen(line);
+            const end = start + pt.lineTextLen(line);
             self.curCursor().* = start;
             // LSP range in the PRE-EDIT document: [start, end).
             const start_pos = self.lspPositionAt(&self.cur().pt, start);
@@ -722,32 +748,37 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             self.markDirty();
         },
         .join_lines => {
-            // J: join the current line with the next: remove the newline,
-            // trim the next line's leading whitespace to one space (vim
-            // joins with a single space when the first line is non-empty).
+            // J: join the current line with the next: remove the whole
+            // terminator (`\n` or `\r\n` — removing only the `\n` would
+            // leave a stray `\r` in the text), trim the next line's leading
+            // whitespace to one space (vim joins with a single space when
+            // the first line is non-empty).
             const pt = &self.cur().pt;
             const line = pt.lineOf(self.curCursor().*);
             if (line + 1 >= pt.lineCount()) return;
-            const cur_end = pt.lineStart(line) + pt.lineLen(line);
+            const line_start = pt.lineStart(line);
+            const cur_text_len = pt.lineTextLen(line);
+            const term_start = line_start + cur_text_len;
             const next_start = pt.lineStart(line + 1);
-            const next_len = pt.lineLen(line + 1);
+            const next_len = pt.lineTextLen(line + 1);
+            const term_len = next_start - term_start;
             var next_indent: u32 = 0;
             while (next_indent < next_len) : (next_indent += 1) {
                 const b = pt.byteAt(next_start + next_indent);
                 if (b != ' ' and b != '\t') break;
             }
             self.cur().history.beginGroup();
-            // remove the newline (cur_end, one byte)
-            try self.cur().history.record(pt, cur_end, 1, "");
+            // remove the terminator; the next line now starts at term_start
+            try self.cur().history.record(pt, term_start, term_len, "");
             // collapse leading whitespace of the next line
             if (next_indent > 0) {
-                try self.cur().history.record(pt, next_start - 1, next_indent, "");
+                try self.cur().history.record(pt, term_start, next_indent, "");
             }
             // join with a single space unless the first line is empty.
-            // The next line's first char now sits at next_start - 1 (the
-            // newline is gone); inserting BEFORE it glues the lines.
-            if (cur_end > pt.lineStart(line)) {
-                try self.cur().history.record(pt, next_start - 1, 0, " ");
+            // The next line's first char now sits at term_start; inserting
+            // BEFORE it glues the lines.
+            if (cur_text_len > 0) {
+                try self.cur().history.record(pt, term_start, 0, " ");
             }
             self.cur().history.endGroup();
             self.curCursor().* = @min(self.curCursor().*, pt.len());

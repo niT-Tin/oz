@@ -219,7 +219,7 @@ pub fn utf16Column(self: *App, line: u32, byte_col: u32) u32 {
 pub fn byteColumnFromUtf16(self: *App, line: u32, utf16_col: u32) u32 {
     const pt = &self.cur().pt;
     const ls = pt.lineStart(line);
-    const end = ls + pt.lineLen(line);
+    const end = ls + pt.lineTextLen(line);
     var p = ls;
     var units: u32 = 0;
     while (p < end) {
@@ -268,7 +268,7 @@ pub fn screenCellCol(self: *App, win: vaxis.Window, line: u32, byte_pos: u32) u3
 pub fn isBlankLine(self: *App, buf: *Buffer, l: u32) bool {
     _ = self;
     const ls = buf.pt.lineStart(l);
-    const ll = buf.pt.lineLen(l);
+    const ll = buf.pt.lineTextLen(l);
     var chunk: [128]u8 = undefined;
     var off: u32 = 0;
     while (off < ll) {
@@ -288,7 +288,7 @@ pub fn isBlankLine(self: *App, buf: *Buffer, l: u32) bool {
 pub fn lineIndentLevels(self: *App, buf: *Buffer, l: u32) u32 {
     _ = self;
     const ls = buf.pt.lineStart(l);
-    const ll = buf.pt.lineLen(l);
+    const ll = buf.pt.lineTextLen(l);
     var chunk: [128]u8 = undefined;
     var cols: u32 = 0;
     var off: u32 = 0;
@@ -347,7 +347,7 @@ pub fn blankContextLevels(self: *App, buf: *Buffer, line: u32, line_count: u32) 
 pub fn lineDisplayRows(self: *App, win: vaxis.Window, buf: *Buffer, buf_index: usize, line: u32, content_width: u32) u32 {
     const cw = @max(content_width, 1);
     const ls = buf.pt.lineStart(line);
-    const ll = buf.pt.lineLen(line);
+    const ll = buf.pt.lineTextLen(line);
     var cells: u32 = 0;
     // chunked copyRange scan (per-byte byteAt is O(pieces) — see lineCellCol)
     var chunk: [4096]u8 = undefined;
@@ -809,7 +809,7 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
             }
         }
 
-        const line_len = buf.pt.lineLen(line);
+        const line_len = buf.pt.lineTextLen(line);
         const line_start = buf.pt.lineStart(line);
         // Soft wrap: the WHOLE line renders over as many screen rows as
         // its display cells need — no right-edge clipping. Only the bytes
@@ -884,7 +884,7 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
                 // V (visual_line) selects whole lines
                 if (self.state.mode == .visual_line) {
                     sel_start = buf.pt.lineStart(buf.pt.lineOf(sel_start));
-                    sel_end = buf.pt.lineStart(buf.pt.lineOf(sel_end)) + buf.pt.lineLen(buf.pt.lineOf(sel_end));
+                    sel_end = buf.pt.lineStart(buf.pt.lineOf(sel_end)) + buf.pt.lineTextLen(buf.pt.lineOf(sel_end));
                 }
                 // Ctrl+v (visual_block) selects a rectangle
                 if (self.state.mode == .visual_block) {
@@ -2243,7 +2243,6 @@ pub fn drawStatusChrome(self: *App, win: vaxis.Window) void {
         });
     }
 }
-
 
 /// Fill one strip row span with the strip's flat background. The buffer
 /// strip is a distinct chrome band (demo `.buffer-bar`), so every cell in

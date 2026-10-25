@@ -66,6 +66,15 @@ pub const Script = enum {
     /// document (a stale copy yields stale labels). Script `hello` keeps
     /// its fixed line-0 ": i32" hint for the older tests.
     inlay_range,
+    /// End-of-line inlay hints, zls-shaped: one hint per requested line,
+    /// anchored at the line's TEXT end (after the last content byte, before
+    /// a CRLF/ LF terminator) with label ": eol". zls emits a variable type
+    /// hint at the end of the declared name token, which is at EOL for a
+    /// legal multiline declaration (`const foo\n    = 1;`) — the case that
+    /// exposed the stale-hint shift on `o`. Also models a slow response:
+    /// only the FIRST inlayHint request is answered, so the hints cannot be
+    /// repaired from a fresh document between `o` and the assertions.
+    inlay_eol,
     /// Rich popup fixture: hover markdown with a heading, an arrow glyph
     /// ("→", 3 bytes / 1 cell), a fenced zig block and CJK text; completion
     /// items with detail + markdown documentation and a wide label. Used by
@@ -78,6 +87,7 @@ pub const Script = enum {
         if (std.mem.eql(u8, name, "clear_on_change")) return .clear_on_change;
         if (std.mem.eql(u8, name, "jk_sync")) return .jk_sync;
         if (std.mem.eql(u8, name, "inlay_range")) return .inlay_range;
+        if (std.mem.eql(u8, name, "inlay_eol")) return .inlay_eol;
         if (std.mem.eql(u8, name, "rich")) return .rich;
         return null;
     }
@@ -97,6 +107,10 @@ pub const State = struct {
     changed: std.ArrayList(ChangeRecord) = .empty,
     /// clear_on_change script: the empty publishDiagnostics went out.
     clear_pushed: bool = false,
+    /// inlay_eol script: the single inlayHint response has been sent.
+    /// Later requests are deliberately left unanswered to model a slow
+    /// server (the editor must not rely on a refresh to fix stale hints).
+    inlay_answered: bool = false,
 
     pub const ChangeRecord = struct {
         uri: []u8,
@@ -116,7 +130,6 @@ pub const State = struct {
 
 /// Result of handling one incoming message: zero or more outgoing frame
 /// *bodies* (allocator-owned JSON content, no headers). Call `deinit`.
-
 pub const Outcome = struct {
     frames: std.ArrayList([]u8) = .empty,
 
@@ -237,6 +250,14 @@ pub fn handleMessage(
                 // Echo the recorded text of the REQUESTED uri, one hint per
                 // line of the requested range (see Script.inlay_range).
                 try pushResponse(alloc, &out, id, try buildRangeInlayResult(a, state, msg.params));
+            } else if (script == .inlay_eol) {
+                // Exactly one response, then silence (slow zls): hints the
+                // editor shifted must stay where it put them until the next
+                // insert-exit request, so a stale EOL hint is observable.
+                if (!state.inlay_answered) {
+                    state.inlay_answered = true;
+                    try pushResponse(alloc, &out, id, try buildEolInlayResult(a, state, msg.params));
+                }
             } else {
                 try pushResponse(alloc, &out, id, try buildInlayResult(a));
             }
@@ -722,6 +743,50 @@ fn buildRangeInlayResult(a: std.mem.Allocator, state: *State, params: ?std.json.
     return .{ .array = hints };
 }
 
+/// `inlay_eol` script: one hint per non-empty line of the requested range,
+/// anchored at the line's TEXT end (excluding a trailing CR). Label ": eol".
+/// Mirrors zls's variable-type hint position for a multiline declaration
+/// whose name token ends the line (`const foo\n    = 1;`). The requested
+/// range is always ASCII in the fixture, so UTF-16 vs byte columns coincide.
+fn buildEolInlayResult(a: std.mem.Allocator, state: *State, params: ?std.json.Value) !std.json.Value {
+    var hints = std.json.Array.init(a);
+    errdefer hints.deinit();
+    const p = params orelse return .{ .array = hints };
+    if (p != .object) return .{ .array = hints };
+    const td = p.object.get("textDocument") orelse return .{ .array = hints };
+    if (td != .object) return .{ .array = hints };
+    const uri_v = td.object.get("uri") orelse return .{ .array = hints };
+    if (uri_v != .string) return .{ .array = hints };
+    const range = p.object.get("range") orelse return .{ .array = hints };
+    if (range != .object) return .{ .array = hints };
+    var start_line: u32 = 0;
+    var end_line: u32 = 0;
+    if (!posLineOf(range.object.get("start") orelse return .{ .array = hints }, &start_line)) return .{ .array = hints };
+    if (!posLineOf(range.object.get("end") orelse return .{ .array = hints }, &end_line)) return .{ .array = hints };
+    if (end_line <= start_line) return .{ .array = hints };
+    const text = recordedTextOf(state, uri_v.string) orelse return .{ .array = hints };
+    var line: u32 = 0;
+    var line_start: usize = 0;
+    while (line < end_line and line_start <= text.len) : (line += 1) {
+        const nl = std.mem.indexOfScalarPos(u8, text, line_start, '\n');
+        const line_end = nl orelse text.len;
+        var content_end = line_end;
+        if (content_end > line_start and text[content_end - 1] == '\r') content_end -= 1;
+        if (line >= start_line and content_end > line_start) {
+            var hint = try std.json.ObjectMap.init(a, &.{}, &.{});
+            var pos = try std.json.ObjectMap.init(a, &.{}, &.{});
+            try pos.put(a, "line", .{ .integer = @intCast(line) });
+            try pos.put(a, "character", .{ .integer = @intCast(content_end - line_start) });
+            try hint.put(a, "position", .{ .object = pos });
+            try hint.put(a, "label", .{ .string = ": eol" });
+            try hints.append(.{ .object = hint });
+        }
+        if (nl == null) break;
+        line_start = line_end + 1;
+    }
+    return .{ .array = hints };
+}
+
 fn buildSymbolResult(a: std.mem.Allocator) !std.json.Value {
     var sym = try std.json.ObjectMap.init(a, &.{}, &.{});
     try sym.put(a, "name", .{ .string = "mockFn" });
@@ -975,6 +1040,9 @@ fn printUsage(io: std.Io) void {
         \\           document starts with 'j', else an empty list — detects
         \\           a didChange for a 'j' insertion whose jk-exit removal
         \\           was never synced.
+        \\  inlay_eol  one ": eol" type hint at each requested line's TEXT end
+        \\           (zls multiline-declaration shape); only the first request
+        \\           is answered, modelling a slow server.
         \\  rich    hover/completion fixture for popup geometry: markdown
         \\           heading + arrow + fenced code + CJK hover; completion
         \\           items with detail/docs and a wide label.
@@ -1446,6 +1514,37 @@ test "jk_sync: phantom 'j' in the doc pushes the error; corrected text pushes em
     defer msg_fixed.deinit(alloc);
     const diags_fixed = msg_fixed.params.?.object.get("diagnostics").?.array;
     try testing.expectEqual(@as(usize, 0), diags_fixed.items.len);
+}
+
+test "inlay_eol: hints anchor at the line text end; only the first request answers" {
+    const alloc = testing.allocator;
+    var state = State{};
+    defer state.deinit(alloc);
+    const open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///e.zig\",\"version\":1,\"text\":\"const foo\\n    = 1;\\r\\n\"}}}";
+    var out_open = try handleContent(alloc, .inlay_eol, &state, open);
+    defer out_open.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), out_open.frames.items.len);
+
+    const req = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/inlayHint\",\"params\":{\"textDocument\":{\"uri\":\"file:///e.zig\"},\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":2,\"character\":0}}}}";
+    var out = try handleContent(alloc, .inlay_eol, &state, req);
+    defer out.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), out.frames.items.len);
+    var resp = try json_rpc.parseMessage(alloc, out.frames.items[0]);
+    defer resp.deinit(alloc);
+    const hints = resp.result.?.array;
+    try testing.expectEqual(@as(usize, 2), hints.items.len);
+    // line 0: "const foo" ends at byte 9; line 1: "    = 1;\r" -> text end 8
+    const pos0 = hints.items[0].object.get("position").?.object;
+    const pos1 = hints.items[1].object.get("position").?.object;
+    try testing.expectEqualStrings("9", pos0.get("character").?.number_string);
+    try testing.expectEqualStrings("8", pos1.get("character").?.number_string);
+    try testing.expectEqualStrings(": eol", hints.items[0].object.get("label").?.string);
+
+    // Slow server: a second request gets no response at all, so the editor
+    // cannot repair a shifted hint from a fresh document.
+    var out2 = try handleContent(alloc, .inlay_eol, &state, req);
+    defer out2.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), out2.frames.items.len);
 }
 
 test "format: whole-doc edit is in range and covers the real document" {

@@ -16,6 +16,7 @@ pub const key_event = @import("editor/key_event.zig");
 pub const keymaps = @import("editor/keymaps.zig");
 pub const mode = @import("editor/mode.zig");
 pub const motion = @import("editor/motion.zig");
+pub const line_open = @import("editor/line_open.zig");
 pub const ex_command = @import("editor/ex_command.zig");
 pub const text_object = @import("editor/text_object.zig");
 pub const surround = @import("editor/surround.zig");

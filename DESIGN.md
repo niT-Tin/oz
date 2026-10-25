@@ -31,6 +31,7 @@
 
 - Modal 编辑，六模式：Normal / Insert / Visual / Visual Line / Visual Block / **Command**（vim `:` 命令模式，用户补充，见 §6.7）
 - Leader = `Space`，Insert 下 `jk` 退回 Normal，相对行号，块/beam 光标
+- Insert 的 `Esc` 退出 Insert 并同时关闭补全菜单（一次按键）：不再有"第一次 Esc 只关菜单、仍留在 Insert"的半插入状态；`Ctrl+e` 只隐藏菜单并留在 Insert（对应 blink.cmp 的 hide）
 - 无限 undo/redo、`.` 重复、数字前缀 count
 - 文本对象、surround、注释切换、对齐、自动配对、多光标
 - easymotion 等价物（`s` / `<leader>f`）

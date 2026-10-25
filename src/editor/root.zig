@@ -13,3 +13,4 @@ pub const align_text = @import("align.zig");
 pub const MultiCursor = @import("multicursor.zig").MultiCursor;
 pub const easymotion = @import("easymotion.zig");
 pub const fold = @import("fold.zig");
+pub const line_open = @import("line_open.zig");
