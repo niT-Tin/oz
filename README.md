@@ -82,6 +82,7 @@ A terminal text editor written in Zig.
   - Prompt: Enter send · Ctrl+c cancel · Ctrl+n new thread · Tab → thread list · Ctrl+j/k scroll one line · PageUp/PageDown scroll a page · Esc → editor (drawer: closes)
   - Thread list / workbox: `j`/`k` select · Enter attach · `n`/`+` new thread · `c`/`d`/`t`/`r` Chat/Changes/Tools/Terminal · Tab/Shift+Tab cycle tabs · `q`/Esc → editor
   - `<Ctrl-w> a` re-enters the rail at the thread list from the editor (also opens a closed rail)
+- **Keyboard hints (M2.6a)**: `<leader>j` overlays qutebrowser-style labels (`asdfghjkl`, fixed length 1–3) on every visible target — filetree rows, buffer tabs, agent threads, Workbox tabs, the `+` new-thread button and the prompt row. Type a full label to run the target's normal action, Backspace edits the prefix, Esc cancels with no side effects. A `HINTS · N targets · Esc cancel` indicator appears on the status bar; with nothing visible it reads `HINTS · no targets`. Plain `f` stays vim find-char — hints never take it. Works from the editor, the dashboard, the file tree and the AI thread list (not while typing in the prompt).
 - Streaming OpenAI-compatible completions (`POST {base_url}/chat/completions`, SSE); Markdown + fenced code rendering, auto-scroll
 - Editor context is attached automatically: current file path, visual selection with its 1-based line range, otherwise the cursor line ± a small window (capped at 8 KB)
 - Configuration via env (read when the rail opens):

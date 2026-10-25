@@ -163,6 +163,7 @@ an automatic create.
 | AI thread isolation/cancel/error, selection context | existing deep L3 tests |
 | Layout arithmetic / focus state | property sweeps |
 | AI/frame cell colors and borders | goldens + semantic assertions |
+| Keyboard hints (labels, status, target actions, Esc) | L1 pure model (`src/app/hints.zig`) + L3 `hints:` tests + `@hints` matrix scenarios |
 | Mock LSP protocol | L4 mock server e2e |
 | Deterministic build/test run | `tools/verify.sh` + CI |
 
@@ -174,6 +175,10 @@ Known gaps / deliberate limitations:
 - The browser does not apply: oz is a terminal application.
 - Cursor position observability is not available (see above).
 - Goldens cover two AI workspace frames by design, not every screen/theme.
+- There is intentionally no hint-overlay golden: labels cover the target text and
+  the target count depends on the repository-root filetree entries, so a full-frame
+  golden would be dominated by volatile rows. The dedicated `hints:` e2e tests
+  read labels back from the drawn cells and assert status/border/overflow instead.
 - The file-tree L3 test navigates by key count and is sensitive to new
   top-level repository entries; adding a visible root directory can shift it.
   Keep this in mind when adding repo-root fixtures.

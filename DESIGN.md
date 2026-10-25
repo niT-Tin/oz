@@ -936,7 +936,7 @@ pub const Target = struct { rect: Rect, action: Action };
 
 ### 19.6 里程碑
 
-- **M2.6a**：`<leader>j`、标签生成、tint 覆盖层、文件树/buffer/agent/workbox tab 的目标与动作、Esc/Backspace、单元 + e2e + golden。
+- **M2.6a（已完成，2026-10-25）**：`<leader>j`、标签生成、tint 覆盖层、文件树/buffer/agent/workbox tab 的目标与动作、Esc/Backspace、单元 + e2e。实现状态见 §19.8。
 - **M2.6b**：`<leader>J` secondary actions（split 打开、新 thread）、approval/diff/tool 按钮、`gi` 聚焦输入、目标优先级/去重。
 - **M3**：工具卡片、审批、metrics 的按钮自动注册为 hint target；不引入第二套键盘导航。
 
@@ -946,3 +946,34 @@ pub const Target = struct { rect: Rect, action: Action };
 - e2e：120 dock 打开 hint mode，断言覆盖标签、输入文件树标签打开/展开、输入 buffer tab 标签切换、Esc 取消无副作用；80 drawer 输入 workbox/agent 标签；标签不越界、不覆盖 status bar；普通 `f` 仍是 find-char。
 - 新增 required scenario tag `@hints`；golden 增加 `hints-120x30`（可选）。
 - 性能：微基准只测纯标签生成/匹配（固定 128 targets），不在 e2e 中用墙钟断言。
+
+### 19.8 M2.6a 实现状态（已完成，2026-10-25）
+
+**入口**：`<leader>j`。editor normal / dashboard / 文件树聚焦 / AI 线程列表聚焦均可用。AI rail 聚焦时会先消费所有可打印键，因此线程列表的 `<leader>j` 在 `src/app/ai.zig:handleAiRailKey` 里识别（`rail_pending_leader`）；prompt 聚焦时空格属于输入文本，hint 不从输入框触发（先 Esc/Tab 离开输入框）。文件树聚焦时，pending leader 期间文件树不再吃掉序列尾键（`Mode.leaderPending`），否则 `<leader>j` 的 `j` 会变成移动文件树光标。
+
+**目标（当前约 20 个，取决于布局）**
+
+| 目标 | Action | 复用方法 |
+|---|---|---|
+| 文件树可见行 | `filetree_activate` | `activateFiletreeSelection`（Enter 抽出的同一函数） |
+| buffer tab（单窗口 / split tab bar） | `buffer_select` | `switchTo` |
+| AI 线程行 | `agent_thread_select` | `aiSelectThread`（Enter attach 语义） |
+| Workbox Chat/Changes/Tools/Terminal | `workbox_tab` | `aiSetWorkboxTab` |
+| 新建线程 `+` | `agent_new` | `aiNewThread` |
+| AI 输入框行 | `agent_prompt_focus` | `aiFocusPrompt` |
+
+`Action.filetree_select` 保留在 union 中（API 完整性），M2.6a 不注册——单独的“只选中”没有可观察效果。dashboard 的 `[No Name]` 空 tab 不注册（动作不可观察）。审批/tool 卡片留给 M3 通过同一个 `addHintTarget` API 注册。
+
+**动作与焦点**：`src/app/hint_ui.zig:execHintAction` 只调用上表的既有方法，先做越界检查；动作抛错时 `catch` 转成状态消息，不 panic。焦点由动作本身决定：文件树展开留在文件树、打开文件回 editor（Enter 语义）；buffer 切换回 editor；线程 attach/`+`/输入框聚焦 prompt；Workbox tab 保持当前焦点。Esc/Backspace/无效前缀不修改任何业务状态。
+
+**标签与绘制**：纯模型 `src/app/hints.zig` 不 import App/vaxis：固定 128 容量、comptime 静态标签表（O(1) 生成、零分配）、稳定 row-major 排序（同位置按注册顺序）、前缀/回退/无效前缀/flash、`statusText` 写入 State 自带 buffer（vaxis cell 引用文本直到 `vx.render()`，不能放栈上）。标签画在目标内容区左上角（不盖边框），靠近右边界时整体左移 clamp，且永不绘制终端最后一列；匹配前缀为 accent bg + 深色 fg，其余 dim。状态文字替换状态栏右侧的 AI 状态块：`HINTS · N targets · Esc cancel` / `HINTS · no match · Esc cancel` / `HINTS · no targets`。
+
+**性能**：普通帧只有 `beginFrame` 的一次布尔判断；target 收集只在 hint 帧；排序 n≤128 插入排序；每键前缀匹配 O(n)；overlay 在 `vx.render()` 前一遍绘制，O(targets)，无额外 layout pass。标签生成/匹配的复杂度在模块头注释与单测中固定（729 标签 O(n) 不变量）。
+
+**与最初设计的差异 / 限制**
+
+- 在 §19.2 的 editor/dashboard 之外，额外支持线程列表入口；否则 80 列 drawer 下 prompt 聚焦会吞掉空格，hint 不可达。
+- 容量 128 < 729，`+N more` 在 App 中不可达；纯模型与单测覆盖该分支。
+- target 集合每帧重建。若帧间 target 数变化（resize / rail 开关等），已输入前缀会被清空，避免指向重排后的标签；目标动作本身不改变目标集。
+- 没有 golden：标签会覆盖目标文本，target 数还依赖仓库根目录条目；语义断言（从画面读出标签、状态文字、边框、水平溢出）比整帧 golden 更稳定，见 `test/e2e.zig` 的 hints 测试与 `@hints` scenario。
+- 鼠标仍未接入；hint 与既有键盘路径共享同一批动作方法，没有第二套业务逻辑。
