@@ -1654,6 +1654,17 @@ pub fn renderFiletree(self: *App, a: std.mem.Allocator, win: vaxis.Window, heigh
         @memset(pads, ' ');
         if (pads.len > 0) try segs.append(a, .{ .text = pads, .style = style });
         _ = win.print(segs.items, .{ .row_offset = @intCast(ft_top + 1 + k), .col_offset = @intCast(inner_left), .wrap = .none });
+        if (self.hints.collecting) {
+            // Inner row rect (starts after the left border so a label never
+            // breaks the panel frame). Payload is the absolute row index in
+            // filetree_rows, not the visible slot.
+            self.addHintTarget(.{
+                .row = ft_top + 1 + @as(u32, @intCast(k)),
+                .col = inner_left,
+                .width = usable,
+                .height = 1,
+            }, .{ .filetree_activate = ri });
+        }
     }
     // right border column — mirrors the left one so the panel is a
     // closed box. The title row's "╮" and the bottom row's "╯"
@@ -1906,6 +1917,9 @@ pub fn render(self: *App) !void {
 
     const height: u32 = win.height;
     if (height <= status_row_count) return;
+    // M2.6a hints: clear this frame's target list. One boolean test per
+    // frame outside hint mode; normal frames never touch the fixed array.
+    self.hints.beginFrame(height, win.width);
     // Content area rows: below the tab bar, above the status bar.
     const content_rows = height - status_row_count - self.tabBarRows(a);
 
@@ -1969,6 +1983,17 @@ pub fn render(self: *App) !void {
                 .{ .text = " ", .style = .{ .bg = .{ .rgb = self.theme.bg } } },
             };
             _ = win.print(&segs, .{ .row_offset = 0, .col_offset = col, .wrap = .none });
+            if (self.hints.collecting and !self.isDashboard()) {
+                // Label anchored on the tab's icon (the row's top-left). The
+                // dashboard's empty "[No Name]" tab is deliberately skipped:
+                // activating it has no observable action (no fake targets).
+                self.addHintTarget(.{
+                    .row = 0,
+                    .col = col,
+                    .width = 1 + @as(u32, @intCast(fit.cells)),
+                    .height = 1,
+                }, .{ .buffer_select = tab_i });
+            }
             col +|= @intCast(1 + fit.cells + 1);
             if (col >= editor_w) break;
         }
@@ -2062,6 +2087,14 @@ pub fn render(self: *App) !void {
                         .{ .text = fit.slice, .style = tab_style },
                     };
                     _ = win.print(&segs, .{ .row_offset = @intCast(lli), .col_offset = @intCast(col), .wrap = .none });
+                    if (self.hints.collecting) {
+                        self.addHintTarget(.{
+                            .row = lli,
+                            .col = @intCast(col),
+                            .width = 1 + @as(u32, @intCast(fit.cells)),
+                            .height = 1,
+                        }, .{ .buffer_select = tab_i });
+                    }
                     col += @intCast(1 + fit.cells + 1); // icon + label + gap
                     if (col >= right) break;
                 }
@@ -2187,6 +2220,9 @@ pub fn render(self: *App) !void {
         // places the cursor only when the rail/prompt owns focus; otherwise
         // the dashboard's recent-row cursor stays visible).
         if (self.ai.rail_open) try self.drawAiRail(a, win);
+        // M2.6a: labels + status indicator are the topmost layer, and must be
+        // drawn after rail/filetree/dashboard before the frame is flushed.
+        try self.drawHintOverlay(a, win);
         try self.vx.render(self.tty.writer());
         return;
     }
@@ -3175,8 +3211,11 @@ pub fn render(self: *App) !void {
     }
     // AI workspace status (M2a): active thread · model · status, flush right
     // on the status bar. Kept off the left status text (and git branch);
-    // narrower terminals fall back to the compact/mini forms.
-    if (try self.aiStatusText(a)) |full_ai_text| {
+    // narrower terminals fall back to the compact/mini forms. Hint mode owns
+    // that same right-hand slot (HINTS · N targets · Esc cancel) and
+    // suppresses the AI block so the two indicators never share cells.
+    const ai_status_text: ?[]const u8 = if (self.hints.active) null else try self.aiStatusText(a);
+    if (ai_status_text) |full_ai_text| {
         const avail = win.width -| used_cells -| 2;
         var ai_text = full_ai_text;
         var ai_cells: u32 = @intCast(autil.cellWidth(win, ai_text));
@@ -3252,6 +3291,10 @@ pub fn render(self: *App) !void {
     self.vx.screen.cursor_vis = true;
     self.vx.screen.cursor_shape = if (self.state.mode == .insert) .beam else .block;
 
+    // M2.6a: final overlay pass — labels over every collected target and the
+    // compact hint indicator on the status bar. Drawn after everything else
+    // (editor, rail/workbox, filetree, floats) so it is topmost.
+    try self.drawHintOverlay(a, win);
     try self.vx.render(self.tty.writer());
 }
 

@@ -14577,6 +14577,386 @@ test "ai workspace: error surfaces in the thread and leaves the editor usable" {
 }
 
 // ---------------------------------------------------------------------------
+// M2.6a keyboard hints (DESIGN.md §19)
+// ---------------------------------------------------------------------------
+
+/// Charset of the hint labels (mirrors src/app/hints.zig; the unit tests pin
+/// the implementation, this only reads labels off the drawn grid).
+const hint_charset = "asdfghjkl";
+
+fn hintIsChar(ch: u8) bool {
+    return std.mem.indexOfScalar(u8, hint_charset, ch) != null;
+}
+
+/// Label length implied by the target count shown in the HINTS status.
+fn hintLabelLenFor(count: usize) usize {
+    if (count == 0) return 0;
+    if (count <= 9) return 1;
+    if (count <= 81) return 2;
+    return 3;
+}
+
+/// Parse "HINTS · N targets · Esc cancel" from the bottom row. Returns null
+/// for "HINTS · no targets".
+fn hintTargetCount(grid: *Grid) ?usize {
+    const row = grid.rowText(grid.rows - 1);
+    const at = std.mem.indexOf(u8, row, "HINTS · ") orelse return null;
+    var i = at + "HINTS · ".len;
+    var n: usize = 0;
+    var digits: usize = 0;
+    while (i < row.len and row[i] >= '0' and row[i] <= '9') : (i += 1) {
+        n = n * 10 + (row[i] - '0');
+        digits += 1;
+    }
+    if (digits == 0) return null;
+    return n;
+}
+
+/// Read a drawn hint label from the cells starting at (row, col): exactly
+/// `want` charset glyphs (the length derives from the status target count,
+/// never from a hard-coded letter).
+fn hintLabelAt(grid: *Grid, buf: *[3]u8, row: usize, col: usize, want: usize) []const u8 {
+    var n: usize = 0;
+    const cap = @min(@min(want, buf.len), 3);
+    while (n < cap) : (n += 1) {
+        const text = aiCellText(grid, row, col + n);
+        if (text.len != 1 or !hintIsChar(text[0])) break;
+        buf[n] = text[0];
+    }
+    return buf[0..n];
+}
+
+/// Workbox tabs row (the rail metrics place it one row below the header).
+fn aiTabsRow(rows: usize) usize {
+    return aiWorkboxHeaderRow(rows) + 1;
+}
+
+test "hints: 120x30 dock labels the filetree and activates the docs row" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}hintd.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "hint docs fixture\n");
+    }
+
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, null, 30, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+
+    // File tree rooted at the project cwd: row 2 is the first entry "docs".
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, " files ", 5000);
+    try gridWaitFor(&sess, &grid, "docs", 5000);
+
+    // Docked rail with a thread + prompt, then Esc back to the editor. The
+    // hint entry point is only reachable while the prompt does NOT own the
+    // keyboard.
+    try sess.send("\x17a");
+    try gridWaitFor(&sess, &grid, "agents", 5000);
+    try gridWaitFor(&sess, &grid, "thread 1", 4000);
+    try gridWaitFor(&sess, &grid, "❯ ", 4000);
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+
+    // <leader>j: labels + status, focus unchanged (editor).
+    try sess.send(" j");
+    try gridWaitFor(&sess, &grid, "HINTS ·", 4000);
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    const count = hintTargetCount(&grid) orelse {
+        std.debug.print("docs hints: no target count in status\n", .{});
+        grid.dump();
+        return error.TestUnexpectedResult;
+    };
+    // filetree rows + one buffer tab + thread + 4 workbox tabs + "+" + prompt
+    try std.testing.expect(count >= 7);
+    const want = hintLabelLenFor(count);
+    try std.testing.expect(want >= 1 and want <= 3);
+
+    // The docs row is the first filetree entry row; its label is drawn at the
+    // row's top-left (the inner column after the border). Derive the label
+    // from the frame instead of hard-coding a letter.
+    var label_buf: [3]u8 = undefined;
+    const label = hintLabelAt(&grid, &label_buf, 2, 1, want);
+    if (label.len != want) {
+        std.debug.print("docs hints: could not read label at (2,1): got {d} of {d} chars\n", .{ label.len, want });
+        grid.dump();
+        return error.TestUnexpectedResult;
+    }
+    // Borders stay intact under the overlay: the label starts inside the
+    // panel, and the status bar keeps NORMAL + HINTS on its own row.
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 2, 0));
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    // Typing the full label expands docs exactly like Enter: its children
+    // appear, the folder glyph flips open, hint mode exits.
+    try sess.send(label);
+    try gridWaitFor(&sess, &grid, "workspace-plan", 5000);
+    try gridWaitGone(&sess, &grid, "HINTS ·", 4000);
+    try std.testing.expect(grid.contains("\u{f07c}")); // open folder glyph
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    try aiQuit(&sess);
+}
+
+test "hints: 120x30 dock buffer tab, workbox tab and agent thread targets" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    const tag = tmp_counter;
+    tmp_counter += 1;
+    var path_a_buf: [160:0]u8 = undefined;
+    const path_a = try bufPrintZ(&path_a_buf, "/tmp/ozhint_{d}_{d}a.txt", .{ linux.getpid(), tag });
+    var path_b_buf: [160:0]u8 = undefined;
+    const path_b = try bufPrintZ(&path_b_buf, "/tmp/ozhint_{d}_{d}b.txt", .{ linux.getpid(), tag });
+    var name_b_buf: [128]u8 = undefined;
+    const name_b = try std.fmt.bufPrint(&name_b_buf, "ozhint_{d}_{d}b.txt", .{ linux.getpid(), tag });
+    defer std.Io.Dir.cwd().deleteFile(io, path_a) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path_b) catch {};
+    {
+        const fa = try std.Io.Dir.cwd().createFile(io, path_a, .{ .truncate = true });
+        defer fa.close(io);
+        try fa.writeStreamingAll(io, "HINTS_BUFFER_A\n");
+        const fb = try std.Io.Dir.cwd().createFile(io, path_b, .{ .truncate = true });
+        defer fb.close(io);
+        try fb.writeStreamingAll(io, "HINTS_BUFFER_B\n");
+    }
+
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, path_a }, null, 30, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "HINTS_BUFFER_A", 5000);
+
+    // Second buffer via :e, then back to A so the tab target has an
+    // observable effect (B's marker must disappear then reappear).
+    var cmd_buf: [256]u8 = undefined;
+    const cmd = try std.fmt.bufPrint(&cmd_buf, ":e {s}\r", .{path_b});
+    try sess.send(cmd);
+    try gridWaitFor(&sess, &grid, "HINTS_BUFFER_B", 6000);
+    try sess.send("gT");
+    try gridWaitFor(&sess, &grid, "HINTS_BUFFER_A", 5000);
+    try gridWaitGone(&sess, &grid, "HINTS_BUFFER_B", 3000);
+
+    // Rail + second thread, then back to the editor for hint entry.
+    try sess.send(" a");
+    try gridWaitFor(&sess, &grid, "agents", 5000);
+    try gridWaitFor(&sess, &grid, "thread 1", 4000);
+    try sess.send("\x0e"); // Ctrl+n: new thread -> thread 2, prompt focus
+    try gridWaitFor(&sess, &grid, "thread 2", 5000);
+    try sess.send("\t"); // prompt -> thread list
+    try sess.send("\x1b"); // thread list -> editor (docked rail stays)
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+
+    // Locate the B tab from the DRAWN frame before the overlay replaces its
+    // name: the tab rect starts at the icon, one cell left of the leading
+    // space before the name.
+    const b_name = aiCellIndexOf(&grid, 0, name_b) orelse {
+        std.debug.print("tab hints: B tab not found in row 0\n", .{});
+        grid.dump();
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expect(b_name >= 2);
+
+    try sess.send(" j");
+    try gridWaitFor(&sess, &grid, "HINTS ·", 4000);
+    const count = hintTargetCount(&grid) orelse return error.TestUnexpectedResult;
+    const want = hintLabelLenFor(count);
+    var label_buf: [3]u8 = undefined;
+    const tab_label = hintLabelAt(&grid, &label_buf, 0, b_name - 2, want);
+    if (tab_label.len != want) {
+        std.debug.print("tab hints: could not read buffer-tab label at (0,{d}): {d}/{d}\n", .{ b_name - 2, tab_label.len, want });
+        grid.dump();
+        return error.TestUnexpectedResult;
+    }
+    try sess.send(tab_label);
+    try gridWaitFor(&sess, &grid, "HINTS_BUFFER_B", 5000);
+    try gridWaitGone(&sess, &grid, "HINTS ·", 3000);
+
+    // Workbox tab target: the changes tab starts after "chat" + one space in
+    // the rail's tabs row. Its label activates the tab -> body changes.
+    try sess.send(" j");
+    try gridWaitFor(&sess, &grid, "HINTS ·", 4000);
+    const changes_col = aiRailCol(120) + 2 + "chat ".len;
+    const want2 = hintLabelLenFor(hintTargetCount(&grid) orelse return error.TestUnexpectedResult);
+    var label2_buf: [3]u8 = undefined;
+    const changes_label = hintLabelAt(&grid, &label2_buf, aiTabsRow(30), changes_col, want2);
+    if (changes_label.len != want2) {
+        std.debug.print("tab hints: could not read workbox-tab label at ({d},{d}): {d}/{d}\n", .{ aiTabsRow(30), changes_col, changes_label.len, want2 });
+        grid.dump();
+        return error.TestUnexpectedResult;
+    }
+    try sess.send(changes_label);
+    try gridWaitFor(&sess, &grid, "no pending changes", 5000);
+    try gridWaitGone(&sess, &grid, "HINTS ·", 3000);
+
+    // Agent thread target: thread 1's row is the first thread row; attaching
+    // makes it the workbox header ("thread 1 · idle").
+    try sess.send(" j");
+    try gridWaitFor(&sess, &grid, "HINTS ·", 4000);
+    const want3 = hintLabelLenFor(hintTargetCount(&grid) orelse return error.TestUnexpectedResult);
+    var label3_buf: [3]u8 = undefined;
+    const thread_label = hintLabelAt(&grid, &label3_buf, 2, aiRailCol(120) + 2, want3);
+    if (thread_label.len != want3) {
+        std.debug.print("thread hints: could not read thread label: {d}/{d}\n", .{ thread_label.len, want3 });
+        grid.dump();
+        return error.TestUnexpectedResult;
+    }
+    try sess.send(thread_label);
+    try gridWaitFor(&sess, &grid, "thread 1 ·", 5000);
+    try gridWaitGone(&sess, &grid, "HINTS ·", 3000);
+    // Attaching focused the prompt; hand keys back to the editor before :q.
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+
+    try aiQuit(&sess);
+}
+
+test "hints: 80x24 drawer target works, Esc cancels without side effects" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}hint80.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "hint drawer fixture\n");
+    }
+
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, null, 24, 80);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+
+    // Drawer: <leader>a focuses the prompt, Tab moves to the thread list,
+    // and <leader>j there enters hint mode (the prompt itself keeps text
+    // input, exactly like the design's "prompt not focused" rule).
+    try sess.send(" a");
+    try gridWaitFor(&sess, &grid, "agents", 5000);
+    try gridWaitFor(&sess, &grid, "thread 1", 4000);
+    try sess.send("\t");
+    try sess.send(" j");
+    try gridWaitFor(&sess, &grid, "HINTS ·", 4000);
+
+    const rail_col = aiRailCol(80);
+    try std.testing.expectEqual(@as(usize, 46), rail_col);
+    // Drawer borders survive the overlay; labels live inside the panel.
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 5, rail_col));
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+    const status_rect = frame.Rect{ .top = 23, .left = 0, .right = 79, .bottom = 23 };
+    try std.testing.expect(std.mem.startsWith(u8, grid.rowText(23), "[main]"));
+    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(23), "NORMAL") != null);
+
+    // Activate the changes workbox tab through its drawn label.
+    const count = hintTargetCount(&grid) orelse return error.TestUnexpectedResult;
+    const want = hintLabelLenFor(count);
+    const changes_col = rail_col + 2 + "chat ".len;
+    var label_buf: [3]u8 = undefined;
+    const changes_label = hintLabelAt(&grid, &label_buf, aiTabsRow(24), changes_col, want);
+    if (changes_label.len != want) {
+        std.debug.print("drawer hints: could not read workbox-tab label: {d}/{d}\n", .{ changes_label.len, want });
+        grid.dump();
+        return error.TestUnexpectedResult;
+    }
+    try sess.send(changes_label);
+    try gridWaitFor(&sess, &grid, "no pending changes", 5000);
+    try gridWaitGone(&sess, &grid, "HINTS ·", 3000);
+    // The action itself does not steal focus from the thread list.
+    try std.testing.expectEqual(packRgb(0xE6, 0xC3, 0x84), grid.fg_buf[5 * grid.cols + rail_col]);
+
+    // Re-enter from the rail, type a non-label key (ignored, still active),
+    // then Esc: no state change (changes tab + rail focus survive).
+    try sess.send(" j");
+    try gridWaitFor(&sess, &grid, "HINTS ·", 4000);
+    try sess.send("q");
+    try std.testing.expect(grid.contains("HINTS ·"));
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "HINTS ·", 3000);
+    try std.testing.expect(grid.contains("no pending changes"));
+    try std.testing.expectEqual(packRgb(0xE6, 0xC3, 0x84), grid.fg_buf[5 * grid.cols + rail_col]);
+    try frame.expectNoOverlap(status_rect, frame.Rect{ .top = 0, .left = rail_col, .right = 79, .bottom = 22 });
+
+    // Esc from the thread list closes the drawer and returns keys to the
+    // editor; only then does ":q!" reach the cmdline.
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "changes 0", 3000);
+    try aiQuit(&sess);
+}
+
+test "hints: plain f still runs find-char (not hint mode)" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}hintf.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "abcdef hint find target\n");
+    }
+
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, null, 24, 80);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "abcdef", 5000);
+
+    // f{char} = vim find, then x deletes the char under the cursor. If `f`
+    // had opened hint mode instead, the delete would never happen.
+    try sess.send("fd");
+    try sess.send("x");
+    try gridWaitFor(&sess, &grid, "abcef hint find target", 5000);
+    try std.testing.expect(!grid.contains("abcdef"));
+    try std.testing.expect(!grid.contains("HINTS"));
+
+    try aiQuit(&sess);
+}
+
+test "hints: no targets shows the empty status and Esc exits" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    // No file argument -> dashboard; no filetree/rail -> no hint targets
+    // (the dashboard's empty "[No Name]" tab is deliberately not a target).
+    var sess = try Session.spawnEnvSize(io, &.{oz_exe_path}, null, 24, 80);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "终端文本编辑器", 8000);
+
+    try sess.send(" j");
+    try gridWaitFor(&sess, &grid, "HINTS · no targets", 4000);
+    // A label character with zero targets is ignored; hint mode stays.
+    try sess.send("a");
+    try std.testing.expect(grid.contains("HINTS · no targets"));
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "HINTS ·", 3000);
+
+    try aiQuit(&sess);
+}
+
+// ---------------------------------------------------------------------------
 // Scenario matrix (M2.5): data-driven layout + AI workspace coverage
 // ---------------------------------------------------------------------------
 const frame = @import("frame.zig");
@@ -14617,6 +14997,9 @@ const Scenario = struct {
     expect_absent: []const []const u8 = &.{},
     /// Substrings that must be present in the mock request body.
     request_contains: []const []const u8 = &.{},
+    /// Enter hint mode as the final step (prompt -> Tab -> <leader>j) and
+    /// assert the overlay/status on the settled frame.
+    hints: bool = false,
 };
 
 /// Pairwise layout matrix: 3 widths × filetree {closed,open} × rail
@@ -14741,13 +15124,35 @@ const scenario_matrix = [_]Scenario{
         .expect_text = &.{ "mock reply", "hello", "idle" },
         .request_contains = &.{ "hello", "mock-model" },
     },
+    .{
+        .name = "hints 120x30 dock",
+        .tags = &.{ "@layout", "@ai", "@hints", "@docked", "@120col" },
+        .rows = 30,
+        .cols = 120,
+        .filetree = true,
+        .rail = .docked,
+        .hints = true,
+        .expect_text = &.{ "HINTS", "GOLDEN_EDITOR_MARKER" },
+    },
+    .{
+        .name = "hints 80x24 drawer",
+        .tags = &.{ "@layout", "@ai", "@hints", "@drawer", "@80col" },
+        .rows = 24,
+        .cols = 80,
+        .filetree = true,
+        .rail = .drawer,
+        .hints = true,
+        // The drawer + filetree leave ~16 editor cells visible, so the
+        // fixture marker is clipped; "files" is covered by the box check.
+        .expect_text = &.{"HINTS"},
+    },
 };
 
 /// Every feature tag that must have at least one scenario. A new layout/AI
 /// feature adds its tag here and to at least one Scenario; the coverage test
 /// fails with a clear message otherwise (instead of silently dropping it).
 const required_scenario_tags = [_][]const u8{
-    "@layout", "@ai", "@filetree", "@stream", "@80col", "@100col", "@120col", "@drawer", "@docked",
+    "@layout", "@ai", "@filetree", "@stream", "@hints", "@80col", "@100col", "@120col", "@drawer", "@docked",
 };
 
 fn expectedRailMode(rail: ScenarioRail) ai_ws.RailMode {
@@ -14827,8 +15232,14 @@ fn assertScenario(sc: Scenario, grid: *Grid) !void {
         try std.testing.expectEqualStrings("│", frame.cellText(grid, 0, rr.left));
         try std.testing.expectEqualStrings("│", frame.cellText(grid, rr.bottom, rr.left));
         try frame.expectTextInRegion(grid, rr, "agents");
-        try frame.expectTextInRegion(grid, rr, "thread 1");
-        try frame.expectTextInRegion(grid, rr, "changes 0");
+        // Hint labels are drawn on the thread rows / workbox tabs' top-left
+        // cells, so those labels cover the first 1-3 text cells. The hint
+        // assertion below checks the overlay instead; every other scenario
+        // keeps the full text assertions.
+        if (!sc.hints) {
+            try frame.expectTextInRegion(grid, rr, "thread 1");
+            try frame.expectTextInRegion(grid, rr, "changes 0");
+        }
         try frame.expectCellBg(grid, @as(usize, rows) - 1, @as(usize, cols) - 1, aiStatusBg());
         // The rail stops above the status bar and never shares a cell with
         // it; the editor keeps its reserved width to the left.
@@ -14846,6 +15257,24 @@ fn assertScenario(sc: Scenario, grid: *Grid) !void {
         try frame.expectTextInRegion(grid, visible_editor, "GOLDEN_EDITOR");
     } else {
         try frame.expectNoHorizontalOverflow(grid, @as(usize, cols));
+    }
+
+    if (sc.hints) {
+        const status_row = grid.rowText(@as(usize, rows) - 1);
+        try std.testing.expect(std.mem.indexOf(u8, status_row, "HINTS ·") != null);
+        // The left status text is never overwritten (labels stay on content
+        // rows), and the overlay stays inside the screen.
+        try std.testing.expect(std.mem.startsWith(u8, status_row, "["));
+        try frame.expectNoHorizontalOverflow(grid, @as(usize, cols));
+        if (lay.mode != .hidden) {
+            // Every workbox tab is a target: the first one's top-left cell
+            // holds a charset label glyph, while the rail's left border and
+            // right edge stay untouched.
+            const tabs_row = aiTabsRow(@as(usize, rows));
+            const label_cell = frame.cellText(grid, tabs_row, @as(usize, lay.rail_col) + 2);
+            try std.testing.expect(label_cell.len == 1 and hintIsChar(label_cell[0]));
+            try std.testing.expectEqualStrings("│", frame.cellText(grid, tabs_row, @as(usize, lay.rail_col)));
+        }
     }
 
     if (sc.filetree) {
@@ -14945,6 +15374,16 @@ fn runScenario(sc: Scenario) !void {
     for (sc.steps) |step| {
         if (step.keys.len > 0) try sess.send(step.keys);
         if (step.wait_for) |needle| try gridWaitFor(&sess, &grid, needle, step.timeout_ms);
+    }
+    if (sc.hints) {
+        // Enter hint mode exactly as documented: printable keys only reach
+        // editor.Mode with editor/filetree focus. <leader>a lands on the
+        // prompt (Tab moves to the thread list); the filetree setup above
+        // uses Ctrl+w a, which already lands on the thread list — sending
+        // Tab there would cycle the Workbox tab instead.
+        if (sc.rail != .hidden and !sc.filetree) try sess.send("\t");
+        try sess.send(" j");
+        try gridWaitFor(&sess, &grid, "HINTS ·", 5000);
     }
     try gridSettle(&sess, &grid, 250, 5000);
 

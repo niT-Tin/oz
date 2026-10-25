@@ -23,6 +23,7 @@ const term = @import("term.zig");
 const autil = @import("app/util.zig");
 const git_job = @import("app/git_job.zig");
 const app_ai = @import("app/ai.zig");
+const app_hints = @import("app/hints.zig");
 
 const GitJobKind = git_job.GitJobKind;
 const GitApplyOp = git_job.GitApplyOp;
@@ -668,6 +669,12 @@ pub const App = struct {
     /// status). Not per workspace: the thread survives panel close and
     /// workspace switches.
     ai: app_ai.Session = .{},
+
+    // ---- M2.6a keyboard hints (<leader>j) ----
+    /// Modal target-selection state (DESIGN.md §19). Pure value: fixed
+    /// target array, no allocation, no deinit. Inactive frames only pay one
+    /// boolean test (`collecting`).
+    hints: app_hints.State = .{},
 
     /// The active buffer (the focused window's buffer; per-buffer document
     /// state lives here, per-window cursor/viewport in `windows`).
@@ -1546,6 +1553,14 @@ pub const App = struct {
     pub const clearHover = @import("app/navigation.zig").clearHover;
     pub const jumpToLocation = @import("app/navigation.zig").jumpToLocation;
     pub const navListKey = @import("app/navigation.zig").navListKey;
+    // ---- keyboard hints (M2.6a) → src/app/hint_ui.zig ----
+    pub const HintAction = app_hints.Action;
+    pub const HintRect = app_hints.Rect;
+    pub const beginHintMode = @import("app/hint_ui.zig").beginHintMode;
+    pub const addHintTarget = @import("app/hint_ui.zig").addHintTarget;
+    pub const drawHintOverlay = @import("app/hint_ui.zig").drawHintOverlay;
+    pub const handleHintKey = @import("app/hint_ui.zig").handleHintKey;
+    pub const execHintAction = @import("app/hint_ui.zig").execHintAction;
     // ---- terminal → src/app/terminal.zig ----
     pub const termCwd = @import("app/terminal.zig").termCwd;
     pub const termRect = @import("app/terminal.zig").termRect;
@@ -1681,6 +1696,7 @@ pub const App = struct {
     pub const locateInFiletree = @import("app/filetree.zig").locateInFiletree;
     pub const revealPath = @import("app/filetree.zig").revealPath;
     pub const filetreeKey = @import("app/filetree.zig").filetreeKey;
+    pub const activateFiletreeSelection = @import("app/filetree.zig").activateFiletreeSelection;
     pub const freeFiletreeNode = @import("app/filetree.zig").freeFiletreeNode;
     pub const detectProjectRoot = @import("app/filetree.zig").detectProjectRoot;
     pub const currentRootDir = @import("app/filetree.zig").currentRootDir;
@@ -1759,6 +1775,9 @@ pub const App = struct {
     pub const toggleAiPanel = app_ai.toggleAiPanel;
     pub const focusAiRail = app_ai.focusAiRail;
     pub const aiNewThread = app_ai.aiNewThread;
+    pub const aiSelectThread = app_ai.aiSelectThread;
+    pub const aiFocusPrompt = app_ai.aiFocusPrompt;
+    pub const aiSetWorkboxTab = app_ai.aiSetWorkboxTab;
     pub const aiLoadConfig = app_ai.aiLoadConfig;
     pub const aiSetError = app_ai.aiSetError;
     pub const aiSetErrorFmt = app_ai.aiSetErrorFmt;

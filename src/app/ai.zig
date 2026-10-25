@@ -37,6 +37,10 @@ pub const Session = struct {
     /// Thread-list cursor (may differ from `threads.active` until Enter).
     thread_cursor: usize = 0,
     thread_top: usize = 0,
+    /// `<leader>` pressed while the thread list owns the keyboard, awaiting
+    /// the hint-mode key (`j`). The rail consumes every printable key, so
+    /// `<leader>j` must be recognized here rather than in editor.Mode.
+    rail_pending_leader: bool = false,
 };
 
 // ---- layout / lifecycle ----
@@ -118,6 +122,7 @@ pub fn toggleAiPanel(self: *App) !void {
         // never make the editor unusable.
         aiLoadConfig(self) catch {};
         // Opening is a modal transition: nothing editor-side may be pending.
+        self.ai.rail_pending_leader = false;
         self.pending_window = false;
         self.pending_replace = null;
         if (self.msg) |m| {
@@ -131,6 +136,7 @@ pub fn toggleAiPanel(self: *App) !void {
 /// list. Opens the rail when closed.
 pub fn focusAiRail(self: *App) !void {
     try ensureAi(self);
+    self.ai.rail_pending_leader = false;
     const state = ws.focusRail();
     self.ai.rail_open = state.open;
     self.ai.focus = state.focus;
@@ -142,6 +148,7 @@ pub fn focusAiRail(self: *App) !void {
 /// Esc / q from the rail or prompt. Wide mode keeps the rail visible and
 /// returns keys to the editor; the narrow drawer closes.
 fn aiLeaveRail(self: *App) void {
+    self.ai.rail_pending_leader = false;
     const narrow = aiLayout(self).mode == .drawer;
     const state = ws.leaveRail(self.ai.rail_open, self.ai.focus, narrow);
     self.ai.rail_open = state.open;
@@ -167,12 +174,37 @@ pub fn aiNewThread(self: *App) !void {
 
 fn selectThreadAtCursor(self: *App) void {
     if (self.ai.threads.items.items.len == 0) return;
-    const idx = @min(self.ai.thread_cursor, self.ai.threads.items.items.len - 1);
+    self.aiSelectThread(@min(self.ai.thread_cursor, self.ai.threads.items.items.len - 1));
+}
+
+/// Attach to thread `idx` exactly like Enter in the thread list. Out-of-range
+/// indices are a no-op (hint targets can be stale for one frame).
+pub fn aiSelectThread(self: *App, idx: usize) void {
+    if (idx >= self.ai.threads.items.items.len) return;
     const res = self.ai.threads.select(idx);
     if (res.cancelled) cancelClient(self, res.prev);
     self.ai.thread_cursor = idx;
     self.ai.focus = .prompt;
     self.ai.tab = .chat;
+    ensureThreadVisible(self);
+}
+
+/// Focus the workbox prompt from a hint target: opens the rail if needed
+/// (defensive — the prompt target only exists while the rail is drawn),
+/// attaches to the active thread and moves keyboard focus to its input row.
+pub fn aiFocusPrompt(self: *App) !void {
+    try ensureAi(self);
+    self.ai.rail_open = true;
+    self.ai.focus = .prompt;
+    self.ai.tab = .chat;
+    self.ai.thread_cursor = self.ai.threads.active;
+    ensureThreadVisible(self);
+    aiLoadConfig(self) catch {};
+}
+
+/// Switch the Workbox tab (same method the rail's c/d/t/r keys use).
+pub fn aiSetWorkboxTab(self: *App, tab: WorkboxTab) void {
+    self.ai.tab = tab;
 }
 
 fn moveThreadCursor(self: *App, delta: i32) void {
@@ -294,6 +326,21 @@ fn handleAiPromptKey(self: *App, key: vaxis.Key) !void {
 }
 
 fn handleAiRailKey(self: *App, key: vaxis.Key) !void {
+    // <leader>j: enter hint mode from the thread list (the rail swallows all
+    // printable keys, so this two-key sequence is owned here). Only `j` is
+    // meaningful after the leader; other keys cancel the pending sequence,
+    // matching editor.Mode's leader behavior.
+    if (self.ai.rail_pending_leader) {
+        self.ai.rail_pending_leader = false;
+        if (key.codepoint == 'j' and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
+            self.beginHintMode();
+        }
+        return;
+    }
+    if (key.codepoint == ' ' and key.mods.eql(.{})) {
+        self.ai.rail_pending_leader = true;
+        return;
+    }
     switch (ai.panel.classifyRail(key)) {
         .up => moveThreadCursor(self, -1),
         .down => moveThreadCursor(self, 1),
@@ -967,6 +1014,14 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
             try segs.append(a, .{ .text = try spaces(a, content_w - used - 1), .style = .{ .bg = rail_bg } });
             try segs.append(a, .{ .text = "+", .style = st.accent });
             used = content_w;
+            if (self.hints.collecting) {
+                self.addHintTarget(.{
+                    .row = m.header_row,
+                    .col = x + 2 + content_w - 1,
+                    .width = 1,
+                    .height = 1,
+                }, .agent_new);
+            }
         }
         try drawRailRow(win, a, m.header_row, x, w, "│", border_style, rail_bg, segs.items, used);
     }
@@ -1043,6 +1098,14 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         }
         if (highlight and selected) cursor_row = y;
         try drawRailRow(win, a, y, x, w, "│", border_style, rail_bg, segs.items, used);
+        if (self.hints.collecting) {
+            self.addHintTarget(.{
+                .row = y,
+                .col = x + 2,
+                .width = content_w,
+                .height = 1,
+            }, .{ .agent_thread_select = ti });
+        }
     }
 
     // ---- divider ----
@@ -1095,8 +1158,17 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
                 .{ .fg = .{ .rgb = t.accent }, .bg = .{ .rgb = t.bg_status }, .bold = true }
             else
                 .{ .fg = .{ .rgb = t.fg_dim }, .bg = rail_bg };
+            const label_cells: u32 = @intCast(autil.cellWidth(win, entry.label));
+            if (self.hints.collecting) {
+                self.addHintTarget(.{
+                    .row = m.tabs_row,
+                    .col = x + 2 + used,
+                    .width = label_cells,
+                    .height = 1,
+                }, .{ .workbox_tab = entry.tab });
+            }
             try segs.append(a, .{ .text = entry.label, .style = style });
-            used += @intCast(autil.cellWidth(win, entry.label));
+            used += label_cells;
         }
         try drawRailRow(win, a, m.tabs_row, x, w, "│", border_style, rail_bg, segs.items, used);
     }
@@ -1139,6 +1211,14 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         if (fit.cells > 0) try segs.append(a, .{ .text = fit.slice, .style = st.base });
         const used: u32 = prefix_cells + @as(u32, @intCast(fit.cells));
         try drawRailRow(win, a, prompt_row, x, w, "│", border_style, rail_bg, segs.items, used);
+        if (self.hints.collecting) {
+            self.addHintTarget(.{
+                .row = prompt_row,
+                .col = x + 2,
+                .width = content_w,
+                .height = 1,
+            }, .agent_prompt_focus);
+        }
         if (self.ai.focus == .prompt) {
             const cursor_col = x + 2 + prefix_cells + @as(u32, @intCast(fit.cells));
             self.vx.screen.cursor = .{

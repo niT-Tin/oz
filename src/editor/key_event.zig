@@ -156,6 +156,8 @@ pub const ActionId = enum {
     workspace_next, // <leader> tab ] — next workspace
     // M1 AI chat
     ai_toggle, // <leader>a — toggle the AI chat panel
+    // M2.6a keyboard hints (DESIGN.md §19)
+    hint_mode, // <leader>j — qutebrowser-style hint mode
     // keyboard macros (vim q/@, registers a-z). q starts recording, a bare
     // q stops it (the stop key is intercepted by the caller — see
     // App.handleKey — so the state machine only ever arms the record

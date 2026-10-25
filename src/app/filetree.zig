@@ -287,6 +287,27 @@ pub fn revealPath(self: *App, path: []const u8) !?*TreeNode {
     return null;
 }
 
+/// Activate the selected row exactly like Enter: a directory toggles its
+/// expansion (focus stays in the tree); a file opens and focus moves back to
+/// the buffer so typing edits text instead of the tree. Shared by
+/// `filetreeKey` and the `<leader>j` hint action so the two cannot drift.
+pub fn activateFiletreeSelection(self: *App) !void {
+    const node = self.filetreeNodeAt(self.filetree_sel) orelse return;
+    if (node.is_dir) {
+        if (node.expanded) {
+            try self.collapseDir(node);
+        } else {
+            try self.expandDir(node);
+        }
+    } else {
+        // open the file but keep the tree visible — only <space>e
+        // (toggleFiletree) or Esc closes it; focus moves back to the buffer
+        // so typing edits, not the tree
+        self.focus = .buffer;
+        try self.openFile(node.path);
+    }
+}
+
 /// j/k/Enter/Esc/h/l for the tree; returns true if consumed.
 pub fn filetreeKey(self: *App, key: vaxis.Key) !bool {
     switch (key.codepoint) {
@@ -321,20 +342,7 @@ pub fn filetreeKey(self: *App, key: vaxis.Key) !bool {
             return true;
         },
         vaxis.Key.enter => {
-            const node = self.filetreeNodeAt(self.filetree_sel) orelse return true;
-            if (node.is_dir) {
-                if (node.expanded) {
-                    try self.collapseDir(node);
-                } else {
-                    try self.expandDir(node);
-                }
-            } else {
-                // open the file but keep the tree visible — only
-                // <space>e (toggleFiletree) or Esc closes it; focus moves
-                // back to the buffer so typing edits, not the tree
-                self.focus = .buffer;
-                try self.openFile(node.path);
-            }
+            try self.activateFiletreeSelection();
             return true;
         },
         vaxis.Key.escape => {

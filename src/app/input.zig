@@ -17,6 +17,16 @@ const isWordByte = App.isWordByte;
 // ---- input ----
 
 pub fn handleKey(self: *App, key: vaxis.Key) !void {
+    // Keyboard hints (M2.6a): while the overlay is active it owns every key
+    // — label characters, Backspace and Esc. Routed before terminal/macro/
+    // AI/picker/editor handling so label chars can never leak into a
+    // register, the command line or a prompt. Returning here does NOT stop
+    // the run loop from draining AI streams/background jobs.
+    if (self.hints.active) {
+        try self.handleHintKey(key);
+        return;
+    }
+
     // Terminal focus first: every key belongs to the child (Esc /
     // Alt+r/w/e are intercepted inside handleTerminalKey).
     if (term.supported) {
@@ -162,8 +172,10 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
 
     // File tree navigation (j/k/Enter/Esc); other keys fall through.
     // Only the focused pane reacts: with buffer focus the sidebar stays
-    // visible but hjkl move the buffer cursor.
-    if (self.filetree_active and self.focus == .filetree) {
+    // visible but hjkl move the buffer cursor. A pending <leader> sequence
+    // owns the next key (e.g. <leader>j = hint mode; the tail is `j`, which
+    // the tree would otherwise consume as cursor movement).
+    if (self.filetree_active and self.focus == .filetree and !editor.Mode.leaderPending(&self.state)) {
         if (try self.filetreeKey(key)) return;
     }
 

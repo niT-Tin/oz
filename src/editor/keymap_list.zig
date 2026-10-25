@@ -130,6 +130,7 @@ pub const entries: []const Entry = &.{
     .{ .keys = "space E", .desc = "文件树中定位当前文件", .group = "Leader" },
     .{ .keys = "space o", .desc = "LSP 符号大纲", .group = "Leader" },
     .{ .keys = "space a", .desc = "AI 聊天面板开关", .group = "Leader" },
+    .{ .keys = "space j", .desc = "键盘提示（hint）选择文件树 / tab / 线程 / Workbox", .group = "Leader" },
     .{ .keys = "space sf", .desc = "模糊查找文件", .group = "Leader" },
     .{ .keys = "space st", .desc = "全文 grep 搜索", .group = "Leader" },
     .{ .keys = "space sb", .desc = "Buffer 列表", .group = "Leader" },
