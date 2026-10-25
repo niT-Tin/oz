@@ -757,6 +757,65 @@ src/app/ai.zig  会话状态 / 键处理 / 请求生命周期 / 渲染
 
 ### 17.5 Roadmap
 
-- **M1（本次）**：chat 面板、流式 SSE、上下文、取消、错误降级、mock e2e。
-- **M2**：inline assistant / ghost suggestion；chat 中展示 diff 预览并以 hunk 为单位接受/拒绝（复用 git preview 的 diff 解析与 float 几何）；多轮上下文压缩。
-- **M3**：agent tools（read/search/apply edit，带权限确认）、ACP client、MCP server 接入；tool-call streaming 复用同一 SSE/队列骨架。
+- **M1（已完成）**：centered chat 面板、流式 SSE、上下文、取消、错误降级、mock e2e。
+- **M2**：workspace 化布局（右侧 Agent Rail + Workbox、Notes/Navigator、线程管理）与 inline assistant/diff。
+- **M3**：agent tools（read/search/apply edit，带权限确认）、tool cards、调用次数/平均耗时折线图、ACP client、MCP server 接入。
+
+---
+
+## 18. AI Workspace 布局（M2/M3，2026-10-25 已确认）
+
+参考可交互原型：`.demo/ai-workspace/`（local only，untracked）。原型不是生产代码，只用于确认布局与交互。
+
+### 18.1 布局原则
+
+```text
+[左侧 navigator] [中间 editor / notes] [右侧 Agent Rail + Workbox]
+```
+
+- 不使用“四栏并排”；右侧 rail 是第二个工作面，不是第三个侧栏。
+- Notes 是 **buffer**，不是固定特殊侧栏；Files/Notes/Agents 是左侧 navigator 的 tab。
+- Agent 是 **thread**，不是 pane：可以 attach/detach，关闭 pane 不删除 thread。
+- 线程列表默认按 workspace 分组、扁平排列；只有 parent/child subagent 缩进一层。
+- Workbox 是右侧单主视图 + tab：`Chat / Changes / Tools / Terminal`，避免同时铺开四块内容。
+
+### 18.2 宽度行为
+
+| 宽度 | 行为 |
+|---|---|
+| ≥ 110 列 | 三栏：navigator + editor + rail（rail 38–42 列） |
+| 90–109 列 | 三栏：rail 34 列，navigator 可收窄 |
+| < 90 列 | editor 单栏；rail 作为右侧 overlay drawer，Esc/`a` 关闭 |
+
+Narrow drawer 必须有遮罩/焦点陷阱，不能挤压编辑器到不可用宽度。所有宽度按 cell 计算，不能出现横向溢出。
+
+### 18.3 区域职责
+
+- **Navigator**：`Files / Notes / Agents` 三个 tab；Files 复用现有文件树，Notes 是 note 列表，Agents 是紧凑线程列表。
+- **Agent Rail**：按 workspace 分组的线程；状态点（streaming / waiting approval / idle / error）、未读/待批准 badge、new thread、archive。
+- **Workbox Chat**：M1 的流式对话与输入；tool cards / approval cards 后续内联。
+- **Workbox Changes**：待审 diff / 文件变更，Approve/Reject 与 Chat approval、badge 联动。
+- **Workbox Tools**：M3 工具卡片 + 调用次数 + 平均耗时折线图；空状态不能伪造数据。
+- **Workbox Terminal**：agent 启动的终端输出（M3 后期）。
+
+### 18.4 里程碑拆分
+
+- **M2a（layout shell）**：右侧 dock rail / narrow drawer；线程模型与 thread rail；workbox Chat + Changes（空状态）；现有 `<leader>a` 改为打开/聚焦 rail；保留 M1 streaming/cancel/error。
+- **M2b（notes + inline）**：navigator Notes tab / note buffer；visual 选区 inline assistant；diff float；Approve/Reject + undo。
+- **M3a（tools）**：tool protocol、权限确认、tool cards、read/list/grep/edit/apply_patch；agent loop。
+- **M3b（metrics）**：per-tool count/avg/success/fail；最近 N 次耗时 ring buffer；braille/线条折线图；窄屏 sparkline fallback。
+
+### 18.5 焦点与按键（草案）
+
+- `<leader>a`：打开 rail 并聚焦 workbox 输入；再按 toggle/`Esc` 返回 editor（rail 保持可见）。
+- `Ctrl+w` 在 editor / navigator / rail 之间切换；`Tab` 在 workbox tab 间切换。
+- rail 聚焦时：`j/k` 选 thread，`Enter` attach，`n` new thread，`x` archive，`c/d/t` 切 Chat/Changes/Tools。
+- 输入框聚焦时，所有 editor 快捷键失效（沿用 M1 的 modal input guard）。
+- narrow 模式：`Esc` 关闭 drawer；`a` 重新打开。
+
+### 18.6 验收与测试
+
+- 所有布局在 80/100/120 列下边框/背景对齐，无 cell 溢出。
+- 线程创建/切换/流式隔离；切换线程不会把 A 的 delta 写进 B 的 transcript。
+- Chat/Changes badge 联动；空状态真实，不显示假工具/假数据。
+- 现有 134 个 e2e + 单测全绿；新增 M2a e2e 覆盖 dock/drawer、thread 切换、focus guard。
