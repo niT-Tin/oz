@@ -17,8 +17,8 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-Current counts at the M3b2 implementation commit: **491 unit tests** and
-**175 e2e tests**. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
+Current counts on `feat/ui-chrome` (M3b2 + UI chrome): **491 unit tests**
+and **178 e2e tests**. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
 `.verify/verify.json` (schema version 1, git commit/dirty flag, exact command
 strings, timestamps, exit codes, log SHA-256s, parsed pass/fail counts). It
 runs every command even after a failure and exits non-zero if any command
@@ -121,6 +121,28 @@ git diff -- test/golden/        # review EVERY changed cell/style run
 
 The update prints the exact files written. A missing golden is an error, not
 an automatic create.
+
+### UI chrome assertions
+
+The chrome changes are covered by two focused pty tests (`ui chrome:` filter)
+at 120x30 dock and 80x24 drawer plus the scenario matrix:
+
+- the rail header band (`AGENTS  1`), the two `├──` rules (thread list/workbox
+  header, tab strip/body), the `│`-separated workbox tabs and the active tab's
+  `>` marker + `bg_sel`/accent style (switching to Changes moves the marker);
+- the navigator strip `╭─ files │ notes │ agents ───╮`, its `│` separators and
+  active `bg_sel` tab;
+- the bottom status band: full-width rule row, `[MODE]` badge with accent
+  background, `│` section separators, and the `dock`/`drawer` layout cell;
+- a scan for tofu-prone chrome glyphs (`▥ ● ○ ◌ ✖ ▸ ▾`) in the rail and
+  navigator regions; and
+- a real-git blame test at 120 dock and 80 drawer: the ghost is truncated one
+  cell before the rail, the gap cell stays blank, the rail's own text is not
+  overwritten, and the commit summary never appears in the rail.
+
+The goldens changed only because the chrome moved rows/styles: header band,
+active markers, the two rules and the status band. They were regenerated with
+`OZ_UPDATE_GOLDEN=1` and reviewed cell-by-cell.
 
 ### Notes test seam (`OZ_NOTES_DIR`)
 
@@ -328,6 +350,7 @@ original "staged/not applied" result after a later local approval.
 | AI thread isolation/cancel/error, selection context | existing deep L3 tests |
 | Layout arithmetic / focus state | property sweeps |
 | AI/frame cell colors and borders | goldens + semantic assertions |
+| UI chrome (rail header/rules/tabs, navigator tab separators, status band, blame clipping, tofu-glyph scan) | L3 `ui chrome:` tests + `git: blame ghost clips before the agent rail` + scenario matrix + goldens |
 | Keyboard hints (labels, status, target actions, Esc) | L1 pure model (`src/app/hints.zig`) + L3 `hints:` tests + `@hints` matrix scenarios |
 | Navigator tabs, notes list/create/save/reopen, agents attach | L1 (`src/app/navigator.zig`, `src/app/note_store.zig`) + L3 `navigator:` tests + `@navigator`/`@notes` matrix scenarios |
 | Notes path fallback/error handling | L1 resolution/creation tests + L3 unavailable-dir e2e (`OZ_NOTES_DIR=/dev/null/notes`) |
