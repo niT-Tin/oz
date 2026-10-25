@@ -2323,10 +2323,12 @@ pub fn drawBufferTabPlan(
                 .fg = .{ .rgb = icons.rgbOf(t, icon.color) },
                 .bg = strip_bg,
             };
-        win.writeCell(@intCast(tab_x + tabstrip.pad_left), @intCast(label_row), .{
-            .char = .{ .grapheme = icon.glyph, .width = 1 },
-            .style = icon_style,
-        });
+        if (slot.width > tabstrip.pad_left) {
+            win.writeCell(@intCast(tab_x + tabstrip.pad_left), @intCast(label_row), .{
+                .char = .{ .grapheme = icon.glyph, .width = 1 },
+                .style = icon_style,
+            });
+        }
         const name = if (buf.path) |path| std.fs.path.basename(path) else "[No Name]";
         var kind_fg = t.fg_dim;
         switch (bufferTabKind(self, buf)) {
@@ -2364,7 +2366,7 @@ pub fn drawBufferTabPlan(
                 });
             }
         }
-        if (slot.dirty) {
+        if (slot.dirty and slot.name_alloc > 0) {
             win.writeCell(@intCast(origin + slot.name_x + slot.name_alloc), @intCast(label_row), .{
                 .char = .{ .grapheme = "●", .width = 1 },
                 .style = .{ .fg = .{ .rgb = t.constant }, .bg = body_bg },
@@ -2384,11 +2386,11 @@ pub fn drawBufferTabPlan(
             // the tab's identity, not its two-cell left padding. The close
             // cell is its own target, wired to the SAME close-buffer path as
             // the keyboard commands.
-            if (!dashboard) {
+            if (!dashboard and slot.width > tabstrip.pad_left) {
                 self.addHintTarget(.{
                     .row = label_row,
                     .col = tab_x + tabstrip.pad_left,
-                    .width = slot.width - tabstrip.pad_left,
+                    .width = slot.width -| tabstrip.pad_left,
                     .height = 1,
                 }, .{ .buffer_select = buf_idx });
             }

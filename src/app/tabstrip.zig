@@ -207,15 +207,20 @@ pub fn plan(specs: []const Spec, avail: u32) Plan {
         const spec = specs[i];
         const name_alloc = w -| fixed_cells;
         const truncated = spec.name_cells > name_alloc;
+        // Extremely narrow panes must stay total: clamp the fixed chrome
+        // offsets inside the body and omit the close/dirty affordances when
+        // there is no room for them (instead of underflowing the column).
+        const name_x = x + @min(pad_left + icon_cells + gap_cells, w);
+        const close_x = x + (w -| (pad_right + close_cells));
         out.slots[out.count] = .{
             .index = i,
             .x = x,
             .width = w,
-            .name_x = x + pad_left + icon_cells + gap_cells,
+            .name_x = name_x,
             .name_alloc = name_alloc,
             .truncated = truncated,
-            .close_x = x + w - pad_right - close_cells,
-            .closeable = spec.closeable,
+            .close_x = close_x,
+            .closeable = spec.closeable and name_alloc > 0,
             .active = spec.active,
             .dirty = spec.dirty,
             .first_visible = out.count == 0,
