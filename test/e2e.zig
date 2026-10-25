@@ -14456,10 +14456,10 @@ test "ai workspace: workbox tabs show honest empty states and badge 0" {
     try std.testing.expectEqualStrings("│", aiCellText(&grid, 5, rail_col));
 
     try sess.send("t");
-    try gridWaitFor(&sess, &grid, "tools arrive in M3", 3000);
-    try gridWaitFor(&sess, &grid, "no tool runs recorded", 3000);
+    try gridWaitFor(&sess, &grid, "no tool calls yet", 3000);
     try std.testing.expect(!grid.contains("avg "));
-    try std.testing.expect(!grid.contains("calls"));
+    try std.testing.expect(!grid.contains("calls 1"));
+    try std.testing.expect(!grid.contains("older"));
 
     try sess.send("r");
     try gridWaitFor(&sess, &grid, "agent terminal arrives in M3", 3000);
@@ -15463,6 +15463,678 @@ test "navigator: 80x24 tabs fit and the notes list scrolls" {
 }
 
 // ---------------------------------------------------------------------------
+// M3a agent tools (read-only loop, cards, metrics, chart)
+// ---------------------------------------------------------------------------
+
+/// JSON-escape `text` for embedding as an OpenAI `arguments` STRING value.
+fn aiJsonQuote(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try std.json.Stringify.value(text, .{}, &out.writer);
+    return out.toOwnedSlice();
+}
+
+const AiToolSpec = struct { id: []const u8, name: []const u8, args: []const u8 };
+
+/// One OpenAI tool-call stream chunk sequence with `specs` as parallel calls
+/// in a single delta (index = position). `arguments` is JSON-escaped here.
+fn aiToolCallsSse(alloc: std.mem.Allocator, specs: []const AiToolSpec) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[");
+    for (specs, 0..) |spec, i| {
+        if (i > 0) try out.append(alloc, ',');
+        const quoted = try aiJsonQuote(alloc, spec.args);
+        defer alloc.free(quoted);
+        const entry = try std.fmt.allocPrint(alloc, "{{\"index\":{d},\"id\":\"{s}\",\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"arguments\":{s}}}}}", .{ i, spec.id, spec.name, quoted });
+        defer alloc.free(entry);
+        try out.appendSlice(alloc, entry);
+    }
+    try out.appendSlice(alloc, "]}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n");
+    return out.toOwnedSlice(alloc);
+}
+
+fn aiTextSse(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        alloc,
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{s}\"}}}}]}}\n\ndata: [DONE]\n\n",
+        .{text},
+    );
+}
+
+test "tools: read_file loop renders card, executes against the workspace, metrics and chart" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_tools_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var fixture_buf: [220:0]u8 = undefined;
+    const fixture = try bufPrintZ(&fixture_buf, "{s}/tool_fixture.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, fixture, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "TOOL_MARKER alpha line\nTOOL_SECOND beta line\n");
+    }
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/editor.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "EDITOR_MARKER for tools\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const round1 = try aiToolCallsSse(alloc, &.{.{ .id = "call_1", .name = "read_file", .args = "{\"path\":\"tool_fixture.txt\"}" }});
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "TOOL_DONE final reply");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "EDITOR_MARKER", 5000);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("read the fixture");
+    try gridWaitFor(&sess, &grid, "read the fixture", 3000);
+    try sess.send("\r");
+
+    // Round 1 tool card: running then ok with a real result excerpt.
+    try gridWaitFor(&sess, &grid, "read_file", 10000);
+    try gridWaitFor(&sess, &grid, "tool_fixture.txt", 5000);
+    try gridWaitFor(&sess, &grid, "TOOL_MARKER alpha line", 10000);
+    try gridWaitFor(&sess, &grid, "TOOL_DONE final reply", 10000);
+    try gridWaitFor(&sess, &grid, "idle", 5000);
+    try std.testing.expect(grid.contains("ok "));
+    try std.testing.expect(!grid.contains("approval required"));
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    // The follow-up request carries the assistant tool-call turn and the
+    // role:"tool" result with the exact id, bounded content and tools.
+    const req2 = try aiReadFile(io, alloc, dir, "request-2.json");
+    defer alloc.free(req2);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"role\":\"assistant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_calls\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"role\":\"tool\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "TOOL_MARKER alpha line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_choice\":\"auto\"") != null);
+    const req1 = try aiReadFile(io, alloc, dir, "request-1.json");
+    defer alloc.free(req1);
+    try std.testing.expect(std.mem.indexOf(u8, req1, "\"tools\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req1, "read_file") != null);
+
+    // Tools tab: real per-tool counts and a latency chart (braille at 120).
+    try sess.send("\t");
+    try sess.send("t");
+    try gridWaitFor(&sess, &grid, "calls 1", 5000);
+    try gridWaitFor(&sess, &grid, "ok 1", 5000);
+    try gridWaitFor(&sess, &grid, "avg ", 5000);
+    try gridWaitFor(&sess, &grid, "max ", 5000);
+    try gridWaitFor(&sess, &grid, "older", 5000);
+    try gridWaitFor(&sess, &grid, "now", 5000);
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+    // Metrics are real: exactly one call, no fabricated baseline rows.
+    try std.testing.expect(!grid.contains("grep · calls"));
+    try std.testing.expect(!grid.contains("no tool calls yet"));
+
+    // Tools tab was opened from the thread list; Esc hands keys back to the
+    // editor (wide rail stays), then :q! reaches the cmdline.
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+
+test "tools: parallel read_file + grep cards and real counts" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_tools_par_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var fixture_buf: [220:0]u8 = undefined;
+    const fixture = try bufPrintZ(&fixture_buf, "{s}/par_fixture.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, fixture, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "NEEDLE_PAR first line\nsecond par line\n");
+    }
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/par_editor.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "PAR_EDITOR marker\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_par_a", .name = "read_file", .args = "{\"path\":\"par_fixture.txt\"}" },
+        .{ .id = "call_par_b", .name = "grep", .args = "{\"pattern\":\"NEEDLE_PAR\"}" },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "PARALLEL_DONE final");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try aiEnterRail(&sess, &grid);
+    try sess.send("check both");
+    try sess.send("\r");
+
+    try gridWaitFor(&sess, &grid, "read_file", 10000);
+    try gridWaitFor(&sess, &grid, "grep", 8000);
+    try gridWaitFor(&sess, &grid, "NEEDLE_PAR first line", 10000);
+    try gridWaitFor(&sess, &grid, "PARALLEL_DONE final", 10000);
+    try gridWaitFor(&sess, &grid, "idle", 5000);
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    const req2 = try aiReadFile(io, alloc, dir, "request-2.json");
+    defer alloc.free(req2);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_par_a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_par_b\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "NEEDLE_PAR first line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "par_fixture.txt:1:NEEDLE_PAR") != null);
+
+    try sess.send("\t");
+    try sess.send("t");
+    try gridWaitFor(&sess, &grid, "2 calls", 5000);
+    try gridWaitFor(&sess, &grid, "read_file", 3000);
+    try gridWaitFor(&sess, &grid, "grep", 3000);
+    try gridWaitFor(&sess, &grid, "ok 1", 3000);
+    try gridWaitFor(&sess, &grid, "older", 5000);
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+
+test "tools: missing file card is a real error and the follow-up still completes" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_tools_err_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/err_editor.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "ERR_EDITOR marker\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_missing", .name = "read_file", .args = "{\"path\":\"does_not_exist.txt\"}" },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "ERROR_DONE follow-up completed");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try aiEnterRail(&sess, &grid);
+    try sess.send("read the missing file");
+    try sess.send("\r");
+
+    try gridWaitFor(&sess, &grid, "does_not_exist.txt", 10000);
+    try gridWaitFor(&sess, &grid, "error: not found", 8000);
+    try gridWaitFor(&sess, &grid, "ERROR_DONE follow-up completed", 10000);
+    try gridWaitFor(&sess, &grid, "idle", 5000);
+    try std.testing.expect(!grid.contains("ok 1 · err 0"));
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    const req2 = try aiReadFile(io, alloc, dir, "request-2.json");
+    defer alloc.free(req2);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "error: not found: does_not_exist.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"role\":\"tool\"") != null);
+
+    try sess.send("\t");
+    try sess.send("t");
+    try gridWaitFor(&sess, &grid, "ok 0 · err 1", 5000);
+    try gridWaitFor(&sess, &grid, "calls 1", 5000);
+    try gridWaitFor(&sess, &grid, "older", 5000);
+
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+
+test "tools: edit_file is blocked (approval required), file unchanged, follow-up completes" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_tools_write_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/write_editor.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "EDITOR_MARKER do not change\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_write", .name = "edit_file", .args = "{\"path\":\"write_editor.txt\",\"old_string\":\"do not change\",\"new_string\":\"HACKED\"}" },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "WRITE_DONE approval path");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try aiEnterRail(&sess, &grid);
+    try sess.send("change the marker");
+    try sess.send("\r");
+
+    try gridWaitFor(&sess, &grid, "edit_file", 10000);
+    try gridWaitFor(&sess, &grid, "approval required (M3b)", 8000);
+    try gridWaitFor(&sess, &grid, "WRITE_DONE approval path", 10000);
+    try gridWaitFor(&sess, &grid, "idle", 5000);
+    try std.testing.expect(!grid.contains("HACKED"));
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    const on_disk = try absFileText(io, alloc, editor);
+    defer alloc.free(on_disk);
+    try std.testing.expectEqualStrings("EDITOR_MARKER do not change\n", on_disk);
+
+    const req2 = try aiReadFile(io, alloc, dir, "request-2.json");
+    defer alloc.free(req2);
+    // The assistant turn necessarily echoes the requested arguments (that
+    // is how the provider sees the call); the TOOL RESULT is the security
+    // boundary and must say "not executed". The on-disk assertion above
+    // proves nothing was written.
+    try std.testing.expect(std.mem.indexOf(u8, req2, "approval required: edit_file was not executed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"role\":\"tool\"") != null);
+
+    try sess.send("\t");
+    try sess.send("t");
+    try gridWaitFor(&sess, &grid, "ok 0 · err 0 · appr 1", 5000);
+    try gridWaitFor(&sess, &grid, "no latency samples", 5000);
+    try std.testing.expect(!grid.contains("older"));
+
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+
+test "tools: four-round bound stops execution and sends one final no-tools request" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_tools_rounds_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/round_editor.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "ROUND_EDITOR marker\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var round: usize = 1;
+    while (round <= 4) : (round += 1) {
+        var name_buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "stream-{d}.sse", .{round});
+        var id_buf: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "call_round_{d}", .{round});
+        const sse = try aiToolCallsSse(alloc, &.{
+            .{ .id = id, .name = "read_file", .args = "{\"path\":\"round_editor.txt\"}" },
+        });
+        defer alloc.free(sse);
+        try aiWriteFile(io, dir, name, sse);
+    }
+    const final_sse = try aiTextSse(alloc, "ROUND_CAP final reply");
+    defer alloc.free(final_sse);
+    try aiWriteFile(io, dir, "stream-5.sse", final_sse);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try aiEnterRail(&sess, &grid);
+    try sess.send("keep reading");
+    try sess.send("\r");
+
+    try gridWaitFor(&sess, &grid, "ROUND_CAP final reply", 20000);
+    try gridWaitFor(&sess, &grid, "idle", 5000);
+    try std.testing.expect(grid.contains("tool loop stopped: max rounds"));
+    try std.testing.expect(!grid.contains("call_round_5"));
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    // Five requests total: 1 initial + 3 tool follow-ups + 1 final no-tools
+    // (the 4th tool round is followed by the final request). No 6th request.
+    var req_buf: [300]u8 = undefined;
+    var last_path_buf: [512]u8 = undefined;
+    const req5_path = try std.fmt.bufPrint(&last_path_buf, "{s}/request-5.json", .{dir});
+    try std.testing.expect(pathExists(io, req5_path));
+    const req5 = try aiReadFile(io, alloc, dir, "request-5.json");
+    defer alloc.free(req5);
+    try std.testing.expect(std.mem.indexOf(u8, req5, "\"tool_choice\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, req5, "\"tools\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, req5, "\"role\":\"tool\"") != null);
+    const req6_path = try std.fmt.bufPrint(&req_buf, "{s}/request-6.json", .{dir});
+    try std.testing.expect(!pathExists(io, req6_path));
+
+    try sess.send("\t");
+    try sess.send("t");
+    try gridWaitFor(&sess, &grid, "calls 4", 5000);
+    try gridWaitFor(&sess, &grid, "ok 4 · err 0", 5000);
+
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+
+/// A long text stream: enough paced chunks that a Ctrl+c after the first
+/// visible token arrives before the terminator.
+fn aiSlowTextSse(alloc: std.mem.Allocator, chunks: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < chunks) : (i += 1) {
+        try out.appendSlice(alloc, "data: {\"choices\":[{\"delta\":{\"content\":\"SLOWSTREAM \"}}]}\n\n");
+    }
+    try out.appendSlice(alloc, "data: {\"choices\":[{\"delta\":{\"content\":\"SLOW_END\"}}]}\n\ndata: [DONE]\n\n");
+    return out.toOwnedSlice(alloc);
+}
+
+test "tools: Ctrl+c cancels the follow-up loop; thread 2 has no cards/metrics" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_tools_cancel_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/cancel_editor.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "CANCEL_EDITOR marker\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_cancel", .name = "read_file", .args = "{\"path\":\"cancel_editor.txt\"}" },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiSlowTextSse(alloc, 180);
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try aiEnterRail(&sess, &grid);
+    try sess.send("read then talk");
+    try sess.send("\r");
+
+    try gridWaitFor(&sess, &grid, "read_file", 10000);
+    try gridWaitFor(&sess, &grid, "SLOWSTREAM", 10000);
+    try sess.send("\x03");
+    try gridWaitFor(&sess, &grid, "cancelled", 6000);
+    try gridWaitFor(&sess, &grid, "[stream cancelled]", 4000);
+    // No second follow-up was issued; the cancelled stream never appends its
+    // terminator or a late tool result.
+    try std.testing.expect(!grid.contains("SLOW_END"));
+    var req3_buf: [300]u8 = undefined;
+    const req3_path = try std.fmt.bufPrint(&req3_buf, "{s}/request-3.json", .{dir});
+    try std.testing.expect(!pathExists(io, req3_path));
+
+    // New thread: empty Tools tab, no read_file card from thread 1.
+    try sess.send("\x0e");
+    try gridWaitFor(&sess, &grid, "thread 2", 5000);
+    try sess.send("\t");
+    try sess.send("t");
+    try gridWaitFor(&sess, &grid, "no tool calls yet", 4000);
+    // The empty state legitimately names the read-only tools; cards/metrics
+    // from thread 1 must not appear (no counts, no chart).
+    try std.testing.expect(!grid.contains("calls 1"));
+    try std.testing.expect(!grid.contains("older"));
+
+    // Back to thread 1: the tool result/card survives, metrics are thread-1
+    // only. Enter attaches to the prompt (and returns to Chat); Tab reaches
+    // the thread list again before the `t` tab-switch key.
+    try sess.send("k");
+    try sess.send("\r");
+    try sess.send("\t");
+    try sess.send("t");
+    try gridWaitFor(&sess, &grid, "calls 1", 5000);
+    try gridWaitFor(&sess, &grid, "cancelled", 3000);
+
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+
+test "tools: malformed tool-call protocol becomes a chat error, not a panic or card" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_tools_bad_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/bad_editor.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "BAD_EDITOR marker\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    // Valid JSON, but the tool-call entry has no `index`: the accumulator
+    // rejects it and the client surfaces a typed chat error.
+    try aiWriteFile(io, dir, "stream.sse", "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_bad\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}]}\n\ndata: [DONE]\n\n");
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try aiEnterRail(&sess, &grid);
+    try sess.send("trigger a bad call");
+    try sess.send("\r");
+
+    try gridWaitFor(&sess, &grid, "tool call protocol", 8000);
+    try gridWaitFor(&sess, &grid, "error", 5000);
+    try std.testing.expect(!grid.contains("calls 1"));
+    try std.testing.expect(!grid.contains("approval required"));
+    var req2_buf: [300]u8 = undefined;
+    const req2_path = try std.fmt.bufPrint(&req2_buf, "{s}/request-2.json", .{dir});
+    try std.testing.expect(!pathExists(io, req2_path));
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+
+test "tools: 80x24 drawer fits cards/chart and a hint expands the card" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_tools_80_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var fixture_buf: [220:0]u8 = undefined;
+    const fixture = try bufPrintZ(&fixture_buf, "{s}/drawer_fixture.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, fixture, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "TOOL_MARKER drawer first\nTOOL_SECOND drawer second\n");
+    }
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/drawer_editor.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "DRAWER_EDITOR marker\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_drawer", .name = "read_file", .args = "{\"path\":\"drawer_fixture.txt\"}" },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "DRAWER_DONE final");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try sess.send(" a");
+    try gridWaitFor(&sess, &grid, "agents", 5000);
+    try gridWaitFor(&sess, &grid, "thread 1", 4000);
+    try sess.send("read drawer fixture");
+    try sess.send("\r");
+
+    try gridWaitFor(&sess, &grid, "read_file", 10000);
+    try gridWaitFor(&sess, &grid, "TOOL_MARKER drawer first", 10000);
+    try gridWaitFor(&sess, &grid, "DRAWER_DONE final", 10000);
+    try gridWaitFor(&sess, &grid, "idle", 5000);
+    try std.testing.expect(!grid.contains("TOOL_SECOND drawer second"));
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    // Hint mode from the drawer's thread list; the card's top row keeps its
+    // name visible beyond the 1–2 char label, so derive the label from the
+    // drawn frame instead of hard-coding it.
+    try sess.send("\t");
+    try sess.send(" j");
+    try gridWaitFor(&sess, &grid, "HINTS ·", 4000);
+    const rail_col = aiRailCol(80);
+    var card_row: ?usize = null;
+    var r: usize = 0;
+    while (r + 1 < grid.rows) : (r += 1) {
+        if (std.mem.indexOf(u8, grid.rowText(r), "read_file") != null) {
+            card_row = r;
+            break;
+        }
+    }
+    const row = card_row orelse {
+        std.debug.print("drawer tools: no card row found\n", .{});
+        grid.dump();
+        return error.TestUnexpectedResult;
+    };
+    const count = hintTargetCount(&grid) orelse return error.TestUnexpectedResult;
+    const want = hintLabelLenFor(count);
+    var label_buf: [3]u8 = undefined;
+    const label = hintLabelAt(&grid, &label_buf, row, rail_col + 2, want);
+    if (label.len != want) {
+        std.debug.print("drawer tools: no card label at ({d},{d}): {d}/{d}\n", .{ row, rail_col + 2, label.len, want });
+        grid.dump();
+        return error.TestUnexpectedResult;
+    }
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+    try sess.send(label);
+    try gridWaitFor(&sess, &grid, "TOOL_SECOND drawer second", 5000);
+    try gridWaitGone(&sess, &grid, "HINTS ·", 3000);
+
+    // Tools tab at 80x24: real counts + chart, still no overflow.
+    try sess.send("t");
+    try gridWaitFor(&sess, &grid, "calls 1", 5000);
+    try gridWaitFor(&sess, &grid, "avg ", 5000);
+    try gridWaitFor(&sess, &grid, "older", 5000);
+    try gridWaitFor(&sess, &grid, "now", 5000);
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    try sess.send("\x1b"); // thread list -> editor (drawer closes)
+    try gridWaitFor(&sess, &grid, "NORMAL", 3000);
+    try aiQuit(&sess);
+}
+
+// ---------------------------------------------------------------------------
 // Scenario matrix (M2.5): data-driven layout + AI workspace coverage
 // ---------------------------------------------------------------------------
 const frame = @import("frame.zig");
@@ -15894,6 +16566,10 @@ const Scenario = struct {
     /// M2b2: select the first two lines, run <leader>i with this instruction,
     /// and wait for the pending-review surface (rail opens on Changes).
     inline_prompt: ?[]const u8 = null,
+    /// M3a: write a fixed /tmp fixture plus tool-call round 1 and a text
+    /// round 2, so the agent loop really executes read_file for this
+    /// scenario (instead of a plain text stream).
+    tool_fixture: bool = false,
 };
 
 /// Pairwise layout matrix: 3 widths × filetree {closed,open} × rail
@@ -16051,6 +16727,26 @@ const scenario_matrix = [_]Scenario{
         .request_contains = &.{ "Selected text", "GOLDEN_EDITOR_MARKER", "rewrite the selected lines" },
     },
     .{
+        .name = "ai tools read 120x30",
+        .tags = &.{ "@layout", "@ai", "@tools", "@120col" },
+        .rows = 30,
+        .cols = 120,
+        .setup = .ai_mock,
+        .tool_fixture = true,
+        .rail = .docked,
+        .prompt = "read the scenario fixture",
+        .steps = &.{
+            .{ .keys = "", .wait_for = "TOOL_SCENARIO_MARKER" },
+            .{ .keys = "\t", .wait_for = "thread 1" },
+            .{ .keys = "t", .wait_for = "calls 1" },
+        },
+        // The final frame shows the Tools tab, so the card excerpt is
+        // asserted by the step above (and by request_contains); the Tools
+        // tab itself proves the real call count/chart.
+        .expect_text = &.{ "read_file", "calls 1", "older" },
+        .request_contains = &.{ "\"tool_choice\":\"auto\"", "\"role\":\"tool\"", "TOOL_SCENARIO_MARKER", "read_file" },
+    },
+    .{
         .name = "navigator notes 120x30",
         .tags = &.{ "@layout", "@navigator", "@notes", "@120col" },
         .rows = 30,
@@ -16075,7 +16771,7 @@ const scenario_matrix = [_]Scenario{
 /// feature adds its tag here and to at least one Scenario; the coverage test
 /// fails with a clear message otherwise (instead of silently dropping it).
 const required_scenario_tags = [_][]const u8{
-    "@layout", "@ai",     "@filetree", "@stream", "@hints",  "@navigator", "@notes", "@inline",
+    "@layout", "@ai",     "@filetree", "@stream", "@hints",  "@navigator", "@notes", "@inline", "@tools",
     "@80col",  "@100col", "@120col",   "@drawer", "@docked",
 };
 
@@ -16283,10 +16979,25 @@ fn runScenario(sc: Scenario) !void {
     defer {
         if (mock_dir) |d| std.Io.Dir.cwd().deleteTree(io, d) catch {};
     }
+    defer if (sc.tool_fixture) std.Io.Dir.cwd().deleteFile(io, "/tmp/oz_scenario_tool_fixture.txt") catch {};
     if (sc.setup == .ai_mock) {
         const d = try aiMockDir(io, &dir_buf);
         mock_dir = d;
-        try aiWriteFile(io, d, "stream.sse", scenario_sse);
+        if (sc.tool_fixture) {
+            // The scenario's opened file lives in /tmp, so /tmp is its
+            // project root; the tool path is relative and fixed.
+            try aiWriteFile(io, "/tmp", "oz_scenario_tool_fixture.txt", "TOOL_SCENARIO_MARKER matrix line\n");
+            const round1 = try aiToolCallsSse(alloc, &.{
+                .{ .id = "call_scenario", .name = "read_file", .args = "{\"path\":\"oz_scenario_tool_fixture.txt\"}" },
+            });
+            defer alloc.free(round1);
+            try aiWriteFile(io, d, "stream-1.sse", round1);
+            const round2 = try aiTextSse(alloc, "mock reply tool scenario done");
+            defer alloc.free(round2);
+            try aiWriteFile(io, d, "stream-2.sse", round2);
+        } else {
+            try aiWriteFile(io, d, "stream.sse", scenario_sse);
+        }
         mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{d});
     }
     var notes_dir_buf: [128]u8 = undefined;
@@ -16319,7 +17030,12 @@ fn runScenario(sc: Scenario) !void {
     }
     if (env_len > 0) env_extra = env_storage[0..env_len];
 
-    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, env_extra, sc.rows, sc.cols);
+    // Tool scenarios run with cwd=/tmp so the workspace root is exactly the
+    // directory holding the opened fixture (no dependency on repo .git).
+    var sess = if (sc.tool_fixture)
+        try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, name }, env_extra, sc.rows, sc.cols, "/tmp")
+    else
+        try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, env_extra, sc.rows, sc.cols);
     defer sess.close();
     defer killPid(sess.pid);
     var grid = try Grid.initSizedCols(alloc, sc.rows, sc.cols);
