@@ -859,7 +859,7 @@ Narrow drawer 必须有遮罩/焦点陷阱，不能挤压编辑器到不可用�
 **范围与限制**
 
 - 仅 M2a：不做 tools、真实文件编辑、diff/Approve、Notes/Navigator tab、inline assistant、工具计数/耗时图、agent shell。Changes 显示 `no pending changes`（badge 0）；Tools 显示 `tools arrive in M3`；Terminal 显示 `agent terminal arrives in M3` 并提示现有 `Alt+r`。
-- 线程 archive 未实现；鼠标操作未接入（`j/k` + Enter）。
+- 线程 archive 未实现；鼠标操作见 §21（线程行可点击 attach、滚轮移动选择）。
 - 现有 `[stream cancelled]` 是 UI 标记，不是协议消息。
 
 **文件**
@@ -1131,7 +1131,7 @@ pub const Target = struct { rect: Rect, action: Action };
 - 容量 128 < 729，`+N more` 在 App 中不可达；纯模型与单测覆盖该分支。
 - target 集合每帧重建。若帧间 target 数变化（resize / rail 开关等），已输入前缀会被清空，避免指向重排后的标签；目标动作本身不改变目标集。
 - 没有 golden：标签会覆盖目标文本，target 数还依赖仓库根目录条目；语义断言（从画面读出标签、状态文字、边框、水平溢出）比整帧 golden 更稳定，见 `test/e2e.zig` 的 hints 测试与 `@hints` scenario。
-- 鼠标仍未接入；hint 与既有键盘路径共享同一批动作方法，没有第二套业务逻辑。
+- 鼠标支持见 §21：hint target 同时作为命中区域，鼠标与键盘共享同一批动作方法，没有第二套业务逻辑。
 - M2b1 追加 `navigator_tab`（复用 `navigatorSetTab`）与 `note_open`（复用 `openNoteAt`）两个动作；`agent_thread_select` 现在先打开 rail，保证从 navigator 的 Agents tab 触发时 attach 可见。navigator 的 tab strip 与 Notes 行都注册为 target，e2e 从画面读取标签后激活。
 - M2b2 追加 `inline_approve` / `inline_reject`：Changes 的 pending diff 渲染 `[a] approve  [r] reject` 两行按钮时注册矩形，动作分别复用 `inlineApprove` / `inlineReject`，与键盘 `a`/Enter、`r`/`d` 是同一条路径。
 - M3b1 追加 `agent_approve` / `agent_reject`：通用 Changes review 渲染器（`inline_ui.drawDiffReview`）把按钮动作作为参数传入，agent edit 走 `agentEditApprove` / `agentEditReject`，与键盘路径一致。
@@ -1231,7 +1231,7 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 - 只执行 `read_file`/`list_directory`/`grep`；写入工具在 M3a 永远返回 approval/unsupported，不创建 pending diff、不写盘。没有 terminal/shell/网络工具。（M3b1 扩展见 §20.9：`edit_file` 在 App 层 staged，executor 仍然只读。）
 - `read_file`/`grep` 只读 workspace root（拒绝绝对路径、`..`、NUL、越界 symlink；输出 workspace-relative）。这是 best-effort confinement，不声称 TOCTOU 安全（与 §20.3 一致）。
 - metrics 是 per-thread、session 级、不持久化；被取消/被 generation 丢弃的 in-flight 调用不计数（只统计真正应用回该 thread 的结果）。没有 p95、没有跨会话图表、没有 mock 数据注入发布 UI。
-- tool card 展开只通过 hint（无鼠标/卡片光标）；M3b 再加审批按钮与完整 hint 覆盖。
+- tool card 展开通过 hint 或鼠标点击（见 §21）；M3b 再加审批按钮与完整 hint 覆盖。
 - 最终 no-tools turn 由 `agent.max_*` 常量触发；如果 provider 忽略无 tools 请求仍返回 tool_calls，只记录 unsupported 后停止（有界）。
 - 未新增 terminal/MCP/ACP；`ai/tool_exec.zig` 的 caps 与 §20.3 一致。
 
@@ -1282,7 +1282,7 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 - 预览是有界 hunk，不是整文件 unified diff；超过 256 KiB 的文件拒绝 stage；没有 word-level diff、hunk 折叠或软换行。
 - stage 后自动 follow-up 已把 “staged/not applied” 结果发给模型；之后 approve 只更新本地卡片，模型 transcript 不会追认该批准（M3b 后续可加通知）。这是本切片的明确限制，不是假成功。
 - 路径校验是 best-effort（与 executor 相同，不声称 TOCTOU 安全）；符号链接别名可能被当作不同路径处理。
-- 无鼠标；hint 与键盘共用同一 approve/reject 方法。
+- 鼠标见 §21；hint、键盘与鼠标共用同一 approve/reject 方法。
 
 **文件**
 
@@ -1332,7 +1332,7 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 - 上限：patch/目标/结果 ≤256 KiB、≤256 hunks、≤16K hunk 行；超出即拒绝，不静默截断应用。
 - stage 后的自动 follow-up 已把 “staged/not applied” 发给模型；之后 approve 只更新本地卡片，模型 transcript 不会追认（与 M3b1 相同）。
 - 路径校验是 best-effort（与 executor 相同，不声称 TOCTOU 安全）；符号链接别名可能被当作不同路径。
-- 无 terminal/shell/网络；无鼠标；pending 不跨进程持久化。
+- 无 terminal/shell/网络；鼠标见 §21；pending 不跨进程持久化。
 
 **文件**
 
@@ -1349,3 +1349,80 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 - `zig build test`：491/491 通过（新增 17 个 `agent_patch`/`agent_edit` 纯模型单测）。
 - `zig build e2e`：175/175 通过（新增 5 个 M3b2 pty 测试；scenario matrix 新增 `ai patch approval 120x30`）。
 - 无 golden 变更（approval diff/卡片不进入固定 golden 帧）。
+
+---
+
+## 21. Mouse 支持（feat/mouse，2026-10-26）
+
+### 21.1 范围与不变量
+
+- **v1 目标**：鼠标左键点击窗口/标签/行/按钮，滚轮滚动编辑器与列表。点击必须真正执行既有动作，不新增第二套业务逻辑。
+- **不变量**：鼠标只能调用键盘/hint 已经存在的 App 方法（`execHintAction`、`switchWindowTo`、`closeBufferAt`、`aiSelectThread`、`aiSetWorkboxTab`、`aiFocusPrompt`、approve/reject…）。审批、stale 校验、dirty 语义、workspace 边界与 `:w` 仍是用户动作，鼠标不能绕过。
+- **v1 不做**：拖拽、分隔线 resize、右键/中键菜单、文本拖选、终端内鼠标转发、精确 grapheme/soft-wrap 逐 cell 反查。
+- **布局**：80/100/120 列均使用同一套目标矩形；鼠标不改变任何布局、golden 或状态栏几何。
+
+### 21.2 生命周期（vaxis）
+
+- `src/app/render.zig:run` 在 enter alt screen + bracketed paste 之后调用 `enableMouse`：
+  - 强制 `caps.sgr_pixels = false`，即使终端宣告 SGR pixel 模式也使用 **cell 坐标**（命中矩形都是 cell）；`setMouseMode(true)` 失败只关闭鼠标功能，应用继续以键盘模式启动。
+  - 启用后 `defer disableMouse`；正常退出在 `exitAltScreen` 之前显式关闭，错误路径由 defer 兜底。
+  - `disableMouse` 幂等：成功后清 `vx.state.mouse`，避免 `Vaxis.deinit` 再发一次 reset；失败则保留状态让 deinit 重试。e2e 断言退出后 reset 恰好一次、且在 enable 之后。
+- vaxis 的 `mouse_set` 同时打开 1002/1003/1004/1006（cell）。loop 只处理 **left press** 与 **wheel press**；motion/drag/release/未绑定按键返回 false，不会触发渲染，也不会接管终端自身的拖选。
+- **复制/选择**：应用无法阻止终端上报鼠标；常规终端用 **Shift+拖拽** 绕过 mouse reporting 做本地选择/复制（终端相关）。若终端仍上报带 Shift 的事件，oz 直接忽略，交给终端语义。
+- `Alt+r/w/e` 终端键位不受影响；鼠标报告的增强不会改变键盘路径。1b47588 的 vaxis 日志抑制仍由 `src/main.zig` 的 scope levels 保证。
+
+### 21.3 命中测试（`src/app/mouse.zig` + `mouse_ui.zig`）
+
+- **单一几何来源**：hint 渲染路径本来就在绘制时注册每个可点击目标（buffer tab、close ×、filetree/notes/agents 行、navigator tab、AI thread、workbox tab、`+`、prompt、tool card、Approve/Reject）。鼠标帧把 `if (self.hints.collecting)` 放宽为 `mouseTargetsCollecting()`，`addHintTarget` 同时写入鼠标 registry，因此矩形/action 不会与 hint 漂移；**hint 标签仍只在 hint mode 绘制**（overlay 仍以 `hints.active` 为门）。
+- **mouse-only 目标**：
+  - 每个 split leaf：点击聚焦 + 定位光标，滚轮移动该窗口光标；
+  - 分隔线：1 cell 厚的显式 no-op（v1 不 resize），按面积优先于相邻 pane；
+  - 滚轮区域：编辑器 pane、navigator 列表（按当前 tab）、AI thread list、workbox body。
+- **优先级**：命中所有包含该 cell 的目标，取 **面积最小** 者；面积相同取后注册（绘制更上层）者。因此 close `×`(1×1) > tab、按钮(整段标签) > card/行、分隔线 > pane。
+- **容量/分配**：`max_targets = 256` 固定数组，每帧 `beginFrame` O(1) 清零，无堆分配；越界/屏幕外矩形裁剪或丢弃。
+- **模态隔离**：hint mode、picker、diag/nav list、git preview、inline prompt、command mode 下鼠标完全忽略；drawer rail 覆盖编辑器时，rail 外的目标不会从抽屉下方“穿透”接收点击/滚轮。
+- **空区域**：编辑器 pane 空白处只聚焦/定位；状态栏、面板空白、无目标 body 全部 no-op，不伪造动作。
+
+### 21.4 点击动作
+
+- 所有 hint action 直接调用 `execHintAction`，与 `<leader>j` 完全同一路径；指针点击前会：
+  - 若处于 Insert，先执行 `exitInsert()`（保留文本、结束 undo group）；
+  - 清 pending leader/operator/replace、multi-cursor 与旧 status message；
+  - 终端若持有焦点且点击发生在终端外，先取消终端焦点；
+  - buffer/tree/notes/navigator 目标把键盘焦点交回 editor；AI thread/workbox/prompt 目标保留 AI focus，由既有方法决定。
+- terminal overlay 优先命中：点击终端矩形聚焦子进程；点击其他位置回到编辑器。wheel 在终端聚焦或位于终端矩形上时 **不抢**（vaxis terminal widget 无鼠标转发）。
+- 点击 tab 的 `×` 仍走 `closeBufferAt`（与 `:bd`/`<leader>bk` 相同；最后一个 buffer 不注册 close 目标）；点击 Approve/Reject 仍走 `inlineApprove`/`agentEditApprove` 等，stale/one-pending/线程隔离规则不变。
+
+### 21.5 编辑器 pane 定位
+
+- 点击 leaf 后先按 **该窗口** 的当前渲染状态反查：
+  - gutter 宽度（相对行号 digits+1）；点击 gutter 落在行首；
+  - 从 `view_top` 起按 `lineDisplayRows`（fold 折叠 + soft wrap + inlay hint 宽度）累加，得到目标 line 与 wrap chunk；
+  - 文本 cell → byte：按 UTF-8 codepoint 逐个累加 `vaxis.gwidth`，tab = `tab_width`，并插入排序后的 inlay hint 宽度；宽字符第二格映射回该字符起点；行尾之后映射到行尾（Normal 模式再回退到最后一个 codepoint 起点，类似 `$`）。
+- **安全限制**：单行只拷贝/映射前 256 KiB；soft wrap 的 chunk 起点按 `chunk * content_width` 近似（渲染在宽字符处可能提前换行）；grapheme cluster/emoji ZWJ 按 codepoint 近似。非折行 ASCII/CJK 的常见情况精确，单元测试覆盖。
+- 点击 pane 不触发编辑、不改变文本；随后 `switchWindowTo` 执行既有 buffer/LSP/inlay/diag/hover 失效策略。
+
+### 21.6 滚轮
+
+- 每个 notch = **3 行**；无平滑滚动/加速。
+- 编辑器：移动该 pane 的 cursor（fold-aware，保持列），不是独立于 cursor 的 viewport —— 渲染器本就保持 cursor 可见，这样行为与 `j/k` 一致且不会下一帧被拉回。Insert 中滚轮仍只移动光标，不退出 Insert。
+- filetree/notes/agents：移动同一 selection（与 `j/k` 共用 helper，clamp 到 `[0,len-1]`），不改变 tab/focus。
+- AI thread list：移动 `thread_cursor`（clamp）；workbox：Chat 滚动 transcript（`aiScroll`），Changes 滚动 inline/agent diff（既有 `j/k` 的 scroll clamp），Tools/Terminal 无滚动状态则 no-op。
+- 终端聚焦/覆盖时滚轮完全不处理；所有滚动都 clamp，不产生 overflow，不启动 busy loop（只有成功改变状态的事件返回 true，触发正常渲染）。
+
+### 21.7 文件与测试
+
+- `src/app/mouse.zig`：纯 hit-test 优先级/边界、scroll clamp、display-row→line、cell→byte、inlay hint 插入；14 个 L1 单测。
+- `src/app/mouse_ui.zig`：生命周期、目标收集入口、点击/滚轮分发、pane 映射、rail/terminal 覆盖规则。
+- `src/app/hint_ui.zig`、`src/app/hints.zig`：hint target 同时喂鼠标 registry；label 绘制/匹配行为不变。
+- `src/app/{render,ai,inline_ui}.zig`：mouse-only pane/separator/scroll 注册 + 目标收集条件；`app/{ai,notes,filetree,inline_ui,agent_edit_ui}.zig` 公开既有 scroll/selection helper。
+- `test/e2e.zig`：6 个 `mouse:` pty 测试（tab 点击/关闭 + 80/100/120、navigator、split/光标映射/分隔线、AI thread/tab/prompt/transcript、approve/reject 真安全、mouse 生命周期 + Alt+r + 终端点击/滚轮），SGR 1006 序列由 `sendMouseButton` 注入；`@mouse` scenario tag。
+- 验证：`./tools/verify.sh` PASS（最终计数见 TESTING.md）。
+
+### 21.8 明确限制
+
+- **CJK/折行精确性**：wide-grapheme 的 wrap 边界与 emoji ZWJ 的 cell 归属是近似；非折行 ASCII/CJK 精确。
+- **终端转发**：vaxis terminal widget 不支持鼠标输入；点击只聚焦，wheel no-op，不伪造 child 点击。
+- **选择/复制**：mouse reporting 会接管默认拖选；依赖终端的 Shift 拖选绕过；无法从应用侧强制。
+- **无拖拽**：不做 tab 拖拽、分隔线 resize、文本拖选、右键菜单、双击选词。
+- **pixel 模式**：强制 cell 坐标，不使用像素级 offset（v1 不需要）。

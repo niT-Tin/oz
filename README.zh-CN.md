@@ -93,6 +93,8 @@
   - 线程列表 / workbox：`j`/`k` 选择 · Enter attach · `n`/`+` 新建线程 · `c`/`d`/`t`/`r` 切换 Chat/Changes/Tools/Terminal · Tab/Shift+Tab 循环 tab · `q`/Esc → editor。Changes 有 pending inline **或 agent** edit 时，`a`/Enter 批准、`r`/`d` 拒绝、`j`/`k` 滚动 diff；没有可见 pending 时这些键仍是正常的 tab 切换。
   - `<Ctrl-w> a` 从 editor 回到 rail 的线程列表（rail 关闭时也会打开）
 - **键盘提示（M2.6a）**：`<leader>j` 为所有可见目标叠加 qutebrowser 风格标签（字符集 `asdfghjkl`，定长 1–3 个字符）——文件树行、buffer tab、agent 线程、navigator tab、note 行、Workbox tab、`+` 新建线程按钮、输入框行和 Changes 的 Approve/Reject 按钮。输入完整标签执行该目标原本的动作，Backspace 删除已输入字符，Esc 取消且不产生任何副作用。状态栏显示 `HINTS · N targets · Esc cancel`；没有目标时显示 `HINTS · no targets`。普通 `f` 仍是 vim find-char，hint 不会占用。可从 editor、dashboard、文件树和 AI 线程列表进入（输入框内打字时不会触发）。
+- **鼠标（`feat/mouse`）**：启动时开启 vaxis cell 坐标鼠标上报，退出（含错误路径）复位。左键点击 split pane 会聚焦并按点击行列定位光标（考虑相对行号 gutter、`view_top`、soft wrap 与 inlay hints），也可点击 buffer tab 及其 `×`、navigator tab/行（files/notes/agents）、AI 线程行、Workbox tab、prompt 与 `+`、tool card、Changes 的 Approve/Reject 按钮。点击调用与键盘/hint **完全相同**的 App 方法，审批/stale/dirty 安全语义不变；最后一个 buffer 不注册 `×`，空白区域 no-op，点击前会先结束插入会话（保留文本）。滚轮滚动编辑器（每格 3 行，保持光标列）、文件树/笔记/agents 选择以及 Chat/Changes 的 transcript/diff，均做 clamp；内嵌终端聚焦时滚轮不会抢走事件（点击终端聚焦，点击其他区域回到编辑器）。普通拖拽由 mouse reporting 接管，按住 **Shift** 拖拽可用终端自身的选择/复制（取决于终端）。v1 不做拖拽/resize、中键/右键、终端鼠标转发；重度折行与 grapheme cluster 的定位是近似值（见 DESIGN §21）。
+
 - 流式 OpenAI 兼容补全（`POST {base_url}/chat/completions`，SSE）；支持 Markdown 与 fenced 代码块渲染、自动滚动
 - 自动附带编辑器上下文：当前文件路径；有可视选区时附带选中文本与 1-based 行号范围；否则附带光标行 ± 少量上下文（总上限 8 KB）
 - 通过环境变量配置（打开 rail 时读取）：

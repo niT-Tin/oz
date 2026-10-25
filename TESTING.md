@@ -17,8 +17,8 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-Current counts on `fix/editing-terminal` (based on UI polish `7d90c90`):
-**516 unit tests** and **189 e2e tests**. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
+Current counts on `feat/mouse` (based on `fix/editing-terminal` 1b47588):
+**529 unit tests** and **195 e2e tests**. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
 `.verify/verify.json` (schema version 1, git commit/dirty flag, exact command
 strings, timestamps, exit codes, log SHA-256s, parsed pass/fail counts). It
 runs every command even after a failure and exits non-zero if any command
@@ -83,9 +83,12 @@ Notes/Agents tabs. A notes scenario gets a fresh temp `OZ_NOTES_DIR` with one
 fixture note; the navigator box is located without its title text (hint labels
 intentionally cover the tab words).
 
-Scenario tags: `@layout @ai @filetree @stream @hints @navigator @notes
-@inline @tools @approval @80col @100col @120col @drawer @docked`. A new feature adds
-its tag here and to at least one scenario.
+Scenario tags: `@layout @ai @filetree @stream @hints @mouse @navigator
+@notes @inline @tools @approval @80col @100col @120col @drawer @docked`. A new
+feature adds its tag here and to at least one scenario. `@mouse` marks the
+scenarios whose clickable/target geometry the pointer tests also exercise
+(hints + approval); pointer sequences themselves are driven by the dedicated
+`mouse:` pty tests, because the matrix scenario format only carries keys.
 
 Every scenario must carry tags; `required_scenario_tags` is the declared
 feature set. A test fails with `UncoveredScenarioTag` if a declared tag has
@@ -411,6 +414,7 @@ original "staged/not applied" result after a later local approval.
 | Two-row buffer strip (20–26 cell tabs, middle-ellipsis, active underline, close hint, split layers) | L1 `src/app/tabstrip.zig` + L3 `ui buffer strip:` tests + goldens |
 | Motion (streaming pulse, running tool spinner, badge flash deadline, idle no-churn) | L1 `src/app/animation.zig` + L3 `animation:` tests + goldens |
 | Keyboard hints (labels, status, target actions, Esc) | L1 pure model (`src/app/hints.zig`) + L3 `hints:` tests + `@hints` matrix scenarios |
+| Mouse click/wheel (hit priority, scroll clamp, cell→byte mapping, lifecycle, panes/tabs/rows/buttons, terminal focus, drawer overlay, Shift selection escape hatch) | L1 `src/app/mouse.zig` + L3 `mouse:` pty tests (SGR 1006 press/release/wheel) + `@mouse` scenarios |
 | Navigator tabs, notes list/create/save/reopen, agents attach | L1 (`src/app/navigator.zig`, `src/app/note_store.zig`) + L3 `navigator:` tests + `@navigator`/`@notes` matrix scenarios |
 | Notes path fallback/error handling | L1 resolution/creation tests + L3 unavailable-dir e2e (`OZ_NOTES_DIR=/dev/null/notes`) |
 | Inline assistant (selection→prompt→stream→Changes diff→Approve/Reject, stale, cancel, 80-col, hints) | L1 `src/app/inline.zig` + L3 `inline:` tests + `@inline` scenario |
@@ -456,6 +460,12 @@ Known gaps / deliberate limitations:
 - The navigator Agents tab is a view of the same session thread model; it is
   not persisted and is covered through that model's existing tests plus one
   attach/switch e2e, not a second state machine.
+- Mouse v1: no drag/resize, middle/right buttons, double-click selection or
+  terminal mouse forwarding. Wheel = 3 lines/notch (cursor scroll in the
+  editor). Soft-wrap chunks and emoji/ZWJ grapheme clusters map approximately;
+  non-wrapped ASCII/CJK click-to-cursor is exact and unit-tested. Plain drag
+  is owned by mouse reporting — Shift+drag delegates to the terminal's local
+  selection (terminal-dependent, not enforceable by oz).
 - CI caches the Zig tarball and the small global Zig cache only; the ~1 GB
   `.vendor/tree-sitter` sources and multi-GB local compile cache are fetched/
   rebuilt each run to keep cache keys small and deterministic.
