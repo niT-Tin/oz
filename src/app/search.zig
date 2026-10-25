@@ -338,6 +338,9 @@ pub fn writeBuffer(self: *App) !bool {
         return false;
     };
     self.cur().dirty = false;
+    // A saved note changed the list's title/snippet/mtime: refresh the
+    // navigator cache now (only for paths under the notes dir).
+    self.notesDidSave(path);
     // the file on disk changed: refresh git marks/branch (async)
     self.scheduleGitStatus();
     try self.setMsg(try std.fmt.allocPrint(self.alloc, "written: {s}", .{path}));

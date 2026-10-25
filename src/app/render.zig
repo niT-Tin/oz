@@ -14,6 +14,8 @@ const term = @import("../term.zig");
 
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
+const nav_tabs = @import("navigator.zig");
+const note_store = @import("note_store.zig");
 const autil = @import("util.zig");
 const git_job = @import("git_job.zig");
 
@@ -1525,13 +1527,17 @@ pub fn hoverLineSegs(self: *App, a: std.mem.Allocator, line: []const u8, cols: u
     }
     return segs.items;
 }
-/// Render the file-tree sidebar into `win`. Extracted from render() so the
-/// dashboard path (which returns before the window loop) can draw the tree too.
-pub fn renderFiletree(self: *App, a: std.mem.Allocator, win: vaxis.Window, height: u32) !void {
+/// Render the left navigator (M2b1): the existing 30-cell filetree panel
+/// with a top tab strip `files | notes | agents`. Files keeps the tree's
+/// exact rendering/keys; Notes and Agents render from the cached note list
+/// and the real thread model. Geometry is unchanged (`contentCol()` is the
+/// same 30 cells), so the editor/splits/rail math below is untouched.
+pub fn renderNavigator(self: *App, a: std.mem.Allocator, win: vaxis.Window, height: u32) !void {
     const ft_col: u32 = 0;
     const ft_width = filetree_width;
     const ft_top = self.contentTop(a);
     const ft_bottom = height - status_row_count; // above the status bar
+    const usable = ft_width - 2; // cells between the two borders
     const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg } };
     // Paint the whole panel with the editor background first — without
     // this only the border columns and the text-width of each item
@@ -1544,29 +1550,108 @@ pub fn renderFiletree(self: *App, a: std.mem.Allocator, win: vaxis.Window, heigh
     });
     panel.fill(.{ .style = .{ .bg = .{ .rgb = self.theme.bg } } });
     // left border column and panel background
-    const left_col = ft_col;
-    const inner_left = ft_col + 1;
-    const inner_w = ft_width -| 1;
     var brow: u32 = ft_top;
     while (brow < ft_bottom) : (brow += 1) {
         const border_seg = [_]vaxis.Segment{.{
             .text = "│",
             .style = border_style,
         }};
-        _ = win.print(&border_seg, .{ .row_offset = @intCast(brow), .col_offset = @intCast(left_col), .wrap = .none });
+        _ = win.print(&border_seg, .{ .row_offset = @intCast(brow), .col_offset = @intCast(ft_col), .wrap = .none });
     }
-    // title row: " files " with a top border (╭─ files ────╮)
+
+    try renderNavigatorTabs(self, a, win, ft_top);
+
+    switch (self.navigator_tab) {
+        .files => try renderFiletreeRows(self, a, win, ft_top, ft_bottom, usable),
+        .notes => try renderNotesRows(self, a, win, ft_top, ft_bottom, usable),
+        .agents => try renderAgentsRows(self, a, win, ft_top, ft_bottom, usable),
+    }
+
+    // right border column — mirrors the left one so the panel is a
+    // closed box. The strip row's "╮" and the bottom row's "╯"
+    // already cap the two corners, so only the interior rows need the
+    // "│" (the item rows' trailing padding is what it covers).
+    {
+        const right_col = ft_col + ft_width - 1;
+        var rrow: u32 = ft_top + 1;
+        const rlast = ft_bottom - 1; // bottom border row
+        while (rrow < rlast) : (rrow += 1) {
+            const border_seg = [_]vaxis.Segment{.{
+                .text = "│",
+                .style = border_style,
+            }};
+            _ = win.print(&border_seg, .{ .row_offset = @intCast(rrow), .col_offset = @intCast(right_col), .wrap = .none });
+        }
+    }
+    // bottom border
     {
         var segs = std.ArrayList(vaxis.Segment).empty;
-        try segs.append(a, .{ .text = "╭─ files ", .style = border_style });
-        // inner_w cells between the borders; "╭─ files " is 9 cells
-        var cx: u32 = 9;
-        while (cx < inner_w) : (cx += 1) {
+        try segs.append(a, .{ .text = "╰", .style = border_style });
+        // inner_w - 1 dashes: "╰" takes the left border column and
+        // "╯" must land ON the right border column (ft_width-1) —
+        // inner_w dashes would push it one cell past the edge
+        var cx: u32 = 0;
+        while (cx < (ft_width - 1) -| 1) : (cx += 1) {
             try segs.append(a, .{ .text = "─", .style = border_style });
         }
-        try segs.append(a, .{ .text = "╮", .style = border_style });
-        _ = win.print(segs.items, .{ .row_offset = @intCast(ft_top), .col_offset = @intCast(left_col), .wrap = .none });
+        try segs.append(a, .{ .text = "╯", .style = border_style });
+        _ = win.print(segs.items, .{ .row_offset = @intCast(ft_bottom - 1), .col_offset = @intCast(ft_col), .wrap = .none });
     }
+}
+
+/// Top strip: `╭─ files ─ notes ─ agents ────╮`. The active tab gets the
+/// selection background + bold so it reads at a glance; inactive tabs are
+/// dim. Every tab is a hint target whose label is drawn at the tab's first
+/// cell (the overlay clamps into the 30-cell panel like any target).
+fn renderNavigatorTabs(self: *App, a: std.mem.Allocator, win: vaxis.Window, row: u32) !void {
+    const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg } };
+    var segs = std.ArrayList(vaxis.Segment).empty;
+    try segs.append(a, .{ .text = "╭─ ", .style = border_style });
+    var used: u32 = 3;
+    var starts: [nav_tabs.count]u32 = undefined;
+    var i: usize = 0;
+    while (i < nav_tabs.count) : (i += 1) {
+        const tab = nav_tabs.all[i];
+        if (i > 0) {
+            try segs.append(a, .{ .text = " ─ ", .style = border_style });
+            used += 3;
+        }
+        starts[i] = used;
+        const active = self.navigator_tab == tab;
+        const style: vaxis.Style = if (active)
+            .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_sel }, .bold = true }
+        else
+            .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg } };
+        const label = nav_tabs.label(tab);
+        try segs.append(a, .{ .text = label, .style = style });
+        used += @intCast(label.len);
+    }
+    while (used + 1 < filetree_width) : (used += 1) {
+        try segs.append(a, .{ .text = "─", .style = border_style });
+    }
+    try segs.append(a, .{ .text = "╮", .style = border_style });
+    _ = win.print(segs.items, .{ .row_offset = @intCast(row), .col_offset = 0, .wrap = .none });
+
+    if (self.hints.collecting) {
+        i = 0;
+        while (i < nav_tabs.count) : (i += 1) {
+            const tab = nav_tabs.all[i];
+            const cells: u32 = @intCast(nav_tabs.label(tab).len);
+            self.addHintTarget(.{
+                .row = row,
+                .col = starts[i],
+                .width = cells,
+                .height = 1,
+            }, .{ .navigator_tab = tab });
+        }
+    }
+}
+
+/// Files tab: the pre-M2b1 filetree row loop unchanged (same geometry,
+/// selection, scroll window and absolute-row hint payload).
+fn renderFiletreeRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, ft_top: u32, ft_bottom: u32, usable: u32) !void {
+    const ft_col: u32 = 0;
+    const inner_left = ft_col + 1;
     // vim-style scroll window (same semantics as the picker)
     const ft_len = self.filetree_rows.items.len;
     // clamp the selection when the tree shrank (collapse) BEFORE the
@@ -1594,7 +1679,6 @@ pub fn renderFiletree(self: *App, a: std.mem.Allocator, win: vaxis.Window, heigh
         // ("├╴"/"└╴"), then icon + space + name. The terminal cursor sits
         // on the padding cell (col 1), not on the icon, so the block cursor
         // no longer touches the glyph.
-        const usable = ft_width - 2; // cells between the two borders
         const icon = if (node.is_dir) icons.folder(node.expanded) else icons.forPath(node.path, false);
 
         // ancestors, top-down. frow.depth is the number of visible
@@ -1666,35 +1750,222 @@ pub fn renderFiletree(self: *App, a: std.mem.Allocator, win: vaxis.Window, heigh
             }, .{ .filetree_activate = ri });
         }
     }
-    // right border column — mirrors the left one so the panel is a
-    // closed box. The title row's "╮" and the bottom row's "╯"
-    // already cap the two corners, so only the interior rows need the
-    // "│" (the item rows' trailing padding is what it covers).
-    {
-        const right_col = ft_col + ft_width - 1;
-        var rrow: u32 = ft_top + 1;
-        const rlast = ft_bottom - 1; // bottom border row
-        while (rrow < rlast) : (rrow += 1) {
-            const border_seg = [_]vaxis.Segment{.{
-                .text = "│",
-                .style = border_style,
-            }};
-            _ = win.print(&border_seg, .{ .row_offset = @intCast(rrow), .col_offset = @intCast(right_col), .wrap = .none });
+}
+
+/// Notes tab: two rows per note (title + right-aligned age, then
+/// filename · snippet). The list is the cached `Store`, refreshed by the
+/// action paths, never by this renderer; rows scroll in note units.
+fn renderNotesRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, ft_top: u32, ft_bottom: u32, usable: u32) !void {
+    const inner_left: u32 = 1;
+    const content_top = ft_top + 1;
+    const content_rows: usize = @intCast(ft_bottom - ft_top - 2);
+    const base_bg: vaxis.Color = .{ .rgb = self.theme.bg };
+
+    if (self.notes.err) |msg| {
+        const err_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.diag_error }, .bg = base_bg };
+        const head = [_]vaxis.Segment{.{ .text = " ! notes unavailable", .style = err_style }};
+        _ = win.print(&head, .{ .row_offset = @intCast(content_top), .col_offset = @intCast(inner_left), .wrap = .none });
+        if (content_rows >= 2) {
+            const line = try std.fmt.allocPrint(a, " {s}", .{msg});
+            const shown = buffer.utf8.truncateWidth(line, usable);
+            const seg = [_]vaxis.Segment{.{ .text = shown, .style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = base_bg } }};
+            _ = win.print(&seg, .{ .row_offset = @intCast(content_top + 1), .col_offset = @intCast(inner_left), .wrap = .none });
+        }
+        return;
+    }
+    if (self.notes.items.items.len == 0) {
+        const seg = [_]vaxis.Segment{.{ .text = " no notes yet", .style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = base_bg } }};
+        _ = win.print(&seg, .{ .row_offset = @intCast(content_top), .col_offset = @intCast(inner_left), .wrap = .none });
+        if (content_rows >= 2) {
+            const seg2 = [_]vaxis.Segment{.{ .text = " n creates a note", .style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = base_bg } }};
+            _ = win.print(&seg2, .{ .row_offset = @intCast(content_top + 1), .col_offset = @intCast(inner_left), .wrap = .none });
+        }
+        return;
+    }
+
+    const n = self.notes.items.items.len;
+    if (self.notes.sel >= n) self.notes.sel = n - 1;
+    const vis = @max(@as(usize, 1), content_rows / 2);
+    if (n > vis) {
+        if (self.notes.top + vis > n) self.notes.top = n - vis;
+        if (self.notes.sel < self.notes.top) self.notes.top = self.notes.sel;
+        if (self.notes.sel >= self.notes.top + vis) self.notes.top = self.notes.sel - vis + 1;
+    } else self.notes.top = 0;
+
+    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+    var k: usize = 0;
+    while (k < vis) : (k += 1) {
+        const idx = self.notes.top + k;
+        if (idx >= n) break;
+        const row1 = content_top + 2 * @as(u32, @intCast(k));
+        if (row1 >= ft_bottom - 1) break;
+        const note = &self.notes.items.items[idx];
+        const selected = idx == self.notes.sel;
+        const bg: vaxis.Color = if (selected) .{ .rgb = self.theme.bg_sel } else base_bg;
+        const base_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = bg };
+
+        var age_buf: [16]u8 = undefined;
+        const age_raw = note_store.formatAge(now, note.mtime_ns, &age_buf);
+        const age = try a.dupe(u8, age_raw);
+        const age_cells: u32 = @intCast(buffer.utf8.displayWidth(age));
+        var title_budget: u32 = usable -| 2; // marker + space
+        var show_age = false;
+        if (age_cells + 1 < title_budget) {
+            title_budget -= age_cells + 1;
+            show_age = true;
+        }
+        const title = buffer.utf8.truncateWidth(note.title, title_budget);
+        const title_cells: u32 = @intCast(buffer.utf8.displayWidth(title));
+
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        try segs.append(a, .{
+            .text = if (selected) "▸ " else "  ",
+            .style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = bg },
+        });
+        try segs.append(a, .{ .text = title, .style = base_style });
+        var filled: u32 = 2 + title_cells;
+        if (show_age) {
+            const pad = usable -| filled -| age_cells;
+            if (pad > 0) {
+                const spaces = try a.alloc(u8, pad);
+                @memset(spaces, ' ');
+                try segs.append(a, .{ .text = spaces, .style = base_style });
+                filled += pad;
+            }
+            try segs.append(a, .{ .text = age, .style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = bg } });
+            filled += age_cells;
+        }
+        if (filled < usable) {
+            const spaces = try a.alloc(u8, usable - filled);
+            @memset(spaces, ' ');
+            try segs.append(a, .{ .text = spaces, .style = base_style });
+        }
+        _ = win.print(segs.items, .{ .row_offset = @intCast(row1), .col_offset = @intCast(inner_left), .wrap = .none });
+        if (self.hints.collecting) {
+            self.addHintTarget(.{
+                .row = row1,
+                .col = inner_left,
+                .width = usable,
+                .height = 1,
+            }, .{ .note_open = idx });
+        }
+
+        if (row1 + 1 < ft_bottom - 1) {
+            const row2 = row1 + 1;
+            var line = std.ArrayList(u8).empty;
+            try line.appendSlice(a, "  ");
+            try line.appendSlice(a, note.filename);
+            if (note.snippet.len > 0) {
+                try line.appendSlice(a, " · ");
+                try line.appendSlice(a, note.snippet);
+            }
+            const shown = buffer.utf8.truncateWidth(line.items, usable);
+            const shown_cells: u32 = @intCast(buffer.utf8.displayWidth(shown));
+            var segs2 = std.ArrayList(vaxis.Segment).empty;
+            try segs2.append(a, .{ .text = shown, .style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = bg } });
+            if (shown_cells < usable) {
+                const spaces = try a.alloc(u8, usable - shown_cells);
+                @memset(spaces, ' ');
+                try segs2.append(a, .{ .text = spaces, .style = .{ .bg = bg } });
+            }
+            _ = win.print(segs2.items, .{ .row_offset = @intCast(row2), .col_offset = @intCast(inner_left), .wrap = .none });
         }
     }
-    // bottom border
-    {
-        var segs = std.ArrayList(vaxis.Segment).empty;
-        try segs.append(a, .{ .text = "╰", .style = border_style });
-        // inner_w - 1 dashes: "╰" takes the left border column and
-        // "╯" must land ON the right border column (ft_width-1) —
-        // inner_w dashes would push it one cell past the edge
-        var cx: u32 = 0;
-        while (cx < inner_w -| 1) : (cx += 1) {
-            try segs.append(a, .{ .text = "─", .style = border_style });
+}
+
+/// Agents tab: one workspace group header (current workspace + provider
+/// model), then the session's REAL threads with a colored status dot, name
+/// and status label. Enter = the same `aiSelectThread` attach path as the
+/// rail; `n` = `aiNewThread`. No synthetic rows, no second thread model.
+fn renderAgentsRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, ft_top: u32, ft_bottom: u32, usable: u32) !void {
+    const inner_left: u32 = 1;
+    const content_top = ft_top + 1;
+    const content_rows: usize = @intCast(ft_bottom - ft_top - 2);
+    const base_bg: vaxis.Color = .{ .rgb = self.theme.bg };
+
+    var header = std.ArrayList(u8).empty;
+    try header.appendSlice(a, " ▾ ");
+    try header.appendSlice(a, self.curWsName());
+    if (self.ai.config) |cfg| {
+        try header.appendSlice(a, " · ");
+        try header.appendSlice(a, cfg.model);
+    }
+    const head_shown = buffer.utf8.truncateWidth(header.items, usable);
+    const head_seg = [_]vaxis.Segment{.{ .text = head_shown, .style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = base_bg } }};
+    _ = win.print(&head_seg, .{ .row_offset = @intCast(content_top), .col_offset = @intCast(inner_left), .wrap = .none });
+
+    const list_top = content_top + 1;
+    const avail = content_rows -| 1;
+    if (avail == 0) return;
+    const n = self.ai.threads.items.items.len;
+    if (n == 0) {
+        const seg = [_]vaxis.Segment{.{ .text = " no threads yet", .style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = base_bg } }};
+        _ = win.print(&seg, .{ .row_offset = @intCast(list_top), .col_offset = @intCast(inner_left), .wrap = .none });
+        return;
+    }
+    if (self.ai.thread_cursor >= n) self.ai.thread_cursor = n - 1;
+    if (n > avail) {
+        if (self.ai.thread_top + avail > n) self.ai.thread_top = n - avail;
+        if (self.ai.thread_cursor < self.ai.thread_top) self.ai.thread_top = self.ai.thread_cursor;
+        if (self.ai.thread_cursor >= self.ai.thread_top + avail) {
+            self.ai.thread_top = self.ai.thread_cursor - avail + 1;
         }
-        try segs.append(a, .{ .text = "╯", .style = border_style });
-        _ = win.print(segs.items, .{ .row_offset = @intCast(ft_bottom - 1), .col_offset = @intCast(left_col), .wrap = .none });
+    } else self.ai.thread_top = 0;
+
+    var k: usize = 0;
+    while (k < avail) : (k += 1) {
+        const idx = self.ai.thread_top + k;
+        if (idx >= n) break;
+        const thread = &self.ai.threads.items.items[idx];
+        const row = list_top + @as(u32, @intCast(k));
+        const selected = idx == self.ai.thread_cursor;
+        const bg: vaxis.Color = if (selected) .{ .rgb = self.theme.bg_sel } else base_bg;
+        const label = thread.statusLabel();
+        const label_cells: u32 = @intCast(buffer.utf8.displayWidth(label));
+        var title_budget: u32 = usable -| 2; // dot + space
+        var show_status = false;
+        if (label_cells + 1 < title_budget) {
+            title_budget -= label_cells + 1;
+            show_status = true;
+        }
+        const title = buffer.utf8.truncateWidth(thread.title, title_budget);
+        const title_cells: u32 = @intCast(buffer.utf8.displayWidth(title));
+        const dot_color = switch (thread.status) {
+            .idle => self.theme.fg_faint,
+            .streaming => self.theme.accent,
+            .cancelled => self.theme.fg_dim,
+            .err => self.theme.diag_error,
+        };
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        try segs.append(a, .{ .text = "●", .style = .{ .fg = .{ .rgb = dot_color }, .bg = bg } });
+        try segs.append(a, .{ .text = " ", .style = .{ .bg = bg } });
+        try segs.append(a, .{ .text = title, .style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = bg } });
+        var filled: u32 = 2 + title_cells;
+        if (show_status) {
+            const pad = usable -| filled -| label_cells;
+            if (pad > 0) {
+                const spaces = try a.alloc(u8, pad);
+                @memset(spaces, ' ');
+                try segs.append(a, .{ .text = spaces, .style = .{ .bg = bg } });
+                filled += pad;
+            }
+            try segs.append(a, .{ .text = label, .style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = bg } });
+            filled += label_cells;
+        }
+        if (filled < usable) {
+            const spaces = try a.alloc(u8, usable - filled);
+            @memset(spaces, ' ');
+            try segs.append(a, .{ .text = spaces, .style = .{ .bg = bg } });
+        }
+        _ = win.print(segs.items, .{ .row_offset = @intCast(row), .col_offset = @intCast(inner_left), .wrap = .none });
+        if (self.hints.collecting) {
+            self.addHintTarget(.{
+                .row = row,
+                .col = inner_left,
+                .width = usable,
+                .height = 1,
+            }, .{ .agent_thread_select = idx });
+        }
     }
 }
 
@@ -1721,182 +1992,182 @@ pub fn drawRichPopup(
         if (c == '\n') rows += 1;
     }
     rows = @min(rows, max_rows);
-            const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
-            const border = "│";
-            const tl = "╭";
-            const tr = "╮";
-            const bl = "╰";
-            const br = "╯";
-            // top border
-            {
-                const seg = [_]vaxis.Segment{
-                    .{ .text = tl, .style = border_style },
-                    .{ .text = "─", .style = border_style },
-                };
-                _ = win.print(&seg, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(col0), .wrap = .none });
-                var cx: u32 = 1;
-                while (cx <= cols) : (cx += 1) {
-                    const hseg = [_]vaxis.Segment{.{
-                        .text = "─",
-                        .style = border_style,
-                    }};
-                    _ = win.print(&hseg, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(col0 + cx), .wrap = .none });
+    const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
+    const border = "│";
+    const tl = "╭";
+    const tr = "╮";
+    const bl = "╰";
+    const br = "╯";
+    // top border
+    {
+        const seg = [_]vaxis.Segment{
+            .{ .text = tl, .style = border_style },
+            .{ .text = "─", .style = border_style },
+        };
+        _ = win.print(&seg, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(col0), .wrap = .none });
+        var cx: u32 = 1;
+        while (cx <= cols) : (cx += 1) {
+            const hseg = [_]vaxis.Segment{.{
+                .text = "─",
+                .style = border_style,
+            }};
+            _ = win.print(&hseg, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(col0 + cx), .wrap = .none });
+        }
+        const rseg = [_]vaxis.Segment{.{
+            .text = tr,
+            .style = border_style,
+        }};
+        _ = win.print(&rseg, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(col0 + cols + 1), .wrap = .none });
+    }
+    // Split the text into up to rows lines; fence off ```lang
+    // code blocks and syntax-highlight their content with
+    // tree-sitter (hoverCodeLineSegs); prose lines get markdown-
+    // ish token colors (hoverLineSegs). Fence lines render dim.
+    // Every cell keeps bg_float — the panel stays a solid block.
+    const HoverBlock = struct {
+        start: usize,
+        end: usize, // line indices, end exclusive
+        lang: ?[]const u8,
+        text: []u8, // lines joined with '\n' (arena)
+        offsets: []u32, // byte offset of each line in text
+        spans: []syntax.Span, // merged spans over text
+    };
+    var lines = std.ArrayList([]const u8).empty;
+    var kinds = std.ArrayList(u8).empty; // 0 prose, 1 fence, 2 code
+    var blocks = std.ArrayList(HoverBlock).empty;
+    {
+        var remaining = md;
+        var r: u32 = 0;
+        var in_fence: ?[]const u8 = null;
+        var block_start: usize = 0;
+        while (r < rows) : (r += 1) {
+            const nl = std.mem.indexOfScalar(u8, remaining, '\n');
+            const line_len = if (nl) |i| i else remaining.len;
+            try lines.append(a, remaining[0..line_len]);
+            if (in_fence == null) {
+                if (autil.isFenceLine(remaining[0..line_len])) |flang| {
+                    try kinds.append(a, 1);
+                    in_fence = flang;
+                    block_start = lines.items.len;
+                } else {
+                    try kinds.append(a, 0);
                 }
-                const rseg = [_]vaxis.Segment{.{
-                    .text = tr,
-                    .style = border_style,
-                }};
-                _ = win.print(&rseg, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(col0 + cols + 1), .wrap = .none });
-            }
-            // Split the text into up to rows lines; fence off ```lang
-            // code blocks and syntax-highlight their content with
-            // tree-sitter (hoverCodeLineSegs); prose lines get markdown-
-            // ish token colors (hoverLineSegs). Fence lines render dim.
-            // Every cell keeps bg_float — the panel stays a solid block.
-            const HoverBlock = struct {
-                start: usize,
-                end: usize, // line indices, end exclusive
-                lang: ?[]const u8,
-                text: []u8, // lines joined with '\n' (arena)
-                offsets: []u32, // byte offset of each line in text
-                spans: []syntax.Span, // merged spans over text
-            };
-            var lines = std.ArrayList([]const u8).empty;
-            var kinds = std.ArrayList(u8).empty; // 0 prose, 1 fence, 2 code
-            var blocks = std.ArrayList(HoverBlock).empty;
-            {
-                var remaining = md;
-                var r: u32 = 0;
-                var in_fence: ?[]const u8 = null;
-                var block_start: usize = 0;
-                while (r < rows) : (r += 1) {
-                    const nl = std.mem.indexOfScalar(u8, remaining, '\n');
-                    const line_len = if (nl) |i| i else remaining.len;
-                    try lines.append(a, remaining[0..line_len]);
-                    if (in_fence == null) {
-                        if (autil.isFenceLine(remaining[0..line_len])) |flang| {
-                            try kinds.append(a, 1);
-                            in_fence = flang;
-                            block_start = lines.items.len;
-                        } else {
-                            try kinds.append(a, 0);
-                        }
-                    } else {
-                        if (autil.isFenceLine(remaining[0..line_len]) != null) {
-                            try kinds.append(a, 1);
-                            try blocks.append(a, .{ .start = block_start, .end = lines.items.len, .lang = in_fence, .text = &.{}, .offsets = &.{}, .spans = &.{} });
-                            in_fence = null;
-                        } else {
-                            try kinds.append(a, 2);
-                        }
-                    }
-                    if (nl) |i| {
-                        remaining = remaining[@min(i + 1, remaining.len)..];
-                    } else {
-                        remaining = remaining[remaining.len..];
-                    }
-                }
-                if (in_fence != null) {
+            } else {
+                if (autil.isFenceLine(remaining[0..line_len]) != null) {
+                    try kinds.append(a, 1);
                     try blocks.append(a, .{ .start = block_start, .end = lines.items.len, .lang = in_fence, .text = &.{}, .offsets = &.{}, .spans = &.{} });
+                    in_fence = null;
+                } else {
+                    try kinds.append(a, 2);
                 }
             }
-            // Build each block: joined text, per-line byte offsets, and
-            // merged tree-sitter spans (all arena — the highlighter lives
-            // only for this frame). The fence language wins; a bare or
-            // unknown fence falls back to the current file's language.
-            for (blocks.items) |*blk| {
-                if (blk.start >= blk.end) continue;
-                var text = std.ArrayList(u8).empty;
-                var offsets = std.ArrayList(u32).empty;
-                var bli = blk.start;
-                while (bli < blk.end) : (bli += 1) {
-                    try offsets.append(a, @intCast(text.items.len));
-                    try text.appendSlice(a, lines.items[bli]);
-                    try text.append(a, '\n');
-                }
-                blk.text = try text.toOwnedSlice(a);
-                blk.offsets = try offsets.toOwnedSlice(a);
-                var hl: ?syntax.Highlighter = null;
-                if (blk.lang) |l| {
-                    if (l.len > 0) {
-                        if (syntax.languageFor(l)) |ln| hl = syntax.Highlighter.init(a, ln) catch null;
+            if (nl) |i| {
+                remaining = remaining[@min(i + 1, remaining.len)..];
+            } else {
+                remaining = remaining[remaining.len..];
+            }
+        }
+        if (in_fence != null) {
+            try blocks.append(a, .{ .start = block_start, .end = lines.items.len, .lang = in_fence, .text = &.{}, .offsets = &.{}, .spans = &.{} });
+        }
+    }
+    // Build each block: joined text, per-line byte offsets, and
+    // merged tree-sitter spans (all arena — the highlighter lives
+    // only for this frame). The fence language wins; a bare or
+    // unknown fence falls back to the current file's language.
+    for (blocks.items) |*blk| {
+        if (blk.start >= blk.end) continue;
+        var text = std.ArrayList(u8).empty;
+        var offsets = std.ArrayList(u32).empty;
+        var bli = blk.start;
+        while (bli < blk.end) : (bli += 1) {
+            try offsets.append(a, @intCast(text.items.len));
+            try text.appendSlice(a, lines.items[bli]);
+            try text.append(a, '\n');
+        }
+        blk.text = try text.toOwnedSlice(a);
+        blk.offsets = try offsets.toOwnedSlice(a);
+        var hl: ?syntax.Highlighter = null;
+        if (blk.lang) |l| {
+            if (l.len > 0) {
+                if (syntax.languageFor(l)) |ln| hl = syntax.Highlighter.init(a, ln) catch null;
+            }
+        }
+        if (hl == null) {
+            const ft = autil.filetypeOf(self.cur().path);
+            if (syntax.languageFor(ft)) |ln| hl = syntax.Highlighter.init(a, ln) catch null;
+        }
+        if (hl) |*h| {
+            h.reparse(blk.text) catch {};
+            var raw = std.ArrayList(syntax.Span).empty;
+            h.spansInRange(0, @intCast(blk.text.len), a, &raw) catch {};
+            var merged = std.ArrayList(syntax.Span).empty;
+            for (raw.items) |sp| {
+                while (merged.items.len > 0) {
+                    var last = &merged.items[merged.items.len - 1];
+                    if (sp.start >= last.end) break; // disjoint
+                    if (sp.start <= last.start) {
+                        _ = merged.pop(); // covered wholly
+                        continue;
                     }
+                    last.end = sp.start; // later span wins
+                    break;
                 }
-                if (hl == null) {
-                    const ft = autil.filetypeOf(self.cur().path);
-                    if (syntax.languageFor(ft)) |ln| hl = syntax.Highlighter.init(a, ln) catch null;
-                }
-                if (hl) |*h| {
-                    h.reparse(blk.text) catch {};
-                    var raw = std.ArrayList(syntax.Span).empty;
-                    h.spansInRange(0, @intCast(blk.text.len), a, &raw) catch {};
-                    var merged = std.ArrayList(syntax.Span).empty;
-                    for (raw.items) |sp| {
-                        while (merged.items.len > 0) {
-                            var last = &merged.items[merged.items.len - 1];
-                            if (sp.start >= last.end) break; // disjoint
-                            if (sp.start <= last.start) {
-                                _ = merged.pop(); // covered wholly
-                                continue;
-                            }
-                            last.end = sp.start; // later span wins
-                            break;
-                        }
-                        try merged.append(a, sp);
-                    }
-                    blk.spans = try merged.toOwnedSlice(a);
-                }
+                try merged.append(a, sp);
             }
-            // Render each row: code lines use their block's spans, fence
-            // lines dim, prose lines the markdown tokenizer.
-            var r: u32 = 0;
-            var cur_block: usize = 0;
-            while (r < rows) : (r += 1) {
-                const line = lines.items[r];
-                var inner: []vaxis.Segment = undefined;
-                switch (kinds.items[r]) {
-                    1 => inner = try self.hoverBlankSegs(a, cols),
-                    2 => {
-                        while (cur_block < blocks.items.len and blocks.items[cur_block].end <= r) cur_block += 1;
-                        if (cur_block < blocks.items.len and blocks.items[cur_block].start <= r) {
-                            const blk = &blocks.items[cur_block];
-                            const bi = r - blk.start;
-                            const ls = blk.offsets[bi];
-                            const shown = buffer.utf8.truncateWidth(line, cols);
-                            inner = try self.hoverCodeLineSegs(a, blk.text, ls, ls + @as(u32, @intCast(shown.len)), blk.spans, cols);
-                        } else {
-                            inner = try self.hoverLineSegs(a, line, cols);
-                        }
-                    },
-                    else => inner = try self.hoverLineSegs(a, line, cols),
+            blk.spans = try merged.toOwnedSlice(a);
+        }
+    }
+    // Render each row: code lines use their block's spans, fence
+    // lines dim, prose lines the markdown tokenizer.
+    var r: u32 = 0;
+    var cur_block: usize = 0;
+    while (r < rows) : (r += 1) {
+        const line = lines.items[r];
+        var inner: []vaxis.Segment = undefined;
+        switch (kinds.items[r]) {
+            1 => inner = try self.hoverBlankSegs(a, cols),
+            2 => {
+                while (cur_block < blocks.items.len and blocks.items[cur_block].end <= r) cur_block += 1;
+                if (cur_block < blocks.items.len and blocks.items[cur_block].start <= r) {
+                    const blk = &blocks.items[cur_block];
+                    const bi = r - blk.start;
+                    const ls = blk.offsets[bi];
+                    const shown = buffer.utf8.truncateWidth(line, cols);
+                    inner = try self.hoverCodeLineSegs(a, blk.text, ls, ls + @as(u32, @intCast(shown.len)), blk.spans, cols);
+                } else {
+                    inner = try self.hoverLineSegs(a, line, cols);
                 }
-                var segs = std.ArrayList(vaxis.Segment).empty;
-                try segs.append(a, .{ .text = border, .style = border_style });
-                try segs.appendSlice(a, inner);
-                try segs.append(a, .{ .text = border, .style = border_style });
-                _ = win.print(segs.items, .{ .row_offset = @intCast(start_row + 1 + r), .col_offset = @intCast(col0), .wrap = .none });
-            }
-            // bottom border
-            {
-                const bseg = [_]vaxis.Segment{.{
-                    .text = bl,
-                    .style = border_style,
-                }};
-                _ = win.print(&bseg, .{ .row_offset = @intCast(start_row + 1 + rows), .col_offset = @intCast(col0), .wrap = .none });
-                var cx: u32 = 1;
-                while (cx <= cols) : (cx += 1) {
-                    const hseg = [_]vaxis.Segment{.{
-                        .text = "─",
-                        .style = border_style,
-                    }};
-                    _ = win.print(&hseg, .{ .row_offset = @intCast(start_row + 1 + rows), .col_offset = @intCast(col0 + cx), .wrap = .none });
-                }
-                const rseg = [_]vaxis.Segment{.{
-                    .text = br,
-                    .style = border_style,
-                }};
-                _ = win.print(&rseg, .{ .row_offset = @intCast(start_row + 1 + rows), .col_offset = @intCast(col0 + cols + 1), .wrap = .none });
-            }
+            },
+            else => inner = try self.hoverLineSegs(a, line, cols),
+        }
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        try segs.append(a, .{ .text = border, .style = border_style });
+        try segs.appendSlice(a, inner);
+        try segs.append(a, .{ .text = border, .style = border_style });
+        _ = win.print(segs.items, .{ .row_offset = @intCast(start_row + 1 + r), .col_offset = @intCast(col0), .wrap = .none });
+    }
+    // bottom border
+    {
+        const bseg = [_]vaxis.Segment{.{
+            .text = bl,
+            .style = border_style,
+        }};
+        _ = win.print(&bseg, .{ .row_offset = @intCast(start_row + 1 + rows), .col_offset = @intCast(col0), .wrap = .none });
+        var cx: u32 = 1;
+        while (cx <= cols) : (cx += 1) {
+            const hseg = [_]vaxis.Segment{.{
+                .text = "─",
+                .style = border_style,
+            }};
+            _ = win.print(&hseg, .{ .row_offset = @intCast(start_row + 1 + rows), .col_offset = @intCast(col0 + cx), .wrap = .none });
+        }
+        const rseg = [_]vaxis.Segment{.{
+            .text = br,
+            .style = border_style,
+        }};
+        _ = win.print(&rseg, .{ .row_offset = @intCast(start_row + 1 + rows), .col_offset = @intCast(col0 + cols + 1), .wrap = .none });
+    }
 }
 
 pub fn render(self: *App) !void {
@@ -2214,7 +2485,7 @@ pub fn render(self: *App) !void {
         // the dashboard returns before the window loop, so the file tree
         // (rendered after that loop) would never draw over it — draw it
         // here too, or <leader>e on the dashboard shows a stale screen
-        if (self.filetree_active) try renderFiletree(self, a, win, height);
+        if (self.filetree_active) try renderNavigator(self, a, win, height);
         if (term.supported) try self.drawTerm(a, win);
         // <leader>a works on the dashboard too: draw the rail last (it
         // places the cursor only when the rail/prompt owns focus; otherwise
@@ -2273,7 +2544,7 @@ pub fn render(self: *App) !void {
     // file tree sidebar (nvim neo-tree style: the panel shares the
     // EDITOR background — Normal bg, not a float — so sidebar and text
     // area read as one surface; only the fg_faint border separates them)
-    if (self.filetree_active) try renderFiletree(self, a, win, height);
+    if (self.filetree_active) try renderNavigator(self, a, win, height);
 
     // multi-cursor word highlights (overlay)
     if (self.mc_active) {
@@ -3260,13 +3531,12 @@ pub fn render(self: *App) !void {
     // when the rail or prompt owns focus; otherwise the editor cursor wins.
     if (self.ai.rail_open and self.ai.focus != .editor) {
         // rail cursor was set by drawAiRail
-    } else if (self.filetree_active and self.focus == .filetree) {
-        // Items render at contentTop()+1+k (below the "╭─ files" title
-        // row) with text starting at column 1 (after the left border) —
-        // the cursor must land on the same row/column as the highlight.
-        const sel_row: u32 = self.contentTop(a) + 1 + @as(u32, @intCast(self.filetree_sel -| self.filetree_top));
+    } else if (self.filetree_active and self.focus == .navigator) {
+        // The navigator's selected row depends on the active tab (tree row,
+        // note title row, or thread row); column 1 is the inner padding cell
+        // shared by all three, after the left border.
         self.vx.screen.cursor = .{
-            .row = @intCast(sel_row),
+            .row = @intCast(self.navigatorCursorRow(a)),
             .col = 1,
         };
     } else if (self.nav_list_active) {

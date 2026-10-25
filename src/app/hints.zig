@@ -26,8 +26,10 @@
 
 const std = @import("std");
 const ws = @import("../ai/workspace.zig");
+const navigator = @import("navigator.zig");
 
 pub const WorkboxTab = ws.WorkboxTab;
+pub const NavigatorTab = navigator.Tab;
 
 /// qutebrowser-style home-row charset. Every label character is one cell.
 pub const charset = "asdfghjkl";
@@ -142,6 +144,10 @@ pub const Action = union(enum) {
     agent_new,
     /// Focus the AI prompt row.
     agent_prompt_focus,
+    /// Switch the left navigator tab (M2b1). Activating focuses the navigator.
+    navigator_tab: NavigatorTab,
+    /// Open the note at this index in the cached Notes list (Enter semantics).
+    note_open: usize,
 };
 
 pub const Target = struct {
@@ -558,9 +564,11 @@ test "hints: action payloads survive collection and activation" {
     st.add(.{ .row = 0, .col = 16, .width = 3, .height = 1 }, .{ .workbox_tab = .tools });
     st.add(.{ .row = 0, .col = 20, .width = 3, .height = 1 }, .agent_new);
     st.add(.{ .row = 0, .col = 24, .width = 3, .height = 1 }, .agent_prompt_focus);
+    st.add(.{ .row = 0, .col = 28, .width = 3, .height = 1 }, .{ .navigator_tab = .notes });
+    st.add(.{ .row = 0, .col = 32, .width = 3, .height = 1 }, .{ .note_open = 4 });
     st.endFrame();
     try std.testing.expectEqual(@as(usize, 1), st.labelLen());
-    try std.testing.expectEqual(@as(usize, 7), st.count);
+    try std.testing.expectEqual(@as(usize, 9), st.count);
 
     switch (st.typeChar('a')) {
         .activate => |a| try std.testing.expectEqual(@as(usize, 7), a.filetree_select),
@@ -588,6 +596,14 @@ test "hints: action payloads survive collection and activation" {
     }
     switch (st.typeChar('j')) {
         .activate => |a| try std.testing.expect(std.meta.eql(a, Action.agent_prompt_focus)),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (st.typeChar('k')) {
+        .activate => |a| try std.testing.expectEqual(NavigatorTab.notes, a.navigator_tab),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (st.typeChar('l')) {
+        .activate => |a| try std.testing.expectEqual(@as(usize, 4), a.note_open),
         else => return error.TestUnexpectedResult,
     }
 }

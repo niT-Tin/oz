@@ -108,11 +108,15 @@ pub fn setProjectRoot(self: *App, file_path: []const u8) void {
 pub fn toggleFiletree(self: *App) !void {
     if (self.filetree_active) {
         self.filetree_active = false;
+        self.focus = .buffer;
         return;
     }
     self.filetree_top = 0;
     self.filetree_sel = 0;
-    self.focus = .filetree;
+    // <leader>e is the canonical Files entry; the tab strip can switch to
+    // Notes/Agents afterwards (Tab/Shift-Tab or 1/2/3).
+    self.navigator_tab = .files;
+    self.focus = .navigator;
     // Root the tree at the workspace's project root (or the process cwd
     // when none is set). Rebuild when the stored root differs, so opening a
     // file in a different directory switches <leader>e to that directory.
@@ -240,7 +244,8 @@ pub fn locateInFiletree(self: *App) !void {
     } else {
         try self.rebuildFiletreeRows();
     }
-    self.focus = .filetree;
+    self.navigator_tab = .files;
+    self.focus = .navigator;
     if (self.cur().path) |p| {
         // Reveal the file's ancestors (expanding any folded dirs on the
         // way) and select the matching row.

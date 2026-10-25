@@ -134,12 +134,12 @@ pub fn execHintAction(self: *App, action: hints.Action) !void {
         .filetree_select => |idx| {
             if (idx >= self.filetree_rows.items.len) return;
             self.filetree_sel = idx;
-            self.focus = .filetree;
+            self.focus = .navigator;
         },
         .filetree_activate => |idx| {
             if (idx >= self.filetree_rows.items.len) return;
             self.filetree_sel = idx;
-            self.focus = .filetree;
+            self.focus = .navigator;
             try self.activateFiletreeSelection();
         },
         .buffer_select => |idx| {
@@ -151,7 +151,11 @@ pub fn execHintAction(self: *App, action: hints.Action) !void {
         },
         .agent_thread_select => |idx| {
             if (idx >= self.ai.threads.items.items.len) return;
-            // Enter in the thread list: attach, focus the prompt, show Chat.
+            // Same attach path as Enter in the thread list. A target may be
+            // drawn on the navigator's Agents tab with the rail closed, so
+            // make the rail visible before focusing its prompt.
+            self.ai.rail_open = true;
+            self.ai.rail_pending_leader = false;
             self.aiSelectThread(idx);
         },
         .workbox_tab => |tab| {
@@ -159,5 +163,11 @@ pub fn execHintAction(self: *App, action: hints.Action) !void {
         },
         .agent_new => try self.aiNewThread(),
         .agent_prompt_focus => try self.aiFocusPrompt(),
+        .navigator_tab => |tab| {
+            try self.navigatorSetTab(tab);
+        },
+        .note_open => |idx| {
+            try self.openNoteAt(idx);
+        },
     }
 }

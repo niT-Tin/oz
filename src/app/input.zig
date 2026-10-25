@@ -134,29 +134,29 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
                 if (self.filetree_active and self.focus == .buffer) {
                     const before = self.current_win;
                     self.navigateWindow(.left);
-                    if (self.current_win == before) self.focus = .filetree;
+                    if (self.current_win == before) self.focus = .navigator;
                 } else if (!self.filetree_active) {
                     self.navigateWindow(.left);
                 }
-                // from the tree (tree open, focus == .filetree) there is
+                // from the navigator (tree open, focus == .navigator) there is
                 // nothing further left
             },
             'l' => {
-                if (self.filetree_active and self.focus == .filetree) {
+                if (self.filetree_active and self.focus == .navigator) {
                     self.focus = .buffer;
                 } else {
                     self.navigateWindow(.right);
                 }
             },
             'j' => {
-                if (self.filetree_active and self.focus == .filetree) {
+                if (self.filetree_active and self.focus == .navigator) {
                     self.focus = .buffer;
                 } else {
                     self.navigateWindow(.down);
                 }
             },
             'k' => {
-                if (self.filetree_active and self.focus == .filetree) {
+                if (self.filetree_active and self.focus == .navigator) {
                     self.focus = .buffer;
                 } else {
                     self.navigateWindow(.up);
@@ -175,8 +175,11 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
     // visible but hjkl move the buffer cursor. A pending <leader> sequence
     // owns the next key (e.g. <leader>j = hint mode; the tail is `j`, which
     // the tree would otherwise consume as cursor movement).
-    if (self.filetree_active and self.focus == .filetree and !editor.Mode.leaderPending(&self.state)) {
-        if (try self.filetreeKey(key)) return;
+    // Navigator (M2b1): Files keeps the filetree keys; Notes/Agents have
+    // their own handlers; Tab/Shift-Tab + 1/2/3 switch tabs. The pending
+    // <leader> check stays first so <leader>j reaches the hint action.
+    if (self.filetree_active and self.focus == .navigator and !editor.Mode.leaderPending(&self.state)) {
+        if (try self.navigatorKey(key)) return;
     }
 
     // Dashboard (no file open): j/k/Enter navigate recent files and the

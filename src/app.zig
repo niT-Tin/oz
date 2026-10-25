@@ -67,8 +67,12 @@ pub const NavAction = enum { none, hover, definition, declaration, references, i
 /// An inlay hint: dim label shown inline at (line, character).
 pub const InlayHint = struct { line: u32, character: u32, label: []const u8 };
 
-
 pub const GitPreview = @import("app/git.zig").GitPreview;
+
+// M2b1 navigator tabs + global note store (pure models live in app/*.zig)
+pub const NavigatorTab = @import("app/navigator.zig").Tab;
+pub const NoteStore = @import("app/note_store.zig").Store;
+pub const Note = @import("app/note_store.zig").Note;
 
 pub const LspStartJob = @import("app/lsp.zig").LspStartJob;
 
@@ -227,7 +231,7 @@ pub const App = struct {
     /// way; only the focused pane reacts to keys. Named `Focus` so the
     /// Workspace struct can swap it alongside the rest of the file-tree
     /// state (the tree is per workspace; see Workspace).
-    pub const Focus = enum { buffer, filetree };
+    pub const Focus = enum { buffer, navigator };
 
     /// Doom-Emacs-style workspace: one independent buffer set + window
     /// layout + file tree (swap-on-switch model, see docs/workspace-plan.md
@@ -270,7 +274,6 @@ pub const App = struct {
         /// like the tree state.
         project_root: ?[]u8 = null,
     };
-
 
     io: std.Io,
     alloc: std.mem.Allocator,
@@ -412,6 +415,13 @@ pub const App = struct {
     /// the window; the window scrolls only when it crosses an edge.
     filetree_top: usize = 0,
     focus: Focus = .buffer,
+    // ---- navigator tabs + notes (M2b1, DESIGN §18.8) ----
+    /// Active left-navigator tab. Global (the navigator view mode) while the
+    /// filetree content/selection remains per workspace.
+    navigator_tab: NavigatorTab = .files,
+    /// Cached global markdown note list (project independent). Refreshed on
+    /// tab entry/create/save/r only; frames never scan the filesystem.
+    notes: NoteStore = .{},
     /// Ctrl-w seen, awaiting the window-motion key (h/l/j/k).
     pending_window: bool = false,
     /// Content hash at insert-session entry, so an insert session that ends
@@ -1450,6 +1460,7 @@ pub const App = struct {
         if (self.filetree_root) |root| self.freeFiletreeNode(root);
         self.filetree_rows.deinit(self.alloc);
         if (self.project_root) |p| self.alloc.free(p);
+        self.notes.deinit(self.alloc);
         for (self.recent_files.items) |f| self.alloc.free(f);
         self.recent_files.deinit(self.alloc);
         for (self.picker_files.items) |f| self.alloc.free(f);
@@ -1704,6 +1715,19 @@ pub const App = struct {
     pub const setProjectRoot = @import("app/filetree.zig").setProjectRoot;
     pub const TreeNode = @import("app/filetree.zig").TreeNode;
     pub const FiletreeRow = @import("app/filetree.zig").FiletreeRow;
+    // ---- notes + navigator (M2b1) → src/app/notes.zig ----
+    pub const notesDir = @import("app/notes.zig").notesDir;
+    pub const notesIsPath = @import("app/notes.zig").notesIsPath;
+    pub const refreshNotes = @import("app/notes.zig").refreshNotes;
+    pub const notesDidSave = @import("app/notes.zig").notesDidSave;
+    pub const openNoteAt = @import("app/notes.zig").openNoteAt;
+    pub const createNote = @import("app/notes.zig").createNote;
+    pub const navigatorSetTab = @import("app/notes.zig").navigatorSetTab;
+    pub const navigatorCycleTab = @import("app/notes.zig").navigatorCycleTab;
+    pub const navigatorKey = @import("app/notes.zig").navigatorKey;
+    pub const navigatorAttachSelectedThread = @import("app/notes.zig").navigatorAttachSelectedThread;
+    pub const navigatorNewThread = @import("app/notes.zig").navigatorNewThread;
+    pub const navigatorCursorRow = @import("app/notes.zig").navigatorCursorRow;
     // ---- lsp_edit → src/app/lsp_edit.zig ----
     pub const requestRename = @import("app/lsp_edit.zig").requestRename;
     pub const execRename = @import("app/lsp_edit.zig").execRename;
@@ -1778,6 +1802,7 @@ pub const App = struct {
     pub const aiSelectThread = app_ai.aiSelectThread;
     pub const aiFocusPrompt = app_ai.aiFocusPrompt;
     pub const aiSetWorkboxTab = app_ai.aiSetWorkboxTab;
+    pub const ensureAi = app_ai.ensureAi;
     pub const aiLoadConfig = app_ai.aiLoadConfig;
     pub const aiSetError = app_ai.aiSetError;
     pub const aiSetErrorFmt = app_ai.aiSetErrorFmt;

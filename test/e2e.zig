@@ -13917,6 +13917,47 @@ test "popup geometry: hover/completion borders align; markdown rendered" {
 // M2a AI workspace (Agent Rail + Workbox)
 // ---------------------------------------------------------------------------
 
+/// Unique temp notes path for navigator/notes tests (OZ_NOTES_DIR seam).
+fn notesTestPath(buf: []u8) ![:0]u8 {
+    const dir = try bufPrintZ(buf, "/tmp/oz_notes_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    return dir;
+}
+
+/// Temp notes dir, created eagerly for tests that pre-populate it.
+fn notesTestDir(io: Io, buf: []u8) ![:0]u8 {
+    const dir = try notesTestPath(buf);
+    try std.Io.Dir.createDirAbsolute(io, dir, .default_dir);
+    return dir;
+}
+
+fn pathExists(io: Io, path: []const u8) bool {
+    _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return true;
+}
+
+fn absFileText(io: Io, alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(64 * 1024));
+}
+
+/// Navigator strip geometry (render.zig: "╭─ files ─ notes ─ agents ────╮"
+/// at contentTop()=1 for a single window; the three labels start at 3/11/19).
+fn navTabsRow() usize {
+    return 1;
+}
+
+fn navTabCol(i: usize) usize {
+    return 3 + 8 * i;
+}
+
+fn navSelectedBg() u32 {
+    return packRgb(0x2D, 0x4F, 0x67); // kanagawa-wave bg_sel
+}
+
+fn navEditorBg() u32 {
+    return packRgb(0x1F, 0x1F, 0x28); // kanagawa-wave bg
+}
+
 fn aiMockDir(io: Io, buf: []u8) ![:0]u8 {
     const dir = try bufPrintZ(buf, "/tmp/oz_ai_{d}_{d}", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
@@ -13982,6 +14023,19 @@ fn aiFindCell(grid: *Grid, needle: []const u8) ?struct { row: usize, col: usize 
     var r: usize = 0;
     while (r < grid.rows) : (r += 1) {
         if (aiCellIndexOf(grid, r, needle)) |c| return .{ .row = r, .col = c };
+    }
+    return null;
+}
+
+/// First cell whose content starts with `needle` at/after `min_col`. Used to
+/// distinguish the editor region (right of the 30-cell navigator) from the
+/// same text shown in the note list.
+fn aiFindCellFrom(grid: *Grid, needle: []const u8, min_col: usize) ?struct { row: usize, col: usize } {
+    var r: usize = 0;
+    while (r < grid.rows) : (r += 1) {
+        if (aiCellIndexOf(grid, r, needle)) |c| {
+            if (c >= min_col) return .{ .row = r, .col = c };
+        }
     }
     return null;
 }
@@ -14160,7 +14214,9 @@ test "ai workspace: 120-col docked rail keeps editor+filetree, streams, focus re
     // <leader>a toggles the rail closed from the editor...
     try sess.send(" a");
     try gridWaitGone(&sess, &grid, "changes 0", 4000);
-    try std.testing.expect(!grid.contains("agents"));
+    // The navigator's "agents" TAB also contains that word, so assert the
+    // rail's own thread-bar header is gone instead.
+    try std.testing.expect(!grid.contains("▥ agents"));
     // ...and reopening restores the session transcript (not persisted, but
     // it survives rail close).
     try sess.send(" a");
@@ -14242,7 +14298,9 @@ test "ai workspace: 80-col drawer overlays the full-width editor without overflo
     try gridWaitFor(&sess, &grid, "beta", 2000);
     try sess.send("\x1b");
     try gridWaitGone(&sess, &grid, "changes 0", 4000);
-    try std.testing.expect(!grid.contains("agents"));
+    // The navigator's "agents" TAB also contains that word, so assert the
+    // rail's own thread-bar header is gone instead.
+    try std.testing.expect(!grid.contains("▥ agents"));
     // Editor focus after the drawer closes.
     try sess.send("i");
     try sess.send("X");
@@ -14957,6 +15015,454 @@ test "hints: no targets shows the empty status and Esc exits" {
 }
 
 // ---------------------------------------------------------------------------
+// M2b1 navigator tabs + notes
+// ---------------------------------------------------------------------------
+
+test "navigator: 120x30 tabs switch files/notes/agents with real content" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}nav.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "NAV_MARKER\n");
+    }
+
+    var notes_buf: [128]u8 = undefined;
+    // Deliberately NOT created: the navigator must not create the notes dir
+    // at startup; only the first Notes-tab entry (lazy list) may do that.
+    const notes_dir = try notesTestPath(&notes_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, notes_dir) catch {};
+    try std.testing.expect(!pathExists(io, notes_dir));
+    const notes_env = try std.fmt.allocPrint(alloc, "OZ_NOTES_DIR={s}", .{notes_dir});
+    defer alloc.free(notes_env);
+
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, &.{notes_env}, 30, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+
+    // Files: existing tree + tab strip in the top border row.
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "build.zig", 6000);
+    try gridWaitFor(&sess, &grid, "agents────╮", 6000);
+    try std.testing.expect(!pathExists(io, notes_dir));
+    const strip = grid.rowText(navTabsRow());
+    try std.testing.expect(std.mem.indexOf(u8, strip, "╭─ files ─ notes ─ agents") != null);
+    try std.testing.expectEqualStrings("╭", aiCellText(&grid, navTabsRow(), 0));
+    try std.testing.expectEqualStrings("╮", aiCellText(&grid, navTabsRow(), 29));
+    // Active tab uses bg_sel; the inactive ones keep the editor bg.
+    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, navTabsRow(), navTabCol(0)));
+    try std.testing.expectEqual(navEditorBg(), aiCellBg(&grid, navTabsRow(), navTabCol(1)));
+    try std.testing.expectEqual(navEditorBg(), aiCellBg(&grid, navTabsRow(), navTabCol(2)));
+
+    // Tab -> Notes: empty state + lazy directory creation on first list.
+    try sess.send("\t");
+    try gridWaitFor(&sess, &grid, "no notes yet", 5000);
+    try std.testing.expect(pathExists(io, notes_dir));
+    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, navTabsRow(), navTabCol(1)));
+    try std.testing.expectEqual(navEditorBg(), aiCellBg(&grid, navTabsRow(), navTabCol(0)));
+    // Border frame intact around the tabs.
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 2, 0));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 2, 29));
+
+    // Tab -> Agents: real thread model, grouped under the current workspace.
+    try sess.send("\t");
+    try gridWaitFor(&sess, &grid, "thread 1", 5000);
+    try std.testing.expect(aiRowContains(&grid, 2, "main"));
+    try std.testing.expect(aiRowContains(&grid, 3, "thread 1"));
+    try std.testing.expect(aiRowContains(&grid, 3, "idle"));
+    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, navTabsRow(), navTabCol(2)));
+
+    // Shift-Tab goes back to Notes, direct "1" returns to Files.
+    try sess.send("\x1b[Z");
+    try gridWaitFor(&sess, &grid, "no notes yet", 5000);
+    try sess.send("1");
+    try gridWaitFor(&sess, &grid, "build.zig", 5000);
+    try std.testing.expect(!grid.contains("no notes yet"));
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    try aiQuit(&sess);
+}
+
+test "navigator: notes create, edit, save and reopen from the list" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}notefix.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "OTHER_BUFFER\n");
+    }
+
+    var notes_buf: [128]u8 = undefined;
+    const notes_dir = try notesTestDir(io, &notes_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, notes_dir) catch {};
+    const notes_env = try std.fmt.allocPrint(alloc, "OZ_NOTES_DIR={s}", .{notes_dir});
+    defer alloc.free(notes_env);
+
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, &.{notes_env}, 30, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "OTHER_BUFFER", 5000);
+
+    // Files -> Notes, then `n`: a real note file + normal buffer.
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "files", 5000);
+    try sess.send("\t");
+    try gridWaitFor(&sess, &grid, "no notes yet", 5000);
+    try sess.send("n");
+    try gridWaitFor(&sess, &grid, "Untitled note", 5000);
+
+    var p1_buf: [256]u8 = undefined;
+    const p1 = try std.fmt.bufPrint(&p1_buf, "{s}/note-1.md", .{notes_dir});
+    try std.testing.expect(pathExists(io, p1));
+    {
+        const created = try absFileText(io, alloc, p1);
+        defer alloc.free(created);
+        try std.testing.expectEqualStrings("# Untitled note\n\n", created);
+    }
+
+    // Edit a marker on a new line below the template, then :w.
+    try sess.send("Go");
+    try sess.send("NOTE_MARKER_1");
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "NORMAL", 4000);
+    try sess.send(":w\r");
+    try gridWaitFor(&sess, &grid, "written:", 5000);
+    {
+        const saved = try absFileText(io, alloc, p1);
+        defer alloc.free(saved);
+        try std.testing.expect(std.mem.indexOf(u8, saved, "# Untitled note") != null);
+        try std.testing.expect(std.mem.indexOf(u8, saved, "NOTE_MARKER_1") != null);
+    }
+
+    // Switch to another buffer, focus the navigator (Notes tab is still
+    // active), refresh on tab entry, then Enter reopens the note.
+    var cmd_buf: [320]u8 = undefined;
+    const cmd = try std.fmt.bufPrint(&cmd_buf, ":e {s}\r", .{name});
+    try sess.send(cmd);
+    try gridWaitFor(&sess, &grid, "OTHER_BUFFER", 5000);
+    // The note's title/snippet (including the saved marker) is in the LIST,
+    // but the editor region right of the 30-cell navigator now shows the
+    // other buffer, not the note.
+    try std.testing.expect(aiFindCellFrom(&grid, "NOTE_MARKER_1", 30) == null);
+    try sess.send("\x17h");
+    try sess.send("2"); // explicit tab entry -> refresh
+    try gridWaitFor(&sess, &grid, "note-1.md", 5000);
+    try gridWaitFor(&sess, &grid, "Untitled note", 5000);
+    try sess.send("\r");
+    // The list already contains the marker (snippet); wait for the editor
+    // region right of the 30-cell navigator to show it, proving the note
+    // buffer itself was reopened.
+    var reopened_wait: i32 = 0;
+    while (reopened_wait < 5000 and aiFindCellFrom(&grid, "NOTE_MARKER_1", 30) == null) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) {
+            reopened_wait += 100;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(aiFindCellFrom(&grid, "NOTE_MARKER_1", 30) != null);
+    // The opened note is a normal buffer: its filename owns a tab title.
+    try std.testing.expect(aiRowContains(&grid, 0, "note-1.md"));
+
+    // Notes are project-independent: Files still shows the repo tree, not
+    // the global data directory (opening a note must not re-root the
+    // workspace's filetree/picker).
+    try sess.send("\x17h");
+    try sess.send("1");
+    try gridWaitFor(&sess, &grid, "build.zig", 5000);
+    try sess.send("2");
+    try gridWaitFor(&sess, &grid, "note-1.md", 5000);
+
+    // A second `n` allocates the next collision-free name (never overwrites).
+    try sess.send("n");
+    try gridWaitFor(&sess, &grid, "note-2.md", 5000);
+    var p2_buf: [256]u8 = undefined;
+    const p2 = try std.fmt.bufPrint(&p2_buf, "{s}/note-2.md", .{notes_dir});
+    try std.testing.expect(pathExists(io, p2));
+    {
+        const second = try absFileText(io, alloc, p2);
+        defer alloc.free(second);
+        try std.testing.expectEqualStrings("# Untitled note\n\n", second);
+    }
+    const first_again = try absFileText(io, alloc, p1);
+    defer alloc.free(first_again);
+    try std.testing.expect(std.mem.indexOf(u8, first_again, "NOTE_MARKER_1") != null);
+
+    try aiQuit(&sess);
+}
+
+test "navigator: agents tab Enter attaches the selected real thread" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}navagent.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "AGENT_NAV_MARKER\n");
+    }
+
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, null, 30, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+
+    // Files -> Agents. thread 1 is the real lazily-created session thread.
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "files", 5000);
+    try sess.send("\t\t");
+    try gridWaitFor(&sess, &grid, "thread 1", 5000);
+    try std.testing.expect(aiRowContains(&grid, 2, "main"));
+
+    // `n` on the navigator = aiNewThread: the rail opens on thread 2.
+    try sess.send("n");
+    try gridWaitFor(&sess, &grid, "thread 2", 5000);
+    try gridWaitFor(&sess, &grid, "thread 2 ·", 5000);
+    try std.testing.expect(aiRowContains(&grid, aiWorkboxHeaderRow(30), "thread 2 · idle"));
+
+    // Back to the navigator (Esc returns keys to the editor; the App focus
+    // is still the navigator), select thread 1, Enter attaches it. Wait for
+    // the rail's faint border before typing so Esc is not merged with the
+    // next key into an Alt sequence.
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try sess.send("k");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "thread 1 ·", 5000);
+    try std.testing.expect(aiRowContains(&grid, aiWorkboxHeaderRow(30), "thread 1 · idle"));
+
+    // And again to thread 2: the workbox header/status follow the attach.
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try sess.send("j");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "thread 2 ·", 5000);
+    try std.testing.expect(aiRowContains(&grid, aiWorkboxHeaderRow(30), "thread 2 · idle"));
+
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+
+test "hints: navigator tab and note row labels activate targets" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}navhint.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "NAV_HINT_MARKER\n");
+    }
+
+    var notes_buf: [128]u8 = undefined;
+    const notes_dir = try notesTestDir(io, &notes_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, notes_dir) catch {};
+    try aiWriteFile(io, notes_dir, "alpha.md", "# Alpha note\n\nsnippet body\n");
+    const notes_env = try std.fmt.allocPrint(alloc, "OZ_NOTES_DIR={s}", .{notes_dir});
+    defer alloc.free(notes_env);
+
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, &.{notes_env}, 30, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "files", 5000);
+    try sess.send("\t");
+    try gridWaitFor(&sess, &grid, "Alpha note", 5000);
+
+    // Enter hint mode; read the files-tab label from the DRAWN frame and
+    // activate it (the notes list must disappear, the tree must appear).
+    try sess.send(" j");
+    try gridWaitFor(&sess, &grid, "HINTS ·", 5000);
+    const count = hintTargetCount(&grid) orelse return error.TestUnexpectedResult;
+    const want = hintLabelLenFor(count);
+    var label_buf: [3]u8 = undefined;
+    const files_label = hintLabelAt(&grid, &label_buf, navTabsRow(), navTabCol(0), want);
+    if (files_label.len != want) {
+        std.debug.print("nav hints: no files-tab label at ({d},{d}): {d}/{d}\n", .{ navTabsRow(), navTabCol(0), files_label.len, want });
+        grid.dump();
+        return error.TestUnexpectedResult;
+    }
+    try sess.send(files_label);
+    try gridWaitFor(&sess, &grid, "build.zig", 5000);
+    try gridWaitGone(&sess, &grid, "HINTS ·", 4000);
+    try std.testing.expect(!grid.contains("Alpha note"));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 2, 0));
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    // Back to Notes and open the note through its drawn row label.
+    try sess.send("2");
+    try gridWaitFor(&sess, &grid, "Alpha note", 5000);
+    try sess.send(" j");
+    try gridWaitFor(&sess, &grid, "HINTS ·", 5000);
+    const want2 = hintLabelLenFor(hintTargetCount(&grid) orelse return error.TestUnexpectedResult);
+    var note_label_buf: [3]u8 = undefined;
+    const note_label = hintLabelAt(&grid, &note_label_buf, navTabsRow() + 1, 1, want2);
+    if (note_label.len != want2) {
+        std.debug.print("nav hints: no note-row label at ({d},1): {d}/{d}\n", .{ navTabsRow() + 1, note_label.len, want2 });
+        grid.dump();
+        return error.TestUnexpectedResult;
+    }
+    try sess.send(note_label);
+    try gridWaitGone(&sess, &grid, "HINTS ·", 4000);
+    // The note buffer now owns a tab title; the fixture buffer is still open.
+    var waited: i32 = 0;
+    while (waited < 5000 and !aiRowContains(&grid, 0, "alpha.md")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) {
+            waited += 100;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(aiRowContains(&grid, 0, "alpha.md"));
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    try aiQuit(&sess);
+}
+
+test "navigator: unavailable notes dir shows a clear error, no crash" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}naverr.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "NAV_ERR_MARKER\n");
+    }
+
+    // /dev/null/notes cannot be a directory: the lazy create/list fails and
+    // the Notes tab must show an error instead of crashing or scanning per
+    // frame.
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, &.{"OZ_NOTES_DIR=/dev/null/notes"}, 24, 80);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "files", 5000);
+    try sess.send("\t");
+    try gridWaitFor(&sess, &grid, "! notes unavailable", 5000);
+    try std.testing.expect(grid.contains("NORMAL"));
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+    // The editor remains usable beside the error: Ctrl-w l hands keys back
+    // to the buffer (no Esc+key merge into an Alt sequence).
+    try sess.send("\x17l");
+    try sess.send("i");
+    try sess.send("X");
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "XNAV_ERR_MARKER", 5000);
+
+    try aiQuit(&sess);
+}
+
+test "navigator: 80x24 tabs fit and the notes list scrolls" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}nav80.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "NAV80_MARKER\n");
+    }
+
+    var notes_buf: [128]u8 = undefined;
+    const notes_dir = try notesTestDir(io, &notes_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, notes_dir) catch {};
+    // 12 notes: 10 fit in the 20 content rows (2 rows each); j*10 scrolls
+    // exactly one note off the top.
+    var i: usize = 1;
+    while (i <= 12) : (i += 1) {
+        var fname_buf: [32]u8 = undefined;
+        const fname = try std.fmt.bufPrint(&fname_buf, "note-{d:0>2}.md", .{i});
+        var body_buf: [96]u8 = undefined;
+        const body = try std.fmt.bufPrint(&body_buf, "# Note {d:0>2}\n\nbody {d}\n", .{ i, i });
+        try aiWriteFile(io, notes_dir, fname, body);
+    }
+    const notes_env = try std.fmt.allocPrint(alloc, "OZ_NOTES_DIR={s}", .{notes_dir});
+    defer alloc.free(notes_env);
+
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, &.{notes_env}, 24, 80);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "agents────╮", 5000);
+    // 30-cell strip, exact fit inside the 80-col screen.
+    // 30 CELLS, not 30 bytes (box-drawing glyphs are 3 bytes each).
+    const strip_end = grid.rowByteOf(navTabsRow(), 30);
+    try std.testing.expectEqualStrings("╭─ files ─ notes ─ agents────╮", grid.rowText(navTabsRow())[0..strip_end]);
+    try std.testing.expectEqualStrings("╮", aiCellText(&grid, navTabsRow(), 29));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 2, 29));
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    try sess.send("\t");
+    try gridWaitFor(&sess, &grid, "Note 12", 5000);
+    // Newest first: note-12's title row is the first content row.
+    try std.testing.expect(aiRowContains(&grid, 2, "Note 12"));
+    try std.testing.expect(aiRowContains(&grid, 3, "note-12.md"));
+    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, 2, 1));
+
+    // Scroll one full page: the top note leaves, note 02 becomes visible.
+    try sess.send("jjjjjjjjjj");
+    try gridWaitGone(&sess, &grid, "Note 12", 5000);
+    try std.testing.expect(aiRowContains(&grid, 2, "Note 11"));
+    try std.testing.expect(grid.contains("Note 02"));
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    // ...and back up: the list restores the first note.
+    try sess.send("kkkkkkkkkk");
+    try gridWaitFor(&sess, &grid, "Note 12", 5000);
+    try std.testing.expect(aiRowContains(&grid, 2, "Note 12"));
+
+    try aiQuit(&sess);
+}
+
+// ---------------------------------------------------------------------------
 // Scenario matrix (M2.5): data-driven layout + AI workspace coverage
 // ---------------------------------------------------------------------------
 const frame = @import("frame.zig");
@@ -15000,6 +15506,9 @@ const Scenario = struct {
     /// Enter hint mode as the final step (prompt -> Tab -> <leader>j) and
     /// assert the overlay/status on the settled frame.
     hints: bool = false,
+    /// Create a temp OZ_NOTES_DIR containing one "Scenario note" markdown
+    /// file, so the Notes tab is deterministic and never touches $HOME.
+    notes: bool = false,
 };
 
 /// Pairwise layout matrix: 3 widths × filetree {closed,open} × rail
@@ -15146,13 +15655,33 @@ const scenario_matrix = [_]Scenario{
         // fixture marker is clipped; "files" is covered by the box check.
         .expect_text = &.{"HINTS"},
     },
+    .{
+        .name = "navigator notes 120x30",
+        .tags = &.{ "@layout", "@navigator", "@notes", "@120col" },
+        .rows = 30,
+        .cols = 120,
+        .filetree = true,
+        .notes = true,
+        .steps = &.{.{ .keys = "\t", .wait_for = "Scenario note" }},
+        .expect_text = &.{ "files", "notes", "agents", "Scenario note", "GOLDEN_EDITOR_MARKER" },
+    },
+    .{
+        .name = "navigator agents 100x30",
+        .tags = &.{ "@layout", "@navigator", "@100col" },
+        .rows = 30,
+        .cols = 100,
+        .filetree = true,
+        .steps = &.{.{ .keys = "\t\t", .wait_for = "thread 1" }},
+        .expect_text = &.{ "files", "notes", "agents", "thread 1", "idle" },
+    },
 };
 
 /// Every feature tag that must have at least one scenario. A new layout/AI
 /// feature adds its tag here and to at least one Scenario; the coverage test
 /// fails with a clear message otherwise (instead of silently dropping it).
 const required_scenario_tags = [_][]const u8{
-    "@layout", "@ai", "@filetree", "@stream", "@hints", "@80col", "@100col", "@120col", "@drawer", "@docked",
+    "@layout", "@ai",     "@filetree", "@stream", "@hints",  "@navigator", "@notes",
+    "@80col",  "@100col", "@120col",   "@drawer", "@docked",
 };
 
 fn expectedRailMode(rail: ScenarioRail) ai_ws.RailMode {
@@ -15178,6 +15707,19 @@ fn gridSettle(sess: *Session, grid: *Grid, quiet_ms: i32, timeout_ms: i32) !void
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
+}
+
+/// Navigator box without depending on its title text: hint mode labels the
+/// three tabs, so "files" may be overwritten in a hint frame. The navigator
+/// is the only 30-cell box starting at column 0.
+fn findNavigatorBox(grid: *Grid) ?frame.Rect {
+    var r: usize = 0;
+    while (r + 2 < grid.rows) : (r += 1) {
+        if (!std.mem.eql(u8, frame.cellText(grid, r, 0), "╭")) continue;
+        const rect = frame.boxRect(grid, r) orelse continue;
+        if (rect.left == 0 and rect.right == 29) return rect;
+    }
+    return null;
 }
 
 fn assertScenario(sc: Scenario, grid: *Grid) !void {
@@ -15275,17 +15817,26 @@ fn assertScenario(sc: Scenario, grid: *Grid) !void {
             try std.testing.expect(label_cell.len == 1 and hintIsChar(label_cell[0]));
             try std.testing.expectEqualStrings("│", frame.cellText(grid, tabs_row, @as(usize, lay.rail_col)));
         }
+        if (sc.filetree) {
+            // Navigator tabs are targets too: their first cell carries a
+            // label glyph under the overlay.
+            var ti: usize = 0;
+            while (ti < 3) : (ti += 1) {
+                const cell = frame.cellText(grid, navTabsRow(), navTabCol(ti));
+                try std.testing.expect(cell.len == 1 and hintIsChar(cell[0]));
+            }
+        }
     }
 
     if (sc.filetree) {
-        const ft = frame.findBoxByTitle(grid, "files") orelse {
-            std.debug.print("scenario {s}: no filetree box with title 'files' in {d}x{d}\n", .{
+        const ft = findNavigatorBox(grid) orelse {
+            std.debug.print("scenario {s}: no 30-cell navigator box in {d}x{d}\n", .{
                 sc.name, sc.rows, sc.cols,
             });
             return error.TestUnexpectedResult;
         };
         try frame.expectBorderBox(grid, ft, null);
-        try frame.expectTextInRegion(grid, ft, "files");
+        if (!sc.hints) try frame.expectTextInRegion(grid, ft, "files");
         if (rail_rect) |rr| try frame.expectNoOverlap(ft, rr);
         try frame.expectNoOverlap(ft, status_rect);
         try std.testing.expect(ft.bottom <= @as(usize, rows) - 2);
@@ -15337,13 +15888,35 @@ fn runScenario(sc: Scenario) !void {
         try aiWriteFile(io, d, "stream.sse", scenario_sse);
         mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{d});
     }
-    var env_storage: [2][]const u8 = undefined;
-    var env_extra: ?[]const []const u8 = null;
-    if (mock_env) |e| {
-        env_storage[0] = e;
-        env_storage[1] = "OZ_AI_MODEL=mock-model";
-        env_extra = env_storage[0..];
+    var notes_dir_buf: [128]u8 = undefined;
+    var notes_dir: ?[:0]const u8 = null;
+    var notes_env: ?[]u8 = null;
+    defer {
+        if (notes_env) |e| alloc.free(e);
     }
+    defer {
+        if (notes_dir) |d| std.Io.Dir.cwd().deleteTree(io, d) catch {};
+    }
+    if (sc.notes) {
+        const d = try notesTestDir(io, &notes_dir_buf);
+        notes_dir = d;
+        try aiWriteFile(io, d, "scenario-note.md", "# Scenario note\n\nnavigator matrix fixture\n");
+        notes_env = try std.fmt.allocPrint(alloc, "OZ_NOTES_DIR={s}", .{d});
+    }
+    var env_storage: [4][]const u8 = undefined;
+    var env_extra: ?[]const []const u8 = null;
+    var env_len: usize = 0;
+    if (mock_env) |e| {
+        env_storage[env_len] = e;
+        env_len += 1;
+        env_storage[env_len] = "OZ_AI_MODEL=mock-model";
+        env_len += 1;
+    }
+    if (notes_env) |e| {
+        env_storage[env_len] = e;
+        env_len += 1;
+    }
+    if (env_len > 0) env_extra = env_storage[0..env_len];
 
     var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, env_extra, sc.rows, sc.cols);
     defer sess.close();
