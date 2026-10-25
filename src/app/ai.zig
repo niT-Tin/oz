@@ -8,12 +8,14 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 
 const buffer = @import("../buffer/root.zig");
+const theme = @import("../theme.zig");
 const ai = @import("../ai/root.zig");
 const agent = @import("../ai/agent.zig");
 const turn = @import("../ai/turn.zig");
 const chart = @import("../chart.zig");
 const autil = @import("util.zig");
 const chrome = @import("chrome.zig");
+const animation = @import("animation.zig");
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const ws = ai.workspace;
@@ -1031,7 +1033,7 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
         setToolNote(self, idx, "tool loop stopped: workspace root unavailable");
         return;
     };
-    const job = tool_job.Job.start(self.alloc, self.io, root, worker_calls, st.?.generation) catch {
+    const job = tool_job.Job.start(self.alloc, self.io, root, worker_calls, st.?.generation, toolTestDelayMs(self)) catch {
         // Job.start freed `worker_calls` on failure.
         for (st.?.pending_cards[0..st.?.pending_card_count]) |msg_index| {
             const name = if (msg_index < t.messages.items.len) (t.messages.items[msg_index].tool_name orelse "?") else "?";
@@ -1064,6 +1066,15 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
     }
     self.ai.tool_jobs.items[idx] = job;
     st.?.active = true;
+}
+
+/// Internal e2e seam: a hold before the read-only tool worker executes, so
+/// the running card/spinner is observable across frames. Unset in every
+/// normal run; capped so a stray value cannot hang the worker.
+fn toolTestDelayMs(self: *App) u32 {
+    const raw = self.env_map.get("OZ_AI_TOOL_DELAY_MS") orelse return 0;
+    const ms = std.fmt.parseInt(u32, raw, 10) catch return 0;
+    return @min(ms, 5000);
 }
 
 /// Card/result for a non-executed local tool. `text` is display-only; `api`
@@ -1289,6 +1300,11 @@ const Styles = struct {
     error_style: vaxis.Style,
     warn: vaxis.Style,
     border: vaxis.Style,
+    /// Raw palette endpoints for streaming/running pulses. Kept beside the
+    /// prebuilt styles so animated elements share the theme mapping (no
+    /// second color table that can drift).
+    pulse_a: theme.Rgb,
+    pulse_b: theme.Rgb,
 };
 
 /// Wraps styled segments into fixed-width rows, repeating a continuation
@@ -1606,12 +1622,18 @@ fn appendToolCardRows(
     inner_w: u32,
     msg: *const Message,
 ) !void {
-    _ = self;
     const status = msg.tool_status;
     const name = msg.tool_name orelse "tool";
     const args = msg.tool_args orelse "";
-    const status_style = cardStatusStyle(st, status);
-    const icon = cardIcon(status);
+    const now_ms = self.frame_now_ms;
+    var status_style = cardStatusStyle(st, status);
+    const icon = if (status == .running) animation.spinnerGlyph(now_ms) else cardIcon(status);
+    if (status == .running) {
+        // Demo `running-pulse`: the icon and status word breathe between the
+        // two accent slots. The glyph itself cycles | / - \ every 120ms.
+        status_style.fg = .{ .rgb = animation.pulseColor(st.pulse_a, st.pulse_b, now_ms, animation.stream_pulse_ms) };
+        status_style.bold = true;
+    }
 
     var status_buf: [agent.max_status_text_bytes]u8 = undefined;
     const status_text = agent.cardStatusText(&status_buf, switch (status) {
@@ -1759,10 +1781,14 @@ fn appendWrappedPlain(
     if (!any) try wrap.newline();
 }
 
-fn railStatusStyle(st: Styles, status: Status) vaxis.Style {
+fn railStatusStyle(st: Styles, status: Status, now_ms: i64) vaxis.Style {
     return switch (status) {
         .idle => st.dim,
-        .streaming => st.accent,
+        .streaming => .{
+            .fg = .{ .rgb = animation.pulseColor(st.pulse_a, st.pulse_b, now_ms, animation.stream_pulse_ms) },
+            .bg = st.base.bg,
+            .bold = true,
+        },
         .cancelled => st.faint,
         .err => st.error_style,
     };
@@ -1790,10 +1816,14 @@ fn threadDot(status: Status) []const u8 {
     };
 }
 
-fn threadDotStyle(st: Styles, status: Status) vaxis.Style {
+fn threadDotStyle(st: Styles, status: Status, now_ms: i64) vaxis.Style {
     return switch (status) {
         .idle => st.faint,
-        .streaming => st.accent,
+        .streaming => .{
+            .fg = .{ .rgb = animation.pulseColor(st.pulse_a, st.pulse_b, now_ms, animation.stream_pulse_ms) },
+            .bg = st.base.bg,
+            .bold = true,
+        },
         .cancelled => st.dim,
         .err => st.error_style,
     };
@@ -1907,6 +1937,8 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         .error_style = .{ .fg = .{ .rgb = t.diag_error }, .bg = rail_bg },
         .warn = .{ .fg = .{ .rgb = t.diag_warn }, .bg = rail_bg },
         .border = border_style,
+        .pulse_a = t.accent,
+        .pulse_b = t.accent_alt,
     };
 
     if (self.ai.threads.items.items.len == 0) {
@@ -2010,7 +2042,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
             .bg = row_bg,
             .bold = attached,
         };
-        const dot_style = threadDotStyle(st, thread.status);
+        const dot_style = threadDotStyle(st, thread.status, self.frame_now_ms);
         const status_text = aiStatusLabelFor(self, ti);
         const status_cells = autil.cellWidth(win, status_text);
         // Active thread: `>` + bold in monochrome. Other rows keep an ASCII
@@ -2033,7 +2065,10 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         try segs.append(a, .{ .text = title_fit.slice, .style = title_style });
         used += @intCast(title_fit.cells);
         if (show_status) {
-            try segs.append(a, .{ .text = try spaces(a, content_w -| used -| status_cells), .style = .{ .bg = row_bg } });
+            try segs.append(a, .{ .text = try spaces(a, content_w -| used -| status_cells), .style = .{
+                .fg = .{ .rgb = t.fg_faint },
+                .bg = row_bg,
+            } });
             try segs.append(a, .{ .text = status_text, .style = .{ .fg = dot_style.fg, .bg = row_bg } });
             used = content_w;
         }
@@ -2065,14 +2100,17 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         try segs.append(a, .{ .text = active.title, .style = st.bold });
         try segs.append(a, .{ .text = " · ", .style = st.dim });
         const active_status_label = aiStatusLabelFor(self, active_idx);
-        try segs.append(a, .{ .text = active_status_label, .style = railStatusStyle(st, active.status) });
+        try segs.append(a, .{ .text = active_status_label, .style = railStatusStyle(st, active.status, self.frame_now_ms) });
         var used: u32 = @intCast(autil.cellWidth(win, active.title) + 3 + autil.cellWidth(win, active_status_label));
         const model: []const u8 = if (self.ai.config) |cfg| cfg.model else ai.config.default_model;
         const mw = autil.cellWidth(win, model);
         if (content_w >= used + mw + 2) {
             const fit = autil.cellFitSuffix(win, model, content_w -| used -| 1);
             if (fit.cells > 0) {
-                try segs.append(a, .{ .text = try spaces(a, content_w -| used -| @as(u32, @intCast(fit.cells))), .style = .{ .bg = rail_bg } });
+                try segs.append(a, .{ .text = try spaces(a, content_w -| used -| @as(u32, @intCast(fit.cells))), .style = .{
+                    .fg = .{ .rgb = t.fg_faint },
+                    .bg = rail_bg,
+                } });
                 try segs.append(a, .{ .text = fit.slice, .style = st.faint });
                 used += @as(u32, @intCast(fit.cells));
             }
@@ -2081,6 +2119,24 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
     }
 
     // ---- tabs: >chat │ changes N │ tools │ terminal ----
+    // Observe the real pending count once per frame. A change starts a
+    // short, explicitly-deadlined flash on the Changes label; the run loop
+    // polls only while `reviewFlashActive` is true, so an idle rail burns
+    // no CPU after the deadline.
+    const pending_now = self.reviewPendingCount();
+    if (!self.review_flash_seen) {
+        self.review_flash_seen = true;
+        self.review_flash_count = pending_now;
+    } else if (pending_now != self.review_flash_count) {
+        self.review_flash_count = pending_now;
+        self.review_flash_start_ms = self.frame_now_ms;
+    }
+    const badge_flashing = animation.flashActive(
+        self.review_flash_start_ms,
+        self.frame_now_ms,
+        animation.badge_flash_ms,
+    );
+
     // The active tab carries a `>` marker on the soft selection background,
     // `fg` bold text and an accent_alt underline; the shared chrome helper
     // keeps it identical to the navigator and buffer tabs. `│`
@@ -2114,10 +2170,14 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
                 try segs.append(a, .{ .text = sep_text, .style = chrome.separatorStyle(t, .minor, rail_bg) });
                 used += sep_cells;
             }
-            const style: vaxis.Style = if (active_tab)
+            var style: vaxis.Style = if (active_tab)
                 chrome.activeTabStyle(t)
             else
                 chrome.inactiveTabStyle(t, rail_bg);
+            if (entry.tab == .changes and badge_flashing) {
+                style.fg = .{ .rgb = animation.pulseColor(t.accent, t.accent_alt, self.frame_now_ms, 300) };
+                style.bold = true;
+            }
             const target_col = x + 2 + used;
             if (active_tab) {
                 // The marker shares the tab's soft selection + accent

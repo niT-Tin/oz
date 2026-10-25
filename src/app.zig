@@ -646,6 +646,18 @@ pub const App = struct {
     /// render on that transition so the final state (ghost appearing as the
     /// CursorHold expires, animation's last spread) is never skipped.
     poll_mode_active: bool = false,
+    /// Monotonic ms captured once at the start of the current render. Every
+    /// animated element in that frame reads the same timestamp, so a dot and
+    /// its status label pulse in phase and a unit test can reason about one
+    /// frame at a time.
+    frame_now_ms: i64 = 0,
+    /// Changes badge flash (§18.12): a short pulse after the pending count
+    /// changes. The start is a hard deadline the run loop can query; 0 means
+    /// "never flashed". `review_flash_count` is the count observed last
+    /// frame, initialized on the first AI frame.
+    review_flash_start_ms: i64 = 0,
+    review_flash_count: usize = 0,
+    review_flash_seen: bool = false,
     /// Cached scopeAt result for the last rendered (window, buffer, cursor,
     /// revision) — recomputed only when the tree or the cursor byte changed.
     scope_cache: ?ScopeCache = null,
@@ -699,6 +711,13 @@ pub const App = struct {
     /// state lives here, per-window cursor/viewport in `windows`).
     pub fn cur(self: *App) *Buffer {
         return &self.buffers.items[self.windows.items[self.current_win].buf];
+    }
+
+    /// Monotonic milliseconds since boot for animation timing. Never used as
+    /// a wall-clock/date; a clock adjustment merely shifts a phase (the pure
+    /// helpers wrap negative values safely).
+    pub fn nowMs(self: *App) i64 {
+        return @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
     }
 
     /// The focused window's cursor (byte offset in its buffer).
@@ -1869,6 +1888,7 @@ pub const App = struct {
     pub const AgentEditSession = app_agent_edit.Session;
     // ---- render → src/app/render.zig ----
     pub const tabBarRows = @import("app/render.zig").tabBarRows;
+    pub const tabLayerCount = @import("app/render.zig").tabLayerCount;
     pub const contentTop = @import("app/render.zig").contentTop;
     pub const contentCol = @import("app/render.zig").contentCol;
     pub const gutterWidth = @import("app/render.zig").gutterWidth;
@@ -1890,10 +1910,13 @@ pub const App = struct {
     pub const hoverLineSegs = @import("app/render.zig").hoverLineSegs;
     pub const drawRichPopup = @import("app/render.zig").drawRichPopup;
     pub const drawStatusChrome = @import("app/render.zig").drawStatusChrome;
+    pub const drawBufferTabPlan = @import("app/render.zig").drawBufferTabPlan;
     pub const render = @import("app/render.zig").render;
     pub const blameHoldActive = @import("app/render.zig").blameHoldActive;
     pub const gitHoldActive = @import("app/render.zig").gitHoldActive;
     pub const scopeAnimActive = @import("app/render.zig").scopeAnimActive;
+    pub const reviewFlashActive = @import("app/render.zig").reviewFlashActive;
+    pub const animationActive = @import("app/render.zig").animationActive;
     pub const run = @import("app/render.zig").run;
     pub const filetree_width = @import("app/render.zig").filetree_width;
     pub const TabSort = @import("app/render.zig").TabSort;

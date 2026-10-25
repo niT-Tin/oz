@@ -149,6 +149,13 @@ pub fn execHintAction(self: *App, action: hints.Action) !void {
             self.focus = .buffer;
             self.switchTo(idx);
         },
+        .buffer_close => |idx| {
+            if (idx >= self.buffers.items.len) return;
+            // Reuse `:bd` / `<leader>bk` exactly: the last buffer stays and
+            // the surviving window/buffer focus rules are unchanged. This is
+            // the existing close semantics, not a second destructive path.
+            self.closeBufferAt(idx);
+        },
         .agent_thread_select => |idx| {
             if (idx >= self.ai.threads.items.items.len) return;
             // Same attach path as Enter in the thread list. A target may be

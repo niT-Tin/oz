@@ -49,6 +49,10 @@ pub const Job = struct {
     /// App-side identity used to discard results for a cancelled/other
     /// thread turn.
     generation: u64,
+    /// Internal e2e seam (`OZ_AI_TOOL_DELAY_MS`): hold the worker before
+    /// executing so a test can observe the running card's spinner across
+    /// frames. 0 for every normal run.
+    delay_ms: u32 = 0,
 
     /// Spawn one batch. Ownership of `calls` transfers on every return path
     /// (freed by the caller-visible job on success, here on failure).
@@ -58,6 +62,7 @@ pub const Job = struct {
         root: []const u8,
         calls: []ai.tools.ToolCall,
         generation: u64,
+        delay_ms: u32,
     ) !*Job {
         const self = try alloc.create(Job);
         errdefer alloc.destroy(self);
@@ -68,6 +73,7 @@ pub const Job = struct {
             .calls = calls,
             .results = try alloc.alloc(Result, calls.len),
             .generation = generation,
+            .delay_ms = delay_ms,
         };
         errdefer {
             ai.tools.freeCalls(alloc, self.calls);
@@ -143,6 +149,10 @@ pub const Job = struct {
             return;
         };
         defer executor.deinit();
+
+        if (self.delay_ms > 0) {
+            std.Io.sleep(self.io, .fromMilliseconds(self.delay_ms), .real) catch {};
+        }
 
         for (self.calls, 0..) |call, i| {
             if (self.cancel.load(.acquire)) {

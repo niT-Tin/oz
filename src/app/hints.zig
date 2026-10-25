@@ -136,6 +136,10 @@ pub const Action = union(enum) {
     filetree_activate: usize,
     /// Switch to the buffer in this slot (same as clicking / `[b`).
     buffer_select: usize,
+    /// Close the buffer at this slot via the SAME path as `:bd` /
+    /// `<leader>bk` (`closeBufferAt`). The last remaining buffer is never
+    /// registered: closing it is a no-op, so no dead target exists.
+    buffer_close: usize,
     /// Attach to the agent thread (Enter in the thread list).
     agent_thread_select: usize,
     /// Switch the Workbox tab.

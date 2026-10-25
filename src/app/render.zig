@@ -18,6 +18,8 @@ const nav_tabs = @import("navigator.zig");
 const note_store = @import("note_store.zig");
 const autil = @import("util.zig");
 const chrome = @import("chrome.zig");
+const tabstrip = @import("tabstrip.zig");
+const animation = @import("animation.zig");
 const git_job = @import("git_job.zig");
 
 const tab_width = app_mod.tab_width;
@@ -42,13 +44,13 @@ pub const filetree_width: u32 = 30;
 /// Blank column between the navigator's right border and editor content.
 pub const filetree_gutter: u32 = 1;
 
-/// Tab-bar rows: one per column-overlap layer of the pane layout.
-/// Panes whose column spans overlap (horizontal splits stack
-/// full-width panes) draw their tabs on separate rows so tabs never
-/// overwrite each other; vertical splits share a row (their spans are
-/// disjoint). Column spans don't depend on the split heights, so a
-/// nominal content height is fine here.
-pub fn tabBarRows(self: *App, a: std.mem.Allocator) u32 {
+/// Tab-label layers: one per column-overlap layer of the pane layout.
+/// Panes whose column spans overlap (horizontal splits stack full-width
+/// panes) draw their tabs on separate rows so tabs never overwrite each
+/// other; vertical splits share a row (their spans are disjoint). Column
+/// spans don't depend on the split heights, so a nominal content height is
+/// enough here.
+pub fn tabLayerCount(self: *App, a: std.mem.Allocator) u32 {
     if (self.windows.items.len <= 1) return 1;
     const height: u32 = self.vx.window().height;
     if (height <= status_row_count) return 1;
@@ -74,7 +76,19 @@ pub fn tabBarRows(self: *App, a: std.mem.Allocator) u32 {
             layer_end.items[li] = lr.col + lr.width;
         }
     }
-    return layers;
+    return @max(layers, 1);
+}
+
+/// Rows owned by the buffer strip: one label layer per pane-column layer
+/// plus ONE shared bottom rule/underline row. Content starts below both, so
+/// the active tab can carry the demo's accent inset line without making the
+/// label text cramped. The bar never consumes the content or status band:
+/// at a pathologically short height it clamps to the rows that exist.
+pub fn tabBarRows(self: *App, a: std.mem.Allocator) u32 {
+    const height: u32 = self.vx.window().height;
+    if (height <= status_row_count) return 1;
+    const max_bar = height - status_row_count;
+    return @min(self.tabLayerCount(a) + 1, max_bar);
 }
 
 /// Sort panes by column for tab streaming: left to right, wider first
@@ -2230,6 +2244,177 @@ pub fn drawStatusChrome(self: *App, win: vaxis.Window) void {
     }
 }
 
+
+/// Fill one strip row span with the strip's flat background. The buffer
+/// strip is a distinct chrome band (demo `.buffer-bar`), so every cell in
+/// its rows owns a background even where there is no tab.
+fn fillStripRow(win: vaxis.Window, row: u32, col: u32, width: u32, bg: vaxis.Color) void {
+    if (width == 0) return;
+    const child = win.child(.{
+        .x_off = @intCast(col),
+        .y_off = @intCast(row),
+        .width = @intCast(width),
+        .height = 1,
+    });
+    child.fill(.{ .style = .{ .bg = bg } });
+}
+
+const BufferTabKind = enum { plain, diff, note };
+
+fn bufferTabKind(self: *App, buf: *const Buffer) BufferTabKind {
+    const path = buf.path orelse return .plain;
+    if (self.notesIsPath(path)) return .note;
+    const ext = std.fs.path.extension(path);
+    if (std.ascii.eqlIgnoreCase(ext, ".diff") or
+        std.ascii.eqlIgnoreCase(ext, ".patch"))
+    {
+        return .diff;
+    }
+    return .plain;
+}
+
+/// Draw one planned tab strip (a single-window strip or one pane's tabs on
+/// its split layer) and the active-tab underline segment on the shared rule
+/// row. `origin` is the screen column of plan x=0; `buf_map` maps a plan
+/// slot's spec index back to a buffer index. All geometry comes from the
+/// pure `tabstrip.plan`, so the close target and underline cannot drift from
+/// the drawn label.
+pub fn drawBufferTabPlan(
+    self: *App,
+    a: std.mem.Allocator,
+    win: vaxis.Window,
+    label_row: u32,
+    rule_row: u32,
+    origin: u32,
+    p: tabstrip.Plan,
+    buf_map: []const usize,
+) !void {
+    const t = self.theme;
+    const strip_bg = vaxis.Color{ .rgb = t.bg_status };
+    const active_underline = vaxis.Style{
+        .fg = .{ .rgb = t.accent_alt },
+        .bg = strip_bg,
+        .bold = true,
+    };
+    const dashboard = self.isDashboard();
+    var i: usize = 0;
+    while (i < p.count) : (i += 1) {
+        const slot = p.slots[i];
+        const buf_idx = buf_map[slot.index];
+        if (buf_idx >= self.buffers.items.len) continue;
+        const buf = &self.buffers.items[buf_idx];
+        const tab_x = origin + slot.x;
+        const body_bg: vaxis.Color = if (slot.active)
+            .{ .rgb = t.bg_sel }
+        else
+            strip_bg;
+        fillStripRow(win, label_row, tab_x, slot.width, body_bg);
+        if (!slot.first_visible and slot.x > 0) {
+            win.writeCell(@intCast(tab_x - 1), @intCast(label_row), .{
+                .char = .{ .grapheme = "│", .width = 1 },
+                .style = chrome.separatorStyle(t, .minor, strip_bg),
+            });
+        }
+        const icon = icons.forPath(if (buf.path) |path| path else "", false);
+        const icon_style: vaxis.Style = if (slot.active)
+            chrome.activeTabMarkerStyle(t)
+        else
+            .{
+                .fg = .{ .rgb = icons.rgbOf(t, icon.color) },
+                .bg = strip_bg,
+            };
+        win.writeCell(@intCast(tab_x + tabstrip.pad_left), @intCast(label_row), .{
+            .char = .{ .grapheme = icon.glyph, .width = 1 },
+            .style = icon_style,
+        });
+        const name = if (buf.path) |path| std.fs.path.basename(path) else "[No Name]";
+        var kind_fg = t.fg_dim;
+        switch (bufferTabKind(self, buf)) {
+            .plain => {},
+            .diff => kind_fg = t.constant,
+            .note => kind_fg = t.type,
+        }
+        const name_style: vaxis.Style = if (slot.active)
+            chrome.activeTabStyle(t)
+        else
+            .{ .fg = .{ .rgb = kind_fg }, .bg = strip_bg };
+        if (slot.name_alloc > 0) {
+            var text = name;
+            if (slot.truncated) {
+                // Middle truncation: readable prefix + `…` + extension.
+                // `cellFitSuffix` is grapheme-aligned, so the suffix never
+                // splits a wide glyph; the loop shrinks it only if the
+                // prefix/suffix would overlap in the original name.
+                const split = tabstrip.nameSplit(slot.name_alloc);
+                const pref = autil.cellFitPrefix(win, name, split.prefix);
+                var suffix_cells = split.suffix;
+                var suf = autil.cellFitSuffix(win, name, suffix_cells);
+                while (suffix_cells > 0 and pref.slice.len + suf.slice.len > name.len) {
+                    suffix_cells -= 1;
+                    suf = autil.cellFitSuffix(win, name, suffix_cells);
+                }
+                text = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ pref.slice, tabstrip.ellipsis, suf.slice });
+            }
+            if (text.len > 0) {
+                const seg = [_]vaxis.Segment{.{ .text = text, .style = name_style }};
+                _ = win.print(&seg, .{
+                    .row_offset = @intCast(label_row),
+                    .col_offset = @intCast(origin + slot.name_x),
+                    .wrap = .none,
+                });
+            }
+        }
+        if (slot.dirty) {
+            win.writeCell(@intCast(origin + slot.name_x + slot.name_alloc), @intCast(label_row), .{
+                .char = .{ .grapheme = "●", .width = 1 },
+                .style = .{ .fg = .{ .rgb = t.constant }, .bg = body_bg },
+            });
+        }
+        if (slot.closeable) {
+            win.writeCell(@intCast(origin + slot.close_x), @intCast(label_row), .{
+                .char = .{ .grapheme = "×", .width = 1 },
+                .style = .{
+                    .fg = .{ .rgb = if (slot.active) t.fg_dim else t.fg_faint },
+                    .bg = body_bg,
+                },
+            });
+        }
+        if (self.hints.collecting) {
+            // The select target starts at the icon so the hint label covers
+            // the tab's identity, not its two-cell left padding. The close
+            // cell is its own target, wired to the SAME close-buffer path as
+            // the keyboard commands.
+            if (!dashboard) {
+                self.addHintTarget(.{
+                    .row = label_row,
+                    .col = tab_x + tabstrip.pad_left,
+                    .width = slot.width - tabstrip.pad_left,
+                    .height = 1,
+                }, .{ .buffer_select = buf_idx });
+            }
+            if (slot.closeable) {
+                self.addHintTarget(.{
+                    .row = label_row,
+                    .col = origin + slot.close_x,
+                    .width = tabstrip.close_cells,
+                    .height = 1,
+                }, .{ .buffer_close = buf_idx });
+            }
+        }
+        if (slot.active and rule_row < self.vx.window().height) {
+            // Demo `inset 0 1px 0 blue`: a bright accent segment on the
+            // shared bottom rule, spanning the full active tab width.
+            var x: u32 = 0;
+            while (x < slot.width) : (x += 1) {
+                win.writeCell(@intCast(tab_x + x), @intCast(rule_row), .{
+                    .char = .{ .grapheme = "─", .width = 1 },
+                    .style = active_underline,
+                });
+            }
+        }
+    }
+}
+
 pub fn render(self: *App) !void {
     // vaxis cells reference the text slices passed to print, so all text
     // must stay alive until vx.render(); a per-frame arena handles that.
@@ -2248,11 +2433,19 @@ pub fn render(self: *App) !void {
 
     const height: u32 = win.height;
     if (height <= status_row_count) return;
+    // One timestamp for every animated element this frame (streaming dots,
+    // tool spinners, badge flash). Idle frames compute it but draw nothing
+    // time-dependent.
+    self.frame_now_ms = self.nowMs();
     // M2.6a hints: clear this frame's target list. One boolean test per
     // frame outside hint mode; normal frames never touch the fixed array.
     self.hints.beginFrame(height, win.width);
-    // Content area rows: below the tab bar, above the status bar.
-    const content_rows = height - status_row_count - self.tabBarRows(a);
+    // Content area rows: below the two-row buffer strip, above the status
+    // band. The strip's rows are real layout rows, so the cursor/viewport
+    // math below can never paint into them.
+    const bar_rows = self.tabBarRows(a);
+    const content_top = bar_rows;
+    const content_rows = height - status_row_count - bar_rows;
 
     // Clamp the focused window's cursor/viewport BEFORE any lineOf /
     // column math below: switching windows or buffers can leave a stale
@@ -2269,174 +2462,134 @@ pub fn render(self: *App) !void {
     // cursor offset, mc highlight and easymotion labels
     const gutter = self.gutterWidth(line_count);
 
-    // tab bar. Single window: one entry per buffer, current highlighted,
-    // + dirty marker — solid blocks separated by a 1-cell base-bg gap.
-    // Split windows: each buffer's tab appears EXACTLY ONCE, in the pane
-    // that last showed it (last_win) — a buffer displayed in a pane
-    // belongs to that pane, a buffer hidden from every pane keeps its
-    // tab in the pane it was last in. The pane's OWN buffer carries the
-    // active style, so a buffer moving panes (<leader>bh/bl) is visible
-    // on the tab bar.
-    if (self.windows.items.len <= 1) {
-        var tab_i: usize = 0;
-        // the tab bar belongs to the BUFFER area: with the file tree
-        // open it starts at the content column (right of the sidebar),
-        // not glued above the tree at x=0
-        var col: u16 = @intCast(self.contentCol());
-        while (tab_i < self.buffers.items.len) : (tab_i += 1) {
-            const buf = &self.buffers.items[tab_i];
-            const name = if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
-            const dirty = if (buf.dirty) "\u{25cf}" else " ";
-            const label = try std.fmt.allocPrint(a, " {s}{s} ", .{ name, dirty });
-            const active_tab = tab_i == self.current;
-            const tab_style: vaxis.Style = if (active_tab)
-                chrome.activeTabStyle(self.theme)
-            else
-                chrome.inactiveTabStyle(self.theme, .{ .rgb = self.theme.bg_float });
-            // File icon: the active tab's icon joins the accent marker
-            // treatment (demo nav-icon), inactive tabs keep the devicon's
-            // semantic color.
-            const icon = icons.forPath(if (buf.path) |p| p else "", false);
-            const icon_style: vaxis.Style = if (active_tab)
-                chrome.activeTabMarkerStyle(self.theme)
-            else
-                .{
-                    .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) },
-                    .bg = .{ .rgb = self.theme.bg_float },
+    // ---- two-row buffer strip (DESIGN §18.11) ----
+    // Row 0..layers-1: labels (one row per pane-column layer). The last row
+    // is a shared full-width rule with the active tab's accent inset
+    // segment. Panes whose column spans overlap keep their own layer; a
+    // vertical split shares one label row, so the strip does not waste rows.
+    const strip_col = self.contentCol();
+    const strip_right = self.aiEditorWidth();
+    const strip_w = strip_right -| strip_col;
+    const strip_bg = vaxis.Color{ .rgb = self.theme.bg_status };
+    const label_rows = bar_rows - 1; // shared rule row = last strip row
+    const rule_row = bar_rows - 1;
+    if (strip_w > 0) {
+        var label_r: u32 = 0;
+        while (label_r < label_rows and label_r < height) : (label_r += 1) {
+            fillStripRow(win, label_r, strip_col, strip_w, strip_bg);
+        }
+        if (rule_row < height) {
+            fillStripRow(win, rule_row, strip_col, strip_w, strip_bg);
+            var rc: u32 = 0;
+            while (rc < strip_w) : (rc += 1) {
+                win.writeCell(@intCast(strip_col + rc), @intCast(rule_row), .{
+                    .char = .{ .grapheme = "─", .width = 1 },
+                    .style = .{
+                        .fg = .{ .rgb = self.theme.win_sep },
+                        .bg = strip_bg,
+                        .dim = true,
+                    },
+                });
+            }
+        }
+        // Scratch maps reused by every pane; the spec array is frame-arena
+        // storage (the vaxis cells reference the printed labels until render).
+        const tab_specs = try a.alloc(tabstrip.Spec, self.buffers.items.len);
+        const tab_bufs = try a.alloc(usize, self.buffers.items.len);
+        if (self.windows.items.len <= 1) {
+            var n: usize = 0;
+            for (self.buffers.items, 0..) |*buf, bi| {
+                const name = if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
+                tab_specs[n] = .{
+                    .name_cells = @intCast(autil.cellWidth(win, name)),
+                    .dirty = buf.dirty,
+                    .active = bi == self.current,
+                    .closeable = self.buffers.items.len > 1,
                 };
-            // The tab bar belongs to the EDITOR area: with the Agent Rail
-            // docked, labels clip at the editor edge instead of running
-            // under the rail.
-            const editor_w = self.aiEditorWidth();
-            const fit = autil.cellFitPrefix(win, label, editor_w -| @as(u32, col) -| 2);
-            if (fit.cells == 0) break;
-            const segs = [_]vaxis.Segment{
-                .{ .text = icon.glyph, .style = icon_style },
-                .{ .text = fit.slice, .style = tab_style },
-                .{ .text = " ", .style = .{ .bg = .{ .rgb = self.theme.bg } } },
-            };
-            _ = win.print(&segs, .{ .row_offset = 0, .col_offset = col, .wrap = .none });
-            if (self.hints.collecting and !self.isDashboard()) {
-                // Label anchored on the tab's icon (the row's top-left). The
-                // dashboard's empty "[No Name]" tab is deliberately skipped:
-                // activating it has no observable action (no fake targets).
-                self.addHintTarget(.{
-                    .row = 0,
-                    .col = col,
-                    .width = 1 + @as(u32, @intCast(fit.cells)),
-                    .height = 1,
-                }, .{ .buffer_select = tab_i });
+                tab_bufs[n] = bi;
+                n += 1;
             }
-            col +|= @intCast(1 + fit.cells + 1);
-            if (col >= editor_w) break;
-        }
-    } else if (self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), self.aiEditorWidth())) |tab_layout| {
-        // each buffer's tab appears EXACTLY ONCE, owned by the pane that
-        // displays it (the focused pane wins when several panes show the
-        // same buffer); a buffer hidden from every pane keeps its tab in
-        // the pane that last showed it. Panes whose column spans overlap
-        // (horizontal splits) draw on separate tab-bar rows so tabs never
-        // overwrite each other; within a row, tabs stream left to right
-        // from each pane's column, borrowing space to the right when a
-        // pane is too narrow to fit its tabs (labels clip only at the
-        // row's right edge). The pane's displayed buffer carries the
-        // active style, so <leader>bh/bl visibly moves the tab.
-        const leaves = tab_layout.leaves;
-        const pane_layer = a.alloc(u32, leaves.len) catch return;
-        var order: std.ArrayList(usize) = .empty;
-        for (0..leaves.len) |i| order.append(a, i) catch return;
-        std.mem.sort(usize, order.items, TabSort{ .leaves = leaves }, TabSort.lt);
-        var layer_end: std.ArrayList(u32) = .empty;
-        var layers: u32 = 0;
-        for (order.items) |oi| {
-            const lr = leaves[oi];
-            var lli: usize = 0;
-            while (lli < layers and layer_end.items[lli] > lr.col) lli += 1;
-            if (lli == layers) {
-                layer_end.append(a, lr.col + lr.width) catch return;
-                layers += 1;
-            } else {
-                layer_end.items[lli] = lr.col + lr.width;
-            }
-            pane_layer[oi] = @intCast(lli);
-        }
-        var lli: u32 = 0;
-        while (lli < layers) : (lli += 1) {
-            // right edge of the layer's widest span: tabs clip here
-            var right: u32 = 0;
+            const p = tabstrip.plan(tab_specs[0..n], strip_w);
+            try self.drawBufferTabPlan(a, win, 0, rule_row, strip_col, p, tab_bufs[0..n]);
+        } else if (self.layoutWindows(a, content_top, content_rows, strip_col, strip_right)) |tab_layout| {
+            // Each buffer's tab appears EXACTLY ONCE, owned by the pane that
+            // displays it (the focused pane wins when several panes show the
+            // same buffer); a buffer hidden from every pane keeps its tab in
+            // the pane that last showed it. Panes whose column spans overlap
+            // (horizontal splits) draw on separate label rows; within a row,
+            // tabs stream left to right and each pane's active tab is kept
+            // fully visible by tabstrip.plan.
+            const leaves = tab_layout.leaves;
+            const pane_layer = a.alloc(u32, leaves.len) catch return;
+            var order: std.ArrayList(usize) = .empty;
+            for (0..leaves.len) |i| order.append(a, i) catch return;
+            std.mem.sort(usize, order.items, TabSort{ .leaves = leaves }, TabSort.lt);
+            var layer_end: std.ArrayList(u32) = .empty;
+            var layers: u32 = 0;
             for (order.items) |oi| {
-                if (pane_layer[oi] == lli) right = @max(right, leaves[oi].col + leaves[oi].width);
-            }
-            var pos: u32 = 0;
-            for (order.items) |oi| {
-                if (pane_layer[oi] != lli) continue;
                 const lr = leaves[oi];
-                // start at the pane's own column, or right after the
-                // previous pane's tabs when they overflow this span
-                pos = @max(pos, lr.col);
-                const own = self.windows.items[lr.win].buf;
-                var tab_i: usize = 0;
-                var col = pos;
-                while (tab_i < self.buffers.items.len) : (tab_i += 1) {
-                    // owner: the pane showing the buffer (the focused
-                    // pane wins when several panes show it); a hidden
-                    // buffer keeps the pane that last showed it
-                    var owner: usize = self.buffers.items[tab_i].last_win;
-                    if (owner >= self.windows.items.len) owner = self.windows.items.len - 1;
-                    // last_win is only a hint for buffers hidden from every
-                    // pane: a buffer that IS displayed belongs to a pane that
-                    // displays it. Without this, a buffer visible only in the
-                    // right pane kept its tab on the left if last_win still
-                    // pointed there (the split tab-bar race).
-                    for (self.windows.items, 0..) |w, wi| {
-                        if (w.buf == tab_i) {
-                            owner = wi;
-                            break;
-                        }
-                    }
-                    if (self.windows.items[self.current_win].buf == tab_i) owner = self.current_win;
-                    if (owner != lr.win) continue;
-                    const buf = &self.buffers.items[tab_i];
-                    const name = if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
-                    const dirty = if (buf.dirty) "\u{25cf}" else " ";
-                    const label = try std.fmt.allocPrint(a, " {s}{s} ", .{ name, dirty });
-                    const active = tab_i == own;
-                    const tab_style: vaxis.Style = if (active)
-                        chrome.activeTabStyle(self.theme)
-                    else
-                        chrome.inactiveTabStyle(self.theme, .{ .rgb = self.theme.bg_float });
-                    const icon = icons.forPath(if (buf.path) |p| p else "", false);
-                    const icon_style: vaxis.Style = if (active)
-                        chrome.activeTabMarkerStyle(self.theme)
-                    else
-                        .{
-                            .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) },
-                            .bg = .{ .rgb = self.theme.bg_float },
-                        };
-                    // clip only at the row's right edge: tabs may borrow
-                    // space right of their own (too narrow) pane span
-                    const fit = autil.cellFitPrefix(win, label, right -| col -| 1);
-                    if (fit.cells == 0) break;
-                    const segs = [_]vaxis.Segment{
-                        .{ .text = icon.glyph, .style = icon_style },
-                        .{ .text = fit.slice, .style = tab_style },
-                    };
-                    _ = win.print(&segs, .{ .row_offset = @intCast(lli), .col_offset = @intCast(col), .wrap = .none });
-                    if (self.hints.collecting) {
-                        self.addHintTarget(.{
-                            .row = lli,
-                            .col = @intCast(col),
-                            .width = 1 + @as(u32, @intCast(fit.cells)),
-                            .height = 1,
-                        }, .{ .buffer_select = tab_i });
-                    }
-                    col += @intCast(1 + fit.cells + 1); // icon + label + gap
-                    if (col >= right) break;
+                var lli: usize = 0;
+                while (lli < layers and layer_end.items[lli] > lr.col) lli += 1;
+                if (lli == layers) {
+                    layer_end.append(a, lr.col + lr.width) catch return;
+                    layers += 1;
+                } else {
+                    layer_end.items[lli] = lr.col + lr.width;
                 }
-                pos = col;
+                pane_layer[oi] = @intCast(lli);
             }
-        }
-    } else |_| {}
+            const draw_layers = @min(layers, label_rows);
+            var lli: u32 = 0;
+            while (lli < draw_layers) : (lli += 1) {
+                fillStripRow(win, lli, strip_col, strip_w, strip_bg);
+                // right edge of the layer's widest span: tabs clip here
+                var right: u32 = 0;
+                for (order.items) |oi| {
+                    if (pane_layer[oi] == lli) right = @max(right, leaves[oi].col + leaves[oi].width);
+                }
+                var pos: u32 = 0;
+                for (order.items) |oi| {
+                    if (pane_layer[oi] != lli) continue;
+                    const lr = leaves[oi];
+                    // start at the pane's own column, or right after the
+                    // previous pane's tabs when they overflow this span
+                    pos = @max(pos, lr.col);
+                    const own = self.windows.items[lr.win].buf;
+                    var n: usize = 0;
+                    var tab_i: usize = 0;
+                    while (tab_i < self.buffers.items.len) : (tab_i += 1) {
+                        // owner: the pane showing the buffer (the focused
+                        // pane wins when several panes show it); a hidden
+                        // buffer keeps the pane that last showed it
+                        var owner: usize = self.buffers.items[tab_i].last_win;
+                        if (owner >= self.windows.items.len) owner = self.windows.items.len - 1;
+                        for (self.windows.items, 0..) |w, wi| {
+                            if (w.buf == tab_i) {
+                                owner = wi;
+                                break;
+                            }
+                        }
+                        if (self.windows.items[self.current_win].buf == tab_i) owner = self.current_win;
+                        if (owner != lr.win) continue;
+                        const buf = &self.buffers.items[tab_i];
+                        const name = if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
+                        tab_specs[n] = .{
+                            .name_cells = @intCast(autil.cellWidth(win, name)),
+                            .dirty = buf.dirty,
+                            .active = tab_i == own,
+                            .closeable = self.buffers.items.len > 1,
+                        };
+                        tab_bufs[n] = tab_i;
+                        n += 1;
+                    }
+                    const avail = right -| pos;
+                    const p = tabstrip.plan(tab_specs[0..n], avail);
+                    try self.drawBufferTabPlan(a, win, lli, rule_row, pos, p, tab_bufs[0..n]);
+                    pos += p.used;
+                }
+            }
+        } else |_| {}
+    }
 
     // dashboard (no file open): snacks.nvim style — a big ASCII logo, a
     // subtitle, a centered key menu, then the recent-files list (j/k/Enter).
@@ -3744,6 +3897,20 @@ pub fn scopeAnimActive(self: *App) bool {
     return now - a.start_ms < ScopeAnim.duration_ms;
 }
 
+/// True while a short Changes-badge flash is still inside its deadline.
+/// Once this is false the run loop stops polling for it (no idle churn).
+pub fn reviewFlashActive(self: *App) bool {
+    return animation.flashActive(self.review_flash_start_ms, self.nowMs(), animation.badge_flash_ms);
+}
+
+/// True while any TUI animation needs frames: AI streaming/tool work, the
+/// inline assistant stream, or a badge flash. Scope/blame/git holds add
+/// themselves separately in the run loop. Idle editors return false, so the
+/// loop blocks in pollEvent and no timer runs.
+pub fn animationActive(self: *App) bool {
+    return self.aiStreaming() or self.inlineStreaming() or self.reviewFlashActive();
+}
+
 pub fn run(self: *App) !void {
     try self.vx.enterAltScreen(self.tty.writer());
     // Bracketed paste (DECSET 2004): the terminal wraps pasted text in
@@ -3897,7 +4064,7 @@ pub fn run(self: *App) !void {
         // animation's last spread) and the loop would block forever
         // without ever drawing it. Force that one render.
         var poll_transition = false;
-        if (self.scopeAnimActive() or self.blameHoldActive() or self.gitHoldActive() or self.aiStreaming() or self.inlineStreaming() or (term.supported and self.term_pane != null)) {
+        if (self.scopeAnimActive() or self.blameHoldActive() or self.gitHoldActive() or self.animationActive() or (term.supported and self.term_pane != null)) {
             std.Io.sleep(self.io, .fromMilliseconds(1), .real) catch {};
             self.poll_mode_active = true;
         } else if (self.poll_mode_active) {

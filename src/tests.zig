@@ -40,6 +40,10 @@ pub const app_macro = @import("app/macro.zig");
 pub const app_chrome = @import("app/chrome.zig");
 // M2.6a keyboard hints (pure label/target model; app/hint_ui.zig is e2e-tested)
 pub const app_hints = @import("app/hints.zig");
+// §18.11 buffer-strip geometry (pure; render.zig owns the drawing)
+pub const app_tabstrip = @import("app/tabstrip.zig");
+// §18.12 time-based animation primitives (pure; render.zig/ai.zig own the use)
+pub const app_animation = @import("app/animation.zig");
 // M2b1 navigator tabs + note store (pure; app/notes.zig is e2e-tested)
 pub const app_navigator = @import("app/navigator.zig");
 pub const app_note_store = @import("app/note_store.zig");
