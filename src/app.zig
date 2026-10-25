@@ -695,7 +695,7 @@ pub const App = struct {
         const height: u32 = win.height;
         if (height <= status_row_count) return 1;
         const content_rows = height - status_row_count - self.tabBarRows(arena.allocator());
-        const layout = self.layoutWindows(arena.allocator(), self.contentTop(arena.allocator()), content_rows, self.contentCol(), win.width) catch return content_rows;
+        const layout = self.layoutWindows(arena.allocator(), self.contentTop(arena.allocator()), content_rows, self.contentCol(), self.aiEditorWidth()) catch return content_rows;
         for (layout.leaves) |leaf| {
             if (leaf.win == self.current_win) return leaf.height;
         }
@@ -714,11 +714,11 @@ pub const App = struct {
         const height: u32 = win.height;
         if (height <= status_row_count) return @max(win.width -| gutter, 1);
         const content_rows = height - status_row_count - self.tabBarRows(arena.allocator());
-        const layout = self.layoutWindows(arena.allocator(), self.contentTop(arena.allocator()), content_rows, self.contentCol(), win.width) catch return @max(win.width -| gutter, 1);
+        const layout = self.layoutWindows(arena.allocator(), self.contentTop(arena.allocator()), content_rows, self.contentCol(), self.aiEditorWidth()) catch return @max(self.aiEditorWidth() -| gutter, 1);
         for (layout.leaves) |leaf| {
             if (leaf.win == self.current_win) return @max(leaf.width -| gutter, 1);
         }
-        return @max(win.width -| gutter, 1);
+        return @max(self.aiEditorWidth() -| gutter, 1);
     }
 
     /// H/M/L: resolve a viewport motion to a document LINE using the focused
@@ -1242,7 +1242,7 @@ pub const App = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const content_rows = height - status_row_count - self.tabBarRows(a);
-        const layout = self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), self.vx.window().width) catch return null;
+        const layout = self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), self.aiEditorWidth()) catch return null;
         const leaves = layout.leaves;
         var cur_rect: ?LeafRect = null;
         for (leaves) |lr| {
@@ -1755,23 +1755,33 @@ pub const App = struct {
     pub const execOpMotion = @import("app/highlight.zig").execOpMotion;
     pub const execAction = @import("app/highlight.zig").execAction;
     pub const replaceCharsAtCursor = @import("app/highlight.zig").replaceCharsAtCursor;
-    // ---- AI chat → src/app/ai.zig ----
+    // ---- AI workspace → src/app/ai.zig ----
     pub const toggleAiPanel = app_ai.toggleAiPanel;
+    pub const focusAiRail = app_ai.focusAiRail;
+    pub const aiNewThread = app_ai.aiNewThread;
     pub const aiLoadConfig = app_ai.aiLoadConfig;
     pub const aiSetError = app_ai.aiSetError;
     pub const aiSetErrorFmt = app_ai.aiSetErrorFmt;
     pub const aiStreaming = app_ai.aiStreaming;
     pub const deinitAi = app_ai.deinitAi;
     pub const handleAiKey = app_ai.handleAiKey;
+    pub const aiPaste = app_ai.aiPaste;
     pub const aiScroll = app_ai.aiScroll;
     pub const aiCancel = app_ai.aiCancel;
-    pub const aiClear = app_ai.aiClear;
     pub const aiSend = app_ai.aiSend;
     pub const drainAi = app_ai.drainAi;
-    pub const drawAiPanel = app_ai.drawAiPanel;
+    pub const aiLayout = app_ai.aiLayout;
+    pub const aiEditorWidth = app_ai.aiEditorWidth;
+    pub const aiStatusText = app_ai.aiStatusText;
+    pub const aiStatusTextCompact = app_ai.aiStatusTextCompact;
+    pub const aiStatusTextMini = app_ai.aiStatusTextMini;
+    pub const drawAiRail = app_ai.drawAiRail;
     pub const AiSession = app_ai.Session;
     pub const AiMessage = app_ai.Message;
     pub const AiStatus = app_ai.Status;
+    pub const AiThread = app_ai.AgentThread;
+    pub const AiFocus = app_ai.Focus;
+    pub const AiWorkboxTab = app_ai.WorkboxTab;
     // ---- render → src/app/render.zig ----
     pub const tabBarRows = @import("app/render.zig").tabBarRows;
     pub const contentTop = @import("app/render.zig").contentTop;

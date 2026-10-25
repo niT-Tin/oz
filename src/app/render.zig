@@ -47,7 +47,7 @@ pub fn tabBarRows(self: *App, a: std.mem.Allocator) u32 {
     if (self.windows.items.len <= 1) return 1;
     const height: u32 = self.vx.window().height;
     if (height <= status_row_count) return 1;
-    const layout = self.layoutWindows(a, 1, height - status_row_count - 1, self.contentCol(), self.vx.window().width) catch return 1;
+    const layout = self.layoutWindows(a, 1, height - status_row_count - 1, self.contentCol(), self.aiEditorWidth()) catch return 1;
     const leaves = layout.leaves;
     // greedy interval coloring: assign each pane to the lowest layer
     // whose rightmost pane ends at or before this pane's column start
@@ -1957,16 +1957,22 @@ pub fn render(self: *App) !void {
                 .bg = tab_style.bg,
                 .bold = (tab_i == self.current),
             };
+            // The tab bar belongs to the EDITOR area: with the Agent Rail
+            // docked, labels clip at the editor edge instead of running
+            // under the rail.
+            const editor_w = self.aiEditorWidth();
+            const fit = autil.cellFitPrefix(win, label, editor_w -| @as(u32, col) -| 2);
+            if (fit.cells == 0) break;
             const segs = [_]vaxis.Segment{
                 .{ .text = icon.glyph, .style = icon_style },
-                .{ .text = label, .style = tab_style },
+                .{ .text = fit.slice, .style = tab_style },
                 .{ .text = " ", .style = .{ .bg = .{ .rgb = self.theme.bg } } },
             };
             _ = win.print(&segs, .{ .row_offset = 0, .col_offset = col, .wrap = .none });
-            col +|= @intCast(1 + label.len + 1);
-            if (col >= win.width) break;
+            col +|= @intCast(1 + fit.cells + 1);
+            if (col >= editor_w) break;
         }
-    } else if (self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), win.width)) |tab_layout| {
+    } else if (self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), self.aiEditorWidth())) |tab_layout| {
         // each buffer's tab appears EXACTLY ONCE, owned by the pane that
         // displays it (the focused pane wins when several panes show the
         // same buffer); a buffer hidden from every pane keeps its tab in
@@ -2074,7 +2080,7 @@ pub fn render(self: *App) !void {
         const label_style: vaxis.Style = .{ .fg = .{ .rgb = t.fg } };
         // content area between the sidebar and the right edge
         const area_col: u32 = self.contentCol();
-        const area_w: u32 = win.width -| area_col;
+        const area_w: u32 = self.aiEditorWidth() -| area_col;
         // horizontal centering helper: the column that centers a `width`-cell
         // block inside the content area (never negative)
         const centerCol = struct {
@@ -2177,16 +2183,17 @@ pub fn render(self: *App) !void {
         // here too, or <leader>e on the dashboard shows a stale screen
         if (self.filetree_active) try renderFiletree(self, a, win, height);
         if (term.supported) try self.drawTerm(a, win);
-        // <leader>a works on the dashboard too: draw the modal AI panel
-        // last and let it place the cursor in its prompt.
-        if (self.ai.active) try self.drawAiPanel(a, win);
+        // <leader>a works on the dashboard too: draw the rail last (it
+        // places the cursor only when the rail/prompt owns focus; otherwise
+        // the dashboard's recent-row cursor stays visible).
+        if (self.ai.rail_open) try self.drawAiRail(a, win);
         try self.vx.render(self.tty.writer());
         return;
     }
 
     // split windows: every leaf gets a rectangle and renders its buffer;
     // the focused window carries syntax highlighting and the selection
-    const layout = try self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), win.width);
+    const layout = try self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), self.aiEditorWidth());
     const leaves = layout.leaves;
     var cur_rect: LeafRect = .{ .win = self.current_win, .row = 0, .col = 0, .height = 0, .width = 0 };
     var li: usize = 0;
@@ -2283,6 +2290,11 @@ pub fn render(self: *App) !void {
     // embedded terminal overlay: drawn after the panes so it covers
     // them; the modal overlays below float above it
     if (term.supported) try self.drawTerm(a, win);
+
+    // Agent Rail / drawer (M2a): drawn after the editor panes and terminal
+    // so it covers exactly its reserved cells. Pickers/hovers below are
+    // genuine modal overlays and may draw above it.
+    if (self.ai.rail_open) try self.drawAiRail(a, win);
 
     // fuzzy picker overlay (telescope/snacks style: a solid bg_float
     // floating window with a border, a title and an in-panel input row,
@@ -3151,21 +3163,48 @@ pub fn render(self: *App) !void {
     _ = win.print(&status_seg, .{ .row_offset = @intCast(height - 1), .wrap = .none });
     // git branch (M3a): "  ⎇ main" right after the mode/message text, in
     // the accent color — the design's StatusLine git component.
+    var used_cells: u32 = @intCast(status.len);
     if (self.git_branch) |b| {
+        const branch_text = try std.fmt.allocPrint(a, "  ⎇ {s}", .{std.mem.trim(u8, b, " \t\r\n")});
         const branch_seg = [_]vaxis.Segment{.{
-            .text = try std.fmt.allocPrint(a, "  ⎇ {s}", .{std.mem.trim(u8, b, " \t\r\n")}),
+            .text = branch_text,
             .style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_status } },
         }};
         _ = win.print(&branch_seg, .{ .row_offset = @intCast(height - 1), .col_offset = @intCast(status.len), .wrap = .none });
+        used_cells = @intCast(status.len + autil.cellWidth(win, branch_text));
     }
-
-    // AI chat panel: modal and topmost (above hover/pickers), drawn after
-    // the status bar so its own rows stay a solid bg_float block. Its prompt
-    // owns the terminal cursor while open.
-    if (self.ai.active) {
-        try self.drawAiPanel(a, win);
-        try self.vx.render(self.tty.writer());
-        return;
+    // AI workspace status (M2a): active thread · model · status, flush right
+    // on the status bar. Kept off the left status text (and git branch);
+    // narrower terminals fall back to the compact/mini forms.
+    if (try self.aiStatusText(a)) |full_ai_text| {
+        const avail = win.width -| used_cells -| 2;
+        var ai_text = full_ai_text;
+        var ai_cells: u32 = @intCast(autil.cellWidth(win, ai_text));
+        if (ai_cells > avail) {
+            if (try self.aiStatusTextCompact(a)) |compact| {
+                ai_text = compact;
+                ai_cells = @intCast(autil.cellWidth(win, ai_text));
+            }
+        }
+        if (ai_cells > avail) {
+            if (try self.aiStatusTextMini(a)) |mini| {
+                ai_text = mini;
+                ai_cells = @intCast(autil.cellWidth(win, ai_text));
+            }
+        }
+        if (ai_cells <= avail) {
+            const ai_status = self.ai.threads.activeStatus();
+            const ai_style: vaxis.Style = .{
+                .fg = .{ .rgb = if (ai_status == .streaming) self.theme.accent else self.theme.fg_dim },
+                .bg = .{ .rgb = self.theme.bg_status },
+            };
+            const ai_seg = [_]vaxis.Segment{.{ .text = ai_text, .style = ai_style }};
+            _ = win.print(&ai_seg, .{
+                .row_offset = @intCast(height - 1),
+                .col_offset = @intCast(win.width - ai_cells),
+                .wrap = .none,
+            });
+        }
     }
 
     // terminal focused: the widget's draw() already placed the child's
@@ -3178,9 +3217,11 @@ pub fn render(self: *App) !void {
             }
         }
     }
-    // cursor position — in the file tree when the tree has focus,
-    // otherwise in the buffer
-    if (self.filetree_active and self.focus == .filetree) {
+    // cursor position — drawAiRail already placed the prompt/thread cursor
+    // when the rail or prompt owns focus; otherwise the editor cursor wins.
+    if (self.ai.rail_open and self.ai.focus != .editor) {
+        // rail cursor was set by drawAiRail
+    } else if (self.filetree_active and self.focus == .filetree) {
         // Items render at contentTop()+1+k (below the "╭─ files" title
         // row) with text starting at column 1 (after the left border) —
         // the cursor must land on the same row/column as the highlight.
@@ -3417,8 +3458,10 @@ pub fn run(self: *App) !void {
                     // buffer them (paste_end inserts the whole thing) so
                     // auto-indent/auto-pairs can't mangle pasted text
                     if (self.pasting and !term_focused) {
-                        if (self.ai.active) {
-                            if (key.text) |text| try self.ai.input.appendSlice(self.alloc, text);
+                        if (self.ai.rail_open and self.ai.focus == .prompt) {
+                            if (key.text) |text| try self.aiPaste(text);
+                            continue;
+                        } else if (self.ai.rail_open and self.ai.focus == .rail) {
                             continue;
                         }
                         try self.pasteAccumulate(key);
@@ -3434,8 +3477,8 @@ pub fn run(self: *App) !void {
                     if (!self.pasting) continue;
                     self.pasting = false;
                     if (term_focused) continue; // child got the keys already
-                    if (self.ai.active) {
-                        try self.ai.input.appendSlice(self.alloc, self.paste_buf.items);
+                    if (self.ai.rail_open and self.ai.focus != .editor) {
+                        if (self.ai.focus == .prompt) try self.aiPaste(self.paste_buf.items);
                         self.paste_buf.clearRetainingCapacity();
                         continue;
                     }
@@ -3462,8 +3505,8 @@ pub fn run(self: *App) !void {
                             }
                         }
                     }
-                    if (self.ai.active) {
-                        try self.ai.input.appendSlice(self.alloc, text);
+                    if (self.ai.rail_open and self.ai.focus != .editor) {
+                        try self.aiPaste(text);
                     } else if (self.state.mode == .insert) {
                         if (self.mc_active) try self.mcInsertText(text) else try self.insertText(text);
                     }

@@ -28,11 +28,11 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
         }
     }
 
-    // AI chat is modal: every key belongs to the prompt. Placed before the
-    // macro recorder so AI typing never lands in a register, and before the
-    // command line / pickers / file tree (opening the panel from normal mode
-    // is the only entry; while it is open those overlays cannot be reached).
-    if (self.ai.active) {
+    // AI workspace: while the rail or its prompt owns the keyboard, every
+    // key belongs to the AI surface. Placed before the macro recorder so AI
+    // typing never lands in a register. An editor-focused docked rail is NOT
+    // modal: normal editing continues beside it.
+    if (self.ai.rail_open and self.ai.focus != .editor) {
         try self.handleAiKey(key);
         return;
     }
@@ -100,7 +100,10 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
 
     // Ctrl-w window commands: switch keyboard focus between split windows
     // (vim Ctrl-w hjkl geometric navigation) and the file-tree sidebar.
-    // Not in insert mode — there Ctrl+w still deletes the word before it.
+    // Ctrl-w a is the Agent Rail re-entry point (it opens the rail when
+    // closed); without it an editor-focused docked rail would be
+    // unreachable from the keyboard. Not in insert mode — there Ctrl+w
+    // still deletes the word before it.
     if (key.codepoint == 'w' and key.mods.ctrl and self.state.mode != .insert) {
         self.pending_window = true;
         return;
@@ -149,6 +152,9 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
                     self.navigateWindow(.up);
                 }
             },
+            // Agent Rail (M2a): open/focus the thread list. Keep the
+            // editor's Ctrl-w hjkl contract untouched.
+            'a' => try self.focusAiRail(),
             else => {},
         }
         return;

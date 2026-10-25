@@ -43,6 +43,7 @@ pub const ai_context = @import("ai/context.zig");
 pub const ai_config = @import("ai/config.zig");
 pub const ai_client = @import("ai/client.zig");
 pub const ai_panel = @import("ai/panel.zig");
+pub const ai_workspace = @import("ai/workspace.zig");
 
 test {
     std.testing.refAllDecls(@This());
