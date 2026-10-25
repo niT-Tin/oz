@@ -15901,6 +15901,85 @@ fn aiSlowTextSse(alloc: std.mem.Allocator, chunks: usize) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
+test "tools: eight-call cap reports the overflow and sends a final no-tools request" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_tools_calls_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/calls_editor.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "CALL_CAP marker\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const args = "{\"path\":\"calls_editor.txt\"}";
+    const specs = [_]AiToolSpec{
+        .{ .id = "cap_1", .name = "read_file", .args = args },
+        .{ .id = "cap_2", .name = "read_file", .args = args },
+        .{ .id = "cap_3", .name = "read_file", .args = args },
+        .{ .id = "cap_4", .name = "read_file", .args = args },
+        .{ .id = "cap_5", .name = "read_file", .args = args },
+        .{ .id = "cap_6", .name = "read_file", .args = args },
+        .{ .id = "cap_7", .name = "read_file", .args = args },
+        .{ .id = "cap_8", .name = "read_file", .args = args },
+        .{ .id = "cap_9", .name = "read_file", .args = args },
+    };
+    const round1 = try aiToolCallsSse(alloc, &specs);
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "CALL_CAP final reply");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try aiEnterRail(&sess, &grid);
+    try sess.send("read it nine times");
+    try sess.send("\r");
+
+    try gridWaitFor(&sess, &grid, "CALL_CAP final reply", 20000);
+    try gridWaitFor(&sess, &grid, "idle", 5000);
+    try std.testing.expect(grid.contains("tool loop stopped: max calls"));
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    // The ninth call is answered truthfully but never executed; the
+    // follow-up is the final no-tools request and there is no third one.
+    const req2 = try aiReadFile(io, alloc, dir, "request-2.json");
+    defer alloc.free(req2);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_choice\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"tools\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"cap_9\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "tool call limit (8) reached; not executed") != null);
+    var req3_buf: [300]u8 = undefined;
+    const req3_path = try std.fmt.bufPrint(&req3_buf, "{s}/request-3.json", .{dir});
+    try std.testing.expect(!pathExists(io, req3_path));
+
+    try sess.send("\t");
+    try sess.send("t");
+    try gridWaitFor(&sess, &grid, "calls 9", 5000);
+    try gridWaitFor(&sess, &grid, "ok 8 · err 0 · unsup 1", 5000);
+    try gridWaitFor(&sess, &grid, "older", 5000);
+
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+
 test "tools: Ctrl+c cancels the follow-up loop; thread 2 has no cards/metrics" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
