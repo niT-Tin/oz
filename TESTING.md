@@ -13,6 +13,7 @@ zig build test                  # L1 unit + L2 render snapshots
 zig build e2e                   # L3 pty end-to-end (Linux)
 zig build test -Dtest-filter="property:"   # one group (compile-time filter)
 zig build e2e -Dtest-filter="scenario matrix"
+zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
@@ -34,7 +35,7 @@ replaying a cached successful run.
 
 | Layer | What it covers | Where |
 |---|---|---|
-| **Model/unit (L1)** | Pure logic: piece table, motions, keymaps, SSE/OpenAI config parsing, AI workspace layout/focus/thread model | `src/**/*.zig` `test` blocks, aggregated by `src/tests.zig` |
+| **Model/unit (L1)** | Pure logic: piece table, motions, keymaps, SSE/OpenAI config parsing, AI workspace layout/focus/thread model, navigator tab model, note store (paths/titles/sorting/creation) | `src/**/*.zig` `test` blocks, aggregated by `src/tests.zig` |
 | **Protocol fixtures** | SSE chunking, request JSON, config env parsing, AI client cancellation/error paths; mock LSP JSON-RPC | `src/ai/sse.zig`, `src/ai/openai.zig`, `src/ai/config.zig`, `src/ai/client.zig`, mock LSP tests |
 | **Semantic frames (L3)** | Real `oz` binary in a pty; ANSI stream reconstructed into a cell grid; assertions on regions, borders, text, overlap, overflow | `test/e2e.zig` + `test/frame.zig` |
 | **Scenario matrix** | Data-driven pairwise matrix over terminal widths, filetree, and AI rail states; fresh pty per scenario; tags enforced | `test/e2e.zig` (`scenario_matrix`) |
@@ -72,8 +73,15 @@ Scenarios live in one `scenario_matrix` array. Each `Scenario` declares:
 
 The runner spawns a fresh pty per scenario, waits for `NORMAL`, drives the
 keys, settles the stream, and applies the semantic assertions. The matrix
-currently covers 3 widths × filetree {closed,open} × rail {closed,open} plus
-AI streaming at 120 (dock) and 80 (drawer).
+currently covers 3 widths × filetree {closed,open} × rail {closed,open}, AI
+streaming at 120 (dock) and 80 (drawer), hints overlays, and the navigator's
+Notes/Agents tabs. A notes scenario gets a fresh temp `OZ_NOTES_DIR` with one
+fixture note; the navigator box is located without its title text (hint labels
+intentionally cover the tab words).
+
+Scenario tags: `@layout @ai @filetree @stream @hints @navigator @notes
+@80col @100col @120col @drawer @docked`. A new feature adds its tag here and
+to at least one scenario.
 
 Every scenario must carry tags; `required_scenario_tags` is the declared
 feature set. A test fails with `UncoveredScenarioTag` if a declared tag has
@@ -112,6 +120,16 @@ git diff -- test/golden/        # review EVERY changed cell/style run
 
 The update prints the exact files written. A missing golden is an error, not
 an automatic create.
+
+### Notes test seam (`OZ_NOTES_DIR`)
+
+Notes live in a global data directory, so tests must never touch the real
+`$HOME`. `OZ_NOTES_DIR` is the first path source in production too
+(`OZ_NOTES_DIR` > `$XDG_DATA_HOME/oz/notes` > `$HOME/.local/share/oz/notes`);
+every navigator/notes e2e points it at a fresh `/tmp/oz_notes_*` directory
+that is deleted afterwards. The error-path test uses
+`OZ_NOTES_DIR=/dev/null/notes` to prove the Notes tab reports a clear error
+and the editor stays usable.
 
 ### Property tests
 
@@ -164,6 +182,8 @@ an automatic create.
 | Layout arithmetic / focus state | property sweeps |
 | AI/frame cell colors and borders | goldens + semantic assertions |
 | Keyboard hints (labels, status, target actions, Esc) | L1 pure model (`src/app/hints.zig`) + L3 `hints:` tests + `@hints` matrix scenarios |
+| Navigator tabs, notes list/create/save/reopen, agents attach | L1 (`src/app/navigator.zig`, `src/app/note_store.zig`) + L3 `navigator:` tests + `@navigator`/`@notes` matrix scenarios |
+| Notes path fallback/error handling | L1 resolution/creation tests + L3 unavailable-dir e2e (`OZ_NOTES_DIR=/dev/null/notes`) |
 | Mock LSP protocol | L4 mock server e2e |
 | Deterministic build/test run | `tools/verify.sh` + CI |
 
@@ -182,6 +202,12 @@ Known gaps / deliberate limitations:
 - The file-tree L3 test navigates by key count and is sensitive to new
   top-level repository entries; adding a visible root directory can shift it.
   Keep this in mind when adding repo-root fixtures.
+- Notes have no delete/rename and no directory watch: the list is refreshed
+  only on Notes-tab entry, create, `:w` of a note, or `r`. Tests assert those
+  explicit refresh points, not per-frame scans.
+- The navigator Agents tab is a view of the same session thread model; it is
+  not persisted and is covered through that model's existing tests plus one
+  attach/switch e2e, not a second state machine.
 - CI caches the Zig tarball and the small global Zig cache only; the ~1 GB
   `.vendor/tree-sitter` sources and multi-GB local compile cache are fetched/
   rebuilt each run to keep cache keys small and deterministic.

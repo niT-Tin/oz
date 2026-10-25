@@ -38,7 +38,9 @@
 **导航与查找**
 
 - 模糊查找 picker：文件（`<leader>sf`）、grep（`<leader>st`）、buffer（`<leader>sb`）、最近文件（`<leader>sr`）、快捷键（`<leader>sk`）
-- 文件树（`<leader>e` 开关，`<leader>E` 定位当前文件），根目录跟随当前 workspace 的项目目录
+- **Navigator**（`<leader>e` 开关，`<leader>E` 定位当前文件）：左侧 30 列侧栏，三个 tab——`files`（原有惰性文件树，根目录跟随当前 workspace 的项目目录）、`notes`、`agents`。聚焦侧栏时 `Tab`/`Shift-Tab` 循环 tab，`1`/`2`/`3` 直接跳转；`h`/`l` 仍是文件树的折叠/父目录。每个 tab 和列表行都是 `<leader>j` 的 hint 目标。
+- **Notes**（`notes` tab）：真实的 markdown buffer，全局存放于 `$OZ_NOTES_DIR`，否则 `$XDG_DATA_HOME/oz/notes`，否则 `$HOME/.local/share/oz/notes`（目录惰性创建，启动时不扫描/不创建）。`j`/`k` 选择 · Enter 用普通 buffer 打开（`:w` 保存）· `n` 创建最小的未占用 `note-N.md`（内容 `# Untitled note`，绝不覆盖已有文件）· `r` 刷新。列表显示首个 markdown 标题（没有则文件名）、正文片段和相对时间，新的在前。Notes 与项目无关，打开 note 不会改变 workspace 文件树/picker 的根目录。删除/重命名暂不提供。
+- **Agents**（`agents` tab）：同一套真实线程模型的紧凑视图（按当前 workspace 分组）——`j`/`k` 选择 · Enter 在 rail/workbox 中 attach 该线程 · `n` 新建线程。它只是视图，不是第二套线程模型。
 - buffer 内搜索（`/`、`?`、n/N）
 
 ![模糊查找文件（leader sf）](docs/screenshots/picker.png)
@@ -82,7 +84,7 @@
   - 输入框：Enter 发送 · Ctrl+c 取消 · Ctrl+n 新建线程 · Tab → 线程列表 · Ctrl+j/k 单行滚动 · PageUp/PageDown 翻页 · Esc → editor（drawer 则关闭）
   - 线程列表 / workbox：`j`/`k` 选择 · Enter attach · `n`/`+` 新建线程 · `c`/`d`/`t`/`r` 切换 Chat/Changes/Tools/Terminal · Tab/Shift+Tab 循环 tab · `q`/Esc → editor
   - `<Ctrl-w> a` 从 editor 回到 rail 的线程列表（rail 关闭时也会打开）
-- **键盘提示（M2.6a）**：`<leader>j` 为所有可见目标叠加 qutebrowser 风格标签（字符集 `asdfghjkl`，定长 1–3 个字符）——文件树行、buffer tab、agent 线程、Workbox tab、`+` 新建线程按钮和输入框行。输入完整标签执行该目标原本的动作，Backspace 删除已输入字符，Esc 取消且不产生任何副作用。状态栏显示 `HINTS · N targets · Esc cancel`；没有目标时显示 `HINTS · no targets`。普通 `f` 仍是 vim find-char，hint 不会占用。可从 editor、dashboard、文件树和 AI 线程列表进入（输入框内打字时不会触发）。
+- **键盘提示（M2.6a）**：`<leader>j` 为所有可见目标叠加 qutebrowser 风格标签（字符集 `asdfghjkl`，定长 1–3 个字符）——文件树行、buffer tab、agent 线程、navigator tab、note 行、Workbox tab、`+` 新建线程按钮和输入框行。输入完整标签执行该目标原本的动作，Backspace 删除已输入字符，Esc 取消且不产生任何副作用。状态栏显示 `HINTS · N targets · Esc cancel`；没有目标时显示 `HINTS · no targets`。普通 `f` 仍是 vim find-char，hint 不会占用。可从 editor、dashboard、文件树和 AI 线程列表进入（输入框内打字时不会触发）。
 - 流式 OpenAI 兼容补全（`POST {base_url}/chat/completions`，SSE）；支持 Markdown 与 fenced 代码块渲染、自动滚动
 - 自动附带编辑器上下文：当前文件路径；有可视选区时附带选中文本与 1-based 行号范围；否则附带光标行 ± 少量上下文（总上限 8 KB）
 - 通过环境变量配置（打开 rail 时读取）：
@@ -95,6 +97,8 @@
   | `OZ_AI_SYSTEM` | 内置 | 可选 system prompt 覆盖 |
 
   示例：`OZ_AI_BASE_URL=https://api.deepseek.com/v1 OZ_AI_MODEL=deepseek-chat OZ_AI_API_KEY=sk-… oz`。
+
+Notes 使用同样的环境变量风格：`OZ_NOTES_DIR=/path/to/notes oz` 可重定向全局 note 目录；不设置时使用 `$XDG_DATA_HOME/oz/notes` 或 `$HOME/.local/share/oz/notes`。
 
 ## 构建与运行
 

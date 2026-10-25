@@ -801,7 +801,8 @@ Narrow drawer 必须有遮罩/焦点陷阱，不能挤压编辑器到不可用�
 ### 18.4 里程碑拆分
 
 - **M2a（layout shell，已完成）**：右侧 dock rail / narrow drawer；线程模型与 thread rail；workbox Chat + Changes（空状态）+ Tools/Terminal 诚实占位；现有 `<leader>a` 改为打开/聚焦 rail；保留 M1 streaming/cancel/error。实现状态见 §18.7。
-- **M2b（notes + inline）**：navigator Notes tab / note buffer；visual 选区 inline assistant；diff float；Approve/Reject + undo。
+- **M2b1（navigator + notes，已完成，2026-10-25）**：左侧 navigator 三 tab（files/notes/agents）、真实 note 文件 + 普通 buffer、Notes 列表、Agents 真实线程视图、tab/行 hint 目标；实现状态见 §18.8。
+- **M2b2（后续）**：visual 选区 inline assistant；diff float；Approve/Reject + undo。
 - **M3a（tools）**：tool protocol、权限确认、tool cards、read/list/grep/edit/apply_patch；agent loop。
 - **M3b（metrics）**：per-tool count/avg/success/fail；最近 N 次耗时 ring buffer；braille/线条折线图；窄屏 sparkline fallback。
 
@@ -872,6 +873,59 @@ Narrow drawer 必须有遮罩/焦点陷阱，不能挤压编辑器到不可用�
 
 - `zig build test`：343/343 通过。
 - `zig build e2e`：136 个 pty 测试全部通过（exit 0，无失败输出）。
+
+---
+
+### 18.8 M2b1 实现状态（navigator tabs + notes，2026-10-25）
+
+**布局（cell 精确）**
+
+- 侧栏宽度不变（`filetree_width = 30`，`contentCol()` 仍为 30），因此 editor/split/rail 的全部宽度计算不变；80/100/120 列都没有横向溢出。
+- 顶栏即原 `╭─ files` 标题行，改为 tab strip：`╭─ files ─ notes ─ agents────╮`（30 cells 内精确放下）。active tab 用 `bg_sel` + bold，非 active 用 `fg_dim`；`files` 子串与面板左上 `╭` 保持原位，既有 `findBoxByTitle("files")`/row-2 几何断言继续成立。hint mode 下三个 tab 都是 target（label 覆盖 tab 首字符），因此 hints 场景用「30-cell box at column 0」而不是标题文本定位面板。
+- 内容区沿用原 filetree 几何：`contentTop()+1 .. status bar-1`，底部仍有闭合边框；每个 tab 的列表在该区域内滚动。
+
+**焦点与按键（实际实现）**
+
+- App focus 由 `Focus.filetree` 改名为 `Focus.navigator`（语义更新，行为沿用 Ctrl-w h/l + `<leader>e`）。
+- `<leader>e`：关闭 → 打开 navigator 并固定落在 **files**（`<leader>E` 同样落 files 并 reveal 当前文件）；已打开 → 关闭并把焦点还给 editor。
+- navigator 聚焦时：`Tab` 下一个 tab、`Shift-Tab` 上一个、`1/2/3` 直接 files/notes/agents（`src/app/navigator.zig` 纯模型）。这些按键先于 per-tab handler 消费，所以 files tab 的 `h/l` 仍是折叠/父目录，不与 tab 切换冲突。
+- Files：原 filetree keys 完全不变（j/k/Enter/h/l/Esc）。
+- Notes：`j/k`（含方向键）选择、Enter 打开、`n` 新建、`r` 刷新、Esc 关闭 navigator。
+- Agents：`j/k` 选择、Enter `aiSelectThread`（必要时先打开 rail）、`n` `aiNewThread`、Esc 关闭。选择光标复用 `ai.thread_cursor`，不是第二份线程光标；Enter 后键盘属于 rail prompt。
+- hint 动作新增 `navigator_tab` / `note_open`；`agent_thread_select` 现在会先把 rail 打开，保证从 navigator 触发时 attach 可见。切换 navigator tab / 打开 note 时把 AI focus 置回 editor（rail 可保持可见），避免 rail 模态吞掉后续导航键。
+
+**Notes 持久化（实际实现，`src/app/note_store.zig`）**
+
+- 路径优先级：`OZ_NOTES_DIR`（文档化的用户覆盖 + e2e seam）→ `$XDG_DATA_HOME/oz/notes` → `$HOME/.local/share/oz/notes`；任一为空则继续 fallback，全部缺失时 Notes tab 显示 `! notes unavailable`（不崩溃）。解析结果缓存，`OZ_NOTES_DIR` 相对路径会规范化成绝对路径。
+- 目录惰性创建：启动/打开 editor 不创建；首次进入 Notes tab（list）或首次 `n`（create）时才 `createDirPath`。`OZ_NOTES_DIR` 不可用时只在 tab 内显示错误与 status message。
+- 新建：`note-<N>.md` 取最小未占用 N（`noteNameNumber` 只识别这个窄格式），`O_EXCL` 创建，内容精确为 `# Untitled note\n\n`；绝不覆盖已有文件。打开走既有 `openFile`/`openInBuffer`，`:w` 走既有原子保存。
+- 列表：每篇 note 读前 8 KiB 提取 title（首个 ATX heading，否则文件名）与 snippet（首个非空、非 heading 行，去掉 `>`/列表符，最多 160 bytes 且不切断 UTF-8）。排序 = mtime 降序，mtime 相同按 filename 降序（确定性；刚创建的 note 在最上）。相对年龄 `now/Nm/Nh/Nd` 每帧只取一次时钟。
+- 缓存/刷新：`Store.items` 是缓存，只在 **tab 进入 / 新建后 / `:w` 保存了 note / `r`** 时重建；渲染只读缓存，不逐帧 scan。刷新按 path 保留选择；保存 note 后立即刷新（`notesDidSave`，仅当路径在 notes 目录内）。
+- notes 是全局/项目无关：`openInBuffer` 对 notes 路径跳过 `setProjectRoot`，所以打开 note 不会把 workspace 文件树/picker 根到数据目录。
+
+**范围与限制**
+
+- 仅 M2b1：没有 inline assistant、diff、Approve/Reject、tool cards；Changes/Tools/Terminal 仍是 M2a 的空状态/占位。
+- Notes 没有删除/重命名（破坏性操作需要单独设计）；没有 note 搜索/标签/附件；不做 notes 目录 watch（刷新是显式路径）。
+- 单行 snippet；超长标题按 cell 截断；时间只有相对粒度。
+- Agents tab 是线程模型的视图：线程本身仍是 session 级、不落盘、随 rail 关闭/workspace 切换保留；navigator 不新增线程状态。
+- hint target 仍受 128 容量限制；Notes 列表只注册可见行。
+
+**文件**
+
+- `src/app/navigator.zig`：Tab 模型 + 单测。
+- `src/app/note_store.zig`：路径解析、扫描、title/snippet、命名/创建、排序、age + 单测。
+- `src/app/notes.zig`：App 缓存/刷新/创建/打开/tab/keys/Agents 动作/cursor 行。
+- `src/app/render.zig`：navigator tab strip + files/notes/agents 渲染；hint targets。
+- `src/app.zig`、`src/app/input.zig`、`src/app/filetree.zig`、`src/app/hints.zig`、`src/app/hint_ui.zig`：类型/焦点/路由/动作接线。
+- `src/app/buffers.zig`、`src/app/search.zig`：notes 路径不改变项目根；保存后刷新缓存。
+- `test/e2e.zig` + TESTING.md：navigator/notes/agents/hints/80 列/错误路径 e2e 与 `@navigator`/`@notes` scenario。
+
+**验证**
+
+- `zig build test`：376/376 通过（新增 navigator/note_store 单测，未改动既有断言）。
+- `zig build e2e`：151/151 通过（原 145 + 6 个 M2b1 pty 测试），新增 scenario `navigator notes 120x30` / `navigator agents 100x30`。
+- 无 golden 变更（golden 帧不含 navigator）。
 
 ---
 
@@ -977,3 +1031,4 @@ pub const Target = struct { rect: Rect, action: Action };
 - target 集合每帧重建。若帧间 target 数变化（resize / rail 开关等），已输入前缀会被清空，避免指向重排后的标签；目标动作本身不改变目标集。
 - 没有 golden：标签会覆盖目标文本，target 数还依赖仓库根目录条目；语义断言（从画面读出标签、状态文字、边框、水平溢出）比整帧 golden 更稳定，见 `test/e2e.zig` 的 hints 测试与 `@hints` scenario。
 - 鼠标仍未接入；hint 与既有键盘路径共享同一批动作方法，没有第二套业务逻辑。
+- M2b1 追加 `navigator_tab`（复用 `navigatorSetTab`）与 `note_open`（复用 `openNoteAt`）两个动作；`agent_thread_select` 现在先打开 rail，保证从 navigator 的 Agents tab 触发时 attach 可见。navigator 的 tab strip 与 Notes 行都注册为 target，e2e 从画面读取标签后激活。

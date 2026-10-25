@@ -38,7 +38,9 @@ A terminal text editor written in Zig.
 **Navigation & search**
 
 - Fuzzy pickers: files (`<leader>sf`), grep (`<leader>st`), buffers (`<leader>sb`), recent files (`<leader>sr`), keymaps (`<leader>sk`)
-- File tree (`<leader>e` toggle, `<leader>E` locate current file) rooted at the workspace's project directory
+- **Navigator** (`<leader>e` toggle, `<leader>E` locate current file): the 30-cell left sidebar with three tabs — `files` (the existing lazy file tree, rooted at the workspace's project directory), `notes` and `agents`. While it has focus, `Tab`/`Shift-Tab` cycle tabs and `1`/`2`/`3` jump directly; `h`/`l` keep the file tree's fold/parent behavior. Every tab and every list row is a `<leader>j` hint target.
+- **Notes** (`notes` tab): real markdown buffers stored globally under `$OZ_NOTES_DIR`, else `$XDG_DATA_HOME/oz/notes`, else `$HOME/.local/share/oz/notes` (the directory is created lazily, never at startup). `j`/`k` select · Enter opens the note as a normal buffer (`:w` saves it) · `n` creates the smallest free `note-N.md` containing `# Untitled note` (existing files are never overwritten) · `r` refreshes. Rows show the first markdown heading (else the filename), a body snippet and relative age, newest first. Notes are project-independent: opening one never re-roots the workspace file tree/picker. Delete/rename are intentionally not implemented yet.
+- **Agents** (`agents` tab): a compact navigator view of the same real session threads (grouped under the current workspace) — `j`/`k` select · Enter attaches the thread in the rail/workbox · `n` creates a new thread. This is a view, not a second thread model.
 - In-buffer search (`/`, `?`, n/N)
 
 ![Fuzzy file picker (leader sf)](docs/screenshots/picker.png)
@@ -82,7 +84,7 @@ A terminal text editor written in Zig.
   - Prompt: Enter send · Ctrl+c cancel · Ctrl+n new thread · Tab → thread list · Ctrl+j/k scroll one line · PageUp/PageDown scroll a page · Esc → editor (drawer: closes)
   - Thread list / workbox: `j`/`k` select · Enter attach · `n`/`+` new thread · `c`/`d`/`t`/`r` Chat/Changes/Tools/Terminal · Tab/Shift+Tab cycle tabs · `q`/Esc → editor
   - `<Ctrl-w> a` re-enters the rail at the thread list from the editor (also opens a closed rail)
-- **Keyboard hints (M2.6a)**: `<leader>j` overlays qutebrowser-style labels (`asdfghjkl`, fixed length 1–3) on every visible target — filetree rows, buffer tabs, agent threads, Workbox tabs, the `+` new-thread button and the prompt row. Type a full label to run the target's normal action, Backspace edits the prefix, Esc cancels with no side effects. A `HINTS · N targets · Esc cancel` indicator appears on the status bar; with nothing visible it reads `HINTS · no targets`. Plain `f` stays vim find-char — hints never take it. Works from the editor, the dashboard, the file tree and the AI thread list (not while typing in the prompt).
+- **Keyboard hints (M2.6a)**: `<leader>j` overlays qutebrowser-style labels (`asdfghjkl`, fixed length 1–3) on every visible target — filetree rows, buffer tabs, agent threads, navigator tabs, note rows, Workbox tabs, the `+` new-thread button and the prompt row. Type a full label to run the target's normal action, Backspace edits the prefix, Esc cancels with no side effects. A `HINTS · N targets · Esc cancel` indicator appears on the status bar; with nothing visible it reads `HINTS · no targets`. Plain `f` stays vim find-char — hints never take it. Works from the editor, the dashboard, the file tree and the AI thread list (not while typing in the prompt).
 - Streaming OpenAI-compatible completions (`POST {base_url}/chat/completions`, SSE); Markdown + fenced code rendering, auto-scroll
 - Editor context is attached automatically: current file path, visual selection with its 1-based line range, otherwise the cursor line ± a small window (capped at 8 KB)
 - Configuration via env (read when the rail opens):
@@ -95,6 +97,8 @@ A terminal text editor written in Zig.
   | `OZ_AI_SYSTEM` | built-in | Optional system-prompt override |
 
   Example: `OZ_AI_BASE_URL=https://api.deepseek.com/v1 OZ_AI_MODEL=deepseek-chat OZ_AI_API_KEY=sk-… oz`.
+
+Notes use the same environment-config style: `OZ_NOTES_DIR=/path/to/notes oz` redirects the global note store; leave it unset to use `$XDG_DATA_HOME/oz/notes` or `$HOME/.local/share/oz/notes`.
 
 ## Build & run
 
