@@ -44,6 +44,12 @@ const Pty = struct {
     /// 24-row terminal; the inlay-viewport tests need a taller one so the
     /// request window's coverage of the visible rows is observable.
     fn openRows(rows: u16) !Pty {
+        return openSize(rows, 80);
+    }
+
+    /// Open a pty with a custom height AND width (the AI workspace tests
+    /// drive a 120-column docked rail and an 80-column drawer).
+    fn openSize(rows: u16, cols: u16) !Pty {
         const master = try std.posix.openat(
             std.posix.AT.FDCWD,
             "/dev/ptmx",
@@ -65,7 +71,7 @@ const Pty = struct {
         );
         errdefer _ = linux.close(slave);
         // give the pty a window size so the child's terminal queries succeed
-        const ws = Winsize{ .ws_row = rows, .ws_col = 80, .ws_xpixel = 0, .ws_ypixel = 0 };
+        const ws = Winsize{ .ws_row = rows, .ws_col = cols, .ws_xpixel = 0, .ws_ypixel = 0 };
         _ = linux.ioctl(master, TIOCSWINSZ, @intFromPtr(&ws));
         return .{ .master = master, .slave = slave };
     }
@@ -238,7 +244,12 @@ const Session = struct {
 
     /// spawnEnv with a custom pty height (rows).
     fn spawnEnvRows(io: Io, argv: []const []const u8, env_extra: ?[]const []const u8, rows: u16) !Session {
-        var pty = try Pty.openRows(rows);
+        return spawnEnvSize(io, argv, env_extra, rows, 80);
+    }
+
+    /// spawnEnv with a custom pty size (AI workspace tests).
+    fn spawnEnvSize(io: Io, argv: []const []const u8, env_extra: ?[]const []const u8, rows: u16, cols: u16) !Session {
+        var pty = try Pty.openSize(rows, cols);
         errdefer pty.close();
         const pid = spawnChildEnv(io, &pty, argv, env_extra) catch |e| {
             pty.close();
@@ -415,8 +426,9 @@ const Grid = struct {
     col: usize = 0,
     fg: u32 = 0, // current fg color (packed RGB, 0 = default)
     bg: u32 = 0, // current bg color (packed RGB, 0 = default)
-    /// Scratch buffer for rowText (one row of compressed cells).
-    row_text_buf: [80 * 4]u8 = undefined,
+    /// Scratch buffer for rowText (one row of compressed cells; the AI
+    /// workspace tests use 120 columns with 4-byte box-drawing glyphs).
+    row_text_buf: [160 * 4]u8 = undefined,
     /// Allocator for the pending-tail combine (set by init).
     alloc: std.mem.Allocator,
     /// Truncated escape/UTF-8 sequence tail from the last feed: pty reads
@@ -435,13 +447,19 @@ const Grid = struct {
     /// run a 40-row terminal so a request window narrower than the viewport
     /// leaves visible rows without hints.
     fn initSized(alloc: std.mem.Allocator, rows: usize) !Grid {
-        const buf = try alloc.alloc(u8, rows * 80 * 4);
+        return initSizedCols(alloc, rows, 80);
+    }
+
+    /// init with a custom terminal size. `cols` must match the pty width or
+    /// cells past the default 80 columns are dropped.
+    fn initSizedCols(alloc: std.mem.Allocator, rows: usize, cols: usize) !Grid {
+        const buf = try alloc.alloc(u8, rows * cols * 4);
         @memset(buf, 0);
-        const fg_buf = try alloc.alloc(u32, rows * 80);
+        const fg_buf = try alloc.alloc(u32, rows * cols);
         @memset(fg_buf, 0);
-        const bg_buf = try alloc.alloc(u32, rows * 80);
+        const bg_buf = try alloc.alloc(u32, rows * cols);
         @memset(bg_buf, 0);
-        return .{ .rows = rows, .buf = buf, .fg_buf = fg_buf, .bg_buf = bg_buf, .alloc = alloc };
+        return .{ .rows = rows, .cols = cols, .buf = buf, .fg_buf = fg_buf, .bg_buf = bg_buf, .alloc = alloc };
     }
 
     fn deinit(self: *Grid, alloc: std.mem.Allocator) void {
@@ -13883,7 +13901,7 @@ test "popup geometry: hover/completion borders align; markdown rendered" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 // ---------------------------------------------------------------------------
-// M1 AI chat
+// M2a AI workspace (Agent Rail + Workbox)
 // ---------------------------------------------------------------------------
 
 fn aiMockDir(io: Io, buf: []u8) ![:0]u8 {
@@ -13907,60 +13925,144 @@ fn aiReadFile(io: Io, alloc: std.mem.Allocator, dir: []const u8, name: []const u
     return std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, path, alloc, .limited(64 * 1024));
 }
 
-/// Top border row of the AI panel (the row containing the " AI " title).
-fn aiPanelTop(grid: *Grid) ?usize {
-    var r: usize = 0;
-    while (r < grid.rows) : (r += 1) {
-        if (std.mem.indexOf(u8, grid.rowText(r), " AI ") != null) return r;
+/// The rail's reserved width at a terminal width (mirrors ai/workspace.zig;
+/// the unit tests pin the implementation, these helpers only derive screen
+/// coordinates).
+fn aiRailWidth(cols: usize) usize {
+    if (cols >= 110) return 38;
+    if (cols >= 90) return 34;
+    return @min(@as(usize, 34), cols -| 8);
+}
+
+fn aiRailCol(cols: usize) usize {
+    return cols - aiRailWidth(cols);
+}
+
+/// Text of one screen cell ("" for an unpainted cell).
+fn aiCellText(grid: *Grid, row: usize, col: usize) []const u8 {
+    if (row >= grid.rows or col >= grid.cols) return "";
+    const slot = grid.buf[(row * grid.cols + col) * 4 ..][0..4];
+    var n: usize = 0;
+    while (n < 4 and slot[n] != 0) : (n += 1) {}
+    return slot[0..n];
+}
+
+fn aiCellBg(grid: *Grid, row: usize, col: usize) u32 {
+    return grid.bg_buf[row * grid.cols + col];
+}
+
+/// First cell on `row` whose content starts with `needle` (ASCII needles:
+/// the tests use file text and rail labels).
+fn aiCellIndexOf(grid: *Grid, row: usize, needle: []const u8) ?usize {
+    const row_text = grid.rowText(row);
+    const at = std.mem.indexOf(u8, row_text, needle) orelse return null;
+    var byte: usize = 0;
+    var c: usize = 0;
+    while (c < grid.cols and byte < row_text.len) : (c += 1) {
+        if (byte == at) return c;
+        byte += aiCellText(grid, row, c).len;
     }
     return null;
 }
 
-/// Panel geometry: (top, bottom, left, right) from the drawn rounded box.
-fn aiPanelRect(grid: *Grid, top: usize) !struct { top: usize, bottom: usize, left: usize, right: usize } {
-    const left = glyphCol(grid, top, "╭", 0) orelse return error.TestUnexpectedResult;
-    const right = glyphCol(grid, top, "╮", 0) orelse return error.TestUnexpectedResult;
-    const bottom = try assertPopupBox(grid, top);
-    return .{ .top = top, .bottom = bottom, .left = left, .right = right };
-}
-
-fn aiAssertSolidBg(grid: *Grid, rect: anytype, bg: u32) !void {
-    var r = rect.top;
-    while (r <= rect.bottom) : (r += 1) {
-        var c = rect.left;
-        while (c <= rect.right) : (c += 1) {
-            if (grid.bg_buf[r * grid.cols + c] != bg) {
-                std.debug.print("panel bg gap at row {d} col {d}\n", .{ r, c });
-                grid.dump();
-                return error.TestUnexpectedResult;
-            }
-        }
+fn aiFindCell(grid: *Grid, needle: []const u8) ?struct { row: usize, col: usize } {
+    var r: usize = 0;
+    while (r < grid.rows) : (r += 1) {
+        if (aiCellIndexOf(grid, r, needle)) |c| return .{ .row = r, .col = c };
     }
+    return null;
 }
 
-fn aiCountInRows(grid: *Grid, from: usize, to: usize, needle: u8) usize {
+fn aiRailBg() u32 {
+    return packRgb(0x22, 0x32, 0x49); // kanagawa-wave bg_float
+}
+
+fn aiEditorBg() u32 {
+    return packRgb(0x1F, 0x1F, 0x28); // kanagawa-wave bg
+}
+
+fn aiStatusBg() u32 {
+    return packRgb(0x2A, 0x2A, 0x37); // kanagawa-wave bg_status
+}
+
+/// Workbox header row for a given terminal height: the row that names the
+/// active thread (the thread rail above it also lists names, so tests that
+/// assert attachment must look at THIS row).
+fn aiWorkboxHeaderRow(rows: usize) usize {
+    const rail_rows = rows - 1;
+    var thread_rows = (rail_rows -| 6) / 3;
+    thread_rows = @min(@max(thread_rows, 3), 8);
+    return 2 + thread_rows + 1;
+}
+
+fn aiRowStatusBg(grid: *Grid, row: usize) u32 {
+    return aiCellBg(grid, row, grid.cols - 1);
+}
+
+/// Count cells holding `ch` in the rail, excluding the status bar. Used to
+/// prove a transcript's reply text disappears when another thread is active
+/// and never appears in the wrong thread.
+fn aiCountRailChar(grid: *Grid, ch: u8) usize {
+    const rail_col = aiRailCol(grid.cols);
     var n: usize = 0;
-    var r = from;
-    while (r < to and r < grid.rows) : (r += 1) {
-        for (grid.rowText(r)) |c| {
-            if (c == needle) n += 1;
+    var r: usize = 0;
+    while (r + 1 < grid.rows) : (r += 1) {
+        var c = rail_col;
+        while (c < grid.cols) : (c += 1) {
+            const txt = aiCellText(grid, r, c);
+            if (txt.len > 0 and txt[0] == ch) n += 1;
         }
     }
     return n;
 }
 
-test "ai: mock stream renders the panel, streams a reply, request has model/prompt/context" {
+fn aiRowContains(grid: *Grid, row: usize, needle: []const u8) bool {
+    return std.mem.indexOf(u8, grid.rowText(row), needle) != null;
+}
+
+fn aiEnterRail(sess: *Session, grid: *Grid) !void {
+    try sess.send(" a");
+    try gridWaitFor(sess, grid, "agents", 4000);
+    try gridWaitFor(sess, grid, "thread 1", 3000);
+    try gridWaitFor(sess, grid, "changes 0", 3000);
+    try gridWaitFor(sess, grid, "❯ ", 2000);
+}
+
+fn aiQuit(sess: *Session) !void {
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+/// Wait until the rail's left border reflects the expected focus (accent =
+/// rail/prompt owns the keyboard, faint = editor). Esc followed immediately
+/// by another printable byte can be parsed as an Alt sequence, so tests wait
+/// for this observable transition before typing editor keys.
+fn aiWaitRailFocus(sess: *Session, grid: *Grid, rail_col: usize, focused: bool, timeout_ms: i32) !void {
+    const want: u32 = if (focused) packRgb(0xE6, 0xC3, 0x84) else packRgb(0x54, 0x54, 0x6D);
+    var waited: i32 = 0;
+    while (waited < timeout_ms) : (waited += 50) {
+        if (grid.fg_buf[5 * grid.cols + rail_col] == want) return;
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
+        if (n > 0) {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+    }
+    try std.testing.expectEqual(want, grid.fg_buf[5 * grid.cols + rail_col]);
+}
+
+test "ai workspace: 120-col docked rail keeps editor+filetree, streams, focus returns to editor" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}ai.zig", .{ linux.getpid(), tmp_counter });
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}aiw.zig", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     {
         const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
         defer f.close(io);
-        try f.writeStreamingAll(io, "const answer = 42;\n");
+        try f.writeStreamingAll(io, "const answer = 42;\nsecond visible line\n");
     }
 
     var dir_buf: [128]u8 = undefined;
@@ -13972,37 +14074,55 @@ test "ai: mock stream renders the panel, streams a reply, request has model/prom
 
     const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
     defer alloc.free(mock_env);
-    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{ mock_env, "OZ_AI_MODEL=mock-model" });
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120);
     defer sess.close();
     defer killPid(sess.pid);
 
-    var grid = try Grid.init(alloc);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
     defer grid.deinit(alloc);
     try gridWaitFor(&sess, &grid, "NORMAL", 8000);
 
-    // <leader>a opens the centered panel.
-    try sess.send(" a");
-    try gridWaitFor(&sess, &grid, " AI ", 4000);
-    try gridWaitFor(&sess, &grid, "mock-model", 4000);
-    try gridWaitFor(&sess, &grid, "❯ ", 2000);
-    var top = aiPanelTop(&grid).?;
-    var rect = try aiPanelRect(&grid, top);
-    // width = min(96, 80-4) = 76, height = min(28, 24-4) = 20, centered
-    try std.testing.expectEqual(@as(usize, 76), rect.right - rect.left + 1);
-    try std.testing.expectEqual(@as(usize, 20), rect.bottom - rect.top + 1);
-    try aiAssertSolidBg(&grid, rect, packRgb(0x22, 0x32, 0x49));
+    // Docked rail: 38 cells reserved on the right (editor width 82).
+    try aiEnterRail(&sess, &grid);
+    const rail_col = aiRailCol(120);
+    try std.testing.expectEqual(@as(usize, 82), rail_col);
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 0, rail_col));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 5, rail_col));
+    // Focused rail border is accent; the whole rail is bg_float.
+    try std.testing.expectEqual(packRgb(0xE6, 0xC3, 0x84), grid.fg_buf[5 * grid.cols + rail_col]);
+    try std.testing.expectEqual(aiRailBg(), aiCellBg(&grid, 5, 100));
+    // Editor cells to the left keep the normal background.
+    try std.testing.expectEqual(aiEditorBg(), aiCellBg(&grid, 20, 40));
+    // The status bar stays full width and owns its row.
+    try std.testing.expectEqual(aiStatusBg(), aiRowStatusBg(&grid, 29));
 
-    // Type a prompt (modal: it must not reach the editor buffer) and send.
+    // Editor + filetree stay visible beside the rail.
+    try sess.send("\x1b"); // prompt -> editor (rail stays docked)
+    try aiWaitRailFocus(&sess, &grid, rail_col, false, 3000);
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "files", 5000);
+    try gridWaitFor(&sess, &grid, "const answer = 42", 5000);
+    try std.testing.expect(aiFindCell(&grid, "const answer = 42") != null);
+    const content_cell = aiFindCell(&grid, "const answer = 42").?;
+    try std.testing.expect(content_cell.col < rail_col);
+    try std.testing.expect(grid.contains("╭─ files"));
+    // Re-enter the rail from the file tree (Ctrl+w a) and attach to the
+    // prompt with Enter. This is the editor -> rail re-entry path.
+    try sess.send("\x17a");
+    try aiWaitRailFocus(&sess, &grid, rail_col, true, 3000);
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "❯ ", 2000);
+
+    // Type in the prompt (it must not reach the editor), send, stream.
     try sess.send("hello");
     try gridWaitFor(&sess, &grid, "hello", 2000);
     try sess.send("\r");
     try gridWaitFor(&sess, &grid, "mock reply", 8000);
     try gridWaitFor(&sess, &grid, "idle", 4000);
-
-    // Still rectangular after the transcript grew.
-    top = aiPanelTop(&grid).?;
-    rect = try aiPanelRect(&grid, top);
-    try aiAssertSolidBg(&grid, rect, packRgb(0x22, 0x32, 0x49));
+    try std.testing.expect(aiRowContains(&grid, 29, "thread 1"));
+    try std.testing.expect(aiRowContains(&grid, 29, "mock-model"));
+    try std.testing.expect(aiRowContains(&grid, 29, "idle"));
+    try std.testing.expect(!grid.contains("helloconst"));
 
     const req = try aiReadFile(io, alloc, dir, "request.json");
     defer alloc.free(req);
@@ -14010,17 +14130,283 @@ test "ai: mock stream renders the panel, streams a reply, request has model/prom
     try std.testing.expect(std.mem.indexOf(u8, req, "\"stream\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, req, "hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, req, name) != null);
-    // The editor buffer is untouched.
-    try std.testing.expect(!grid.contains("helloconst"));
-    try std.testing.expect(grid.contains("const answer = 42"));
 
+    // Esc returns the keyboard to the editor; the rail stays visible and
+    // its border turns faint.
     try sess.send("\x1b");
-    try gridWaitGone(&sess, &grid, " AI ", 3000);
-    const exit_code = try sess.commandAndWaitExit(":q\r");
-    try std.testing.expectEqual(@as(u32, 0), exit_code);
+    try aiWaitRailFocus(&sess, &grid, rail_col, false, 3000);
+    try std.testing.expect(aiCellText(&grid, 5, rail_col).len > 0);
+    // The file tree still has App focus after leaving the rail; Ctrl+w l
+    // hands the keyboard back to the buffer.
+    try sess.send("\x17l");
+    try sess.send("i");
+    try sess.send("zz");
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "zzconst answer = 42", 4000);
+
+    // <leader>a toggles the rail closed from the editor...
+    try sess.send(" a");
+    try gridWaitGone(&sess, &grid, "changes 0", 4000);
+    try std.testing.expect(!grid.contains("agents"));
+    // ...and reopening restores the session transcript (not persisted, but
+    // it survives rail close).
+    try sess.send(" a");
+    try gridWaitFor(&sess, &grid, "changes 0", 4000);
+    try gridWaitFor(&sess, &grid, "mock reply", 3000);
+    // Esc gives the editor back while the rail remains docked.
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, rail_col, false, 3000);
+    // Ctrl+w a re-enters the rail at the thread list; q returns to editor.
+    try sess.send("\x17a");
+    try gridWaitFor(&sess, &grid, "thread 1", 3000);
+    try sess.send("q");
+    try sess.send("u"); // undo the inserted "zz" — only works if editor has focus
+    try gridWaitFor(&sess, &grid, "const answer = 42", 4000);
+    try std.testing.expect(grid.contains("changes 0"));
+
+    try aiQuit(&sess);
 }
 
-test "ai: visual selection context is included in the request body" {
+test "ai workspace: 80-col drawer overlays the full-width editor without overflow" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}aid.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "LINESTART_ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789_TAILDRAWER\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try aiWriteFile(io, dir, "stream.sse", "data: [DONE]\n\n");
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, &.{mock_env}, 24, 80);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    // The long line is rendered at the terminal's full 80-column width
+    // before the drawer opens.
+    try gridWaitFor(&sess, &grid, "TAILDRAWER", 4000);
+    const tail = aiFindCell(&grid, "TAILDRAWER").?;
+    try std.testing.expect(tail.col > aiRailCol(80));
+
+    try aiEnterRail(&sess, &grid);
+    const rail_col = aiRailCol(80);
+    try std.testing.expectEqual(@as(usize, 46), rail_col);
+    // 80-col drawer: 34 cells, covering the right side only.
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 0, rail_col));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 5, rail_col));
+    try std.testing.expectEqual(aiRailBg(), aiCellBg(&grid, 5, 79));
+    try std.testing.expectEqual(aiStatusBg(), aiRowStatusBg(&grid, 23));
+    // The rail stops above the status bar: no fake scrim, no overflow.
+    // The drawer covers the long line's tail, while the left part of the
+    // (unchanged, full-width) editor remains visible underneath.
+    try std.testing.expect(aiFindCell(&grid, "TAILDRAWER") == null);
+    try std.testing.expect(aiFindCell(&grid, "LINESTART_ABCDEF") != null);
+
+    // Esc closes the narrow drawer and restores the editor.
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "changes 0", 4000);
+    try gridWaitFor(&sess, &grid, "TAILDRAWER", 4000);
+
+    // Keys don't trap: reopen, attach to a new thread, then Esc closes.
+    try sess.send(" a");
+    try gridWaitFor(&sess, &grid, "changes 0", 3000);
+    try sess.send("\t");
+    try sess.send("n");
+    try gridWaitFor(&sess, &grid, "thread 2", 3000);
+    try sess.send("beta");
+    try gridWaitFor(&sess, &grid, "beta", 2000);
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "changes 0", 4000);
+    try std.testing.expect(!grid.contains("agents"));
+    // Editor focus after the drawer closes.
+    try sess.send("i");
+    try sess.send("X");
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "XLINESTART", 4000);
+
+    try aiQuit(&sess);
+}
+
+test "ai workspace: thread B streams while A is frozen; transcripts never mix" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}ait.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "threads\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    // Slow "A" stream: enough events that switching away interrupts it.
+    var stream_a = std.ArrayList(u8).empty;
+    defer stream_a.deinit(alloc);
+    var ai: usize = 0;
+    while (ai < 300) : (ai += 1) {
+        try stream_a.appendSlice(alloc, "data: {\"choices\":[{\"delta\":{\"content\":\"AAA-\"}}]}\n\n");
+    }
+    try aiWriteFile(io, dir, "stream.sse", stream_a.items);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try aiEnterRail(&sess, &grid);
+
+    const header_row = aiWorkboxHeaderRow(30);
+    // Thread A streams.
+    try sess.send("alpha\r");
+    try gridWaitFor(&sess, &grid, "streaming…", 4000);
+    // "AAA" is unique to the reply (the status bar's NORMAL also has an A).
+    try gridWaitFor(&sess, &grid, "AAA", 5000);
+    const req_a = try aiReadFile(io, alloc, dir, "request.json");
+    defer alloc.free(req_a);
+    try std.testing.expect(std.mem.indexOf(u8, req_a, "alpha") != null);
+
+    // New thread: switching away cancels A. The rail shows thread 2 and A's
+    // status is frozen as cancelled.
+    try sess.send("\t");
+    try sess.send("n");
+    try gridWaitFor(&sess, &grid, "thread 2", 3000);
+    try gridWaitFor(&sess, &grid, "cancelled", 4000);
+    std.Io.sleep(io, std.Io.Duration.fromNanoseconds(300 * std.time.ns_per_ms), .real) catch {};
+
+    // Let A's worker finish before replacing the mock stream (a truncate
+    // while the cancelled worker still reads would race the test seam).
+    try aiWriteFile(io, dir, "stream.sse", "data: {\"choices\":[{\"delta\":{\"content\":\"banana\"}}]}\n\ndata: [DONE]\n\n");
+    try sess.send("beta\r");
+    try gridWaitFor(&sess, &grid, "banana", 8000);
+    try gridWaitFor(&sess, &grid, "idle", 4000);
+    try std.testing.expect(aiRowContains(&grid, header_row, "thread 2"));
+
+    const req_b = try aiReadFile(io, alloc, dir, "request.json");
+    defer alloc.free(req_b);
+    try std.testing.expect(std.mem.indexOf(u8, req_b, "beta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req_b, "alpha") == null);
+    // B's transcript has no A reply cells.
+    try std.testing.expectEqual(@as(usize, 0), aiCountRailChar(&grid, 'A'));
+
+    // Switching back to A shows the frozen transcript and no B reply.
+    try sess.send("\t");
+    try sess.send("k");
+    try sess.send("\r");
+    // "thread 1 · cancelled" is unique to the workbox header (the thread
+    // rail renders the same title and status in separate columns), so this
+    // also waits for the switched-to frame to arrive.
+    try gridWaitFor(&sess, &grid, "thread 1 · cancelled", 4000);
+    try std.testing.expect(aiRowContains(&grid, header_row, "thread 1"));
+    try gridWaitGone(&sess, &grid, "banana", 4000);
+    try gridWaitFor(&sess, &grid, "cancelled", 3000);
+    const frozen = aiCountRailChar(&grid, 'A');
+    try std.testing.expect(frozen > 0);
+    // No late cancelled-stream deltas may land after the switch.
+    var ticks: usize = 0;
+    while (ticks < 6) : (ticks += 1) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n > 0) {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+    }
+    try std.testing.expectEqual(frozen, aiCountRailChar(&grid, 'A'));
+
+    // And back to B: A's reply text is gone, B's is present.
+    try sess.send("\t");
+    try sess.send("j");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "banana", 4000);
+    try std.testing.expect(aiRowContains(&grid, header_row, "thread 2"));
+    try std.testing.expectEqual(@as(usize, 0), aiCountRailChar(&grid, 'A'));
+
+    try sess.send("\x1b"); // prompt -> editor (wide rail stays)
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+
+test "ai workspace: workbox tabs show honest empty states and badge 0" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}aitab.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "tab test\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try aiWriteFile(io, dir, "stream.sse", "data: [DONE]\n\n");
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, &.{mock_env}, 30, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try aiEnterRail(&sess, &grid);
+    const rail_col = aiRailCol(120);
+
+    // From the prompt, Tab focuses the thread list; c/d/t/r switch tabs.
+    try sess.send("\t");
+    try sess.send("d");
+    try gridWaitFor(&sess, &grid, "no pending changes", 3000);
+    try std.testing.expect(grid.contains("changes 0"));
+    try std.testing.expect(!grid.contains("diff --"));
+    try std.testing.expect(!grid.contains("approve"));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 5, rail_col));
+
+    try sess.send("t");
+    try gridWaitFor(&sess, &grid, "tools arrive in M3", 3000);
+    try gridWaitFor(&sess, &grid, "no tool runs recorded", 3000);
+    try std.testing.expect(!grid.contains("avg "));
+    try std.testing.expect(!grid.contains("calls"));
+
+    try sess.send("r");
+    try gridWaitFor(&sess, &grid, "agent terminal arrives in M3", 3000);
+    try gridWaitFor(&sess, &grid, "editor terminal: Alt+r", 3000);
+    try std.testing.expect(!grid.contains("$ "));
+
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "❯ ", 2000);
+    try sess.send("hi");
+    try gridWaitFor(&sess, &grid, "hi", 2000);
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 28, rail_col));
+
+    try sess.send("\x1b"); // editor (wide rail stays)
+    try aiWaitRailFocus(&sess, &grid, rail_col, false, 3000);
+    try aiQuit(&sess);
+}
+
+test "ai workspace: visual selection context is still included in the request body" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
@@ -14041,23 +14427,21 @@ test "ai: visual selection context is included in the request body" {
 
     const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
     defer alloc.free(mock_env);
-    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{mock_env});
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, &.{mock_env}, 24, 80);
     defer sess.close();
     defer killPid(sess.pid);
-
-    var grid = try Grid.init(alloc);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
     defer grid.deinit(alloc);
     try gridWaitFor(&sess, &grid, "NORMAL", 8000);
 
-    // V j selects lines 1-2, then <leader>a opens the panel with the
+    // V j selects lines 1-2, then <leader>a opens the drawer with the
     // selection still active.
     try sess.send("Vj a");
-    try gridWaitFor(&sess, &grid, " AI ", 4000);
+    try gridWaitFor(&sess, &grid, "agents", 4000);
     try sess.send("what");
     try gridWaitFor(&sess, &grid, "what", 2000);
     try sess.send("\r");
     try gridWaitFor(&sess, &grid, "ok", 6000);
-    try gridWaitFor(&sess, &grid, "idle", 4000);
 
     const req = try aiReadFile(io, alloc, dir, "request.json");
     defer alloc.free(req);
@@ -14066,17 +14450,14 @@ test "ai: visual selection context is included in the request body" {
     try std.testing.expect(std.mem.indexOf(u8, req, "alpha\\nbeta") != null);
     try std.testing.expect(std.mem.indexOf(u8, req, "what") != null);
 
-    // Esc closes the panel (separate writes: ESC + ':' would be parsed as
-    // an alt sequence), Esc leaves visual, then :q exits.
-    try sess.send("\x1b");
-    try gridWaitGone(&sess, &grid, " AI ", 3000);
-    try sess.send("\x1b");
+    try sess.send("\x1b"); // narrow drawer closes
+    try gridWaitGone(&sess, &grid, "agents", 4000);
+    try sess.send("\x1b"); // leave visual
     try gridWaitFor(&sess, &grid, "NORMAL", 3000);
-    const exit_code = try sess.commandAndWaitExit(":q\r");
-    try std.testing.expectEqual(@as(u32, 0), exit_code);
+    try aiQuit(&sess);
 }
 
-test "ai: Ctrl+c cancels a stream without further transcript changes" {
+test "ai workspace: Ctrl+c cancels a stream without further transcript changes" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
@@ -14103,18 +14484,16 @@ test "ai: Ctrl+c cancels a stream without further transcript changes" {
 
     const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
     defer alloc.free(mock_env);
-    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{mock_env});
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, &.{mock_env}, 24, 80);
     defer sess.close();
     defer killPid(sess.pid);
-
-    var grid = try Grid.init(alloc);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
     defer grid.deinit(alloc);
     try gridWaitFor(&sess, &grid, "NORMAL", 8000);
-    try sess.send(" a");
-    try gridWaitFor(&sess, &grid, " AI ", 4000);
+
+    try aiEnterRail(&sess, &grid);
     try sess.send("go\r");
     try gridWaitFor(&sess, &grid, "streaming…", 4000);
-    // Let some chunks land, then cancel.
     var waited: i32 = 0;
     while (waited < 400) : (waited += 100) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
@@ -14125,12 +14504,7 @@ test "ai: Ctrl+c cancels a stream without further transcript changes" {
     }
     try sess.send("\x03");
     try gridWaitFor(&sess, &grid, "cancelled", 4000);
-    const rect = try aiPanelRect(&grid, aiPanelTop(&grid).?);
-    const transcript_from = rect.top + 2;
-    const transcript_to = rect.bottom - 2;
-    const before = aiCountInRows(&grid, transcript_from, transcript_to, 'x');
-    // Drain anything the UI paints after the cancel; the transcript must
-    // not change any more.
+    const before = aiCountRailChar(&grid, 'x');
     var ticks: usize = 0;
     while (ticks < 6) : (ticks += 1) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
@@ -14139,20 +14513,18 @@ test "ai: Ctrl+c cancels a stream without further transcript changes" {
             grid.feed(sess.out[sess.used - n .. sess.used]);
         }
     }
-    const after = aiCountInRows(&grid, transcript_from, transcript_to, 'x');
-    try std.testing.expectEqual(before, after);
+    try std.testing.expectEqual(before, aiCountRailChar(&grid, 'x'));
     try std.testing.expect(before > 0);
 
-    // Panel remains usable.
+    // Still usable after the cancel.
     try sess.send("still");
     try gridWaitFor(&sess, &grid, "still", 2000);
     try sess.send("\x1b");
-    try gridWaitGone(&sess, &grid, " AI ", 3000);
-    const exit_code = try sess.commandAndWaitExit(":q\r");
-    try std.testing.expectEqual(@as(u32, 0), exit_code);
+    try gridWaitGone(&sess, &grid, "changes 0", 4000);
+    try aiQuit(&sess);
 }
 
-test "ai: mock error shows a one-line error and leaves the editor usable" {
+test "ai workspace: error surfaces in the thread and leaves the editor usable" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
@@ -14174,61 +14546,19 @@ test "ai: mock error shows a one-line error and leaves the editor usable" {
 
     const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
     defer alloc.free(mock_env);
-    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{mock_env});
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, &.{mock_env}, 24, 80);
     defer sess.close();
     defer killPid(sess.pid);
-
-    var grid = try Grid.init(alloc);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
     defer grid.deinit(alloc);
     try gridWaitFor(&sess, &grid, "NORMAL", 8000);
-    try sess.send(" a");
-    try gridWaitFor(&sess, &grid, " AI ", 4000);
+
+    try aiEnterRail(&sess, &grid);
     try sess.send("hi\r");
     try gridWaitFor(&sess, &grid, "mock boom", 6000);
-    try std.testing.expect(grid.contains("error:"));
-    // Single line: the panel is still rectangular and the editor works.
-    _ = try aiPanelRect(&grid, aiPanelTop(&grid).?);
+    try std.testing.expect(grid.contains("error"));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 5, aiRailCol(80)));
     try sess.send("\x1b");
-    try gridWaitGone(&sess, &grid, " AI ", 3000);
-    const exit_code = try sess.commandAndWaitExit(":q\r");
-    try std.testing.expectEqual(@as(u32, 0), exit_code);
-}
-
-test "ai: Esc closes the panel and :q quits" {
-    const io = std.testing.io;
-    const alloc = std.testing.allocator;
-
-    var name_buf: [128:0]u8 = undefined;
-    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}aix.zig", .{ linux.getpid(), tmp_counter });
-    tmp_counter += 1;
-    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
-    {
-        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
-        defer f.close(io);
-        try f.writeStreamingAll(io, "escape test\n");
-    }
-
-    var dir_buf: [128]u8 = undefined;
-    const dir = try aiMockDir(io, &dir_buf);
-    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
-    try aiWriteFile(io, dir, "stream.sse", "data: [DONE]\n\n");
-    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
-    defer alloc.free(mock_env);
-
-    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{mock_env});
-    defer sess.close();
-    defer killPid(sess.pid);
-    var grid = try Grid.init(alloc);
-    defer grid.deinit(alloc);
-    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
-
-    try sess.send(" a");
-    try gridWaitFor(&sess, &grid, " AI ", 4000);
-    try gridWaitFor(&sess, &grid, "❯ ", 2000);
-    try sess.send("\x1b");
-    try gridWaitGone(&sess, &grid, "❯ ", 3000);
-    try std.testing.expect(!grid.contains(" AI "));
-
-    const exit_code = try sess.commandAndWaitExit(":q\r");
-    try std.testing.expectEqual(@as(u32, 0), exit_code);
+    try gridWaitGone(&sess, &grid, "changes 0", 4000);
+    try aiQuit(&sess);
 }
