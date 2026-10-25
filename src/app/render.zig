@@ -1599,10 +1599,11 @@ pub fn renderNavigator(self: *App, a: std.mem.Allocator, win: vaxis.Window, heig
     }
 }
 
-/// Top strip: `╭─ files ─ notes ─ agents ────╮`. The active tab gets the
-/// selection background + bold so it reads at a glance; inactive tabs are
-/// dim. Every tab is a hint target whose label is drawn at the tab's first
-/// cell (the overlay clamps into the 30-cell panel like any target).
+/// Top strip: `╭─ files │ notes │ agents ───╮`. The active tab gets the
+/// accent foreground + selection background + bold so it reads at a glance;
+/// inactive tabs are dim. `│` separators make the strip read as tabs rather
+/// than a breadcrumb. Every tab is a hint target whose label is drawn at the
+/// tab's first cell (the overlay clamps into the 30-cell panel).
 fn renderNavigatorTabs(self: *App, a: std.mem.Allocator, win: vaxis.Window, row: u32) !void {
     const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg } };
     var segs = std.ArrayList(vaxis.Segment).empty;
@@ -1613,19 +1614,24 @@ fn renderNavigatorTabs(self: *App, a: std.mem.Allocator, win: vaxis.Window, row:
     while (i < nav_tabs.count) : (i += 1) {
         const tab = nav_tabs.all[i];
         if (i > 0) {
-            try segs.append(a, .{ .text = " ─ ", .style = border_style });
+            try segs.append(a, .{ .text = " │ ", .style = border_style });
             used += 3;
         }
         starts[i] = used;
         const active = self.navigator_tab == tab;
         const style: vaxis.Style = if (active)
-            .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_sel }, .bold = true }
+            .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_sel }, .bold = true }
         else
             .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg } };
         const label = nav_tabs.label(tab);
         try segs.append(a, .{ .text = label, .style = style });
         used += @intCast(label.len);
     }
+    // A single dim space before the closing rule keeps the strip from
+    // looking glued to the list below; the three dashes finish the 30-cell
+    // box exactly.
+    try segs.append(a, .{ .text = " ", .style = border_style });
+    used += 1;
     while (used + 1 < filetree_width) : (used += 1) {
         try segs.append(a, .{ .text = "─", .style = border_style });
     }
@@ -1819,7 +1825,7 @@ fn renderNotesRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, ft_top: 
 
         var segs = std.ArrayList(vaxis.Segment).empty;
         try segs.append(a, .{
-            .text = if (selected) "▸ " else "  ",
+            .text = if (selected) "> " else "  ",
             .style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = bg },
         });
         try segs.append(a, .{ .text = title, .style = base_style });
@@ -1874,8 +1880,9 @@ fn renderNotesRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, ft_top: 
 }
 
 /// Agents tab: one workspace group header (current workspace + provider
-/// model), then the session's REAL threads with a colored status dot, name
-/// and status label. Enter = the same `aiSelectThread` attach path as the
+/// model), then the session's REAL threads with an ASCII status marker, name
+/// and status label. The attached thread carries `>` + bold; the selected
+/// row keeps the fill. Enter = the same `aiSelectThread` attach path as the
 /// rail; `n` = `aiNewThread`. No synthetic rows, no second thread model.
 fn renderAgentsRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, ft_top: u32, ft_bottom: u32, usable: u32) !void {
     const inner_left: u32 = 1;
@@ -1884,7 +1891,7 @@ fn renderAgentsRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, ft_top:
     const base_bg: vaxis.Color = .{ .rgb = self.theme.bg };
 
     var header = std.ArrayList(u8).empty;
-    try header.appendSlice(a, " ▾ ");
+    try header.appendSlice(a, " ");
     try header.appendSlice(a, self.curWsName());
     if (self.ai.config) |cfg| {
         try header.appendSlice(a, " · ");
@@ -1936,10 +1943,23 @@ fn renderAgentsRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, ft_top:
             .cancelled => self.theme.fg_dim,
             .err => self.theme.diag_error,
         };
+        const attached = idx == self.ai.threads.active;
         var segs = std.ArrayList(vaxis.Segment).empty;
-        try segs.append(a, .{ .text = "●", .style = .{ .fg = .{ .rgb = dot_color }, .bg = bg } });
+        // ASCII marker (`>` attached, `o` otherwise): no tofu-prone glyph,
+        // and the attached row stays distinct in monochrome via bold.
+        try segs.append(a, .{
+            .text = if (attached) ">" else "o",
+            .style = .{
+                .fg = .{ .rgb = if (attached) self.theme.accent else dot_color },
+                .bg = bg,
+                .bold = attached,
+            },
+        });
         try segs.append(a, .{ .text = " ", .style = .{ .bg = bg } });
-        try segs.append(a, .{ .text = title, .style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = bg } });
+        try segs.append(a, .{
+            .text = title,
+            .style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = bg, .bold = attached },
+        });
         var filled: u32 = 2 + title_cells;
         if (show_status) {
             const pad = usable -| filled -| label_cells;
@@ -2167,6 +2187,35 @@ pub fn drawRichPopup(
             .style = border_style,
         }};
         _ = win.print(&rseg, .{ .row_offset = @intCast(start_row + 1 + rows), .col_offset = @intCast(col0 + cols + 1), .wrap = .none });
+    }
+}
+
+/// Bottom chrome: a solid status band with a horizontal rule on its first
+/// row. Reserving two rows (`App.status_row_count`) keeps every editor and
+/// rail cell above the band; the rule gives the status text a hard boundary
+/// from the document instead of blending into it.
+pub fn drawStatusChrome(self: *App, win: vaxis.Window) void {
+    const rows: u32 = win.height;
+    if (rows <= status_row_count) return;
+    const rule_row = rows - status_row_count;
+    const bg = vaxis.Color{ .rgb = self.theme.bg_status };
+    const band = win.child(.{
+        .x_off = 0,
+        .y_off = @intCast(rule_row),
+        .width = @intCast(win.width),
+        .height = @intCast(status_row_count),
+    });
+    band.fill(.{ .style = .{ .bg = bg } });
+    const rule_style: vaxis.Style = .{
+        .fg = .{ .rgb = self.theme.fg_faint },
+        .bg = bg,
+    };
+    var col: u32 = 0;
+    while (col < win.width) : (col += 1) {
+        win.writeCell(@intCast(col), @intCast(rule_row), .{
+            .char = .{ .grapheme = "─", .width = 1 },
+            .style = rule_style,
+        });
     }
 }
 
@@ -2494,6 +2543,9 @@ pub fn render(self: *App) !void {
         // M2b2 inline prompt floats above the rail; hint labels remain the
         // topmost overlay below.
         if (self.inlinePromptOpen()) try self.drawInlinePrompt(a, win);
+        // The dashboard has no status text, but the same bottom rule keeps
+        // its content from running into the terminal edge.
+        self.drawStatusChrome(win);
         // M2.6a: labels + status indicator are the topmost layer, and must be
         // drawn after rail/filetree/dashboard before the frame is flushed.
         try self.drawHintOverlay(a, win);
@@ -2952,6 +3004,7 @@ pub fn render(self: *App) !void {
 
     // status bar (or command line in command mode)
     if (self.state.mode == .command) {
+        self.drawStatusChrome(win);
         const prompt_char: []const u8 = switch (self.cmdline_kind) {
             .ex => ":",
             .search_fwd => "/",
@@ -3391,10 +3444,20 @@ pub fn render(self: *App) !void {
                     }
                     // the ghost must stay inside THIS pane: win.width is
                     // the whole screen, and a split's neighbor owns the
-                    // columns past the pane's right edge
+                    // columns past the pane's right edge. With the Agent
+                    // Rail open (docked OR drawer) the ghost is also clipped
+                    // one cell before the rail border, so a long blame never
+                    // touches/enters the agent column and a one-cell gap
+                    // keeps the rail's left rule readable.
                     const pane_end = cur_rect.col + cur_rect.width;
-                    if (b_sp.row < cur_rect.height and start_col < pane_end) {
-                        const fit = autil.cellFitPrefix(win, label, pane_end - start_col);
+                    var ghost_end = pane_end;
+                    if (self.ai.rail_open) {
+                        const lay = self.aiLayout();
+                        const rail_limit = lay.rail_col -| 1;
+                        if (rail_limit < ghost_end) ghost_end = rail_limit;
+                    }
+                    if (b_sp.row < cur_rect.height and start_col < ghost_end) {
+                        const fit = autil.cellFitPrefix(win, label, ghost_end - start_col);
                         if (fit.cells > 0) {
                             const seg = [_]vaxis.Segment{.{
                                 .text = fit.slice,
@@ -3433,14 +3496,28 @@ pub fn render(self: *App) !void {
         }
     }
 
-    const mode_str = switch (self.state.mode) {
-        .normal => " NORMAL ",
-        .insert => " INSERT ",
-        .visual_char, .visual_line, .visual_block => " VISUAL ",
-        .command => " COMMAND ",
+    // The status band is painted after every document overlay so its rule is
+    // the visible boundary above the status text (pickers that return early
+    // have their own modal chrome).
+    self.drawStatusChrome(win);
+    const mode_name = switch (self.state.mode) {
+        .normal => "NORMAL",
+        .insert => "INSERT",
+        .visual_char, .visual_line, .visual_block => "VISUAL",
+        .command => "COMMAND",
     };
+    var mode_buf: [16]u8 = undefined;
+    const mode_badge = std.fmt.bufPrint(&mode_buf, "[{s}]", .{mode_name}) catch mode_name;
     const status_col = self.screenCellCol(win, cursor_line, self.curCursor().*);
     const ws_name = self.curWsName();
+    var ws_buf: [256]u8 = undefined;
+    const ws_label = std.fmt.bufPrint(&ws_buf, "[{s}]", .{ws_name}) catch ws_name;
+    var cursor_buf: [96]u8 = undefined;
+    const cursor_text = std.fmt.bufPrint(
+        &cursor_buf,
+        "line {d}/{d} col {d}",
+        .{ cursor_line + 1, line_count, status_col },
+    ) catch "line ?";
     // vim-style macro recording indicator: "recording @x" while q is live
     // (the transient message set at q{reg} vanishes on the next keystroke;
     // this one persists for the whole recording).
@@ -3452,75 +3529,107 @@ pub fn render(self: *App) !void {
     // build.zig while its build_runner analyses the project) — show "…"
     // so a slow response isn't mistaken for a dead completion that
     // silently turns the next Enter into a newline.
-    const status = if (self.completion_slot != null)
-        try std.fmt.allocPrint(
-            a,
-            "[{s}] {s} line {d}/{d} col {d}  …{s}",
-            .{ ws_name, mode_str, cursor_line + 1, line_count, status_col, rec },
-        )
-    else if (self.msg) |m|
-        try std.fmt.allocPrint(
-            a,
-            "[{s}] {s} line {d}/{d} col {d}  {s}{s}",
-            .{ ws_name, mode_str, cursor_line + 1, line_count, status_col, m, rec },
-        )
-    else
-        try std.fmt.allocPrint(
-            a,
-            "[{s}] {s} line {d}/{d} col {d}{s}",
-            .{ ws_name, mode_str, cursor_line + 1, line_count, status_col, rec },
-        );
-    const status_seg = [_]vaxis.Segment{.{
-        .text = status,
-        .style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_status } },
-    }};
-    _ = win.print(&status_seg, .{ .row_offset = @intCast(height - 1), .wrap = .none });
-    // git branch (M3a): "  ⎇ main" right after the mode/message text, in
-    // the accent color — the design's StatusLine git component.
-    var used_cells: u32 = @intCast(status.len);
-    if (self.git_branch) |b| {
-        const branch_text = try std.fmt.allocPrint(a, "  ⎇ {s}", .{std.mem.trim(u8, b, " \t\r\n")});
-        const branch_seg = [_]vaxis.Segment{.{
-            .text = branch_text,
-            .style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_status } },
-        }};
-        _ = win.print(&branch_seg, .{ .row_offset = @intCast(height - 1), .col_offset = @intCast(status.len), .wrap = .none });
-        used_cells = @intCast(status.len + autil.cellWidth(win, branch_text));
+    const completion_marker: []const u8 = if (self.completion_slot != null) "  …" else "";
+
+    const status_bg = vaxis.Color{ .rgb = self.theme.bg_status };
+    const status_fg: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = status_bg };
+    const status_dim: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = status_bg };
+    const status_sep: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = status_bg };
+    const status_accent: vaxis.Style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = status_bg };
+    const status_badge: vaxis.Style = .{
+        .fg = .{ .rgb = self.theme.bg },
+        .bg = .{ .rgb = self.theme.accent },
+        .bold = true,
+    };
+    const status_row: u32 = height - 1;
+    var used_cells: u32 = 0;
+    const printStatus = struct {
+        fn one(win_: vaxis.Window, text: []const u8, style: vaxis.Style, row: u32, col: *u32) void {
+            const seg = [_]vaxis.Segment{.{ .text = text, .style = style }};
+            _ = win_.print(&seg, .{ .row_offset = @intCast(row), .col_offset = @intCast(col.*), .wrap = .none });
+            col.* += @intCast(autil.cellWidth(win_, text));
+        }
+    }.one;
+    // Sections: workspace │ mode badge │ file/cursor │ git branch. `│`
+    // separators are drawn in every state so the row reads as a status line,
+    // not as the document's last line.
+    printStatus(win, ws_label, status_fg, status_row, &used_cells);
+    printStatus(win, " │ ", status_sep, status_row, &used_cells);
+    printStatus(win, mode_badge, status_badge, status_row, &used_cells);
+    printStatus(win, " │ ", status_sep, status_row, &used_cells);
+    printStatus(win, cursor_text, status_fg, status_row, &used_cells);
+    if (completion_marker.len > 0) printStatus(win, completion_marker, status_fg, status_row, &used_cells);
+    if (self.msg) |m| {
+        printStatus(win, "  ", status_fg, status_row, &used_cells);
+        printStatus(win, m, status_fg, status_row, &used_cells);
     }
+    if (rec.len > 0) printStatus(win, rec, status_fg, status_row, &used_cells);
+    // git branch (M3a): the design's StatusLine git section, after a
+    // separator so it never merges with a long status message.
+    if (self.git_branch) |b| {
+        printStatus(win, " │ ", status_sep, status_row, &used_cells);
+        printStatus(win, "⎇ ", status_accent, status_row, &used_cells);
+        printStatus(win, std.mem.trim(u8, b, " \t\r\n"), status_accent, status_row, &used_cells);
+    }
+
     // AI workspace status (M2a): active thread · model · status, flush right
-    // on the status bar. Kept off the left status text (and git branch);
-    // narrower terminals fall back to the compact/mini forms. Hint mode owns
-    // that same right-hand slot (HINTS · N targets · Esc cancel) and
-    // suppresses the AI block so the two indicators never share cells.
-    const ai_status_text: ?[]const u8 = if (self.hints.active) null else try self.aiStatusText(a);
-    if (ai_status_text) |full_ai_text| {
-        const avail = win.width -| used_cells -| 2;
-        var ai_text = full_ai_text;
-        var ai_cells: u32 = @intCast(autil.cellWidth(win, ai_text));
-        if (ai_cells > avail) {
-            if (try self.aiStatusTextCompact(a)) |compact| {
-                ai_text = compact;
-                ai_cells = @intCast(autil.cellWidth(win, ai_text));
+    // on the status bar, followed by an explicit dock/drawer layout cell.
+    // Hint mode owns that slot (HINTS · N targets · Esc cancel) and
+    // suppresses both so the indicators never share cells.
+    if (!self.hints.active) {
+        const layout_text: ?[]const u8 = if (self.ai.rail_open)
+            (if (self.aiLayout().mode == .docked) "dock" else "drawer")
+        else
+            null;
+        const layout_cells: u32 = if (layout_text) |text| @intCast(autil.cellWidth(win, text)) else 0;
+        const layout_reserved: u32 = if (layout_text != null) layout_cells + 3 else 0;
+        const avail = win.width -| used_cells -| 2 -| layout_reserved;
+        const ai_status_text: ?[]const u8 = try self.aiStatusText(a);
+        if (ai_status_text) |full_ai_text| {
+            var ai_text = full_ai_text;
+            var ai_cells: u32 = @intCast(autil.cellWidth(win, ai_text));
+            if (ai_cells > avail) {
+                if (try self.aiStatusTextCompact(a)) |compact| {
+                    ai_text = compact;
+                    ai_cells = @intCast(autil.cellWidth(win, ai_text));
+                }
+            }
+            if (ai_cells > avail) {
+                if (try self.aiStatusTextMini(a)) |mini| {
+                    ai_text = mini;
+                    ai_cells = @intCast(autil.cellWidth(win, ai_text));
+                }
+            }
+            if (ai_cells <= avail) {
+                const ai_status = self.ai.threads.activeStatus();
+                const ai_style: vaxis.Style = .{
+                    .fg = .{ .rgb = if (ai_status == .streaming) self.theme.accent else self.theme.fg_dim },
+                    .bg = status_bg,
+                };
+                const ai_seg = [_]vaxis.Segment{.{ .text = ai_text, .style = ai_style }};
+                _ = win.print(&ai_seg, .{
+                    .row_offset = @intCast(status_row),
+                    .col_offset = @intCast(win.width - layout_reserved - ai_cells),
+                    .wrap = .none,
+                });
             }
         }
-        if (ai_cells > avail) {
-            if (try self.aiStatusTextMini(a)) |mini| {
-                ai_text = mini;
-                ai_cells = @intCast(autil.cellWidth(win, ai_text));
+        if (layout_text) |text| {
+            if (win.width >= layout_cells + 3) {
+                const sep_col = win.width - layout_cells - 3;
+                const sep_seg = [_]vaxis.Segment{.{ .text = " │ ", .style = status_sep }};
+                _ = win.print(&sep_seg, .{
+                    .row_offset = @intCast(status_row),
+                    .col_offset = @intCast(sep_col),
+                    .wrap = .none,
+                });
+                const layout_seg = [_]vaxis.Segment{.{ .text = text, .style = status_dim }};
+                _ = win.print(&layout_seg, .{
+                    .row_offset = @intCast(status_row),
+                    .col_offset = @intCast(win.width - layout_cells),
+                    .wrap = .none,
+                });
             }
-        }
-        if (ai_cells <= avail) {
-            const ai_status = self.ai.threads.activeStatus();
-            const ai_style: vaxis.Style = .{
-                .fg = .{ .rgb = if (ai_status == .streaming) self.theme.accent else self.theme.fg_dim },
-                .bg = .{ .rgb = self.theme.bg_status },
-            };
-            const ai_seg = [_]vaxis.Segment{.{ .text = ai_text, .style = ai_style }};
-            _ = win.print(&ai_seg, .{
-                .row_offset = @intCast(height - 1),
-                .col_offset = @intCast(win.width - ai_cells),
-                .wrap = .none,
-            });
         }
     }
 

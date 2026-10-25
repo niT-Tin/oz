@@ -983,6 +983,19 @@ Narrow drawer 必须有遮罩/焦点陷阱，不能挤压编辑器到不可用�
 
 ---
 
+### 18.10 UI chrome clarity（feat/ui-chrome，2026-10-25）
+
+只改视觉层次，不改键位、行为、数据或提示目标；goldens 因布局变化显式重建。目标是让 TUI 的四个工作面（navigator / editor / rail / workbox）和底部状态区一眼可分，接近批准原型的清晰度。
+
+- **状态带**：`status_row_count` 从 1 改为 2（一行 `─` 规则 + 一行状态）。编辑器、rail、floats 的高度计算统一走该常量，因此内容不会画进状态带；编辑器与 rail 各让出一行。状态行分 `[workspace] │ [MODE] │ line/col │ ⎇ branch`，右侧 `agent … │ dock/drawer`；80 列仍走 compact/mini fallback，不横向溢出。`[MODE]` 用 accent 背景的 badge，普通行保持 bg_status。
+- **Agent Rail**：`AGENTS  N` header band（bg_status）+ workspace `name / workspace`；active thread 用 ASCII `>` + bold，非 active 状态用 `o/*/x/!`。thread list 与 workbox header、tab strip 与 body 之间各一条 `├──` rule；tabs 为 `>chat│changes N│tools│terminal`，active tab 同时有 `>`、accent 与 bg_sel（monochrome 下仍可区分）。`▥`、`●/○/◌/✖`、`▸/▾` 等易 tofu 的装饰字形不再用于 AI/nav chrome；tool card 状态图标也改为 ASCII。rail 左边界未聚焦时用 `fg_dim`（原来 `fg_faint` 太容易消失在 bg_float 里）。
+- **Navigator**：top strip 为 `╭─ files │ notes │ agents ───╮`（精确 30 cells），active tab accent + bg_sel + bold，inactive dim，`│` 明确分隔；标签起始列仍为 3/11/19，hint target 不变。Notes/Agents 的 selected row 保留 bg_sel fill；Notes 选中标记与 Agents active thread 标记改为 ASCII `>`，Agents 的组标题去掉 `▾`。
+- **Blame ghost**：仍在 editor content pane 内绘制；rail 打开时（dock 或 drawer）额外 clip 到 `rail_col - 1`，即 rail 左侧保留一个空格，不触碰 agent 列。rail/workbox 仍最后绘制，因此 ghost 永远不能覆盖 rail 文本；放不下时直接截断/丢弃，绝不画一列进 rail。
+- **性能**：规则行用 `writeCell` 写静态 `─`，状态文本使用栈 buffer，不新增普通帧堆分配；rail header count 沿用 frame arena（vaxis 在 render 前引用文本）。
+- **测试**：491 unit / 178 e2e。新增 120 dock 与 80 drawer 的 chrome e2e（header band、两条 rule、tab 分隔/active 样式、status 规则行与 section 分隔、禁止 glyph 扫描）和 blame/rail 裁剪 e2e；goldens 仅通过 `OZ_UPDATE_GOLDEN=1` 重建（header band、rule 行、active marker、status band 导致的 cell/style 变化）。
+
+---
+
 ## 19. Keyboard Hints（qutebrowser 风格，M2.6）
 
 参考：[qutebrowser quickstart](https://www.qutebrowser.org/doc/quickstart.html) 的 hint mode：按 `f` 给所有可点击目标加标签，输入标签直接触发，不需要鼠标。oz 是 TUI，没有 DOM，但所有“可点击/可聚焦”的区域（文件树行、buffer tab、agent thread、workbox tab、审批按钮）都可以注册成 target。

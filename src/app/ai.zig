@@ -1575,15 +1575,15 @@ fn cardStatusStyle(st: Styles, status: ws.ToolStatus) vaxis.Style {
 
 fn cardIcon(status: ws.ToolStatus) []const u8 {
     return switch (status) {
-        .running => "…",
-        .ok => "✓",
-        .err => "✖",
+        .running => "~",
+        .ok => "+",
+        .err => "x",
         .approval_required => "!",
-        .approved => "✓",
-        .rejected => "✖",
-        .unsupported => "–",
-        .cancelled => "◌",
-        .none => "·",
+        .approved => "+",
+        .rejected => "x",
+        .unsupported => "-",
+        .cancelled => "x",
+        .none => ".",
     };
 }
 
@@ -1782,10 +1782,10 @@ fn aiStatusLabelFor(self: *App, idx: usize) []const u8 {
 
 fn threadDot(status: Status) []const u8 {
     return switch (status) {
-        .idle => "○",
-        .streaming => "●",
-        .cancelled => "◌",
-        .err => "✖",
+        .idle => "o",
+        .streaming => "*",
+        .cancelled => "x",
+        .err => "!",
     };
 }
 
@@ -1862,7 +1862,10 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
     const rail_bg = vaxis.Color{ .rgb = t.bg_float };
     const content_w = w -| 3;
     const focused = self.ai.focus != .editor;
-    const border_color = if (focused) t.accent else t.fg_faint;
+    // The left rule is the rail's hard boundary: accent while the rail owns
+    // the keyboard, a readable dim rule otherwise (faint disappeared into
+    // bg_float on some themes/terminals).
+    const border_color = if (focused) t.accent else t.fg_dim;
     const border_style = vaxis.Style{ .fg = .{ .rgb = border_color }, .bg = rail_bg };
     const m = ws.metrics(rail_rows, self.ai.tab);
 
@@ -1902,19 +1905,37 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
     const active = self.ai.threads.activeThread();
     const active_idx = self.ai.threads.active;
 
-    // ---- header: ▥ agents  N  [+] ----
+    // ---- header band: AGENTS  N  [+] ----
     {
+        // A full-width header band separates the rail from the editor even
+        // when the rail does not own the keyboard; the count is a separate
+        // token so `AGENTS 1` is readable (and no decorative glyph is
+        // required).
+        const header_bg = vaxis.Color{ .rgb = t.bg_status };
+        const header_border_style = vaxis.Style{
+            .fg = .{ .rgb = border_color },
+            .bg = header_bg,
+        };
+        const header_label_style = vaxis.Style{
+            .fg = .{ .rgb = if (focused) t.accent else t.fg },
+            .bg = header_bg,
+            .bold = true,
+        };
+        const header_dim_style = vaxis.Style{ .fg = .{ .rgb = t.fg_dim }, .bg = header_bg };
+        const header_base_style = vaxis.Style{ .fg = .{ .rgb = t.fg }, .bg = header_bg };
         var segs = std.ArrayList(vaxis.Segment).empty;
-        try segs.append(a, .{ .text = "▥ ", .style = if (focused) st.accent else st.dim });
-        try segs.append(a, .{ .text = "agents", .style = if (focused) st.accent else st.bold });
-        try segs.append(a, .{ .text = " ", .style = st.base });
+        try segs.append(a, .{ .text = "AGENTS", .style = header_label_style });
+        try segs.append(a, .{ .text = "  ", .style = header_base_style });
+        // vaxis cells reference this slice until vx.render(), after
+        // drawAiRail has returned — the frame arena owns it like every
+        // other label on the rail.
         const count = try std.fmt.allocPrint(a, "{d}", .{self.ai.threads.items.items.len});
-        try segs.append(a, .{ .text = count, .style = st.dim });
-        var used: u32 = 2 + 6 + 1 + @as(u32, @intCast(count.len));
+        try segs.append(a, .{ .text = count, .style = header_dim_style });
+        var used: u32 = 6 + 2 + @as(u32, @intCast(count.len));
         // right-aligned "+" affordance (n / + also work from the rail).
         if (content_w >= used + 2) {
-            try segs.append(a, .{ .text = try spaces(a, content_w - used - 1), .style = .{ .bg = rail_bg } });
-            try segs.append(a, .{ .text = "+", .style = st.accent });
+            try segs.append(a, .{ .text = try spaces(a, content_w - used - 1), .style = .{ .bg = header_bg } });
+            try segs.append(a, .{ .text = "+", .style = .{ .fg = .{ .rgb = t.accent }, .bg = header_bg, .bold = true } });
             used = content_w;
             if (self.hints.collecting) {
                 self.addHintTarget(.{
@@ -1925,22 +1946,21 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
                 }, .agent_new);
             }
         }
-        try drawRailRow(win, a, m.header_row, x, w, "│", border_style, rail_bg, segs.items, used);
+        try drawRailRow(win, a, m.header_row, x, w, "│", header_border_style, header_bg, segs.items, used);
     }
 
-    // ---- workspace group + thread list ----
+    // ---- workspace group ----
     {
         var segs = std.ArrayList(vaxis.Segment).empty;
         const ws_name = self.curWsName();
-        const fit = autil.cellFitPrefix(win, ws_name, content_w);
-        try segs.append(a, .{ .text = fit.slice, .style = st.dim });
-        var used: u32 = @intCast(fit.cells);
-        const label = "workspace";
-        const lw = autil.cellWidth(win, label);
-        if (content_w >= used + lw + 1) {
-            try segs.append(a, .{ .text = try spaces(a, content_w - used - lw), .style = .{ .bg = rail_bg } });
-            try segs.append(a, .{ .text = label, .style = st.faint });
-            used = content_w;
+        const suffix = " / workspace";
+        const suffix_w: u32 = @intCast(autil.cellWidth(win, suffix));
+        const ws_fit = autil.cellFitPrefix(win, ws_name, content_w -| suffix_w);
+        try segs.append(a, .{ .text = ws_fit.slice, .style = st.dim });
+        var used: u32 = @intCast(ws_fit.cells);
+        if (content_w >= used + suffix_w) {
+            try segs.append(a, .{ .text = suffix, .style = st.faint });
+            used += suffix_w;
         }
         try drawRailRow(win, a, m.group_row, x, w, "│", border_style, rail_bg, segs.items, used);
     }
@@ -1981,9 +2001,16 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         const dot_style = threadDotStyle(st, thread.status);
         const status_text = aiStatusLabelFor(self, ti);
         const status_cells = autil.cellWidth(win, status_text);
+        // Active thread: `>` + bold in monochrome. Other rows keep an ASCII
+        // status marker so no nerd-font/geometric glyph is required.
+        const marker: []const u8 = if (attached) ">" else threadDot(thread.status);
+        const marker_style: vaxis.Style = if (attached)
+            .{ .fg = .{ .rgb = t.accent }, .bg = row_bg, .bold = true }
+        else
+            .{ .fg = dot_style.fg, .bg = row_bg };
 
         var segs = std.ArrayList(vaxis.Segment).empty;
-        try segs.append(a, .{ .text = threadDot(thread.status), .style = .{ .fg = dot_style.fg, .bg = row_bg } });
+        try segs.append(a, .{ .text = marker, .style = marker_style });
         try segs.append(a, .{ .text = " ", .style = .{ .bg = row_bg } });
         var used: u32 = 2;
         // Keep the status word when there is room; otherwise let the title
@@ -2010,13 +2037,13 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         }
     }
 
-    // ---- divider ----
+    // ---- divider: thread list | workbox ----
     {
         var rule = std.ArrayList(u8).empty;
         var rc: u32 = 0;
         while (rc < content_w) : (rc += 1) try rule.appendSlice(a, "─");
         var segs = std.ArrayList(vaxis.Segment).empty;
-        try segs.append(a, .{ .text = rule.items, .style = st.faint });
+        try segs.append(a, .{ .text = rule.items, .style = st.dim });
         try drawRailRow(win, a, m.divider_row, x, w, "├", border_style, rail_bg, segs.items, content_w);
     }
 
@@ -2041,7 +2068,11 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         try drawRailRow(win, a, m.workbox_header_row, x, w, "│", border_style, rail_bg, segs.items, used);
     }
 
-    // ---- tabs: chat / changes N / tools / terminal ----
+    // ---- tabs: >chat │ changes N │ tools │ terminal ----
+    // The active tab carries a `>` marker, accent + bold text and the
+    // selection background, so it is distinct even in monochrome. `│`
+    // separators keep the four targets from reading as one label; the
+    // compact labels leave room for the badge at 34-cell rail widths.
     {
         const changes_label = try std.fmt.allocPrint(a, "changes {d}", .{self.reviewPendingCount()});
         const Tabs = [_]struct { tab: WorkboxTab, label: []const u8 }{
@@ -2053,21 +2084,33 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         var segs = std.ArrayList(vaxis.Segment).empty;
         var used: u32 = 0;
         for (Tabs, 0..) |entry, i| {
+            const active_tab = self.ai.tab == entry.tab;
+            const label_cells: u32 = @intCast(autil.cellWidth(win, entry.label));
+            const marker_cells: u32 = if (active_tab) 1 else 0;
+            const sep_cells: u32 = if (i > 0) 1 else 0;
+            // Extremely narrow rails omit trailing tabs instead of running
+            // past the border; all tabs fit at the supported 34/38 widths.
+            if (used + sep_cells + marker_cells + label_cells > content_w) break;
             if (i > 0) {
-                try segs.append(a, .{ .text = " ", .style = .{ .bg = rail_bg } });
+                try segs.append(a, .{ .text = "│", .style = .{ .fg = .{ .rgb = t.fg_faint }, .bg = rail_bg } });
                 used += 1;
             }
-            const active_tab = self.ai.tab == entry.tab;
             const style: vaxis.Style = if (active_tab)
-                .{ .fg = .{ .rgb = t.accent }, .bg = .{ .rgb = t.bg_status }, .bold = true }
+                .{ .fg = .{ .rgb = t.accent }, .bg = .{ .rgb = t.bg_sel }, .bold = true }
             else
                 .{ .fg = .{ .rgb = t.fg_dim }, .bg = rail_bg };
-            const label_cells: u32 = @intCast(autil.cellWidth(win, entry.label));
+            const target_col = x + 2 + used;
+            if (active_tab) {
+                try segs.append(a, .{ .text = ">", .style = .{ .fg = .{ .rgb = t.accent }, .bg = rail_bg, .bold = true } });
+                used += 1;
+            }
             if (self.hints.collecting) {
+                // The active tab's `>` marker belongs to the same target as
+                // its label (the label overlay covers the marker).
                 self.addHintTarget(.{
                     .row = m.tabs_row,
-                    .col = x + 2 + used,
-                    .width = label_cells,
+                    .col = target_col,
+                    .width = label_cells + marker_cells,
                     .height = 1,
                 }, .{ .workbox_tab = entry.tab });
             }
@@ -2075,6 +2118,16 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
             used += label_cells;
         }
         try drawRailRow(win, a, m.tabs_row, x, w, "│", border_style, rail_bg, segs.items, used);
+    }
+
+    // ---- rule: tab strip | body ----
+    {
+        var rule = std.ArrayList(u8).empty;
+        var rc: u32 = 0;
+        while (rc < content_w) : (rc += 1) try rule.appendSlice(a, "─");
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        try segs.append(a, .{ .text = rule.items, .style = st.dim });
+        try drawRailRow(win, a, m.tabs_sep_row, x, w, "├", border_style, rail_bg, segs.items, content_w);
     }
 
     // ---- body ----

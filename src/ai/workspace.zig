@@ -80,6 +80,8 @@ pub const Metrics = struct {
     divider_row: u32 = 0,
     workbox_header_row: u32 = 0,
     tabs_row: u32 = 0,
+    /// Second horizontal rule: closes the tab strip and opens the body.
+    tabs_sep_row: u32 = 0,
     body_top: u32 = 0,
     body_rows: u32 = 0,
     prompt_row: ?u32 = null,
@@ -87,27 +89,38 @@ pub const Metrics = struct {
 
 pub fn metrics(rail_rows: u32, tab: WorkboxTab) Metrics {
     if (rail_rows == 0) return .{};
-    if (rail_rows < 8) {
+    if (rail_rows < 9) {
+        // Defensive geometry for terminals too short for a body. The
+        // renderer refuses to draw a rail below 8 rows; keep every row in
+        // bounds and give each section a distinct row where possible.
+        const thread_rows: u32 = @min(2, rail_rows -| 2);
+        const divider_row = @min(2 + thread_rows, rail_rows - 1);
+        const workbox_header_row = @min(divider_row + 1, rail_rows - 1);
+        const tabs_row = @min(workbox_header_row + 1, rail_rows - 1);
+        const tabs_sep_row = @min(tabs_row + 1, rail_rows - 1);
         return .{
             .rail_rows = rail_rows,
-            .thread_rows = 1,
-            .divider_row = @min(3, rail_rows - 1),
-            .workbox_header_row = @min(4, rail_rows - 1),
-            .tabs_row = @min(5, rail_rows - 1),
-            .body_top = @min(6, rail_rows),
+            .thread_rows = thread_rows,
+            .divider_row = divider_row,
+            .workbox_header_row = workbox_header_row,
+            .tabs_row = tabs_row,
+            .tabs_sep_row = tabs_sep_row,
+            .body_top = @min(tabs_sep_row + 1, rail_rows),
             .body_rows = 0,
         };
     }
     // Two fixed rows (agent header + workspace group), one divider, the
-    // workbox header and the tab row. The thread list takes roughly a
-    // third of what remains (bounded so the workbox always wins on short
-    // terminals).
-    var thread_rows = (rail_rows - 6) / 3;
-    thread_rows = @min(@max(thread_rows, 3), 8);
+    // workbox header, the tab row and its closing rule. The thread list
+    // takes roughly a third of what remains; one row is reclaimed versus
+    // the pre-chrome layout so the body keeps its starting row.
+    var thread_rows = (rail_rows - 5) / 3;
+    thread_rows = @min(@max(thread_rows, 3), 8) - 1;
+    thread_rows = @max(thread_rows, 3);
     const divider_row = 2 + thread_rows;
     const workbox_header_row = divider_row + 1;
     const tabs_row = workbox_header_row + 1;
-    const body_top = tabs_row + 1;
+    const tabs_sep_row = tabs_row + 1;
+    const body_top = tabs_sep_row + 1;
     const prompt_row: ?u32 = if (tab == .chat and rail_rows > body_top + 1) rail_rows - 1 else null;
     const body_bottom = if (prompt_row) |p| p - 1 else rail_rows - 1;
     const body_rows = if (body_bottom >= body_top) body_bottom - body_top + 1 else 0;
@@ -117,6 +130,7 @@ pub fn metrics(rail_rows: u32, tab: WorkboxTab) Metrics {
         .divider_row = divider_row,
         .workbox_header_row = workbox_header_row,
         .tabs_row = tabs_row,
+        .tabs_sep_row = tabs_sep_row,
         .body_top = body_top,
         .body_rows = body_rows,
         .prompt_row = prompt_row,
@@ -614,21 +628,27 @@ test "workspace layout: 120/110/100/90 dock, 89/80 drawer, hidden" {
 }
 
 test "workspace layout: rail metrics keep a workbox and chat prompt" {
-    const m = metrics(29, .chat);
-    try std.testing.expectEqual(@as(u32, 7), m.thread_rows);
-    try std.testing.expectEqual(@as(u32, 9), m.divider_row);
-    try std.testing.expectEqual(@as(u32, 10), m.workbox_header_row);
-    try std.testing.expectEqual(@as(u32, 11), m.tabs_row);
-    try std.testing.expectEqual(@as(u32, 28), m.prompt_row.?);
+    // 30-row terminal: the status band owns two rows (rule + status).
+    const m = metrics(28, .chat);
+    try std.testing.expectEqual(@as(u32, 6), m.thread_rows);
+    try std.testing.expectEqual(@as(u32, 8), m.divider_row);
+    try std.testing.expectEqual(@as(u32, 9), m.workbox_header_row);
+    try std.testing.expectEqual(@as(u32, 10), m.tabs_row);
+    try std.testing.expectEqual(@as(u32, 11), m.tabs_sep_row);
+    try std.testing.expectEqual(@as(u32, 12), m.body_top);
+    try std.testing.expectEqual(@as(u32, 27), m.prompt_row.?);
     try std.testing.expect(m.body_rows > 8);
 
-    const m24 = metrics(23, .chat);
-    try std.testing.expectEqual(@as(u32, 5), m24.thread_rows);
-    try std.testing.expectEqual(@as(u32, 22), m24.prompt_row.?);
+    // 24-row drawer: the body keeps its starting row and row budget.
+    const m24 = metrics(22, .chat);
+    try std.testing.expectEqual(@as(u32, 4), m24.thread_rows);
+    try std.testing.expectEqual(@as(u32, 10), m24.body_top);
+    try std.testing.expectEqual(@as(u32, 11), m24.body_rows);
+    try std.testing.expectEqual(@as(u32, 21), m24.prompt_row.?);
 
-    const changes = metrics(23, .changes);
+    const changes = metrics(22, .changes);
     try std.testing.expect(changes.prompt_row == null);
-    try std.testing.expectEqual(@as(u32, 13), changes.body_rows);
+    try std.testing.expectEqual(@as(u32, 12), changes.body_rows);
 }
 
 test "workspace focus: toggle, escape and the two rail re-entry points" {
@@ -860,13 +880,14 @@ test "property: rail metrics stay inside the rail for 0..200 rows" {
                 try std.testing.expect(m.prompt_row == null);
                 continue;
             }
-            if (rows < 8) {
+            if (rows < 9) {
                 // Defensive metrics for terminals too short to render the
                 // rail; the renderer refuses to draw below 8 rows, but the
                 // model must still be arithmetic-safe.
                 try std.testing.expect(m.divider_row < rows);
                 try std.testing.expect(m.workbox_header_row < rows);
                 try std.testing.expect(m.tabs_row < rows);
+                try std.testing.expect(m.tabs_sep_row < rows);
                 try std.testing.expect(m.body_top <= rows);
                 try std.testing.expectEqual(@as(u32, 0), m.body_rows);
                 try std.testing.expect(m.prompt_row == null);
@@ -877,7 +898,8 @@ test "property: rail metrics stay inside the rail for 0..200 rows" {
             try std.testing.expectEqual(m.thread_top + m.thread_rows, m.divider_row);
             try std.testing.expectEqual(m.divider_row + 1, m.workbox_header_row);
             try std.testing.expectEqual(m.workbox_header_row + 1, m.tabs_row);
-            try std.testing.expectEqual(m.tabs_row + 1, m.body_top);
+            try std.testing.expectEqual(m.tabs_row + 1, m.tabs_sep_row);
+            try std.testing.expectEqual(m.tabs_sep_row + 1, m.body_top);
             try std.testing.expect(m.body_top <= m.rail_rows);
             try std.testing.expect(m.body_top + m.body_rows <= m.rail_rows);
             if (m.prompt_row) |p| {

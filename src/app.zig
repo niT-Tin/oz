@@ -41,7 +41,10 @@ const gitPreviewLineCount = git_job.gitPreviewLineCount;
 /// positions the cursor/ghost/menu must use the same value or columns drift.
 pub const tab_width: u32 = 4;
 
-pub const status_row_count: u32 = 1;
+/// Bottom chrome rows: one separator rule + the status line. Every layout
+/// (editor rows, rail rows, floats) reserves both so no content paints over
+/// the status boundary.
+pub const status_row_count: u32 = 2;
 
 /// Current-line blame CursorHold delay (ms) — nvim updatetime-style; the
 /// ghost appears this long after the cursor settles (<leader>tb).
@@ -1886,6 +1889,7 @@ pub const App = struct {
     pub const hoverCodeLineSegs = @import("app/render.zig").hoverCodeLineSegs;
     pub const hoverLineSegs = @import("app/render.zig").hoverLineSegs;
     pub const drawRichPopup = @import("app/render.zig").drawRichPopup;
+    pub const drawStatusChrome = @import("app/render.zig").drawStatusChrome;
     pub const render = @import("app/render.zig").render;
     pub const blameHoldActive = @import("app/render.zig").blameHoldActive;
     pub const gitHoldActive = @import("app/render.zig").gitHoldActive;
