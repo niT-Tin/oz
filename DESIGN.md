@@ -985,14 +985,24 @@ Narrow drawer 必须有遮罩/焦点陷阱，不能挤压编辑器到不可用�
 
 ### 18.10 UI chrome clarity（feat/ui-chrome，2026-10-25）
 
-只改视觉层次，不改键位、行为、数据或提示目标；goldens 因布局变化显式重建。目标是让 TUI 的四个工作面（navigator / editor / rail / workbox）和底部状态区一眼可分，接近批准原型的清晰度。
+只改视觉层次，不改键位、行为、数据或提示目标；goldens 因布局变化显式重建。目标是让 TUI 的四个工作面（navigator / editor / rail / workbox）和底部状态区一眼可分，接近批准原型的清晰度。active tab / separator 的具体颜色随后在 §18.10.1 全部主题化，本节中写死的 accent/fg_dim 描述由该节取代。
 
 - **状态带**：`status_row_count` 从 1 改为 2（一行 `─` 规则 + 一行状态）。编辑器、rail、floats 的高度计算统一走该常量，因此内容不会画进状态带；编辑器与 rail 各让出一行。状态行分 `[workspace] │ [MODE] │ line/col │ ⎇ branch`，右侧 `agent … │ dock/drawer`；80 列仍走 compact/mini fallback，不横向溢出。`[MODE]` 用 accent 背景的 badge，普通行保持 bg_status。
 - **Agent Rail**：`AGENTS  N` header band（bg_status）+ workspace `name / workspace`；active thread 用 ASCII `>` + bold，非 active 状态用 `o/*/x/!`。thread list 与 workbox header、tab strip 与 body 之间各一条 `├──` rule；active tab 同时有 `>`、accent 与 bg_sel（monochrome 下仍可区分）。38-cell rail 的 tabs 使用带呼吸感的 `>chat│ changes N │ tools │ terminal`（35 cells 内精确放下），34-cell rail（100 dock / 80 drawer）继续用紧凑 `>chat│changes N│tools│terminal`；hint target 随 label 起点移动。rail 左侧固定留 1 列空白 gutter：dock 模式不计入 editor 宽度，drawer 模式在 editor 之后覆盖最后一列，因此 text/blame 均不触碰 `│`。`▥`、`●/○/◌/✖`、`▸/▾` 等易 tofu 的装饰字形不再用于 AI/nav chrome；tool card 状态图标也改为 ASCII。rail 左边界未聚焦时用 `fg_dim`（原来 `fg_faint` 太容易消失在 bg_float 里）。
 - **Navigator**：top strip 为 `╭─ files │ notes │ agents ───╮`（精确 30 cells），active tab accent + bg_sel + bold，inactive dim，`│` 明确分隔；标签起始列仍为 3/11/19，hint target 不变。box 与 editor 之间固定 1 列空白 gutter（`contentCol()` 从 30 变为 31），editor text/cursor/tab 都不再贴住 `╮`。Notes/Agents 的 selected row 保留 bg_sel fill；Notes 选中标记与 Agents active thread 标记改为 ASCII `>`，Agents 的组标题去掉 `▾`。
 - **Blame ghost**：仍在 editor content pane 内绘制；rail 打开时（dock 或 drawer）额外 clip 到 `rail_col - rail_gutter`，即 rail 前固定保留一个空格，不触碰 agent 列。rail/workbox 仍最后绘制，因此 ghost 永远不能覆盖 rail 文本；放不下时直接截断/丢弃，绝不画一列进 rail。
 - **性能**：规则行用 `writeCell` 写静态 `─`，状态文本使用栈 buffer，不新增普通帧堆分配；rail header count 沿用 frame arena（vaxis 在 render 前引用文本）。
-- **测试**：491 unit / 178 e2e。新增 120 dock 与 80 drawer 的 chrome e2e（header band、两条 rule、tab 分隔/active 样式、status 规则行与 section 分隔、禁止 glyph 扫描、nav/rail 空白 gutter）和 blame/rail 裁剪 e2e；goldens 仅通过 `OZ_UPDATE_GOLDEN=1` 重建（最终 gutter 轮只改 120 dock 的 tab 行：38-cell rail 的 separator 呼吸空间；80 drawer 的短行从未占用新 gutter，故 cell 不变）。
+- **测试**：491 unit / 178 e2e（主题化后为 493 unit / 179 e2e，见 §18.10.1）。新增 120 dock 与 80 drawer 的 chrome e2e（header band、两条 rule、tab 分隔/active 样式、status 规则行与 section 分隔、禁止 glyph 扫描、nav/rail 空白 gutter）和 blame/rail 裁剪 e2e；goldens 仅通过 `OZ_UPDATE_GOLDEN=1` 重建（最终 gutter 轮只改 120 dock 的 tab 行：38-cell rail 的 separator 呼吸空间；80 drawer 的短行从未占用新 gutter，故 cell 不变）。
+
+#### 18.10.1 Theme-aware chrome（feat/theme-chrome，2026-10-25）
+
+用户反馈 active tab 与部分分隔线在所有主题下都读成同一种灰色。本节把 active tab / rule / panel border 的颜色从 renderer 里零散的 `theme.*` 取值提升为 `src/app/chrome.zig` 的纯风格函数，navigator、buffer tab bar、workbox 共用，避免三处漂移。
+
+- **active tab**（navigator / buffer / workbox）：`bg_sel` 软选择底 + `fg` 加粗文字 + `accent_alt` 单下划线（SGR 4 + 58 真彩色，等价 demo 的蓝色 inset underline）；workbox 的 `>` marker 与 active buffer icon 同用 `accent_alt`。不是灰色，也不是整块饱和 accent 填充；monochrome 下仍靠 bold + `>` + underline 区分。catppuccin-latte / flexoki-light 等浅色主题同样成立（单测检查 `fg`/`bg_sel` 对比度 ≥3:1，16 个主题实测最低 3.61:1，即 catppuccin-frappe）。
+- **separators / rules**：`separatorStyle(theme, emphasis)` 统一取 `accent_alt`：minor（navigator tab `│`、workbox tab `│`、status section `│`）加 `.dim=true`；major（workbox 两条 `├──` rule、status 顶部通栏 `─`）保持全亮。panel border 走 `panelBorderStyle(theme, focused)`：未聚焦 `win_sep`，聚焦 `win_sep_active`（主题 accent），navigator 与 rail 一致。
+- **active thread row**：`>` marker 使用 `accent_alt`；prompt/rail 聚焦时整行仍是 `bg_sel`，否则落在 `bg_float` rail 底上，不再只有灰色。
+- **scope/性能**：只映射样式，无键位、行为、hint target 或布局改动；helper 返回 `vaxis.Style` 值，无每帧分配。`fg_faint` 仅保留给非 active 的次要文字。
+- **测试**：493 unit / 179 e2e。单测覆盖全部 16 个主题（active tab = `bg_sel`/`fg`/bold/`accent_alt` underline；minor/major/panel 均非 `fg_faint` 且跨主题不同；浅色主题有效）；新增 `ui chrome: theme matrix ...` e2e，用临时 HOME + `~/.cache/oz/theme`（生产 `loadTheme` seam）分别加载 kanagawa-wave / catppuccin-mocha / flexoki-light，逐 cell 校验 nav/buffer/workbox active tab 的 fg/bg/underline、tab/rule/status 分隔线的 accent、focused rail/navigator border，并断言三种主题的实际渲染色两两不同。goldens 通过 `OZ_UPDATE_GOLDEN=1` 重建：只有 fg/bg style run 变化（active buffer tab 底色、workbox marker/underline、rule/status 颜色），row text 未变。
 
 ---
 

@@ -17,8 +17,8 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-Current counts on `feat/ui-chrome` (M3b2 + UI chrome): **491 unit tests**
-and **178 e2e tests**. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
+Current counts on `feat/theme-chrome` (M3b2 + UI chrome + theme chrome):
+**493 unit tests** and **179 e2e tests**. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
 `.verify/verify.json` (schema version 1, git commit/dirty flag, exact command
 strings, timestamps, exit codes, log SHA-256s, parsed pass/fail counts). It
 runs every command even after a failure and exits non-zero if any command
@@ -48,6 +48,9 @@ replaying a cached successful run.
 `test/frame.zig` provides reusable assertions over the reconstructed grid:
 
 - `expectCellBg` / `expectRegionBg` / `expectRegionFg` / `expectRegionPainted`
+- `expectCellUl` plus `cellUl` / `cellUnderlined` — the ANSI parser now
+  records SGR 4 and SGR 58 (underline color), so active-tab underlines can be
+  asserted as theme colors instead of being inferred from fg/bg
 - `expectBorderBox` — validates corners and both vertical borders (optionally
   the border foreground), replacing copied popup-geometry checks
 - `expectTextInRegion` — cell-boundary-aware text search inside a rectangle
@@ -138,6 +141,12 @@ at 120x30 dock and 80x24 drawer plus the scenario matrix:
   the rail's `│`, and drawer cursors under the panel are hidden);
 - the bottom status band: full-width rule row, `[MODE]` badge with accent
   background, `│` section separators, and the `dock`/`drawer` layout cell;
+- the theme matrix (`ui chrome: theme matrix ...`): three real starts with a
+  fresh `HOME` and a written `~/.cache/oz/theme` (kanagawa-wave,
+  catppuccin-mocha, flexoki-light), asserting the navigator/buffer/workbox
+  active tabs' fg/bg/underline, the `>` markers, the minor/major separator
+  colors, the status top rule, and focused vs inactive panel borders — plus a
+  cross-theme check that those rendered samples are pairwise different;
 - a scan for tofu-prone chrome glyphs (`▥ ● ○ ◌ ✖ ▸ ▾`) in the rail and
   navigator regions; and
 - a real-git blame test at 120 dock and 80 drawer: the ghost is truncated one
@@ -146,8 +155,11 @@ at 120x30 dock and 80x24 drawer plus the scenario matrix:
 
 The goldens changed only because the chrome moved rows/styles: header band,
 active markers, the two rules, the status band, and the 38-cell tab separator
-spacing in the final gutter pass. They were regenerated with
-`OZ_UPDATE_GOLDEN=1` and reviewed cell-by-cell.
+spacing in the final gutter pass. The theme-chrome pass changed style runs
+only: active buffer tab `bg_sel`, workbox marker/label underline and marker
+background, `accent_alt` rules/tab separators, status top rule and section
+separators, and the active thread marker. Row text is unchanged. They were
+regenerated with `OZ_UPDATE_GOLDEN=1` and reviewed cell-by-cell.
 
 ### Notes test seam (`OZ_NOTES_DIR`)
 
