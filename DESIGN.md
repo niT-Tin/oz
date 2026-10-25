@@ -872,3 +872,77 @@ Narrow drawer 必须有遮罩/焦点陷阱，不能挤压编辑器到不可用�
 
 - `zig build test`：343/343 通过。
 - `zig build e2e`：136 个 pty 测试全部通过（exit 0，无失败输出）。
+
+---
+
+## 19. Keyboard Hints（qutebrowser 风格，M2.6）
+
+参考：[qutebrowser quickstart](https://www.qutebrowser.org/doc/quickstart.html) 的 hint mode：按 `f` 给所有可点击目标加标签，输入标签直接触发，不需要鼠标。oz 是 TUI，没有 DOM，但所有“可点击/可聚焦”的区域（文件树行、buffer tab、agent thread、workbox tab、审批按钮）都可以注册成 target。
+
+### 19.1 为什么需要
+
+AI workspace 把目标分散到 navigator、editor、agent rail、workbox 四处。只用 `j/k` + `Tab` 到达某个具体 tab/thread/approval 的路径太长；hint mode 把“找到目标”变成一次视觉扫描 + 1–2 个字符，适合键盘用户。
+
+### 19.2 键位（避免与 vim 冲突）
+
+- `<leader>j`：进入 **primary hint mode**（jump）。
+- `<leader>J`：进入 **secondary hint mode**（后续：在新 split/新 thread 打开；M2.6b）。
+- 不占用 plain `f`：normal mode 的 `f{char}` 是 vim 查找，必须保留。
+- hint mode 内：可打印标签字符输入、Backspace 删除、Esc 取消；不进入 insert/command/picker。
+- 激活后当前模式/焦点不变；动作完成后回到原焦点（除非动作本身要求切换）。
+- 后续可加 `gi` 风格“聚焦第一个输入框”，但 M2.6a 先用 `<leader>a` / `<Ctrl-w>a`。
+
+### 19.3 标签算法
+
+- 字符集 `asdfghjkl`（9 个）：1 个目标 1 字符；10–81 个目标 2 字符；82–729 个目标 3 字符；超过 729 截断并显示 `+N more`。
+- **固定长度**，不做“唯一前缀自动触发”，避免输入到一半误触；输入长度 == label 长度时执行。
+- 目标按 **从上到下、从左到右** 的屏幕位置排序；同位置按注册顺序，保证确定性。
+- 标签唯一；前缀输入只高亮匹配目标；无匹配时清空输入并 flash。
+- 目标不可见/被裁剪时不注册；注册 rect 必须 clamp 到屏幕内。
+- 标签绘制在 target rect 的左上角（覆盖 1–3 个 cell），使用 accent bg + 深色 fg；不做半透明。
+
+### 19.4 Target 注册与动作
+
+新增纯模块 `src/app/hints.zig`：
+
+```zig
+pub const Action = union(enum) {
+    filetree_select: usize,
+    filetree_activate: usize,
+    buffer_select: usize,
+    agent_thread_select: usize,
+    workbox_tab: WorkboxTab,
+    agent_new,
+    // M2.6b: change_accept/reject, tool_approve/deny, ...
+};
+
+pub const Target = struct { rect: Rect, action: Action };
+```
+
+- `Hints.beginFrame()`：hint mode 激活时清空；普通帧零开销。
+- 各渲染函数在绘制目标时调用 `self.hints.add(rect, action)`。
+- 渲染最后 `drawOverlay()`：计算/绘制标签、当前前缀高亮。
+- 输入路由在 `handleKey` 最前（在 macro/picker/editor 之前）；动作由 App 的 `execHintAction` 映射到现有方法，不复制业务逻辑。
+- 初始 target：文件树行、buffer tab、agent thread 行、workbox tab、`+` 新建线程、navigator tab（M2b 后）。
+- 审批/工具卡片在 M3 注册同一 API，不另造点击系统。
+
+### 19.5 性能
+
+- 只有 hint mode 激活的帧才收集 target；普通编辑/流式帧不增加 O(n) 以上的固定开销。
+- 固定容量数组（例如 128 targets），不每帧分配；标签在栈上/复用 buffer 生成。
+- overlay 绘制 O(targets)，最后一遍，不触发额外 layout pass。
+- 目标注册使用已有 Rect，不做 DOM/树遍历；不确定/离屏目标直接跳过。
+- 输入每次最多触发一次 render；流式 AI 仍可继续 drain，不阻塞。
+
+### 19.6 里程碑
+
+- **M2.6a**：`<leader>j`、标签生成、tint 覆盖层、文件树/buffer/agent/workbox tab 的目标与动作、Esc/Backspace、单元 + e2e + golden。
+- **M2.6b**：`<leader>J` secondary actions（split 打开、新 thread）、approval/diff/tool 按钮、`gi` 聚焦输入、目标优先级/去重。
+- **M3**：工具卡片、审批、metrics 的按钮自动注册为 hint target；不引入第二套键盘导航。
+
+### 19.7 测试
+
+- 单元：0/1/9/10/81/82 targets 的标签长度/唯一性/顺序；前缀匹配/回退/无效；动作 payload；rect clamp；容量截断。
+- e2e：120 dock 打开 hint mode，断言覆盖标签、输入文件树标签打开/展开、输入 buffer tab 标签切换、Esc 取消无副作用；80 drawer 输入 workbox/agent 标签；标签不越界、不覆盖 status bar；普通 `f` 仍是 find-char。
+- 新增 required scenario tag `@hints`；golden 增加 `hints-120x30`（可选）。
+- 性能：微基准只测纯标签生成/匹配（固定 128 targets），不在 e2e 中用墙钟断言。
