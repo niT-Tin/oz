@@ -539,6 +539,7 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
             },
             'o' => return emitAction(state, .document_outline), // <leader>o outline
             'a' => return emitAction(state, .ai_toggle), // <leader>a AI chat
+            'i' => return emitAction(state, .inline_edit), // <leader>i inline edit
             'j' => return emitAction(state, .hint_mode), // <leader>j hint mode
             'h' => {
                 state.pending_leader_h = true; // <leader>h — git hunk family
@@ -937,6 +938,7 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .term_bottom => emitAction(state, .term_bottom),
         .term_right => emitAction(state, .term_right),
         .ai_toggle => emitAction(state, .ai_toggle),
+        .inline_edit => emitAction(state, .inline_edit),
         .next_buffer => emitAction(state, .next_buffer),
         .prev_buffer => emitAction(state, .prev_buffer),
         .leader => blk: {

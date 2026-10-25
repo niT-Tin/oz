@@ -341,6 +341,10 @@ fn handleAiRailKey(self: *App, key: vaxis.Key) !void {
         self.ai.rail_pending_leader = true;
         return;
     }
+    // Changes tab with a pending inline edit: a/Enter approve, r/d reject,
+    // j/k scroll the cached diff. These consume the tab-switch keys only
+    // while a review is on screen (documented in README/DESIGN).
+    if (try self.handleInlineChangesKey(key)) return;
     switch (ai.panel.classifyRail(key)) {
         .up => moveThreadCursor(self, -1),
         .down => moveThreadCursor(self, 1),
@@ -1138,11 +1142,12 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         try drawRailRow(win, a, m.workbox_header_row, x, w, "│", border_style, rail_bg, segs.items, used);
     }
 
-    // ---- tabs: chat / changes 0 / tools / terminal ----
+    // ---- tabs: chat / changes N / tools / terminal ----
     {
+        const changes_label = try std.fmt.allocPrint(a, "changes {d}", .{self.inlinePendingCount()});
         const Tabs = [_]struct { tab: WorkboxTab, label: []const u8 }{
             .{ .tab = .chat, .label = "chat" },
-            .{ .tab = .changes, .label = "changes 0" },
+            .{ .tab = .changes, .label = changes_label },
             .{ .tab = .tools, .label = "tools" },
             .{ .tab = .terminal, .label = "terminal" },
         };
@@ -1178,9 +1183,13 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         switch (self.ai.tab) {
             .chat => try drawChatBody(self, a, win, st, x, w, border_style, rail_bg, &m, active),
             .changes => {
-                try drawRailTextRow(self, win, a, m.body_top, x, w, border_style, rail_bg, "no pending changes", st.dim);
-                if (m.body_rows > 2) {
-                    try drawRailTextRow(self, win, a, m.body_top + 2, x, w, border_style, rail_bg, "edits arrive in M2b", st.faint);
+                if (self.inlinePendingCount() > 0) {
+                    try self.drawInlineChanges(a, win, x, w, m.body_top, m.body_rows, border_style, rail_bg);
+                } else {
+                    try drawRailTextRow(self, win, a, m.body_top, x, w, border_style, rail_bg, "no pending changes", st.dim);
+                    if (m.body_rows > 2) {
+                        try drawRailTextRow(self, win, a, m.body_top + 2, x, w, border_style, rail_bg, "select lines · <leader>i", st.faint);
+                    }
                 }
             },
             .tools => {

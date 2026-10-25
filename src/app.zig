@@ -24,6 +24,7 @@ const autil = @import("app/util.zig");
 const git_job = @import("app/git_job.zig");
 const app_ai = @import("app/ai.zig");
 const app_hints = @import("app/hints.zig");
+const app_inline = @import("app/inline_ui.zig");
 
 const GitJobKind = git_job.GitJobKind;
 const GitApplyOp = git_job.GitApplyOp;
@@ -679,6 +680,8 @@ pub const App = struct {
     /// status). Not per workspace: the thread survives panel close and
     /// workspace switches.
     ai: app_ai.Session = .{},
+    /// M2b2 inline assistant: prompt, dedicated stream client, pending diff.
+    inline_edit: app_inline.Session = .{},
 
     // ---- M2.6a keyboard hints (<leader>j) ----
     /// Modal target-selection state (DESIGN.md §19). Pure value: fixed
@@ -1417,6 +1420,7 @@ pub const App = struct {
         // Stop and join the AI stream worker before the io/env it borrowed
         // and the vaxis loop it renders into go away.
         self.deinitAi();
+        self.deinitInline();
         self.vx.deinit(self.alloc, self.tty.writer());
         self.tty.deinit();
         self.alloc.free(self.tty_buffer);
@@ -1826,6 +1830,23 @@ pub const App = struct {
     pub const AiThread = app_ai.AgentThread;
     pub const AiFocus = app_ai.Focus;
     pub const AiWorkboxTab = app_ai.WorkboxTab;
+    // ---- inline assistant (M2b2) → src/app/inline_ui.zig ----
+    pub const inlinePromptOpen = app_inline.inlinePromptOpen;
+    pub const inlinePendingCount = app_inline.inlinePendingCount;
+    pub const inlineStreaming = app_inline.inlineStreaming;
+    pub const deinitInline = app_inline.deinitInline;
+    pub const startInlineEdit = app_inline.startInlineEdit;
+    pub const handleInlineKey = app_inline.handleInlineKey;
+    pub const inlinePaste = app_inline.inlinePaste;
+    pub const submitInlineEdit = app_inline.submitInlineEdit;
+    pub const inlineCancel = app_inline.inlineCancel;
+    pub const drainInline = app_inline.drainInline;
+    pub const inlineApprove = app_inline.inlineApprove;
+    pub const inlineReject = app_inline.inlineReject;
+    pub const handleInlineChangesKey = app_inline.handleInlineChangesKey;
+    pub const drawInlinePrompt = app_inline.drawInlinePrompt;
+    pub const drawInlineChanges = app_inline.drawInlineChanges;
+    pub const InlineSession = app_inline.Session;
     // ---- render → src/app/render.zig ----
     pub const tabBarRows = @import("app/render.zig").tabBarRows;
     pub const contentTop = @import("app/render.zig").contentTop;

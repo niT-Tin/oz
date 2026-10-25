@@ -35,7 +35,7 @@ replaying a cached successful run.
 
 | Layer | What it covers | Where |
 |---|---|---|
-| **Model/unit (L1)** | Pure logic: piece table, motions, keymaps, SSE/OpenAI config parsing, AI workspace layout/focus/thread model, navigator tab model, note store (paths/titles/sorting/creation) | `src/**/*.zig` `test` blocks, aggregated by `src/tests.zig` |
+| **Model/unit (L1)** | Pure logic: piece table, motions, keymaps, SSE/OpenAI config parsing, AI workspace layout/focus/thread model, navigator tab model, note store (paths/titles/sorting/creation), inline selection mapping/fences/diff/pending policy | `src/**/*.zig` `test` blocks, aggregated by `src/tests.zig` |
 | **Protocol fixtures** | SSE chunking, request JSON, config env parsing, AI client cancellation/error paths; mock LSP JSON-RPC | `src/ai/sse.zig`, `src/ai/openai.zig`, `src/ai/config.zig`, `src/ai/client.zig`, mock LSP tests |
 | **Semantic frames (L3)** | Real `oz` binary in a pty; ANSI stream reconstructed into a cell grid; assertions on regions, borders, text, overlap, overflow | `test/e2e.zig` + `test/frame.zig` |
 | **Scenario matrix** | Data-driven pairwise matrix over terminal widths, filetree, and AI rail states; fresh pty per scenario; tags enforced | `test/e2e.zig` (`scenario_matrix`) |
@@ -80,8 +80,8 @@ fixture note; the navigator box is located without its title text (hint labels
 intentionally cover the tab words).
 
 Scenario tags: `@layout @ai @filetree @stream @hints @navigator @notes
-@80col @100col @120col @drawer @docked`. A new feature adds its tag here and
-to at least one scenario.
+@inline @80col @100col @120col @drawer @docked`. A new feature adds its tag
+here and to at least one scenario.
 
 Every scenario must carry tags; `required_scenario_tags` is the declared
 feature set. A test fails with `UncoveredScenarioTag` if a declared tag has
@@ -184,6 +184,7 @@ and the editor stays usable.
 | Keyboard hints (labels, status, target actions, Esc) | L1 pure model (`src/app/hints.zig`) + L3 `hints:` tests + `@hints` matrix scenarios |
 | Navigator tabs, notes list/create/save/reopen, agents attach | L1 (`src/app/navigator.zig`, `src/app/note_store.zig`) + L3 `navigator:` tests + `@navigator`/`@notes` matrix scenarios |
 | Notes path fallback/error handling | L1 resolution/creation tests + L3 unavailable-dir e2e (`OZ_NOTES_DIR=/dev/null/notes`) |
+| Inline assistant (selection→prompt→stream→Changes diff→Approve/Reject, stale, cancel, 80-col, hints) | L1 `src/app/inline.zig` + L3 `inline:` tests + `@inline` scenario |
 | Mock LSP protocol | L4 mock server e2e |
 | Deterministic build/test run | `tools/verify.sh` + CI |
 
@@ -205,6 +206,13 @@ Known gaps / deliberate limitations:
 - Notes have no delete/rename and no directory watch: the list is refreshed
   only on Notes-tab entry, create, `:w` of a note, or `r`. Tests assert those
   explicit refresh points, not per-frame scans.
+- Inline edit has one pending replacement and one live inline stream; there is
+  no multi-file queue, word-level diff, hunk folding or soft-wrapped diff line.
+  The diff is a line-level LCS capped at 400 lines per side (larger selections
+  use an accurate all-removed/all-added fallback), computed once on completion.
+  Approval is revision/path/range checked; after a workspace switch the pending
+  diff has no matching buffer and must be rejected (safe failure, never apply).
+  There is no auto-save: approve only edits the buffer.
 - The navigator Agents tab is a view of the same session thread model; it is
   not persisted and is covered through that model's existing tests plus one
   attach/switch e2e, not a second state machine.

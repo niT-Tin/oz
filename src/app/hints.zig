@@ -148,6 +148,10 @@ pub const Action = union(enum) {
     navigator_tab: NavigatorTab,
     /// Open the note at this index in the cached Notes list (Enter semantics).
     note_open: usize,
+    /// Approve the pending inline edit (same path as `a`/Enter in Changes).
+    inline_approve,
+    /// Reject the pending inline edit (same path as `r`/`d` in Changes).
+    inline_reject,
 };
 
 pub const Target = struct {

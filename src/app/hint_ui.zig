@@ -169,5 +169,7 @@ pub fn execHintAction(self: *App, action: hints.Action) !void {
         .note_open => |idx| {
             try self.openNoteAt(idx);
         },
+        .inline_approve => try self.inlineApprove(),
+        .inline_reject => self.inlineReject(),
     }
 }

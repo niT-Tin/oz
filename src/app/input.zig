@@ -27,6 +27,15 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
         return;
     }
 
+    // Inline edit prompt (M2b2): while the compact float owns the keyboard,
+    // every key is prompt input — never an editor shortcut or leader
+    // sequence. Placed before the terminal/AI/editor dispatch for the same
+    // modality reason as hint mode.
+    if (self.inlinePromptOpen()) {
+        try self.handleInlineKey(key);
+        return;
+    }
+
     // Terminal focus first: every key belongs to the child (Esc /
     // Alt+r/w/e are intercepted inside handleTerminalKey).
     if (term.supported) {

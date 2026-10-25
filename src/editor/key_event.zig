@@ -158,6 +158,8 @@ pub const ActionId = enum {
     ai_toggle, // <leader>a — toggle the AI chat panel
     // M2.6a keyboard hints (DESIGN.md §19)
     hint_mode, // <leader>j — qutebrowser-style hint mode
+    // M2b2 inline assistant
+    inline_edit, // <leader>i — edit the visual selection via an inline prompt
     // keyboard macros (vim q/@, registers a-z). q starts recording, a bare
     // q stops it (the stop key is intercepted by the caller — see
     // App.handleKey — so the state machine only ever arms the record

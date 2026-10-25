@@ -2491,6 +2491,9 @@ pub fn render(self: *App) !void {
         // places the cursor only when the rail/prompt owns focus; otherwise
         // the dashboard's recent-row cursor stays visible).
         if (self.ai.rail_open) try self.drawAiRail(a, win);
+        // M2b2 inline prompt floats above the rail; hint labels remain the
+        // topmost overlay below.
+        if (self.inlinePromptOpen()) try self.drawInlinePrompt(a, win);
         // M2.6a: labels + status indicator are the topmost layer, and must be
         // drawn after rail/filetree/dashboard before the frame is flushed.
         try self.drawHintOverlay(a, win);
@@ -2602,6 +2605,10 @@ pub fn render(self: *App) !void {
     // so it covers exactly its reserved cells. Pickers/hovers below are
     // genuine modal overlays and may draw above it.
     if (self.ai.rail_open) try self.drawAiRail(a, win);
+
+    // Inline edit prompt (M2b2): a compact centered float above the rail and
+    // editor, below the hint overlay. It owns a beam cursor while open.
+    if (self.inlinePromptOpen()) try self.drawInlinePrompt(a, win);
 
     // fuzzy picker overlay (telescope/snacks style: a solid bg_float
     // floating window with a border, a title and an in-panel input row,
@@ -3529,7 +3536,9 @@ pub fn render(self: *App) !void {
     }
     // cursor position — drawAiRail already placed the prompt/thread cursor
     // when the rail or prompt owns focus; otherwise the editor cursor wins.
-    if (self.ai.rail_open and self.ai.focus != .editor) {
+    if (self.inlinePromptOpen()) {
+        // cursor was placed by drawInlinePrompt
+    } else if (self.ai.rail_open and self.ai.focus != .editor) {
         // rail cursor was set by drawAiRail
     } else if (self.filetree_active and self.focus == .navigator) {
         // The navigator's selected row depends on the active tab (tree row,
@@ -3650,6 +3659,9 @@ pub fn run(self: *App) !void {
         // renders, like the LSP/git slots above. Repaint immediately so
         // tokens appear incrementally.
         const ai_ready = self.drainAi() catch false;
+        // Inline assistant stream (M2b2): dedicated client, never a chat
+        // thread. Repaint on deltas/completion/errors.
+        const inline_ready = self.drainInline() catch false;
         // A finished async LSP attach installs its client (and opens the
         // document) — render so diagnostics/inlay requests can start.
         const lsp_ready = self.finishLspStart();
@@ -3688,7 +3700,7 @@ pub fn run(self: *App) !void {
                 }
             }
         }
-        if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready or lsp_ready or term_ready or ai_ready) {
+        if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready or lsp_ready or term_ready or ai_ready or inline_ready) {
             try self.render();
             last_render_ms = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
             continue;
@@ -3745,7 +3757,7 @@ pub fn run(self: *App) !void {
         // animation's last spread) and the loop would block forever
         // without ever drawing it. Force that one render.
         var poll_transition = false;
-        if (self.scopeAnimActive() or self.blameHoldActive() or self.gitHoldActive() or self.aiStreaming() or (term.supported and self.term_pane != null)) {
+        if (self.scopeAnimActive() or self.blameHoldActive() or self.gitHoldActive() or self.aiStreaming() or self.inlineStreaming() or (term.supported and self.term_pane != null)) {
             std.Io.sleep(self.io, .fromMilliseconds(1), .real) catch {};
             self.poll_mode_active = true;
         } else if (self.poll_mode_active) {
@@ -3790,6 +3802,11 @@ pub fn run(self: *App) !void {
                     if (!self.pasting) continue;
                     self.pasting = false;
                     if (term_focused) continue; // child got the keys already
+                    if (self.inlinePromptOpen()) {
+                        try self.inlinePaste(self.paste_buf.items);
+                        self.paste_buf.clearRetainingCapacity();
+                        continue;
+                    }
                     if (self.ai.rail_open and self.ai.focus != .editor) {
                         if (self.ai.focus == .prompt) try self.aiPaste(self.paste_buf.items);
                         self.paste_buf.clearRetainingCapacity();
@@ -3818,7 +3835,9 @@ pub fn run(self: *App) !void {
                             }
                         }
                     }
-                    if (self.ai.rail_open and self.ai.focus != .editor) {
+                    if (self.inlinePromptOpen()) {
+                        try self.inlinePaste(text);
+                    } else if (self.ai.rail_open and self.ai.focus != .editor) {
                         try self.aiPaste(text);
                     } else if (self.state.mode == .insert) {
                         if (self.mc_active) try self.mcInsertText(text) else try self.insertText(text);

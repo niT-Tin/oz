@@ -802,7 +802,7 @@ Narrow drawer 必须有遮罩/焦点陷阱，不能挤压编辑器到不可用�
 
 - **M2a（layout shell，已完成）**：右侧 dock rail / narrow drawer；线程模型与 thread rail；workbox Chat + Changes（空状态）+ Tools/Terminal 诚实占位；现有 `<leader>a` 改为打开/聚焦 rail；保留 M1 streaming/cancel/error。实现状态见 §18.7。
 - **M2b1（navigator + notes，已完成，2026-10-25）**：左侧 navigator 三 tab（files/notes/agents）、真实 note 文件 + 普通 buffer、Notes 列表、Agents 真实线程视图、tab/行 hint 目标；实现状态见 §18.8。
-- **M2b2（后续）**：visual 选区 inline assistant；diff float；Approve/Reject + undo。
+- **M2b2（已完成，2026-10-25）**：visual 选区 inline assistant；紧凑 prompt；真实 diff；Changes 中显式 Approve/Reject + 单 undo group；`<leader>i`、hint 目标与 80 列适配。实现状态见 §18.9。
 - **M3a（tools）**：tool protocol、权限确认、tool cards、read/list/grep/edit/apply_patch；agent loop。
 - **M3b（metrics）**：per-tool count/avg/success/fail；最近 N 次耗时 ring buffer；braille/线条折线图；窄屏 sparkline fallback。
 
@@ -929,6 +929,60 @@ Narrow drawer 必须有遮罩/焦点陷阱，不能挤压编辑器到不可用�
 
 ---
 
+### 18.9 M2b2 实现状态（inline assistant + pending diff，2026-10-25）
+
+**入口与 prompt**
+
+- editor/visual/visual-line 有选区时 `<leader>i` 打开 **inline edit** prompt；`visual_block` 也按 anchor→cursor 的连续区间处理。没有选区时只在状态栏提示 `inline edit: select lines first`，不改变任何状态。已有 pending edit 时提示 `inline edit: reject the pending change first`（one-pending policy，绝不静默替换）。
+- prompt 是居中 float：宽 `min(64, cols-4)`、高 6、精确圆角边框；标题 `inline edit`。内部 4 行：model + 状态（`ready` / `streaming…` / `error`）、`❯ ` 输入行（beam cursor）、`Enter generate · Esc cancel`（错误时显示 `error: …`）、`lines A-B · N bytes · file`。80/100/120 列都不越界，也不覆盖状态栏。
+- 输入支持 UTF-8（vaxis 的完整 `key.text`）与 bracketed paste；换行/tab 在单行 prompt 中折叠为空格（tab → 4 spaces）。Enter 生成、Esc/Ctrl+c 取消、Ctrl+w 删除最后一个词。prompt 打开期间按键在 `handleKey` 最前被截获，editor/AI/tab/leader 快捷键与普通 vim 序列都不可达；visual 选区保持可见。
+- 只有 prompt 自身（及其流式状态）拥有键盘；`<leader>i` 之外的普通编辑键不会进入 buffer。
+
+**请求（独立于 chat thread）**
+
+- 新增独立 client `App.inline_edit.client`（`src/ai/client.zig` 复用，不复制 HTTP/SSE）；同一时刻最多一个 inline 流。chat/thread transcript 不读不写，请求体只有固定 system prompt + 一条 inline user message。
+- system prompt 要求只返回选区替换文本，不要 fences/解释；user message 含文件路径、1-based 行范围、instruction、选区文本。选区文本最多 16 KiB 且只按 UTF-8 边界截断；完整选区仍保存在 snapshot 中用于 diff/approval。
+- `OZ_AI_MOCK_DIR` 仍走同一 client seam（写 `request.json`、回放 `stream.sse`），e2e 用它验证请求体与流式行为。
+- Esc/Ctrl+c 调 `requestCancel()` 并立即关闭 prompt；之后到达的 delta/done 全部丢弃。错误（配置/启动/流）留在 prompt 的 `error:` 行，buffer/历史不变；可修改 instruction 后重试。
+
+**Pending edit 与 diff**
+
+- 流完成时（`done`）把 streamed text 经 `stripFences` 处理（仅当首行是 ```[lang]、末行是闭合 ``` 时剥离，其他情况逐字节保留），构造 `Pending`：buffer index、path、原始 byte range、原始文本、replacement、生成时 `history.revision`、1-based 行范围、缓存的 diff 行与统计。
+- diff 在完成时计算一次（行级 LCS；两侧超过 400 行时退化为“全部删除 + 全部添加”，仍真实），渲染只遍历可见行；不逐帧重建。context 行原样、`- ` 用 `diag_error`、`+ ` 用 `string`，行超宽按 cell 截断。
+- 完成即：必要时打开 rail、切到 **Changes**、badge 变 `changes 1`、焦点落在 workbox。Changes 固定显示 `path · lines A-B`、`-N +M`（stale 时追加 `stale selection`）、`[a] approve  [r] reject`、空白行和 diff 行；diff 不足时剩余行仍画左/右边框，空状态仍是 `no pending changes`。
+- 长 diff 可用 `j/k` 滚动（只改 `pending_scroll`，不重新 diff）。
+
+**Approve / Reject / undo**
+
+- Approve（`a` 或 Enter，或 hint 标签）先验证：buffer 仍存在（有 path 时按 path 重新定位）、`history.revision` 等于生成时值、range 在界内、`[start,end)` 当前字节等于 original。任一失败 → `stale selection`，pending 保留并标 stale，绝不应用到移动后的文本。
+- 验证通过后 `switchTo`（若需要）+ `applyEdit(start, end, replacement)`：`applyEdit` 内部 `beginGroup/record/endGroup`，因此整个替换是 **一个 undo group**；`u` 一次恢复原文。随后 dirty、cursor 落在 range start、清除 pending（badge 0）、焦点回 editor、状态栏 toast `inline edit applied · u to undo`。
+- Reject（`r`/`d` 或 hint 标签）只释放 pending、badge 0、焦点回 editor，不触碰 buffer/history/revision；toast `inline edit rejected`。不存在“静默 auto-apply”。
+- Changes 的 review 键只在“tab=Changes 且存在 pending”时覆盖：`a`/Enter approve、`r`/`d` reject、`j`/`k` scroll；无 pending 时 `r`/`d` 仍是原来的 Terminal/Changes tab 切换。hint action 新增 `inline_approve` / `inline_reject`，按钮 rect 在渲染时注册，`<leader>j` 可激活；这些键在输入框中不可达（prompt 先消费所有按键）。
+
+**与 chat/rail 的关系 / 限制**
+
+- inline 有独立 client 和独立状态；chat 线程仍各自一份 client/transcript，两者可并存流式，互不写入。inline 完成会打开 rail 并抢占焦点，但不会 attach/修改 thread。
+- 只支持一个 pending、一个 inline 流；不提供多文件/多 hunk 队列或“替换为第二个候选”。block 选区按连续区间处理，不做矩形替换。
+- diff 是行级 LCS（上限 400 行/侧），没有 word-level diff、语法高亮或 hunk 折叠；长行截断而非软换行。
+- pending 不存在 workspace 隔离：切换 workspace 后 pending 仍显示，approve 会因找不到对应 path/revision 而 stale，必须 Reject；这是安全失败而非静默丢失。
+- 不自动保存：approve 只改 buffer（dirty），写盘仍由用户 `:w`。
+
+**文件**
+
+- `src/app/inline.zig`：纯选区映射、bounded UTF-8、fence 剥离、行 LCS diff、snapshot/pending/one-pending policy + 单测。
+- `src/app/inline_ui.zig`：prompt、独立 client、stream drain、approve/reject、Changes 渲染、hint 按钮。
+- `src/app.zig`、`src/app/input.zig`、`src/app/render.zig`、`src/app/ai.zig`、`src/app/hints.zig`、`src/app/hint_ui.zig`：状态/路由/rail badge/diff/hint 接线。
+- `src/editor/key_event.zig`、`src/editor/mode.zig`、`src/editor/keymap_list.zig`：`<leader>i`。
+- `test/e2e.zig` + TESTING.md：approve/undo、reject/one-pending、stale、cancel、80 列/hint、`@inline` scenario。
+
+**验证**
+
+- `zig build test`：389/389 通过（原 376 + 13 个 inline 纯模型单测，未改动既有断言）。
+- `zig build e2e`：156/156 通过（原 151 + 5 个 inline pty 测试），新增 scenario `inline edit 120x30` 与 required tag `@inline`。
+- 无 golden 变更（inline prompt/diff 不进入固定 golden 帧）。
+
+---
+
 ## 19. Keyboard Hints（qutebrowser 风格，M2.6）
 
 参考：[qutebrowser quickstart](https://www.qutebrowser.org/doc/quickstart.html) 的 hint mode：按 `f` 给所有可点击目标加标签，输入标签直接触发，不需要鼠标。oz 是 TUI，没有 DOM，但所有“可点击/可聚焦”的区域（文件树行、buffer tab、agent thread、workbox tab、审批按钮）都可以注册成 target。
@@ -1032,3 +1086,4 @@ pub const Target = struct { rect: Rect, action: Action };
 - 没有 golden：标签会覆盖目标文本，target 数还依赖仓库根目录条目；语义断言（从画面读出标签、状态文字、边框、水平溢出）比整帧 golden 更稳定，见 `test/e2e.zig` 的 hints 测试与 `@hints` scenario。
 - 鼠标仍未接入；hint 与既有键盘路径共享同一批动作方法，没有第二套业务逻辑。
 - M2b1 追加 `navigator_tab`（复用 `navigatorSetTab`）与 `note_open`（复用 `openNoteAt`）两个动作；`agent_thread_select` 现在先打开 rail，保证从 navigator 的 Agents tab 触发时 attach 可见。navigator 的 tab strip 与 Notes 行都注册为 target，e2e 从画面读取标签后激活。
+- M2b2 追加 `inline_approve` / `inline_reject`：Changes 的 pending diff 渲染 `[a] approve  [r] reject` 两行按钮时注册矩形，动作分别复用 `inlineApprove` / `inlineReject`，与键盘 `a`/Enter、`r`/`d` 是同一条路径。
