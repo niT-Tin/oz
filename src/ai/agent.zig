@@ -12,12 +12,17 @@
 //!     text. Both cap by display-independent byte limits and never split a
 //!     UTF-8 sequence; the renderer adds the cell-level clipping.
 //!   - `Metrics`: per-tool calls/ok/error/approval/unsupported counts, average
-//!     and max latency, and a 32-sample ring for the Tools chart. Only real
-//!     requests are recorded; running/cancelled cards are not.
+//!     and max latency, a 32-sample ring for the Tools chart, and a
+//!     nearest-rank p95 of that recent window. Only real requests are
+//!     recorded; running/cancelled cards are not.
 //!
 //! Nothing here fabricates a baseline: an empty `Metrics` renders as the
-//! Tools tab's `no tool calls yet` state, and the chart's samples come from
-//! the same real durations as `avg`/`max`.
+//! Tools tab's `no tool calls yet` state, and the chart/p95 samples come from
+//! the same real durations as `avg`/`max`. p95 is defined over at most the
+//! last `recent_capacity` (32) executed calls per tool, integer nearest-rank
+//! (`ceil(0.95*n)-1`, clamped); zero samples mean `null`, never 0ms. The
+//! Tools-tab header pools those per-tool recent windows (at most 256 samples)
+//! and says so in DESIGN §20.5/§20.11.
 
 const std = @import("std");
 const tools = @import("tools.zig");
@@ -327,6 +332,17 @@ pub fn bodyLines(content: []const u8, out: [][]const u8, max_lines: usize) struc
     return .{ .count = n, .more = more };
 }
 
+/// Nearest-rank p95 over `samples`, sorted in place. The 0-based index is
+/// `ceil(0.95*n)-1`, clamped to the array (so n=1 returns its only sample and
+/// n=2 returns the larger). Integer and allocation-free; empty -> null.
+fn nearestRankP95(samples: []u32) ?u32 {
+    if (samples.len == 0) return null;
+    std.sort.insertion(u32, samples, {}, std.sort.asc(u32));
+    const rank = (95 * samples.len + 99) / 100; // ceil(95*n/100)
+    const idx = @min(rank - 1, samples.len - 1);
+    return samples[idx];
+}
+
 /// Per-tool counters and recent latency ring. Names are owned copies so the
 /// chart/metrics survive the request buffers they came from.
 pub const Stats = struct {
@@ -370,6 +386,18 @@ pub const Stats = struct {
             out[i] = self.recent[idx];
         }
         return count;
+    }
+
+    /// Nearest-rank p95 of this tool's recent executed-call window: at most
+    /// the last `recent_capacity` (32) real durations, integer
+    /// `ceil(0.95*n)-1` (clamped), null with no samples. Sorts a fixed
+    /// stack copy, so this read never allocates and the ring/revision/counters
+    /// are untouched. This is not an all-time percentile: older calls outside
+    /// the ring do not participate.
+    pub fn p95RecentMs(self: *const Stats) ?u32 {
+        var sorted: [recent_capacity]u32 = undefined;
+        const n = self.recentInto(&sorted);
+        return nearestRankP95(sorted[0..n]);
     }
 };
 
@@ -528,6 +556,19 @@ pub const Metrics = struct {
         }
         if (durations == 0) return null;
         return @intCast((total + durations / 2) / durations);
+    }
+
+    /// Nearest-rank p95 over the pooled per-tool recent windows (at most
+    /// `recent_capacity` samples from each tracked tool, ≤256 total). The
+    /// Tools-tab header uses this; per-tool cards use `Stats.p95RecentMs`.
+    /// Allocation-free stack collection; empty -> null and revision untouched.
+    pub fn p95RecentMs(self: *const Metrics) ?u32 {
+        var samples: [max_metric_tools * recent_capacity]u32 = undefined;
+        var n: usize = 0;
+        for (&self.items) |*slot| {
+            if (slot.*) |*s| n += s.recentInto(samples[n..]);
+        }
+        return nearestRankP95(samples[0..n]);
     }
 };
 
@@ -720,6 +761,130 @@ test "agent: metrics aggregate average, max and a chronological ring" {
     try std.testing.expectEqual(@as(usize, 0), empty.count());
     try std.testing.expectEqual(@as(u32, 0), empty.totalCalls());
     try std.testing.expect(empty.averageMs() == null);
+}
+
+test "agent: p95 recent window is nearest-rank over real samples" {
+    // Direct ring fill keeps the fixture independent from wall-clock timing.
+    var s: Stats = .{};
+    const fill = struct {
+        fn f(st: *Stats, values: []const u32) void {
+            for (values) |v| {
+                st.recent[st.recent_next] = v;
+                st.recent_next = @intCast((@as(usize, st.recent_next) + 1) % recent_capacity);
+                if (st.recent_len < recent_capacity) st.recent_len += 1;
+            }
+        }
+    }.f;
+
+    try std.testing.expect(s.p95RecentMs() == null); // empty -> null, not 0
+
+    fill(&s, &.{7});
+    try std.testing.expectEqual(@as(?u32, 7), s.p95RecentMs()); // n=1: only sample
+
+    s = .{};
+    fill(&s, &.{ 10, 20 });
+    try std.testing.expectEqual(@as(?u32, 20), s.p95RecentMs()); // n=2: nearest rank
+
+    s = .{};
+    fill(&s, &.{ 30, 10, 20 });
+    try std.testing.expectEqual(@as(?u32, 30), s.p95RecentMs()); // unsorted
+
+    // n=20 / n=21 pin the ceil(0.95*n) boundary: 19th vs 20th smallest.
+    s = .{};
+    var values_20: [20]u32 = undefined;
+    for (&values_20, 0..) |*v, i| v.* = @intCast((i + 1) * 2); // 2, 4, …, 40
+    fill(&s, &values_20);
+    try std.testing.expectEqual(@as(?u32, 38), s.p95RecentMs()); // index 18
+
+    s = .{};
+    var values_21: [21]u32 = undefined;
+    for (&values_21, 0..) |*v, i| v.* = @intCast(i + 1); // 1..21
+    fill(&s, &values_21);
+    try std.testing.expectEqual(@as(?u32, 20), s.p95RecentMs()); // index 19
+
+    // 32 samples: ceil(30.4)=31 -> index 30 (the second-highest sample).
+    s = .{};
+    var values_32: [32]u32 = undefined;
+    for (&values_32, 0..) |*v, i| v.* = @intCast(i + 1);
+    fill(&s, &values_32);
+    try std.testing.expectEqual(@as(?u32, 31), s.p95RecentMs());
+
+    // Duplicates: 20 samples, only 18 of them are 5ms; the 19th smallest
+    // (nearest-rank index 18) is already a 100ms outlier.
+    s = .{};
+    var dup: [20]u32 = @splat(5);
+    dup[7] = 100;
+    dup[19] = 100;
+    fill(&s, &dup);
+    try std.testing.expectEqual(@as(?u32, 100), s.p95RecentMs());
+
+    // Duplicates below the rank stay below p95: one 100ms outlier in 20
+    // samples is index 19 only, so the 19th smallest is still 5ms.
+    s = .{};
+    var one_outlier: [20]u32 = @splat(5);
+    one_outlier[3] = 100;
+    fill(&s, &one_outlier);
+    try std.testing.expectEqual(@as(?u32, 5), s.p95RecentMs());
+
+    // All equal is a real p95, not a sentinel.
+    s = .{};
+    var equal: [recent_capacity]u32 = @splat(42);
+    fill(&s, &equal);
+    try std.testing.expectEqual(@as(?u32, 42), s.p95RecentMs());
+}
+
+test "agent: p95 uses the wrapped recent ring and never mutates metrics" {
+    const alloc = std.testing.allocator;
+    var m: Metrics = .{};
+    defer m.deinit(alloc);
+
+    try std.testing.expect(m.p95RecentMs() == null);
+    try std.testing.expectEqual(@as(u64, 0), m.revision);
+
+    // Allocation-free by construction: neither read accepts an allocator
+    // (they only sort a fixed stack copy; no heap path exists).
+    try std.testing.expectEqual(@as(usize, 1), @typeInfo(@TypeOf(Stats.p95RecentMs)).@"fn".param_types.len);
+    try std.testing.expectEqual(@as(usize, 1), @typeInfo(@TypeOf(Metrics.p95RecentMs)).@"fn".param_types.len);
+
+    // 40 calls wrap the 32-slot ring; only samples 8..39 are still recent.
+    var i: u32 = 0;
+    while (i < 40) : (i += 1) m.record(alloc, "read_file", .ok, i);
+    const rf = m.get("read_file").?;
+    try std.testing.expectEqual(@as(usize, recent_capacity), @as(usize, rf.recent_len));
+    try std.testing.expectEqual(@as(?u32, 38), rf.p95RecentMs()); // idx 30 of 8..39
+    try std.testing.expectEqual(@as(?u32, 38), m.p95RecentMs()); // only tool
+
+    // Reading p95 is pure: the revision, counters and ring bytes are untouched
+    // (the implementation sorts a fixed stack copy and never allocates).
+    var before: [recent_capacity]u32 = undefined;
+    const before_n = rf.recentInto(&before);
+    const revision = m.revision;
+    const calls = rf.calls;
+    const total = rf.total_ms;
+    _ = rf.p95RecentMs();
+    _ = m.p95RecentMs();
+    try std.testing.expectEqual(revision, m.revision);
+    try std.testing.expectEqual(calls, rf.calls);
+    try std.testing.expectEqual(total, rf.total_ms);
+    var after: [recent_capacity]u32 = undefined;
+    const after_n = rf.recentInto(&after);
+    try std.testing.expectEqual(before_n, after_n);
+    try std.testing.expectEqualSlices(u32, before[0..before_n], after[0..after_n]);
+    // Ring order is preserved (not reordered in place by the p95 read).
+    try std.testing.expectEqual(@as(u32, 8), before[0]);
+    try std.testing.expectEqual(@as(u32, 39), before[before_n - 1]);
+
+    // A header p95 pools the per-tool recent windows (still nearest-rank,
+    // still real samples): read_file contributes 8..39, grep adds 10 and 20.
+    // The 33rd of 34 sorted samples is 38ms.
+    m.record(alloc, "grep", .ok, 10);
+    m.record(alloc, "grep", .ok, 20);
+    try std.testing.expectEqual(@as(?u32, 38), m.p95RecentMs());
+
+    // A new real call still bumps revision; p95 reads never did.
+    const bumped = m.revision;
+    m.record(alloc, "grep", .ok, 1);
+    try std.testing.expect(m.revision != bumped);
 }
 
 test "agent: approval decisions do not count as a second call" {
