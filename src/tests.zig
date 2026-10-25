@@ -12,6 +12,7 @@ pub const history = @import("buffer/history.zig");
 pub const ops = @import("buffer/ops.zig");
 pub const fzy = @import("util/fzy.zig");
 pub const json_rpc = @import("util/json_rpc.zig");
+pub const logging = @import("logging.zig");
 pub const key_event = @import("editor/key_event.zig");
 pub const keymaps = @import("editor/keymaps.zig");
 pub const mode = @import("editor/mode.zig");

@@ -13528,6 +13528,74 @@ test "terminal: :q! quits cleanly while the terminal is still open" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+test "terminal: shell-integration OSC sequences never print vaxis logs" {
+    // Alt+r with shell integration used to flood the whole TUI with
+    // `warning(vaxis_terminal): couldn't write uri[_id]` (per printed cell,
+    // from vaxis's uninitialized cursor link state) plus
+    // `info(terminal): unhandled osc: 133;B` / `error(terminal): osc: 7;…`
+    // lines. None of those may reach the screen; the shell must still work.
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}termlog.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "alpha\nbeta\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    var waited: i32 = 0;
+    while (!grid.contains("NORMAL")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 8000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains("NORMAL"));
+
+    try sess.send("\x1br"); // floating terminal, focused
+    try gridWaitFor(&sess, &grid, "$", 8000);
+
+    // Drive the shell to emit the exact families vaxis logs: OSC 133
+    // (shell integration), OSC 7 (cwd) and OSC 8 (hyperlink).
+    try sess.send("printf '\\033]133;A\\007'; printf '\\033]133;B\\007'; " ++
+        "printf '\\033]7;file://hostname/tmp\\007'; " ++
+        "printf '\\033]8;;https://example.com\\007x\\033]8;;\\007'; echo OSC-DONE\r");
+    try gridWaitFor(&sess, &grid, "OSC-DONE", 8000);
+
+    if (grid.contains("warning(") or grid.contains("info(") or grid.contains("error(") or
+        grid.contains("unhandled osc") or grid.contains("couldn't write uri"))
+    {
+        std.debug.print("vaxis terminal logs leaked into the TUI:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(!grid.contains("warning("));
+    try std.testing.expect(!grid.contains("info("));
+    try std.testing.expect(!grid.contains("error("));
+    try std.testing.expect(!grid.contains("unhandled osc"));
+    try std.testing.expect(!grid.contains("couldn't write uri"));
+
+    // Still interactive: Esc returns to the editor; :q! quits with the
+    // terminal session still alive (teardown path already covered above).
+    try sess.send("\x1b");
+    std.Io.sleep(io, .fromMilliseconds(250), .real) catch {};
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
 // ================= workspace e2e (M5) =================
 //
 // Shared feed-loop helpers for the workspace tests below (same shape as the

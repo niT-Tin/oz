@@ -269,8 +269,26 @@ pub const Terminal = if (supported) struct {
         errdefer allocator.free(self.write_buf);
         self.inner = try vaxis.widgets.Terminal.init(io, allocator, argv, env, opts, self.write_buf);
         errdefer self.inner.deinit();
+        resetLinkState(&self.inner);
         try self.inner.spawn();
         return self;
+    }
+
+    /// vaxis's `widgets/terminal/Screen.init` leaves `Cursor.uri` and
+    /// `Cursor.uri_id` as `undefined` while every `Screen.print` reads them
+    /// as the source slice for each cell's OSC 8 link state. On a real
+    /// allocation pattern those bytes are garbage: `appendSlice` then either
+    /// OOMs (logging "couldn't write uri_id" for EVERY cell — thousands of
+    /// lines into the TUI) or copies from a wild pointer. The vendored
+    /// terminal has no OSC 8 support, so the correct zero state is `.empty`.
+    /// Resize recreates all three screens, so re-apply it there too.
+    fn resetLinkState(t: *vaxis.widgets.Terminal) void {
+        t.front_screen.cursor.uri = .empty;
+        t.front_screen.cursor.uri_id = .empty;
+        t.back_screen_pri.cursor.uri = .empty;
+        t.back_screen_pri.cursor.uri_id = .empty;
+        t.back_screen_alt.cursor.uri = .empty;
+        t.back_screen_alt.cursor.uri_id = .empty;
     }
 
     /// Stop the child (SIGTERM), await the reader thread, free everything
@@ -289,12 +307,19 @@ pub const Terminal = if (supported) struct {
     /// (rows/cols), not the full screen size. The pty's SIGWINCH tells the
     /// shell to re-query its size.
     pub fn resize(self: *Terminal, rows: u16, cols: u16) !void {
+        // A size change re-runs Screen.init for all three screens, which
+        // resets the cursor link arrays to `undefined`; restore the empty
+        // state afterwards. An unchanged size is a no-op and keeps the
+        // arrays resetLinkState already installed in create().
+        const resized = self.inner.front_screen.width != cols or
+            self.inner.front_screen.height != rows;
         try self.inner.resize(.{
             .rows = rows,
             .cols = cols,
             .x_pixel = 0,
             .y_pixel = 0,
         });
+        if (resized) resetLinkState(&self.inner);
     }
 
     /// Non-blocking event poll (maps to `inner.tryEvent`). Returns null when

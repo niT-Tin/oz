@@ -17,8 +17,8 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-Current counts on `feat/ui-polish` (M3b2 + UI chrome + theme chrome + buffer strip/motion):
-**510 unit tests** and **185 e2e tests**. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
+Current counts on `fix/editing-terminal` (based on UI polish `7d90c90`):
+**516 unit tests** and **189 e2e tests**. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
 `.verify/verify.json` (schema version 1, git commit/dirty flag, exact command
 strings, timestamps, exit codes, log SHA-256s, parsed pass/fail counts). It
 runs every command even after a failure and exits non-zero if any command
