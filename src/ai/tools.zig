@@ -99,7 +99,7 @@ const grep_parameters =
     \\  "properties": {
     \\    "pattern": {
     \\      "type": "string",
-    \\      "description": "Regular expression to search for."
+    \\      "description": "Literal substring to search for (case-sensitive; not a regular expression)."
     \\    },
     \\    "path": {
     \\      "type": "string",
@@ -172,7 +172,7 @@ pub const definitions = [_]Definition{
     .{
         .kind = .grep,
         .name = "grep",
-        .description = "Search file contents with a regular expression, optionally restricted by path and glob.",
+        .description = "Search file contents with a literal, case-sensitive substring, optionally restricted by path and glob.",
         .parameters_json = grep_parameters,
     },
     .{

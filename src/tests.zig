@@ -55,6 +55,8 @@ pub const ai_panel = @import("ai/panel.zig");
 pub const ai_workspace = @import("ai/workspace.zig");
 // M3 tool protocol (pure; no execution or App wiring)
 pub const ai_tools = @import("ai/tools.zig");
+// M3a safe read-only tool executor (filesystem-confined; no App wiring)
+pub const ai_tool_exec = @import("ai/tool_exec.zig");
 
 test {
     std.testing.refAllDecls(@This());

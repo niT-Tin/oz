@@ -17,3 +17,4 @@ pub const client = @import("client.zig");
 pub const panel = @import("panel.zig");
 pub const workspace = @import("workspace.zig");
 pub const tools = @import("tools.zig");
+pub const tool_exec = @import("tool_exec.zig");
