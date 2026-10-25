@@ -1046,7 +1046,7 @@ pub const Target = struct { rect: Rect, action: Action };
 
 - **M2.6a（已完成，2026-10-25）**：`<leader>j`、标签生成、tint 覆盖层、文件树/buffer/agent/workbox tab 的目标与动作、Esc/Backspace、单元 + e2e。实现状态见 §19.8。
 - **M2.6b**：`<leader>J` secondary actions（split 打开、新 thread）、approval/diff/tool 按钮、`gi` 聚焦输入、目标优先级/去重。
-- **M3**：工具卡片、审批、metrics 的按钮自动注册为 hint target；不引入第二套键盘导航。
+- **M3**：工具卡片、审批、metrics 的按钮自动注册为 hint target；不引入第二套键盘导航。M3a 已注册 Chat tool card（展开/收起）与既有 Workbox tab；审批按钮留到 M3b。
 
 ### 19.7 测试
 
@@ -1127,15 +1127,15 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
   - calls / ok / error / denied
   - average / p95?（先 avg + max）
   - 最近 N 次耗时 ring buffer（每工具固定容量，例如 64）
-  - 折线图使用 `src/chart.zig`（M3b core），窄屏 fallback sparkline；没有数据时显示真实空状态。
+  - 折线图使用 `src/chart.zig`（M3a 已接入 Tools tab），窄屏 fallback sparkline；没有数据时显示真实空状态。
 - Metrics 只统计真实调用；mock/e2e 数据不得进入发布 UI。
 - 图表只在数据变化时重算，按 workbox 尺寸缓存；普通帧 O(visible cards)，不每帧重跑 diff/chart。
-- 卡片/图表可被 hint mode 选中（同一 target API）。
+- Chat tool card 通过同一 `<leader>j` target API 选中，激活 = 展开/收起结果详情（真实动作；不 invent 无效果目标）。
 
 ### 20.6 里程碑
 
-- **M3a**：只读 executor + tool loop + Chat tool cards + Tools tab 真实统计（纯文本/无图也可）+ 审批占位；e2e mock。
-- **M3b**：`edit_file`/`apply_patch` 审批 + pending diff/apply/undo；chart 接入；hint 覆盖审批/卡片；性能基准。
+- **M3a（已完成，2026-10-25）**：只读 executor + tool loop + Chat tool cards + Tools tab 真实统计 + chart 接入 + 审批占位；e2e mock。实现状态见 §20.8。
+- **M3b**：`edit_file`/`apply_patch` 审批 + pending diff/apply/undo；审批按钮 hint；更多 metrics（p95、跨会话持久化）；性能基准。
 - **后续**：terminal tool（独立沙箱/明确确认）、MCP/ACP、跨会话 metrics 持久化。
 
 ### 20.7 测试
@@ -1144,3 +1144,60 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 - E2E：只读 tool call 一轮/多轮、并行 calls、错误工具、超轮次、取消、审批 deny/allow（M3b）、卡片 stats、Tools tab 空/有数据、80/100/120 布局、hint 选中。
 - 每个工具调用必须能在 mock 请求体/响应中复现；不能依赖真实网络。
 - 性能：executor 在 worker，UI 帧不等待；metrics/chart 重算次数可断言（例如只在数据变化时）。
+
+### 20.8 M3a 实现状态（已完成，2026-10-25）
+
+**Transport（`src/ai/client.zig` + `src/ai/openai.zig` + `src/ai/tools.zig`）**
+
+- 每个 chat client worker 持有一个 `ai.tools.Accumulator`：每个有效 JSON chunk 在保留 `openai.parseDelta` 文本 delta 的同时喂给 accumulator；流结束（`finish_reason`/`[DONE]`/EOF）时 `finalize` 并按 index 顺序 push 一个 `Event.tool_calls`（owned），随后才 push `Event.done`。纯文本流零行为变化。
+- 并行 calls/交错 fragments/文本+calls 都由 accumulator 处理；`invalid index`、缺 id/name、非法 arguments 等**有效 JSON 内的协议错误** push `tool call protocol: <Error>` 聊天错误，不 panic、不执行半截调用。语法非法的 JSON chunk 仍按 M1 策略忽略（网关 keep-alive/metadata 兼容）。
+- 请求：`turn.buildMessages` 把 thread transcript 映射为 OpenAI messages（user/assistant/tool 保持原顺序，空 assistant 占位跳过，带 tool_calls 的空文本 assistant 保留）；`tools.appendTools` 追加 `tools` + `tool_choice:"auto"`。assistant tool-call turn 用 `tools.buildAssistantToolCallsJson` 序列化，tool result 用 `tools.buildToolResultContent`（≤64 KiB、UTF-8 安全、`error: ` 前缀）；OpenAI writer 对带 tool_calls 的空 content 写 `null`。
+- 测试 seam（仅 `OZ_AI_MOCK_DIR`）：第 n 个请求写 `request.json`（最新）+ `request-<n>.json`，优先回放 `stream-<n>.sse`/`error-<n>.txt`，否则 fallback `stream.sse`/`error.txt`。既有测试不受影响。
+
+**Agent loop（`src/app/ai.zig`）**
+
+- 每 thread 一个 `ToolThreadState`（与 `threads.items` 平行）：捕获当轮 workspace root（`currentRootDir`，绝对、无 trailing slash）、round/call 计数、in-flight batch、stream terminal、follow-up 状态、generation、当前 batch 的 card message indices、transcript note、`agent.Metrics`。
+- 一轮 user turn：首个请求带 tools；响应结束时若有 tool calls：把 calls 附到本轮 assistant message，为每个 call 建 card（running），按 `agent.planBatch` admission（prefix）：前 N 个交给 worker；超限的立即写为 `unsupported` + `error: ... limit ...; not executed`，并写回一条真实的 `role:"tool"` 结果。`rounds` 按 batch 计，`calls` 按实际 admitted 计。
+- worker 完成后：填 card 的 status/content/duration（`ok`/`error`/`approval required (M3b)`/`unsupported`），记录 metrics，然后自动 follow-up；follow-up 仍是同一 thread 的 client（`joinAfterTerminal` 消除 done/worker 重用的 Busy race），消息序列为 assistant(tool_calls) → tool results → 下一条 assistant。
+- **限制**：最多 4 个 tool batch（`agent.max_tool_rounds`）、最多 8 个执行调用（`agent.max_tool_calls_per_turn`）。到达任一上限后下一请求 **不带 tools**（最终 no-tools turn），保证仍能拿到最终文本；若模型在最终轮仍返回 tool calls，只生成 `unsupported` card/结果并停止。超限时 Chat transcript 显示 `tool loop stopped: max rounds/calls (N) ...`；Tools tab 的计数仍是真实值。
+- `edit_file`/`apply_patch` 只走 executor 的 `approval_required`（不落盘），`terminal`/未知工具 `unsupported`；`ai/tool_exec.zig` 内没有任何写 syscall。
+- 取消/切线程：现有 `cancelClient` 同时 requestCancel transport、`generation += 1`、冻结 running cards 为 `cancelled`、requestCancel worker；随后 worker 的结果因 generation/`cancel_requested` 不匹配被丢弃，绝不写入任何 transcript。`Ctrl+c` 在 stream 已结束但 tool/follow-up 仍活动时也会停止 loop。
+
+**Worker（`src/app/tool_job.zig`）**
+
+- 每 thread 最多一个 `Job`（后台 `std.Thread`），在 worker 内构造一次 `tool_exec.Executor`（realpath 一次），顺序执行 batch；调用之间检查 cancel。结果数组由 worker 写好，`done` release 发布；run loop 的 `drainToolJobs` acquire 消费，UI 帧从不读取文件/不等待 IO。
+- 每 call 用 monotonic `awake` ms 计时；`read_file` 64 KiB/2000 行、list 500、grep 200/1 MiB/深度 8 等上限仍在 executor 内。`aiStreaming()` 把未消费 job 也视为 active，run loop 以 1ms slice poll（不阻塞按键）。
+
+**UI**
+
+- Chat tool card：2–4 行紧凑卡片（icon + name + 右对齐状态；args summary；结果 excerpt / `not executed` / `⋯ working`），running/ok/error/approval/unsupported/cancelled 有不同 icon/颜色/文案；卡片是 transcript 行，随 Chat 滚动。`<leader>j` target 注册在可见卡片首行，激活切换 `tool_expanded`（最多 8 行真实结果 + `…`）。不伪造结果。
+- Tools tab：无 metrics 显示 `no tool calls yet`（空状态真实）；有数据时第一行 `tools · N calls · avg Xms`，每个工具 3 行 `name · calls N` / `ok · err [· appr · unsup]` / `avg · max`（没有执行样本时 `no latency samples`）；工具多时显示 `+N more tools`。
+- Chart：有执行样本时用 `chart.render`（≥24×4 braille，否则 sparkline）渲染所有工具最近 32 个真实 duration，legend 为工具名，轴为 `0ms`/y_max + `older`/`now`。`ChartCache` 以 (thread, metrics.revision, width, height) 为 key；只有 metrics 变化或布局变化才重算，画布 cell 直接复制到 vaxis。颜色取主题 syntax palette（最多 8 series）。
+- 状态：thread list/workbench header/status bar 在 batch 或 follow-up pending 时显示 `tools…`（不是 `idle`/`streaming…`）；完成后恢复正常状态。
+- 80x24 drawer：按 body_rows 预算 visible cards + chart 高度（chart 最小 2 行，否则省略），所有行由 `drawRailRow` 精确填满，不越界；hint label 只画在 panel 内。card 名称/状态/arguments 在 80 列下按 cell 截断。
+
+**只读边界与限制**
+
+- 只执行 `read_file`/`list_directory`/`grep`；写入工具在 M3a 永远返回 approval/unsupported，不创建 pending diff、不写盘。没有 terminal/shell/网络工具。
+- `read_file`/`grep` 只读 workspace root（拒绝绝对路径、`..`、NUL、越界 symlink；输出 workspace-relative）。这是 best-effort confinement，不声称 TOCTOU 安全（与 §20.3 一致）。
+- metrics 是 per-thread、session 级、不持久化；被取消/被 generation 丢弃的 in-flight 调用不计数（只统计真正应用回该 thread 的结果）。没有 p95、没有跨会话图表、没有 mock 数据注入发布 UI。
+- tool card 展开只通过 hint（无鼠标/卡片光标）；M3b 再加审批按钮与完整 hint 覆盖。
+- 最终 no-tools turn 由 `agent.max_*` 常量触发；如果 provider 忽略无 tools 请求仍返回 tool_calls，只记录 unsupported 后停止（有界）。
+- 未新增 terminal/MCP/ACP；`ai/tool_exec.zig` 的 caps 与 §20.3 一致。
+
+**文件**
+
+- `src/ai/agent.zig`：loop bounds、card 文案/args summary/excerpt、metrics/ring/chart key + 单测。
+- `src/ai/turn.zig`：transcript → OpenAI request messages（assistant tool_calls / role tool）+ 单测。
+- `src/ai/client.zig`、`src/ai/openai.zig`、`src/ai/tools.zig`：streaming tool_calls、request writer、assistant JSON/content builder + 单测。
+- `src/ai/workspace.zig`：tool role/message/card 字段与 thread helpers + 单测。
+- `src/app/ai.zig`：Session sidecars、request/follow-up、drain、cards/tools tab/chart cache、hints/status。
+- `src/app/tool_job.zig`：后台 read-only worker。
+- `src/app/render.zig`、`src/app.zig`、`src/app/hints.zig`、`src/app/hint_ui.zig`：run-loop drain、alias、hint action/wiring。
+- `test/e2e.zig` + TESTING.md：8 个 M3a pty 测试、`@tools` scenario、mock 轮次 fixture。
+
+**验证**
+
+- `zig build test`：466/466 通过（原 449 + 17 个 M3a 单测，未改动既有断言）。
+- `zig build e2e`：164/164 通过（原 156 + 8 个 M3a pty 测试；scenario matrix 新增 `ai tools read 120x30`）。
+- 无 golden 变更（tool cards/metrics 不进入固定 golden 帧）；`tools arrive in M3` 的旧空状态测试更新为 `no tool calls yet`（产品要求变化，断言不回退）。

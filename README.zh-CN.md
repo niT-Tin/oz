@@ -79,14 +79,15 @@
 - `<leader>a` 打开右侧 **Agent Rail + Workbox** 并聚焦输入框；在 editor 或线程列表中再按一次会关闭 rail 并把焦点还给 editor。dock 模式下 rail 不是模态的，可以一边编辑一边使用。
 - 宽度行为：**≥110 列**保留 38 列的右侧 dock；**90–109** 列保留 34；**<90** 列改为右侧 overlay drawer（`min(34, width-8)`），editor 在下方保持全宽。rail 只画到状态栏上方，绝不占用 editor 的保留区域；drawer 模式按 Esc 关闭，没有假遮罩、假 diff 或假遥测。
 - **线程**是会话级的，按当前 workspace 分组显示。`j`/`k` 选择，Enter attach，`n`（或 `+`）新建线程并聚焦其输入框，输入框内 Tab 回到线程列表。同一时间只允许一个流：切换到别的线程会取消正在流式的线程（状态 `cancelled`，transcript 冻结）；切回来看到冻结的 transcript。每个线程有自己的请求历史和 client，delta 不会串到其他线程。线程在 rail 关闭和 workspace 切换后仍保留，但不落盘。
-- **Workbox tabs**：Chat（沿用 M1 的 transcript、流式、取消、错误、Markdown 与输入框）、Changes（inline edit 审核：真实 unified 风格 diff + 显式 Approve/Reject；没有待审内容时显示 `no pending changes`）、Tools（`tools arrive in M3`）、Terminal（`agent terminal arrives in M3`；编辑器自己的终端仍是 `Alt+r`）。空状态是真实的，不伪造 diff、计数或图表。
+- **Workbox tabs**：Chat（沿用 M1 的 transcript、流式、取消、错误、Markdown、tool cards 与输入框）、Changes（inline edit 审核：真实 unified 风格 diff + 显式 Approve/Reject；没有待审内容时显示 `no pending changes`）、Tools（真实的只读工具调用统计与延迟图；没有数据时显示 `no tool calls yet`）、Terminal（`agent terminal arrives in M3`；编辑器自己的终端仍是 `Alt+r`）。空状态是真实的，不伪造 diff、计数或图表。
 - **Inline assistant（`<leader>i`）**：在 visual/visual-line 中选行后按 `<leader>i`，在紧凑的 `inline edit` 浮窗里输入指令并 Enter。请求使用**独立**的 OpenAI 兼容 client 流式返回（绝不追加到 chat thread）；完成后自动打开 rail 并切到 **Changes**，badge 变 `changes 1`，diff 展示被删除的选区行和流式 replacement。未经批准不会写入：
   - Changes：`a`/Enter 批准 · `r`/`d` 拒绝 · `j`/`k` 滚动长 diff；两个按钮都是 `<leader>j` 的 hint 目标。
   - 输入框：Enter 生成 · Esc/Ctrl+c 取消 · Ctrl+w 删除最后一个词；支持 UTF-8 输入和 bracketed paste，选区在输入期间保持可见。
   - 批准时把 replacement 作为**一个 undo group** 应用（`u` 一次恢复原文）、buffer 标脏、焦点回 editor。拒绝丢弃 pending diff，buffer 逐字节不变。生成后如果 buffer 又被编辑，approve 会报 `stale selection` 并保留 pending diff，直到显式 Reject。
   - 同一时刻只允许一个 pending（或一个流式 inline 请求）；再次 `<leader>i` 会提示先 Reject 现有 pending。没有 tools、没有自动写文件、没有静默编辑。
+- **Agent tools（M3a，只读）**：chat 请求会带上 `read_file`、`list_directory`、`grep`（`tools` + `tool_choice:"auto"`）。响应以 tool calls 结束时，每个调用在 transcript 里生成一张紧凑卡片，安全的只读调用在**后台 worker** 中针对该 thread 的 workspace root 执行——读文件/grep 永不阻塞 UI。卡片显示名称、参数摘要、真实状态（`running`/`ok`/`error`）、耗时和有上限的结果摘要；失败或被阻止的调用绝不伪装成功。结果以 `role:"tool"` 消息回填并自动发起一次后续请求（每轮最多 **4 个 tool round / 8 个实际执行调用**；触顶后最后一个请求不再带 tools，以便仍能拿到文本回答）。`edit_file`/`apply_patch` 在 M3a **绝不执行**：卡片显示 `approval required (M3b)`，文件逐字节不变；`terminal`/未知工具显示 `unsupported`。Ctrl+c 或切线程会取消流**并**停止后续 loop/tool 执行；过期结果按 thread 丢弃。Chat 卡片是 `<leader>j` 目标：激活标签展开/收起真实结果。**Tools** tab 按线程聚合 calls/ok/error/approval/unsupported、avg/max 延迟，并把最近样本画成 braille 折线图（窄屏 sparkline），例如 `read_file · calls 1 · avg 3ms · max 3ms`；图表在 metrics 或布局变化前使用缓存。Metrics 只记录真实调用——没有 mock/基线数据。
 - 按键：
-  - 输入框：Enter 发送 · Ctrl+c 取消 · Ctrl+n 新建线程 · Tab → 线程列表 · Ctrl+j/k 单行滚动 · PageUp/PageDown 翻页 · Esc → editor（drawer 则关闭）
+  - 输入框：Enter 发送 · Ctrl+c 取消（也会停止活动 tool loop） · Ctrl+n 新建线程 · Tab → 线程列表 · Ctrl+j/k 单行滚动 · PageUp/PageDown 翻页 · Esc → editor（drawer 则关闭）
   - 线程列表 / workbox：`j`/`k` 选择 · Enter attach · `n`/`+` 新建线程 · `c`/`d`/`t`/`r` 切换 Chat/Changes/Tools/Terminal · Tab/Shift+Tab 循环 tab · `q`/Esc → editor。Changes 有 pending inline edit 时，`a`/Enter 批准、`r`/`d` 拒绝、`j`/`k` 滚动 diff。
   - `<Ctrl-w> a` 从 editor 回到 rail 的线程列表（rail 关闭时也会打开）
 - **键盘提示（M2.6a）**：`<leader>j` 为所有可见目标叠加 qutebrowser 风格标签（字符集 `asdfghjkl`，定长 1–3 个字符）——文件树行、buffer tab、agent 线程、navigator tab、note 行、Workbox tab、`+` 新建线程按钮和输入框行。输入完整标签执行该目标原本的动作，Backspace 删除已输入字符，Esc 取消且不产生任何副作用。状态栏显示 `HINTS · N targets · Esc cancel`；没有目标时显示 `HINTS · no targets`。普通 `f` 仍是 vim find-char，hint 不会占用。可从 editor、dashboard、文件树和 AI 线程列表进入（输入框内打字时不会触发）。

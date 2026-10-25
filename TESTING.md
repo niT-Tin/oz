@@ -17,7 +17,8 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-`tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
+Current counts at the M3a implementation commit: **466 unit tests** and
+**164 e2e tests**. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
 `.verify/verify.json` (schema version 1, git commit/dirty flag, exact command
 strings, timestamps, exit codes, log SHA-256s, parsed pass/fail counts). It
 runs every command even after a failure and exits non-zero if any command
@@ -35,8 +36,8 @@ replaying a cached successful run.
 
 | Layer | What it covers | Where |
 |---|---|---|
-| **Model/unit (L1)** | Pure logic: piece table, motions, keymaps, SSE/OpenAI config parsing, AI workspace layout/focus/thread model, navigator tab model, note store (paths/titles/sorting/creation), inline selection mapping/fences/diff/pending policy | `src/**/*.zig` `test` blocks, aggregated by `src/tests.zig` |
-| **Protocol fixtures** | SSE chunking, request JSON, config env parsing, AI client cancellation/error paths; mock LSP JSON-RPC | `src/ai/sse.zig`, `src/ai/openai.zig`, `src/ai/config.zig`, `src/ai/client.zig`, mock LSP tests |
+| **Model/unit (L1)** | Pure logic: piece table, motions, keymaps, SSE/OpenAI config parsing, AI workspace layout/focus/thread model, navigator tab model, note store (paths/titles/sorting/creation), inline selection mapping/fences/diff/pending policy, M3a agent loop bounds/card formatting/metrics/chart cache key + transcript→request assembly | `src/**/*.zig` `test` blocks, aggregated by `src/tests.zig` |
+| **Protocol fixtures** | SSE chunking, request JSON (incl. assistant tool-call turns and `role:"tool"` results), streamed `tool_calls` fragments/parallel calls/malformed protocol, config env parsing, AI client cancellation/error paths; mock LSP JSON-RPC | `src/ai/sse.zig`, `src/ai/openai.zig`, `src/ai/tools.zig`, `src/ai/client.zig`, `src/ai/config.zig`, mock LSP tests |
 | **Semantic frames (L3)** | Real `oz` binary in a pty; ANSI stream reconstructed into a cell grid; assertions on regions, borders, text, overlap, overflow | `test/e2e.zig` + `test/frame.zig` |
 | **Scenario matrix** | Data-driven pairwise matrix over terminal widths, filetree, and AI rail states; fresh pty per scenario; tags enforced | `test/e2e.zig` (`scenario_matrix`) |
 | **Goldens** | Cell-exact text + fg/bg frames for representative AI workspace sizes | `test/golden/`, `test/golden.zig` |
@@ -80,8 +81,8 @@ fixture note; the navigator box is located without its title text (hint labels
 intentionally cover the tab words).
 
 Scenario tags: `@layout @ai @filetree @stream @hints @navigator @notes
-@inline @80col @100col @120col @drawer @docked`. A new feature adds its tag
-here and to at least one scenario.
+@inline @tools @80col @100col @120col @drawer @docked`. A new feature adds
+its tag here and to at least one scenario.
 
 Every scenario must carry tags; `required_scenario_tags` is the declared
 feature set. A test fails with `UncoveredScenarioTag` if a declared tag has
@@ -130,6 +131,43 @@ every navigator/notes e2e points it at a fresh `/tmp/oz_notes_*` directory
 that is deleted afterwards. The error-path test uses
 `OZ_NOTES_DIR=/dev/null/notes` to prove the Notes tab reports a clear error
 and the editor stays usable.
+
+### M3a agent-tool fixtures and e2e
+
+`OZ_AI_MOCK_DIR` gained per-request fixtures for the automatic tool loop: the
+nth request writes `request.json` (latest) plus `request-<n>.json`, and replays
+`stream-<n>.sse` when present (falling back to `stream.sse` for the one-shot M1
+tests). `error-<n>.txt` likewise falls back to `error.txt`. Existing text-only
+tests are unchanged.
+
+The M3a pty tests (`test/e2e.zig`, filter `tools:`) cover:
+
+- a real `read_file` through two mock rounds: card running→ok, result excerpt,
+  follow-up `request-2.json` with assistant `tool_calls` + `role:"tool"` +
+  `tool_call_id`, Tools tab `calls 1`/`ok 1`/avg/max and a braille chart;
+- parallel `read_file` + `grep` calls in one delta: both cards, both
+  `tool_call_id`s in the follow-up, `2 calls`, chart;
+- a missing file: real `error:` card and `ok 0 · err 1`, while the follow-up
+  final text still arrives;
+- `edit_file`: `approval required (M3b)`, the file bytes on disk are unchanged,
+  the tool result says "not executed", no latency samples/chart;
+- four tool rounds: execution stops, the transcript note names the bound, the
+  fifth request is the final **no-tools** request (no `tools`/`tool_choice`),
+  and no sixth request exists; Tools tab `calls 4`;
+- Ctrl+c during the follow-up stream: `cancelled` + frozen transcript, no
+  `request-3.json`, and a second thread's Tools tab is still
+  `no tool calls yet` (no cross-thread cards/metrics);
+- 80x24 drawer: cards/chart fit with no horizontal overflow, and a drawn hint
+  label on the card toggles the expanded result (only the second fixture line
+  becomes visible);
+- a valid-JSON tool-call entry missing `index`: the client surfaces a typed
+  `tool call protocol` chat error, no card executes and no follow-up request
+  is written.
+
+The unit tests pin the bounded loop admission (`planBatch`), limit notes,
+card status/argument/excerpt formatting, metrics average/max/ring/revision,
+chart cache-key invalidation, `assistant tool_calls`/tool-result wire JSON, and
+the transcript message order used by the follow-up request.
 
 ### Property tests
 
