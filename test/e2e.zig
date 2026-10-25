@@ -435,10 +435,18 @@ const Grid = struct {
     buf: []u8,
     fg_buf: []u32, // rows*cols packed RGB (0 = default)
     bg_buf: []u32, // rows*cols packed RGB (0 = default)
+    /// SGR 58 underline color (0 = default) and SGR 4 underline state.
+    /// Active chrome tabs use a colored single underline; recording it lets
+    /// the theme-matrix test prove the underline follows `accent_alt`
+    /// instead of inheriting the label fg.
+    ul_buf: []u32 = &.{},
+    ul_on_buf: []bool = &.{},
     row: usize = 0,
     col: usize = 0,
     fg: u32 = 0, // current fg color (packed RGB, 0 = default)
     bg: u32 = 0, // current bg color (packed RGB, 0 = default)
+    ul: u32 = 0, // current underline color (packed RGB, 0 = default)
+    ul_on: bool = false, // SGR 4 single underline active
     /// Scratch buffer for rowText (one row of compressed cells; the AI
     /// workspace tests use 120 columns with 4-byte box-drawing glyphs).
     row_text_buf: [160 * 4]u8 = undefined,
@@ -472,13 +480,28 @@ const Grid = struct {
         @memset(fg_buf, 0);
         const bg_buf = try alloc.alloc(u32, rows * cols);
         @memset(bg_buf, 0);
-        return .{ .rows = rows, .cols = cols, .buf = buf, .fg_buf = fg_buf, .bg_buf = bg_buf, .alloc = alloc };
+        const ul_buf = try alloc.alloc(u32, rows * cols);
+        @memset(ul_buf, 0);
+        const ul_on_buf = try alloc.alloc(bool, rows * cols);
+        @memset(ul_on_buf, false);
+        return .{
+            .rows = rows,
+            .cols = cols,
+            .buf = buf,
+            .fg_buf = fg_buf,
+            .bg_buf = bg_buf,
+            .ul_buf = ul_buf,
+            .ul_on_buf = ul_on_buf,
+            .alloc = alloc,
+        };
     }
 
     fn deinit(self: *Grid, alloc: std.mem.Allocator) void {
         alloc.free(self.buf);
         alloc.free(self.fg_buf);
         alloc.free(self.bg_buf);
+        alloc.free(self.ul_buf);
+        alloc.free(self.ul_on_buf);
     }
 
     /// The 4-byte slot for one screen cell.
@@ -644,11 +667,15 @@ const Grid = struct {
                         @memcpy(slot[0..ln], bytes[i .. i + ln]);
                         self.fg_buf[self.row * self.cols + self.col] = self.fg;
                         self.bg_buf[self.row * self.cols + self.col] = self.bg;
+                        self.ul_buf[self.row * self.cols + self.col] = self.ul;
+                        self.ul_on_buf[self.row * self.cols + self.col] = self.ul_on;
                         var extra: usize = 1;
                         while (extra < cells and self.col + extra < self.cols) : (extra += 1) {
                             @memset(self.cell(self.row, self.col + extra), 0);
                             self.fg_buf[self.row * self.cols + self.col + extra] = self.fg;
                             self.bg_buf[self.row * self.cols + self.col + extra] = self.bg;
+                            self.ul_buf[self.row * self.cols + self.col + extra] = self.ul;
+                            self.ul_on_buf[self.row * self.cols + self.col + extra] = self.ul_on;
                         }
                     }
                     self.col += cells;
@@ -677,10 +704,26 @@ const Grid = struct {
                     if (p == 0) {
                         self.fg = 0;
                         self.bg = 0;
+                        self.ul = 0;
+                        self.ul_on = false;
                     } else if (p == 39) {
                         self.fg = 0;
                     } else if (p == 49) {
                         self.bg = 0;
+                    } else if (p == 59) {
+                        self.ul = 0;
+                    } else if (p == 4) {
+                        self.ul_on = true;
+                    } else if (p == 24) {
+                        self.ul_on = false;
+                    } else if (p == 58 and k + 4 < np and params[k + 1] == 2) {
+                        self.ul = packRgb(
+                            @intCast(params[k + 2]),
+                            @intCast(params[k + 3]),
+                            @intCast(params[k + 4]),
+                        );
+                        k += 5;
+                        continue;
                     } else if (p == 38 and k + 4 < np and params[k + 1] == 2) {
                         self.fg = packRgb(
                             @intCast(params[k + 2]),
@@ -711,6 +754,8 @@ const Grid = struct {
                     @memset(self.cell(self.row, c), 0);
                     self.fg_buf[self.row * self.cols + c] = 0;
                     self.bg_buf[self.row * self.cols + c] = 0;
+                    self.ul_buf[self.row * self.cols + c] = 0;
+                    self.ul_on_buf[self.row * self.cols + c] = false;
                 }
             },
         }
@@ -5174,7 +5219,9 @@ test "visual line: Esc exits and clears the stale selection highlight" {
         }
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
-        var r: usize = 0;
+        // Row 0 is the buffer tab bar: its active tab also uses bg_sel, so
+        // selection scans start at the first editor content row.
+        var r: usize = 1;
         while (r < grid.rows) : (r += 1) {
             if (grid.rowHasBg(r, sel_bg)) {
                 sel_visible = true;
@@ -5200,7 +5247,9 @@ test "visual line: Esc exits and clears the stale selection highlight" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
         sel_cleared = true;
-        var r: usize = 0;
+        // Row 0 is the buffer tab bar: its active tab also uses bg_sel, so
+        // selection scans start at the first editor content row.
+        var r: usize = 1;
         while (r < grid.rows) : (r += 1) {
             if (grid.rowHasBg(r, sel_bg)) {
                 sel_cleared = false;
@@ -5227,7 +5276,9 @@ test "visual line: Esc exits and clears the stale selection highlight" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
         sel_visible = false;
-        var r: usize = 0;
+        // Row 0 is the buffer tab bar: its active tab also uses bg_sel, so
+        // selection scans start at the first editor content row.
+        var r: usize = 1;
         while (r < grid.rows) : (r += 1) {
             if (grid.rowHasBg(r, sel_bg)) {
                 sel_visible = true;
@@ -5250,7 +5301,9 @@ test "visual line: Esc exits and clears the stale selection highlight" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
         sel_cleared = true;
-        var r: usize = 0;
+        // Row 0 is the buffer tab bar: its active tab also uses bg_sel, so
+        // selection scans start at the first editor content row.
+        var r: usize = 1;
         while (r < grid.rows) : (r += 1) {
             if (grid.rowHasBg(r, sel_bg)) {
                 sel_cleared = false;
@@ -5490,7 +5543,9 @@ test "visual line: gt buffer switch drops the selection highlight" {
         }
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
-        var r: usize = 0;
+        // Row 0 is the buffer tab bar: its active tab also uses bg_sel, so
+        // selection scans start at the first editor content row.
+        var r: usize = 1;
         while (r < grid.rows) : (r += 1) {
             if (grid.rowHasBg(r, sel_bg)) {
                 sel_visible = true;
@@ -5516,7 +5571,7 @@ test "visual line: gt buffer switch drops the selection highlight" {
     }
     try std.testing.expect(grid.contains("AAA"));
     var sel_cleared = true;
-    var r: usize = 0;
+    var r: usize = 1; // row 0 is the tab bar (active tab bg_sel)
     while (r < grid.rows) : (r += 1) {
         if (grid.rowHasBg(r, sel_bg)) {
             sel_cleared = false;
@@ -8122,7 +8177,9 @@ test "insert Ctrl+n: Esc dismisses the menu and stays in insert" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
         var any_hl = false;
-        var r: usize = 0;
+        // Row 0 is the buffer tab bar: its active tab also uses bg_sel, so
+        // selection scans start at the first editor content row.
+        var r: usize = 1;
         while (r < grid.rows) : (r += 1) {
             if (grid.rowHasBg(r, sel_bg)) {
                 any_hl = true;
@@ -8226,7 +8283,9 @@ test "insert Ctrl+n: no candidates when the cursor is not inside a word" {
         }
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
-        var r: usize = 0;
+        // Row 0 is the buffer tab bar: its active tab also uses bg_sel, so
+        // selection scans start at the first editor content row.
+        var r: usize = 1;
         while (r < grid.rows) : (r += 1) {
             if (grid.rowHasBg(r, sel_bg)) {
                 any_hl = true;
@@ -11963,9 +12022,11 @@ test "picker + tab: file rows and tabs carry devicons" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(grid.contains("NORMAL"));
-    // tab bar (row 0) icon: seti_zig glyph, constant color (surimiOrange)
+    // tab bar (row 0) icon: seti_zig glyph. The active tab now paints its
+    // icon with the theme accent marker color (demo nav-icon treatment);
+    // inactive tabs keep the devicon's semantic color.
     const zig_glyph = "\u{e6a9}";
-    try std.testing.expect(grid.containsFg(zig_glyph, packRgb(0xFF, 0xA0, 0x66)));
+    try std.testing.expect(grid.containsFg(zig_glyph, packRgb(0x7E, 0x9C, 0xD8)));
 
     // <leader>sf + "main" filters to src/main.zig; its picker row also
     // carries the zig icon before the path. Wait on the picker's own input
@@ -14225,7 +14286,13 @@ fn aiQuit(sess: *Session) !void {
 /// another printable byte can be parsed as an Alt sequence, so tests wait
 /// for this observable transition before typing editor keys.
 fn aiWaitRailFocus(sess: *Session, grid: *Grid, rail_col: usize, focused: bool, timeout_ms: i32) !void {
-    const want: u32 = if (focused) packRgb(0xE6, 0xC3, 0x84) else packRgb(0x72, 0x71, 0x69);
+    // Kanagawa-wave literals: the default-theme tests below. Theme-matrix
+    // tests pass their palette through aiWaitRailBorderColor instead.
+    const want: u32 = if (focused) packRgb(0xE6, 0xC3, 0x84) else packRgb(0x54, 0x54, 0x6D);
+    try aiWaitRailBorderColor(sess, grid, rail_col, want, timeout_ms);
+}
+
+fn aiWaitRailBorderColor(sess: *Session, grid: *Grid, rail_col: usize, want: u32, timeout_ms: i32) !void {
     var waited: i32 = 0;
     while (waited < timeout_ms) : (waited += 50) {
         if (grid.fg_buf[5 * grid.cols + rail_col] == want) return;
@@ -14500,10 +14567,13 @@ test "ui chrome: 120x30 rail header, rules, tabs and status boundary" {
     const content_col = aiTabsContentCol(rail_col);
     try std.testing.expectEqualStrings("│", aiCellText(&grid, tabs_row, content_col + 5));
     try std.testing.expectEqualStrings("│", aiCellText(&grid, tabs_row, content_col + 17));
-    // Active chat tab: accent bold text on bg_sel. The inactive badge stays
-    // on the rail background.
+    // Active chat tab: bold `fg` text on bg_sel with an accent_alt
+    // underline and accent marker; the inactive badge stays on the rail
+    // background.
     try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, tabs_row, content_col + 1));
-    try std.testing.expectEqual(packRgb(0xE6, 0xC3, 0x84), grid.fg_buf[tabs_row * grid.cols + content_col + 1]);
+    try std.testing.expectEqual(packRgb(0xDC, 0xD7, 0xBA), grid.fg_buf[tabs_row * grid.cols + content_col + 1]);
+    try frame.expectCellUl(&grid, tabs_row, content_col + 1, packRgb(0x7E, 0x9C, 0xD8));
+    try std.testing.expectEqual(packRgb(0x7E, 0x9C, 0xD8), grid.fg_buf[tabs_row * grid.cols + content_col]);
     try std.testing.expectEqual(aiRailBg(), aiCellBg(&grid, tabs_row, content_col + 7));
     try std.testing.expectEqualStrings("├", aiCellText(&grid, aiTabsSepRow(30), rail_col));
     try std.testing.expectEqualStrings("─", aiCellText(&grid, aiTabsSepRow(30), rail_col + 2));
@@ -14514,8 +14584,15 @@ test "ui chrome: 120x30 rail header, rules, tabs and status boundary" {
     try sess.send("d");
     try gridWaitFor(&sess, &grid, "no pending changes", 4000);
     try std.testing.expect(aiRowContains(&grid, tabs_row, "chat│ >changes 0 │ tools │ terminal"));
+    // Tab separators use the dim secondary accent, the `>` marker sits on
+    // the selection background, and the new label/underline follow it.
+    try std.testing.expectEqual(packRgb(0x7E, 0x9C, 0xD8), grid.fg_buf[tabs_row * grid.cols + content_col + 5]);
+    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, tabs_row, content_col + 6));
+    try std.testing.expectEqual(packRgb(0x7E, 0x9C, 0xD8), grid.fg_buf[tabs_row * grid.cols + content_col + 6]);
+    try frame.expectCellUl(&grid, tabs_row, content_col + 6, packRgb(0x7E, 0x9C, 0xD8));
     try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, tabs_row, content_col + 7));
-    try std.testing.expectEqual(packRgb(0xE6, 0xC3, 0x84), grid.fg_buf[tabs_row * grid.cols + content_col + 6]);
+    try std.testing.expectEqual(packRgb(0xDC, 0xD7, 0xBA), grid.fg_buf[tabs_row * grid.cols + content_col + 7]);
+    try frame.expectCellUl(&grid, tabs_row, content_col + 7, packRgb(0x7E, 0x9C, 0xD8));
     try sess.send("c");
     try gridWaitFor(&sess, &grid, ">chat│ changes 0", 4000);
 
@@ -14593,6 +14670,244 @@ test "ui chrome: 80x24 drawer header, tabs and status boundary" {
     try sess.send("\x1b"); // narrow drawer closes
     try gridWaitGone(&sess, &grid, "AGENTS", 3000);
     try aiQuit(&sess);
+}
+
+/// Palette literals for the theme-style e2e. Mirror the semantic slots in
+/// `src/theme.zig` (the e2e binary cannot import the app module); every value
+/// is the exact RGB the renderer must emit for that theme.
+const ThemeStyleCase = struct {
+    name: []const u8,
+    bg: u32,
+    bg_sel: u32,
+    fg: u32,
+    fg_dim: u32,
+    fg_faint: u32,
+    accent: u32,
+    accent_alt: u32,
+    win_sep: u32,
+    win_sep_active: u32,
+};
+
+const theme_style_cases = [_]ThemeStyleCase{
+    .{
+        .name = "kanagawa-wave",
+        .bg = packRgb(0x1F, 0x1F, 0x28),
+        .bg_sel = packRgb(0x2D, 0x4F, 0x67),
+        .fg = packRgb(0xDC, 0xD7, 0xBA),
+        .fg_dim = packRgb(0x72, 0x71, 0x69),
+        .fg_faint = packRgb(0x54, 0x54, 0x6D),
+        .accent = packRgb(0xE6, 0xC3, 0x84),
+        .accent_alt = packRgb(0x7E, 0x9C, 0xD8),
+        .win_sep = packRgb(0x54, 0x54, 0x6D),
+        .win_sep_active = packRgb(0xE6, 0xC3, 0x84),
+    },
+    .{
+        .name = "catppuccin-mocha",
+        .bg = packRgb(0x1E, 0x1E, 0x2E),
+        .bg_sel = packRgb(0x58, 0x5B, 0x70),
+        .fg = packRgb(0xCD, 0xD6, 0xF4),
+        .fg_dim = packRgb(0x7F, 0x84, 0x9C),
+        .fg_faint = packRgb(0x58, 0x5B, 0x70),
+        .accent = packRgb(0xF5, 0xE0, 0xDC),
+        .accent_alt = packRgb(0x89, 0xB4, 0xFA),
+        .win_sep = packRgb(0x58, 0x5B, 0x70),
+        .win_sep_active = packRgb(0xF5, 0xE0, 0xDC),
+    },
+    .{
+        .name = "flexoki-light",
+        .bg = packRgb(0xFF, 0xFC, 0xF0),
+        .bg_sel = packRgb(0xDA, 0xD8, 0xCE),
+        .fg = packRgb(0x10, 0x0F, 0x0F),
+        .fg_dim = packRgb(0x6F, 0x6E, 0x69),
+        .fg_faint = packRgb(0xB7, 0xB5, 0xAC),
+        .accent = packRgb(0xAD, 0x83, 0x01),
+        .accent_alt = packRgb(0x20, 0x5E, 0xA6),
+        .win_sep = packRgb(0xB7, 0xB5, 0xAC),
+        .win_sep_active = packRgb(0xAD, 0x83, 0x01),
+    },
+};
+
+/// The chrome colors every theme must produce, sampled from one live frame.
+const ThemeStyleSample = struct {
+    nav_tab_bg: u32 = 0,
+    nav_tab_fg: u32 = 0,
+    nav_tab_ul: u32 = 0,
+    nav_sep_fg: u32 = 0,
+    nav_border_fg: u32 = 0,
+    rail_border_fg: u32 = 0,
+    workbox_tab_bg: u32 = 0,
+    workbox_tab_fg: u32 = 0,
+    workbox_tab_ul: u32 = 0,
+    workbox_sep_fg: u32 = 0,
+    workbox_rule_fg: u32 = 0,
+    thread_marker_fg: u32 = 0,
+    thread_marker_bg: u32 = 0,
+    status_rule_fg: u32 = 0,
+    buffer_tab_fg: u32 = 0,
+    buffer_tab_ul: u32 = 0,
+};
+
+test "ui chrome: theme matrix colors active tabs, separators and focused borders" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var samples: [theme_style_cases.len]ThemeStyleSample = @splat(.{});
+    var sample_i: usize = 0;
+
+    for (theme_style_cases) |tc| {
+        var root_buf: [192]u8 = undefined;
+        const root = try bufPrintZ(&root_buf, "/tmp/oz_theme_{d}_{d}", .{ linux.getpid(), tmp_counter });
+        tmp_counter += 1;
+        defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        try std.Io.Dir.createDirAbsolute(io, root, .default_dir);
+
+        var fixture_buf: [224]u8 = undefined;
+        const fixture = try std.fmt.bufPrint(&fixture_buf, "{s}/fixture.txt", .{root});
+        {
+            const f = try std.Io.Dir.createFileAbsolute(io, fixture, .{ .truncate = true });
+            defer f.close(io);
+            try f.writeStreamingAll(io, "theme matrix fixture\n");
+        }
+
+        var home_buf: [224]u8 = undefined;
+        const home = try std.fmt.bufPrint(&home_buf, "{s}/home", .{root});
+        try std.Io.Dir.createDirAbsolute(io, home, .default_dir);
+        var cache_buf: [256]u8 = undefined;
+        const cache_dir = try std.fmt.bufPrint(&cache_buf, "{s}/.cache", .{home});
+        try std.Io.Dir.createDirAbsolute(io, cache_dir, .default_dir);
+        var oz_cache_buf: [288]u8 = undefined;
+        const oz_cache = try std.fmt.bufPrint(&oz_cache_buf, "{s}/oz", .{cache_dir});
+        try std.Io.Dir.createDirAbsolute(io, oz_cache, .default_dir);
+        // This is the production load seam (`loadTheme`): a fresh HOME plus
+        // ~/.cache/oz/theme, not a test-only env override.
+        var theme_path_buf: [320]u8 = undefined;
+        const theme_path = try std.fmt.bufPrint(&theme_path_buf, "{s}/theme", .{oz_cache});
+        {
+            const f = try std.Io.Dir.createFileAbsolute(io, theme_path, .{ .truncate = true });
+            defer f.close(io);
+            try f.writeStreamingAll(io, tc.name);
+            try f.writeStreamingAll(io, "\n");
+        }
+
+        var mock_buf: [224]u8 = undefined;
+        const mock = try std.fmt.bufPrint(&mock_buf, "{s}/mock", .{root});
+        try std.Io.Dir.createDirAbsolute(io, mock, .default_dir);
+
+        const home_env = try std.fmt.allocPrint(alloc, "HOME={s}", .{home});
+        defer alloc.free(home_env);
+        const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{mock});
+        defer alloc.free(mock_env);
+        const env_extra = [_][]const u8{ home_env, mock_env, "OZ_AI_MODEL=mock-model" };
+
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "fixture.txt" }, &env_extra, 30, 120, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(alloc, 30, 120);
+        defer grid.deinit(alloc);
+
+        try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+        try gridWaitFor(&sess, &grid, "theme matrix fixture", 5000);
+        try sess.send(" e");
+        try gridWaitFor(&sess, &grid, "╭─ files", 5000);
+
+        var sample = ThemeStyleSample{};
+        const nav_row = navTabsRow();
+        sample.nav_tab_bg = aiCellBg(&grid, nav_row, navTabCol(0));
+        sample.nav_tab_fg = grid.fg_buf[nav_row * grid.cols + navTabCol(0)];
+        sample.nav_tab_ul = frame.cellUl(&grid, nav_row, navTabCol(0));
+        sample.nav_sep_fg = grid.fg_buf[nav_row * grid.cols + 9]; // "│" at x=9
+        // Navigator owns the keyboard after <leader>e: active panel border.
+        sample.nav_border_fg = grid.fg_buf[2 * grid.cols + 0];
+
+        try std.testing.expectEqual(tc.bg_sel, sample.nav_tab_bg);
+        try std.testing.expectEqual(tc.fg, sample.nav_tab_fg);
+        try std.testing.expectEqual(tc.accent_alt, sample.nav_tab_ul);
+        try std.testing.expect(frame.cellUnderlined(&grid, nav_row, navTabCol(0)));
+        try std.testing.expectEqual(tc.accent_alt, sample.nav_sep_fg);
+        try std.testing.expect(sample.nav_sep_fg != tc.fg_faint);
+        try std.testing.expectEqual(tc.win_sep_active, sample.nav_border_fg);
+
+        try sess.send(" a");
+        try gridWaitFor(&sess, &grid, "AGENTS", 5000);
+        try gridWaitFor(&sess, &grid, "❯ ", 4000);
+
+        const rail_col = aiRailCol(120);
+        const tabs_row = aiTabsRow(30);
+        const content_col = aiTabsContentCol(rail_col);
+        sample.nav_border_fg = grid.fg_buf[2 * grid.cols + 0]; // now inactive
+        sample.rail_border_fg = grid.fg_buf[5 * grid.cols + rail_col];
+        sample.workbox_tab_bg = aiCellBg(&grid, tabs_row, content_col + 1);
+        sample.workbox_tab_fg = grid.fg_buf[tabs_row * grid.cols + content_col + 1];
+        sample.workbox_tab_ul = frame.cellUl(&grid, tabs_row, content_col + 1);
+        // The first tab separator sits right after "chat".
+        sample.workbox_sep_fg = grid.fg_buf[tabs_row * grid.cols + content_col + 5];
+        sample.workbox_rule_fg = grid.fg_buf[aiTabsSepRow(30) * grid.cols + rail_col + 2];
+        // Attached thread row (the rail header is row 0, the workspace
+        // group row 1, thread rows start at row 2). Prompt focus puts the
+        // active row on bg_sel and its `>` marker on accent_alt.
+        sample.thread_marker_fg = grid.fg_buf[2 * grid.cols + rail_col + 2];
+        sample.thread_marker_bg = grid.bg_buf[2 * grid.cols + rail_col + 2];
+        sample.status_rule_fg = grid.fg_buf[28 * grid.cols + 0];
+
+        // The buffer tab bar lives at row 0 from contentCol (31 with the
+        // navigator open). Find the active tab's accent underline.
+        sample.buffer_tab_fg = 0;
+        sample.buffer_tab_ul = 0;
+        var bc: usize = 31;
+        while (bc < 70) : (bc += 1) {
+            if (grid.bg_buf[bc] == tc.bg_sel and
+                grid.fg_buf[bc] == tc.fg and
+                frame.cellUl(&grid, 0, bc) == tc.accent_alt and
+                frame.cellUnderlined(&grid, 0, bc))
+            {
+                sample.buffer_tab_fg = grid.fg_buf[bc];
+                sample.buffer_tab_ul = frame.cellUl(&grid, 0, bc);
+                break;
+            }
+        }
+
+        // The active workbox tab and buffer tab use the shared style; rules
+        // and separators use the theme's secondary accent, never the old
+        // fixed gray.
+        try std.testing.expectEqual(tc.bg_sel, sample.workbox_tab_bg);
+        try std.testing.expectEqual(tc.fg, sample.workbox_tab_fg);
+        try std.testing.expectEqual(tc.accent_alt, sample.workbox_tab_ul);
+        try std.testing.expect(frame.cellUnderlined(&grid, tabs_row, content_col + 1));
+        try std.testing.expectEqual(tc.accent_alt, sample.workbox_sep_fg);
+        try std.testing.expectEqual(tc.accent_alt, sample.workbox_rule_fg);
+        try std.testing.expectEqual(tc.accent_alt, sample.thread_marker_fg);
+        try std.testing.expectEqual(tc.bg_sel, sample.thread_marker_bg);
+        try std.testing.expectEqual(tc.accent_alt, sample.status_rule_fg);
+        try std.testing.expectEqual(tc.win_sep, sample.nav_border_fg);
+        try std.testing.expectEqual(tc.win_sep_active, sample.rail_border_fg);
+        try std.testing.expectEqual(tc.fg, sample.buffer_tab_fg);
+        try std.testing.expectEqual(tc.accent_alt, sample.buffer_tab_ul);
+
+        samples[sample_i] = sample;
+        sample_i += 1;
+
+        // Return focus to the editor before `:q!`; an immediate Esc+":"
+        // would be decoded as an Alt sequence.
+        try sess.send("\x1b");
+        try aiWaitRailBorderColor(&sess, &grid, rail_col, tc.win_sep, 3000);
+        try aiQuit(&sess);
+    }
+
+    // Prove the rendered bytes differ per theme (not just that each theme's
+    // literal was hardcoded in the assertions): the accent underline,
+    // separator and focused-border samples must all be distinct.
+    var i: usize = 0;
+    while (i < samples.len) : (i += 1) {
+        var j: usize = i + 1;
+        while (j < samples.len) : (j += 1) {
+            try std.testing.expect(samples[i].nav_tab_ul != samples[j].nav_tab_ul);
+            try std.testing.expect(samples[i].nav_tab_bg != samples[j].nav_tab_bg);
+            try std.testing.expect(samples[i].workbox_sep_fg != samples[j].workbox_sep_fg);
+            try std.testing.expect(samples[i].status_rule_fg != samples[j].status_rule_fg);
+            try std.testing.expect(samples[i].thread_marker_fg != samples[j].thread_marker_fg);
+            try std.testing.expect(samples[i].rail_border_fg != samples[j].rail_border_fg);
+        }
+    }
 }
 
 test "ai workspace: thread B streams while A is frozen; transcripts never mix" {

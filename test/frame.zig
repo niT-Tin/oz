@@ -63,6 +63,18 @@ pub fn cellFg(grid: anytype, row: usize, col: usize) u32 {
     return grid.fg_buf[row * grid.cols + col];
 }
 
+/// SGR 58 underline color of one cell (0 = terminal default).
+pub fn cellUl(grid: anytype, row: usize, col: usize) u32 {
+    if (row >= grid.rows or col >= grid.cols) return 0;
+    return grid.ul_buf[row * grid.cols + col];
+}
+
+/// True when the cell has an SGR 4 single underline.
+pub fn cellUnderlined(grid: anytype, row: usize, col: usize) bool {
+    if (row >= grid.rows or col >= grid.cols) return false;
+    return grid.ul_on_buf[row * grid.cols + col];
+}
+
 fn widthOfGlyph(text: []const u8) usize {
     if (text.len == 0) return 1;
     const cp = std.unicode.utf8Decode(text) catch return 1;
@@ -115,6 +127,24 @@ pub fn expectCellBg(grid: anytype, row: usize, col: usize, color: u32) !void {
         std.debug.print("cell bg mismatch at ({d},{d}): expected #{x:0>6}, got #{x:0>6}\n", .{
             row, col, color, got,
         });
+        return error.TestUnexpectedResult;
+    }
+}
+
+pub fn expectCellUl(grid: anytype, row: usize, col: usize, color: u32) !void {
+    if (row >= grid.rows or col >= grid.cols) {
+        std.debug.print("cell out of bounds: ({d},{d}) grid {d}x{d}\n", .{ row, col, grid.rows, grid.cols });
+        return error.TestUnexpectedResult;
+    }
+    const got = cellUl(grid, row, col);
+    if (got != color) {
+        std.debug.print("cell underline mismatch at ({d},{d}): expected #{x:0>6}, got #{x:0>6}\n", .{
+            row, col, color, got,
+        });
+        return error.TestUnexpectedResult;
+    }
+    if (!cellUnderlined(grid, row, col)) {
+        std.debug.print("cell at ({d},{d}) has underline color but SGR 4 is off\n", .{ row, col });
         return error.TestUnexpectedResult;
     }
 }
