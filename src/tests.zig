@@ -51,6 +51,8 @@ pub const ai_config = @import("ai/config.zig");
 pub const ai_client = @import("ai/client.zig");
 pub const ai_panel = @import("ai/panel.zig");
 pub const ai_workspace = @import("ai/workspace.zig");
+// M3 tool protocol (pure; no execution or App wiring)
+pub const ai_tools = @import("ai/tools.zig");
 
 test {
     std.testing.refAllDecls(@This());
