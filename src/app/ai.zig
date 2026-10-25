@@ -2448,10 +2448,29 @@ fn drawToolsTab(
     const mm = metrics.?;
     const calls = mm.totalCalls();
     const avg = mm.averageMs();
-    const summary = if (avg) |value|
-        try std.fmt.allocPrint(a, "tools · {d} calls · avg {d}ms", .{ calls, value })
-    else
-        try std.fmt.allocPrint(a, "tools · {d} calls · no durations", .{calls});
+    const p95 = mm.p95RecentMs();
+    const content_w = w -| 3;
+    const width_cells: usize = content_w;
+
+    // Summary candidates are tried widest first; the compact fallback keeps
+    // `p95` visible on the 34/38-cell rail and the 80-column drawer, and the
+    // last candidate is still clipped by drawRailTextRow (never overflows).
+    // Strings come from the frame allocator: vaxis retains grapheme slices
+    // until the frame flush, so stack buffers would be reused too early.
+    const summary: []const u8 = if (avg) |value| blk: {
+        if (p95) |p| {
+            const full = try std.fmt.allocPrint(a, "tools · {d} calls · avg {d}ms · p95 {d}ms", .{ calls, value, p });
+            if (autil.cellWidth(win, full) <= width_cells) break :blk full;
+            const mid = try std.fmt.allocPrint(a, "{d} calls · avg {d}ms · p95 {d}ms", .{ calls, value, p });
+            if (autil.cellWidth(win, mid) <= width_cells) break :blk mid;
+            const compact = try std.fmt.allocPrint(a, "avg {d}ms · p95 {d}ms", .{ value, p });
+            if (autil.cellWidth(win, compact) <= width_cells) break :blk compact;
+            break :blk try std.fmt.allocPrint(a, "p95 {d}ms", .{p});
+        }
+        const full = try std.fmt.allocPrint(a, "tools · {d} calls · avg {d}ms", .{ calls, value });
+        if (autil.cellWidth(win, full) <= width_cells) break :blk full;
+        break :blk try std.fmt.allocPrint(a, "avg {d}ms", .{value});
+    } else try std.fmt.allocPrint(a, "tools · {d} calls · no durations", .{calls});
     if (m.body_rows > 0) {
         try drawRailTextRow(self, win, a, m.body_top, x, w, border_style, rail_bg, summary, st.bold);
     }
@@ -2473,7 +2492,6 @@ fn drawToolsTab(
         // row 1: name + call count (right-aligned count). Clip the name to
         // the rail width before handing it to vaxis: unknown tool names can
         // be long and must never spill past the border.
-        const content_w = w -| 3;
         const head = buffer.utf8.truncateWidth(stats.name, content_w);
         var head_segs = std.ArrayList(vaxis.Segment).empty;
         defer head_segs.deinit(a);
@@ -2501,10 +2519,20 @@ fn drawToolsTab(
         try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, counts, st.dim);
         y += 1;
 
-        const latency = if (stats.averageMs()) |avg_ms|
-            try std.fmt.allocPrint(a, "avg {d}ms · max {d}ms", .{ avg_ms, stats.max_ms })
-        else
-            try a.dupe(u8, "no latency samples");
+        // p95 is the tool's own recent window (≤32 real samples); avg/max
+        // stay all-time. Drop max first, then avg, rather than overflow.
+        const latency: []const u8 = if (stats.averageMs()) |avg_ms| blk: {
+            if (stats.p95RecentMs()) |p| {
+                const full = try std.fmt.allocPrint(a, "avg {d}ms · p95 {d}ms · max {d}ms", .{ avg_ms, p, stats.max_ms });
+                if (autil.cellWidth(win, full) <= width_cells) break :blk full;
+                const compact = try std.fmt.allocPrint(a, "avg {d}ms · p95 {d}ms", .{ avg_ms, p });
+                if (autil.cellWidth(win, compact) <= width_cells) break :blk compact;
+                break :blk try std.fmt.allocPrint(a, "p95 {d}ms", .{p});
+            }
+            const plain = try std.fmt.allocPrint(a, "avg {d}ms · max {d}ms", .{ avg_ms, stats.max_ms });
+            if (autil.cellWidth(win, plain) <= width_cells) break :blk plain;
+            break :blk try std.fmt.allocPrint(a, "avg {d}ms", .{avg_ms});
+        } else "no latency samples";
         try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, latency, st.dim);
         y += 1;
     }

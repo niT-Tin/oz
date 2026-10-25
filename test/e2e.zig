@@ -1034,6 +1034,27 @@ fn gridWaitFor(sess: *Session, grid: *Grid, needle: []const u8, timeout_ms: i32)
     try std.testing.expect(grid.contains(needle));
 }
 
+/// Parse the first visible `<label><n>ms` pair (label includes its trailing
+/// space, e.g. `"avg "` / `"p95 "`). Used to prove the Tools-tab latency text
+/// is a real number from the recorded samples, not a fabricated constant.
+fn gridMetricMs(grid: *Grid, label: []const u8) ?u32 {
+    var r: usize = 0;
+    while (r < grid.rows) : (r += 1) {
+        const text = grid.rowText(r);
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, text, from, label)) |at| {
+            var i = at + label.len;
+            const start = i;
+            while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {}
+            if (i > start and i + 2 <= text.len and std.mem.eql(u8, text[i .. i + 2], "ms")) {
+                return std.fmt.parseInt(u32, text[start..i], 10) catch null;
+            }
+            from = at + label.len;
+        }
+    }
+    return null;
+}
+
 // ---- feat/mouse: pty mouse-sequence helpers (SGR 1006, CELL coordinates) ----
 //
 // vaxis parses SGR mouse reports as 0-based cells; the wire format is
@@ -15961,6 +15982,7 @@ test "ai workspace: workbox tabs show honest empty states and badge 0" {
     try sess.send("t");
     try gridWaitFor(&sess, &grid, "no tool calls yet", 3000);
     try std.testing.expect(!grid.contains("avg "));
+    try std.testing.expect(!grid.contains("p95 "));
     try std.testing.expect(!grid.contains("calls 1"));
     try std.testing.expect(!grid.contains("older"));
 
@@ -17134,10 +17156,23 @@ test "tools: read_file loop renders card, executes against the workspace, metric
     try gridWaitFor(&sess, &grid, "calls 1", 5000);
     try gridWaitFor(&sess, &grid, "ok 1", 5000);
     try gridWaitFor(&sess, &grid, "avg ", 5000);
+    try gridWaitFor(&sess, &grid, "p95 ", 5000);
     try gridWaitFor(&sess, &grid, "max ", 5000);
     try gridWaitFor(&sess, &grid, "older", 5000);
     try gridWaitFor(&sess, &grid, "now", 5000);
     try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+    // p95 is real: exactly one executed call, so avg == p95 and both are a
+    // plausible millisecond duration (the mock has no injected latency).
+    const avg_ms = gridMetricMs(&grid, "avg ") orelse {
+        grid.dump();
+        return error.TestUnexpectedResult;
+    };
+    const p95_ms = gridMetricMs(&grid, "p95 ") orelse {
+        grid.dump();
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expect(p95_ms <= 60_000);
+    try std.testing.expectEqual(avg_ms, p95_ms);
     // Metrics are real: exactly one call, no fabricated baseline rows.
     try std.testing.expect(!grid.contains("grep · calls"));
     try std.testing.expect(!grid.contains("no tool calls yet"));
@@ -17989,6 +18024,7 @@ test "approval: apply_patch stages, approve patches the buffer, undo and :w beha
     try gridWaitFor(&sess, &grid, "ok 1 · err 0 · appr 1", 5000);
     try gridWaitFor(&sess, &grid, "apply_patch", 3000);
     try gridWaitFor(&sess, &grid, "no latency samples", 3000);
+    try std.testing.expect(!grid.contains("p95 "));
     try sess.send("\x1b");
     try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
 
@@ -18777,6 +18813,7 @@ test "tools: 80x24 drawer fits cards/chart and a hint expands the card" {
     try sess.send("t");
     try gridWaitFor(&sess, &grid, "calls 1", 5000);
     try gridWaitFor(&sess, &grid, "avg ", 5000);
+    try gridWaitFor(&sess, &grid, "p95 ", 5000);
     try gridWaitFor(&sess, &grid, "older", 5000);
     try gridWaitFor(&sess, &grid, "now", 5000);
     try frame.expectNoHorizontalOverflow(&grid, grid.cols);
@@ -19401,7 +19438,26 @@ const scenario_matrix = [_]Scenario{
         // The final frame shows the Tools tab, so the card excerpt is
         // asserted by the step above (and by request_contains); the Tools
         // tab itself proves the real call count/chart.
-        .expect_text = &.{ "read_file", "calls 1", "older" },
+        .expect_text = &.{ "read_file", "calls 1", "p95 ", "older" },
+        .request_contains = &.{ "\"tool_choice\":\"auto\"", "\"role\":\"tool\"", "TOOL_SCENARIO_MARKER", "read_file" },
+    },
+    .{
+        .name = "ai tools read 100x30",
+        .tags = &.{ "@layout", "@ai", "@tools", "@100col" },
+        .rows = 30,
+        .cols = 100,
+        .setup = .ai_mock,
+        .tool_fixture = true,
+        .rail = .docked,
+        .prompt = "read the scenario fixture",
+        .steps = &.{
+            .{ .keys = "", .wait_for = "TOOL_SCENARIO_MARKER" },
+            .{ .keys = "\t", .wait_for = "thread 1" },
+            .{ .keys = "t", .wait_for = "calls 1" },
+        },
+        // 100 columns uses the 34-cell rail; the compact latency fallback must
+        // still show p95 without clipping the labels.
+        .expect_text = &.{ "read_file", "calls 1", "avg ", "p95 ", "older" },
         .request_contains = &.{ "\"tool_choice\":\"auto\"", "\"role\":\"tool\"", "TOOL_SCENARIO_MARKER", "read_file" },
     },
     .{

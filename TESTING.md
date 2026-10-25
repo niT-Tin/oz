@@ -17,8 +17,8 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-Current counts on `feat/mouse` (based on `fix/editing-terminal` 1b47588):
-**529 unit tests** and **195 e2e tests**. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
+Current counts on `feat/metrics-p95` (based on mouse `9b7cd86`):
+**531 unit tests** and **195 e2e tests**. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
 `.verify/verify.json` (schema version 1, git commit/dirty flag, exact command
 strings, timestamps, exit codes, log SHA-256s, parsed pass/fail counts). It
 runs every command even after a failure and exits non-zero if any command
@@ -36,7 +36,7 @@ replaying a cached successful run.
 
 | Layer | What it covers | Where |
 |---|---|---|
-| **Model/unit (L1)** | Pure logic: piece table, motions, keymaps, SSE/OpenAI config parsing, AI workspace layout/focus/thread model, navigator tab model, note store (paths/titles/sorting/creation), inline selection mapping/fences/diff/pending policy, M3a agent loop bounds/card formatting/metrics/chart cache key + transcript→request assembly, M3b1 staged `edit_file` args/occurrence/span/bounded-preview/pending policy and approval decision metrics; M3b2 single-file unified-diff parse/apply, whole-file patch pending, bounded hunk preview and `verifyPatch` | `src/**/*.zig` `test` blocks, aggregated by `src/tests.zig` |
+| **Model/unit (L1)** | Pure logic: piece table, motions, keymaps, SSE/OpenAI config parsing, AI workspace layout/focus/thread model, navigator tab model, note store (paths/titles/sorting/creation), inline selection mapping/fences/diff/pending policy, M3a agent loop bounds/card formatting/metrics/chart cache key + transcript→request assembly, M3c recent-window p95 (nearest-rank, ring wraparound, empty→null, no revision change), M3b1 staged `edit_file` args/occurrence/span/bounded-preview/pending policy and approval decision metrics; M3b2 single-file unified-diff parse/apply, whole-file patch pending, bounded hunk preview and `verifyPatch` | `src/**/*.zig` `test` blocks, aggregated by `src/tests.zig` |
 | **Protocol fixtures** | SSE chunking, request JSON (incl. assistant tool-call turns and `role:"tool"` results), streamed `tool_calls` fragments/parallel calls/malformed protocol, config env parsing, AI client cancellation/error paths; mock LSP JSON-RPC | `src/ai/sse.zig`, `src/ai/openai.zig`, `src/ai/tools.zig`, `src/ai/client.zig`, `src/ai/config.zig`, mock LSP tests |
 | **Semantic frames (L3)** | Real `oz` binary in a pty; ANSI stream reconstructed into a cell grid; assertions on regions, borders, text, overlap, overflow | `test/e2e.zig` + `test/frame.zig` |
 | **Scenario matrix** | Data-driven pairwise matrix over terminal widths, filetree, and AI rail states; fresh pty per scenario; tags enforced | `test/e2e.zig` (`scenario_matrix`) |
@@ -226,7 +226,8 @@ The M3a pty tests (`test/e2e.zig`, filter `tools:`) cover:
 
 - a real `read_file` through two mock rounds: card running→ok, result excerpt,
   follow-up `request-2.json` with assistant `tool_calls` + `role:"tool"` +
-  `tool_call_id`, Tools tab `calls 1`/`ok 1`/avg/max and a braille chart;
+  `tool_call_id`, Tools tab `calls 1`/`ok 1`/avg/p95/max and a braille chart
+  (the single real sample makes `avg == p95`; a parsed p95 must be ≤60s);
 - parallel `read_file` + `grep` calls in one delta: both cards, both
   `tool_call_id`s in the follow-up, `2 calls`, chart;
 - a missing file: real `error:` card and `ok 0 · err 1`, while the follow-up
@@ -252,16 +253,20 @@ The M3a pty tests (`test/e2e.zig`, filter `tools:`) cover:
 
 The unit tests pin the bounded loop admission (`planBatch`), limit notes,
 card status/argument/excerpt formatting, metrics average/max/ring/revision,
+M3c p95 nearest-rank across 1/2/20/21/32 samples (duplicates, all-equal,
+unsorted, ring wraparound, empty→null, revision/ring/counters untouched),
 chart cache-key invalidation, `assistant tool_calls`/tool-result wire JSON, and
 the transcript message order used by the follow-up request.
 
 Known gaps at M3a (intentional, documented in DESIGN §20.8): metrics are
-session/per-thread only (no cross-session persistence, no p95); calls
-cancelled before their worker result is applied are not counted; `edit_file`
-approval is M3b1 while `apply_patch`/terminal remain M3b; tool-card expansion
-is hint-only (no mouse/card cursor); the chart legend lists tool names but has
-no per-series average annotation. The `stream-<n>.sse` seam is test-only and never used against a
-real provider.
+session/per-thread only (no cross-session persistence); calls cancelled
+before their worker result is applied are not counted; `edit_file` approval is
+M3b1 while `apply_patch`/terminal remain M3b; tool-card expansion is
+hint-only (no mouse/card cursor); the chart legend lists tool names but has no
+per-series average annotation. p95 covers only the per-tool recent window
+(≤32 real samples; header pools those windows, ≤256), so it is not an
+all-time percentile. The `stream-<n>.sse` seam is test-only and never used
+against a real provider.
 
 ### M3b1 staged edit approval fixtures and e2e
 
@@ -360,6 +365,25 @@ patch/target/result and ≤256 hunks/16K hunk lines; no terminal, approval
 queue, cross-session persistence or mouse; the model transcript keeps the
 original "staged/not applied" result after a later local approval.
 
+### M3c recent-window p95
+
+`Stats.p95RecentMs() ?u32` is the integer nearest-rank p95 of the tool's
+`recent` ring: ascending sort, 0-based `ceil(0.95*n)-1`, clamped; n=0 → null.
+It uses a fixed `[recent_capacity]u32` stack copy (no heap allocation) and
+never touches `revision`, counters, chart samples or the ring itself. The
+Tools-tab header uses `Metrics.p95RecentMs()`, which pools each tool's recent
+window (≤32 per tool, ≤256 total) with the same nearest-rank rule; that
+pooling is explicit in DESIGN §20.11 so the header is not misread as a
+"last 32 calls overall" statistic.
+
+The pty tests extend the existing tools tests rather than adding new test
+blocks: 120x30 asserts the `p95 ` label, parses it and checks it is ≤60s and
+equal to `avg` for the one real sample; the 80x24 drawer asserts the label
+still fits with no horizontal overflow; the empty Tools tab and an
+approval-only tool (no latency sample) assert p95 does **not** appear; the
+scenario matrix's `ai tools read 120x30` and `ai tools read 100x30` rows also
+expect `p95 `. No golden changes: neither golden frame renders the Tools tab.
+
 ### Property tests
 
 `src/ai/workspace.zig` sweeps deterministic invariants (fast, no RNG):
@@ -419,6 +443,7 @@ original "staged/not applied" result after a later local approval.
 | Notes path fallback/error handling | L1 resolution/creation tests + L3 unavailable-dir e2e (`OZ_NOTES_DIR=/dev/null/notes`) |
 | Inline assistant (selection→prompt→stream→Changes diff→Approve/Reject, stale, cancel, 80-col, hints) | L1 `src/app/inline.zig` + L3 `inline:` tests + `@inline` scenario |
 | Staged agent writes (`edit_file` + `apply_patch`: parse/occurrence/hunk/diff/stale/one pending), approve buffer+undo, reject, 80-col hints, thread scoping | L1 `src/app/agent_edit.zig` + `src/app/agent_patch.zig` + `src/ai/agent.zig` decision metrics + L3 `approval:` tests + `@approval` scenarios |
+| M3 tool metrics (counts, avg/max, recent-window nearest-rank p95, 32-sample chart, empty/approval-only states, 80/100/120 fit) | L1 `src/ai/agent.zig` p95/metrics tests + L3 `tools:` tests + `@tools` scenario |
 | Mock LSP protocol | L4 mock server e2e |
 | Deterministic build/test run | `tools/verify.sh` + CI |
 

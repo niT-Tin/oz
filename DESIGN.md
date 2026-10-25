@@ -1173,8 +1173,10 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 - Chat 中每个 tool call 显示紧凑卡片：name、参数摘要、状态（running/ok/error/denied）、耗时、结果摘要；失败不能伪装成功。
 - Workbox `Tools` tab：按工具聚合
   - calls / ok / error / denied
-  - average / p95?（先 avg + max）
-  - 最近 N 次耗时 ring buffer（每工具固定容量，例如 64）
+  - average / max（该工具全部真实执行样本）
+  - **p95**（该工具最近至多 32 次真实执行样本的整数 nearest-rank：`ceil(0.95*n)-1`，clamp 到 `[0, n-1]`；n=0 时没有值，显示 `no latency samples`，绝不伪造 0ms）
+  - 最近 32 次耗时 ring buffer（每工具固定 `recent_capacity = 32`；p95 和图表共用这同一批真实样本）
+  - Tools tab 顶栏的聚合 p95 汇总每个工具各自的 recent window（每工具 ≤32，最多 8 工具 = ≤256 个真实样本，仍为 nearest-rank）；per-tool 卡片则只统计该工具的窗口。两者语义在 §20.11 固定。
   - 折线图使用 `src/chart.zig`（M3a 已接入 Tools tab），窄屏 fallback sparkline；没有数据时显示真实空状态。
 - Metrics 只统计真实调用；mock/e2e 数据不得进入发布 UI。
 - 图表只在数据变化时重算，按 workbox 尺寸缓存；普通帧 O(visible cards)，不每帧重跑 diff/chart。
@@ -1185,7 +1187,8 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 - **M3a（已完成，2026-10-25）**：只读 executor + tool loop + Chat tool cards + Tools tab 真实统计 + chart 接入 + 审批占位；e2e mock。实现状态见 §20.8。
 - **M3b1（已完成，2026-10-25）**：`edit_file` staged diff + 人工 approve/reject + buffer-only apply/undo、审批按钮 hint、`approved`/`rejected` 卡片与 decision metrics。实现状态见 §20.9。
 - **M3b2（已完成，2026-10-25）**：`apply_patch` 单文件 unified diff 解析/校验/整文件 staged 替换 + 同一 approve/reject/undo 路径；多文件与 terminal 仍不支持。实现状态见 §20.10。
-- **M3b 余下**：terminal 沙箱/明确确认、更多 metrics（p95、跨会话持久化）、性能基准。
+- **M3c（已完成，2026-10-26）**：每工具 recent-window p95（整数 nearest-rank，≤32 个真实样本）+ Tools tab 卡片/顶栏展示与 80/100/120 紧凑 fallback。实现状态见 §20.11。
+- **M3b 余下**：terminal 沙箱/明确确认、跨会话 metrics 持久化、性能基准。
 - **后续**：terminal tool（独立沙箱/明确确认）、MCP/ACP、跨会话 metrics 持久化。
 
 ### 20.7 测试
@@ -1221,7 +1224,7 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 **UI**
 
 - Chat tool card：2–4 行紧凑卡片（icon + name + 右对齐状态；args summary；结果 excerpt / `not executed` / `⋯ working`），running/ok/error/approval/unsupported/cancelled 有不同 icon/颜色/文案；卡片是 transcript 行，随 Chat 滚动。`<leader>j` target 注册在可见卡片首行，激活切换 `tool_expanded`（最多 8 行真实结果 + `…`）。不伪造结果。
-- Tools tab：无 metrics 显示 `no tool calls yet`（空状态真实）；有数据时第一行 `tools · N calls · avg Xms`，每个工具 3 行 `name · calls N` / `ok · err [· appr · unsup]` / `avg · max`（没有执行样本时 `no latency samples`）；工具多时显示 `+N more tools`。
+- Tools tab：无 metrics 显示 `no tool calls yet`（空状态真实）；有数据时第一行 `tools · N calls · avg Xms · p95 Yms`（窄栏按 34/38 cells 与 80 drawer 依次退化为 `N calls · avg Xms · p95 Yms` → `avg Xms · p95 Yms` → `p95 Yms`），每个工具 3 行 `name · calls N` / `ok · err [· appr · unsup]` / `avg Xms · p95 Yms · max Zms`（放不下时先掉 max，再退化为 `p95 Yms`；没有执行样本时 `no latency samples`）；工具多时显示 `+N more tools`。
 - Chart：有执行样本时用 `chart.render`（≥24×4 braille，否则 sparkline）渲染所有工具最近 32 个真实 duration，legend 为工具名，轴为 `0ms`/y_max + `older`/`now`。`ChartCache` 以 (thread, metrics.revision, width, height) 为 key；只有 metrics 变化或布局变化才重算，画布 cell 直接复制到 vaxis。颜色取主题 syntax palette（最多 8 series）。
 - 状态：thread list/workbench header/status bar 在 batch 或 follow-up pending 时显示 `tools…`（不是 `idle`/`streaming…`）；完成后恢复正常状态。
 - 80x24 drawer：按 body_rows 预算 visible cards + chart 高度（chart 最小 2 行，否则省略），所有行由 `drawRailRow` 精确填满，不越界；hint label 只画在 panel 内。card 名称/状态/arguments 在 80 列下按 cell 截断。
@@ -1230,7 +1233,7 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 
 - 只执行 `read_file`/`list_directory`/`grep`；写入工具在 M3a 永远返回 approval/unsupported，不创建 pending diff、不写盘。没有 terminal/shell/网络工具。（M3b1 扩展见 §20.9：`edit_file` 在 App 层 staged，executor 仍然只读。）
 - `read_file`/`grep` 只读 workspace root（拒绝绝对路径、`..`、NUL、越界 symlink；输出 workspace-relative）。这是 best-effort confinement，不声称 TOCTOU 安全（与 §20.3 一致）。
-- metrics 是 per-thread、session 级、不持久化；被取消/被 generation 丢弃的 in-flight 调用不计数（只统计真正应用回该 thread 的结果）。没有 p95、没有跨会话图表、没有 mock 数据注入发布 UI。
+- metrics 是 per-thread、session 级、不持久化；被取消/被 generation 丢弃的 in-flight 调用不计数（只统计真正应用回该 thread 的结果）。p95（§20.11）只覆盖每工具最近 ≤32 个真实样本；没有跨会话图表、没有 mock 数据注入发布 UI。
 - tool card 展开通过 hint 或鼠标点击（见 §21）；M3b 再加审批按钮与完整 hint 覆盖。
 - 最终 no-tools turn 由 `agent.max_*` 常量触发；如果 provider 忽略无 tools 请求仍返回 tool_calls，只记录 unsupported 后停止（有界）。
 - 未新增 terminal/MCP/ACP；`ai/tool_exec.zig` 的 caps 与 §20.3 一致。
@@ -1349,6 +1352,35 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 - `zig build test`：491/491 通过（新增 17 个 `agent_patch`/`agent_edit` 纯模型单测）。
 - `zig build e2e`：175/175 通过（新增 5 个 M3b2 pty 测试；scenario matrix 新增 `ai patch approval 120x30`）。
 - 无 golden 变更（approval diff/卡片不进入固定 golden 帧）。
+
+---
+
+### 20.11 M3c 实现状态（recent-window p95，2026-10-26）
+
+**语义（唯一事实来源）**
+
+- `agent.Stats.p95RecentMs() ?u32`：只统计该工具 **最近至多 32 次真实执行**（ok/error；approval_required/unsupported/denied 没有耗时样本）的 `recent` ring。整数 nearest-rank：升序排序后取 0-based `ceil(0.95*n)-1`，并 clamp 到 `[0, n-1]`；n=0 → `null`，绝不返回伪造的 `0ms`。
+- `agent.Metrics.p95RecentMs() ?u32`：Tools tab **顶栏**使用，按工具收集各自的 recent window（每工具 ≤32、最多 8 个工具 = ≤256 个真实样本）后做同一 nearest-rank；它不是“全局最近 32 次调用”的另一种定义，DESIGN/README 都明确这一点。per-tool 卡片只用 `Stats.p95RecentMs()`。
+- **不变量**：p95 与图表/avg/max 使用同一批真实 duration；不新增计时、不改 `duration_count`/`total_ms`/`max_ms`/`recent`/`revision`，也不改 chart samples。读取 p95 是纯函数：在固定栈数组 `[recent_capacity]u32` 上排序副本，无堆分配、无锁、无 IO。
+- 与 avg/max 的域不同且已标注：avg/max 覆盖该工具全部执行样本，p95 只覆盖 recent 32；n<20 时 p95 是窗口最大值（nearest-rank 的自然结果，不是 bug）。
+
+**UI**
+
+- per-tool latency 行：`avg Xms · p95 Yms · max Zms`；34/38-cell rail、80 drawer 放不下时先掉 `max` → `avg Xms · p95 Yms`，再退化为 `p95 Yms`，最后由 `drawRailTextRow` 做 grapheme-safe clip（不横向溢出）。无执行样本仍是 `no latency samples`。
+- 顶栏：`tools · N calls · avg Xms · p95 Yms`；窄栏依次退化 `N calls · avg Xms · p95 Yms` → `avg Xms · p95 Yms` → `p95 Yms`，保证 34/38 cells 与 80 drawer 仍显示 p95 标签。
+- 不新增 golden 帧；空态（`no tool calls yet`）与 approval-only（`no latency samples`）不出现 p95。
+
+**实现与文件**
+
+- `src/ai/agent.zig`：`nearestRankP95`（固定栈副本 + `std.sort.insertion`，O(32²) 最坏）、`Stats.p95RecentMs`、`Metrics.p95RecentMs` + 单测（1/2/20/21/32 样本、重复值、全相等、乱序、ring 回绕、empty→null、revision/ring/counters 不变）。
+- `src/app/ai.zig`：Tools tab summary/latency 候选串按 cell 宽度选择；字符串沿用既有 frame allocator（vaxis 在 frame flush 前保留 grapheme slice，栈缓冲会被提前复用），p95 的采样/排序本身只在固定栈数组上进行、不增加堆分配。
+- `test/e2e.zig`：`tools:` 80/100/120 mock loop 断言 `p95 ` 标签、解析真实值并在合理范围（单样本时 `avg == p95`）；空态/approval-only 断言不出现 p95；scenario matrix 的 `ai tools read 120x30` 也断言标签。
+
+**验证**
+
+- `zig build test`：531/531 通过（新增 2 个 p95 单测；既有 529 不变）。
+- `zig build e2e`：195/195 通过（不新增 pty 测试块；扩展既有 `tools:` 断言与空态/approval 反断言，scenario matrix 新增 `ai tools read 100x30` 并加强 120x30 期望）。
+- 无 golden 变更（goldens 不渲染 Tools tab）。
 
 ---
 
