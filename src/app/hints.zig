@@ -152,6 +152,10 @@ pub const Action = union(enum) {
     inline_approve,
     /// Reject the pending inline edit (same path as `r`/`d` in Changes).
     inline_reject,
+    /// Toggle the expanded result view of the tool card at this message
+    /// index in the active thread (M3a). A real action: no new control is
+    /// invented, and only visible Chat cards register.
+    tool_card_toggle: usize,
 };
 
 pub const Target = struct {

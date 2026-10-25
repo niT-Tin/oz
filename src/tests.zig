@@ -57,6 +57,11 @@ pub const ai_workspace = @import("ai/workspace.zig");
 pub const ai_tools = @import("ai/tools.zig");
 // M3a safe read-only tool executor (filesystem-confined; no App wiring)
 pub const ai_tool_exec = @import("ai/tool_exec.zig");
+// M3a agent policy/metrics + request-message assembly (pure)
+pub const ai_agent = @import("ai/agent.zig");
+pub const ai_turn = @import("ai/turn.zig");
+// M3a background tool worker (App-side but independent from the editor)
+pub const app_tool_job = @import("app/tool_job.zig");
 
 test {
     std.testing.refAllDecls(@This());

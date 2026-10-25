@@ -384,6 +384,9 @@ pub fn drainInline(self: *App) !bool {
             .cancelled => {
                 if (s.request_active) setInlineError(self, "stream cancelled");
             },
+            // The inline request never advertises tools; a tool-call event
+            // is a protocol surprise. `defer ev.deinit` already freed it.
+            .tool_calls => {},
         }
     }
     if (s.request_active and s.status == .streaming and !c.isRunning() and !c.hasEvents()) {

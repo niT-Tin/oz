@@ -3659,6 +3659,10 @@ pub fn run(self: *App) !void {
         // renders, like the LSP/git slots above. Repaint immediately so
         // tokens appear incrementally.
         const ai_ready = self.drainAi() catch false;
+        // Background read-only tool batches (M3a): consume finished results
+        // and start the automatic follow-up request. The worker never blocks
+        // this loop; `aiStreaming()` keeps the poll slice short while it runs.
+        const ai_tools_ready = self.drainToolJobs() catch false;
         // Inline assistant stream (M2b2): dedicated client, never a chat
         // thread. Repaint on deltas/completion/errors.
         const inline_ready = self.drainInline() catch false;
@@ -3700,7 +3704,7 @@ pub fn run(self: *App) !void {
                 }
             }
         }
-        if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready or lsp_ready or term_ready or ai_ready or inline_ready) {
+        if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready or lsp_ready or term_ready or ai_ready or ai_tools_ready or inline_ready) {
             try self.render();
             last_render_ms = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
             continue;

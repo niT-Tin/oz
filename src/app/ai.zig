@@ -9,10 +9,14 @@ const vaxis = @import("vaxis");
 
 const buffer = @import("../buffer/root.zig");
 const ai = @import("../ai/root.zig");
+const agent = @import("../ai/agent.zig");
+const turn = @import("../ai/turn.zig");
+const chart = @import("../chart.zig");
 const autil = @import("util.zig");
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const ws = ai.workspace;
+const tool_job = @import("tool_job.zig");
 
 pub const Status = ws.Status;
 pub const Role = ws.Role;
@@ -20,6 +24,57 @@ pub const Message = ws.Message;
 pub const AgentThread = ws.Thread;
 pub const Focus = ws.Focus;
 pub const WorkboxTab = ws.WorkboxTab;
+
+/// Per-thread agent-loop/tool state. Parallel to `threads.items` (cards and
+/// metrics are per thread: no cross-thread contamination), but kept here so
+/// the pure workspace model stays UI/worker independent.
+pub const ToolThreadState = struct {
+    /// Captured when a user turn starts. Follow-ups keep using the same
+    /// workspace root even if the visible workspace switched meanwhile.
+    root: ?[]u8 = null,
+    /// Tool batches started in this user turn (agent.max_tool_rounds).
+    rounds: u8 = 0,
+    /// Tool calls admitted for execution this user turn.
+    calls: u8 = 0,
+    /// A worker batch is in flight (cards show running).
+    active: bool = false,
+    /// The current stream's terminal event arrived.
+    stream_done: bool = false,
+    /// Batch finished; a follow-up request is due once the stream settles.
+    pending_followup: bool = false,
+    /// The pending follow-up is the final no-tools request (loop limit hit).
+    final_only: bool = false,
+    /// A no-tools final request was already sent: refuse further tool calls.
+    final_sent: bool = false,
+    /// Bumped whenever work is cancelled; stale job results are discarded.
+    generation: u64 = 0,
+    /// Message indices of the cards the in-flight job fills, in call order.
+    pending_cards: [agent.max_tool_calls_per_turn]usize = @splat(0),
+    pending_card_count: usize = 0,
+    /// Dim transcript note explaining a stopped loop (owned).
+    note: ?[]u8 = null,
+    metrics: agent.Metrics = .{},
+
+    fn deinit(self: *ToolThreadState, alloc: std.mem.Allocator) void {
+        if (self.root) |r| alloc.free(r);
+        if (self.note) |n| alloc.free(n);
+        self.metrics.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+/// Cached Tools-tab chart. Recomputed only when the active thread, the
+/// metrics revision or the body dimensions change (agent.ChartKey).
+pub const ChartCache = struct {
+    key: agent.ChartKey = .{},
+    canvas: ?chart.Canvas = null,
+
+    fn clear(self: *ChartCache, alloc: std.mem.Allocator) void {
+        if (self.canvas) |*c| c.deinit(alloc);
+        self.canvas = null;
+        self.key = .{};
+    }
+};
 
 /// Session-wide AI state. Deliberately NOT per workspace: closing the rail
 /// keeps every thread, switching workspaces keeps the same list. Not
@@ -31,6 +86,11 @@ pub const Session = struct {
     /// thread's own client is what keeps late deltas out of another thread's
     /// transcript. `null` slots are created lazily on the first send.
     clients: std.ArrayList(?*ai.client.Client) = .empty,
+    /// Tool loop state + metrics per thread (parallel to `threads.items`).
+    tool_states: std.ArrayList(ToolThreadState) = .empty,
+    /// At most one background tool batch per thread.
+    tool_jobs: std.ArrayList(?*tool_job.Job) = .empty,
+    chart_cache: ChartCache = .{},
     rail_open: bool = false,
     focus: Focus = .editor,
     tab: WorkboxTab = .chat,
@@ -42,6 +102,27 @@ pub const Session = struct {
     /// `<leader>j` must be recognized here rather than in editor.Mode.
     rail_pending_leader: bool = false,
 };
+
+/// Keep the per-thread sidecars (client/tool state/job) exactly parallel to
+/// the pure thread list. Threads are never deleted in M3a, so appending is
+/// enough.
+fn syncAiSidecars(self: *App) !void {
+    const n = self.ai.threads.items.items.len;
+    while (self.ai.clients.items.len < n) try self.ai.clients.append(self.alloc, null);
+    while (self.ai.tool_states.items.len < n) try self.ai.tool_states.append(self.alloc, .{});
+    while (self.ai.tool_jobs.items.len < n) try self.ai.tool_jobs.append(self.alloc, null);
+}
+
+fn toolState(self: *App, idx: usize) ?*ToolThreadState {
+    if (idx >= self.ai.tool_states.items.len) return null;
+    return &self.ai.tool_states.items[idx];
+}
+
+fn setToolNote(self: *App, idx: usize, text: []const u8) void {
+    const st = toolState(self, idx) orelse return;
+    if (st.note) |old| self.alloc.free(old);
+    st.note = self.alloc.dupe(u8, text) catch null;
+}
 
 // ---- layout / lifecycle ----
 
@@ -61,26 +142,61 @@ pub fn aiThread(self: *App) *AgentThread {
     return self.ai.threads.activeThread();
 }
 
+/// Cancel every piece of work owned by thread `idx`: the transport, the
+/// in-flight tool batch (its generation is invalidated so late results can
+/// never land) and any running cards. Safe for threads without a client/job.
 fn cancelClient(self: *App, idx: usize) void {
     if (idx < self.ai.clients.items.len) {
         if (self.ai.clients.items[idx]) |c| c.requestCancel();
+    }
+    if (toolState(self, idx)) |st| {
+        st.generation +%= 1;
+        st.active = false;
+        st.pending_followup = false;
+        st.final_only = false;
+        st.pending_card_count = 0;
+    }
+    if (idx < self.ai.tool_jobs.items.len) {
+        if (self.ai.tool_jobs.items[idx]) |job| job.requestCancel();
+    }
+    if (idx < self.ai.threads.items.items.len) {
+        self.ai.threads.cancelRunningTools(idx);
+    }
+}
+
+fn resetToolTurn(self: *App, idx: usize) void {
+    const st = toolState(self, idx) orelse return;
+    st.rounds = 0;
+    st.calls = 0;
+    st.active = false;
+    st.stream_done = false;
+    st.pending_followup = false;
+    st.final_only = false;
+    st.final_sent = false;
+    st.pending_card_count = 0;
+    if (st.note) |n| {
+        self.alloc.free(n);
+        st.note = null;
     }
 }
 
 /// Create the first thread lazily (the rail may never be opened).
 pub fn ensureAi(self: *App) !void {
-    while (self.ai.clients.items.len < self.ai.threads.items.items.len) {
-        try self.ai.clients.append(self.alloc, null);
-    }
+    try syncAiSidecars(self);
     if (self.ai.threads.items.items.len == 0) {
         try self.ai.clients.append(self.alloc, null);
+        errdefer _ = self.ai.clients.pop();
+        try self.ai.tool_states.append(self.alloc, .{});
+        errdefer _ = self.ai.tool_states.pop();
+        try self.ai.tool_jobs.append(self.alloc, null);
         const idx = self.ai.threads.create(self.alloc) catch |e| {
-            _ = self.ai.clients.pop();
+            _ = self.ai.tool_jobs.pop();
             return e;
         };
         self.ai.threads.active = idx;
         self.ai.thread_cursor = idx;
         self.ai.thread_top = 0;
+        try syncAiSidecars(self);
     }
     if (self.ai.thread_cursor >= self.ai.threads.items.items.len) {
         self.ai.thread_cursor = self.ai.threads.items.items.len - 1;
@@ -160,8 +276,12 @@ fn aiLeaveRail(self: *App) void {
 pub fn aiNewThread(self: *App) !void {
     try ensureAi(self);
     try self.ai.clients.append(self.alloc, null);
+    errdefer _ = self.ai.clients.pop();
+    try self.ai.tool_states.append(self.alloc, .{});
+    errdefer _ = self.ai.tool_states.pop();
+    try self.ai.tool_jobs.append(self.alloc, null);
     const idx = self.ai.threads.create(self.alloc) catch |e| {
-        _ = self.ai.clients.pop();
+        _ = self.ai.tool_jobs.pop();
         return e;
     };
     const res = self.ai.threads.select(idx);
@@ -205,6 +325,17 @@ pub fn aiFocusPrompt(self: *App) !void {
 /// Switch the Workbox tab (same method the rail's c/d/t/r keys use).
 pub fn aiSetWorkboxTab(self: *App, tab: WorkboxTab) void {
     self.ai.tab = tab;
+}
+
+/// Hint action: expand/collapse a tool card's result excerpt. Bounds-checked
+/// because a hint target may outlive a re-render by one frame.
+pub fn aiToggleToolCard(self: *App, msg_index: usize) void {
+    if (self.ai.threads.items.items.len == 0) return;
+    const t = self.ai.threads.activeThread();
+    if (msg_index >= t.messages.items.len) return;
+    const msg = &t.messages.items[msg_index];
+    if (msg.role != .tool) return;
+    msg.tool_expanded = !msg.tool_expanded;
 }
 
 fn moveThreadCursor(self: *App, delta: i32) void {
@@ -255,6 +386,12 @@ fn aiSetThreadError(self: *App, idx: usize, text: []const u8) void {
     }
 }
 
+fn aiSetThreadErrorFmt(self: *App, idx: usize, comptime fmt: []const u8, args: anytype) void {
+    const text = std.fmt.allocPrint(self.alloc, fmt, args) catch return;
+    defer self.alloc.free(text);
+    aiSetThreadError(self, idx, text);
+}
+
 /// True while ANY thread's worker is alive or has queued events: the run
 /// loop polls instead of blocking so deltas (from the active thread or a
 /// cancelled thread winding down) are drained without a keypress.
@@ -264,6 +401,11 @@ pub fn aiStreaming(self: *App) bool {
             if (c.isRunning() or c.hasEvents()) return true;
         }
     }
+    // A tool batch keeps the run loop polling (1ms slices) so its completion
+    // is consumed without a keypress; `drainToolJobs` then clears the slot.
+    for (self.ai.tool_jobs.items) |maybe| {
+        if (maybe != null) return true;
+    }
     return false;
 }
 
@@ -271,13 +413,25 @@ pub fn deinitAi(self: *App) void {
     for (self.ai.clients.items) |maybe| {
         if (maybe) |c| c.requestCancel();
     }
+    for (self.ai.tool_jobs.items) |maybe| {
+        if (maybe) |j| j.requestCancel();
+    }
     for (self.ai.clients.items) |maybe| {
         if (maybe) |c| {
             c.deinit();
             self.alloc.destroy(c);
         }
     }
+    for (self.ai.tool_jobs.items) |maybe| {
+        if (maybe) |j| j.deinit();
+    }
+    // Chart cells reference metric-owned series names only textually;
+    // release the canvas first so shutdown order stays obvious.
+    self.ai.chart_cache.clear(self.alloc);
+    for (self.ai.tool_states.items) |*st| st.deinit(self.alloc);
     self.ai.clients.deinit(self.alloc);
+    self.ai.tool_states.deinit(self.alloc);
+    self.ai.tool_jobs.deinit(self.alloc);
     self.ai.threads.deinit(self.alloc);
     if (self.ai.config) |*cfg| cfg.deinit(self.alloc);
     self.ai.config = null;
@@ -384,12 +538,145 @@ pub fn aiScroll(self: *App, delta: i64) void {
 pub fn aiCancel(self: *App) void {
     if (self.ai.threads.items.items.len == 0) return;
     const idx = self.ai.threads.active;
-    if (self.ai.threads.cancel(idx)) cancelClient(self, idx);
+    const streaming = self.ai.threads.cancel(idx);
+    // Ctrl+c also stops a tool loop whose stream already finished but whose
+    // worker/follow-up is still live. `cancelClient` freezes running cards
+    // and invalidates the job generation.
+    const tool_live = if (toolState(self, idx)) |st| st.active or st.pending_followup else false;
+    if (streaming or tool_live) cancelClient(self, idx);
 }
 
 /// Build the provider request for the active prompt, append the messages,
 /// and start that thread's background stream. Errors are surfaced in the
 /// thread's workbox.
+const RequestPlan = struct {
+    body: []u8,
+    url: []u8,
+
+    fn deinit(self: *RequestPlan, alloc: std.mem.Allocator) void {
+        alloc.free(self.body);
+        alloc.free(self.url);
+    }
+};
+
+/// Serialize the thread's transcript (+ optional new user turn) into an
+/// OpenAI-compatible request. `include_tools` adds the M3 tool definitions
+/// and `tool_choice:"auto"`; the final no-tools follow-up omits both.
+fn buildThreadBody(
+    self: *App,
+    idx: usize,
+    include_tools: bool,
+    extra_user: ?[]const u8,
+) !RequestPlan {
+    const cfg = &(self.ai.config orelse return error.ConfigUnavailable);
+    const t = &self.ai.threads.items.items[idx];
+    const req_msgs = try turn.buildMessages(self.alloc, t.messages.items, extra_user);
+    defer self.alloc.free(req_msgs);
+
+    const base = try ai.openai.buildRequestBody(self.alloc, cfg.model, cfg.system, req_msgs);
+    defer self.alloc.free(base);
+    const body = if (include_tools)
+        try ai.tools.appendTools(self.alloc, base)
+    else
+        try self.alloc.dupe(u8, base);
+    errdefer self.alloc.free(body);
+    const url = try std.fmt.allocPrint(self.alloc, "{s}/chat/completions", .{cfg.base_url});
+    return .{ .body = body, .url = url };
+}
+
+fn ensureThreadClient(self: *App, idx: usize) !*ai.client.Client {
+    try syncAiSidecars(self);
+    if (idx >= self.ai.clients.items.len) return error.IndexOutOfRange;
+    const slot = &self.ai.clients.items[idx];
+    if (slot.* == null) {
+        const c = try self.alloc.create(ai.client.Client);
+        c.* = ai.client.Client.init(self.alloc, self.io);
+        slot.* = c;
+    }
+    return slot.*.?;
+}
+
+/// Start one stream for `idx`. The caller has already appended any user /
+/// assistant messages; this only cancels other live work, starts the
+/// worker, and flips the thread to streaming.
+fn startThreadRequest(self: *App, idx: usize, plan: *RequestPlan) !void {
+    const cfg = &(self.ai.config orelse return error.ConfigUnavailable);
+    // Exactly one live stream/agent loop at a time (defensive invariant).
+    for (self.ai.threads.items.items, 0..) |_, oi| {
+        if (oi == idx) continue;
+        const streaming = self.ai.threads.cancel(oi);
+        const tool_live = if (toolState(self, oi)) |st| st.active or st.pending_followup else false;
+        if (streaming or tool_live) cancelClient(self, oi);
+    }
+    const client = try ensureThreadClient(self, idx);
+    client.start(.{
+        .url = plan.url,
+        .api_key = cfg.api_key,
+        .body = plan.body,
+        .mock_dir = cfg.mock_dir,
+    }) catch |e| {
+        std.log.debug("ai start failed: {s}", .{@errorName(e)});
+        return error.StartFailed;
+    };
+    self.ai.threads.markStreaming(self.alloc, idx);
+    if (toolState(self, idx)) |st| {
+        st.stream_done = false;
+        st.active = false;
+    }
+}
+
+/// Issue the automatic follow-up request after a tool batch (or the final
+/// no-tools request once a loop limit was hit). A new assistant bubble is
+/// created for the streamed answer; on any failure it is removed and the
+/// thread reports the error instead of hanging.
+fn issueFollowup(self: *App, idx: usize, include_tools: bool) !void {
+    if (idx >= self.ai.threads.items.items.len) return;
+    try self.ai.threads.beginAssistant(self.alloc, idx);
+    var plan = buildThreadBody(self, idx, include_tools, null) catch |e| {
+        self.ai.threads.dropEmptyAssistant(self.alloc, idx);
+        aiSetThreadError(self, idx, @errorName(e));
+        return e;
+    };
+    defer plan.deinit(self.alloc);
+    startThreadRequest(self, idx, &plan) catch |e| {
+        self.ai.threads.dropEmptyAssistant(self.alloc, idx);
+        aiSetThreadError(self, idx, "start failed");
+        return e;
+    };
+    if (toolState(self, idx)) |st| {
+        st.pending_followup = false;
+        if (!include_tools) st.final_sent = true;
+    }
+}
+
+/// Called when a batch has finished AND its stream's terminal event has
+/// been consumed. Starts the next request (tools enabled) or, once the
+/// round/call budget is spent or the model already got its final no-tools
+/// turn, settles the thread at idle. Returns true when it acted.
+fn maybeFollowup(self: *App, idx: usize) !bool {
+    const t = &self.ai.threads.items.items[idx];
+    const st = toolState(self, idx) orelse return false;
+    if (t.cancel_requested or t.status != .streaming) return false;
+    if (!st.stream_done or !st.pending_followup or st.active) return false;
+
+    if (st.final_sent) {
+        st.pending_followup = false;
+        self.ai.threads.finish(idx);
+        return true;
+    }
+    const include_tools = !st.final_only;
+    try issueFollowup(self, idx, include_tools);
+    return true;
+}
+
+fn stopToolLoop(self: *App, idx: usize, reason: agent.LimitReason) void {
+    const st = toolState(self, idx) orelse return;
+    const note = agent.limitNote(self.alloc, reason, .{}) catch return;
+    defer self.alloc.free(note);
+    setToolNote(self, idx, note);
+    st.final_only = true;
+}
+
 pub fn aiSend(self: *App) !void {
     if (self.ai.threads.items.items.len == 0) return;
     const idx = self.ai.threads.active;
@@ -398,7 +685,11 @@ pub fn aiSend(self: *App) !void {
     const prompt = std.mem.trim(u8, t.input.items, " \t\r\n");
     if (prompt.len == 0) return;
     try aiLoadConfig(self);
-    const cfg = &self.ai.config.?;
+    if (self.ai.config == null) {
+        aiSetThreadError(self, idx, "config unavailable");
+        return;
+    }
+    try syncAiSidecars(self);
 
     if (t.error_text) |e| {
         self.alloc.free(e);
@@ -440,30 +731,15 @@ pub fn aiSend(self: *App) !void {
     const api_text = try std.fmt.allocPrint(self.alloc, "{s}\nUser request:\n{s}", .{ context, prompt });
     defer self.alloc.free(api_text);
 
-    // Request messages: system is added by openai.buildRequestBody. The
-    // new user turn is included here; the assistant placeholder is not.
-    var msgs = std.ArrayList(ai.openai.Message).empty;
-    defer msgs.deinit(self.alloc);
-    for (t.messages.items) |m| {
-        if (m.role == .assistant and m.text.len == 0) continue;
-        try msgs.append(self.alloc, .{
-            .role = if (m.role == .user) "user" else "assistant",
-            .content = m.api_text,
-        });
-    }
-    try msgs.append(self.alloc, .{ .role = "user", .content = api_text });
-    const body = try ai.openai.buildRequestBody(self.alloc, cfg.model, cfg.system, msgs.items);
-    defer self.alloc.free(body);
-    const url = try std.fmt.allocPrint(self.alloc, "{s}/chat/completions", .{cfg.base_url});
-    defer self.alloc.free(url);
+    var plan = try buildThreadBody(self, idx, true, api_text);
+    defer plan.deinit(self.alloc);
 
-    // Exactly one streaming thread at a time: any other live stream is
-    // cancelled before this request starts (switching/new-thread usually
-    // already did it; this is the defensive invariant).
-    for (self.ai.threads.items.items, 0..) |_, oi| {
-        if (oi == idx) continue;
-        if (self.ai.threads.cancel(oi)) cancelClient(self, oi);
-    }
+    // The tool root is captured once per user turn: follow-up rounds keep
+    // reading the same workspace even if the visible workspace changes.
+    const st = toolState(self, idx) orelse return error.ToolStateUnavailable;
+    if (st.root) |old| self.alloc.free(old);
+    st.root = self.currentRootDir() catch null;
+    resetToolTurn(self, idx);
 
     self.ai.threads.appendUser(self.alloc, idx, prompt, api_text) catch |e| {
         aiSetThreadError(self, idx, @errorName(e));
@@ -473,41 +749,275 @@ pub fn aiSend(self: *App) !void {
         aiSetThreadError(self, idx, @errorName(e));
         return e;
     };
-    while (self.ai.clients.items.len <= idx) {
-        self.ai.clients.append(self.alloc, null) catch |e| {
-            self.ai.threads.dropEmptyAssistant(self.alloc, idx);
-            aiSetThreadError(self, idx, @errorName(e));
-            return e;
-        };
-    }
-    const slot = &self.ai.clients.items[idx];
-    if (slot.* == null) {
-        const c = self.alloc.create(ai.client.Client) catch |e| {
-            self.ai.threads.dropEmptyAssistant(self.alloc, idx);
-            aiSetThreadError(self, idx, @errorName(e));
-            return e;
-        };
-        c.* = ai.client.Client.init(self.alloc, self.io);
-        slot.* = c;
-    }
-    slot.*.?.start(.{
-        .url = url,
-        .api_key = cfg.api_key,
-        .body = body,
-        .mock_dir = cfg.mock_dir,
-    }) catch |e| {
+    startThreadRequest(self, idx, &plan) catch |e| {
         self.ai.threads.dropEmptyAssistant(self.alloc, idx);
         aiSetThreadError(self, idx, "start failed");
-        std.log.debug("ai start failed: {s}", .{@errorName(e)});
-        return;
+        return e;
     };
 
-    // Only after the worker is running: no failure path can leave a thread
-    // stuck at `streaming` with no client to drain.
-    self.ai.threads.markStreaming(self.alloc, idx);
     t.input.clearRetainingCapacity();
     t.scroll = 0;
     t.auto_scroll = true;
+}
+
+fn displayToolStatus(status: agent.CardStatus) ws.ToolStatus {
+    return switch (status) {
+        .running => .running,
+        .ok => .ok,
+        .err => .err,
+        .approval_required => .approval_required,
+        .unsupported => .unsupported,
+        .cancelled => .cancelled,
+    };
+}
+
+fn mapOutcomeStatus(status: ai.tool_exec.Status) agent.CardStatus {
+    return switch (status) {
+        .ok => .ok,
+        .err => .err,
+        .approval_required => .approval_required,
+        .unsupported => .unsupported,
+    };
+}
+
+/// Handle one streamed assistant turn's tool calls: attach the OpenAI
+/// tool-call turn to the transcript, create compact cards, execute only the
+/// admitted read-only prefix on a worker, and leave the rest truthfully
+/// unexecuted. Ownership of `calls` is consumed in every branch.
+fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
+    const t = &self.ai.threads.items.items[idx];
+    const st = toolState(self, idx);
+    if (st == null or t.cancel_requested or t.status != .streaming) {
+        ai.tools.freeCalls(self.alloc, calls);
+        return;
+    }
+
+    const calls_json = ai.tools.buildAssistantToolCallsJson(self.alloc, calls) catch {
+        ai.tools.freeCalls(self.alloc, calls);
+        aiSetThreadErrorFmt(self, idx, "tool call protocol: out of memory", .{});
+        return;
+    };
+    defer self.alloc.free(calls_json);
+    self.ai.threads.setAssistantToolCalls(self.alloc, idx, calls_json) catch {
+        ai.tools.freeCalls(self.alloc, calls);
+        aiSetThreadErrorFmt(self, idx, "tool call protocol: out of memory", .{});
+        return;
+    };
+
+    // After the final no-tools request the model must not be able to start
+    // another execution round; answer truthfully and stop.
+    if (st.?.final_sent) {
+        for (calls) |call| {
+            const args = agent.summarizeArguments(self.alloc, call.name, call.arguments_json) catch null;
+            defer if (args) |a| self.alloc.free(a);
+            _ = self.ai.threads.appendToolMessage(
+                self.alloc,
+                idx,
+                call.id,
+                call.name,
+                args orelse "{}",
+                .unsupported,
+                "error: tool calls are disabled after the final round",
+            ) catch {};
+            st.?.metrics.record(self.alloc, call.name, .unsupported, 0);
+        }
+        ai.tools.freeCalls(self.alloc, calls);
+        st.?.pending_followup = false;
+        setToolNote(self, idx, "tool loop stopped: model called tools after the final round");
+        return;
+    }
+
+    const plan = agent.planBatch(st.?.rounds, st.?.calls, .{}, calls.len);
+    var admitted = self.alloc.alloc(ai.tools.ToolCall, plan.execute) catch {
+        ai.tools.freeCalls(self.alloc, calls);
+        aiSetThreadErrorFmt(self, idx, "tool call protocol: out of memory", .{});
+        return;
+    };
+    var admitted_count: usize = 0;
+    st.?.pending_card_count = 0;
+
+    const limit_text: ?[]u8 = if (plan.reason) |reason| (switch (reason) {
+        .rounds => std.fmt.allocPrint(self.alloc, "error: tool round limit ({d}) reached; not executed", .{agent.max_tool_rounds}),
+        .calls => std.fmt.allocPrint(self.alloc, "error: tool call limit ({d}) reached; not executed", .{agent.max_tool_calls_per_turn}),
+    } catch null) else null;
+    defer if (limit_text) |text| self.alloc.free(text);
+
+    for (calls, 0..) |call, i| {
+        const args = agent.summarizeArguments(self.alloc, call.name, call.arguments_json) catch null;
+        defer if (args) |a| self.alloc.free(a);
+        const args_text = args orelse "{}";
+        if (i < plan.execute) {
+            const msg_index = self.ai.threads.appendToolMessage(
+                self.alloc,
+                idx,
+                call.id,
+                call.name,
+                args_text,
+                .running,
+                "",
+            ) catch {
+                ai.tools.freeCalls(self.alloc, calls);
+                self.alloc.free(admitted);
+                aiSetThreadErrorFmt(self, idx, "tool call protocol: out of memory", .{});
+                return;
+            };
+            admitted[admitted_count] = call;
+            admitted_count += 1;
+            if (st.?.pending_card_count < agent.max_tool_calls_per_turn) {
+                st.?.pending_cards[st.?.pending_card_count] = msg_index;
+                st.?.pending_card_count += 1;
+            }
+        } else {
+            _ = self.ai.threads.appendToolMessage(
+                self.alloc,
+                idx,
+                call.id,
+                call.name,
+                args_text,
+                .unsupported,
+                limit_text orelse "error: not executed",
+            ) catch {};
+            st.?.metrics.record(self.alloc, call.name, .unsupported, 0);
+        }
+    }
+    // The call structs are owned by the job (admitted) or must be freed
+    // (skipped); the original slice container is always freed.
+    for (calls[plan.execute..]) |call| call.deinit(self.alloc);
+    self.alloc.free(calls);
+
+    st.?.rounds +|= 1;
+    st.?.calls +|= @intCast(plan.execute);
+    if (plan.reason) |reason| stopToolLoop(self, idx, reason);
+    if (st.?.calls >= agent.max_tool_calls_per_turn) stopToolLoop(self, idx, .calls);
+    if (st.?.rounds >= agent.max_tool_rounds) stopToolLoop(self, idx, .rounds);
+
+    if (admitted_count == 0) {
+        self.alloc.free(admitted);
+        st.?.pending_followup = true;
+        return;
+    }
+    const root = st.?.root orelse {
+        for (admitted) |call| call.deinit(self.alloc);
+        self.alloc.free(admitted);
+        for (st.?.pending_cards[0..st.?.pending_card_count]) |msg_index| {
+            const name = if (msg_index < t.messages.items.len) (t.messages.items[msg_index].tool_name orelse "?") else "?";
+            self.ai.threads.setToolOutcome(
+                self.alloc,
+                idx,
+                msg_index,
+                .err,
+                "error: workspace root unavailable",
+                "error: workspace root unavailable",
+                0,
+            ) catch {};
+            st.?.metrics.record(self.alloc, name, .err, 0);
+        }
+        st.?.pending_card_count = 0;
+        st.?.pending_followup = true;
+        st.?.final_only = true;
+        setToolNote(self, idx, "tool loop stopped: workspace root unavailable");
+        return;
+    };
+    const job = tool_job.Job.start(self.alloc, self.io, root, admitted, st.?.generation) catch {
+        // Job.start freed `admitted` on failure.
+        for (st.?.pending_cards[0..st.?.pending_card_count]) |msg_index| {
+            const name = if (msg_index < t.messages.items.len) (t.messages.items[msg_index].tool_name orelse "?") else "?";
+            self.ai.threads.setToolOutcome(
+                self.alloc,
+                idx,
+                msg_index,
+                .err,
+                "error: tool execution failed to start",
+                "error: tool execution failed to start",
+                0,
+            ) catch {};
+            st.?.metrics.record(self.alloc, name, .err, 0);
+        }
+        st.?.pending_card_count = 0;
+        st.?.pending_followup = true;
+        st.?.final_only = true;
+        setToolNote(self, idx, "tool loop stopped: worker failed to start");
+        return;
+    };
+    if (idx >= self.ai.tool_jobs.items.len) {
+        job.requestCancel();
+        // syncAiSidecars keeps this in range; if it ever isn't, surface the
+        // failure instead of leaking a running job.
+        var j = job;
+        j.deinit();
+        st.?.pending_followup = true;
+        st.?.final_only = true;
+        return;
+    }
+    self.ai.tool_jobs.items[idx] = job;
+    st.?.active = true;
+}
+
+/// Consume finished tool workers. Results apply only to the exact thread and
+/// loop generation that spawned them; anything else (cancel, thread switch,
+/// a stopped loop) is freed without touching a transcript.
+pub fn drainToolJobs(self: *App) !bool {
+    var changed = false;
+    for (self.ai.tool_jobs.items, 0..) |*slot, idx| {
+        const job = slot.* orelse continue;
+        if (!job.isDone()) continue;
+        changed = true;
+        const results = job.takeResults();
+        const t = &self.ai.threads.items.items[idx];
+        const st = toolState(self, idx);
+        const matches = st != null and st.?.active and
+            job.generation == st.?.generation and
+            st.?.pending_card_count == results.len and
+            !t.cancel_requested and t.status == .streaming;
+
+        if (matches) {
+            const s = st.?;
+            for (results, 0..) |*result, i| {
+                const msg_index = s.pending_cards[i];
+                if (msg_index >= t.messages.items.len) continue;
+                const msg = &t.messages.items[msg_index];
+                if (msg.role != .tool) continue;
+                const name = msg.tool_name orelse "?";
+                const excerpt = agent.resultExcerpt(self.alloc, result.content, agent.max_excerpt_bytes) catch null;
+                defer if (excerpt) |e| self.alloc.free(e);
+                const api = ai.tools.buildToolResultContent(
+                    self.alloc,
+                    .{ .output = result.content },
+                    .{},
+                ) catch null;
+                defer if (api) |a| self.alloc.free(a);
+                self.ai.threads.setToolOutcome(
+                    self.alloc,
+                    idx,
+                    msg_index,
+                    displayToolStatus(result.status),
+                    excerpt orelse "",
+                    api orelse result.content,
+                    result.duration_ms,
+                ) catch {
+                    // Keep the card truthful even if the copy failed: mark it
+                    // errored without allocating.
+                    t.messages.items[msg_index].tool_status = .err;
+                };
+                s.metrics.record(self.alloc, name, result.status, result.duration_ms);
+            }
+            s.active = false;
+            s.pending_card_count = 0;
+            s.pending_followup = true;
+        } else if (st) |s| {
+            s.active = false;
+            s.pending_card_count = 0;
+        }
+        for (results) |*result| result.deinit(self.alloc);
+        self.alloc.free(results);
+        job.deinit();
+        slot.* = null;
+
+        if (matches) {
+            _ = try maybeFollowup(self, idx);
+        }
+    }
+    return changed;
 }
 
 /// Drain every thread's worker events. Returns true when anything changed
@@ -520,31 +1030,72 @@ pub fn drainAi(self: *App) !bool {
         const client = maybe orelse continue;
         if (idx >= self.ai.threads.items.items.len) continue;
         const t = &self.ai.threads.items.items[idx];
+        var saw_terminal = false;
         while (client.pop()) |ev| {
-            defer ev.deinit(self.alloc);
             changed = true;
-            if (t.cancel_requested) continue;
             switch (ev) {
                 .delta => |text| {
+                    defer self.alloc.free(text);
+                    if (t.cancel_requested) continue;
                     if (try self.ai.threads.applyDelta(self.alloc, idx, text)) {
                         t.auto_scroll = true;
                     }
                 },
-                .done => self.ai.threads.finish(idx),
+                .done => saw_terminal = true,
                 .err => |text| {
+                    defer self.alloc.free(text);
+                    saw_terminal = true;
+                    if (t.cancel_requested) continue;
+                    // A stream failure also ends any in-flight tool work; no
+                    // stale result may resurrect the turn.
+                    cancelClient(self, idx);
                     self.ai.threads.fail(self.alloc, idx, text);
                 },
                 .cancelled => {
+                    saw_terminal = true;
                     if (t.status == .streaming) {
                         t.status = .cancelled;
                         t.cancel_requested = true;
                     }
                 },
+                .tool_calls => |calls| {
+                    if (t.cancel_requested) {
+                        ai.tools.freeCalls(self.alloc, calls);
+                        continue;
+                    }
+                    aiHandleToolCalls(self, idx, calls);
+                },
+            }
+        }
+
+        if (saw_terminal) {
+            // The worker pushes its terminal event last; join so a follow-up
+            // can reuse the client immediately (no Busy race).
+            client.joinAfterTerminal();
+            const st = toolState(self, idx);
+            if (st) |s| s.stream_done = true;
+            if (!t.cancel_requested and t.status == .streaming) {
+                if (st) |s| {
+                    if (s.active) {
+                        // Wait for the worker; drainToolJobs will follow up.
+                    } else if (s.pending_followup) {
+                        _ = maybeFollowup(self, idx) catch |e| {
+                            aiSetThreadErrorFmt(self, idx, "follow-up failed: {s}", .{@errorName(e)});
+                        };
+                    } else {
+                        self.ai.threads.finish(idx);
+                    }
+                } else {
+                    self.ai.threads.finish(idx);
+                }
             }
         }
         // Safety net: a worker that died without a terminal event must not
-        // leave the workbox saying "streaming…" forever.
-        if (t.status == .streaming and !client.isRunning() and !client.hasEvents()) {
+        // leave the workbox saying "streaming…" forever — unless a tool
+        // batch is still legitimately running and will follow up.
+        const st = toolState(self, idx);
+        const waiting_tools = if (st) |s| s.active or s.pending_followup else false;
+        if (t.status == .streaming and !waiting_tools and !client.isRunning() and !client.hasEvents()) {
             self.ai.threads.fail(self.alloc, idx, "stream ended unexpectedly");
             changed = true;
         }
@@ -558,7 +1109,7 @@ pub fn aiStatusText(self: *App, a: std.mem.Allocator) !?[]const u8 {
     if (self.ai.threads.items.items.len == 0) return null;
     const t = self.ai.threads.activeThreadConst();
     const model: []const u8 = if (self.ai.config) |cfg| cfg.model else ai.config.default_model;
-    return @as(?[]const u8, try std.fmt.allocPrint(a, "agent {s} · {s} · {s}", .{ t.title, model, t.statusLabel() }));
+    return @as(?[]const u8, try std.fmt.allocPrint(a, "agent {s} · {s} · {s}", .{ t.title, model, aiStatusLabelFor(self, self.ai.threads.active) }));
 }
 
 /// Narrow status-bar variant (drops the "agent " prefix). Used only when the
@@ -567,7 +1118,7 @@ pub fn aiStatusTextCompact(self: *App, a: std.mem.Allocator) !?[]const u8 {
     if (self.ai.threads.items.items.len == 0) return null;
     const t = self.ai.threads.activeThreadConst();
     const model: []const u8 = if (self.ai.config) |cfg| cfg.model else ai.config.default_model;
-    return @as(?[]const u8, try std.fmt.allocPrint(a, "{s} · {s} · {s}", .{ t.title, model, t.statusLabel() }));
+    return @as(?[]const u8, try std.fmt.allocPrint(a, "{s} · {s} · {s}", .{ t.title, model, aiStatusLabelFor(self, self.ai.threads.active) }));
 }
 
 /// Last-resort status-bar variant that preserves the thread name and status
@@ -575,7 +1126,7 @@ pub fn aiStatusTextCompact(self: *App, a: std.mem.Allocator) !?[]const u8 {
 pub fn aiStatusTextMini(self: *App, a: std.mem.Allocator) !?[]const u8 {
     if (self.ai.threads.items.items.len == 0) return null;
     const t = self.ai.threads.activeThreadConst();
-    return @as(?[]const u8, try std.fmt.allocPrint(a, "{s} · {s}", .{ t.title, t.statusLabel() }));
+    return @as(?[]const u8, try std.fmt.allocPrint(a, "{s} · {s}", .{ t.title, aiStatusLabelFor(self, self.ai.threads.active) }));
 }
 
 // ---- rendering ----
@@ -596,6 +1147,7 @@ const Styles = struct {
     label_user: vaxis.Style,
     label_ai: vaxis.Style,
     error_style: vaxis.Style,
+    warn: vaxis.Style,
     border: vaxis.Style,
 };
 
@@ -846,6 +1398,167 @@ fn appendMessageRows(
     try rows.append(a, .{});
 }
 
+/// Append one already-clipped card row: segments are cut at `inner_w` cell
+/// boundaries so a long tool name/path can never spill into the rail border.
+fn appendCardRow(
+    a: std.mem.Allocator,
+    rows: *std.ArrayList(Row),
+    inner_w: u32,
+    segs: []const vaxis.Segment,
+) !void {
+    var row = Row{};
+    var remaining = inner_w;
+    for (segs) |seg| {
+        if (remaining == 0) break;
+        const fit = buffer.utf8.truncateWidth(seg.text, remaining);
+        if (fit.len == 0) continue;
+        const cells = buffer.utf8.displayWidth(fit);
+        try row.segs.append(a, .{ .text = fit, .style = seg.style });
+        row.cells += cells;
+        remaining -|= cells;
+    }
+    try rows.append(a, row);
+}
+
+fn cardStatusStyle(st: Styles, status: ws.ToolStatus) vaxis.Style {
+    return switch (status) {
+        .running => st.accent,
+        .ok => st.code,
+        .err => st.error_style,
+        .approval_required => st.warn,
+        .unsupported => st.dim,
+        .cancelled => st.faint,
+        .none => st.dim,
+    };
+}
+
+fn cardIcon(status: ws.ToolStatus) []const u8 {
+    return switch (status) {
+        .running => "…",
+        .ok => "✓",
+        .err => "✖",
+        .approval_required => "!",
+        .unsupported => "–",
+        .cancelled => "◌",
+        .none => "·",
+    };
+}
+
+/// Compact 2–4 row tool card in the chat transcript:
+///
+///   ✓ read_file                     ok 3ms
+///     src/main.zig:1-20
+///     ↳ const answer = 42;
+///
+/// Running/error/approval/unsupported states are distinct (icon + label +
+/// color); a blocked tool never shows a fabricated result. Expanded cards
+/// (hint target) add up to 8 result lines. `msg.text` is already a bounded
+/// excerpt; `msg.api_text` is the full bounded result used when expanded.
+fn appendToolCardRows(
+    self: *App,
+    a: std.mem.Allocator,
+    rows: *std.ArrayList(Row),
+    st: Styles,
+    inner_w: u32,
+    msg: *const Message,
+) !void {
+    _ = self;
+    const status = msg.tool_status;
+    const name = msg.tool_name orelse "tool";
+    const args = msg.tool_args orelse "";
+    const status_style = cardStatusStyle(st, status);
+    const icon = cardIcon(status);
+
+    var status_buf: [agent.max_status_text_bytes]u8 = undefined;
+    const status_text = agent.cardStatusText(&status_buf, switch (status) {
+        .running => .running,
+        .ok => .ok,
+        .err => .err,
+        .approval_required => .approval_required,
+        .unsupported => .unsupported,
+        .cancelled => .cancelled,
+        .none => .running,
+    }, msg.tool_ms);
+    const status_owned = try a.dupe(u8, status_text);
+
+    const icon_text = try std.fmt.allocPrint(a, "{s} ", .{icon});
+    const icon_cells: u32 = @intCast(buffer.utf8.displayWidth(icon_text));
+    const status_cells: u32 = @intCast(buffer.utf8.displayWidth(status_owned));
+    const name_cells: u32 = @intCast(buffer.utf8.displayWidth(name));
+
+    var header: std.ArrayList(vaxis.Segment) = .empty;
+    if (inner_w <= icon_cells + 1) {
+        try header.append(a, .{ .text = try a.dupe(u8, buffer.utf8.truncateWidth(status_owned, inner_w)), .style = status_style });
+    } else {
+        const room_for_name_and_status = inner_w - icon_cells;
+        if (name_cells + 1 + status_cells <= room_for_name_and_status) {
+            try header.append(a, .{ .text = icon_text, .style = status_style });
+            try header.append(a, .{ .text = name, .style = st.bold });
+            const pad = room_for_name_and_status - name_cells - status_cells;
+            if (pad > 0) try header.append(a, .{ .text = try spaces(a, pad), .style = .{ .bg = st.base.bg } });
+            try header.append(a, .{ .text = status_owned, .style = status_style });
+        } else {
+            const name_room = room_for_name_and_status -| (status_cells + 1);
+            if (name_room > 0) {
+                try header.append(a, .{ .text = icon_text, .style = status_style });
+                try header.append(a, .{ .text = buffer.utf8.truncateWidth(name, name_room), .style = st.bold });
+                const pad = room_for_name_and_status - @as(u32, @intCast(buffer.utf8.displayWidth(buffer.utf8.truncateWidth(name, name_room)))) - status_cells;
+                if (pad > 0) try header.append(a, .{ .text = try spaces(a, pad), .style = .{ .bg = st.base.bg } });
+                try header.append(a, .{ .text = status_owned, .style = status_style });
+            } else {
+                try header.append(a, .{ .text = buffer.utf8.truncateWidth(status_owned, inner_w), .style = status_style });
+            }
+        }
+    }
+    try appendCardRow(a, rows, inner_w, header.items);
+
+    if (args.len > 0) {
+        const args_safe = try displaySafe(a, args);
+        const line = try std.fmt.allocPrint(a, "  {s}", .{args_safe});
+        try appendCardRow(a, rows, inner_w, &.{.{ .text = line, .style = st.dim }});
+    }
+
+    switch (status) {
+        .approval_required => {
+            try appendCardRow(a, rows, inner_w, &.{.{ .text = "  not executed — write tools need M3b approval", .style = st.warn }});
+        },
+        .unsupported => {
+            try appendCardRow(a, rows, inner_w, &.{.{ .text = "  not executed", .style = st.faint }});
+        },
+        .cancelled => {
+            try appendCardRow(a, rows, inner_w, &.{.{ .text = "  stopped (no result applied)", .style = st.faint }});
+        },
+        .running => {
+            try appendCardRow(a, rows, inner_w, &.{.{ .text = "  ⋯ working", .style = st.faint }});
+        },
+        .ok, .err, .none => {
+            if (msg.text.len > 0) {
+                const safe = try displaySafe(a, msg.text);
+                const line = try std.fmt.allocPrint(a, "  ↳ {s}", .{safe});
+                try appendCardRow(a, rows, inner_w, &.{.{ .text = line, .style = if (status == .err) st.error_style else st.code }});
+            }
+        },
+    }
+
+    if (msg.tool_expanded) {
+        var line_buf: [16][]const u8 = undefined;
+        const view = agent.bodyLines(msg.api_text, &line_buf, 8);
+        var i: usize = 0;
+        while (i < view.count) : (i += 1) {
+            const safe = try displaySafe(a, line_buf[i]);
+            const line = try std.fmt.allocPrint(a, "  │ {s}", .{safe});
+            try appendCardRow(a, rows, inner_w, &.{.{ .text = line, .style = st.faint }});
+        }
+        if (view.more) {
+            try appendCardRow(a, rows, inner_w, &.{.{ .text = "  …", .style = st.faint }});
+        }
+    }
+
+    // One blank row separates adjacent cards without wasting a full row on
+    // a single-tool transcript.
+    try rows.append(a, .{});
+}
+
 fn appendWrappedPlain(
     a: std.mem.Allocator,
     rows: *std.ArrayList(Row),
@@ -881,6 +1594,19 @@ fn railStatusStyle(st: Styles, status: Status) vaxis.Style {
         .cancelled => st.faint,
         .err => st.error_style,
     };
+}
+
+/// Status label with the M3a tool state layered on: an in-flight batch (or a
+/// batch waiting for its follow-up) reads `tools…`, never `idle`. Once the
+/// results land and the follow-up streams, the normal label returns.
+fn aiStatusLabelFor(self: *App, idx: usize) []const u8 {
+    if (idx < self.ai.threads.items.items.len) {
+        if (toolState(self, idx)) |st| {
+            if (st.active or st.pending_followup) return "tools…";
+        }
+        return self.ai.threads.items.items[idx].statusLabel();
+    }
+    return "idle";
 }
 
 fn threadDot(status: Status) []const u8 {
@@ -990,6 +1716,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         .label_user = .{ .fg = .{ .rgb = t.accent }, .bg = rail_bg, .bold = true },
         .label_ai = .{ .fg = .{ .rgb = t.keyword }, .bg = rail_bg, .bold = true },
         .error_style = .{ .fg = .{ .rgb = t.diag_error }, .bg = rail_bg },
+        .warn = .{ .fg = .{ .rgb = t.diag_warn }, .bg = rail_bg },
         .border = border_style,
     };
 
@@ -1081,7 +1808,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
             .bold = attached,
         };
         const dot_style = threadDotStyle(st, thread.status);
-        const status_text = thread.statusLabel();
+        const status_text = aiStatusLabelFor(self, ti);
         const status_cells = autil.cellWidth(win, status_text);
 
         var segs = std.ArrayList(vaxis.Segment).empty;
@@ -1127,8 +1854,9 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         var segs = std.ArrayList(vaxis.Segment).empty;
         try segs.append(a, .{ .text = active.title, .style = st.bold });
         try segs.append(a, .{ .text = " · ", .style = st.dim });
-        try segs.append(a, .{ .text = active.statusLabel(), .style = railStatusStyle(st, active.status) });
-        var used: u32 = @intCast(autil.cellWidth(win, active.title) + 3 + autil.cellWidth(win, active.statusLabel()));
+        const active_status_label = aiStatusLabelFor(self, active_idx);
+        try segs.append(a, .{ .text = active_status_label, .style = railStatusStyle(st, active.status) });
+        var used: u32 = @intCast(autil.cellWidth(win, active.title) + 3 + autil.cellWidth(win, active_status_label));
         const model: []const u8 = if (self.ai.config) |cfg| cfg.model else ai.config.default_model;
         const mw = autil.cellWidth(win, model);
         if (content_w >= used + mw + 2) {
@@ -1192,12 +1920,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
                     }
                 }
             },
-            .tools => {
-                try drawRailTextRow(self, win, a, m.body_top, x, w, border_style, rail_bg, "tools arrive in M3", st.dim);
-                if (m.body_rows > 2) {
-                    try drawRailTextRow(self, win, a, m.body_top + 2, x, w, border_style, rail_bg, "no tool runs recorded", st.faint);
-                }
-            },
+            .tools => try drawToolsTab(self, a, win, st, x, w, border_style, rail_bg, &m),
             .terminal => {
                 try drawRailTextRow(self, win, a, m.body_top, x, w, border_style, rail_bg, "agent terminal arrives in M3", st.dim);
                 if (m.body_rows > 2) {
@@ -1248,6 +1971,213 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
     }
 }
 
+fn packThemeRgb(rgb: [3]u8) u32 {
+    return (@as(u32, rgb[0]) << 16) | (@as(u32, rgb[1]) << 8) | rgb[2];
+}
+
+fn chartColor(theme_color: [3]u8) u32 {
+    return packThemeRgb(theme_color);
+}
+
+/// Deterministic per-tool chart colors (the theme's syntax palette).
+fn toolSeriesColor(self: *App, index: usize) u32 {
+    const t = self.theme;
+    const palette = [_][3]u8{
+        t.accent, t.string, t.keyword,  t.function,
+        t.number, t.type,   t.operator, t.boolean,
+    };
+    return chartColor(palette[index % palette.len]);
+}
+
+/// Return the cached chart canvas, re-rendering only when the active thread,
+/// metrics revision or body dimensions changed. Series names stay owned by
+/// the metrics; samples are copied into frame scratch before `chart.render`
+/// (which copies what it needs into cells).
+fn toolChartCanvas(
+    self: *App,
+    a: std.mem.Allocator,
+    active_idx: usize,
+    content_w: u32,
+    height: u32,
+) ?*const chart.Canvas {
+    const state = toolState(self, active_idx) orelse return null;
+    const metrics = &state.metrics;
+    if (metrics.count() == 0) return null;
+    const width: u16 = @intCast(@min(content_w, @as(u32, chart.max_width)));
+    const h: u16 = @intCast(@min(height, @as(u32, chart.max_height)));
+    if (width == 0 or h == 0) return null;
+
+    const cache = &self.ai.chart_cache;
+    if (cache.canvas != null and cache.key.validFor(active_idx, metrics.revision, width, h)) {
+        return &cache.canvas.?;
+    }
+    cache.clear(self.alloc);
+
+    var series_list: std.ArrayList(chart.Series) = .empty;
+    defer series_list.deinit(a);
+    var samples: std.ArrayList(u32) = .empty;
+    defer samples.deinit(a);
+    // Preallocate the whole sample pool: `series_list` stores slices into
+    // `samples`, so a later growth reallocation would invalidate earlier
+    // series before `chart.render` reads them.
+    samples.ensureTotalCapacity(a, metrics.count() * agent.recent_capacity) catch return null;
+    var i: usize = 0;
+    while (i < metrics.count()) : (i += 1) {
+        const stats = metrics.atConst(i) orelse continue;
+        if (stats.recent_len == 0) continue;
+        if (series_list.items.len >= chart.max_series) break;
+        var scratch: [agent.recent_capacity]u32 = undefined;
+        const n = stats.recentInto(&scratch);
+        const start = samples.items.len;
+        samples.appendSlice(a, scratch[0..n]) catch return null;
+        series_list.append(a, .{
+            .name = stats.name,
+            .color = toolSeriesColor(self, series_list.items.len),
+            .samples = samples.items[start..],
+        }) catch return null;
+    }
+    if (series_list.items.len == 0) return null;
+
+    const canvas = chart.render(self.alloc, series_list.items, .{
+        .width = width,
+        .height = h,
+        .max_points = agent.recent_capacity,
+        .show_legend = true,
+        .show_axis = h >= 3,
+    }) catch return null;
+    cache.canvas = canvas;
+    cache.key = .{ .thread = active_idx, .revision = metrics.revision, .width = width, .height = h };
+    return &cache.canvas.?;
+}
+
+fn drawChartCanvas(
+    self: *App,
+    a: std.mem.Allocator,
+    win: vaxis.Window,
+    x: u32,
+    w: u32,
+    border_style: vaxis.Style,
+    rail_bg: vaxis.Color,
+    y: u32,
+    canvas: *const chart.Canvas,
+) !void {
+    var row: u32 = 0;
+    while (row < canvas.height) : (row += 1) {
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        defer segs.deinit(a);
+        for (canvas.row(row)) |cell| {
+            if (cell.width == 0) continue;
+            const fg: vaxis.Color = if (cell.fg) |packed_fg| .{ .rgb = .{
+                @intCast((packed_fg >> 16) & 0xff),
+                @intCast((packed_fg >> 8) & 0xff),
+                @intCast(packed_fg & 0xff),
+            } } else .{ .rgb = self.theme.fg_dim };
+            try segs.append(a, .{ .text = cell.text, .style = .{ .fg = fg, .bg = rail_bg } });
+        }
+        try drawRailRow(win, a, y + row, x, w, "│", border_style, rail_bg, segs.items, canvas.width);
+    }
+}
+
+fn drawToolsTab(
+    self: *App,
+    a: std.mem.Allocator,
+    win: vaxis.Window,
+    st: Styles,
+    x: u32,
+    w: u32,
+    border_style: vaxis.Style,
+    rail_bg: vaxis.Color,
+    m: *const ws.Metrics,
+) !void {
+    const active_idx = self.ai.threads.active;
+    const state = toolState(self, active_idx);
+    const metrics: ?*agent.Metrics = if (state) |s| &s.metrics else null;
+    const n = if (metrics) |mm| mm.count() else 0;
+    if (n == 0) {
+        try drawRailTextRow(self, win, a, m.body_top, x, w, border_style, rail_bg, "no tool calls yet", st.dim);
+        if (m.body_rows > 2) {
+            try drawRailTextRow(self, win, a, m.body_top + 2, x, w, border_style, rail_bg, "read-only tools: read_file · list_directory · grep", st.faint);
+        }
+        return;
+    }
+    const mm = metrics.?;
+    const calls = mm.totalCalls();
+    const avg = mm.averageMs();
+    const summary = if (avg) |value|
+        try std.fmt.allocPrint(a, "tools · {d} calls · avg {d}ms", .{ calls, value })
+    else
+        try std.fmt.allocPrint(a, "tools · {d} calls · no durations", .{calls});
+    if (m.body_rows > 0) {
+        try drawRailTextRow(self, win, a, m.body_top, x, w, border_style, rail_bg, summary, st.bold);
+    }
+
+    const remaining = m.body_rows -| 1;
+    const max_cards = @max(@as(u32, 1), (remaining -| 2) / 3);
+    const visible: u32 = @min(@as(u32, @intCast(n)), max_cards);
+    const more = n - visible;
+    // Reserve one line for `+N more tools` when some cards do not fit, so
+    // the overflow marker is never silently painted over by the chart.
+    var chart_h: u32 = @min(@as(u32, 8), remaining -| (visible * 3) -| @intFromBool(more > 0));
+    if (chart_h == 1) chart_h = 0;
+
+    var y = m.body_top + 1;
+    const body_end = m.body_top + m.body_rows;
+    var i: u32 = 0;
+    while (i < visible and y + 3 <= body_end) : (i += 1) {
+        const stats = mm.atConst(i) orelse break;
+        // row 1: name + call count (right-aligned count). Clip the name to
+        // the rail width before handing it to vaxis: unknown tool names can
+        // be long and must never spill past the border.
+        const content_w = w -| 3;
+        const head = buffer.utf8.truncateWidth(stats.name, content_w);
+        var head_segs = std.ArrayList(vaxis.Segment).empty;
+        defer head_segs.deinit(a);
+        try head_segs.append(a, .{ .text = head, .style = st.bold });
+        const count_text = try std.fmt.allocPrint(a, "calls {d}", .{stats.calls});
+        const head_cells: u32 = @intCast(autil.cellWidth(win, head));
+        const count_cells: u32 = @intCast(autil.cellWidth(win, count_text));
+        if (head_cells +| count_cells < content_w) {
+            try head_segs.append(a, .{ .text = try spaces(a, content_w - head_cells - count_cells), .style = .{ .bg = rail_bg } });
+            try head_segs.append(a, .{ .text = count_text, .style = st.dim });
+        }
+        try drawRailRow(win, a, y, x, w, "│", border_style, rail_bg, head_segs.items, @min(content_w, head_cells +| count_cells));
+        y += 1;
+
+        var counts = try std.fmt.allocPrint(a, "ok {d} · err {d}", .{ stats.ok, stats.errors });
+        if (stats.approval_required > 0) {
+            counts = try std.fmt.allocPrint(a, "{s} · appr {d}", .{ counts, stats.approval_required });
+        }
+        if (stats.unsupported > 0) {
+            counts = try std.fmt.allocPrint(a, "{s} · unsup {d}", .{ counts, stats.unsupported });
+        }
+        try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, counts, st.dim);
+        y += 1;
+
+        const latency = if (stats.averageMs()) |avg_ms|
+            try std.fmt.allocPrint(a, "avg {d}ms · max {d}ms", .{ avg_ms, stats.max_ms })
+        else
+            try a.dupe(u8, "no latency samples");
+        try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, latency, st.dim);
+        y += 1;
+    }
+
+    if (more > 0 and y < body_end) {
+        const text = try std.fmt.allocPrint(a, "+{d} more tools", .{more});
+        try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, text, st.faint);
+    }
+
+    if (chart_h >= 2 and body_end >= chart_h + 1) {
+        const chart_y = body_end - chart_h;
+        if (chart_y > m.body_top) {
+            if (toolChartCanvas(self, a, active_idx, w -| 3, chart_h)) |canvas| {
+                try drawChartCanvas(self, a, win, x, w, border_style, rail_bg, chart_y, canvas);
+            } else if (chart_y < body_end) {
+                try drawRailTextRow(self, win, a, chart_y, x, w, border_style, rail_bg, "no latency samples yet", st.faint);
+            }
+        }
+    }
+}
+
 fn drawChatBody(
     self: *App,
     a: std.mem.Allocator,
@@ -1260,21 +2190,38 @@ fn drawChatBody(
     m: *const ws.Metrics,
     active: *AgentThread,
 ) !void {
-    _ = self;
     const content_w = w -| 3;
+    const CardRow = struct { msg: usize, row: u32 };
     var rows = std.ArrayList(Row).empty;
     defer {
         for (rows.items) |*r| r.segs.deinit(a);
         rows.deinit(a);
     }
-    for (active.messages.items) |msg| {
-        try appendMessageRows(a, &rows, st, content_w, msg.role, msg.text);
+    var card_rows: std.ArrayList(CardRow) = .empty;
+    defer card_rows.deinit(self.alloc);
+
+    for (active.messages.items, 0..) |msg, mi| {
+        if (msg.role == .tool) {
+            const at: u32 = @intCast(rows.items.len);
+            try appendToolCardRows(self, a, &rows, st, content_w, &msg);
+            try card_rows.append(self.alloc, .{ .msg = mi, .row = at });
+        } else {
+            // A tool-call assistant turn with no text is represented by its
+            // cards; an empty in-flight bubble renders nothing (M1 behavior).
+            if (msg.role == .assistant and msg.tool_calls_json != null and msg.text.len == 0) continue;
+            try appendMessageRows(a, &rows, st, content_w, msg.role, msg.text);
+        }
     }
     if (active.error_text) |err| {
         const prefix = try std.fmt.allocPrint(a, "error: {s}", .{std.mem.trim(u8, err, " \t\r\n")});
         try appendWrappedPlain(a, &rows, content_w, prefix, st.error_style);
     } else if (active.status == .cancelled) {
         try appendWrappedPlain(a, &rows, content_w, "[stream cancelled]", st.faint);
+    }
+    if (toolState(self, self.ai.threads.active)) |tool_state| {
+        if (tool_state.note) |note| {
+            try appendWrappedPlain(a, &rows, content_w, note, st.faint);
+        }
     }
     if (active.messages.items.len == 0 and active.error_text == null and active.status != .cancelled) {
         try appendWrappedPlain(a, &rows, content_w, "no messages yet", st.dim);
@@ -1302,5 +2249,22 @@ fn drawChatBody(
         }
         const row = rows.items[ri];
         try drawRailRow(win, a, y, x, w, "│", border_style, rail_bg, row.segs.items, row.cells);
+    }
+
+    // Tool cards are interactive through the existing hint API: activating
+    // the label toggles the result excerpt open/closed (a real action; no
+    // invented controls). Only visible card rows are targets.
+    if (self.hints.collecting) {
+        for (card_rows.items) |card| {
+            if (card.row < top) continue;
+            const rel = card.row - top;
+            if (rel >= m.body_rows) continue;
+            self.addHintTarget(.{
+                .row = m.body_top + rel,
+                .col = x + 2,
+                .width = content_w,
+                .height = 1,
+            }, .{ .tool_card_toggle = card.msg });
+        }
     }
 }

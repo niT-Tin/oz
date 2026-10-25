@@ -171,5 +171,6 @@ pub fn execHintAction(self: *App, action: hints.Action) !void {
         },
         .inline_approve => try self.inlineApprove(),
         .inline_reject => self.inlineReject(),
+        .tool_card_toggle => |msg_index| self.aiToggleToolCard(msg_index),
     }
 }
