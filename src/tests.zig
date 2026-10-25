@@ -36,6 +36,8 @@ pub const icons = @import("icons.zig");
 pub const git = @import("git.zig");
 pub const term = @import("term.zig");
 pub const app_macro = @import("app/macro.zig");
+// Theme-aware chrome styles (pure; app/chrome.zig owns the active-tab/rule mapping)
+pub const app_chrome = @import("app/chrome.zig");
 // M2.6a keyboard hints (pure label/target model; app/hint_ui.zig is e2e-tested)
 pub const app_hints = @import("app/hints.zig");
 // M2b1 navigator tabs + note store (pure; app/notes.zig is e2e-tested)

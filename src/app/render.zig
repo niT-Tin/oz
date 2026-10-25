@@ -17,6 +17,7 @@ const App = app_mod.App;
 const nav_tabs = @import("navigator.zig");
 const note_store = @import("note_store.zig");
 const autil = @import("util.zig");
+const chrome = @import("chrome.zig");
 const git_job = @import("git_job.zig");
 
 const tab_width = app_mod.tab_width;
@@ -1543,7 +1544,11 @@ pub fn renderNavigator(self: *App, a: std.mem.Allocator, win: vaxis.Window, heig
     const ft_top = self.contentTop(a);
     const ft_bottom = height - status_row_count; // above the status bar
     const usable = ft_width - 2; // cells between the two borders
-    const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg } };
+    // The navigator box is a panel: its border follows focus (win_sep when
+    // the editor owns the keyboard, the theme's active separator when the
+    // navigator does), and every tab/rule inside derives from the palette.
+    const nav_focused = self.focus == .navigator and self.ai.focus == .editor;
+    const border_style = chrome.panelBorderStyle(self.theme, nav_focused, .{ .rgb = self.theme.bg });
     // Paint the whole panel with the editor background first — without
     // this only the border columns and the text-width of each item
     // got the bg, leaving the interior terminal-default (patchy).
@@ -1610,7 +1615,9 @@ pub fn renderNavigator(self: *App, a: std.mem.Allocator, win: vaxis.Window, heig
 /// than a breadcrumb. Every tab is a hint target whose label is drawn at the
 /// tab's first cell (the overlay clamps into the 30-cell panel).
 fn renderNavigatorTabs(self: *App, a: std.mem.Allocator, win: vaxis.Window, row: u32) !void {
-    const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg } };
+    const nav_focused = self.focus == .navigator and self.ai.focus == .editor;
+    const border_style = chrome.panelBorderStyle(self.theme, nav_focused, .{ .rgb = self.theme.bg });
+    const sep_style = chrome.separatorStyle(self.theme, .minor, .{ .rgb = self.theme.bg });
     var segs = std.ArrayList(vaxis.Segment).empty;
     try segs.append(a, .{ .text = "╭─ ", .style = border_style });
     var used: u32 = 3;
@@ -1619,15 +1626,15 @@ fn renderNavigatorTabs(self: *App, a: std.mem.Allocator, win: vaxis.Window, row:
     while (i < nav_tabs.count) : (i += 1) {
         const tab = nav_tabs.all[i];
         if (i > 0) {
-            try segs.append(a, .{ .text = " │ ", .style = border_style });
+            try segs.append(a, .{ .text = " │ ", .style = sep_style });
             used += 3;
         }
         starts[i] = used;
         const active = self.navigator_tab == tab;
         const style: vaxis.Style = if (active)
-            .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_sel }, .bold = true }
+            chrome.activeTabStyle(self.theme)
         else
-            .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg } };
+            chrome.inactiveTabStyle(self.theme, .{ .rgb = self.theme.bg });
         const label = nav_tabs.label(tab);
         try segs.append(a, .{ .text = label, .style = style });
         used += @intCast(label.len);
@@ -2211,10 +2218,9 @@ pub fn drawStatusChrome(self: *App, win: vaxis.Window) void {
         .height = @intCast(status_row_count),
     });
     band.fill(.{ .style = .{ .bg = bg } });
-    const rule_style: vaxis.Style = .{
-        .fg = .{ .rgb = self.theme.fg_faint },
-        .bg = bg,
-    };
+    // The top rule is the strongest horizontal chrome boundary above the
+    // status text: full secondary accent, not the old fixed gray.
+    const rule_style = chrome.separatorStyle(self.theme, .major, bg);
     var col: u32 = 0;
     while (col < win.width) : (col += 1) {
         win.writeCell(@intCast(col), @intCast(rule_row), .{
@@ -2282,20 +2288,22 @@ pub fn render(self: *App) !void {
             const name = if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
             const dirty = if (buf.dirty) "\u{25cf}" else " ";
             const label = try std.fmt.allocPrint(a, " {s}{s} ", .{ name, dirty });
-            const tab_style: vaxis.Style = if (tab_i == self.current)
-                // bg_status, NOT bg_sel: tests (and the eye) read bg_sel
-                // as an editor selection — the tab bar must not emit it
-                .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_status }, .bold = true }
+            const active_tab = tab_i == self.current;
+            const tab_style: vaxis.Style = if (active_tab)
+                chrome.activeTabStyle(self.theme)
             else
-                .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
-            // file icon in the tab's own semantic color (devicons style);
-            // the name keeps the plain tab style
+                chrome.inactiveTabStyle(self.theme, .{ .rgb = self.theme.bg_float });
+            // File icon: the active tab's icon joins the accent marker
+            // treatment (demo nav-icon), inactive tabs keep the devicon's
+            // semantic color.
             const icon = icons.forPath(if (buf.path) |p| p else "", false);
-            const icon_style: vaxis.Style = .{
-                .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) },
-                .bg = tab_style.bg,
-                .bold = (tab_i == self.current),
-            };
+            const icon_style: vaxis.Style = if (active_tab)
+                chrome.activeTabMarkerStyle(self.theme)
+            else
+                .{
+                    .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) },
+                    .bg = .{ .rgb = self.theme.bg_float },
+                };
             // The tab bar belongs to the EDITOR area: with the Agent Rail
             // docked, labels clip at the editor edge instead of running
             // under the rail.
@@ -2394,15 +2402,17 @@ pub fn render(self: *App) !void {
                     const label = try std.fmt.allocPrint(a, " {s}{s} ", .{ name, dirty });
                     const active = tab_i == own;
                     const tab_style: vaxis.Style = if (active)
-                        .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_status }, .bold = true }
+                        chrome.activeTabStyle(self.theme)
                     else
-                        .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
+                        chrome.inactiveTabStyle(self.theme, .{ .rgb = self.theme.bg_float });
                     const icon = icons.forPath(if (buf.path) |p| p else "", false);
-                    const icon_style: vaxis.Style = .{
-                        .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) },
-                        .bg = tab_style.bg,
-                        .bold = active,
-                    };
+                    const icon_style: vaxis.Style = if (active)
+                        chrome.activeTabMarkerStyle(self.theme)
+                    else
+                        .{
+                            .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) },
+                            .bg = .{ .rgb = self.theme.bg_float },
+                        };
                     // clip only at the row's right edge: tabs may borrow
                     // space right of their own (too narrow) pane span
                     const fit = autil.cellFitPrefix(win, label, right -| col -| 1);
@@ -3539,7 +3549,7 @@ pub fn render(self: *App) !void {
     const status_bg = vaxis.Color{ .rgb = self.theme.bg_status };
     const status_fg: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = status_bg };
     const status_dim: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = status_bg };
-    const status_sep: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = status_bg };
+    const status_sep = chrome.separatorStyle(self.theme, .minor, status_bg);
     const status_accent: vaxis.Style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = status_bg };
     const status_badge: vaxis.Style = .{
         .fg = .{ .rgb = self.theme.bg },

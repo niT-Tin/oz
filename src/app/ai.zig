@@ -13,6 +13,7 @@ const agent = @import("../ai/agent.zig");
 const turn = @import("../ai/turn.zig");
 const chart = @import("../chart.zig");
 const autil = @import("util.zig");
+const chrome = @import("chrome.zig");
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const ws = ai.workspace;
@@ -1876,11 +1877,11 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
     const rail_bg = vaxis.Color{ .rgb = t.bg_float };
     const content_w = w -| 3;
     const focused = self.ai.focus != .editor;
-    // The left rule is the rail's hard boundary: accent while the rail owns
-    // the keyboard, a readable dim rule otherwise (faint disappeared into
-    // bg_float on some themes/terminals).
-    const border_color = if (focused) t.accent else t.fg_dim;
-    const border_style = vaxis.Style{ .fg = .{ .rgb = border_color }, .bg = rail_bg };
+    // The left rule is the rail's hard boundary: the theme's active window
+    // separator while the rail owns the keyboard, `win_sep` otherwise. Both
+    // slots are palette-derived; the focused border is distinctly colored
+    // in every theme.
+    const border_style = chrome.panelBorderStyle(t, focused, rail_bg);
     const m = ws.metrics(rail_rows, self.ai.tab);
 
     // Solid bg first: every rail cell (including the border/padding) is
@@ -1926,10 +1927,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         // token so `AGENTS 1` is readable (and no decorative glyph is
         // required).
         const header_bg = vaxis.Color{ .rgb = t.bg_status };
-        const header_border_style = vaxis.Style{
-            .fg = .{ .rgb = border_color },
-            .bg = header_bg,
-        };
+        const header_border_style = chrome.panelBorderStyle(t, focused, header_bg);
         const header_label_style = vaxis.Style{
             .fg = .{ .rgb = if (focused) t.accent else t.fg },
             .bg = header_bg,
@@ -2019,7 +2017,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         // status marker so no nerd-font/geometric glyph is required.
         const marker: []const u8 = if (attached) ">" else threadDot(thread.status);
         const marker_style: vaxis.Style = if (attached)
-            .{ .fg = .{ .rgb = t.accent }, .bg = row_bg, .bold = true }
+            chrome.activeThreadMarkerStyle(t, row_bg)
         else
             .{ .fg = dot_style.fg, .bg = row_bg };
 
@@ -2057,7 +2055,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         var rc: u32 = 0;
         while (rc < content_w) : (rc += 1) try rule.appendSlice(a, "─");
         var segs = std.ArrayList(vaxis.Segment).empty;
-        try segs.append(a, .{ .text = rule.items, .style = st.dim });
+        try segs.append(a, .{ .text = rule.items, .style = chrome.separatorStyle(t, .major, rail_bg) });
         try drawRailRow(win, a, m.divider_row, x, w, "├", border_style, rail_bg, segs.items, content_w);
     }
 
@@ -2083,8 +2081,9 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
     }
 
     // ---- tabs: >chat │ changes N │ tools │ terminal ----
-    // The active tab carries a `>` marker, accent + bold text and the
-    // selection background, so it is distinct even in monochrome. `│`
+    // The active tab carries a `>` marker on the soft selection background,
+    // `fg` bold text and an accent_alt underline; the shared chrome helper
+    // keeps it identical to the navigator and buffer tabs. `│`
     // separators keep the four targets from reading as one label; the
     // compact labels leave room for the badge at 34-cell rail widths.
     {
@@ -2112,16 +2111,18 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
             if (used + sep_cells + marker_cells + label_cells > content_w) break;
             if (i > 0) {
                 const sep_text = if (spaced) (if (i == 1) "│ " else " │ ") else "│";
-                try segs.append(a, .{ .text = sep_text, .style = .{ .fg = .{ .rgb = t.fg_faint }, .bg = rail_bg } });
+                try segs.append(a, .{ .text = sep_text, .style = chrome.separatorStyle(t, .minor, rail_bg) });
                 used += sep_cells;
             }
             const style: vaxis.Style = if (active_tab)
-                .{ .fg = .{ .rgb = t.accent }, .bg = .{ .rgb = t.bg_sel }, .bold = true }
+                chrome.activeTabStyle(t)
             else
-                .{ .fg = .{ .rgb = t.fg_dim }, .bg = rail_bg };
+                chrome.inactiveTabStyle(t, rail_bg);
             const target_col = x + 2 + used;
             if (active_tab) {
-                try segs.append(a, .{ .text = ">", .style = .{ .fg = .{ .rgb = t.accent }, .bg = rail_bg, .bold = true } });
+                // The marker shares the tab's soft selection + accent
+                // underline, so marker + label read as one selected tab.
+                try segs.append(a, .{ .text = ">", .style = chrome.activeTabMarkerStyle(t) });
                 used += 1;
             }
             if (self.hints.collecting) {
@@ -2146,7 +2147,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         var rc: u32 = 0;
         while (rc < content_w) : (rc += 1) try rule.appendSlice(a, "─");
         var segs = std.ArrayList(vaxis.Segment).empty;
-        try segs.append(a, .{ .text = rule.items, .style = st.dim });
+        try segs.append(a, .{ .text = rule.items, .style = chrome.separatorStyle(t, .major, rail_bg) });
         try drawRailRow(win, a, m.tabs_sep_row, x, w, "├", border_style, rail_bg, segs.items, content_w);
     }
 
