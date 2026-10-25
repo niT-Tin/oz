@@ -1004,6 +1004,29 @@ Narrow drawer 必须有遮罩/焦点陷阱，不能挤压编辑器到不可用�
 - **scope/性能**：只映射样式，无键位、行为、hint target 或布局改动；helper 返回 `vaxis.Style` 值，无每帧分配。`fg_faint` 仅保留给非 active 的次要文字。
 - **测试**：493 unit / 179 e2e。单测覆盖全部 16 个主题（active tab = `bg_sel`/`fg`/bold/`accent_alt` underline；minor/major/panel 均非 `fg_faint` 且跨主题不同；浅色主题有效）；新增 `ui chrome: theme matrix ...` e2e，用临时 HOME + `~/.cache/oz/theme`（生产 `loadTheme` seam）分别加载 kanagawa-wave / catppuccin-mocha / flexoki-light，逐 cell 校验 nav/buffer/workbox active tab 的 fg/bg/underline、tab/rule/status 分隔线的 accent、focused rail/navigator border，并断言三种主题的实际渲染色两两不同。goldens 通过 `OZ_UPDATE_GOLDEN=1` 重建：只有 fg/bg style run 变化（active buffer tab 底色、workbox marker/underline、rule/status 颜色），row text 未变。
 
+#### 18.11 Two-row buffer strip（feat/ui-polish，2026-10-25）
+
+用户反馈顶部 buffer tabs 太小、不像批准 demo 的 `.buffer-bar`。本节只放大/重组 buffer strip，不改键位、buffer 模型、关闭语义或其它工作面；内容整体下移一行，goldens 因布局变化显式重建。
+
+- **两行结构**：第 0 行是 tab labels，第 1 行是编辑器区域通栏 `─` rule + active tab 的 `accent_alt` inset underline segment；内容从两行之下开始。split 时每个 column-overlap layer 各占一个 label row，所有 layer 共享同一条 rule row（`tabBarRows = layers + 1`），因此 stacked pane 不会重复画 rule，也不会让内容画进 strip。高度极小时 `tabBarRows` clamp 到可用行数，dashboard/空 buffer 仍保留 strip 与 rule，不塌陷。
+- **tab 几何**（纯模块 `src/app/tabstrip.zig`）：body 最小 20、最大 26 cells；固定 2-cell 左侧内边距 + devicon + 空格 + filename + 保留的 dirty 列（`●`）+ 空格 + close `×` + 2-cell 右内边距；tab 之间一条 `│`。dirty 列即使 clean 也保留，输入时 tab 宽度不跳动；close 位置固定在 body 右端，hint target 与之同源。粗算：`fixed_cells = 9`，name region = body - 9（11..17 cells）。
+- **宽度/滚动**：filename 超宽时 middle-ellipsis（保留可读前缀 + `…` + 8-cell 后缀），比 CSS 的尾部省略更能在窄 cell 中保留扩展名/尾标识；`plan()` 在总宽超限时以 active tab 为锚，先向右再向左填充可见邻居，返回每个可见 tab 的 x/width/name 区/close 列。80/100/120 下切换 buffer 始终完整显示 active tab；不可见邻居由 `hidden_left/right` 表示，不画越界内容，也无额外滚动键位。
+- **样式**：label row 底色 `bg_status`（bar 层级），inactive tab 用 `fg_dim`（diff/note 未 active 时仍用 `constant`/`type` 语义色），active tab 保持 §18.10.1 的 `bg_sel` + `fg` bold + `accent_alt` underline；active icon/marker 同 accent。rule row 用 `win_sep` 的 dim hairline（demo `.buffer-bar` 的 border），active segment 用亮 `accent_alt`，因此 rule 与 active inset 在 cell 层面可区分。split 的每个 pane 各自按自己的 active buffer 画 underline。
+- **hint / 关闭**：tab 的 select target 从 icon（左内边距之后）开始且覆盖 tab body；clean/dirty 均可注册 close target。新增 `hints.Action.buffer_close`，动作直接调用既有 `closeBufferAt`（`:bd` / `<leader>bk` 同一条路径，最后一个 buffer 不注册 target，无第二套破坏性逻辑）。关闭 dirty buffer 仍是既有语义，不新增确认框。
+- **性能/测试**：plan 为 O(tabs)、固定可见槽位、零分配；renderer 复用 frame arena 的 spec 映射，无每帧堆分配增长。单测覆盖 min/max width、icon/name/dirty/close 几何、middle-ellipsis 分配、active 可见性（80/100/120）、>64 visible 的截断、空/单 tab/clamp；e2e 新增 `ui buffer strip:` 三尺寸（120x30/100x30/80x24）和 split shared-rule 测试：逐 cell 校验 two-row 高度、rule/underline、`bg_sel` active、`×` 与 close hint 动作、内容首行、无水平溢出。
+- **测试计数**：510 unit / 185 e2e。
+
+#### 18.12 Motion（feat/ui-polish，2026-10-25）
+
+目标是把 demo 的 `dot-pulse` / `running-pulse` / `badge-pop` 语言带进 TUI，但只在有真实活动时动；空闲编辑器没有任何 timer 或逐帧重绘。纯函数在 `src/app/animation.zig`，不依赖 App/vaxis/分配。
+
+- **streaming pulse**：thread 的 dot/status 颜色在 `accent` ↔ `accent_alt` 之间按 `stream_pulse_ms = 900` 三角波插值（`pulseColor`），只对 `.streaming` 状态生效；idle/cancelled/error 保持静态语义色。rail thread row 与 workbox header 的 status 文案同步脉冲，active marker 仍可读。
+- **running tool spinner/pulse**：running card 的 icon 每 `spinner_step_ms = 120` 循环 ASCII `| / - \`，status 文案与 icon 颜色同步 pulse；ok/err/approval 等终态立即回到静态 icon/颜色。终态后不再有状态变化。
+- **Changes badge flash**：workbox 的 `changes N` 在 pending count 真正变化时获得 `badge_flash_ms = 420` 的颜色脉冲 + bold；`review_flash_start_ms` 是显式 deadline，`reviewFlashActive()` 到期即 false。首次打开 rail 初始化基线，不误闪。
+- **run loop / idle safety**：`animationActive() = aiStreaming() or inlineStreaming() or reviewFlashActive()`；tool-only batch 已被 `aiStreaming()` 的 tool_jobs 分支覆盖。loop 仅在该谓词为真时进入 1ms poll slice（16ms 渲染节流），谓词为假后回到阻塞 `pollEvent`；flash 到期不需要额外 wake。`frame_now_ms` 每帧只取一次，所有元素同相。
+- **可测性**：`wrapMs`/`triangle`/`spinnerGlyph`/`flashActive`/`flashProgress`/`blend`/`pulseColor`/`caretVisible` 全部纯函数并单测负时钟、端点、deadline 与 0 周期；内部 e2e seam `OZ_AI_TOOL_DELAY_MS`（默认未设）让 running card 在测试中停留数帧。e2e `animation:` 用长 SSE 流与带 delay 的 tool mock 各抓多帧，断言 status fg / spinner glyph 至少出现两种值；完成后断言 300ms 内 PTY 零输出、cell 不再变化（idle 无 churn）。
+- **限制**：TUI 无 opacity/transform，pulse 用 RGB 插值；badge flash 只有单测 deadline 与渲染路径，没有单独 e2e（不计入“至少两种动画”的验收）；caret blink helper 已就绪但硬件光标保持现状。
+
 ---
 
 ## 19. Keyboard Hints（qutebrowser 风格，M2.6）

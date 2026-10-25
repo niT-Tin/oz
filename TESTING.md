@@ -17,8 +17,8 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-Current counts on `feat/theme-chrome` (M3b2 + UI chrome + theme chrome):
-**493 unit tests** and **179 e2e tests**. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
+Current counts on `feat/ui-polish` (M3b2 + UI chrome + theme chrome + buffer strip/motion):
+**510 unit tests** and **185 e2e tests**. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
 `.verify/verify.json` (schema version 1, git commit/dirty flag, exact command
 strings, timestamps, exit codes, log SHA-256s, parsed pass/fail counts). It
 runs every command even after a failure and exits non-zero if any command
@@ -160,6 +160,46 @@ only: active buffer tab `bg_sel`, workbox marker/label underline and marker
 background, `accent_alt` rules/tab separators, status top rule and section
 separators, and the active thread marker. Row text is unchanged. They were
 regenerated with `OZ_UPDATE_GOLDEN=1` and reviewed cell-by-cell.
+
+### Buffer strip and motion assertions
+
+The `feat/ui-polish` strip is covered by the `ui buffer strip:` tests at
+120x30, 100x30 and 80x24 plus one split test:
+
+- row 0 is the label row and row 1 is the editor-wide rule row; the first
+  content line is row 2 (single window) or row 3 (two stacked label layers);
+- five real files (short, long/truncated, plain, note, diff) prove the 20–26
+  cell tab width, the `×` close cell, `│` separators, middle-ellipsis, and
+  that `gT` moves a complete `accent_alt` underline span together with the
+  `bg_sel` body (the rule row itself is the neutral `win_sep` hairline);
+- hint mode read from the drawn frame: the tab select label sits at the icon,
+  the close label at the close cell, and activating the close label removes
+  the real buffer through the existing `closeBufferAt` path;
+- the split test asserts two label rows, one shared rule row, one active
+  underline on the focused pane, content starting below all three rows, and
+  no horizontal overflow.
+
+Motion is covered by pure unit tests (`src/app/animation.zig`) and two pty
+tests:
+
+- `streaming status pulses...`: a long mock SSE stream keeps the workbox
+  header's `streaming` label alive; sampled frames must show at least two
+  distinct fg colors in the `accent`↔`accent_alt` pulse. After completion the
+  label settles to the static dim `idle` color, 300 ms of pty reads must be
+  empty, and the row must not change.
+- `running tool spinner...`: `OZ_AI_TOOL_DELAY_MS=700` (internal e2e seam,
+  unset in production) holds the worker so the running card is observable;
+  sampled frames must show at least two `| / - \` glyphs. After the result and
+  idle, the icon is a static terminal-state glyph, the cell does not change,
+  and 300 ms of reads is empty.
+- The Changes badge flash uses the same `flashActive` deadline in the run
+  loop; it is unit-tested at the helper level and does not add an idle timer.
+
+Goldens were regenerated once with `OZ_UPDATE_GOLDEN=1` after the strip grew:
+row 0/1 now carry the label/rule cells, every content row shifted down by one,
+and the 80x24 golden additionally pins the static idle status color (the
+padding style is explicit so a shrinking streaming label cannot leave a stale
+pulse fg).
 
 ### Notes test seam (`OZ_NOTES_DIR`)
 
@@ -368,6 +408,8 @@ original "staged/not applied" result after a later local approval.
 | Layout arithmetic / focus state | property sweeps |
 | AI/frame cell colors and borders | goldens + semantic assertions |
 | UI chrome (rail header/rules/tabs, nav/rail blank gutters, navigator tab separators, status band, blame clipping, tofu-glyph scan) | L3 `ui chrome:` tests + `git: blame ghost clips before the agent rail` + scenario matrix + goldens |
+| Two-row buffer strip (20–26 cell tabs, middle-ellipsis, active underline, close hint, split layers) | L1 `src/app/tabstrip.zig` + L3 `ui buffer strip:` tests + goldens |
+| Motion (streaming pulse, running tool spinner, badge flash deadline, idle no-churn) | L1 `src/app/animation.zig` + L3 `animation:` tests + goldens |
 | Keyboard hints (labels, status, target actions, Esc) | L1 pure model (`src/app/hints.zig`) + L3 `hints:` tests + `@hints` matrix scenarios |
 | Navigator tabs, notes list/create/save/reopen, agents attach | L1 (`src/app/navigator.zig`, `src/app/note_store.zig`) + L3 `navigator:` tests + `@navigator`/`@notes` matrix scenarios |
 | Notes path fallback/error handling | L1 resolution/creation tests + L3 unavailable-dir e2e (`OZ_NOTES_DIR=/dev/null/notes`) |
