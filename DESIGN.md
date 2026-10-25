@@ -1087,3 +1087,60 @@ pub const Target = struct { rect: Rect, action: Action };
 - 鼠标仍未接入；hint 与既有键盘路径共享同一批动作方法，没有第二套业务逻辑。
 - M2b1 追加 `navigator_tab`（复用 `navigatorSetTab`）与 `note_open`（复用 `openNoteAt`）两个动作；`agent_thread_select` 现在先打开 rail，保证从 navigator 的 Agents tab 触发时 attach 可见。navigator 的 tab strip 与 Notes 行都注册为 target，e2e 从画面读取标签后激活。
 - M2b2 追加 `inline_approve` / `inline_reject`：Changes 的 pending diff 渲染 `[a] approve  [r] reject` 两行按钮时注册矩形，动作分别复用 `inlineApprove` / `inlineReject`，与键盘 `a`/Enter、`r`/`d` 是同一条路径。
+
+---
+
+## 20. Agent Tools 与 Metrics（M3）
+
+### 20.1 目标
+
+M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时请求批准、并把调用过程可视化”。M3a 先做只读工具；M3b 再做写入/补丁审批和完整 metrics 图表。任何工具都不得绕过 workspace 边界或用户批准。
+
+### 20.2 工具协议
+
+- 复用 OpenAI-compatible `tools` + `tool_choice:"auto"`；工具定义与流式 `delta.tool_calls[]` 解析在 `src/ai/tools.zig`（M3 core）。
+- 支持并行 tool calls；按 index 累积 arguments 片段，finalize 后校验 JSON object。
+- 工具结果用 `role:"tool"` + `tool_call_id` 回填，content bounded（≤64 KiB），UTF-8 安全。
+- 一轮最多 N 次工具调用（例如 8）和最多 M 轮（例如 6），超限停止并显示原因；避免无限 agent loop。
+- 取消：与 chat 共用取消路径；取消后丢弃未完成的 tool calls，不执行。
+
+### 20.3 只读工具（M3a）
+
+`read_file` / `list_directory` / `grep`：
+
+- 路径必须限制在 workspace root 内：拒绝绝对路径、`..`、NUL、指向 root 外的 symlink；输出只显示相对路径。
+- 读取上限 64 KiB / 2000 行；目录最多 500 项；grep 最多 200 个匹配、单文件 1 MiB、深度 8；超出显示 truncation marker。
+- grep 为字面量匹配（不引入正则执行风险），可带简单 glob；跳过二进制。
+- 执行在后台线程/现有 worker 中，不阻塞 UI；结果回到对应 thread，不能串线。
+
+### 20.4 权限与审批
+
+- 读工具默认 allow；`edit_file` / `apply_patch` / terminal 默认 confirm；未知工具 deny。
+- 审批卡片出现在 Chat 内联，并同步到 Workbox Changes/Approval badge；`<leader>j` hint target 可选中 Allow/Deny。
+- M3a 的写入工具只返回 `approval_required`/未实现，不落盘；M3b 才通过 pending diff/apply 路径执行。
+- 审批决定必须绑定 tool_call id + 参数摘要；参数变化/过期不得复用旧批准。
+
+### 20.5 Tool cards 与 metrics
+
+- Chat 中每个 tool call 显示紧凑卡片：name、参数摘要、状态（running/ok/error/denied）、耗时、结果摘要；失败不能伪装成功。
+- Workbox `Tools` tab：按工具聚合
+  - calls / ok / error / denied
+  - average / p95?（先 avg + max）
+  - 最近 N 次耗时 ring buffer（每工具固定容量，例如 64）
+  - 折线图使用 `src/chart.zig`（M3b core），窄屏 fallback sparkline；没有数据时显示真实空状态。
+- Metrics 只统计真实调用；mock/e2e 数据不得进入发布 UI。
+- 图表只在数据变化时重算，按 workbox 尺寸缓存；普通帧 O(visible cards)，不每帧重跑 diff/chart。
+- 卡片/图表可被 hint mode 选中（同一 target API）。
+
+### 20.6 里程碑
+
+- **M3a**：只读 executor + tool loop + Chat tool cards + Tools tab 真实统计（纯文本/无图也可）+ 审批占位；e2e mock。
+- **M3b**：`edit_file`/`apply_patch` 审批 + pending diff/apply/undo；chart 接入；hint 覆盖审批/卡片；性能基准。
+- **后续**：terminal tool（独立沙箱/明确确认）、MCP/ACP、跨会话 metrics 持久化。
+
+### 20.7 测试
+
+- Core：tools 协议/accumulator（已有 26 单测）、executor 路径逃逸/大小上限/二进制/错误、chart（已有 17 单测）。
+- E2E：只读 tool call 一轮/多轮、并行 calls、错误工具、超轮次、取消、审批 deny/allow（M3b）、卡片 stats、Tools tab 空/有数据、80/100/120 布局、hint 选中。
+- 每个工具调用必须能在 mock 请求体/响应中复现；不能依赖真实网络。
+- 性能：executor 在 worker，UI 帧不等待；metrics/chart 重算次数可断言（例如只在数据变化时）。
