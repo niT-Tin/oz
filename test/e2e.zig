@@ -1238,6 +1238,10 @@ test "mouse: navigator tabs, filetree row, notes row, wheel move/clamp" {
     try mouseClickAt(&sess, 5, 3);
     try gridWaitFor(&sess, &grid, "# Alpha note", 5000);
     try std.testing.expect(aiRowContains(&grid, 0, "alpha.md"));
+
+    // Agents tab click initializes/shows the real thread model.
+    try mouseClickAt(&sess, navTabCol(2) + 1, navTabsRow());
+    try gridWaitFor(&sess, &grid, "thread 1", 5000);
     try std.testing.expect(grid.contains("NORMAL"));
     try frame.expectNoHorizontalOverflow(&grid, 120);
 
