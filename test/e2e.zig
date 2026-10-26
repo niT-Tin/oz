@@ -19480,6 +19480,590 @@ test "approval: 80x24 apply_patch drawer diff/buttons fit and the approve hint a
     try aiQuit(&sess);
 }
 
+test "approval: multi-file apply_patch writes both files, updates both buffers, undo/redo" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_appr_patch_multi_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var a_buf: [220:0]u8 = undefined;
+    var b_buf: [220:0]u8 = undefined;
+    const a_path = try bufPrintZ(&a_buf, "{s}/a.txt", .{root});
+    const b_path = try bufPrintZ(&b_buf, "{s}/b.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, a_path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "alpha one\nbeta two\n");
+    }
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, b_path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "gamma three\ndelta four\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const patch_args = try aiPatchArgs(alloc,
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1,2 +1,2 @@
+        \\ alpha one
+        \\-beta two
+        \\+BETA two
+        \\diff --git a/b.txt b/b.txt
+        \\--- a/b.txt
+        \\+++ b/b.txt
+        \\@@ -1,2 +1,2 @@
+        \\ gamma three
+        \\-delta four
+        \\+DELTA four
+        \\
+    );
+    defer alloc.free(patch_args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_patch_multi", .name = "apply_patch", .args = patch_args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "PATCH_MULTI_DONE follow-up");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, a_path }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "alpha one", 5000);
+
+    // Open both targets first so approve must refresh two live buffers.
+    try sess.send(":e b.txt\r");
+    try gridWaitFor(&sess, &grid, "gamma three", 5000);
+    try sess.send(":e a.txt\r");
+    try gridWaitFor(&sess, &grid, "alpha one", 5000);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("patch both files");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "changes 1", 10000);
+    try gridWaitFor(&sess, &grid, "2 files", 5000);
+    try gridWaitFor(&sess, &grid, "-2 +2", 5000);
+    try gridWaitFor(&sess, &grid, "> a.txt", 5000);
+    try gridWaitFor(&sess, &grid, "- beta two", 5000);
+    try gridWaitFor(&sess, &grid, "+ BETA two", 5000);
+    try gridWaitFor(&sess, &grid, "idle", 10000);
+    try expectNoDirtyMarker(&grid);
+    try frame.expectNoHorizontalOverflow(&grid, 120);
+
+    const a_before = try absFileText(io, alloc, a_path);
+    defer alloc.free(a_before);
+    const b_before = try absFileText(io, alloc, b_path);
+    defer alloc.free(b_before);
+    try std.testing.expectEqualStrings("alpha one\nbeta two\n", a_before);
+    try std.testing.expectEqualStrings("gamma three\ndelta four\n", b_before);
+
+    // The card says `2 files`, and the follow-up already told the model the
+    // truth (staged, not applied).
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "2 files · -2 +2", 8000);
+    try gridWaitFor(&sess, &grid, "a.txt, b.txt", 5000);
+    try gridWaitFor(&sess, &grid, "PATCH_MULTI_DONE follow-up", 10000);
+    const req2 = try aiReadFile(io, alloc, dir, "request-2.json");
+    defer alloc.free(req2);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "apply_patch (2 files: a.txt, b.txt) staged for review; not applied") != null);
+
+    // File selection: j shows the second diff, k comes back. Approve applies
+    // the whole set.
+    try sess.send("d");
+    try gridWaitFor(&sess, &grid, "[a] approve", 5000);
+    try sess.send("j");
+    try gridWaitFor(&sess, &grid, "> b.txt", 5000);
+    try gridWaitFor(&sess, &grid, "+ DELTA four", 5000);
+    try sess.send("k");
+    try gridWaitFor(&sess, &grid, "> a.txt", 5000);
+    try gridWaitFor(&sess, &grid, "+ BETA two", 5000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "changes 0", 5000);
+    try gridWaitFor(&sess, &grid, "no pending changes", 4000);
+    try gridWaitFor(&sess, &grid, "BETA two", 5000);
+    try expectNoDirtyMarker(&grid);
+
+    const a_applied = try absFileText(io, alloc, a_path);
+    defer alloc.free(a_applied);
+    const b_applied = try absFileText(io, alloc, b_path);
+    defer alloc.free(b_applied);
+    try std.testing.expectEqualStrings("alpha one\nBETA two\n", a_applied);
+    try std.testing.expectEqualStrings("gamma three\nDELTA four\n", b_applied);
+
+    // The other live buffer was refreshed too.
+    try sess.send(":e b.txt\r");
+    try gridWaitFor(&sess, &grid, "DELTA four", 5000);
+    try expectNoDirtyMarker(&grid);
+
+    // One `u` restores the whole set, including the unopened-at-that-moment
+    // semantics: both buffers and both files.
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "delta four", 5000);
+    try std.testing.expect(!grid.contains("DELTA four"));
+    const a_undone = try absFileText(io, alloc, a_path);
+    defer alloc.free(a_undone);
+    const b_undone = try absFileText(io, alloc, b_path);
+    defer alloc.free(b_undone);
+    try std.testing.expectEqualStrings("alpha one\nbeta two\n", a_undone);
+    try std.testing.expectEqualStrings("gamma three\ndelta four\n", b_undone);
+
+    // Redo re-applies the same cross-file unit.
+    try sess.send("\x12");
+    try gridWaitFor(&sess, &grid, "DELTA four", 5000);
+    const b_redone = try absFileText(io, alloc, b_path);
+    defer alloc.free(b_redone);
+    try std.testing.expectEqualStrings("gamma three\nDELTA four\n", b_redone);
+
+    try sess.send("\x17a");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), true, 3000);
+    try sess.send("t");
+    try gridWaitFor(&sess, &grid, "calls 1", 5000);
+    try gridWaitFor(&sess, &grid, "ok 1 · err 0 · appr 1", 5000);
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+
+    try aiQuit(&sess);
+}
+
+test "approval: multi-file apply_patch deny via mouse writes nothing" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_appr_patch_multi_deny_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var a_buf: [220:0]u8 = undefined;
+    var b_buf: [220:0]u8 = undefined;
+    const a_path = try bufPrintZ(&a_buf, "{s}/a.txt", .{root});
+    const b_path = try bufPrintZ(&b_buf, "{s}/b.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, a_path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "KEEP A\n");
+    }
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, b_path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "KEEP B\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const patch_args = try aiPatchArgs(alloc,
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-KEEP A
+        \\+MUTATE A
+        \\--- a/b.txt
+        \\+++ b/b.txt
+        \\@@ -1 +1 @@
+        \\-KEEP B
+        \\+MUTATE B
+        \\
+    );
+    defer alloc.free(patch_args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_patch_multi_deny", .name = "apply_patch", .args = patch_args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "MULTI_DENY_DONE follow-up");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, a_path }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "KEEP A", 5000);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("stage multi and deny");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "changes 1", 10000);
+    try gridWaitFor(&sess, &grid, "2 files", 5000);
+    try gridWaitFor(&sess, &grid, "[r] reject", 5000);
+    try gridWaitFor(&sess, &grid, "idle", 10000);
+    try expectNoDirtyMarker(&grid);
+
+    const reject_cell = aiFindCell(&grid, "[r] reject") orelse {
+        std.debug.print("multi deny: no reject button\n", .{});
+        grid.dump();
+        return error.TestUnexpectedResult;
+    };
+    try mouseClickAt(&sess, reject_cell.col + 4, reject_cell.row);
+    try gridWaitFor(&sess, &grid, "changes 0", 5000);
+    try gridWaitFor(&sess, &grid, "no pending changes", 4000);
+    try gridWaitFor(&sess, &grid, "KEEP A", 4000);
+    try std.testing.expect(!grid.contains("MUTATE"));
+    try expectNoDirtyMarker(&grid);
+
+    const a_after = try absFileText(io, alloc, a_path);
+    defer alloc.free(a_after);
+    const b_after = try absFileText(io, alloc, b_path);
+    defer alloc.free(b_after);
+    try std.testing.expectEqualStrings("KEEP A\n", a_after);
+    try std.testing.expectEqualStrings("KEEP B\n", b_after);
+
+    // Reject returned focus to the editor; re-enter the rail before Chat.
+    try sess.send("\x17a");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), true, 3000);
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "rejected", 5000);
+    try gridWaitFor(&sess, &grid, "MULTI_DENY_DONE follow-up", 10000);
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+
+    try aiQuit(&sess);
+}
+
+test "approval: one stale multi-file target rejects the whole set with the file named" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_appr_patch_multi_stale_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var a_buf: [220:0]u8 = undefined;
+    var b_buf: [220:0]u8 = undefined;
+    const a_path = try bufPrintZ(&a_buf, "{s}/a.txt", .{root});
+    const b_path = try bufPrintZ(&b_buf, "{s}/b.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, a_path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "STALE A old\n");
+    }
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, b_path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "STALE B old\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const patch_args = try aiPatchArgs(alloc,
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-STALE A old
+        \\+STALE A new
+        \\--- a/b.txt
+        \\+++ b/b.txt
+        \\@@ -1 +1 @@
+        \\-STALE B old
+        \\+STALE B new
+        \\
+    );
+    defer alloc.free(patch_args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_patch_multi_stale", .name = "apply_patch", .args = patch_args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "MULTI_STALE_DONE follow-up");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, a_path }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "STALE A old", 5000);
+
+    // Open b, edit it after staging, then approve: the exact stale buffer
+    // revision must reject the entire 2-file set and identify b.txt.
+    try sess.send(":e b.txt\r");
+    try gridWaitFor(&sess, &grid, "STALE B old", 5000);
+    try aiEnterRail(&sess, &grid);
+    try sess.send("stage both then edit one");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "changes 1", 10000);
+    try gridWaitFor(&sess, &grid, "2 files", 5000);
+    try gridWaitFor(&sess, &grid, "idle", 10000);
+
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try sess.send("iX\x1b");
+    try gridWaitFor(&sess, &grid, "XSTALE B old", 5000);
+
+    // The rail kept the Changes tab from staging; `d` here would be Reject,
+    // so approve directly from the already-active review.
+    try sess.send("\x17a");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), true, 3000);
+    try gridWaitFor(&sess, &grid, "[a] approve", 5000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "stale patch", 5000);
+    try gridWaitFor(&sess, &grid, "b.txt", 5000);
+    try gridWaitFor(&sess, &grid, "changes 1", 3000);
+    try std.testing.expect(grid.contains("XSTALE B old"));
+
+    const a_after = try absFileText(io, alloc, a_path);
+    defer alloc.free(a_after);
+    const b_after = try absFileText(io, alloc, b_path);
+    defer alloc.free(b_after);
+    try std.testing.expectEqualStrings("STALE A old\n", a_after);
+    try std.testing.expectEqualStrings("STALE B old\n", b_after);
+
+    try sess.send("r");
+    try gridWaitFor(&sess, &grid, "changes 0", 4000);
+    try gridWaitFor(&sess, &grid, "XSTALE B old", 3000);
+
+    try aiQuit(&sess);
+}
+
+test "approval: 80x24 multi-file review fits and its approve hint writes both" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_appr_patch_multi_80_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var a_buf: [220:0]u8 = undefined;
+    var b_buf: [220:0]u8 = undefined;
+    const a_path = try bufPrintZ(&a_buf, "{s}/a.txt", .{root});
+    const b_path = try bufPrintZ(&b_buf, "{s}/b.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, a_path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "tiny A old\n");
+    }
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, b_path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "tiny B old\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const patch_args = try aiPatchArgs(alloc,
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-tiny A old
+        \\+tiny A NEW
+        \\--- a/b.txt
+        \\+++ b/b.txt
+        \\@@ -1 +1 @@
+        \\-tiny B old
+        \\+tiny B NEW
+        \\
+    );
+    defer alloc.free(patch_args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_patch_multi_80", .name = "apply_patch", .args = patch_args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "MULTI_80_DONE");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, a_path }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "tiny A old", 5000);
+
+    try sess.send(" a");
+    try gridWaitFor(&sess, &grid, "AGENTS", 5000);
+    try sess.send("stage multi at 80");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "changes 1", 10000);
+    try gridWaitFor(&sess, &grid, "2 files", 5000);
+    try gridWaitFor(&sess, &grid, "> a.txt", 5000);
+    try gridWaitFor(&sess, &grid, "[a] approve", 5000);
+    try gridWaitFor(&sess, &grid, "idle", 10000);
+    try frame.expectNoHorizontalOverflow(&grid, 80);
+
+    const approve_cell = aiFindCell(&grid, "[a] approve") orelse {
+        std.debug.print("multi 80: no approve button\n", .{});
+        grid.dump();
+        return error.TestUnexpectedResult;
+    };
+    try sess.send(" j");
+    try gridWaitFor(&sess, &grid, "HINTS ·", 5000);
+    const want = hintLabelLenFor(hintTargetCount(&grid) orelse return error.TestUnexpectedResult);
+    var label_buf: [3]u8 = undefined;
+    const label = hintLabelAt(&grid, &label_buf, approve_cell.row, approve_cell.col, want);
+    if (label.len != want) {
+        std.debug.print("multi 80: no approve label ({d}/{d})\n", .{ label.len, want });
+        grid.dump();
+        return error.TestUnexpectedResult;
+    }
+    try sess.send(label);
+    try gridWaitFor(&sess, &grid, "tiny A NEW", 5000);
+    try gridWaitFor(&sess, &grid, "changes 0", 4000);
+    try std.testing.expect(!grid.contains("HINTS ·"));
+    try frame.expectNoHorizontalOverflow(&grid, 80);
+    try expectNoDirtyMarker(&grid);
+
+    // b.txt was never open: the multi-file apply still wrote it.
+    const b_after = try absFileText(io, alloc, b_path);
+    defer alloc.free(b_after);
+    try std.testing.expectEqualStrings("tiny B NEW\n", b_after);
+
+    try aiQuit(&sess);
+}
+
+test "approval: unsafe, binary or extra-section multi patches never stage" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_appr_patch_guard2_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var guard_buf: [220:0]u8 = undefined;
+    const guard = try bufPrintZ(&guard_buf, "{s}/guard.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, guard, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "guard line\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const unsafe_args = try aiPatchArgs(alloc,
+        \\--- a/guard.txt
+        \\+++ b/guard.txt
+        \\@@ -1 +1 @@
+        \\-guard line
+        \\+GUARD
+        \\--- /etc/passwd
+        \\+++ /etc/passwd
+        \\@@ -1 +1 @@
+        \\-a
+        \\+b
+        \\
+    );
+    defer alloc.free(unsafe_args);
+    const binary_args = try aiPatchArgs(alloc,
+        \\--- a/guard.txt
+        \\+++ b/guard.txt
+        \\@@ -1 +1 @@
+        \\-guard line
+        \\+GUARD
+        \\diff --git a/img.bin b/img.bin
+        \\Binary files a/img.bin and b/img.bin differ
+        \\
+    );
+    defer alloc.free(binary_args);
+    const extra_args = try aiPatchArgs(alloc,
+        \\--- a/guard.txt
+        \\+++ b/guard.txt
+        \\@@ -1 +1 @@
+        \\-guard line
+        \\+GUARD
+        \\diff --git a/new.txt b/new.txt
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/new.txt
+        \\@@ -0,0 +1 @@
+        \\+created
+        \\
+    );
+    defer alloc.free(extra_args);
+    const mode_args = try aiPatchArgs(alloc,
+        \\--- a/guard.txt
+        \\+++ b/guard.txt
+        \\@@ -1 +1 @@
+        \\-guard line
+        \\+GUARD
+        \\diff --git a/run.sh b/run.sh
+        \\old mode 100644
+        \\new mode 100755
+        \\
+    );
+    defer alloc.free(mode_args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_patch_unsafe", .name = "apply_patch", .args = unsafe_args },
+        .{ .id = "call_patch_binary", .name = "apply_patch", .args = binary_args },
+        .{ .id = "call_patch_extra", .name = "apply_patch", .args = extra_args },
+        .{ .id = "call_patch_mode", .name = "apply_patch", .args = mode_args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "PATCH_GUARD2_DONE follow-up");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, guard }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try aiEnterRail(&sess, &grid);
+    try sess.send("try invalid multi patches");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "PATCH_GUARD2_DONE follow-up", 10000);
+    try gridWaitFor(&sess, &grid, "idle", 5000);
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+    try expectNoDirtyMarker(&grid);
+    try std.testing.expect(!grid.contains("changes 1"));
+    try std.testing.expect(!grid.contains("approval required"));
+
+    const req2 = try aiReadFile(io, alloc, dir, "request-2.json");
+    defer alloc.free(req2);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "absolute paths are not allowed in patches") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "binary patches are not supported") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "creating or deleting files is not supported") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "file mode changes are not supported") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_patch_unsafe\"") != null);
+
+    try sess.send("\t");
+    try sess.send("t");
+    try gridWaitFor(&sess, &grid, "4 calls", 5000);
+    try gridWaitFor(&sess, &grid, "ok 0 · err 4", 5000);
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+
+    const on_disk = try absFileText(io, alloc, guard);
+    defer alloc.free(on_disk);
+    try std.testing.expectEqualStrings("guard line\n", on_disk);
+
+    try aiQuit(&sess);
+}
+
 test "approval: malformed or missing-target apply_patch calls never stage" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -19500,14 +20084,16 @@ test "approval: malformed or missing-target apply_patch calls never stage" {
     var dir_buf: [128]u8 = undefined;
     const dir = try aiMockDir(io, &dir_buf);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    // The same normalized file twice: duplicate sections are still rejected
+    // as a whole (two *different* files are the new multi-file path).
     const multi_args = try aiPatchArgs(alloc,
         \\--- a/guard.txt
         \\+++ b/guard.txt
         \\@@ -1 +1 @@
         \\-guard line
         \\+GUARD
-        \\--- a/other.txt
-        \\+++ b/other.txt
+        \\--- guard.txt
+        \\+++ guard.txt
         \\@@ -1 +1 @@
         \\-x
         \\+y
@@ -19557,7 +20143,7 @@ test "approval: malformed or missing-target apply_patch calls never stage" {
 
     // Compact cards clip the message; the full text is asserted on the
     // follow-up request body below.
-    try gridWaitFor(&sess, &grid, "multi-file patches", 10000);
+    try gridWaitFor(&sess, &grid, "error: patch contains the same", 10000);
     try gridWaitFor(&sess, &grid, "patch context does not", 8000);
     try gridWaitFor(&sess, &grid, "not found: missing.txt", 8000);
     try gridWaitFor(&sess, &grid, "BAD_PATCH_DONE follow-up", 10000);
@@ -19569,7 +20155,7 @@ test "approval: malformed or missing-target apply_patch calls never stage" {
 
     const req2 = try aiReadFile(io, alloc, dir, "request-2.json");
     defer alloc.free(req2);
-    try std.testing.expect(std.mem.indexOf(u8, req2, "error: multi-file patches are not supported") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "error: patch contains the same file more than once") != null);
     try std.testing.expect(std.mem.indexOf(u8, req2, "error: patch context does not match guard.txt") != null);
     try std.testing.expect(std.mem.indexOf(u8, req2, "error: not found: missing.txt") != null);
     try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_patch_multi\"") != null);
@@ -20440,6 +21026,10 @@ const Scenario = struct {
     /// M3b2: round 1 stages an apply_patch on the scenario's own opened
     /// buffer; the scenario approves and expects the patched buffer.
     patch_approval_fixture: bool = false,
+    /// M3b2 multi-file: round 1 stages a two-file patch (the scenario file
+    /// plus a fixed second /tmp fixture); the scenario reviews both files,
+    /// approves, and expects both write results.
+    patch_multi_fixture: bool = false,
     /// M3b3: round 1 stages a terminal command; the scenario allows it and
     /// expects the real output/follow-up (cwd = /tmp, the fixture's root).
     terminal_fixture: bool = false,
@@ -20705,6 +21295,40 @@ const scenario_matrix = [_]Scenario{
         },
     },
     .{
+        .name = "ai patch multi 120x30",
+        .tags = &.{ "@layout", "@ai", "@tools", "@approval", "@patch-multi", "@120col" },
+        .rows = 30,
+        .cols = 120,
+        .setup = .ai_mock,
+        .patch_multi_fixture = true,
+        .rail = .docked,
+        .steps = &.{
+            // Leave the prompt for the editor, open the second target, then
+            // return to the rail prompt for the mock tool call.
+            .{ .keys = "\x1b", .wait_for = "GOLDEN_EDITOR_MARKER" },
+            .{ .keys = ":e /tmp/oz_scenario_patch_b.txt\r", .wait_for = "B_SCENARIO_OLD" },
+            .{ .keys = "\x17a", .wait_for = "thread 1" },
+            .{ .keys = "\r", .wait_for = "❯ " },
+            .{ .keys = "patch both scenario files\r", .wait_for = "changes 1" },
+            .{ .keys = "", .wait_for = "2 files · -2 +2" },
+            .{ .keys = "", .wait_for = "second line PATCH_MULTI_SCENARIO_" },
+            .{ .keys = "j", .wait_for = "B line PATCH_MULTI_SC" },
+            .{ .keys = "", .wait_for = "idle" },
+            .{ .keys = "a", .wait_for = "changes 0" },
+            .{ .keys = "", .wait_for = "second B line PATCH_MULTI_SCENARIO_B_NEW" },
+            // Return to the first buffer so the scenario's standard editor
+            // marker remains visible in the settled frame.
+            .{ .keys = ":bp\r", .wait_for = "GOLDEN_EDITOR_MARKER" },
+            .{ .keys = "", .wait_for = "second line PATCH_MULTI_SCENARIO_NEW" },
+        },
+        .expect_text = &.{ "changes 0", "PATCH_MULTI_SCENARIO_NEW", "GOLDEN_EDITOR_MARKER" },
+        .request_contains = &.{
+            "apply_patch (2 files:",
+            "staged for review; not applied",
+            "\"role\":\"tool\"",
+        },
+    },
+    .{
         .name = "ai terminal approval 120x30",
         .tags = &.{ "@layout", "@ai", "@tools", "@approval", "@terminal", "@120col" },
         .rows = 30,
@@ -20753,8 +21377,8 @@ const scenario_matrix = [_]Scenario{
 /// feature adds its tag here and to at least one Scenario; the coverage test
 /// fails with a clear message otherwise (instead of silently dropping it).
 const required_scenario_tags = [_][]const u8{
-    "@layout",   "@ai",       "@filetree", "@stream", "@hints",  "@mouse",  "@navigator", "@notes",   "@inline", "@tools",
-    "@approval", "@terminal", "@80col",    "@100col", "@120col", "@drawer", "@docked",    "@compact",
+    "@layout",   "@ai",       "@filetree",    "@stream", "@hints",  "@mouse",  "@navigator", "@notes",  "@inline",  "@tools",
+    "@approval", "@terminal", "@patch-multi", "@80col",  "@100col", "@120col", "@drawer",    "@docked", "@compact",
 };
 
 fn expectedRailMode(rail: ScenarioRail) ai_ws.RailMode {
@@ -21034,6 +21658,7 @@ fn runScenario(sc: Scenario) !void {
         if (mock_dir) |d| std.Io.Dir.cwd().deleteTree(io, d) catch {};
     }
     defer if (sc.tool_fixture) std.Io.Dir.cwd().deleteFile(io, "/tmp/oz_scenario_tool_fixture.txt") catch {};
+    defer if (sc.patch_multi_fixture) std.Io.Dir.cwd().deleteFile(io, "/tmp/oz_scenario_patch_b.txt") catch {};
     if (sc.setup == .ai_mock) {
         const d = try aiMockDir(io, &dir_buf);
         mock_dir = d;
@@ -21073,6 +21698,28 @@ fn runScenario(sc: Scenario) !void {
             defer alloc.free(round1);
             try aiWriteFile(io, d, "stream-1.sse", round1);
             const round2 = try aiTextSse(alloc, "mock reply patch approval scenario done");
+            defer alloc.free(round2);
+            try aiWriteFile(io, d, "stream-2.sse", round2);
+        } else if (sc.patch_multi_fixture) {
+            // Two-file patch: the scenario's own opened file plus a fixed
+            // second /tmp target that the steps open explicitly.
+            try aiWriteFile(io, "/tmp", "oz_scenario_patch_b.txt", "B_SCENARIO_OLD\nsecond B line\n");
+            const base = std.fs.path.basename(name);
+            const patch_text = try std.fmt.allocPrint(
+                alloc,
+                "--- a/{s}\n+++ b/{s}\n@@ -1,2 +1,2 @@\n GOLDEN_EDITOR_MARKER\n-second line for the layout matrix\n+second line PATCH_MULTI_SCENARIO_NEW\n" ++
+                    "--- a/oz_scenario_patch_b.txt\n+++ b/oz_scenario_patch_b.txt\n@@ -1,2 +1,2 @@\n B_SCENARIO_OLD\n-second B line\n+second B line PATCH_MULTI_SCENARIO_B_NEW\n",
+                .{ base, base },
+            );
+            defer alloc.free(patch_text);
+            const args = try aiPatchArgs(alloc, patch_text);
+            defer alloc.free(args);
+            const round1 = try aiToolCallsSse(alloc, &.{
+                .{ .id = "call_scenario_patch_multi", .name = "apply_patch", .args = args },
+            });
+            defer alloc.free(round1);
+            try aiWriteFile(io, d, "stream-1.sse", round1);
+            const round2 = try aiTextSse(alloc, "mock reply patch multi scenario done");
             defer alloc.free(round2);
             try aiWriteFile(io, d, "stream-2.sse", round2);
         } else if (sc.terminal_fixture) {
@@ -21135,7 +21782,7 @@ fn runScenario(sc: Scenario) !void {
 
     // Tool scenarios run with cwd=/tmp so the workspace root is exactly the
     // directory holding the opened fixture (no dependency on repo .git).
-    var sess = if (sc.tool_fixture or sc.approval_fixture or sc.patch_approval_fixture or sc.terminal_fixture)
+    var sess = if (sc.tool_fixture or sc.approval_fixture or sc.patch_approval_fixture or sc.patch_multi_fixture or sc.terminal_fixture)
         try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, name }, env_extra, sc.rows, sc.cols, "/tmp")
     else
         try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, env_extra, sc.rows, sc.cols);

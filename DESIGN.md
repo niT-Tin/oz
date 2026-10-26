@@ -1197,7 +1197,7 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 
 - **M3a（已完成，2026-10-25）**：只读 executor + tool loop + Chat tool cards + Tools tab 真实统计 + chart 接入 + 审批占位；e2e mock。实现状态见 §20.8。
 - **M3b1（已完成，2026-10-25）**：`edit_file` staged diff + 人工 approve/reject + buffer-only apply/undo、审批按钮 hint、`approved`/`rejected` 卡片与 decision metrics。实现状态见 §20.9。
-- **M3b2（已完成，2026-10-25）**：`apply_patch` 单文件 unified diff 解析/校验/整文件 staged 替换 + 同一 approve/reject/undo 路径；多文件仍不支持。实现状态见 §20.10。
+- **M3b2（已完成，2026-10-25；multi-file 2026-10-26）**：`apply_patch` 1..8 文件 unified diff 解析/全量预校验/整文件 staged review；单文件保持 buffer-only approve/undo，多文件是一组显式跨文件 disk transaction + 跨文件 undo/redo。实现状态见 §20.10。
 - **M3c（已完成，2026-10-26）**：每工具 recent-window p95（整数 nearest-rank，≤32 个真实样本）+ Tools tab 卡片/顶栏展示与 80/100/120 紧凑 fallback。实现状态见 §20.11。
 - **M3b3（已完成，2026-10-26）**：`terminal` 工具 + 每命令显式人工 Allow/Deny + 后台 `/bin/sh -c`（captured workspace root、空 stdin、bounded env）+ 10s 上限/64 KiB 合并输出 + 真实进程组 kill + 结果回填/follow-up/metrics。**不是**通用 shell UI；编辑器终端（Alt+r）不变。实现状态见 §20.12。
 - **M3b 余下**：跨会话 metrics 持久化、性能基准。
@@ -1318,52 +1318,65 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 
 ---
 
-### 20.10 M3b2 实现状态（staged `apply_patch` approval，2026-10-25）
+### 20.10 M3b2 实现状态（staged `apply_patch` approval，single-file 2026-10-25；multi-file 2026-10-26）
 
 **范围与策略**
 
-- M3b2 只实现 `apply_patch` 的人工审批；`terminal`/未知工具仍不执行（本地 `unsupported`）。不含 terminal 沙箱、审批队列/持久化、多文件 patch、add/delete/rename/binary/mode 变更。（M3b3 之后 `terminal` 由 §20.12 接管；本节保留为 M3b2 当时的状态。）
-- `src/app/ai.zig:aiHandleToolCalls` 把 `edit_file` 与 `apply_patch` 都分流到 App 层 stage（`agent_edit_ui.stageToolCall` / `stagePatchToolCall`），executor/worker 仍只看到只读调用；任何工具执行路径都没有写 syscall。
-- `agent_patch.parse` 只接受**单文件 unified diff**：`diff --git`/`index`/`---`/`+++`/`@@` 头可选，但必须至少有一个路径来源；支持同一文件多个 hunk、省略 count（默认 1）、`\ No newline at end of file`、以及后续 hunk 的行号漂移。Markdown 代码围栏与 CRLF 传输会被规范化。`a/`/`b/` 前缀只在 old/new 拼写确实构成 git 前缀对时才剥离；`--no-prefix` 下真实路径以 `a/`/`b/` 开头的文件不会被误改。
-- 明确拒绝（typed error，真实 error card，不 stage、不部分应用）：多文件、增删文件（`/dev/null`/`new file mode`/`deleted file mode`）、binary、rename/copy、mode 变更、malformed header/hunk/counts、context/removal 不匹配、hunk 越界或乱序、`new_start` 与实际应用结果不一致、路径 absolute/`..`/NUL/符号链接逃逸/越出 captured root、文件缺失、patch >256 KiB、>256 hunks、>16K hunk 行、结果 >256 KiB。
-- 路径与目标复用 M3b1 的 confinement：`tool_exec.normalizeWorkspacePath` + `isWithin`，canonical path 必须位于**当轮捕获**的 workspace root；stage 只读，优先使用已打开 buffer（含未保存修改），否则读盘（≤256 KiB）。
-- `agent_patch.apply` 以旧全文为基准，按顺序复制未变行、校验 context/removal、应用全部 hunk，构造新全文；任一 hunk 不匹配即整体失败，绝不部分应用。
-- 新全文通过既有 `PendingAgentEdit`/approval 路径 stage：pending 是整文件 span `[0, old_len)`，`span_replacement` 为新全文；approve 仍是**一次 `applyEdit` = 一个 undo group**。没有第二套 review 组件。
+- `apply_patch` 支持 **1..8 个 modified files**：`diff --git`/`index`/`---`/`+++`/`@@` sections 可以背靠背出现，顺序即 review/write 顺序。单文件仍保持 M3b2 最初的 **buffer-only** 语义；多文件是新的 **whole-set disk transaction** 语义（见下）。
+- `src/app/ai.zig:aiHandleToolCalls` 仍把 `edit_file` 与 `apply_patch` 分流到 App 层 stage（`agent_edit_ui.stageToolCall` / `stagePatchToolCall`），executor/worker 只看到只读调用；任何工具执行路径都没有写 syscall。
+- `agent_patch.parseSet` 解析 1..`max_files` 个 section：每个 section 必须至少有一个 `@@` hunk；同一 normalized path 出现两次 → `DuplicatePath`；`a/`/`b/` 前缀只在 old/new 拼写确实构成 git 前缀对时才剥离（`--no-prefix` 下真实以 `a/`/`b/` 开头的路径不会被误改）。Markdown 围栏与 CRLF 传输会被规范化。
+- 明确拒绝（typed error，真实 error card，不 stage、不部分应用）：多文件超过 8 个、重复路径、增删文件（`/dev/null`/`new file mode`/`deleted file mode`）、binary、rename/copy、mode 变更、malformed header/hunk/counts、空 section、context/removal 不匹配、hunk 越界或乱序、`new_start` 与实际应用结果不一致、路径 absolute/`..`/NUL/符号链接逃逸/越出 captured root、文件缺失。
+- 预算：patch ≤256 KiB；每个文件的 old/result ≤256 KiB；整个 set 的 old+result 总量 ≤2 MiB；≤8 files；总 hunks ≤256、单文件 ≤128；hunk-body 行总数 ≤16K、单文件 ≤8K。超出即 typed error，不静默截断应用。
+- 路径与目标复用 M3b1 confinement：`tool_exec.normalizeWorkspacePath` + `isWithin`，canonical path 必须位于**当轮捕获**的 workspace root；stage 只读，优先使用已打开 buffer（含未保存修改），否则读盘。
+- `agent_patch.validateSet` 在 stage 前对**每个文件**应用全部 hunk，收集所有失败（文件 + reason），任一失败即丢弃整个 set；只有全部成功才产生 `Pending`。stage 过程不写任何文件。
+- `agent_patch.apply` 以单个文件的旧全文为基准，按顺序复制未变行、校验 context/removal、应用全部 hunk；任一 hunk 不匹配即整体失败。
 
 **Pending 与 UI**
 
-- `Pending` 新增 `kind: edit_file | apply_patch` 与保留的 `patch`（供 approve 时重新执行 hunk 校验）。stale 文案按 kind 为 `stale edit` / `stale patch`；卡片与 metrics 使用真实工具名。
-- stage 成功：不碰 buffer/history/dirty/file；自动打开 rail、Changes、badge `changes 1`；卡片 `approval required` + `-N +M · staged · review in Changes`（`-N +M` 是实际展示 hunk 的行级统计）；`role:"tool"` 结果固定为 `approval required: apply_patch staged for review; not applied`。
-- approve：重新 canonicalize 路径（必要时重新打开 buffer）、校验 buffer revision、整文件文本逐字节相等，并**重新应用保留的 patch** 要求结果与 stage 时完全一致；任一项失败 → `stale patch`，保留 review，buffer/history 不变。通过后整文件替换写入 buffer（dirty），不 save；卡片 `approved` + `-N +M · applied · u to undo`，metrics 记 ok，焦点回 editor。`:w` 仍是用户动作。
-- reject：丢弃 pending，卡片 `rejected`，metrics 记 denied；buffer/history/dirty/file 全部不变。
-- 同一时刻只有一个 review（agent 或 inline）：第二笔 `apply_patch`（或 `edit_file`）返回 `resolve the pending edit first`；pending 线程隔离，切线程隐藏 badge/review 但保留，必须回到 staging thread 才能 apply/reject。
-- 80x24 drawer 复用通用 `inline_ui.drawDiffReview`：diff/buttons 不横向溢出，`agent_approve`/`agent_reject` hint 与键盘路径一致。
+- `Pending` 改为 `files: []PendingFile`：每个 file 持有 canonical path、display path、old/new full text、buffer index/revision、保留的 parsed patch（approve 时重新执行 hunk 校验）和完整 preview。单文件兼容字段（`span_start/span_end`、`verify`/`verifyPatch`）保留；多文件没有连续 span。
+- 卡片：单文件保持 `-N +M · staged · review in Changes` 与固定 tool result。多文件为 `K files · -N +M · <有界 file list>`（最多 2 个名字，长路径显式 `…`，其余显示 `+N more`）；`role:"tool"` 结果包含全部 8 个以内的 path（长 path 显式截断），并明确 `staged for review; not applied`。
+- Changes 多文件 review：顶部 total stats，随后每文件一行（`> path` 为 active），超出可用高度时只显示 active 附近的有界窗口，并显示 `… file i/N · j/k select`；active file 的完整 diff 在下半部。`j`/`k` 选择文件，`J`/`K` 滚动当前 diff，Enter/`a` approve、`r`/`d` reject；每个可见文件行都是 `<leader>j` hint / 鼠标 target，Approve/Reject 按钮 target 不变。单文件仍走原 `inline_ui.drawDiffReview`。
+- 同一时刻只有一个 review（agent 或 inline）；pending 线程隔离，切线程隐藏 badge/review 但保留，必须回到 staging thread 才能 apply/reject。
+- 80x24 drawer 也使用同一多文件布局（有界 file 窗口 + diff），不横向溢出。
+
+**Apply / undo**
+
+- 单文件：approve 后重新 canonicalize（必要时打开 buffer）、校验 buffer revision、整文件文本与重新执行的 patch；通过后**一次 buffer 替换 = 一个 undo group**（dirty，不写盘），`:w` 仍是用户动作。
+- 多文件：approve 先对每个文件重新校验 canonical path、buffer revision、old text 与 retained hunks；任一失败 → `stale patch: <file>`，保留 review，**不写任何文件**。全部通过后：
+  1. 再次 realpath 每个目标（防 symlink 替换）；
+  2. 两个阶段写：先把每个 new text 写入同目录 sibling temp（保留原 mode），全部 temp 成功后才逐个 `rename` 覆盖目标；
+  3. phase-1 失败：清理 temp，目标全部未动；phase-2 某个 rename 失败：删除未 rename 的 temp，并用内存中的 old text **回滚已经 rename 的文件**；回滚本身失败会在卡片/状态栏如实报告，绝不声称成功；
+  4. 事务成功后更新所有已打开 buffer（整文件替换、一个 history group、clean、cursor/view 截断），当前 buffer 同步 LSP，其他 buffer 在下次 switch 时 full sync；
+  5. 如果 apply 前没有任何目标被打开，则打开第一个目标以便用户看到结果。
+- 多文件 undo：`Session.patch_undo: UndoSet` 保存每个文件的 old/new text、路径、apply 时的 buffer/revision。在多文件 set 的任一 buffer 按 `u`，只有**所有**相关 buffer revision 与磁盘内容仍等于 apply 结果时才执行跨文件 undo：先以同一 two-phase transaction 把 old text 写回所有文件，再对打开过的 buffer 执行历史 undo；`Ctrl+r` 对称 redo。任一项 stale/被编辑/disk 改变 → 拒绝并提示，不部分恢复。
+- metrics：stage 记一次 `approval_required`，approve/reject 记一次 decision；一次 `apply_patch` 调用只算一次 call。自动 follow-up 已经发出 “staged/not applied”，之后本地 approve 不改写模型 transcript（与 M3b1 相同）。
+- 单文件 apply 成功后清空上一组 multi undo unit；新的 multi apply 替换上一组。跨文件 undo 只保留**最近一组**。
 
 **限制**
 
-- 只支持**单文件** patch；多文件 patch 需要拆成多次调用。没有 add/delete/rename/copy、binary 或 mode 变更；没有 partial apply。
-- 整文件替换：一个 patch 是一个 undo group，不提供 per-hunk undo。`apply_patch` 与 `edit_file` 共享同一 pending 槽位。
-- 预览直接来自解析后的 hunk 行（本身就是 diff），有界（≤240 行 / ≤16 hunks）；不是整文件 unified diff，也不是 word-level diff。
-- 上限：patch/目标/结果 ≤256 KiB、≤256 hunks、≤16K hunk 行；超出即拒绝，不静默截断应用。
-- stage 后的自动 follow-up 已把 “staged/not applied” 发给模型；之后 approve 只更新本地卡片，模型 transcript 不会追认（与 M3b1 相同）。
-- 路径校验是 best-effort（与 executor 相同，不声称 TOCTOU 安全）；符号链接别名可能被当作不同路径。
-- 无 terminal/shell/网络；鼠标见 §21；pending 不跨进程持久化。
+- 语义不对称是有意的：单文件保持 buffer-only（`:w` 落盘），多文件 approve 即写盘。若需要统一语义，需要另一个设计切片，不能在本切片悄悄改变已有单文件 e2e。
+- 跨文件写不是 filesystem-wide atomic commit：保证是“所有 temp 成功前不动任何目标” + “rename 失败时 best-effort 回滚并如实报告”。没有 journal/事务恢复；进程在 rename 中途被杀仍可能留下部分新文件。
+- 没有 add/delete/rename/copy、binary 或 mode 变更；没有 partial apply；没有 per-hunk undo。
+- 多文件 preview 使用全局预算而不是单文件 240 行/16 hunks 的显示截断，因此 stats 是全量准确值；单文件保持原有 bounded preview。
+- 跨文件 undo 只保留最近一组；如果 apply 时未打开的文件后来被打开，undo 会拒绝直到关闭该 buffer（避免丢弃用户未保存内容）。任何相关文件在 apply 后被编辑或磁盘被外部修改，undo 会拒绝并保留 unit。
+- 路径校验是 best-effort（与 executor 相同，不声称 TOCTOU 安全），但 multi apply/undo 会在写前再次 realpath；符号链接别名可能被当作不同路径。
+- 无 terminal/shell/网络；pending 不跨进程持久化。
 
 **文件**
 
-- `src/app/agent_patch.zig`：参数解析、单文件 unified diff 解析、hunk 应用/重建全文、bounded preview + 单测。
-- `src/app/agent_edit.zig`：`Kind`、patch pending（整文件 span）、`verifyPatch`、stale 文案 + 单测。
-- `src/app/agent_edit_ui.zig`：共享目标解析/加载 helper、`stagePatchToolCall`、kind-aware 卡片/决策/apply。
-- `src/app/ai.zig`：`edit_file`/`apply_patch` 统一 stage 分流、真实 tool result、terminal/unknown unsupported。
-- `src/app/inline.zig`：公开 `dupeDisplayLine` 供 patch preview 复用（无行为变化）。
-- `src/ai/tools.zig`：`apply_patch` schema 描述明确为 single-file（参数/策略不变）。
-- `test/e2e.zig` + TESTING.md：5 个 M3b2 pty 测试、`ai patch approval 120x30` scenario、`@approval`。
+- `src/app/agent_patch.zig`：`parseSet` 多 section 解析、`validateSet` 全量预校验、`buildPreviewWithLimits`、hunk 应用/重建全文 + 单测。
+- `src/app/agent_edit.zig`：`PendingFile`/多文件 `Pending`、`commitFiles` two-phase transaction、`UndoSet`、`verifyFile`/`staleFile` + 单测。
+- `src/app/agent_edit_ui.zig`：多目标解析/加载、`stageMultiPatch`、跨文件 disk transaction、buffer/LSP/dirty 更新、multi Changes 布局、跨文件 undo/redo。
+- `src/app/inline_ui.zig`：`drawMultiDiffReview` + 有界 file-row 窗口；单文件 renderer 不变。
+- `src/app/highlight.zig` / `src/app/hints.zig` / `src/app/hint_ui.zig`：`u`/`Ctrl+r` 跨文件 hook、`agent_patch_file` 目标。
+- `src/app/ai.zig` / `src/ai/tools.zig`：多文件 stage 卡片/真实 tool result、schema 描述。
+- `test/e2e.zig` + TESTING.md：多文件 approve/undo/redo、deny、stale、80x24 hint、unsafe/binary/extra 拒绝；`ai patch multi 120x30` scenario、`@patch-multi`。
 
 **验证**
 
-- `zig build test`：491/491 通过（新增 17 个 `agent_patch`/`agent_edit` 纯模型单测）。
-- `zig build e2e`：175/175 通过（新增 5 个 M3b2 pty 测试；scenario matrix 新增 `ai patch approval 120x30`）。
-- 无 golden 变更（approval diff/卡片不进入固定 golden 帧）。
+- `zig build test`：556/556 通过（新增 `agent_patch` parseSet/validate/commit 与 `agent_edit` 多文件 pending/commitFiles/UndoSet 单测）。
+- `zig build e2e`：213/213 通过（新增 5 个 multi-file pty 测试；scenario matrix 新增 `ai patch multi 120x30` / `@patch-multi`）。
+- 无 golden 变更（approval 卡片/diff 不进入固定 golden 帧）。
 
 ---
 

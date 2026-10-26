@@ -17,13 +17,11 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-Current counts on `feat/terminal-tool` (based on `09c432e`):
-**544 unit tests** and **205 e2e tests**. In this git worktree, `tools/verify.sh`
-reports 202/205 e2e: three pre-existing checkout-sensitive tests fail
-(`relative CLI path` assumes the 4-level main checkout, the filetree scroll
-test hard-codes root/child counts, and the grep-picker test assumes ripgrep
-result order; the new terminal symbols change that order). See "Known gaps"
-below. The 13 `terminal:` tests all pass. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
+Current counts on `feat/patch-multi` (based on `5d57e73`):
+**556 unit tests** and **213 e2e tests**. `tools/verify.sh` PASSes all three
+commands in this worktree (diff check, 556/556 unit, 213/213 e2e; the
+`terminal:` and multi-file `approval:` suites included). `tools/verify.sh`
+writes `.verify/unit.log`, `.verify/e2e.log`, and
 `.verify/verify.json` (schema version 1, git commit/dirty flag, exact command
 strings, timestamps, exit codes, log SHA-256s, parsed pass/fail counts). It
 runs every command even after a failure and exits non-zero if any command
@@ -41,7 +39,7 @@ replaying a cached successful run.
 
 | Layer | What it covers | Where |
 |---|---|---|
-| **Model/unit (L1)** | Pure logic: piece table, motions, keymaps, SSE/OpenAI config parsing, AI workspace layout/focus/thread model, navigator tab model, note store (paths/titles/sorting/creation), inline selection mapping/fences/diff/pending policy, M3a agent loop bounds/card formatting/metrics/chart cache key + transcript→request assembly, M3c recent-window p95 (nearest-rank, ring wraparound, empty→null, no revision change), M3b1 staged `edit_file` args/occurrence/span/bounded-preview/pending policy and approval decision metrics; M3b2 single-file unified-diff parse/apply, whole-file patch pending, bounded hunk preview and `verifyPatch`; M3b3 terminal argument validation/timeout bounds/escaped display/output cap/result text, real `/bin/sh` spawn/cancel/timeout/output-cap job wrapper, and one-call terminal execution metrics | `src/**/*.zig` `test` blocks, aggregated by `src/tests.zig` |
+| **Model/unit (L1)** | Pure logic: piece table, motions, keymaps, SSE/OpenAI config parsing, AI workspace layout/focus/thread model, navigator tab model, note store (paths/titles/sorting/creation), inline selection mapping/fences/diff/pending policy, M3a agent loop bounds/card formatting/metrics/chart cache key + transcript→request assembly, M3c recent-window p95 (nearest-rank, ring wraparound, empty→null, no revision change), M3b1 staged `edit_file` args/occurrence/span/bounded-preview/pending policy and approval decision metrics; M3b2 multi/single-file unified-diff parse/validate, per-file patch pending, two-phase commit rollback, cross-file undo set, bounded/full hunk preview and `verifyFile`; M3b3 terminal argument validation/timeout bounds/escaped display/output cap/result text, real `/bin/sh` spawn/cancel/timeout/output-cap job wrapper, and one-call terminal execution metrics | `src/**/*.zig` `test` blocks, aggregated by `src/tests.zig` |
 | **Protocol fixtures** | SSE chunking, request JSON (incl. assistant tool-call turns and `role:"tool"` results), streamed `tool_calls` fragments/parallel calls/malformed protocol, config env parsing, AI client cancellation/error paths; mock LSP JSON-RPC | `src/ai/sse.zig`, `src/ai/openai.zig`, `src/ai/tools.zig`, `src/ai/client.zig`, `src/ai/config.zig`, mock LSP tests |
 | **Semantic frames (L3)** | Real `oz` binary in a pty; ANSI stream reconstructed into a cell grid; assertions on regions, borders, text, overlap, overflow | `test/e2e.zig` + `test/frame.zig` |
 | **Scenario matrix** | Data-driven pairwise matrix over terminal widths, filetree, and AI rail states; fresh pty per scenario; tags enforced | `test/e2e.zig` (`scenario_matrix`) |
@@ -89,8 +87,8 @@ fixture note; the navigator box is located without its title text (hint labels
 intentionally cover the tab words).
 
 Scenario tags: `@layout @ai @filetree @stream @hints @mouse @navigator
-@notes @inline @tools @approval @terminal @80col @100col @120col @drawer
-@docked @compact`. A new
+@notes @inline @tools @approval @terminal @patch-multi @80col @100col @120col
+@drawer @docked @compact`. A new
 feature adds its tag here and to at least one scenario. `@mouse` marks the
 scenarios whose clickable/target geometry the pointer tests also exercise
 (hints + approval); pointer sequences themselves are driven by the dedicated
@@ -354,7 +352,7 @@ later by M3b3, see below); ≤256 KiB stage cap; bounded hunk preview rather tha
 unified diff; the model transcript keeps the original "staged/not applied"
 tool result even after a later local approval; no mouse.
 
-### M3b2 staged `apply_patch` fixtures and e2e
+### M3b2 staged `apply_patch` fixtures and e2e (single- and multi-file)
 
 The M3b2 pty tests (`test/e2e.zig`, filter `approval:`) cover the complete
 single-file patch stage → review → decide path with real disk fixtures:
@@ -374,32 +372,68 @@ single-file patch stage → review → decide path with real disk fixtures:
 - a buffer edit after staging refuses with `stale patch`, keeps the diff
   reviewable and does not corrupt the user's edited buffer; reject cleans up;
 - an 80x24 drawer renders the patch diff/buttons without horizontal overflow
-  and the drawn Approve hint applies the patch;
-- two malformed calls plus a missing-target call in one batch (multi-file,
-  context mismatch, missing file) produce real `error:` cards with no stage,
-  `changes 0`, no dirty flag and the exact error text in the follow-up
-  request; Tools shows `3 calls` / `ok 0 · err 3`.
+  and the drawn Approve hint applies the patch.
 
-The scenario matrix adds `ai patch approval 120x30` (tag `@approval`): it
-stages a patch against the opened scenario buffer, checks the Changes
-diff/card, approves and asserts the patched buffer plus `changes 0`/`approved`.
+Multi-file coverage (also `approval:`):
+
+- two files (both already open) stage as one review: `changes 1`,
+  `2 files · -2 +2`, both file rows, and the active file's diff; the Chat card
+  carries the bounded file list (`a.txt, b.txt`) and the follow-up tool result
+  is `apply_patch (2 files: a.txt, b.txt) staged for review; not applied`.
+  Nothing is written before approve;
+- `j` selects the second file's diff and `k` returns; approve writes **both**
+  files, refreshes both open buffers (clean, no dirty marker) and shows
+  `applied to disk`; one `u` restores both buffers **and** both disk files,
+  Ctrl+r redoes the whole set; Tools stays `calls 1` / `appr 1`;
+- mouse click on the drawn `[r] reject` label denies the set: both files,
+  both buffers and history stay byte-identical, card `rejected`;
+- editing one open target after staging refuses the whole set with
+  `stale patch: b.txt`, keeps the review, writes neither file, and leaves the
+  user's edited buffer intact;
+- an 80x24 multi-file review fits without horizontal overflow and the drawn
+  Approve hint writes both files, including one that was never opened;
+- duplicate sections (same normalized path twice), unsafe absolute paths,
+  binary patches, `new file mode` additions and mode changes are rejected in
+  one 4-call batch: real `error:` cards, no stage, `changes 0`, no dirty flag,
+  exact per-call errors in the follow-up request, Tools `4 calls` /
+  `ok 0 · err 4`, guard file byte-identical.
+
+The scenario matrix adds `ai patch approval 120x30` (`@approval`, unchanged
+single-file) and `ai patch multi 120x30` (tags `@layout @ai @tools @approval
+@patch-multi @120col`): the latter opens a second `/tmp` fixture, stages a
+two-file patch, checks the Changes file list/active diff (`j` switches files),
+approves, and asserts the second patched buffer plus `changes 0`; the request
+body contains the multi-file staged result.
 
 Unit tests pin the pure half in `src/app/agent_patch.zig` and
 `src/app/agent_edit.zig`: single/multi-hunk apply with line-number drift,
 omitted counts, zero-count insert/delete, `\ No newline at end of file` on
 both sides, malformed headers/hunks/counts, context and newline mismatches,
-out-of-range/overlapping hunks, multi-file/add-delete/binary/rename/mode
-rejection, absolute/`..`/NUL/mismatched paths, `a/`/`b/` path-prefix preservation for no-prefix diffs, patch/hunk/line caps, bounded
-and truthful preview truncation, empty-file patches, and the patch pending's
-whole-file span plus `verify`/`verifyPatch` staleness.
+out-of-range/overlapping hunks, add-delete/binary/rename/mode rejection,
+absolute/`..`/NUL/mismatched paths, `a/`/`b/` path-prefix preservation for
+no-prefix diffs, patch/hunk/line caps (including per-file hunk/line budgets),
+empty-file patches, `parseSet` 2/3-file order and duplicate/too-many-files
+rejection, one malformed section rejecting the set, `validateSet` returning
+the full per-file reason list with no new text, the multi-file pending's
+per-file old/new snapshots/totals/staleness, `commitFiles` phase-1 no-write
+and phase-2 rollback (including rollback failure reporting), and the cross-file
+`UndoSet` live/target swap.
 
-Known M3b2 gaps (documented in DESIGN §20.10): single-file only (no
-add/delete/rename/copy/binary/mode changes, no partial apply); whole-file
-replacement means one undo group per patch, not per hunk; the preview comes
-from the parsed hunk lines (bounded), not a whole-file unified diff; ≤256 KiB
-patch/target/result and ≤256 hunks/16K hunk lines; no terminal, approval
-queue, cross-session persistence or mouse; the model transcript keeps the
-original "staged/not applied" result after a later local approval.
+Known M3b2 gaps (documented in DESIGN §20.10): multi-file is limited to
+**1–8 modified files** with no add/delete/rename/copy/binary/mode changes and
+no partial apply. Single-file approval remains buffer-only (`:w` writes);
+multi-file approval is an explicit whole-set disk write — a deliberate
+asymmetry. The multi-file commit is **not** a filesystem-wide atomic
+transaction: it guarantees "no target changes before every temp exists" and
+restores already-renamed files from in-memory old text on a later rename
+failure, with rollback failures reported truthfully; there is no journal or
+crash recovery. Cross-file undo keeps only the most recent set and refuses
+when any file changed since apply or a file that was closed/opened later makes
+the history state ambiguous. Multi-file previews use the global patch budgets
+so their stats are exact (the single-file review keeps its historical
+240-line/16-hunk bound). The model transcript keeps the original
+"staged/not applied" result after a later local approval, and pending state is
+not persisted across restarts.
 
 ### M3c recent-window p95
 
@@ -548,7 +582,7 @@ may coexist.
 | Navigator brand + counts, compact rail/peek, close transitions, hint/mouse icons, 60/80/120 geometry | L1 breakpoint/tab-layout/workspace-line tests + L3 `navigator:` brand/compact tests + `@compact` scenario |
 | Notes path fallback/error handling | L1 resolution/creation tests + L3 unavailable-dir e2e (`OZ_NOTES_DIR=/dev/null/notes`) |
 | Inline assistant (selection→prompt→stream→Changes diff→Approve/Reject, stale, cancel, 80-col, hints) | L1 `src/app/inline.zig` + L3 `inline:` tests + `@inline` scenario |
-| Staged agent writes (`edit_file` + `apply_patch`: parse/occurrence/hunk/diff/stale/one pending), approve buffer+undo, reject, 80-col hints, thread scoping | L1 `src/app/agent_edit.zig` + `src/app/agent_patch.zig` + `src/ai/agent.zig` decision metrics + L3 `approval:` tests + `@approval` scenarios |
+| Staged agent writes (`edit_file` + single/multi-file `apply_patch`: parse/occurrence/hunk/diff/stale/one pending, per-file validate, two-phase write/rollback, cross-file undo/redo), approve/reject, 80-col hints, thread scoping | L1 `src/app/agent_edit.zig` + `src/app/agent_patch.zig` + `src/ai/agent.zig` decision metrics + L3 `approval:` tests + `@approval`/`@patch-multi` scenarios |
 | M3 tool metrics (counts, avg/max, recent-window nearest-rank p95, 32-sample chart, empty/approval-only states, 80/100/120 fit) | L1 `src/ai/agent.zig` p95/metrics tests + L3 `tools:` tests + `@tools` scenario |
 | Approved terminal tool (strict args/timeout/output caps, real spawn/exit/timeout/kill, explicit Allow/Deny via key/hint/mouse, follow-up result, metrics, thread switch/cancel isolation, 80/120 fit) | L1 `src/ai/terminal_tool.zig` + `src/app/terminal_job.zig` + `src/ai/agent.zig` `recordExecution` + `src/ai/tools.zig` permission/schema + L3 `terminal:` pty tests + `@terminal` scenario |
 | Mock LSP protocol | L4 mock server e2e |
@@ -572,12 +606,6 @@ Known gaps / deliberate limitations:
 - Notes have no delete/rename and no directory watch: the list is refreshed
   only on Notes-tab entry, create, `:w` of a note, or `r`. Tests assert those
   explicit refresh points, not per-frame scans.
-- Three existing L3 tests are sensitive to the checkout/worktree layout:
-  `relative CLI path` hard-codes `../../../../tmp` (only correct at the main
-  checkout's depth), the filetree scroll test assumes a fixed number of
-  root/docs children, and the grep-picker test assumes ripgrep's result order
-  (new `pub fn build*` symbols in terminal code change it). They fail in this
-  worktree; they are unrelated to M3b3 and are not weakened here.
 - Inline edit has one pending replacement and one live inline stream; there is
   no multi-file queue, word-level diff, hunk folding or soft-wrapped diff line.
   The diff is a line-level LCS capped at 400 lines per side (larger selections
@@ -586,15 +614,21 @@ Known gaps / deliberate limitations:
   diff has no matching buffer and must be rejected (safe failure, never apply).
   There is no auto-save: approve only edits the buffer.
 - Agent staged edits are M3b1/M3b2: `edit_file` (occurrence replacement) and
-  single-file `apply_patch` (unified diff, whole-file replacement), one review
-  at a time (shared with inline), one file/one contiguous span per apply,
-  ≤256 KiB source/result, bounded preview, and no persistence across restarts.
-  `apply_patch` rejects multi-file/add-delete/binary/rename/copy/mode patches
-  and never partially applies; terminal/unknown still never execute. The
-  automatic follow-up already sent the staged "not applied" tool result, so a
-  later approval updates the local card but not the model transcript. Pending
-  edits are thread-scoped: switching threads hides the badge/review but keeps
-  it, and apply/reject requires returning to that thread.
+  `apply_patch` for 1–8 modified files, one review at a time (shared with
+  inline), no persistence across restarts. Single-file `apply_patch` remains a
+  buffer-only whole-file replacement (one history group; `:w` writes). Multi-
+  file approval is an explicit whole-set disk transaction: per-file
+  validate → temp writes → renames, with best-effort rollback of already-
+  renamed files (not filesystem-wide atomic; no journal/crash recovery) and
+  one cross-file undo unit (most recent set only; refuses when a file changed
+  since apply or the open/closed history state is ambiguous). Reject and every
+  validation failure write nothing. `apply_patch` rejects
+  add-delete/binary/rename/copy/mode patches and duplicate/unsafe paths; it
+  never partially applies on validation. The automatic follow-up already sent
+  the staged "not applied" tool result, so a later approval updates the local
+  card but not the model transcript. Pending edits are thread-scoped: switching
+  threads hides the badge/review but keeps it, and apply/reject requires
+  returning to that thread.
 - The navigator Agents tab is a view of the same session thread model; it is
   not persisted and is covered through that model's existing tests plus one
   attach/switch e2e, not a second state machine.
