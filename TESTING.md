@@ -17,8 +17,13 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-Current counts on `feat/metrics-p95` (based on mouse `9b7cd86`):
-**531 unit tests** and **195 e2e tests**. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
+Current counts on `feat/terminal-tool` (based on `09c432e`):
+**544 unit tests** and **205 e2e tests**. In this git worktree, `tools/verify.sh`
+reports 202/205 e2e: three pre-existing checkout-sensitive tests fail
+(`relative CLI path` assumes the 4-level main checkout, the filetree scroll
+test hard-codes root/child counts, and the grep-picker test assumes ripgrep
+result order; the new terminal symbols change that order). See "Known gaps"
+below. The 13 `terminal:` tests all pass. `tools/verify.sh` writes `.verify/unit.log`, `.verify/e2e.log`, and
 `.verify/verify.json` (schema version 1, git commit/dirty flag, exact command
 strings, timestamps, exit codes, log SHA-256s, parsed pass/fail counts). It
 runs every command even after a failure and exits non-zero if any command
@@ -36,7 +41,7 @@ replaying a cached successful run.
 
 | Layer | What it covers | Where |
 |---|---|---|
-| **Model/unit (L1)** | Pure logic: piece table, motions, keymaps, SSE/OpenAI config parsing, AI workspace layout/focus/thread model, navigator tab model, note store (paths/titles/sorting/creation), inline selection mapping/fences/diff/pending policy, M3a agent loop bounds/card formatting/metrics/chart cache key + transcript→request assembly, M3c recent-window p95 (nearest-rank, ring wraparound, empty→null, no revision change), M3b1 staged `edit_file` args/occurrence/span/bounded-preview/pending policy and approval decision metrics; M3b2 single-file unified-diff parse/apply, whole-file patch pending, bounded hunk preview and `verifyPatch` | `src/**/*.zig` `test` blocks, aggregated by `src/tests.zig` |
+| **Model/unit (L1)** | Pure logic: piece table, motions, keymaps, SSE/OpenAI config parsing, AI workspace layout/focus/thread model, navigator tab model, note store (paths/titles/sorting/creation), inline selection mapping/fences/diff/pending policy, M3a agent loop bounds/card formatting/metrics/chart cache key + transcript→request assembly, M3c recent-window p95 (nearest-rank, ring wraparound, empty→null, no revision change), M3b1 staged `edit_file` args/occurrence/span/bounded-preview/pending policy and approval decision metrics; M3b2 single-file unified-diff parse/apply, whole-file patch pending, bounded hunk preview and `verifyPatch`; M3b3 terminal argument validation/timeout bounds/escaped display/output cap/result text, real `/bin/sh` spawn/cancel/timeout/output-cap job wrapper, and one-call terminal execution metrics | `src/**/*.zig` `test` blocks, aggregated by `src/tests.zig` |
 | **Protocol fixtures** | SSE chunking, request JSON (incl. assistant tool-call turns and `role:"tool"` results), streamed `tool_calls` fragments/parallel calls/malformed protocol, config env parsing, AI client cancellation/error paths; mock LSP JSON-RPC | `src/ai/sse.zig`, `src/ai/openai.zig`, `src/ai/tools.zig`, `src/ai/client.zig`, `src/ai/config.zig`, mock LSP tests |
 | **Semantic frames (L3)** | Real `oz` binary in a pty; ANSI stream reconstructed into a cell grid; assertions on regions, borders, text, overlap, overflow | `test/e2e.zig` + `test/frame.zig` |
 | **Scenario matrix** | Data-driven pairwise matrix over terminal widths, filetree, and AI rail states; fresh pty per scenario; tags enforced | `test/e2e.zig` (`scenario_matrix`) |
@@ -84,8 +89,8 @@ fixture note; the navigator box is located without its title text (hint labels
 intentionally cover the tab words).
 
 Scenario tags: `@layout @ai @filetree @stream @hints @mouse @navigator
-@notes @inline @tools @approval @80col @100col @120col @drawer @docked
-@compact`. A new
+@notes @inline @tools @approval @terminal @80col @100col @120col @drawer
+@docked @compact`. A new
 feature adds its tag here and to at least one scenario. `@mouse` marks the
 scenarios whose clickable/target geometry the pointer tests also exercise
 (hints + approval); pointer sequences themselves are driven by the dedicated
@@ -290,9 +295,9 @@ the transcript message order used by the follow-up request.
 
 Known gaps at M3a (intentional, documented in DESIGN §20.8): metrics are
 session/per-thread only (no cross-session persistence); calls cancelled
-before their worker result is applied are not counted; `edit_file` approval is
-M3b1 while `apply_patch`/terminal remain M3b; tool-card expansion is
-hint-only (no mouse/card cursor); the chart legend lists tool names but has no
+before their worker result is applied are not counted; `edit_file`/`apply_patch`
+approval is M3b1/M3b2 and `terminal` approval is M3b3; tool-card expansion is
+hint/mouse-activatable but has no card cursor; the chart legend lists tool names but has no
 per-series average annotation. p95 covers only the per-tool recent window
 (≤32 real samples; header pools those windows, ≤256), so it is not an
 all-time percentile. The `stream-<n>.sse` seam is test-only and never used
@@ -327,9 +332,10 @@ stage → review → decide path with real disk fixtures:
   it and approve still applies to the staging thread's buffer;
 - `apply_patch` is no longer an M3a/M3b1 unsupported block: it is staged by
   the M3b2 path below (the old placeholder test was rewritten, not deleted).
-  A batch mixing `apply_patch` with `terminal`/unknown stages the patch and
-  keeps the other two truthfully `unsupported`; Tools counts the staged call
-  and the decisions.
+  A batch mixing `apply_patch` with an unknown tool stages the patch and keeps
+  the unknown tool truthfully `unsupported`; Tools counts the staged call and
+  the decisions. `terminal` is no longer part of this test: it has its own
+  approval path (§ M3b3 below).
 
 The scenario matrix adds `ai approval 120x30` (tag `@approval`): it stages an
 edit against the opened scenario buffer, checks the Changes diff/card, approves
@@ -343,8 +349,8 @@ as a second call.
 
 Known M3b1 gaps (documented in DESIGN §20.9): only `edit_file`; single-file,
 single-contiguous-span apply (replace_all merges occurrences into one undo
-group); no `apply_patch`, terminal, approval queue or cross-session
-persistence; ≤256 KiB stage cap; bounded hunk preview rather than a whole-file
+group); no approval queue or cross-session persistence (terminal was added
+later by M3b3, see below); ≤256 KiB stage cap; bounded hunk preview rather than a whole-file
 unified diff; the model transcript keeps the original "staged/not applied"
 tool result even after a later local approval; no mouse.
 
@@ -414,6 +420,75 @@ approval-only tool (no latency sample) assert p95 does **not** appear; the
 scenario matrix's `ai tools read 120x30` and `ai tools read 100x30` rows also
 expect `p95 `. No golden changes: neither golden frame renders the Tools tab.
 
+### M3b3 approved `terminal` fixtures and e2e
+
+The M3b3 pty tests (`test/e2e.zig`, filter `terminal:`; this filter also
+matches the three pre-existing editor-terminal tests) add ten approval tests
+with real mock rounds and real child processes:
+
+- a streamed `terminal` call stages (`terminal · approval required`,
+  `[a] allow`, exact escaped command, `timeout 5000ms`); **no process** is
+  spawned and the editor fixture on disk is byte-identical until Allow. Allow
+  runs the background command, flips the card/Terminal tab to `ok`, shows
+  `exit 0` and the real output, creates only the command's intended side file,
+  and the follow-up `request-2.json` carries `role:"tool"`, the matching
+  `tool_call_id`, `exit: 0` and the output. Tools shows `calls 1` / `ok 1` /
+  avg/p95 from the real duration; the Chat card and Terminal tab are both
+  checked.
+- Deny (`r`) spawns nothing, shows `rejected` / `denied · not executed`,
+  leaves the target file untouched, writes a truthful denied result into
+  `request-2.json` and records `denied 1` without a latency sample.
+- a failing command (`printf …; exit 7`) reports `error` / `exit 7` and the
+  real output; the follow-up contains `error: exit code 7` and Tools shows
+  `err 1`.
+- a 150 ms timeout of `(sleep 1; printf LATE > late.txt) & wait` is killed by
+  the watchdog **as a process group**: the error/card arrives promptly, the
+  background subshell never writes `late.txt` after waiting 1.3 s, and the
+  follow-up contains `timeout; process group killed`.
+- `yes TRUNCLINE | head -c 70000` is capped at 64 KiB: the result/follow-up is
+  `<80 KiB` JSON, contains `output_truncated: N bytes dropped`, and the card
+  shows the truncation marker before the excerpt.
+- `<leader>j` hint labels on `[a] allow` execute the same Allow path, and a
+  real mouse click on `[r] deny` executes the same Deny path in a second turn
+  (staged through the prompt after Enter attaches it).
+- an 80x24 drawer renders the approval panel/buttons without horizontal
+  overflow; `r` denies with no process and the layout stays closed.
+- Ctrl+c while running kills the command, freezes `cancelled · command
+  stopped`, sends **no** follow-up (`request-2.json` absent) and a delayed
+  background side effect never appears.
+- switching to a new thread while a command runs kills it (no `late.txt`, no
+  follow-up); the new thread's Terminal tab is empty (no cross-thread card)
+  and returning to thread 1 shows the frozen `cancelled` state.
+- a **pending** (un-approved) command survives a thread switch hidden, has
+  spawned nothing while away, is still `approval required` with `[a] allow`
+  on return, and can then be denied with a truthful follow-up.
+
+The scenario matrix adds `ai terminal approval 120x30` (tags `@approval
+@terminal`): it stages a command against the /tmp fixture root, allows it,
+asserts `terminal · ok` + the real marker + the follow-up card, and checks
+`request.json` for `role:"tool"`, `terminal` and the output marker.
+
+Unit tests pin the pure half: strict schema/unknown-field/empty/NUL/>4 KiB
+rejection, timeout 100..10000 acceptance (and rejection outside), defensive
+`clampTimeout`, escaped command display (control bytes/backslash/newline/
+invalid UTF-8), bounded card summaries with an explicit `… (+N bytes)`
+marker, 64 KiB `OutputBuffer` accounting/dropped bytes, result text for
+ok/exit-error/signal/timeout/read-error/truncation, terminal permission always
+`confirm`, and `recordExecution` (one `calls` count at stage, real duration on
+execution, no second call). `src/app/terminal_job.zig` is exercised with real
+`/bin/sh` children: output/exit capture, nonzero/stderr, a 100 ms timeout
+(returns in <2.5 s), cancellation, the 64 KiB cap, and a bad spawn.
+
+Known M3b3 gaps (documented in DESIGN §20.12): **no sandbox / no network
+isolation** — the command runs with the user's permissions; the environment
+is only allowlisted, not isolated; `setsid`/daemon children can escape the
+process-group kill; no PTY/interactive stdin/shell choice/cwd parameter; one
+pending command per session (second call refused); pending/approval state is
+not persisted; local approval decisions are not re-announced to the model
+beyond the final tool result; a running command is killed on thread switch or
+Ctrl+c (result discarded). Terminal and file reviews are separate slots and
+may coexist.
+
 ### Property tests
 
 `src/ai/workspace.zig` sweeps deterministic invariants (fast, no RNG):
@@ -475,6 +550,7 @@ expect `p95 `. No golden changes: neither golden frame renders the Tools tab.
 | Inline assistant (selection→prompt→stream→Changes diff→Approve/Reject, stale, cancel, 80-col, hints) | L1 `src/app/inline.zig` + L3 `inline:` tests + `@inline` scenario |
 | Staged agent writes (`edit_file` + `apply_patch`: parse/occurrence/hunk/diff/stale/one pending), approve buffer+undo, reject, 80-col hints, thread scoping | L1 `src/app/agent_edit.zig` + `src/app/agent_patch.zig` + `src/ai/agent.zig` decision metrics + L3 `approval:` tests + `@approval` scenarios |
 | M3 tool metrics (counts, avg/max, recent-window nearest-rank p95, 32-sample chart, empty/approval-only states, 80/100/120 fit) | L1 `src/ai/agent.zig` p95/metrics tests + L3 `tools:` tests + `@tools` scenario |
+| Approved terminal tool (strict args/timeout/output caps, real spawn/exit/timeout/kill, explicit Allow/Deny via key/hint/mouse, follow-up result, metrics, thread switch/cancel isolation, 80/120 fit) | L1 `src/ai/terminal_tool.zig` + `src/app/terminal_job.zig` + `src/ai/agent.zig` `recordExecution` + `src/ai/tools.zig` permission/schema + L3 `terminal:` pty tests + `@terminal` scenario |
 | Mock LSP protocol | L4 mock server e2e |
 | Deterministic build/test run | `tools/verify.sh` + CI |
 
@@ -496,6 +572,12 @@ Known gaps / deliberate limitations:
 - Notes have no delete/rename and no directory watch: the list is refreshed
   only on Notes-tab entry, create, `:w` of a note, or `r`. Tests assert those
   explicit refresh points, not per-frame scans.
+- Three existing L3 tests are sensitive to the checkout/worktree layout:
+  `relative CLI path` hard-codes `../../../../tmp` (only correct at the main
+  checkout's depth), the filetree scroll test assumes a fixed number of
+  root/docs children, and the grep-picker test assumes ripgrep's result order
+  (new `pub fn build*` symbols in terminal code change it). They fail in this
+  worktree; they are unrelated to M3b3 and are not weakened here.
 - Inline edit has one pending replacement and one live inline stream; there is
   no multi-file queue, word-level diff, hunk folding or soft-wrapped diff line.
   The diff is a line-level LCS capped at 400 lines per side (larger selections

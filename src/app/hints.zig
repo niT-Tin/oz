@@ -163,6 +163,11 @@ pub const Action = union(enum) {
     agent_approve,
     /// Reject the staged agent edit (same path as `r`/`d` in Changes).
     agent_reject,
+    /// Allow the staged terminal command (same path as `a`/Enter on the
+    /// Terminal tab). Never auto-executes: the human must activate this.
+    agent_terminal_allow,
+    /// Deny the staged terminal command (same path as `r`/`d`).
+    agent_terminal_deny,
     /// Toggle the expanded result view of the tool card at this message
     /// index in the active thread (M3a). A real action: no new control is
     /// invented, and only visible Chat cards register.

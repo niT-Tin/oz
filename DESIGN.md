@@ -1174,9 +1174,9 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 
 ### 20.4 权限与审批
 
-- 读工具默认 allow；`edit_file` / `apply_patch` / terminal 默认 confirm；未知工具 deny。
-- 审批卡片出现在 Chat 内联，并同步到 Workbox Changes/Approval badge；`<leader>j` hint target 可选中 Allow/Deny。
-- M3a 的写入工具只返回 `approval_required`/未实现，不落盘；M3b1 已把 `edit_file` 接到 pending diff/apply 路径（§20.9），M3b2 把 `apply_patch` 接到同一审批路径（§20.10）；terminal 仍不执行。
+- 读工具默认 allow；`edit_file` / `apply_patch` / terminal 默认 confirm；未知工具 deny。terminal **没有任何 auto-allow 开关**：权限判定恒为 confirm，执行必须经过人工 Allow（M3b3）。
+- 审批卡片出现在 Chat 内联；文件写入同步到 Workbox Changes（`changes N`），terminal 命令在 Workbox Terminal tab 审批（`[a] allow [r] deny`，badge 用高亮 label 而不是加宽 tab）；`<leader>j` hint target 与鼠标都可选中 Allow/Deny。
+- M3a 的写入工具只返回 `approval_required`/未实现，不落盘；M3b1 已把 `edit_file` 接到 pending diff/apply 路径（§20.9），M3b2 把 `apply_patch` 接到同一审批路径（§20.10）；M3b3 把 `terminal` 接到独立的人工审批 + 后台执行路径（§20.12）。
 - 审批决定绑定 stage 时的 tool card/参数摘要；approve 时重新校验路径、整文件文本与 `history.revision`，参数/内容变化不得复用旧批准。
 
 ### 20.5 Tool cards 与 metrics
@@ -1197,15 +1197,16 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 
 - **M3a（已完成，2026-10-25）**：只读 executor + tool loop + Chat tool cards + Tools tab 真实统计 + chart 接入 + 审批占位；e2e mock。实现状态见 §20.8。
 - **M3b1（已完成，2026-10-25）**：`edit_file` staged diff + 人工 approve/reject + buffer-only apply/undo、审批按钮 hint、`approved`/`rejected` 卡片与 decision metrics。实现状态见 §20.9。
-- **M3b2（已完成，2026-10-25）**：`apply_patch` 单文件 unified diff 解析/校验/整文件 staged 替换 + 同一 approve/reject/undo 路径；多文件与 terminal 仍不支持。实现状态见 §20.10。
+- **M3b2（已完成，2026-10-25）**：`apply_patch` 单文件 unified diff 解析/校验/整文件 staged 替换 + 同一 approve/reject/undo 路径；多文件仍不支持。实现状态见 §20.10。
 - **M3c（已完成，2026-10-26）**：每工具 recent-window p95（整数 nearest-rank，≤32 个真实样本）+ Tools tab 卡片/顶栏展示与 80/100/120 紧凑 fallback。实现状态见 §20.11。
-- **M3b 余下**：terminal 沙箱/明确确认、跨会话 metrics 持久化、性能基准。
-- **后续**：terminal tool（独立沙箱/明确确认）、MCP/ACP、跨会话 metrics 持久化。
+- **M3b3（已完成，2026-10-26）**：`terminal` 工具 + 每命令显式人工 Allow/Deny + 后台 `/bin/sh -c`（captured workspace root、空 stdin、bounded env）+ 10s 上限/64 KiB 合并输出 + 真实进程组 kill + 结果回填/follow-up/metrics。**不是**通用 shell UI；编辑器终端（Alt+r）不变。实现状态见 §20.12。
+- **M3b 余下**：跨会话 metrics 持久化、性能基准。
+- **后续**：MCP/ACP、跨会话 metrics 持久化。
 
 ### 20.7 测试
 
 - Core：tools 协议/accumulator（已有 26 单测）、executor 路径逃逸/大小上限/二进制/错误、chart（已有 17 单测）。
-- E2E：只读 tool call 一轮/多轮、并行 calls、错误工具、超轮次、取消、审批 deny/allow（M3b）、卡片 stats、Tools tab 空/有数据、80/100/120 布局、hint 选中。
+- E2E：只读 tool call 一轮/多轮、并行 calls、错误工具、超轮次、取消、审批 deny/allow（M3b）、卡片 stats、Tools tab 空/有数据、80/100/120 布局、hint 选中；M3b3 另有 terminal 的真实 spawn/deny/timeout/输出上限/线程隔离/鼠标审批测试（`@terminal`）。
 - 每个工具调用必须能在 mock 请求体/响应中复现；不能依赖真实网络。
 - 性能：executor 在 worker，UI 帧不等待；metrics/chart 重算次数可断言（例如只在数据变化时）。
 
@@ -1272,7 +1273,7 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 
 **范围与策略**
 
-- M3b1 只实现 `edit_file` 的人工审批；`apply_patch`/`terminal`/未知工具仍不执行（本地 `unsupported`）。这是 M3b 的第一个切片，不含 patch 解析、terminal 沙箱、审批队列/持久化。（M3b2 在此之后接入 `apply_patch`，见 §20.10；本节保留为 M3b1 当时的状态。）
+- M3b1 只实现 `edit_file` 的人工审批；`apply_patch`/`terminal`/未知工具仍不执行（本地 `unsupported`）。这是 M3b 的第一个切片，不含 patch 解析、terminal 沙箱、审批队列/持久化。（M3b2 在此之后接入 `apply_patch`，见 §20.10；M3b3 再接入 `terminal`，见 §20.12；本节保留为 M3b1 当时的状态。）
 - 工具调用不再到达 executor：`src/app/ai.zig:aiHandleToolCalls` 按 `ai.tools.classify` 分流。只有 `read_file`/`list_directory`/`grep` 进入后台 worker；`edit_file` 在 App 线程 stage；`apply_patch`/`terminal`/未知立即生成真实的 unsupported 卡片与 `role:"tool"` 结果，不启动 worker。
 - stage 只读目标：优先使用已打开 buffer 的当前文本（含未保存修改），否则 `readFileAlloc` 上限 256 KiB；**不打开新 buffer、不写临时文件、不改 dirty**。路径复用 `ai/tool_exec.zig` 的 `normalizeWorkspacePath` / `isWithin`：拒绝绝对路径、`..`、NUL、越界 symlink；canonical path 必须位于**当轮捕获**的 workspace root 内（不是当前可见 workspace）。
 - `old_string` 必须非空；未设 `replace_all` 时必须恰好出现一次；`replace_all` 至少一次且最多 512 次。任何失败返回真实 `error:` 卡片，不 stage。
@@ -1321,7 +1322,7 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 
 **范围与策略**
 
-- M3b2 只实现 `apply_patch` 的人工审批；`terminal`/未知工具仍不执行（本地 `unsupported`）。不含 terminal 沙箱、审批队列/持久化、多文件 patch、add/delete/rename/binary/mode 变更。
+- M3b2 只实现 `apply_patch` 的人工审批；`terminal`/未知工具仍不执行（本地 `unsupported`）。不含 terminal 沙箱、审批队列/持久化、多文件 patch、add/delete/rename/binary/mode 变更。（M3b3 之后 `terminal` 由 §20.12 接管；本节保留为 M3b2 当时的状态。）
 - `src/app/ai.zig:aiHandleToolCalls` 把 `edit_file` 与 `apply_patch` 都分流到 App 层 stage（`agent_edit_ui.stageToolCall` / `stagePatchToolCall`），executor/worker 仍只看到只读调用；任何工具执行路径都没有写 syscall。
 - `agent_patch.parse` 只接受**单文件 unified diff**：`diff --git`/`index`/`---`/`+++`/`@@` 头可选，但必须至少有一个路径来源；支持同一文件多个 hunk、省略 count（默认 1）、`\ No newline at end of file`、以及后续 hunk 的行号漂移。Markdown 代码围栏与 CRLF 传输会被规范化。`a/`/`b/` 前缀只在 old/new 拼写确实构成 git 前缀对时才剥离；`--no-prefix` 下真实路径以 `a/`/`b/` 开头的文件不会被误改。
 - 明确拒绝（typed error，真实 error card，不 stage、不部分应用）：多文件、增删文件（`/dev/null`/`new file mode`/`deleted file mode`）、binary、rename/copy、mode 变更、malformed header/hunk/counts、context/removal 不匹配、hunk 越界或乱序、`new_start` 与实际应用结果不一致、路径 absolute/`..`/NUL/符号链接逃逸/越出 captured root、文件缺失、patch >256 KiB、>256 hunks、>16K hunk 行、结果 >256 KiB。
@@ -1392,6 +1393,89 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 - `zig build test`：531/531 通过（新增 2 个 p95 单测；既有 529 不变）。
 - `zig build e2e`：195/195 通过（不新增 pty 测试块；扩展既有 `tools:` 断言与空态/approval 反断言，scenario matrix 新增 `ai tools read 100x30` 并加强 120x30 期望）。
 - 无 golden 变更（goldens 不渲染 Tools tab）。
+
+---
+
+### 20.12 M3b3 实现状态（approved `terminal` tool，2026-10-26）
+
+**范围与策略**
+
+- 新增 `terminal` agent tool：让模型请求**一条**非交互 shell 命令，但**绝不自动执行**。每个命令先在 App 层 stage 为 pending approval；只有人工 Allow 后才 spawn。它不是通用 shell UI，也不是第二个编辑器终端：无 PTY、无按键转发、无 scrollback；既有 `Alt+r` 终端（`src/term.zig`/`src/app/terminal.zig`）完全不改。
+- 一个 session 同时最多一个 terminal approval/命令（比“每 thread 一个”更严格）；第二个 `terminal` 调用得到真实错误卡片/`role:"tool"` 结果，不排队。
+- pending approval 按 thread 隔离并跨线程切换保留（隐藏、无进程）；运行中的命令在离开其 thread / Ctrl+c 时被真实 kill，结果丢弃（避免未观察 thread 的后台惊喜）。文件 review（`agent_edit`）仍是独立槽位，互不清除。
+- 只有人工动作能触发执行：`stageToolCall` 不 spawn，`Job.start` 只被 `allow` 调用；模型 follow-up 文本、工具协议本身都不会执行命令。pending 期间该 thread 的自动 follow-up 被挂起（`maybeFollowup` 检测 pending/job，settle 到 idle），Allow/Deny 后才带上真实结果恢复 loop，因此模型看到的是最终输出/exit code，而不是“staged”。
+- 文件 diff/审批与 terminal 审批可共存；terminal 的 Allow 不阻塞已 staged 的文件 review，文件 review 的后续本地决定仍不回写模型 transcript（§20.9 的既有限制）。
+
+**工具协议（`src/ai/tools.zig`）**
+
+- `definitions` 增加 `terminal`，严格 schema：`{ command: string, timeout_ms?: integer 100..10000 }`，`required: ["command"]`，`additionalProperties: false`；description 明确“以用户权限在 workspace root 运行、运行前必须人工批准、无沙箱/无网络隔离、输出 64 KiB / 时间 100–10000 ms”。`tools` 与 `tool_choice:"auto"` 不变。
+- `tools.Permission`：terminal 恒为 `confirm`；`Policy` 删除 `allow_terminal`，不存在任何 auto-allow 开关。未知工具仍 `deny`。
+- `src/ai/tool_exec.zig` 仍把 `terminal` 返回 `unsupported`（防御性），read-only executor 没有任何 shell/spawn 路径；正常执行只走 App 的 dedicated job。
+
+**Staging 与校验（`src/app/agent_terminal.zig` + `src/ai/terminal_tool.zig`）**
+
+- 纯模块 `terminal_tool.zig` 负责：严格参数解析/typed error、timeout 区间（拒绝而非静默 clamp；`clampTimeout` 只作 spawner 防御）、命令长度 ≤4096 bytes、拒绝空/空白/NUL/非 UTF-8/未知字段、转义显示、64 KiB `OutputBuffer`、真实结果文本。
+- stage 时只读校验 captured root 仍是 directory；不打开文件、不写盘、不 spawn。保存 command 原始 bytes、escaped display、timeout、root、thread/card、loop generation。
+- 失败（busy/参数错误/root 不可用）产生真实 `error:` 卡片与结果，记录 `.err`，不 stage、不执行。
+- stage 成功自动打开 rail 并切到 **Terminal** tab（focus rail），卡片 `approval required`、args 行为 escaped command（>200 bytes 时显式 `… (+N bytes)`，完整命令在 Terminal tab），第三行显示 timeout/用户权限提示；`role:"tool"` 结果固定 `approval required: terminal command staged for review; not executed`。
+
+**执行（`src/app/terminal_job.zig`）**
+
+- Allow 后后台 `std.Thread` spawn `/bin/sh -c <command>`：`cwd` = 当轮 captured workspace root；`stdin = .ignore`（空）；bounded env 仅复制 `PATH/HOME/TERM/LANG/LC_ALL/TMPDIR`（缺 PATH 时用固定 `/usr/local/bin:/usr/bin:/bin`）；`pgid = 0` 建独立进程组。
+- 输出：poll(2) 循环读 stdout/stderr，最多保存 64 KiB **合并**输出（另计 dropped bytes）；超过上限继续读并丢弃，子进程不会因管道满而阻塞。逐次 poll 不阻塞 UI；worker 线程独立。
+- 时间：`timeout_ms` 100–10000（默认 5000）；watchdog 线程 5 ms 粒度检查 deadline/cancel，到点/取消向 `-pid` 发 SIGKILL，杀掉整个进程组；worker wait 返回后 join watchdog。spawn 失败/read 失败/nonzero/signal 都产生真实 `.err` 结果，不伪造成功。
+- 结果文本含 `error: exit code N` / `exit: 0` / `signal` / `timeout; process group killed` + `duration` + 可选 `output_truncated: N bytes dropped` + `---` + bounded output；经 `tools.buildToolResultContent` 再套 64 KiB/UTF-8 协议上限。卡片的展示文本是 status + 截断标记 + 首行 excerpt。
+- timeout/cancel 后结果仍回到模型（timeout 是 error result，模型可恢复）；用户显式 Ctrl+c / 切线程导致的 cancel 不发 follow-up（与既有取消语义一致，transcript 冻结）。
+
+**决策与线程策略**
+
+- Deny（Terminal tab `r`/`d`、hint/mouse）：不 spawn，卡片 `rejected`，metrics `denied`，`role:"tool"` 结果更新为 `denied: user rejected the command; not executed`，随后恢复 follow-up。文件/进程均未改变。
+- Allow（`a`/Enter、hint/mouse）：spawn；卡片 `running`；完成后 `ok`/`error`，记录真实 duration；恢复 follow-up。spawn 前若 thread 已取消/失败则不执行，卡片 `cancelled`。
+- Ctrl+c：`cancelForThread` 将 pending/running 命令标记 `cancelled`、清 pending、requestCancel（真实 kill）；线程标 cancelled，无 follow-up。`deinitAi`/`App.destroy` 会 join job，避免进程泄漏。
+- 线程切换：pending approval 保留（隐藏）；running 命令 kill、卡片 `cancelled`、结果丢弃。回到原 thread 后 badge/tab 重新可见。terminal 状态在 thread list/workbench header 显示 `approval…` / `terminal…`（不是 `idle`）。
+- pending/running 期间 `aiSend` 拒绝新 prompt（`resolve the pending terminal command first`），因为该 turn 的 follow-up 尚未完成；切线程仍允许（pending 隐藏保留）。
+
+**UI（`src/app/ai.zig`）**
+
+- Chat 卡片：`terminal` + escaped command + `approval required`（warn） + timeout/“runs with your permissions”；running 显示 spinner/`working`；完成显示 `ok/error` + exit code/duration + bounded excerpt；rejected/cancelled 有独立状态。卡片仍是 `<leader>j` 展开目标（展开显示 result body 行）。
+- **Terminal tab** 是审批/结果面（不是 shell）：header（`terminal · approval required|running|ok|error|rejected|cancelled`）、`runs with your permissions · not sandboxed`、`cwd: <captured root tail>`、`[a] allow  [r] deny`（hint/mouse target）或 `running… · Ctrl+c stops`、`timeout Nms · max 10000ms`、完整 escaped command（按 body 宽度换行，>512 行时显式 display clip）、完成后 bounded output 行；`j/k` 与滚轮滚动（clamp）。空态显示 `no pending terminal command` + `the terminal tool asks before it runs` + `editor terminal: Alt+r`。
+- Terminal tab 不新增 tab 宽度/标签：pending 时 label 使用 warning 色 + bold（34/38-cell tab row 已满，不能安全加 `terminal 1` badge）；Changes badge 语义不变。
+- 只有 Terminal tab + rail focus 时 `a/r/d/j/k` 才被审批/滚动消费；其他 tab 的既有键位不变，Alt+r 终端不受影响。鼠标点击走与键盘完全相同的 `aiAgentTerminalAllow/Deny`，没有第二套业务逻辑。
+- 80x24 drawer 与 100/120 docked 都无横向溢出；所有 body 行由 `drawRailRow` 精确闭合。
+
+**Metrics（`src/ai/agent.zig`）**
+
+- stage 记一次 `.approval_required`（`calls +1`，无 latency）；deny 走 `recordDecision(.rejected)`（`denied +1`，不增加 calls）；Allow 完成走新 `Metrics.recordExecution(status, duration)`：ok/error 计数 + 真实 recent duration，**不重复计 calls**。timeout 记 `.err` + 真实 duration。
+- Tools tab 因此显示 `terminal · calls N`、ok/err/denied、真实 avg/max/p95；取消/被丢弃的 in-flight 结果不计数（与 M3a 一致）。p95 语义仍为每工具最近 ≤32 个真实执行样本（§20.11）。
+
+**安全边界与明确限制**
+
+- **没有沙箱**：命令以用户权限运行，可读写任意用户可访问文件、访问网络、启动子进程；不声称 seccomp/container/网络隔离。唯一的保证是“每个命令必须人工批准”+“cwd 固定 workspace root”+空 stdin + bounded env/output/time。
+- 命令显示采用可逆转义（`\n`/`\t`/`\\`/`\xNN`），防止命令向 oz UI 注入终端 escape；**执行字节原样**，不重新引用/不截断。完整命令（≤4 KiB）在 Terminal tab 可滚动查看；Chat 卡片是显式 bounded summary。
+- 进程组 kill 覆盖 shell 及其未 `setsid` 的子进程；显式 `setsid`/daemonize 的进程可以逃逸（文档化，非安全边界）。极小的 pid/pgid 复用窗口不做原子保证。
+- 命令可修改文件/仓库（包括未保存 buffer 之外的内容）；审批 UI 明确显示 cwd 和“以你的权限运行”，但没有 per-file/command 策略、allowlist 或 dry-run。允许一次不等于允许下次：每个命令都重新 stage。
+- 不提供 PTY/tty、交互 stdin、环境变量选择 UI、shell 选择（固定 `/bin/sh`）、working-directory 参数（固定 captured root）、后台持久化/重连；session 退出即丢弃 pending。
+- pending approval 与模型 transcript 的既有局限：Deny/Allow 的最终结果在 follow-up 中发送，因此模型会看到最终结果；但审批动作本身不产生额外 assistant 消息，模型不知道“谁在何时点击”。文件 review 的本地决定仍不会追认（§20.9）。
+- terminal 与文件 review 可以同时 pending；两者 UI 分离（Terminal/Changes），没有统一审批队列。
+
+**文件**
+
+- `src/ai/terminal_tool.zig`：严格参数校验、timeout clamp、escaped display、OutputBuffer、结果文本 + 单测。
+- `src/app/terminal_job.zig`：真实 POSIX spawn/poll/watchdog/进程组 kill + 单测。
+- `src/app/agent_terminal.zig`：pending/stage/allow/deny/cancel/thread policy、结果应用、metrics、卡片文案。
+- `src/ai/tools.zig`：terminal definition/schema、`Policy` 去掉 auto-allow、权限/单测。
+- `src/ai/tool_exec.zig`：terminal 防御性 `unsupported` 文案（不变语义）。
+- `src/ai/agent.zig`：terminal args 摘要、`recordExecution`、metrics + 单测。
+- `src/app/ai.zig`：工具调用分流、follow-up 暂停/恢复、drain、status、Terminal tab 渲染/按键/滚动、hints。
+- `src/app/hints.zig`、`src/app/hint_ui.zig`、`src/app.zig`、`src/app/render.zig`：`agent_terminal_allow/deny`、session 字段、run-loop drain。
+- `src/tests.zig`：纯模块/后台 job 单测注册。
+- `test/e2e.zig` + TESTING.md：10 个 `terminal:` pty 测试、`ai terminal approval 120x30` scenario、required tag `@terminal`。
+
+**验证**
+
+- `zig build test`：544/544 通过（M3b3 新增 13 个单测：terminal_tool 5、terminal_job 7、terminal metrics 1；既有 531 不变）。
+- `zig build e2e`：本 worktree HEAD 为 **202/205**（新增 10 个 `terminal:` pty 测试全部通过；scenario matrix 新增 `ai terminal approval 120x30`；既有 195 不变）。3 个失败是既有 checkout 敏感测试，与 terminal 无关：`relative CLI path` 硬编码 4 层主 checkout 的 `../../../../tmp`、`file tree ...` 依赖固定的仓库根/目录子项数量、`grep picker ...` 依赖 ripgrep 结果顺序且新增源码符号改变了排序；详见 TESTING 的已知 gaps。`tools/verify.sh` 因此在本 worktree 报 FAIL（diff-check/unit 通过，e2e 仅这 3 个失败）。
+- 无 golden 变更（terminal 审批/结果不进入固定 golden 帧）。
 
 ---
 
