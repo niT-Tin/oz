@@ -84,7 +84,8 @@ fixture note; the navigator box is located without its title text (hint labels
 intentionally cover the tab words).
 
 Scenario tags: `@layout @ai @filetree @stream @hints @mouse @navigator
-@notes @inline @tools @approval @80col @100col @120col @drawer @docked`. A new
+@notes @inline @tools @approval @80col @100col @120col @drawer @docked
+@compact`. A new
 feature adds its tag here and to at least one scenario. `@mouse` marks the
 scenarios whose clickable/target geometry the pointer tests also exercise
 (hints + approval); pointer sequences themselves are driven by the dedicated
@@ -137,9 +138,12 @@ at 120x30 dock and 80x24 drawer plus the scenario matrix:
   header, tab strip/body), the `│`-separated workbox tabs (spaced at 38 cells,
   compact at 34/80) and the active tab's `>` marker + `bg_sel`/accent style
   (switching to Changes moves the marker);
-- the navigator strip `╭─ files │ notes │ agents ───╮`, its `│` separators and
-  active `bg_sel` tab, plus the one-cell blank gutter between the navigator box
-  and editor text;
+- the navigator: the branded `╭─ OZ ─────╮` border, the real
+  `workspace / branch` line, the `Files / Notes / Agents` icon tabs with
+  separators and active `bg_sel`/underline, the 4-row header + `├──┤` rule, and
+  the one-cell blank gutter between the 30-cell box and editor text (full
+  mode); at <90 columns the 7-cell `OZ` + icon rail and its 30-cell peek,
+  with the editor starting at column 8 after the peek is closed;
 - the one-cell blank rail gutter in dock and drawer modes (text never touches
   the rail's `│`, and drawer cursors under the panel are hidden);
 - the bottom status band: full-width rule row, `[MODE]` badge with accent
@@ -203,6 +207,32 @@ row 0/1 now carry the label/rule cells, every content row shifted down by one,
 and the 80x24 golden additionally pins the static idle status color (the
 padding style is explicit so a shrinking streaming label cannot leave a stale
 pulse fg).
+
+### Navigator brand + compact rail
+
+The full navigator model is unit-tested in `src/app/navigator.zig`: the 90-col
+breakpoint, `editorCol` (31 full / 8 compact), `layoutTabs` count-badge fitting
+(exactly 28 cells, labels never truncated, Notes badge omitted until its cache
+is loaded), real `workspace / branch` formatting, and the same-icon peek
+toggle. The e2e suite adds:
+
+- `navigator: 120x30 brand header shows workspace, real branch and counts` —
+  OZ border, `main / <branch>` (repository cwd), Files/Agents counts, frame.
+- `navigator: 80x24 compact rail 1/2/3, hints, outside click and drawer` —
+  peek from `<leader>e`, `1/2/3` + Tab/Shift-Tab switching, Esc back to the
+  7-cell rail, editor marker at column 8, icon click, outside click, compact
+  hint labels activating a peek, note/file/agent open closing the peek, and
+  the AI drawer never stacking with the peek.
+- `navigator: 60x24 compact peek and rail never overflow` — 30-cell peek and
+  7-cell rail at the minimum width.
+- The scenario matrix adds `navigator compact rail 80x24` (`@compact`) and
+  the existing `filetree 80x24` scenario still proves the auto-opened peek is
+  a real 30-cell box. The matrix's navigator assertions derive the tab
+  rows/headers from `src/app/navigator.zig` (no hard-coded strip constants).
+
+No golden changed: `ai-dock-120x30.txt` / `ai-drawer-80x24.txt` do not open
+the navigator, so their cells are unchanged. Update goldens only with
+`OZ_UPDATE_GOLDEN=1`.
 
 ### Notes test seam (`OZ_NOTES_DIR`)
 
@@ -440,6 +470,7 @@ expect `p95 `. No golden changes: neither golden frame renders the Tools tab.
 | Keyboard hints (labels, status, target actions, Esc) | L1 pure model (`src/app/hints.zig`) + L3 `hints:` tests + `@hints` matrix scenarios |
 | Mouse click/wheel (hit priority, scroll clamp, cell→byte mapping, lifecycle, panes/tabs/rows/buttons, terminal focus, drawer overlay, Shift selection escape hatch) | L1 `src/app/mouse.zig` + L3 `mouse:` pty tests (SGR 1006 press/release/wheel) + `@mouse` scenarios |
 | Navigator tabs, notes list/create/save/reopen, agents attach | L1 (`src/app/navigator.zig`, `src/app/note_store.zig`) + L3 `navigator:` tests + `@navigator`/`@notes` matrix scenarios |
+| Navigator brand + counts, compact rail/peek, close transitions, hint/mouse icons, 60/80/120 geometry | L1 breakpoint/tab-layout/workspace-line tests + L3 `navigator:` brand/compact tests + `@compact` scenario |
 | Notes path fallback/error handling | L1 resolution/creation tests + L3 unavailable-dir e2e (`OZ_NOTES_DIR=/dev/null/notes`) |
 | Inline assistant (selection→prompt→stream→Changes diff→Approve/Reject, stale, cancel, 80-col, hints) | L1 `src/app/inline.zig` + L3 `inline:` tests + `@inline` scenario |
 | Staged agent writes (`edit_file` + `apply_patch`: parse/occurrence/hunk/diff/stale/one pending), approve buffer+undo, reject, 80-col hints, thread scoping | L1 `src/app/agent_edit.zig` + `src/app/agent_patch.zig` + `src/ai/agent.zig` decision metrics + L3 `approval:` tests + `@approval` scenarios |

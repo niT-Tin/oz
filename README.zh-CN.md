@@ -38,9 +38,11 @@
 **导航与查找**
 
 - 模糊查找 picker：文件（`<leader>sf`）、grep（`<leader>st`）、buffer（`<leader>sb`）、最近文件（`<leader>sr`）、快捷键（`<leader>sk`）
-- **Navigator**（`<leader>e` 开关，`<leader>E` 定位当前文件）：左侧 30 列侧栏，三个 tab——`files`（原有惰性文件树，根目录跟随当前 workspace 的项目目录）、`notes`、`agents`。聚焦侧栏时 `Tab`/`Shift-Tab` 循环 tab，`1`/`2`/`3` 直接跳转；`h`/`l` 仍是文件树的折叠/父目录。每个 tab 和列表行都是 `<leader>j` 的 hint 目标。
-- **Notes**（`notes` tab）：真实的 markdown buffer，全局存放于 `$OZ_NOTES_DIR`，否则 `$XDG_DATA_HOME/oz/notes`，否则 `$HOME/.local/share/oz/notes`（目录惰性创建，启动时不扫描/不创建）。`j`/`k` 选择 · Enter 用普通 buffer 打开（`:w` 保存）· `n` 创建最小的未占用 `note-N.md`（内容 `# Untitled note`，绝不覆盖已有文件）· `r` 刷新。列表显示首个 markdown 标题（没有则文件名）、正文片段和相对时间，新的在前。Notes 与项目无关，打开 note 不会改变 workspace 文件树/picker 的根目录。删除/重命名暂不提供。
-- **Agents**（`agents` tab）：同一套真实线程模型的紧凑视图（按当前 workspace 分组）——`j`/`k` 选择 · Enter 在 rail/workbox 中 attach 该线程 · `n` 新建线程。它只是视图，不是第二套线程模型。
+- **Navigator**（`<leader>e` 开关，`<leader>E` 定位当前文件）：左侧导航栏，三个 tab——**Files**（原有惰性文件树，根目录跟随当前 workspace 的项目目录）、**Notes**、**Agents**。每个 tab 和列表行都是 `<leader>j` 的 hint 目标，也是鼠标目标；聚焦导航栏时 `Tab`/`Shift-Tab` 循环 tab，`1`/`2`/`3` 直接跳转（`h`/`l` 仍是文件树的折叠/父目录）。
+  - **完整模式（≥90 列）**——30 列面板：顶部边框内有 accent + bold 的 **OZ**，下一行是真实的 `workspace / branch`（有 git 分支时显示分支），然后是 `folder Files N │ notes Notes N │ agents Agents N`。计数全部来自真实缓存：可见文件树行、已加载的 note 列表（惰性列表加载前不显示 badge）、会话线程。active tab 复用统一的 `bg_sel` + accent underline。
+  - **紧凑模式（<90 列）**——7 列图标 rail（顶部 `OZ`，下面 folder/notes/agents 两行高按钮），editor 保留其余宽度（正文从第 8 列开始，绝不压在 rail 下）。点击图标、hint，或在导航栏持有键盘时按 `1`/`2`/`3`/Tab，会打开 30 列的 **peek**，显示该 tab 的真实内容。`Esc` 或点击外部关闭 peek 并回到 editor；打开文件/note/agent 也会关闭。peek 与 Agent drawer 互斥（打开一个会关闭另一个）。`Ctrl-w h` 进入导航栏（紧凑模式下自动打开 peek）；`Ctrl-w l/j/k` 回到 editor。
+- **Notes**（**Notes** tab）：真实的 markdown buffer，全局存放于 `$OZ_NOTES_DIR`，否则 `$XDG_DATA_HOME/oz/notes`，否则 `$HOME/.local/share/oz/notes`（目录惰性创建，启动时不扫描/不创建）。`j`/`k` 选择 · Enter 用普通 buffer 打开（`:w` 保存）· `n` 创建最小的未占用 `note-N.md`（内容 `# Untitled note`，绝不覆盖已有文件）· `r` 刷新。列表显示首个 markdown 标题（没有则文件名）、正文片段和相对时间，新的在前。Notes 与项目无关，打开 note 不会改变 workspace 文件树/picker 的根目录。删除/重命名暂不提供。
+- **Agents**（**Agents** tab）：同一套真实线程模型的紧凑视图（按当前 workspace 分组）——`j`/`k` 选择 · Enter 在 rail/workbox 中 attach 该线程 · `n` 新建线程。它只是视图，不是第二套线程模型。
 - buffer 内搜索（`/`、`?`、n/N）
 
 ![模糊查找文件（leader sf）](docs/screenshots/picker.png)

@@ -786,9 +786,9 @@ src/app/ai.zig  会话状态 / 键处理 / 请求生命周期 / 渲染
 |---|---|
 | ≥ 110 列 | 三栏：navigator + editor + rail（rail 38–42 列） |
 | 90–109 列 | 三栏：rail 34 列，navigator 可收窄 |
-| < 90 列 | editor 单栏；rail 作为右侧 overlay drawer，Esc/`a` 关闭 |
+| < 90 列 | editor 单栏；左侧 navigator 收成 7 列 icon rail（选中时 30 列 peek），右侧 rail 作为 overlay drawer，Esc/`a` 关闭 |
 
-Narrow drawer 必须有遮罩/焦点陷阱，不能挤压编辑器到不可用宽度。所有宽度按 cell 计算，不能出现横向溢出。
+Narrow drawer 必须有焦点隔离，不能挤压编辑器到不可用宽度；navigator peek 与 Agent drawer 互斥，不能叠画。所有宽度按 cell 计算，不能出现横向溢出。
 
 ### 18.3 区域职责
 
@@ -1027,6 +1027,17 @@ Narrow drawer 必须有遮罩/焦点陷阱，不能挤压编辑器到不可用�
 - **run loop / idle safety**：`animationActive() = aiStreaming() or inlineStreaming() or reviewFlashActive()`；tool-only batch 已被 `aiStreaming()` 的 tool_jobs 分支覆盖。loop 仅在该谓词为真时进入 1ms poll slice（16ms 渲染节流），谓词为假后回到阻塞 `pollEvent`；flash 到期不需要额外 wake。`frame_now_ms` 每帧只取一次，所有元素同相。
 - **可测性**：`wrapMs`/`triangle`/`spinnerGlyph`/`flashActive`/`flashProgress`/`blend`/`pulseColor`/`caretVisible` 全部纯函数并单测负时钟、端点、deadline 与 0 周期；内部 e2e seam `OZ_AI_TOOL_DELAY_MS`（默认未设）让 running card 在测试中停留数帧。e2e `animation:` 用长 SSE 流与带 delay 的 tool mock 各抓多帧，断言 status fg / spinner glyph 至少出现两种值；完成后断言 300ms 内 PTY 零输出、cell 不再变化（idle 无 churn）。
 - **限制**：TUI 无 opacity/transform，pulse 用 RGB 插值；badge flash 只有单测 deadline 与渲染路径，没有单独 e2e（不计入“至少两种动画”的验收）；caret blink helper 已就绪但硬件光标保持现状。
+
+#### 18.13 Navigator brand + compact rail（feat/navigator-brand，2026-10-26）
+
+用户要求把批准 demo 的左侧 navigator 落到 TUI：完整宽度要有 `OZ` 品牌头、`workspace / branch`、带图标/真实计数的 `Files / Notes / Agents` tabs；窄宽度要像 demo 一样只剩 `OZ + 三个图标` 的 rail，点图标弹出内容。只改 navigator 的视觉/几何，不改 tab 模型、notes/thread 数据或既有键位语义。
+
+- **断点与几何（纯模块 `src/app/navigator.zig`）**：`modeForCols(cols)` 在 **≥90** 用完整面板（30 cells 含边框），**<90** 用紧凑 rail（`compact_width = 7`，含右侧边框）。editor 内容列 `editorCol = panelWidth + 1`：完整 31、紧凑 8；完整/peek 的 header 固定 4 行（品牌边框、workspace、tabs、`├──┤` rule），内容从面板顶 +4 开始；紧凑 rail 是 `OZ`（row 0）、hairline（row 1）、三个两行高按钮（row 2/4/6）。`contentCol()`/`editorAreaWidth()` 用同一模型；`layoutWindows` 的总宽改为 `aiEditorWidth - contentCol`（此前漏减 navigator 列，导致文本在 navigator/rail 下折行），split/tab-layer/focused-width 全部走该值。
+- **品牌头**：完整面板顶边框画 `╭─ OZ ─────╮`（`accent` + bold），下一行 `│ main / feat/navigator-brand │`（`fg_dim`，真实 `curWsName()` + `git_branch`；分支未知时只显示 workspace，过长按 cell 截断加 `…`）。分支是异步 git status 的真实值，测试用仓库内文件打开时等待 status 后再断言；/tmp 非 git 测试只断言 workspace。
+- **完整 tabs**：`Files / Notes / Agents` 前各加一个已确认的 Nerd Font 图标（folder `U+F07B`、md file document `U+F0219`、fa-users `U+F0C0`，见 `src/icons.zig`），label 大写以对齐 demo。计数是真实缓存：`filetree_rows` 可见行、`notes.items`（**未加载时不画 badge**，不伪造 0）、`ai.threads` 真实线程数。`layoutTabs` 把 28 个 interior cells 装下：首选 `icon + space + label + count` 的紧凑 badge 加 1-cell `│` 分隔；放不下时先去掉分隔 gap，再整体省略 badge，但绝不截断 label。active tab 继续用 §18.10.1 的 `bg_sel` + `fg` bold + `accent_alt` underline；图标/计数同步 accent。tab 的 hint/mouse rect 由同一 layout 的 start/width 生成。
+- **紧凑 rail / peek**：rail 顶部居中 `OZ`，一条 `──` hairline，然后三个两行高按钮；active 按钮整行 `bg_sel` + 左侧 accent `│` inset + accent 图标（inactive `fg_dim`）。`<leader>e`/`Ctrl-w h` 或点击/hint/`1/2/3`/Tab 打开 30-cell peek；peek 复用同一个完整面板渲染（含 `×` 关闭目标与真实内容），`Esc`、peek 外点击、打开 file/note/agent 关闭并把键盘交回 editor；peek 与 AI drawer 互斥（打开一个关闭另一个），因此不会叠画。焦点离开 navigator 时 render 收口关闭 peek，避免“焦点在 editor、面板还盖着”的悬空状态。紧凑模式 `Ctrl-w l/j/k` 关闭 peek 回 editor；非 git/非 workspace 切换时 `closeTransientUi` 清理 peek，切回曾聚焦 navigator 的 workspace 时按 `focus` 恢复 peek。
+- **性能/正确性**：计数只读已有缓存（notes 仍只在 tab 进入/create/save/`r` 刷新），没有逐帧文件系统扫描；peek 关闭时零额外绘制/分配，peek 打开才复用完整面板的 frame-arena 绘制。所有动态文本（workspace/branch/count）都 dupe 到 frame arena 后再交给 vaxis（vaxis 保存 grapheme slice 到 render，栈缓冲会变 U+FFFD）。新增 `hints.Action.navigator_peek_close`。
+- **测试**：navigator 纯模型新增断点/editor 列、`layoutTabs`（1/2/3 位计数、超宽省略、Notes 未知、无计数）和 `workspaceLine`/peek toggle 单测；e2e 新增 120 品牌头（真实 workspace/branch + 真实计数）、80 紧凑 rail 的 `1/2/3`/Tab、hint/鼠标开关、file/note/agent 关闭 peek、AI drawer 互斥、60x24 无 overflow，更新既有 navigator/mouse/chrome/theme/scenario 断言；新增 `@compact` scenario（`navigator compact rail 80x24`）。当前 **535 unit / 198 e2e**；golden 帧不含 navigator，未重建。`./tools/verify.sh` PASS。
 
 ---
 
