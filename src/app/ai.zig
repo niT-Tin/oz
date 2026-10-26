@@ -1080,9 +1080,10 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
             },
             .edit_file, .apply_patch => {
                 // M3b: stage a reviewable diff instead of executing. The
-                // executor/worker never sees this call, and the staged patch
-                // is applied to the in-memory buffer only after an explicit
-                // human approve.
+                // executor/worker never sees this call. A single-file edit
+                // applies to the in-memory buffer after approval; a
+                // multi-file patch runs the App's validated whole-set disk
+                // transaction only after an explicit human approve.
                 const result = switch (kind) {
                     .edit_file => app_agent_edit.stageToolCall(self, idx, msg_index, call),
                     .apply_patch => app_agent_edit.stagePatchToolCall(self, idx, msg_index, call),
@@ -1090,25 +1091,15 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
                 };
                 switch (result) {
                     .staged => |staged| {
-                        const text = std.fmt.allocPrint(
-                            self.alloc,
-                            "-{d} +{d} · staged · review in Changes",
-                            .{ staged.removed, staged.added },
-                        ) catch null;
-                        defer if (text) |x| self.alloc.free(x);
-                        const api_text = std.fmt.allocPrint(
-                            self.alloc,
-                            "approval required: {s} staged for review; not applied",
-                            .{call.name},
-                        ) catch null;
-                        defer if (api_text) |x| self.alloc.free(x);
+                        defer self.alloc.free(staged.summary);
+                        defer self.alloc.free(staged.api_text);
                         self.ai.threads.setToolOutcome(
                             self.alloc,
                             idx,
                             msg_index,
                             .approval_required,
-                            text orelse "staged · review in Changes",
-                            api_text orelse "approval required: staged for review; not applied",
+                            staged.summary,
+                            staged.api_text,
                             0,
                         ) catch {
                             t.messages.items[msg_index].tool_status = .err;

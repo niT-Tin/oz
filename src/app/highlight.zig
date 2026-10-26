@@ -291,6 +291,11 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
                 self.cur().history.endGroup();
                 self.in_insert = false;
             }
+            // M3b2 multi-file apply: one cross-file undo unit. `u` in any
+            // buffer of the set restores every file (buffers + disk) instead
+            // of undoing just the current buffer. From an unrelated buffer
+            // this returns false and normal per-buffer undo runs.
+            if (self.agentPatchUndo()) return;
             _ = self.cur().history.undo(&self.cur().pt);
             self.curCursor().* = @min(self.curCursor().*, self.cur().pt.len());
             // the document changed: keep LSP/inlay in sync (markDirty
@@ -299,6 +304,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             self.markDirty();
         },
         .redo => {
+            if (self.agentPatchRedo()) return;
             _ = self.cur().history.redo(&self.cur().pt);
             self.curCursor().* = @min(self.curCursor().*, self.cur().pt.len());
             self.markDirty();

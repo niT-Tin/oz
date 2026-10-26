@@ -150,7 +150,7 @@ const apply_patch_parameters =
     \\    "patch": {
     \\      "type": "string",
     \\      "minLength": 1,
-    \\      "description": "Single-file unified diff text with optional git-style headers and @@ hunks; the path is relative to the workspace root."
+    \\      "description": "Unified diff text for 1-8 modified files (back-to-back diff --git/---/+++ sections), with optional git-style headers and @@ hunks; paths are relative to the workspace root. Add/delete, binary, rename/copy and mode changes are rejected."
     \\    }
     \\  },
     \\  "required": ["patch"]
@@ -208,7 +208,7 @@ pub const definitions = [_]Definition{
     .{
         .kind = .apply_patch,
         .name = "apply_patch",
-        .description = "Apply a single-file unified diff patch. Requires user confirmation by default.",
+        .description = "Apply a unified diff patch to 1-8 modified files. Requires user confirmation by default; multi-file sets are reviewed and written together (all-or-nothing validation).",
         .parameters_json = apply_patch_parameters,
     },
     .{

@@ -163,6 +163,9 @@ pub const Action = union(enum) {
     agent_approve,
     /// Reject the staged agent edit (same path as `r`/`d` in Changes).
     agent_reject,
+    /// Select the file at this index in a multi-file staged patch review
+    /// (same path as `j`/`k` in Changes).
+    agent_patch_file: usize,
     /// Allow the staged terminal command (same path as `a`/Enter on the
     /// Terminal tab). Never auto-executes: the human must activate this.
     agent_terminal_allow,

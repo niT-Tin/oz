@@ -536,7 +536,7 @@ pub fn handleInlineChangesKey(self: *App, key: vaxis.Key) !bool {
 // Rendering
 // ---------------------------------------------------------------------------
 
-fn drawRow(
+pub fn drawRow(
     win: vaxis.Window,
     a: std.mem.Allocator,
     y: u32,
@@ -563,7 +563,7 @@ fn drawRow(
     _ = win.print(segs.items, .{ .row_offset = @intCast(y), .col_offset = @intCast(x), .wrap = .none });
 }
 
-fn drawTextRow(
+pub fn drawTextRow(
     self: *App,
     win: vaxis.Window,
     a: std.mem.Allocator,
@@ -915,6 +915,186 @@ pub fn drawDiffReview(
     // Fill every remaining body row with the rail border: the Changes body
     // must stay a closed panel even when the diff is shorter than the body
     // (scenario/golden checks sample the bottom-left cell).
+    var y = row + @min(@as(u32, @intCast(view.diff.len -| top)), diff_rows);
+    while (y < bottom) : (y += 1) {
+        try drawRow(win, a, y, x, w, "│", border_style, rail_bg, &.{}, 0);
+    }
+}
+
+/// Multi-file staged patch review. One row per file (bounded window around
+/// the active file, with an explicit overflow indicator) plus the active
+/// file's diff. Per-file rows are real hint/mouse targets, so pointer users
+/// can switch files with the same action as `j`/`k`; approve/reject stay on
+/// the same two buttons as the single-file review.
+pub const MultiReviewView = struct {
+    paths: []const []const u8,
+    actions: []const hints.Action,
+    active: usize,
+    total_removed: u32,
+    total_added: u32,
+    stale: bool = false,
+    stale_label: []const u8 = "stale patch",
+    stale_file: ?[]const u8 = null,
+    diff: []const inline_model.DiffLine,
+    scroll: *u32,
+    approve_action: hints.Action,
+    reject_action: hints.Action,
+};
+
+/// Number of file-list rows the multi review may use at `body_rows`, leaving
+/// a title, buttons, one breathing row and at least two diff rows.
+pub fn multiFileRowBudget(body_rows: u32, file_count: usize) u32 {
+    const budget = body_rows -| 5;
+    return @min(file_count, @max(budget, 1));
+}
+
+pub fn drawMultiDiffReview(
+    self: *App,
+    a: std.mem.Allocator,
+    win: vaxis.Window,
+    x: u32,
+    w: u32,
+    body_top: u32,
+    body_rows: u32,
+    border_style: vaxis.Style,
+    rail_bg: vaxis.Color,
+    view: MultiReviewView,
+) !void {
+    if (body_rows == 0 or view.paths.len == 0) return;
+    const t = self.theme;
+    const dim: vaxis.Style = .{ .fg = .{ .rgb = t.fg_dim }, .bg = rail_bg };
+    const base: vaxis.Style = .{ .fg = .{ .rgb = t.fg }, .bg = rail_bg };
+    const err_style: vaxis.Style = .{ .fg = .{ .rgb = t.diag_error }, .bg = rail_bg, .bold = true };
+    const add_style: vaxis.Style = .{ .fg = .{ .rgb = t.string }, .bg = rail_bg };
+    const accent: vaxis.Style = .{ .fg = .{ .rgb = t.accent }, .bg = rail_bg, .bold = true };
+    const bottom = body_top + body_rows;
+    var row = body_top;
+
+    // total stats header (the Chat card carries the same totals)
+    {
+        var text = try std.fmt.allocPrint(a, "{d} files · -{d} +{d}", .{
+            view.paths.len,
+            view.total_removed,
+            view.total_added,
+        });
+        if (view.stale) {
+            const suffix = if (view.stale_file) |f|
+                try std.fmt.allocPrint(a, "  {s}: {s}", .{ view.stale_label, f })
+            else
+                try std.fmt.allocPrint(a, "  {s}", .{view.stale_label});
+            text = try std.fmt.allocPrint(a, "{s}{s}", .{ text, suffix });
+        }
+        try drawTextRow(self, win, a, row, x, w, border_style, rail_bg, text, if (view.stale) err_style else dim);
+        row += 1;
+    }
+    if (row >= bottom) return;
+
+    // file list (bounded window around the active file, explicit overflow)
+    const budget = multiFileRowBudget(body_rows, view.paths.len);
+    const overflow = view.paths.len > budget;
+    const shown = if (overflow) @max(budget -| 1, 1) else budget;
+    const max_start = view.paths.len - shown;
+    var start: usize = 0;
+    if (view.active >= shown) start = @min(view.active - shown + 1, max_start);
+    if (view.active < start) start = view.active;
+    const content_w = w -| 3;
+    var fi: usize = 0;
+    while (fi < shown and row < bottom) : (fi += 1) {
+        const idx = start + fi;
+        if (idx >= view.paths.len) break;
+        const active = idx == view.active;
+        const marker: []const u8 = if (active) "> " else "  ";
+        const max_cells: usize = content_w -| 2;
+        const fit = autil.cellFitPrefix(win, view.paths[idx], max_cells);
+        const clipped = fit.slice.len < view.paths[idx].len;
+        const text = if (clipped)
+            try std.fmt.allocPrint(a, "{s}{s}…", .{ marker, fit.slice })
+        else
+            try std.fmt.allocPrint(a, "{s}{s}", .{ marker, fit.slice });
+        try drawTextRow(self, win, a, row, x, w, border_style, rail_bg, text, if (active) accent else base);
+        if (self.mouseTargetsCollecting()) {
+            self.addHintTarget(.{
+                .row = row,
+                .col = x + 2,
+                .width = @intCast(@min(
+                    content_w,
+                    @as(usize, 2) + @as(usize, @intCast(autil.cellWidth(win, text))),
+                )),
+                .height = 1,
+            }, view.actions[idx]);
+        }
+        row += 1;
+    }
+    if (overflow and row < bottom) {
+        const text = try std.fmt.allocPrint(
+            a,
+            "… file {d}/{d} · j/k select",
+            .{ view.active + 1, view.paths.len },
+        );
+        try drawTextRow(self, win, a, row, x, w, border_style, rail_bg, text, dim);
+        row += 1;
+    }
+    if (row >= bottom) return;
+
+    // buttons
+    {
+        const full = "[a] approve  [r] reject";
+        if (content_w >= autil.cellWidth(win, full)) {
+            var segs = std.ArrayList(vaxis.Segment).empty;
+            try segs.append(a, .{ .text = "[a] approve", .style = accent });
+            try segs.append(a, .{ .text = "  ", .style = .{ .bg = rail_bg } });
+            try segs.append(a, .{ .text = "[r] reject", .style = err_style });
+            const used: u32 = @intCast(autil.cellWidth(win, full));
+            try drawRow(win, a, row, x, w, "│", border_style, rail_bg, segs.items, used);
+            if (self.mouseTargetsCollecting()) {
+                self.addHintTarget(.{
+                    .row = row,
+                    .col = x + 2,
+                    .width = @intCast("[a] approve".len),
+                    .height = 1,
+                }, view.approve_action);
+                self.addHintTarget(.{
+                    .row = row,
+                    .col = x + 2 + @as(u32, @intCast("[a] approve  ".len)),
+                    .width = @intCast("[r] reject".len),
+                    .height = 1,
+                }, view.reject_action);
+            }
+        } else {
+            try drawTextRow(self, win, a, row, x, w, border_style, rail_bg, "[a] approve  [r] reject", accent);
+        }
+        row += 1;
+    }
+    if (row >= bottom) return;
+    try drawRow(win, a, row, x, w, "│", border_style, rail_bg, &.{}, 0);
+    row += 1;
+    const diff_rows = bottom -| row;
+    if (diff_rows == 0) return;
+    const max_top = view.diff.len -| diff_rows;
+    if (view.scroll.* > max_top) view.scroll.* = @intCast(max_top);
+    const top = view.scroll.*;
+    var k: u32 = 0;
+    while (k < diff_rows) : (k += 1) {
+        const idx = top + k;
+        if (idx >= view.diff.len) break;
+        const d = view.diff[idx];
+        const prefix: []const u8 = switch (d.kind) {
+            .context => "  ",
+            .removed => "- ",
+            .added => "+ ",
+        };
+        const style: vaxis.Style = switch (d.kind) {
+            .context => base,
+            .removed => err_style,
+            .added => add_style,
+        };
+        const fit = autil.cellFitPrefix(win, d.text, content_w -| 2);
+        const segs = [_]vaxis.Segment{
+            .{ .text = prefix, .style = style },
+            .{ .text = fit.slice, .style = style },
+        };
+        try drawRow(win, a, row + k, x, w, "│", border_style, rail_bg, &segs, 2 + @as(u32, @intCast(fit.cells)));
+    }
     var y = row + @min(@as(u32, @intCast(view.diff.len -| top)), diff_rows);
     while (y < bottom) : (y += 1) {
         try drawRow(win, a, y, x, w, "│", border_style, rail_bg, &.{}, 0);

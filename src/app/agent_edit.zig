@@ -16,8 +16,12 @@
 //!     does not implement a second diff engine;
 //!   - the full target text is snapshotted for staleness; applying requires
 //!     the buffer/file text and occurrence count to still match;
-//!   - one agent edit may be pending at a time (checked together with the
-//!     inline edit in the App).
+//!   - one agent edit/review may be pending at a time (checked together with
+//!     the inline edit in the App);
+//!   - a multi-file patch is one `Pending` with a `PendingFile` per target,
+//!     one whole-set validation result, a two-phase commit helper and one
+//!     cross-file undo snapshot. Single-file edits keep their historical
+//!     contiguous-span/history-group behavior.
 const std = @import("std");
 const inline_model = @import("inline.zig");
 const patch_model = @import("agent_patch.zig");
@@ -269,7 +273,7 @@ const Preview = struct {
 
 fn freePreview(alloc: std.mem.Allocator, diff: []inline_model.DiffLine) void {
     for (diff) |d| alloc.free(d.text);
-    alloc.free(diff);
+    if (diff.len > 0) alloc.free(diff);
 }
 
 fn appendNote(alloc: std.mem.Allocator, list: *std.ArrayList(inline_model.DiffLine), comptime fmt: []const u8, args: anytype) !void {
@@ -446,53 +450,86 @@ pub const PlanError = error{
     TooManyOccurrences,
 };
 
+/// One file in a staged review. Every file carries its own old/new snapshot,
+/// buffer identity, retained patch (for re-verification) and preview diff.
+pub const PendingFile = struct {
+    /// Canonical absolute target path (inside `Pending.root`).
+    path: []u8,
+    /// Workspace-relative display path.
+    display_path: []u8,
+    /// Full target text at staging time (buffer or disk).
+    text: []u8,
+    /// Full staged result for this file.
+    new_text: []u8,
+    buffer_index: ?usize = null,
+    revision: ?u64 = null,
+    /// Parsed patch for this file (`apply_patch` only; null for `edit_file`).
+    patch: ?patch_model.Patch = null,
+    diff: []inline_model.DiffLine = &.{},
+    removed: u32 = 0,
+    added: u32 = 0,
+    first_line: u32 = 1,
+    last_line: u32 = 1,
+    preview_partial: bool = false,
+
+    pub fn deinit(self: *PendingFile, alloc: std.mem.Allocator) void {
+        if (self.path.len > 0) alloc.free(self.path);
+        if (self.display_path.len > 0) alloc.free(self.display_path);
+        if (self.text.len > 0) alloc.free(self.text);
+        if (self.new_text.len > 0) alloc.free(self.new_text);
+        if (self.patch) |*patch| patch.deinit(alloc);
+        freePreview(alloc, self.diff);
+        self.* = undefined;
+    }
+};
+
+/// A staged review. `files.len == 1` for `edit_file` and the historical
+/// single-file `apply_patch`; 2..`patch_model.max_files` for the multi-file
+/// path. The edit_file occurrence/span fields are only meaningful for
+/// `kind == .edit_file` (multi-file patches never have a contiguous span).
 pub const Pending = struct {
     kind: Kind = .edit_file,
     thread_index: usize,
     card_index: usize,
     root: []u8,
-    path: []u8,
-    display_path: []u8,
-    text: []u8,
+    files: []PendingFile,
     /// Empty for `apply_patch` (the whole text is the replacement span).
     old_string: []u8,
     new_string: []u8,
     replace_all: bool,
-    buffer_index: ?usize,
-    revision: ?u64,
-    occurrence_count: u32,
-    /// One contiguous span from the first occurrence's start to the last
-    /// occurrence's end. `applyEdit(span_start, span_end, span_replacement)`
-    /// is therefore a single undo group even for `replace_all`; an
-    /// `apply_patch` pending is the whole-file span `[0, text.len)`.
-    span_start: u32,
-    span_end: u32,
-    span_replacement: []u8,
-    /// Parsed patch retained for apply-time re-verification (`apply_patch`
-    /// only). Owned; `null` for `edit_file`.
-    patch: ?patch_model.Patch = null,
-    diff: []inline_model.DiffLine,
-    removed: u32,
-    added: u32,
-    /// 1-based affected line range of the shown preview.
-    first_line: u32,
-    last_line: u32,
-    preview_partial: bool,
+    /// `edit_file` only: occurrence count and contiguous span.
+    occurrence_count: u32 = 0,
+    span_start: u32 = 0,
+    span_end: u32 = 0,
+    /// Aggregate shown-hunk stats (sum over files).
+    removed: u32 = 0,
+    added: u32 = 0,
+    preview_partial: bool = false,
     /// Set when an approve attempt found the buffer/file changed. Purely a
     /// display/lifecycle flag: apply is refused either way.
     stale: bool = false,
+    /// First stale file (owned) for the multi-file review header/card.
+    stale_file: ?[]u8 = null,
 
     pub fn deinit(self: *Pending, alloc: std.mem.Allocator) void {
         alloc.free(self.root);
-        alloc.free(self.path);
-        alloc.free(self.display_path);
-        alloc.free(self.text);
-        alloc.free(self.old_string);
-        alloc.free(self.new_string);
-        alloc.free(self.span_replacement);
-        if (self.patch) |*patch| patch.deinit(alloc);
-        freePreview(alloc, self.diff);
+        for (self.files) |*file| file.deinit(alloc);
+        if (self.files.len > 0) alloc.free(self.files);
+        if (self.old_string.len > 0) alloc.free(self.old_string);
+        if (self.new_string.len > 0) alloc.free(self.new_string);
+        if (self.stale_file) |file| alloc.free(file);
         self.* = undefined;
+    }
+
+    /// Replacement for the contiguous edit_file span (owned by the single
+    /// PendingFile).
+    pub fn spanReplacement(self: *const Pending) []const u8 {
+        if (self.files.len != 1) return "";
+        return self.files[0].new_text;
+    }
+
+    pub fn isMulti(self: *const Pending) bool {
+        return self.files.len > 1;
     }
 
     pub fn isVisibleFor(self: *const Pending, thread_index: usize) bool {
@@ -507,11 +544,13 @@ pub const Pending = struct {
     /// snapshot and the exact occurrence count is unchanged. The caller
     /// still checks the buffer history revision (when the edit was staged
     /// from a buffer). For `apply_patch` the occurrence check is replaced by
-    /// `verifyPatch` (the whole text is the replacement span).
+    /// re-applying the retained hunks in `verifyPatch`.
     pub fn verify(self: *const Pending, current_text: []const u8) bool {
-        if (!std.mem.eql(u8, self.text, current_text)) return false;
-        if (self.span_start > self.span_end or self.span_end > current_text.len) return false;
+        if (self.files.len != 1) return false;
+        const file = &self.files[0];
+        if (!std.mem.eql(u8, file.text, current_text)) return false;
         if (self.kind == .apply_patch) return true;
+        if (self.span_start > self.span_end or self.span_end > current_text.len) return false;
         var count: u32 = 0;
         var pos: usize = 0;
         while (pos + self.old_string.len <= current_text.len) {
@@ -523,16 +562,92 @@ pub const Pending = struct {
         return count == self.occurrence_count;
     }
 
-    /// Re-apply the retained patch to `current_text` and require the exact
-    /// staged new text. This is the "the patch still applies" check that runs
-    /// on top of full-text/revision equality before an approve mutates the
-    /// buffer. Always true for `edit_file`.
+    /// Re-apply the retained single-file patch to `current_text` and require
+    /// the exact staged new text. Always true for `edit_file`. Kept for the
+    /// historical single-file API; multi-file approval calls `verifyFile`.
     pub fn verifyPatch(self: *const Pending, alloc: std.mem.Allocator, current_text: []const u8) bool {
-        if (self.kind != .apply_patch) return true;
-        const patch = if (self.patch) |*p| p else return false;
+        if (self.kind != .apply_patch or self.files.len != 1) return true;
+        return self.verifyFile(alloc, 0, current_text);
+    }
+
+    /// Full per-file staleness check: old text identity, then (for patches)
+    /// re-run the hunks and require the exact staged result.
+    pub fn verifyFile(self: *const Pending, alloc: std.mem.Allocator, index: usize, current_text: []const u8) bool {
+        if (index >= self.files.len) return false;
+        const file = &self.files[index];
+        if (!std.mem.eql(u8, file.text, current_text)) return false;
+        if (self.kind == .edit_file) return true;
+        const patch = if (file.patch) |*p| p else return false;
         const applied = patch_model.apply(alloc, patch, current_text) catch return false;
         defer alloc.free(applied);
-        return std.mem.eql(u8, applied, self.span_replacement);
+        return std.mem.eql(u8, applied, file.new_text);
+    }
+
+    /// First file (in patch order) whose current text no longer matches the
+    /// staging snapshot, or null when the whole set is still current. The
+    /// caller supplies each current text; path/buffer-index checks happen at
+    /// the UI boundary.
+    pub fn staleFile(
+        self: *const Pending,
+        alloc: std.mem.Allocator,
+        current_texts: []const []const u8,
+    ) ?usize {
+        if (current_texts.len != self.files.len) return 0;
+        for (self.files, 0..) |_, i| {
+            if (!self.verifyFile(alloc, i, current_texts[i])) return i;
+        }
+        return null;
+    }
+};
+
+/// Owned undo snapshot for one multi-file patch set. The existing undo
+/// history is per buffer; a multi-file apply is one explicit cross-file undo
+/// unit. `applied` flips on undo/redo so the same entry can drive both.
+pub const UndoEntry = struct {
+    path: []u8,
+    old_text: []u8,
+    new_text: []u8,
+    buffer_index: ?usize = null,
+    /// True when the buffer was already open at apply time, so the apply's
+    /// one history group exists in that buffer. A file opened later is
+    /// disk-only; the cross-file undo refuses rather than discard its
+    /// unsaved buffer state.
+    open_at_apply: bool = false,
+    /// Buffer history revision after the most recent apply/undo, when open.
+    revision: ?u64 = null,
+
+    pub fn deinit(self: *UndoEntry, alloc: std.mem.Allocator) void {
+        if (self.path.len > 0) alloc.free(self.path);
+        if (self.old_text.len > 0) alloc.free(self.old_text);
+        if (self.new_text.len > 0) alloc.free(self.new_text);
+        self.* = undefined;
+    }
+};
+
+pub const UndoSet = struct {
+    files: []UndoEntry,
+    /// Captured workspace root for confinement checks on a later undo.
+    root: []u8,
+    /// True after apply (new text is live), false after undo (old text).
+    applied: bool = true,
+
+    pub fn deinit(self: *UndoSet, alloc: std.mem.Allocator) void {
+        for (self.files) |*file| file.deinit(alloc);
+        if (self.files.len > 0) alloc.free(self.files);
+        if (self.root.len > 0) alloc.free(self.root);
+        self.* = undefined;
+    }
+
+    /// Text currently on disk/buffer for this file.
+    pub fn liveText(self: *const UndoSet, index: usize) []const u8 {
+        const file = &self.files[index];
+        return if (self.applied) file.new_text else file.old_text;
+    }
+
+    /// Text an undo (or redo) must write for this file.
+    pub fn targetText(self: *const UndoSet, index: usize) []const u8 {
+        const file = &self.files[index];
+        return if (self.applied) file.old_text else file.new_text;
     }
 };
 
@@ -547,40 +662,19 @@ pub fn createPending(alloc: std.mem.Allocator, meta: Meta) PlanError!Pending {
     if (!meta.replace_all and occurrences.len > 1) return error.Ambiguous;
     if (occurrences.len > max_occurrences) return error.TooManyOccurrences;
 
-    var pending = Pending{
-        .thread_index = meta.thread_index,
-        .card_index = meta.card_index,
-        .root = try alloc.dupe(u8, meta.root),
-        .path = try alloc.dupe(u8, meta.path),
-        .display_path = try alloc.dupe(u8, meta.display_path),
-        .text = try alloc.dupe(u8, meta.text),
-        .old_string = try alloc.dupe(u8, meta.old_string),
-        .new_string = try alloc.dupe(u8, meta.new_string),
-        .replace_all = meta.replace_all,
-        .buffer_index = meta.buffer_index,
-        .revision = meta.revision,
-        .occurrence_count = @intCast(occurrences.len),
-        .span_start = occurrences[0],
-        .span_end = occurrences[occurrences.len - 1] + @as(u32, @intCast(meta.old_string.len)),
-        .span_replacement = undefined,
-        .diff = &.{},
-        .removed = 0,
-        .added = 0,
-        .first_line = 0,
-        .last_line = 0,
-        .preview_partial = false,
-    };
-    errdefer pending.deinit(alloc);
-
-    pending.span_replacement = try replaceInSpan(
+    const span_start = occurrences[0];
+    const span_end = occurrences[occurrences.len - 1] + @as(u32, @intCast(meta.old_string.len));
+    const replacement = try replaceInSpan(
         alloc,
         meta.text,
         meta.old_string,
         meta.new_string,
         occurrences,
-        pending.span_start,
-        pending.span_end,
+        span_start,
+        span_end,
     );
+    errdefer alloc.free(replacement);
+
     const preview = try buildPreview(
         alloc,
         meta.text,
@@ -588,13 +682,181 @@ pub fn createPending(alloc: std.mem.Allocator, meta: Meta) PlanError!Pending {
         meta.old_string.len,
         meta.new_string,
     );
-    pending.diff = preview.diff;
-    pending.removed = preview.removed;
-    pending.added = preview.added;
-    pending.first_line = preview.first_line;
-    pending.last_line = preview.last_line;
-    pending.preview_partial = preview.partial;
+    var diff_owned = true;
+    errdefer if (diff_owned) freePreview(alloc, preview.diff);
+
+    const files = try alloc.alloc(PendingFile, 1);
+    errdefer alloc.free(files);
+    var file = PendingFile{
+        .path = &.{},
+        .display_path = &.{},
+        .text = &.{},
+        .new_text = &.{},
+        .buffer_index = meta.buffer_index,
+        .revision = meta.revision,
+        .diff = &.{},
+        .removed = preview.removed,
+        .added = preview.added,
+        .first_line = preview.first_line,
+        .last_line = preview.last_line,
+        .preview_partial = preview.partial,
+    };
+    var replacement_owned = true;
+    errdefer if (replacement_owned) alloc.free(replacement);
+    errdefer file.deinit(alloc);
+    file.path = try alloc.dupe(u8, meta.path);
+    file.display_path = try alloc.dupe(u8, meta.display_path);
+    file.text = try alloc.dupe(u8, meta.text);
+    file.new_text = replacement;
+    replacement_owned = false;
+    file.diff = preview.diff;
+    diff_owned = false;
+    files[0] = file;
+
+    return .{
+        .thread_index = meta.thread_index,
+        .card_index = meta.card_index,
+        .root = try alloc.dupe(u8, meta.root),
+        .files = files,
+        .old_string = try alloc.dupe(u8, meta.old_string),
+        .new_string = try alloc.dupe(u8, meta.new_string),
+        .replace_all = meta.replace_all,
+        .occurrence_count = @intCast(occurrences.len),
+        .span_start = span_start,
+        .span_end = span_end,
+        .removed = preview.removed,
+        .added = preview.added,
+        .preview_partial = preview.partial,
+    };
+}
+
+pub const PatchFileMeta = struct {
+    path: []const u8,
+    display_path: []const u8,
+    old_text: []const u8,
+    new_text: []const u8,
+    buffer_index: ?usize = null,
+    revision: ?u64 = null,
+    /// Parsed patch. Ownership moves into the returned `Pending` on success;
+    /// on error the caller still owns every patch and must free the set.
+    patch: *patch_model.Patch,
+};
+
+pub const PatchSetMeta = struct {
+    thread_index: usize,
+    card_index: usize,
+    root: []const u8,
+    files: []const PatchFileMeta,
+};
+
+pub const PatchPlanError = error{OutOfMemory};
+
+/// Build one pending review for a validated 1..max_files patch set. Every
+/// file keeps its own old/new text and retained hunks; all fallible work
+/// happens before ownership of the caller's patches moves.
+pub fn createPatchSetPending(alloc: std.mem.Allocator, meta: PatchSetMeta) PatchPlanError!Pending {
+    if (meta.files.len == 0 or meta.files.len > patch_model.max_files) return error.OutOfMemory;
+
+    const files = try alloc.alloc(PendingFile, meta.files.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (files[0..initialized]) |*file| file.deinit(alloc);
+        alloc.free(files);
+    }
+
+    // Historical single-file behavior is preserved exactly: the preview is
+    // the bounded 240-line/16-hunk display and the stats count shown lines.
+    // Multi-file sets use the global patch budgets instead (complete per-file
+    // diff + exact whole-file stats).
+    const single = meta.files.len == 1;
+    var removed_total: u32 = 0;
+    var added_total: u32 = 0;
+    var partial_total = false;
+    for (meta.files, 0..) |file_meta, i| {
+        const preview = if (single)
+            patch_model.buildPreview(alloc, file_meta.patch) catch return error.OutOfMemory
+        else
+            patch_model.buildPreviewWithLimits(
+                alloc,
+                file_meta.patch,
+                @intCast(patch_model.max_hunk_lines),
+                patch_model.max_hunks,
+            ) catch return error.OutOfMemory;
+        const stats = if (single)
+            patch_model.Stats{ .removed = preview.removed, .added = preview.added }
+        else
+            file_meta.patch.stats();
+        files[i] = initPendingFile(alloc, file_meta, stats, preview) catch |e| {
+            freePreview(alloc, preview.lines);
+            return e;
+        };
+        initialized += 1;
+        removed_total +|= stats.removed;
+        added_total +|= stats.added;
+        partial_total = partial_total or preview.partial;
+    }
+
+    var pending = Pending{
+        .kind = .apply_patch,
+        .thread_index = meta.thread_index,
+        .card_index = meta.card_index,
+        .root = try alloc.dupe(u8, meta.root),
+        .files = files,
+        .old_string = &.{},
+        .new_string = &.{},
+        .replace_all = false,
+        .removed = removed_total,
+        .added = added_total,
+        .preview_partial = partial_total,
+    };
+    // Historical single-file API: the patch is the whole-file span. Multi
+    // applies are not a contiguous span (each file is written separately).
+    if (meta.files.len == 1) {
+        pending.span_start = 0;
+        pending.span_end = @intCast(meta.files[0].old_text.len);
+    }
+    // Ownership of every patch moves only after all duplication/previews
+    // succeeded, so a failed call never consumes the caller's set.
+    for (meta.files, 0..) |file_meta, i| {
+        pending.files[i].patch = file_meta.patch.*;
+        // Leave a safely deinitializable placeholder: a caller that still
+        // owns the set can free it after a successful move.
+        file_meta.patch.* = .{ .path = &.{}, .hunks = &.{} };
+    }
     return pending;
+}
+
+fn initPendingFile(
+    alloc: std.mem.Allocator,
+    meta: PatchFileMeta,
+    stats: patch_model.Stats,
+    preview: patch_model.Preview,
+) !PendingFile {
+    var file = PendingFile{
+        .path = &.{},
+        .display_path = &.{},
+        .text = &.{},
+        .new_text = &.{},
+        .buffer_index = meta.buffer_index,
+        .revision = meta.revision,
+        .diff = preview.lines,
+        .removed = stats.removed,
+        .added = stats.added,
+        .first_line = preview.first_line,
+        .last_line = preview.last_line,
+        .preview_partial = preview.partial,
+    };
+    errdefer {
+        if (file.path.len > 0) alloc.free(file.path);
+        if (file.display_path.len > 0) alloc.free(file.display_path);
+        if (file.text.len > 0) alloc.free(file.text);
+        if (file.new_text.len > 0) alloc.free(file.new_text);
+    }
+    file.path = try alloc.dupe(u8, meta.path);
+    file.display_path = try alloc.dupe(u8, meta.display_path);
+    file.text = try alloc.dupe(u8, meta.old_text);
+    file.new_text = try alloc.dupe(u8, meta.new_text);
+    return file;
 }
 
 pub const PatchMeta = struct {
@@ -616,50 +878,99 @@ pub const PatchMeta = struct {
     patch: *patch_model.Patch,
 };
 
-pub const PatchPlanError = error{OutOfMemory};
-
-/// Build a whole-file replacement pending from a validated single-file patch.
-/// All fallible work (duplication + bounded preview) happens before the patch
-/// ownership move, so a failed call never consumes the caller's patch.
+/// Single-file compatibility wrapper around `createPatchSetPending`.
 pub fn createPatchPending(alloc: std.mem.Allocator, meta: PatchMeta) PatchPlanError!Pending {
-    var pending = Pending{
-        .kind = .apply_patch,
+    return createPatchSetPending(alloc, .{
         .thread_index = meta.thread_index,
         .card_index = meta.card_index,
-        .root = try alloc.dupe(u8, meta.root),
-        .path = try alloc.dupe(u8, meta.path),
-        .display_path = try alloc.dupe(u8, meta.display_path),
-        .text = try alloc.dupe(u8, meta.old_text),
-        .old_string = &.{},
-        .new_string = &.{},
-        .replace_all = false,
-        .buffer_index = meta.buffer_index,
-        .revision = meta.revision,
-        .occurrence_count = 1,
-        .span_start = 0,
-        .span_end = @intCast(meta.old_text.len),
-        .span_replacement = try alloc.dupe(u8, meta.new_text),
-        .diff = &.{},
-        .removed = 0,
-        .added = 0,
-        .first_line = 1,
-        .last_line = 1,
-        .preview_partial = false,
-    };
-    errdefer pending.deinit(alloc);
+        .root = meta.root,
+        .files = &.{.{
+            .path = meta.path,
+            .display_path = meta.display_path,
+            .old_text = meta.old_text,
+            .new_text = meta.new_text,
+            .buffer_index = meta.buffer_index,
+            .revision = meta.revision,
+            .patch = meta.patch,
+        }},
+    });
+}
 
-    const preview = try patch_model.buildPreview(alloc, meta.patch);
-    pending.diff = preview.lines;
-    pending.removed = preview.removed;
-    pending.added = preview.added;
-    pending.first_line = preview.first_line;
-    pending.last_line = preview.last_line;
-    pending.preview_partial = preview.partial;
+/// One file in a disk write transaction. `old_text` is the rollback source
+/// (the exact bytes on disk before this apply).
+pub const CommitFile = struct {
+    path: []const u8,
+    old_text: []const u8,
+    new_text: []const u8,
+};
 
-    // Ownership move is the final (infallible) step.
-    pending.patch = meta.patch.*;
-    meta.patch.* = undefined;
-    return pending;
+pub const CommitStatus = enum {
+    committed,
+    /// A temp write failed: no target was renamed.
+    write_failed,
+    /// A rename failed after earlier files were committed; those were
+    /// restored from their in-memory old text.
+    rename_failed,
+};
+
+pub const CommitOutcome = struct {
+    status: CommitStatus,
+    failed_index: usize = 0,
+    /// Number of already-renamed files a failed commit attempted to restore.
+    rolled_back: usize = 0,
+    /// True when at least one rollback write/rename failed. The caller must
+    /// report the partially-applied set truthfully (never claim rollback).
+    rollback_failed: bool = false,
+};
+
+/// Two-phase multi-file write: every new text is first staged into a sibling
+/// temp file (phase 1, no target touched), then each temp is renamed over its
+/// target (phase 2). A phase-1 failure leaves every target unchanged. A
+/// phase-2 failure restores already-renamed targets from `old_text` and
+/// reports any rollback failure. This is *not* a filesystem-wide atomic
+/// multi-file commit; the guarantee is "no target changes before all temps
+/// exist" plus best-effort rollback with honest reporting.
+///
+/// `sink` is compile-time-injected so unit tests can simulate write/rename
+/// failures without touching the filesystem:
+///   writeTemp(index, text) !void, renameTemp(index) !void,
+///   abortTemp(index) void, restore(index, old_text) !void
+pub fn commitFiles(files: []const CommitFile, sink: anytype) CommitOutcome {
+    var written: usize = 0;
+    for (files, 0..) |file, i| {
+        sink.writeTemp(i, file.new_text) catch {
+            sink.abortTemp(i);
+            var j: usize = 0;
+            while (j < written) : (j += 1) sink.abortTemp(j);
+            return .{ .status = .write_failed, .failed_index = i };
+        };
+        written += 1;
+    }
+
+    var renamed: usize = 0;
+    for (files, 0..) |_, i| {
+        sink.renameTemp(i) catch {
+            // Drop every temp that was not renamed yet (including this one).
+            var j = i;
+            while (j < written) : (j += 1) sink.abortTemp(j);
+            var rollback_failed = false;
+            var k = renamed;
+            while (k > 0) {
+                k -= 1;
+                sink.restore(k, files[k].old_text) catch {
+                    rollback_failed = true;
+                };
+            }
+            return .{
+                .status = .rename_failed,
+                .failed_index = i,
+                .rolled_back = renamed,
+                .rollback_failed = rollback_failed,
+            };
+        };
+        renamed += 1;
+    }
+    return .{ .status = .committed };
 }
 
 /// One-review policy shared with the inline assistant: a new agent stage is
@@ -732,12 +1043,12 @@ test "agent_edit: unique old_string stages a real diff and span replacement" {
 
     try testing.expectEqual(@as(usize, 2), pending.thread_index);
     try testing.expectEqual(@as(usize, 7), pending.card_index);
-    try testing.expectEqualStrings("a.txt", pending.display_path);
+    try testing.expectEqualStrings("a.txt", pending.files[0].display_path);
     try testing.expectEqual(@as(u32, 1), pending.occurrence_count);
     try testing.expectEqual(@as(u32, 1), pending.removed);
     try testing.expectEqual(@as(u32, 1), pending.added);
     try testing.expect(!pending.preview_partial);
-    try testing.expectEqualStrings("BETA TWO", pending.span_replacement);
+    try testing.expectEqualStrings("BETA TWO", pending.spanReplacement());
     try testing.expectEqual(@as(u32, 10), pending.span_start);
     try testing.expectEqual(@as(u32, 18), pending.span_end);
     try testing.expect(pending.verify(text));
@@ -746,7 +1057,7 @@ test "agent_edit: unique old_string stages a real diff and span replacement" {
     // The preview is a line diff with context, not a fabricated unified blob.
     var saw_removed = false;
     var saw_added = false;
-    for (pending.diff) |d| switch (d.kind) {
+    for (pending.files[0].diff) |d| switch (d.kind) {
         .removed => {
             saw_removed = true;
             try testing.expectEqualStrings("beta two", d.text);
@@ -768,7 +1079,7 @@ test "agent_edit: missing and ambiguous old_string are real errors" {
     var all = try createPending(alloc, testMeta(0, 0, text, "same", "x", true));
     defer all.deinit(alloc);
     try testing.expectEqual(@as(u32, 2), all.occurrence_count);
-    try testing.expectEqualStrings("x\nx", all.span_replacement);
+    try testing.expectEqualStrings("x\nx", all.spanReplacement());
 }
 
 test "agent_edit: replace_all is one span and a single undo unit" {
@@ -777,7 +1088,7 @@ test "agent_edit: replace_all is one span and a single undo unit" {
     var pending = try createPending(alloc, testMeta(0, 0, text, "alpha", "ALPHA", true));
     defer pending.deinit(alloc);
     try testing.expectEqual(@as(u32, 2), pending.occurrence_count);
-    try testing.expectEqualStrings("ALPHA\nthree ALPHA", pending.span_replacement);
+    try testing.expectEqualStrings("ALPHA\nthree ALPHA", pending.spanReplacement());
     // The span starts at the first occurrence and ends after the last one.
     try testing.expectEqual(@as(u32, 8), pending.span_start);
     try testing.expectEqual(@as(u32, 25), pending.span_end);
@@ -799,7 +1110,7 @@ test "agent_edit: distant occurrences produce multiple hunks with context" {
     var removed: u32 = 0;
     var added: u32 = 0;
     var separators: usize = 0;
-    for (pending.diff) |d| switch (d.kind) {
+    for (pending.files[0].diff) |d| switch (d.kind) {
         .removed => removed += 1,
         .added => added += 1,
         .context => if (std.mem.eql(u8, d.text, "…")) {
@@ -830,11 +1141,11 @@ test "agent_edit: preview is bounded and summarizes omitted occurrences" {
     defer pending.deinit(alloc);
     try testing.expect(pending.preview_partial);
     var note_found = false;
-    for (pending.diff) |d| {
+    for (pending.files[0].diff) |d| {
         if (std.mem.indexOf(u8, d.text, "more occurrence(s) not shown") != null) note_found = true;
     }
     try testing.expect(note_found);
-    try testing.expect(pending.diff.len <= max_preview_lines + max_preview_hunks + 2);
+    try testing.expect(pending.files[0].diff.len <= max_preview_lines + max_preview_hunks + 2);
 }
 
 test "agent_edit: pending is thread-scoped and one review at a time" {
@@ -882,11 +1193,11 @@ test "agent_edit: patch pending is one whole-file span and re-verifies exactly" 
     try testing.expectEqualStrings(stale_patch_label, pending.staleLabel());
     try testing.expectEqual(@as(u32, 0), pending.span_start);
     try testing.expectEqual(@as(u32, @intCast(old_text.len)), pending.span_end);
-    try testing.expectEqualStrings(new_text, pending.span_replacement);
+    try testing.expectEqualStrings(new_text, pending.spanReplacement());
     try testing.expectEqual(@as(u32, 1), pending.removed);
     try testing.expectEqual(@as(u32, 1), pending.added);
-    try testing.expectEqual(@as(u32, 1), pending.first_line);
-    try testing.expectEqual(@as(u32, 3), pending.last_line);
+    try testing.expectEqual(@as(u32, 1), pending.files[0].first_line);
+    try testing.expectEqual(@as(u32, 3), pending.files[0].last_line);
     try testing.expect(!pending.preview_partial);
     try testing.expect(pending.isVisibleFor(2));
 
@@ -929,4 +1240,194 @@ test "agent_edit: patch pending from an empty file and preview truncation" {
     try testing.expectEqual(@as(u32, 0), pending.removed);
     try testing.expectEqual(@as(u32, 2), pending.added);
     try testing.expect(!pending.verify("x\n"));
+}
+
+const FakeCommitSink = struct {
+    targets: [2][]const u8,
+    temps: [2][]const u8 = .{ "", "" },
+    fail_write: ?usize = null,
+    fail_rename: ?usize = null,
+    restore_fails: bool = false,
+    writes: usize = 0,
+    renames: usize = 0,
+    aborts: usize = 0,
+    restores: usize = 0,
+
+    pub fn writeTemp(self: *FakeCommitSink, index: usize, text: []const u8) !void {
+        if (self.fail_write == index) return error.DiskFull;
+        self.temps[index] = text;
+        self.writes += 1;
+    }
+
+    pub fn renameTemp(self: *FakeCommitSink, index: usize) !void {
+        if (self.fail_rename == index) return error.AccessDenied;
+        self.targets[index] = self.temps[index];
+        self.temps[index] = "";
+        self.renames += 1;
+    }
+
+    pub fn abortTemp(self: *FakeCommitSink, index: usize) void {
+        self.temps[index] = "";
+        self.aborts += 1;
+    }
+
+    pub fn restore(self: *FakeCommitSink, index: usize, old_text: []const u8) !void {
+        if (self.restore_fails) return error.AccessDenied;
+        self.targets[index] = old_text;
+        self.restores += 1;
+    }
+};
+
+test "agent_edit: commitFiles is all-or-nothing before renames and rolls back" {
+    const files = [_]CommitFile{
+        .{ .path = "a", .old_text = "old-a", .new_text = "new-a" },
+        .{ .path = "b", .old_text = "old-b", .new_text = "new-b" },
+    };
+
+    {
+        var sink = FakeCommitSink{ .targets = .{ "old-a", "old-b" } };
+        const outcome = commitFiles(&files, &sink);
+        try testing.expectEqual(CommitStatus.committed, outcome.status);
+        try testing.expectEqualStrings("new-a", sink.targets[0]);
+        try testing.expectEqualStrings("new-b", sink.targets[1]);
+        try testing.expectEqual(@as(usize, 2), sink.renames);
+    }
+
+    // Temp-write failure: no target is touched; staged temps are removed.
+    {
+        var sink = FakeCommitSink{ .targets = .{ "old-a", "old-b" }, .fail_write = 1 };
+        const outcome = commitFiles(&files, &sink);
+        try testing.expectEqual(CommitStatus.write_failed, outcome.status);
+        try testing.expectEqual(@as(usize, 1), outcome.failed_index);
+        try testing.expectEqualStrings("old-a", sink.targets[0]);
+        try testing.expectEqualStrings("old-b", sink.targets[1]);
+        try testing.expectEqual(@as(usize, 0), sink.renames);
+        try testing.expect(sink.aborts >= 2);
+    }
+
+    // Rename failure after the first target: the already-renamed file is
+    // restored from its in-memory old text.
+    {
+        var sink = FakeCommitSink{ .targets = .{ "old-a", "old-b" }, .fail_rename = 1 };
+        const outcome = commitFiles(&files, &sink);
+        try testing.expectEqual(CommitStatus.rename_failed, outcome.status);
+        try testing.expectEqual(@as(usize, 1), outcome.failed_index);
+        try testing.expectEqual(@as(usize, 1), outcome.rolled_back);
+        try testing.expect(!outcome.rollback_failed);
+        try testing.expectEqualStrings("old-a", sink.targets[0]);
+        try testing.expectEqualStrings("old-b", sink.targets[1]);
+        try testing.expectEqual(@as(usize, 1), sink.restores);
+    }
+
+    // A failed rollback is reported, never hidden.
+    {
+        var sink = FakeCommitSink{
+            .targets = .{ "old-a", "old-b" },
+            .fail_rename = 1,
+            .restore_fails = true,
+        };
+        const outcome = commitFiles(&files, &sink);
+        try testing.expectEqual(CommitStatus.rename_failed, outcome.status);
+        try testing.expect(outcome.rollback_failed);
+        try testing.expectEqualStrings("new-a", sink.targets[0]);
+    }
+}
+
+test "agent_edit: multi-file patch pending keeps per-file snapshots and totals" {
+    const alloc = testing.allocator;
+    var set = try patch_model.parseSet(alloc,
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-old a
+        \\+new a
+        \\--- a/b.txt
+        \\+++ b/b.txt
+        \\@@ -1,2 +1,2 @@
+        \\ keep b
+        \\-old b
+        \\+new b
+        \\
+    );
+    defer set.deinit(alloc);
+    const old_a = "old a\n";
+    const old_b = "keep b\nold b\n";
+    const new_a = try patch_model.apply(alloc, &set.files[0], old_a);
+    defer alloc.free(new_a);
+    const new_b = try patch_model.apply(alloc, &set.files[1], old_b);
+    defer alloc.free(new_b);
+
+    const metas = [_]PatchFileMeta{
+        .{
+            .path = "/workspace/a.txt",
+            .display_path = "a.txt",
+            .old_text = old_a,
+            .new_text = new_a,
+            .patch = &set.files[0],
+        },
+        .{
+            .path = "/workspace/b.txt",
+            .display_path = "b.txt",
+            .old_text = old_b,
+            .new_text = new_b,
+            .patch = &set.files[1],
+        },
+    };
+    var pending = try createPatchSetPending(alloc, .{
+        .thread_index = 4,
+        .card_index = 9,
+        .root = "/workspace",
+        .files = &metas,
+    });
+    defer pending.deinit(alloc);
+
+    try testing.expect(pending.isMulti());
+    try testing.expectEqual(@as(usize, 2), pending.files.len);
+    try testing.expectEqualStrings("a.txt", pending.files[0].display_path);
+    try testing.expectEqualStrings("b.txt", pending.files[1].display_path);
+    try testing.expectEqual(@as(u32, 2), pending.removed);
+    try testing.expectEqual(@as(u32, 2), pending.added);
+    try testing.expect(pending.verifyFile(alloc, 0, old_a));
+    try testing.expect(pending.verifyFile(alloc, 1, old_b));
+    try testing.expect(!pending.verifyFile(alloc, 0, "changed\n"));
+    try testing.expect(!pending.verify(old_a));
+
+    const current = [_][]const u8{ old_a, "stale b\n" };
+    try testing.expectEqual(@as(usize, 1), pending.staleFile(alloc, &current).?);
+    // The set's patches moved into the pending review; the outer set is now
+    // safely empty (and the deferred deinit above remains valid).
+    try testing.expectEqual(@as(usize, 0), set.files[0].hunks.len);
+    try testing.expectEqual(@as(usize, 0), set.files[1].hunks.len);
+}
+
+test "agent_edit: undo set swaps every file's live and target text" {
+    const alloc = testing.allocator;
+    const entries = try alloc.alloc(UndoEntry, 2);
+    entries[0] = .{
+        .path = try alloc.dupe(u8, "/workspace/a.txt"),
+        .old_text = try alloc.dupe(u8, "old a\n"),
+        .new_text = try alloc.dupe(u8, "new a\n"),
+    };
+    entries[1] = .{
+        .path = try alloc.dupe(u8, "/workspace/b.txt"),
+        .old_text = try alloc.dupe(u8, "old b\n"),
+        .new_text = try alloc.dupe(u8, "new b\n"),
+    };
+    var set = UndoSet{
+        .files = entries,
+        .root = try alloc.dupe(u8, "/workspace"),
+        .applied = true,
+    };
+    defer set.deinit(alloc);
+
+    try testing.expectEqualStrings("new a\n", set.liveText(0));
+    try testing.expectEqualStrings("old a\n", set.targetText(0));
+    try testing.expectEqualStrings("new b\n", set.liveText(1));
+    try testing.expectEqualStrings("old b\n", set.targetText(1));
+
+    set.applied = false;
+    try testing.expectEqualStrings("old a\n", set.liveText(0));
+    try testing.expectEqualStrings("new a\n", set.targetText(0));
+    try testing.expectEqualStrings("old b\n", set.liveText(1));
+    try testing.expectEqualStrings("new b\n", set.targetText(1));
 }
