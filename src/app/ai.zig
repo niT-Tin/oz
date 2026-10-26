@@ -21,6 +21,8 @@ const App = app_mod.App;
 const ws = ai.workspace;
 const tool_job = @import("tool_job.zig");
 const app_agent_edit = @import("agent_edit_ui.zig");
+const app_agent_terminal = @import("agent_terminal.zig");
+const terminal_tool = @import("../ai/terminal_tool.zig");
 
 pub const Status = ws.Status;
 pub const Role = ws.Role;
@@ -290,6 +292,9 @@ pub fn aiNewThread(self: *App) !void {
     };
     const res = self.ai.threads.select(idx);
     if (res.cancelled) cancelClient(self, res.prev);
+    // M3b3: a pending approval survives (hidden); a running command is killed
+    // when its thread is left, so no result lands in an unwatched thread.
+    app_agent_terminal.leaveThread(self, res.prev);
     self.ai.thread_cursor = idx;
     self.ai.tab = .chat;
     self.ai.focus = .prompt;
@@ -307,6 +312,7 @@ pub fn aiSelectThread(self: *App, idx: usize) void {
     if (idx >= self.ai.threads.items.items.len) return;
     const res = self.ai.threads.select(idx);
     if (res.cancelled) cancelClient(self, res.prev);
+    app_agent_terminal.leaveThread(self, res.prev);
     self.ai.thread_cursor = idx;
     self.ai.focus = .prompt;
     self.ai.tab = .chat;
@@ -410,6 +416,9 @@ pub fn aiStreaming(self: *App) bool {
     for (self.ai.tool_jobs.items) |maybe| {
         if (maybe != null) return true;
     }
+    // A running terminal command needs the run loop to poll for completion;
+    // a pending approval does not (it waits for a human key/click).
+    if (app_agent_terminal.anyJob(self)) return true;
     return false;
 }
 
@@ -504,6 +513,7 @@ fn handleAiRailKey(self: *App, key: vaxis.Key) !void {
     // while a review is on screen (documented in README/DESIGN).
     if (try self.handleAgentEditChangesKey(key)) return;
     if (try self.handleInlineChangesKey(key)) return;
+    if (try handleAgentTerminalKey(self, key)) return;
     switch (ai.panel.classifyRail(key)) {
         .up => moveThreadCursor(self, -1),
         .down => moveThreadCursor(self, 1),
@@ -519,6 +529,40 @@ fn handleAiRailKey(self: *App, key: vaxis.Key) !void {
         .cancel => aiCancel(self),
         .ignore => {},
     }
+}
+
+/// Terminal-tab keys while the rail owns the keyboard. `a`/Enter allow and
+/// `r`/`d` deny ONLY while a staged command is awaiting approval; with no
+/// pending command these keys keep their tab-switch behavior. j/k (and the
+/// wheel, via `aiScrollWheel`) scroll the command/result pane.
+fn handleAgentTerminalKey(self: *App, key: vaxis.Key) !bool {
+    if (self.ai.tab != .terminal or self.ai.focus != .rail) return false;
+    if (self.ai.threads.items.items.len == 0) return false;
+    if (key.mods.ctrl or key.mods.alt or key.mods.super) return false;
+
+    const pending = app_agent_terminal.visiblePending(self) != null;
+    const last = app_agent_terminal.lastCard(self, self.ai.threads.active) != null;
+    if (!pending and !last) return false;
+
+    if (key.codepoint == 'j') {
+        app_agent_terminal.scrollBy(self, 1);
+        return true;
+    }
+    if (key.codepoint == 'k') {
+        app_agent_terminal.scrollBy(self, -1);
+        return true;
+    }
+    if (!pending) return false;
+    if (app_agent_terminal.anyJob(self)) return false; // running: only Ctrl+c/cancel
+    if (key.codepoint == vaxis.Key.enter or key.codepoint == 'a') {
+        aiAgentTerminalAllow(self);
+        return true;
+    }
+    if (key.codepoint == 'r' or key.codepoint == 'd') {
+        aiAgentTerminalDeny(self);
+        return true;
+    }
+    return false;
 }
 
 /// Paste/OSC-52 text while the rail owns the keyboard. Only the prompt
@@ -540,6 +584,13 @@ pub fn aiScrollWheel(self: *App, delta: i64) void {
                 self.agentEditScrollBy(delta);
             } else if (self.inline_edit.pending != null) {
                 self.inlineScrollBy(delta);
+            }
+        },
+        .terminal => {
+            if (app_agent_terminal.visiblePending(self) != null or
+                app_agent_terminal.lastCard(self, self.ai.threads.active) != null)
+            {
+                app_agent_terminal.scrollBy(self, delta);
             }
         },
         else => {},
@@ -567,6 +618,9 @@ pub fn aiScroll(self: *App, delta: i64) void {
 pub fn aiCancel(self: *App) void {
     if (self.ai.threads.items.items.len == 0) return;
     const idx = self.ai.threads.active;
+    // M3b3: Ctrl+c aborts a staged/running terminal command too (the running
+    // process group is killed). No follow-up is sent for a cancelled turn.
+    _ = app_agent_terminal.cancelForThread(self, idx);
     const streaming = self.ai.threads.cancel(idx);
     // Ctrl+c also stops a tool loop whose stream already finished but whose
     // worker/follow-up is still live. `cancelClient` freezes running cards
@@ -687,6 +741,13 @@ fn maybeFollowup(self: *App, idx: usize) !bool {
     const st = toolState(self, idx) orelse return false;
     if (t.cancel_requested or t.status != .streaming) return false;
     if (!st.stream_done or !st.pending_followup or st.active) return false;
+    if (app_agent_terminal.blocksFollowup(self, idx)) {
+        // The model must not continue until the human decides. Settle the
+        // thread at idle; the decision path starts the follow-up itself.
+        st.pending_followup = false;
+        self.ai.threads.finish(idx);
+        return false;
+    }
 
     if (st.final_sent) {
         st.pending_followup = false;
@@ -696,6 +757,67 @@ fn maybeFollowup(self: *App, idx: usize) !bool {
     const include_tools = !st.final_only;
     try issueFollowup(self, idx, include_tools);
     return true;
+}
+
+/// Owned status-bar message for a prompt refusal (setMsg takes ownership).
+fn setStatusMsg(self: *App, text: []const u8) void {
+    const copy = self.alloc.dupe(u8, text) catch return;
+    self.setMsg(copy) catch self.alloc.free(copy);
+}
+
+/// Hint/mouse/keyboard Allow for a staged terminal command. Never called
+/// from the tool protocol path: only an explicit human action reaches this.
+pub fn aiAgentTerminalAllow(self: *App) void {
+    resolveTerminalDecision(self, app_agent_terminal.allow(self));
+}
+
+/// Hint/mouse/keyboard Deny for a staged terminal command.
+pub fn aiAgentTerminalDeny(self: *App) void {
+    resolveTerminalDecision(self, app_agent_terminal.deny(self));
+}
+
+fn resolveTerminalDecision(self: *App, decision: app_agent_terminal.Decision) void {
+    switch (decision) {
+        .none => {},
+        .followup => |idx| resumeTerminalFollowup(self, idx),
+    }
+}
+
+/// Resume the paused agent loop after an allow/deny/failure. The thread may
+/// still be streaming (approval arrived before the stream's terminal event) or
+/// already settled at idle; both paths are handled without racing the client.
+fn resumeTerminalFollowup(self: *App, idx: usize) void {
+    if (idx >= self.ai.threads.items.items.len) return;
+    if (idx >= self.ai.tool_states.items.len) return;
+    const t = &self.ai.threads.items.items[idx];
+    const st = &self.ai.tool_states.items[idx];
+    if (t.cancel_requested or t.status == .cancelled or t.status == .err) return;
+    if (st.final_sent) {
+        self.ai.threads.finish(idx);
+        return;
+    }
+    if (t.status == .streaming) {
+        // The stream's terminal event has not been drained yet. Let the
+        // normal settle path issue the follow-up once it arrives.
+        st.pending_followup = true;
+        _ = maybeFollowup(self, idx) catch |e| {
+            aiSetThreadErrorFmt(self, idx, "follow-up failed: {s}", .{@errorName(e)});
+        };
+        return;
+    }
+    // Settled while awaiting the human decision: start the follow-up now.
+    st.pending_followup = false;
+    issueFollowup(self, idx, !st.final_only) catch |e| {
+        aiSetThreadErrorFmt(self, idx, "follow-up failed: {s}", .{@errorName(e)});
+    };
+}
+
+/// Consume a finished terminal job (called once per run-loop iteration).
+/// Returns true when the App should repaint.
+pub fn drainTerminal(self: *App) !bool {
+    const outcome = app_agent_terminal.drain(self);
+    if (outcome.resume_thread) |idx| resumeTerminalFollowup(self, idx);
+    return outcome.changed;
 }
 
 fn stopToolLoop(self: *App, idx: usize, reason: agent.LimitReason) void {
@@ -713,6 +835,13 @@ pub fn aiSend(self: *App) !void {
     if (t.status == .streaming) return;
     const prompt = std.mem.trim(u8, t.input.items, " \t\r\n");
     if (prompt.len == 0) return;
+    // M3b3: a terminal approval pauses the conversation until the human
+    // allows/denies it (or Ctrl+c cancels). Starting a new turn here would
+    // race the decision's follow-up.
+    if (app_agent_terminal.anyPending(self) or app_agent_terminal.anyJob(self)) {
+        setStatusMsg(self, "resolve the pending terminal command first");
+        return;
+    }
     try aiLoadConfig(self);
     if (self.ai.config == null) {
         aiSetThreadError(self, idx, "config unavailable");
@@ -921,9 +1050,19 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
             return;
         };
 
-        // Unknown names share the local unsupported path (the card/result
-        // still name the real requested tool).
-        const kind = ai.tools.classify(call.name) orelse .terminal;
+        // Unknown names are denied/answered locally and never routed into a
+        // real tool path (in particular they must not be mistaken for the
+        // newly advertised `terminal` tool).
+        const kind = ai.tools.classify(call.name) orelse {
+            const text_owned = tryUnsupportedToolText(self.alloc, call.name);
+            defer if (text_owned) |x| self.alloc.free(x);
+            const text = text_owned orelse "not executed — unsupported tool";
+            setLocalToolCard(self, idx, msg_index, .unsupported, text, text);
+            st.?.metrics.record(self.alloc, call.name, .unsupported, 0);
+            call.deinit(self.alloc);
+            freed[i] = true;
+            continue;
+        };
         switch (kind) {
             .read_file, .list_directory, .grep => {
                 worker_calls[worker_count] = call;
@@ -1003,14 +1142,52 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
                 freed[i] = true;
             },
             .terminal => {
-                // No execution and no fake approval: terminal is not
-                // implemented (there is no sandbox in this slice). The
-                // card/result say exactly that.
-                const text_owned = tryUnsupportedToolText(self.alloc, call.name);
-                defer if (text_owned) |x| self.alloc.free(x);
-                const text = text_owned orelse "not executed";
-                setLocalToolCard(self, idx, msg_index, .unsupported, text, text);
-                st.?.metrics.record(self.alloc, call.name, .unsupported, 0);
+                // M3b3: stage for explicit per-command human approval, never
+                // execute on receipt. `stageToolCall` only validates and opens
+                // the Terminal review surface; the process is spawned by
+                // `aiAgentTerminalAllow` after a human allows it.
+                const result = app_agent_terminal.stageToolCall(self, idx, msg_index, call);
+                switch (result) {
+                    .staged => |staged| {
+                        const text = std.fmt.allocPrint(
+                            self.alloc,
+                            "timeout {d}ms · runs with your permissions · review in terminal",
+                            .{staged.timeout_ms},
+                        ) catch null;
+                        defer if (text) |x| self.alloc.free(x);
+                        const api_text = "approval required: terminal command staged for review; not executed";
+                        self.ai.threads.setToolOutcome(
+                            self.alloc,
+                            idx,
+                            msg_index,
+                            .approval_required,
+                            text orelse "approval required · review in terminal",
+                            api_text,
+                            0,
+                        ) catch {
+                            t.messages.items[msg_index].tool_status = .err;
+                        };
+                        st.?.metrics.record(self.alloc, call.name, .approval_required, 0);
+                        // No automatic follow-up: the human decision path
+                        // (`drainTerminal`/`aiAgentTerminalDeny`) resumes it.
+                        st.?.pending_followup = false;
+                    },
+                    .busy => {
+                        const text = "error: another terminal command is already pending; not executed";
+                        setLocalToolCard(self, idx, msg_index, .err, text, text);
+                        st.?.metrics.record(self.alloc, call.name, .err, 0);
+                    },
+                    .failed => |message| {
+                        defer self.alloc.free(message);
+                        setLocalToolCard(self, idx, msg_index, .err, message, message);
+                        st.?.metrics.record(self.alloc, call.name, .err, 0);
+                    },
+                    .oom => {
+                        const text = "error: out of memory";
+                        setLocalToolCard(self, idx, msg_index, .err, text, text);
+                        st.?.metrics.record(self.alloc, call.name, .err, 0);
+                    },
+                }
                 call.deinit(self.alloc);
                 freed[i] = true;
             },
@@ -1120,11 +1297,9 @@ fn setLocalToolCard(
     };
 }
 
-/// Owned, truthful text for terminal/unknown tools.
+/// Owned, truthful text for an unknown tool name. `terminal` has its own
+/// staged approval path and never reaches this helper.
 fn tryUnsupportedToolText(alloc: std.mem.Allocator, name: []const u8) ?[]u8 {
-    if (std.mem.eql(u8, name, "terminal")) {
-        return alloc.dupe(u8, "not executed — terminal execution is not available") catch null;
-    }
     return std.fmt.allocPrint(alloc, "not executed — unsupported tool: {s}", .{name}) catch null;
 }
 
@@ -1223,6 +1398,7 @@ pub fn drainAi(self: *App) !bool {
                     if (t.cancel_requested) continue;
                     // A stream failure also ends any in-flight tool work; no
                     // stale result may resurrect the turn.
+                    _ = app_agent_terminal.cancelForThread(self, idx);
                     cancelClient(self, idx);
                     self.ai.threads.fail(self.alloc, idx, text);
                 },
@@ -1706,8 +1882,23 @@ fn appendToolCardRows(
 
     if (args.len > 0) {
         const args_safe = try displaySafe(a, args);
-        const line = try std.fmt.allocPrint(a, "  {s}", .{args_safe});
-        try appendCardRow(a, rows, inner_w, &.{.{ .text = line, .style = st.dim }});
+        if (std.mem.eql(u8, name, "terminal")) {
+            // A terminal command can be far wider than the rail. Clip with an
+            // explicit ellipsis so the card never looks like the whole
+            // command; the full escaped command lives in the Terminal tab.
+            const width = inner_w -| 2;
+            const full = buffer.utf8.truncateWidth(args_safe, width);
+            const clipped = full.len < args_safe.len;
+            const shown = if (clipped) buffer.utf8.truncateWidth(args_safe, width -| 1) else args_safe;
+            const line = if (clipped)
+                try std.fmt.allocPrint(a, "  {s}…", .{shown})
+            else
+                try std.fmt.allocPrint(a, "  {s}", .{args_safe});
+            try appendCardRow(a, rows, inner_w, &.{.{ .text = line, .style = st.dim }});
+        } else {
+            const line = try std.fmt.allocPrint(a, "  {s}", .{args_safe});
+            try appendCardRow(a, rows, inner_w, &.{.{ .text = line, .style = st.dim }});
+        }
     }
 
     switch (status) {
@@ -1823,6 +2014,7 @@ fn railStatusStyle(st: Styles, status: Status, now_ms: i64) vaxis.Style {
 /// results land and the follow-up streams, the normal label returns.
 fn aiStatusLabelFor(self: *App, idx: usize) []const u8 {
     if (idx < self.ai.threads.items.items.len) {
+        if (app_agent_terminal.statusLabelFor(self, idx)) |label| return label;
         if (toolState(self, idx)) |st| {
             if (st.active or st.pending_followup) return "tools…";
         }
@@ -2207,6 +2399,12 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
                 style.fg = .{ .rgb = animation.pulseColor(t.accent, t.accent_alt, self.frame_now_ms, 300) };
                 style.bold = true;
             }
+            if (entry.tab == .terminal and app_agent_terminal.pendingCount(self) > 0) {
+                // No extra label cells (the 34/38-cell tab row is exactly
+                // full); a warning-tinted label marks the approval instead.
+                style.fg = .{ .rgb = t.diag_warn };
+                style.bold = true;
+            }
             const target_col = x + 2 + used;
             if (active_tab) {
                 // The marker shares the tab's soft selection + accent
@@ -2266,12 +2464,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
                 }
             },
             .tools => try drawToolsTab(self, a, win, st, x, w, border_style, rail_bg, &m),
-            .terminal => {
-                try drawRailTextRow(self, win, a, m.body_top, x, w, border_style, rail_bg, "agent terminal arrives in M3", st.dim);
-                if (m.body_rows > 2) {
-                    try drawRailTextRow(self, win, a, m.body_top + 2, x, w, border_style, rail_bg, "editor terminal: Alt+r", st.faint);
-                }
-            },
+            .terminal => try drawTerminalTab(self, a, win, st, x, w, border_style, rail_bg, &m),
         }
     }
 
@@ -2552,6 +2745,235 @@ fn drawToolsTab(
             }
         }
     }
+}
+
+/// Terminal tab: the M3b3 approval/result surface. It is deliberately NOT a
+/// shell: no input line, no PTY and no keystroke forwarding. A staged command
+/// shows its exact (escaped) text, cwd, timeout and Allow/Deny buttons; a
+/// finished command shows its real status and bounded output lines.
+fn drawTerminalTab(
+    self: *App,
+    a: std.mem.Allocator,
+    win: vaxis.Window,
+    st: Styles,
+    x: u32,
+    w: u32,
+    border_style: vaxis.Style,
+    rail_bg: vaxis.Color,
+    m: *const ws.Metrics,
+) !void {
+    if (m.body_rows == 0) return;
+    const content_w: usize = w -| 3;
+    const bottom = m.body_top + m.body_rows;
+    var y = m.body_top;
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(a);
+    var scrollable = false;
+
+    const pending = app_agent_terminal.visiblePending(self);
+    const last = app_agent_terminal.lastCard(self, self.ai.threads.active);
+
+    if (pending) |p| {
+        const running = self.agent_terminal.job != null;
+        if (y < bottom) {
+            const head = if (running) "terminal · running" else "terminal · approval required";
+            try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, head, if (running) st.accent else st.warn);
+            y += 1;
+        }
+        if (y < bottom) {
+            try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, "your permissions · not sandboxed", st.warn);
+            y += 1;
+        }
+        if (y < bottom) {
+            const tail = autil.cellFitSuffix(win, p.root, content_w -| 5);
+            const cwd = try std.fmt.allocPrint(a, "cwd: {s}", .{tail.slice});
+            try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, cwd, st.dim);
+            y += 1;
+        }
+        if (y < bottom) {
+            if (running) {
+                try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, "running… · Ctrl+c stops", st.accent);
+            } else {
+                const full = "[a] allow  [r] deny";
+                if (content_w >= autil.cellWidth(win, full)) {
+                    var segs = std.ArrayList(vaxis.Segment).empty;
+                    try segs.append(a, .{ .text = "[a] allow", .style = st.accent });
+                    try segs.append(a, .{ .text = "  ", .style = .{ .bg = rail_bg } });
+                    try segs.append(a, .{ .text = "[r] deny", .style = st.error_style });
+                    try drawRailRow(win, a, y, x, w, "│", border_style, rail_bg, segs.items, @intCast(autil.cellWidth(win, full)));
+                    if (self.mouseTargetsCollecting()) {
+                        self.addHintTarget(.{
+                            .row = y,
+                            .col = x + 2,
+                            .width = @intCast("[a] allow".len),
+                            .height = 1,
+                        }, .agent_terminal_allow);
+                        self.addHintTarget(.{
+                            .row = y,
+                            .col = x + 2 + @as(u32, @intCast("[a] allow  ".len)),
+                            .width = @intCast("[r] deny".len),
+                            .height = 1,
+                        }, .agent_terminal_deny);
+                    }
+                } else {
+                    try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, full, st.warn);
+                }
+            }
+            y += 1;
+        }
+        if (y < bottom) {
+            const timeout = try std.fmt.allocPrint(
+                a,
+                "timeout {d}ms · max {d}ms",
+                .{ p.timeout_ms, terminal_tool.max_timeout_ms },
+            );
+            try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, timeout, st.dim);
+            y += 1;
+        }
+        if (y < bottom) {
+            try drawRailRow(win, a, y, x, w, "│", border_style, rail_bg, &.{}, 0);
+            y += 1;
+        }
+        const clipped = try appendWrappedTerminalLines(self, a, win, &lines, p.display, content_w, 512);
+        if (clipped) try lines.append(a, "… [command display clipped]");
+        scrollable = true;
+    } else if (last) |msg| {
+        if (y < bottom) {
+            const status_label = terminalToolStatusLabel(msg.tool_status);
+            const style: vaxis.Style = switch (msg.tool_status) {
+                .ok => st.code,
+                .err, .rejected => st.error_style,
+                .running => st.accent,
+                .cancelled => st.faint,
+                else => st.dim,
+            };
+            const head = try std.fmt.allocPrint(a, "terminal · {s}", .{status_label});
+            try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, head, style);
+            y += 1;
+        }
+        if (y < bottom) {
+            try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, "not sandboxed · runs as you", st.warn);
+            y += 1;
+        }
+        if (y < bottom and msg.text.len > 0) {
+            try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, msg.text, st.bold);
+            y += 1;
+        }
+        if (y < bottom) {
+            try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, "j/k scroll output · r tab", st.faint);
+            y += 1;
+        }
+        if (y < bottom) {
+            try drawRailRow(win, a, y, x, w, "│", border_style, rail_bg, &.{}, 0);
+            y += 1;
+        }
+        const body = terminalResultBody(msg.api_text);
+        const clipped = try appendTerminalOutputLines(self, a, &lines, body, 2000);
+        if (clipped) try lines.append(a, "… [output display clipped]");
+        scrollable = true;
+    } else {
+        if (y < bottom) {
+            try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, "terminal", st.bold);
+            y += 1;
+        }
+        if (y < bottom) {
+            try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, "no pending terminal command", st.dim);
+            y += 1;
+        }
+        if (y < bottom) {
+            try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, "the terminal tool asks before it runs", st.faint);
+            y += 1;
+        }
+        if (y < bottom) {
+            try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, "editor terminal: Alt+r", st.faint);
+            y += 1;
+        }
+    }
+
+    if (scrollable and y < bottom) {
+        const visible = bottom - y;
+        const line_count: u32 = @intCast(lines.items.len);
+        const max_top = line_count -| visible;
+        app_agent_terminal.setMaxScroll(self, max_top);
+        const top = @min(self.agent_terminal.scroll, max_top);
+        var i: u32 = 0;
+        while (i < visible and top + i < line_count) : (i += 1) {
+            try drawRailTextRow(self, win, a, y + i, x, w, border_style, rail_bg, lines.items[top + i], st.base);
+        }
+        y += i;
+    }
+
+    // Closed panel: every remaining body row keeps the rail border.
+    while (y < bottom) : (y += 1) {
+        try drawRailRow(win, a, y, x, w, "│", border_style, rail_bg, &.{}, 0);
+    }
+}
+
+fn terminalToolStatusLabel(status: ws.ToolStatus) []const u8 {
+    return switch (status) {
+        .running => "running",
+        .ok => "ok",
+        .err => "error",
+        .approval_required => "approval required",
+        .approved => "approved",
+        .rejected => "rejected",
+        .unsupported => "unsupported",
+        .cancelled => "cancelled",
+        .none => "idle",
+    };
+}
+
+/// Wrap the escaped command into display-width lines. The escaped text is
+/// grapheme-safe (escapeCommand only emits ASCII) and bounded to 4 KiB, so
+/// wrapping it once per Terminal-tab frame is cheap. Returns true when the
+/// line cap clipped part of the display (the pending command itself is never
+/// truncated for execution).
+fn appendWrappedTerminalLines(
+    self: *App,
+    a: std.mem.Allocator,
+    win: vaxis.Window,
+    lines: *std.ArrayList([]const u8),
+    text: []const u8,
+    width: usize,
+    max_lines: usize,
+) !bool {
+    _ = self;
+    if (width == 0) return text.len > 0;
+    var rest = text;
+    while (rest.len > 0) {
+        if (lines.items.len >= max_lines) return true;
+        const fit = autil.cellFitPrefix(win, rest, width);
+        if (fit.slice.len == 0) return true;
+        try lines.append(a, rest[0..fit.slice.len]);
+        rest = rest[fit.slice.len..];
+    }
+    return false;
+}
+
+/// Split a bounded tool result body (skipping the header prologue) into
+/// display lines. Output lines are clipped per row by `drawRailTextRow`, not wrapped:
+/// the stored result is capped at 64 KiB and wrapping huge lines every frame
+/// would add cost without adding information.
+fn appendTerminalOutputLines(
+    self: *App,
+    a: std.mem.Allocator,
+    lines: *std.ArrayList([]const u8),
+    body: []const u8,
+    max_lines: usize,
+) !bool {
+    _ = self;
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |line| {
+        if (lines.items.len >= max_lines) return true;
+        try lines.append(a, line);
+    }
+    return false;
+}
+
+fn terminalResultBody(content: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, content, "\n---\n")) |at| return content[at + 5 ..];
+    return content;
 }
 
 fn drawChatBody(

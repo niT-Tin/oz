@@ -27,6 +27,7 @@ const app_hints = @import("app/hints.zig");
 const app_mouse = @import("app/mouse.zig");
 const app_inline = @import("app/inline_ui.zig");
 const app_agent_edit = @import("app/agent_edit_ui.zig");
+const app_agent_terminal = @import("app/agent_terminal.zig");
 
 const GitJobKind = git_job.GitJobKind;
 const GitApplyOp = git_job.GitApplyOp;
@@ -701,6 +702,8 @@ pub const App = struct {
     inline_edit: app_inline.Session = .{},
     /// M3b1 staged agent edits: one pending diff, thread-scoped.
     agent_edit: app_agent_edit.Session = .{},
+    /// M3b3 staged `terminal` approval + running job (session-wide, one).
+    agent_terminal: app_agent_terminal.Session = .{},
 
     // ---- M2.6a keyboard hints (<leader>j) ----
     /// Modal target-selection state (DESIGN.md §19). Pure value: fixed
@@ -1454,6 +1457,7 @@ pub const App = struct {
         self.deinitAi();
         self.deinitInline();
         self.deinitAgentEdit();
+        self.deinitAgentTerminal();
         self.vx.deinit(self.alloc, self.tty.writer());
         self.tty.deinit();
         self.alloc.free(self.tty_buffer);
@@ -1913,6 +1917,13 @@ pub const App = struct {
     pub const handleAgentEditChangesKey = app_agent_edit.handleAgentEditChangesKey;
     pub const drawAgentEditChanges = app_agent_edit.drawAgentEditChanges;
     pub const AgentEditSession = app_agent_edit.Session;
+    // ---- staged terminal tool approval (M3b3) → src/app/agent_terminal.zig ----
+    pub const deinitAgentTerminal = app_agent_terminal.deinitAgentTerminal;
+    pub const agentTerminalPendingCount = app_agent_terminal.pendingCount;
+    pub const aiAgentTerminalAllow = app_ai.aiAgentTerminalAllow;
+    pub const aiAgentTerminalDeny = app_ai.aiAgentTerminalDeny;
+    pub const drainTerminal = app_ai.drainTerminal;
+    pub const AgentTerminalSession = app_agent_terminal.Session;
     // ---- render → src/app/render.zig ----
     pub const tabBarRows = @import("app/render.zig").tabBarRows;
     pub const tabLayerCount = @import("app/render.zig").tabLayerCount;
