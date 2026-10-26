@@ -25,7 +25,10 @@ jobs:
       - name: Cache Zig toolchain
         uses: actions/cache@v4
         with:
-          path: zig-*.tar.xz
+          # Keep the toolchain tarball and install directory OUTSIDE the
+          # checkout: filetree/dashboard e2e tests enumerate the repo root,
+          # and a visible zig-* directory changes their row geometry.
+          path: ${{ runner.temp }}/zig-*.tar.xz
           key: zig-${{ runner.os }}-${{ runner.arch }}-0.17.0
 
       # The compiled tree-sitter objects in the local Zig cache are several
@@ -59,7 +62,10 @@ jobs:
             "https://zig.linus.dev/zig/${file}"
             "https://zigmirror.hryx.net/zig/${file}"
           )
-          if [ ! -f "$file" ]; then
+          dest="$RUNNER_TEMP/zig-${triple}-${ZIG_VERSION}"
+          file="$RUNNER_TEMP/zig-${triple}-${ZIG_VERSION}.tar.xz"
+          mkdir -p "$RUNNER_TEMP"
+          if [ ! -d "$dest" ]; then
             ok=0
             for u in "${sources[@]}"; do
               echo "downloading ${u}"
@@ -69,12 +75,18 @@ jobs:
               fi
             done
             [ "$ok" = 1 ] || { echo "all Zig download sources failed"; exit 1; }
+            tar -xf "$file" -C "$RUNNER_TEMP"
           fi
-          tar -xf "$file"
           # GITHUB_PATH only affects later steps; export now for the check.
-          export PATH="$PWD/zig-${triple}-${ZIG_VERSION}:$PATH"
-          echo "$PWD/zig-${triple}-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          export PATH="$dest:$PATH"
+          echo "$dest" >> "$GITHUB_PATH"
           zig version
+
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ripgrep
+          rg --version
 
       - name: Fetch vendored tree-sitter
         run: ./.scripts/bootstrap-deps.sh

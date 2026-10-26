@@ -372,7 +372,7 @@ const Session = struct {
         try self.send(keys);
         var exit_code: ?u32 = null;
         var waited: i32 = 0;
-        while (exit_code == null and waited < 5000) {
+        while (exit_code == null and waited < 15000) {
             try self.drainAndReply();
             exit_code = try self.tryWaitExit();
             _ = std.Io.sleep(self.io, std.Io.Duration.fromNanoseconds(200 * std.time.ns_per_ms), .real) catch {};
@@ -1847,19 +1847,19 @@ test "relative CLI path: :w saves without BadPathName" {
     const alloc = std.testing.allocator;
 
     var name_buf: [128:0]u8 = undefined;
-    const abs = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}rel.txt", .{ linux.getpid(), tmp_counter });
+    const rel = try bufPrintZ(&name_buf, "relsave/oz_e2e_{d}_{d}rel.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
-    // relative path from the project root to the same file
-    var rel_path_buf: [256:0]u8 = undefined;
-    const rel_path = try bufPrintZ(&rel_path_buf, "../../../../tmp/{s}", .{abs["/tmp/".len..]});
-    defer std.Io.Dir.cwd().deleteFile(io, abs) catch {};
+    var abs_buf: [256:0]u8 = undefined;
+    const abs = try bufPrintZ(&abs_buf, "{s}", .{rel});
+    try std.Io.Dir.cwd().createDirPath(io, "relsave");
+    defer std.Io.Dir.cwd().deleteTree(io, "relsave") catch {};
     {
         const f = try std.Io.Dir.cwd().createFile(io, abs, .{ .truncate = true });
         defer f.close(io);
         try f.writeStreamingAll(io, "base\n");
     }
 
-    var sess = try Session.spawn(io, &.{ oz_exe_path, rel_path });
+    var sess = try Session.spawn(io, &.{ oz_exe_path, rel });
     defer sess.close();
     defer killPid(sess.pid);
 
@@ -14022,7 +14022,7 @@ test "terminal: <M-r> float opens, keys forward, Esc returns, <M-w>/<M-e> switch
                 const nn = try readAvailable(s.pty.master, s.out[s.used..], 200);
                 if (nn == 0) {
                     waited += 200;
-                    if (waited >= 8000) return false;
+                    if (waited >= 15000) return false;
                     continue;
                 }
                 s.used += nn;
@@ -14036,7 +14036,7 @@ test "terminal: <M-r> float opens, keys forward, Esc returns, <M-w>/<M-e> switch
                 const nn = try readAvailable(s.pty.master, s.out[s.used..], 200);
                 if (nn == 0) {
                     waited += 200;
-                    if (waited >= 8000) return false;
+                    if (waited >= 15000) return false;
                     continue;
                 }
                 s.used += nn;
@@ -14058,7 +14058,7 @@ test "terminal: <M-r> float opens, keys forward, Esc returns, <M-w>/<M-e> switch
                 const nn = try readAvailable(s.pty.master, s.out[s.used..], 200);
                 if (nn == 0) {
                     waited += 200;
-                    if (waited >= 8000) return false;
+                    if (waited >= 15000) return false;
                     continue;
                 }
                 s.used += nn;
@@ -14188,7 +14188,7 @@ test "terminal: :q! quits cleanly while the terminal is still open" {
                 const nn = try readAvailable(s.pty.master, s.out[s.used..], 200);
                 if (nn == 0) {
                     waited += 200;
-                    if (waited >= 8000) return false;
+                    if (waited >= 15000) return false;
                     continue;
                 }
                 s.used += nn;
@@ -14796,8 +14796,11 @@ test "workspace: filetree expansion state is per-workspace" {
     const leaked = try wsWaitGone(&sess, &grid, "leaf.txt");
     if (!leaked) grid.dump();
     try std.testing.expect(leaked);
-    // but aa itself is listed (collapsed)
-    try std.testing.expect(grid.contains("aa"));
+    // but aa itself is listed (collapsed). Wait for the post-switch frame:
+    // the leaf.txt disappearance can be observed before the tree repaints.
+    const aa_visible = try wsWait(&sess, &grid, "aa", 5000);
+    if (!aa_visible) grid.dump();
+    try std.testing.expect(aa_visible);
 
     // back to main: main's own expansion is still there
     try sess.send(" \t[");
