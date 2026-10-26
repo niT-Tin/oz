@@ -113,6 +113,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // Navigator breakpoint/header/tab-layout model: e2e derives tab rows and
+    // starts from the same pure code the renderer uses.
+    const navigator_mod = b.createModule(.{
+        .root_source_file = b.path("src/app/navigator.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const e2e = b.addTest(.{
         .filters = test_filters,
         .root_module = b.createModule(.{
@@ -122,6 +129,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "vaxis", .module = vaxis_mod },
                 .{ .name = "ai_workspace", .module = ai_workspace_mod },
+                .{ .name = "navigator", .module = navigator_mod },
             },
         }),
     });

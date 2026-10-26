@@ -425,6 +425,11 @@ pub const App = struct {
     /// Active left-navigator tab. Global (the navigator view mode) while the
     /// filetree content/selection remains per workspace.
     navigator_tab: NavigatorTab = .files,
+    /// Compact-mode (<90 cols) peek overlay: the icon rail is always the
+    /// resting state; selecting an icon opens the 30-cell full navigator
+    /// over the editor. Closed by Esc, an outside click, opening a file/note/
+    /// agent, or giving the keyboard back to the editor.
+    navigator_peek: bool = false,
     /// Cached global markdown note list (project independent). Refreshed on
     /// tab entry/create/save/r only; frames never scan the filesystem.
     notes: NoteStore = .{},
@@ -747,7 +752,7 @@ pub const App = struct {
         const height: u32 = win.height;
         if (height <= status_row_count) return 1;
         const content_rows = height - status_row_count - self.tabBarRows(arena.allocator());
-        const layout = self.layoutWindows(arena.allocator(), self.contentTop(arena.allocator()), content_rows, self.contentCol(), self.aiEditorWidth()) catch return content_rows;
+        const layout = self.layoutWindows(arena.allocator(), self.contentTop(arena.allocator()), content_rows, self.contentCol(), self.editorAreaWidth()) catch return content_rows;
         for (layout.leaves) |leaf| {
             if (leaf.win == self.current_win) return leaf.height;
         }
@@ -766,11 +771,11 @@ pub const App = struct {
         const height: u32 = win.height;
         if (height <= status_row_count) return @max(win.width -| gutter, 1);
         const content_rows = height - status_row_count - self.tabBarRows(arena.allocator());
-        const layout = self.layoutWindows(arena.allocator(), self.contentTop(arena.allocator()), content_rows, self.contentCol(), self.aiEditorWidth()) catch return @max(self.aiEditorWidth() -| gutter, 1);
+        const layout = self.layoutWindows(arena.allocator(), self.contentTop(arena.allocator()), content_rows, self.contentCol(), self.editorAreaWidth()) catch return @max(self.editorAreaWidth() -| gutter, 1);
         for (layout.leaves) |leaf| {
             if (leaf.win == self.current_win) return @max(leaf.width -| gutter, 1);
         }
-        return @max(self.aiEditorWidth() -| gutter, 1);
+        return @max(self.editorAreaWidth() -| gutter, 1);
     }
 
     /// H/M/L: resolve a viewport motion to a document LINE using the focused
@@ -1294,7 +1299,7 @@ pub const App = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const content_rows = height - status_row_count - self.tabBarRows(a);
-        const layout = self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), self.aiEditorWidth()) catch return null;
+        const layout = self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), self.editorAreaWidth()) catch return null;
         const leaves = layout.leaves;
         var cur_rect: ?LeafRect = null;
         for (leaves) |lr| {
@@ -1778,6 +1783,10 @@ pub const App = struct {
     pub const navigatorScrollBy = @import("app/notes.zig").navigatorScrollBy;
     pub const navigatorCycleTab = @import("app/notes.zig").navigatorCycleTab;
     pub const navigatorKey = @import("app/notes.zig").navigatorKey;
+    pub const navigatorCompact = @import("app/notes.zig").navigatorCompact;
+    pub const navigatorEnter = @import("app/notes.zig").navigatorEnter;
+    pub const navigatorPeekClose = @import("app/notes.zig").navigatorPeekClose;
+    pub const closeNavigator = @import("app/notes.zig").closeNavigator;
     pub const navigatorAttachSelectedThread = @import("app/notes.zig").navigatorAttachSelectedThread;
     pub const navigatorNewThread = @import("app/notes.zig").navigatorNewThread;
     pub const navigatorCursorRow = @import("app/notes.zig").navigatorCursorRow;
@@ -1918,6 +1927,9 @@ pub const App = struct {
     pub const tabLayerCount = @import("app/render.zig").tabLayerCount;
     pub const contentTop = @import("app/render.zig").contentTop;
     pub const contentCol = @import("app/render.zig").contentCol;
+    pub const editorAreaWidth = @import("app/render.zig").editorAreaWidth;
+    pub const navigatorBodyTop = @import("app/render.zig").navigatorBodyTop;
+    pub const navigatorPeekActive = @import("app/render.zig").navigatorPeekActive;
     pub const gutterWidth = @import("app/render.zig").gutterWidth;
     pub const lineCellCol = @import("app/render.zig").lineCellCol;
     pub const textWidth = @import("app/render.zig").textWidth;

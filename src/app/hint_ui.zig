@@ -149,6 +149,7 @@ pub fn execHintAction(self: *App, action: hints.Action) !void {
             if (idx >= self.buffers.items.len) return;
             // Same as clicking the tab / the buffer picker: the focused
             // editor shows that buffer.
+            self.navigator_peek = false;
             self.focus = .buffer;
             self.switchTo(idx);
         },
@@ -175,6 +176,11 @@ pub fn execHintAction(self: *App, action: hints.Action) !void {
         .agent_prompt_focus => try self.aiFocusPrompt(),
         .navigator_tab => |tab| {
             try self.navigatorSetTab(tab);
+        },
+        .navigator_peek_close => {
+            self.navigator_peek = false;
+            self.focus = .buffer;
+            self.ai.focus = .editor;
         },
         .note_open => |idx| {
             try self.openNoteAt(idx);

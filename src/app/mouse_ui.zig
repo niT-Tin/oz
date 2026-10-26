@@ -23,6 +23,7 @@ const term = @import("../term.zig");
 const editor = @import("../editor/root.zig");
 const hints = @import("hints.zig");
 const mouse = @import("mouse.zig");
+const nav_tabs = @import("navigator.zig");
 
 /// Lines moved by one wheel notch over an editor pane. The renderer always
 /// keeps the cursor visible, so the viewport follows: wheel = a 3-line
@@ -201,6 +202,13 @@ fn terminalContains(self: *App, col: u32, row: u32) bool {
 
 fn handleLeftClick(self: *App, col: u32, row: u32) !bool {
     if (mouseBlocked(self)) return false;
+    // The compact peek is a light overlay, not a focus trap: a click on the
+    // editor side closes it and gives the keyboard back. Do not also place
+    // the cursor — the first click's job is dismissing the overlay.
+    if (self.navigatorPeekActive() and col >= nav_tabs.panel_width) {
+        self.navigatorPeekClose();
+        return true;
+    }
     const in_rail = railContains(self, col, row);
 
     // Z-order: the terminal overlay is drawn above the panes/filetree but
@@ -219,6 +227,19 @@ fn handleLeftClick(self: *App, col: u32, row: u32) !bool {
     }
 
     const hit = self.mouse.hitClick(col, row) orelse return false;
+    // The compact navigator peek is an opaque overlay: only its own hint
+    // targets (tabs, ×, rows) may receive a click. Without this guard the
+    // editor pane target underneath would focus/place the cursor through the
+    // header and close the peek.
+    if (self.navigatorPeekActive() and col < nav_tabs.panel_width) {
+        switch (hit.target.action) {
+            .click => |click| switch (click) {
+                .hint => {},
+                .focus_pane, .separator => return false,
+            },
+            .scroll => return false,
+        }
+    }
     // Drawer rail overlays the editor: only targets inside the rail may
     // receive this click; hitting the rail body is a no-op.
     if (in_rail) {
@@ -256,7 +277,7 @@ fn handleLeftClick(self: *App, col: u32, row: u32) !bool {
 /// prompt) and approvals keep their own focus policy.
 fn hintActionFocusesEditor(action: hints.Action) bool {
     return switch (action) {
-        .buffer_select, .buffer_close, .filetree_select, .filetree_activate, .navigator_tab, .note_open => true,
+        .buffer_select, .buffer_close, .filetree_select, .filetree_activate, .navigator_tab, .navigator_peek_close, .note_open => true,
         else => false,
     };
 }
@@ -284,6 +305,8 @@ fn prepareMouseAction(self: *App) void {
 
 fn handleWheel(self: *App, col: u32, row: u32, dir: i64) !bool {
     if (mouseBlocked(self)) return false;
+    // Never scroll the editor behind an open compact peek.
+    if (self.navigatorPeekActive() and col >= nav_tabs.panel_width) return false;
     // The embedded terminal owns the wheel while it has focus; vaxis's
     // terminal widget has no mouse forwarding, so the safe behavior is
     // no-op (never scroll the editor behind it).
@@ -293,6 +316,17 @@ fn handleWheel(self: *App, col: u32, row: u32, dir: i64) !bool {
     // elsewhere wheel over the terminal is a no-op.
     if (!in_rail and terminalContains(self, col, row)) return false;
     const hit = self.mouse.hitScroll(col, row) orelse return false;
+    // Inside the peek only its list scroll regions are eligible; the editor
+    // pane target underneath must not scroll through the header/blank cells.
+    if (self.navigatorPeekActive() and col < nav_tabs.panel_width) {
+        switch (hit.target.action) {
+            .scroll => |s| switch (s) {
+                .navigator_files, .navigator_notes, .navigator_agents => {},
+                else => return false,
+            },
+            .click => return false,
+        }
+    }
     // Same overlay rule as clicks: the drawer rail's body owns its wheel;
     // only scroll regions inside the rail are eligible.
     if (in_rail) {

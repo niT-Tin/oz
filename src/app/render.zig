@@ -40,9 +40,9 @@ const kindGlyph = App.kindGlyph;
 
 // ---- rendering ----
 
-pub const filetree_width: u32 = 30;
+pub const filetree_width: u32 = nav_tabs.panel_width;
 /// Blank column between the navigator's right border and editor content.
-pub const filetree_gutter: u32 = 1;
+pub const filetree_gutter: u32 = nav_tabs.gutter;
 
 /// Tab-label layers: one per column-overlap layer of the pane layout.
 /// Panes whose column spans overlap (horizontal splits stack full-width
@@ -54,7 +54,7 @@ pub fn tabLayerCount(self: *App, a: std.mem.Allocator) u32 {
     if (self.windows.items.len <= 1) return 1;
     const height: u32 = self.vx.window().height;
     if (height <= status_row_count) return 1;
-    const layout = self.layoutWindows(a, 1, height - status_row_count - 1, self.contentCol(), self.aiEditorWidth()) catch return 1;
+    const layout = self.layoutWindows(a, 1, height - status_row_count - 1, self.contentCol(), self.editorAreaWidth()) catch return 1;
     const leaves = layout.leaves;
     // greedy interval coloring: assign each pane to the lowest layer
     // whose rightmost pane ends at or before this pane's column start
@@ -108,10 +108,31 @@ pub fn contentTop(self: *App, a: std.mem.Allocator) u32 {
     return self.tabBarRows(a);
 }
 
-pub fn contentCol(self: *const App) u32 {
-    // Editor content never touches the navigator's right border: one blank
-    // column sits between the 30-cell panel and the first text cell.
-    return if (self.filetree_active) filetree_width + filetree_gutter else 0;
+pub fn contentCol(self: *App) u32 {
+    // Full mode keeps the 30-cell panel; compact mode reserves only the
+    // 7-cell icon rail. In both, one blank column separates the navigator's
+    // right border from editor text.
+    return nav_tabs.editorCol(self.filetree_active, self.vx.window().width);
+}
+
+/// Width of the editor's usable area after the navigator takes its column
+/// slice. Layouts/splits/tab layers must use this (not `aiEditorWidth`,
+/// which is the full span from column 0 to the rail) or a navigator-open
+/// pane would wrap text underneath the navigator/rail.
+pub fn editorAreaWidth(self: *App) u32 {
+    return self.aiEditorWidth() -| self.contentCol();
+}
+
+/// First row of the navigator's real content (below brand, workspace, tabs
+/// and the closing rule) in full/peek mode.
+pub fn navigatorBodyTop(self: *App, a: std.mem.Allocator) u32 {
+    return self.contentTop(a) + nav_tabs.full_header_rows;
+}
+
+/// True when the compact icon rail's peek drawer should be drawn/owned.
+pub fn navigatorPeekActive(self: *App) bool {
+    return self.filetree_active and self.navigator_peek and
+        nav_tabs.modeForCols(self.vx.window().width) == .compact;
 }
 
 /// Width of the relative-line-number gutter in cells: digits of the
@@ -1546,151 +1567,360 @@ pub fn hoverLineSegs(self: *App, a: std.mem.Allocator, line: []const u8, cols: u
     }
     return segs.items;
 }
-/// Render the left navigator (M2b1): the existing 30-cell filetree panel
-/// with a top tab strip `files | notes | agents`. Files keeps the tree's
-/// exact rendering/keys; Notes and Agents render from the cached note list
-/// and the real thread model. The panel stays 30 cells; the editor starts
-/// at `contentCol()` (30 + a one-cell gutter), so text never touches the
-/// navigator's right border.
+/// Render the left navigator. Two layouts:
+///   * >= 90 cols — the closed 30-cell panel: branded top border (`OZ`),
+///     workspace/branch line, icon+label+count tab strip, then the active
+///     tab's real content.
+///   * < 90 cols  — a 7-cell icon rail (`OZ`, folder/notes/agents). Selecting
+///     an icon opens the same 30-cell panel as a peek overlay over the
+///     editor; Esc/outside-click closes it. The editor keeps its full width
+///     underneath in both compact states.
+/// Files keeps the tree's exact rendering/keys; Notes and Agents render from
+/// the cached note list and the real thread model. Counts come from those
+/// existing caches — never from a per-frame filesystem scan.
 pub fn renderNavigator(self: *App, a: std.mem.Allocator, win: vaxis.Window, height: u32) !void {
+    if (height <= status_row_count) return;
+    const mode = nav_tabs.modeForCols(win.width);
+    if (mode == .compact) {
+        // Keyboard focus leaving the navigator closes the peek, so a user
+        // can never type into the editor under an open overlay.
+        if (self.focus != .navigator) self.navigator_peek = false;
+        if (self.navigator_peek) {
+            try renderNavigatorPanel(self, a, win, height, true);
+        } else {
+            try renderCompactRail(self, a, win, height);
+        }
+    } else {
+        self.navigator_peek = false;
+        try renderNavigatorPanel(self, a, win, height, false);
+    }
+}
+
+/// The 30-cell navigator box. `peek` adds the close affordance and is only
+/// used in compact mode; full mode draws the same box in place.
+fn renderNavigatorPanel(self: *App, a: std.mem.Allocator, win: vaxis.Window, height: u32, peek: bool) !void {
     const ft_col: u32 = 0;
-    const ft_width = filetree_width;
+    const ft_width: u32 = nav_tabs.panel_width;
     const ft_top = self.contentTop(a);
     const ft_bottom = height - status_row_count; // above the status bar
+    if (ft_bottom < ft_top + nav_tabs.full_header_rows + 1) return;
     const usable = ft_width - 2; // cells between the two borders
-    // The navigator box is a panel: its border follows focus (win_sep when
-    // the editor owns the keyboard, the theme's active separator when the
-    // navigator does), and every tab/rule inside derives from the palette.
+    const panel_bg: vaxis.Color = .{ .rgb = self.theme.bg };
     const nav_focused = self.focus == .navigator and self.ai.focus == .editor;
-    const border_style = chrome.panelBorderStyle(self.theme, nav_focused, .{ .rgb = self.theme.bg });
-    // Paint the whole panel with the editor background first — without
-    // this only the border columns and the text-width of each item
-    // got the bg, leaving the interior terminal-default (patchy).
+    const border_style = chrome.panelBorderStyle(self.theme, nav_focused, panel_bg);
+    const brand_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = panel_bg, .bold = true };
+
+    // Paint the whole panel before anything else: every interior cell then
+    // has the editor background, not a terminal-default hole.
     const panel = win.child(.{
         .x_off = @intCast(ft_col),
         .y_off = @intCast(ft_top),
         .width = @intCast(ft_width),
         .height = @intCast(ft_bottom - ft_top),
     });
-    panel.fill(.{ .style = .{ .bg = .{ .rgb = self.theme.bg } } });
-    // left border column and panel background
-    var brow: u32 = ft_top;
-    while (brow < ft_bottom) : (brow += 1) {
-        const border_seg = [_]vaxis.Segment{.{
-            .text = "│",
-            .style = border_style,
-        }};
-        _ = win.print(&border_seg, .{ .row_offset = @intCast(brow), .col_offset = @intCast(ft_col), .wrap = .none });
+    panel.fill(.{ .style = .{ .bg = panel_bg } });
+
+    // Body geometry: header rows (border/workspace/tabs/rule) + content +
+    // the bottom border.
+    const body_top = ft_top + nav_tabs.full_header_rows;
+    const body_bottom = ft_bottom - 1; // bottom border row
+    const content_bottom = @max(body_top, body_bottom);
+
+    // Vertical borders first; header rows overwrite only the interior.
+    {
+        var r: u32 = ft_top + 1;
+        while (r < body_bottom) : (r += 1) {
+            const left = [_]vaxis.Segment{.{ .text = "│", .style = border_style }};
+            _ = win.print(&left, .{ .row_offset = @intCast(r), .col_offset = @intCast(ft_col), .wrap = .none });
+            const right = [_]vaxis.Segment{.{ .text = "│", .style = border_style }};
+            _ = win.print(&right, .{ .row_offset = @intCast(r), .col_offset = @intCast(ft_col + ft_width - 1), .wrap = .none });
+        }
     }
 
-    try renderNavigatorTabs(self, a, win, ft_top);
+    // Branded top border: ╭─ OZ ─────────────────────╮
+    {
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        try segs.append(a, .{ .text = "╭─ ", .style = border_style });
+        try segs.append(a, .{ .text = "OZ", .style = brand_style });
+        try segs.append(a, .{ .text = " ", .style = border_style });
+        var used: u32 = 6; // "╭─ " + "OZ" + " "
+        while (used + 1 < ft_width) : (used += 1) {
+            try segs.append(a, .{ .text = "─", .style = border_style });
+        }
+        try segs.append(a, .{ .text = "╮", .style = border_style });
+        _ = win.print(segs.items, .{ .row_offset = @intCast(ft_top), .col_offset = @intCast(ft_col), .wrap = .none });
+    }
 
-    // Mouse-only wheel region: the list body (below the tab strip, above
-    // the bottom border) scrolls the active tab's selection. Click targets
-    // for rows/tabs are registered by their draw paths.
-    self.addMouseScrollTarget(ft_top + 1, ft_col, ft_width, (ft_bottom - 1) -| (ft_top + 1), switch (self.navigator_tab) {
+    // Workspace / branch line. The compact peek adds a close `×` at the
+    // inner right edge (the demo's nav-head close affordance).
+    {
+        var ws_buf: [512]u8 = undefined;
+        const line = nav_tabs.workspaceLine(self.curWsName(), self.git_branch, &ws_buf);
+        const text_budget: u32 = usable -| 1 -| (if (peek) @as(u32, 1) else 0);
+        var shown = buffer.utf8.truncateWidth(line, text_budget);
+        const ellipsized = shown.len < line.len and text_budget > 0;
+        if (ellipsized) shown = buffer.utf8.truncateWidth(line, text_budget - 1);
+        // vaxis stores grapheme slices until vx.render(); the workspace-line
+        // scratch buffer is stack-local, so keep the printed slice alive in
+        // the frame arena (the same reason other labels dupe).
+        shown = try a.dupe(u8, shown);
+        const dim: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = panel_bg };
+
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        try segs.append(a, .{ .text = "│", .style = border_style });
+        try segs.append(a, .{ .text = " ", .style = dim });
+        try segs.append(a, .{ .text = shown, .style = dim });
+        var used: u32 = 2 + @as(u32, @intCast(buffer.utf8.displayWidth(shown)));
+        if (ellipsized) {
+            try segs.append(a, .{ .text = "…", .style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = panel_bg } });
+            used += 1;
+        }
+        // Close button column (peek) or trailing padding (full).
+        while (used < usable) : (used += 1) {
+            try segs.append(a, .{ .text = " ", .style = dim });
+        }
+        if (peek) {
+            try segs.append(a, .{ .text = "×", .style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = panel_bg, .bold = true } });
+            if (self.mouseTargetsCollecting()) {
+                self.addHintTarget(.{
+                    .row = ft_top + 1,
+                    .col = ft_col + ft_width - 2,
+                    .width = 1,
+                    .height = 1,
+                }, .navigator_peek_close);
+            }
+        }
+        try segs.append(a, .{ .text = "│", .style = border_style });
+        _ = win.print(segs.items, .{ .row_offset = @intCast(ft_top + 1), .col_offset = @intCast(ft_col), .wrap = .none });
+    }
+
+    try renderNavigatorTabs(self, a, win, ft_top + 2);
+
+    // Closing rule under the tab strip: ├────────────────────────────┤
+    {
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        try segs.append(a, .{ .text = "├", .style = border_style });
+        var cx: u32 = 0;
+        while (cx < usable) : (cx += 1) {
+            try segs.append(a, .{ .text = "─", .style = border_style });
+        }
+        try segs.append(a, .{ .text = "┤", .style = border_style });
+        _ = win.print(segs.items, .{ .row_offset = @intCast(ft_top + 3), .col_offset = @intCast(ft_col), .wrap = .none });
+    }
+
+    // Mouse-only wheel region: the content body (never the header rows).
+    self.addMouseScrollTarget(body_top, ft_col, ft_width, body_bottom -| body_top, switch (self.navigator_tab) {
         .files => .navigator_files,
         .notes => .navigator_notes,
         .agents => .navigator_agents,
     });
 
     switch (self.navigator_tab) {
-        .files => try renderFiletreeRows(self, a, win, ft_top, ft_bottom, usable),
-        .notes => try renderNotesRows(self, a, win, ft_top, ft_bottom, usable),
-        .agents => try renderAgentsRows(self, a, win, ft_top, ft_bottom, usable),
+        .files => try renderFiletreeRows(self, a, win, body_top, content_bottom, usable),
+        .notes => try renderNotesRows(self, a, win, body_top, content_bottom, usable),
+        .agents => try renderAgentsRows(self, a, win, body_top, content_bottom, usable),
     }
 
-    // right border column — mirrors the left one so the panel is a
-    // closed box. The strip row's "╮" and the bottom row's "╯"
-    // already cap the two corners, so only the interior rows need the
-    // "│" (the item rows' trailing padding is what it covers).
-    {
-        const right_col = ft_col + ft_width - 1;
-        var rrow: u32 = ft_top + 1;
-        const rlast = ft_bottom - 1; // bottom border row
-        while (rrow < rlast) : (rrow += 1) {
-            const border_seg = [_]vaxis.Segment{.{
-                .text = "│",
-                .style = border_style,
-            }};
-            _ = win.print(&border_seg, .{ .row_offset = @intCast(rrow), .col_offset = @intCast(right_col), .wrap = .none });
-        }
-    }
-    // bottom border
+    // Bottom border.
     {
         var segs = std.ArrayList(vaxis.Segment).empty;
         try segs.append(a, .{ .text = "╰", .style = border_style });
-        // inner_w - 1 dashes: "╰" takes the left border column and
-        // "╯" must land ON the right border column (ft_width-1) —
-        // inner_w dashes would push it one cell past the edge
         var cx: u32 = 0;
-        while (cx < (ft_width - 1) -| 1) : (cx += 1) {
+        while (cx < usable) : (cx += 1) {
             try segs.append(a, .{ .text = "─", .style = border_style });
         }
         try segs.append(a, .{ .text = "╯", .style = border_style });
-        _ = win.print(segs.items, .{ .row_offset = @intCast(ft_bottom - 1), .col_offset = @intCast(ft_col), .wrap = .none });
+        _ = win.print(segs.items, .{ .row_offset = @intCast(body_bottom), .col_offset = @intCast(ft_col), .wrap = .none });
     }
 }
 
-/// Top strip: `╭─ files │ notes │ agents ───╮`. The active tab gets the
-/// accent foreground + selection background + bold so it reads at a glance;
-/// inactive tabs are dim. `│` separators make the strip read as tabs rather
-/// than a breadcrumb. Every tab is a hint target whose label is drawn at the
-/// tab's first cell (the overlay clamps into the 30-cell panel).
-fn renderNavigatorTabs(self: *App, a: std.mem.Allocator, win: vaxis.Window, row: u32) !void {
+/// Compact icon rail (cols < 90): `OZ` + one two-row button per tab, with a
+/// right border and no content. The 30-cell peek drawer is the content view.
+fn renderCompactRail(self: *App, a: std.mem.Allocator, win: vaxis.Window, height: u32) !void {
+    const rail_w: u32 = nav_tabs.compact_width;
+    const content_w = rail_w - 1;
+    const top = self.contentTop(a);
+    const bottom = height -| status_row_count;
+    if (bottom <= top or content_w == 0) return;
+
+    const panel_bg: vaxis.Color = .{ .rgb = self.theme.bg };
     const nav_focused = self.focus == .navigator and self.ai.focus == .editor;
-    const border_style = chrome.panelBorderStyle(self.theme, nav_focused, .{ .rgb = self.theme.bg });
-    const sep_style = chrome.separatorStyle(self.theme, .minor, .{ .rgb = self.theme.bg });
-    var segs = std.ArrayList(vaxis.Segment).empty;
-    try segs.append(a, .{ .text = "╭─ ", .style = border_style });
-    var used: u32 = 3;
-    var starts: [nav_tabs.count]u32 = undefined;
+    const border_style = chrome.panelBorderStyle(self.theme, nav_focused, panel_bg);
+    const brand_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = panel_bg, .bold = true };
+    const rule_style = chrome.separatorStyle(self.theme, .minor, panel_bg);
+
+    const panel = win.child(.{
+        .x_off = 0,
+        .y_off = @intCast(top),
+        .width = @intCast(rail_w),
+        .height = @intCast(bottom - top),
+    });
+    panel.fill(.{ .style = .{ .bg = panel_bg } });
+
+    // Right border (the demo's compact rail has no left border; the editor
+    // starts after a one-cell gutter at `compact_width + 1`).
+    {
+        var r: u32 = top;
+        while (r < bottom) : (r += 1) {
+            const seg = [_]vaxis.Segment{.{ .text = "│", .style = border_style }};
+            _ = win.print(&seg, .{ .row_offset = @intCast(r), .col_offset = @intCast(rail_w - 1), .wrap = .none });
+        }
+    }
+
+    // OZ mark, centered in the six content cells.
+    {
+        const oz = [_]vaxis.Segment{
+            .{ .text = "  ", .style = .{ .bg = panel_bg } },
+            .{ .text = "OZ", .style = brand_style },
+            .{ .text = "  ", .style = .{ .bg = panel_bg } },
+        };
+        _ = win.print(&oz, .{ .row_offset = @intCast(top), .col_offset = 0, .wrap = .none });
+    }
+
+    // Hairline under the brand head.
+    if (top + 1 < bottom) {
+        var cx: u32 = 0;
+        while (cx < content_w) : (cx += 1) {
+            const seg = [_]vaxis.Segment{.{ .text = "─", .style = rule_style }};
+            _ = win.print(&seg, .{ .row_offset = @intCast(top + 1), .col_offset = @intCast(cx), .wrap = .none });
+        }
+    }
+
+    // One two-row button per tab, icon only:  OZ / rule / [icon][icon][icon].
+    const active_bg: vaxis.Color = .{ .rgb = self.theme.bg_sel };
     var i: usize = 0;
     while (i < nav_tabs.count) : (i += 1) {
         const tab = nav_tabs.all[i];
-        if (i > 0) {
-            try segs.append(a, .{ .text = " │ ", .style = sep_style });
-            used += 3;
-        }
-        starts[i] = used;
+        const row = top + nav_tabs.compact_first_tab_row + @as(u32, @intCast(i)) * nav_tabs.compact_tab_rows;
+        if (row + 1 >= bottom) break;
         const active = self.navigator_tab == tab;
-        const style: vaxis.Style = if (active)
-            chrome.activeTabStyle(self.theme)
+        const bg: vaxis.Color = if (active) active_bg else panel_bg;
+        const icon = icons.tabIcon(tab);
+        const icon_style: vaxis.Style = if (active)
+            .{ .fg = .{ .rgb = self.theme.accent_alt }, .bg = bg, .bold = true }
         else
-            chrome.inactiveTabStyle(self.theme, .{ .rgb = self.theme.bg });
-        const label = nav_tabs.label(tab);
-        try segs.append(a, .{ .text = label, .style = style });
-        used += @intCast(label.len);
+            .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = bg };
+
+        // Both rows of the button share the selection background.
+        const blank = "      "; // compact content width, no per-frame alloc
+        var rr: u32 = 0;
+        while (rr < nav_tabs.compact_tab_rows) : (rr += 1) {
+            const segs = [_]vaxis.Segment{.{ .text = blank[0..content_w], .style = .{ .bg = bg } }};
+            _ = win.print(&segs, .{ .row_offset = @intCast(row + rr), .col_offset = 0, .wrap = .none });
+        }
+        if (active) {
+            // Accent inset bar, the terminal equivalent of the demo's 2px
+            // active rail marker; drawn on both rows.
+            var bar_r: u32 = 0;
+            while (bar_r < nav_tabs.compact_tab_rows) : (bar_r += 1) {
+                const bar = [_]vaxis.Segment{.{ .text = "│", .style = .{
+                    .fg = .{ .rgb = self.theme.accent_alt },
+                    .bg = bg,
+                    .bold = true,
+                } }};
+                _ = win.print(&bar, .{ .row_offset = @intCast(row + bar_r), .col_offset = 0, .wrap = .none });
+            }
+        }
+        // Icon centered horizontally in the six content cells.
+        const icon_col: u32 = 2;
+        const icon_seg = [_]vaxis.Segment{.{ .text = icon.glyph, .style = icon_style }};
+        _ = win.print(&icon_seg, .{ .row_offset = @intCast(row), .col_offset = icon_col, .wrap = .none });
+
+        if (self.mouseTargetsCollecting()) {
+            self.addHintTarget(.{
+                .row = row,
+                .col = 0,
+                .width = content_w,
+                .height = nav_tabs.compact_tab_rows,
+            }, .{ .navigator_tab = tab });
+        }
     }
-    // A single dim space before the closing rule keeps the strip from
-    // looking glued to the list below; the three dashes finish the 30-cell
-    // box exactly.
-    try segs.append(a, .{ .text = " ", .style = border_style });
-    used += 1;
-    while (used + 1 < filetree_width) : (used += 1) {
-        try segs.append(a, .{ .text = "─", .style = border_style });
+}
+
+/// Full-mode tab strip: folder/notes/agents icons, labels and compact real
+/// count badges. `layoutTabs` fits the strip into the 28 inner cells and
+/// drops badges (never labels) if a huge count cannot fit; the same layout
+/// drives the hint/mouse rectangles.
+fn renderNavigatorTabs(self: *App, a: std.mem.Allocator, win: vaxis.Window, row: u32) !void {
+    const inner: u16 = nav_tabs.panel_width - 2;
+    const counts: nav_tabs.Counts = .{
+        self.filetree_rows.items.len,
+        if (self.notes.loaded and self.notes.err == null) self.notes.items.items.len else null,
+        self.ai.threads.items.items.len,
+    };
+    const layout = nav_tabs.layoutTabs(counts, inner);
+    const active_label = chrome.activeTabStyle(self.theme);
+    const active_icon = chrome.activeTabMarkerStyle(self.theme);
+    const active_count: vaxis.Style = .{
+        .fg = .{ .rgb = self.theme.accent_alt },
+        .bg = .{ .rgb = self.theme.bg_sel },
+        .bold = true,
+        .ul = .{ .rgb = self.theme.accent_alt },
+        .ul_style = .single,
+    };
+    const inactive_icon: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg } };
+    const inactive_label = chrome.inactiveTabStyle(self.theme, .{ .rgb = self.theme.bg });
+    const inactive_count: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg } };
+    const gap_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg } };
+    const sep_style = chrome.separatorStyle(self.theme, .minor, .{ .rgb = self.theme.bg });
+    const border_style = chrome.panelBorderStyle(self.theme, self.focus == .navigator and self.ai.focus == .editor, .{ .rgb = self.theme.bg });
+
+    var segs = std.ArrayList(vaxis.Segment).empty;
+    try segs.append(a, .{ .text = "│", .style = border_style });
+
+    var used: u16 = 0;
+    var ti: usize = 0;
+    while (ti < nav_tabs.count) : (ti += 1) {
+        const tab = nav_tabs.all[ti];
+        const start = layout.starts[ti];
+        // The fitter leaves one cell between tabs whenever possible; draw
+        // it as the demo's dim accent separator. A zero-gap fallback (only
+        // when even compact badges overflow) has no separator cell.
+        if (ti > 0 and used < start) {
+            try segs.append(a, .{ .text = "│", .style = sep_style });
+            used += 1;
+        }
+        while (used < start) : (used += 1) {
+            try segs.append(a, .{ .text = " ", .style = gap_style });
+        }
+        const active = self.navigator_tab == tab;
+        const icon = icons.tabIcon(tab);
+        const icon_style: vaxis.Style = if (active) active_icon else inactive_icon;
+        const label_style: vaxis.Style = if (active) active_label else inactive_label;
+        try segs.append(a, .{ .text = icon.glyph, .style = icon_style });
+        try segs.append(a, .{ .text = " ", .style = .{ .bg = icon_style.bg } });
+        try segs.append(a, .{ .text = nav_tabs.label(tab), .style = label_style });
+        if (layout.has_count[ti]) {
+            if (counts[ti]) |n| {
+                // Frame-arena text: vaxis holds the slice until render.
+                const text = std.fmt.allocPrint(a, "{d}", .{n}) catch "";
+                try segs.append(a, .{ .text = text, .style = if (active) active_count else inactive_count });
+            }
+        }
+        used = start + layout.widths[ti];
     }
-    try segs.append(a, .{ .text = "╮", .style = border_style });
+    while (used < inner) : (used += 1) {
+        try segs.append(a, .{ .text = " ", .style = gap_style });
+    }
+    try segs.append(a, .{ .text = "│", .style = border_style });
     _ = win.print(segs.items, .{ .row_offset = @intCast(row), .col_offset = 0, .wrap = .none });
 
     if (self.mouseTargetsCollecting()) {
-        i = 0;
-        while (i < nav_tabs.count) : (i += 1) {
-            const tab = nav_tabs.all[i];
-            const cells: u32 = @intCast(nav_tabs.label(tab).len);
+        ti = 0;
+        while (ti < nav_tabs.count) : (ti += 1) {
             self.addHintTarget(.{
                 .row = row,
-                .col = starts[i],
-                .width = cells,
+                .col = 1 + layout.starts[ti],
+                .width = layout.widths[ti],
                 .height = 1,
-            }, .{ .navigator_tab = tab });
+            }, .{ .navigator_tab = nav_tabs.all[ti] });
         }
     }
 }
 
 /// Files tab: the pre-M2b1 filetree row loop unchanged (same geometry,
 /// selection, scroll window and absolute-row hint payload).
-fn renderFiletreeRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, ft_top: u32, ft_bottom: u32, usable: u32) !void {
+fn renderFiletreeRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, body_top: u32, body_bottom: u32, usable: u32) !void {
     const ft_col: u32 = 0;
     const inner_left = ft_col + 1;
     // vim-style scroll window (same semantics as the picker)
@@ -1703,7 +1933,7 @@ fn renderFiletreeRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, ft_to
     } else if (self.filetree_sel >= ft_len) {
         self.filetree_sel = ft_len - 1;
     }
-    const ft_vis = @min(ft_len, @as(usize, ft_bottom - ft_top - 2));
+    const ft_vis = @min(ft_len, @as(usize, body_bottom -| body_top));
     if (ft_len > ft_vis) {
         if (self.filetree_top + ft_vis > ft_len) self.filetree_top = ft_len - ft_vis;
         if (self.filetree_sel < self.filetree_top) self.filetree_top = self.filetree_sel;
@@ -1778,13 +2008,13 @@ fn renderFiletreeRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, ft_to
         const pads = try a.alloc(u8, usable -| content_cells);
         @memset(pads, ' ');
         if (pads.len > 0) try segs.append(a, .{ .text = pads, .style = style });
-        _ = win.print(segs.items, .{ .row_offset = @intCast(ft_top + 1 + k), .col_offset = @intCast(inner_left), .wrap = .none });
+        _ = win.print(segs.items, .{ .row_offset = @intCast(body_top + @as(u32, @intCast(k))), .col_offset = @intCast(inner_left), .wrap = .none });
         if (self.mouseTargetsCollecting()) {
             // Inner row rect (starts after the left border so a label never
             // breaks the panel frame). Payload is the absolute row index in
             // filetree_rows, not the visible slot.
             self.addHintTarget(.{
-                .row = ft_top + 1 + @as(u32, @intCast(k)),
+                .row = body_top + @as(u32, @intCast(k)),
                 .col = inner_left,
                 .width = usable,
                 .height = 1,
@@ -1796,10 +2026,10 @@ fn renderFiletreeRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, ft_to
 /// Notes tab: two rows per note (title + right-aligned age, then
 /// filename · snippet). The list is the cached `Store`, refreshed by the
 /// action paths, never by this renderer; rows scroll in note units.
-fn renderNotesRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, ft_top: u32, ft_bottom: u32, usable: u32) !void {
+fn renderNotesRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, body_top: u32, body_bottom: u32, usable: u32) !void {
     const inner_left: u32 = 1;
-    const content_top = ft_top + 1;
-    const content_rows: usize = @intCast(ft_bottom - ft_top - 2);
+    const content_top = body_top;
+    const content_rows: usize = @intCast(body_bottom -| body_top);
     const base_bg: vaxis.Color = .{ .rgb = self.theme.bg };
 
     if (self.notes.err) |msg| {
@@ -1839,7 +2069,7 @@ fn renderNotesRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, ft_top: 
         const idx = self.notes.top + k;
         if (idx >= n) break;
         const row1 = content_top + 2 * @as(u32, @intCast(k));
-        if (row1 >= ft_bottom - 1) break;
+        if (row1 >= body_bottom) break;
         const note = &self.notes.items.items[idx];
         const selected = idx == self.notes.sel;
         const bg: vaxis.Color = if (selected) .{ .rgb = self.theme.bg_sel } else base_bg;
@@ -1891,7 +2121,7 @@ fn renderNotesRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, ft_top: 
             }, .{ .note_open = idx });
         }
 
-        if (row1 + 1 < ft_bottom - 1) {
+        if (row1 + 1 < body_bottom) {
             const row2 = row1 + 1;
             var line = std.ArrayList(u8).empty;
             try line.appendSlice(a, "  ");
@@ -1919,10 +2149,10 @@ fn renderNotesRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, ft_top: 
 /// and status label. The attached thread carries `>` + bold; the selected
 /// row keeps the fill. Enter = the same `aiSelectThread` attach path as the
 /// rail; `n` = `aiNewThread`. No synthetic rows, no second thread model.
-fn renderAgentsRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, ft_top: u32, ft_bottom: u32, usable: u32) !void {
+fn renderAgentsRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, body_top: u32, body_bottom: u32, usable: u32) !void {
     const inner_left: u32 = 1;
-    const content_top = ft_top + 1;
-    const content_rows: usize = @intCast(ft_bottom - ft_top - 2);
+    const content_top = body_top;
+    const content_rows: usize = @intCast(body_bottom -| body_top);
     const base_bg: vaxis.Color = .{ .rgb = self.theme.bg };
 
     var header = std.ArrayList(u8).empty;
@@ -2525,7 +2755,7 @@ pub fn render(self: *App) !void {
             }
             const p = tabstrip.plan(tab_specs[0..n], strip_w);
             try self.drawBufferTabPlan(a, win, 0, rule_row, strip_col, p, tab_bufs[0..n]);
-        } else if (self.layoutWindows(a, content_top, content_rows, strip_col, strip_right)) |tab_layout| {
+        } else if (self.layoutWindows(a, content_top, content_rows, strip_col, strip_w)) |tab_layout| {
             // Each buffer's tab appears EXACTLY ONCE, owned by the pane that
             // displays it (the focused pane wins when several panes show the
             // same buffer); a buffer hidden from every pane keeps its tab in
@@ -2737,7 +2967,7 @@ pub fn render(self: *App) !void {
 
     // split windows: every leaf gets a rectangle and renders its buffer;
     // the focused window carries syntax highlighting and the selection
-    const layout = try self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), self.aiEditorWidth());
+    const layout = try self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), self.editorAreaWidth());
     const leaves = layout.leaves;
     var cur_rect: LeafRect = .{ .win = self.current_win, .row = 0, .col = 0, .height = 0, .width = 0 };
     var li: usize = 0;

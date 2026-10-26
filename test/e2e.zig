@@ -1229,39 +1229,44 @@ test "mouse: navigator tabs, filetree row, notes row, wheel move/clamp" {
     try gridWaitFor(&sess, &grid, "docs", 5000);
     try gridWaitFor(&sess, &grid, "root.txt", 5000);
 
-    // Click the notes tab, then the files tab: both tabs are hint-geometry
-    // targets registered during the mouse frame.
-    try mouseClickAt(&sess, navTabCol(1) + 1, navTabsRow());
+    // Tab targets move as real counts arrive, so resolve the label column
+    // from the DRAWN frame before each click (hint/mouse rectangles use the
+    // same layout).
+    var notes_col = navTabStart(&grid, "Notes") orelse return error.TestUnexpectedResult;
+    try mouseClickAt(&sess, notes_col + 1, navTabsRow());
     try gridWaitFor(&sess, &grid, "Alpha note", 5000);
-    try mouseClickAt(&sess, navTabCol(0) + 1, navTabsRow());
+    const files_col = navTabStart(&grid, "Files") orelse return error.TestUnexpectedResult;
+    try mouseClickAt(&sess, files_col + 1, navTabsRow());
     try gridWaitFor(&sess, &grid, "docs", 5000);
 
-    // Row 3 is docs/ (dirs first). Click expands exactly like Enter; click
+    // First content row is docs/. Click expands exactly like Enter; click
     // again collapses.
-    try mouseClickAt(&sess, 5, 3);
+    try mouseClickAt(&sess, 5, navBodyRow());
     try gridWaitFor(&sess, &grid, "workspace-plan", 5000);
-    try mouseClickAt(&sess, 5, 3);
+    try mouseClickAt(&sess, 5, navBodyRow());
     try gridWaitGone(&sess, &grid, "workspace-plan", 5000);
 
     // Wheel down selects the next row (src); clamp is proven by scrolling far
     // up afterwards and toggling the row that must be selected.
-    try mouseWheelAt(&sess, 5, 3, 1);
+    try mouseWheelAt(&sess, 5, navBodyRow(), 1);
     try sess.send("\r");
     try gridWaitFor(&sess, &grid, "main.zig", 5000);
-    for (0..20) |_| try mouseWheelAt(&sess, 5, 3, -1);
+    for (0..20) |_| try mouseWheelAt(&sess, 5, navBodyRow(), -1);
     try sess.send("\r");
     try gridWaitFor(&sess, &grid, "workspace-plan", 5000);
 
     // Notes row click opens the note in the editor (its buffer tab appears;
     // the editor body owns "# Alpha note", the list only shows the title).
-    try mouseClickAt(&sess, navTabCol(1) + 1, navTabsRow());
+    notes_col = navTabStart(&grid, "Notes") orelse return error.TestUnexpectedResult;
+    try mouseClickAt(&sess, notes_col + 1, navTabsRow());
     try gridWaitFor(&sess, &grid, "Alpha note", 5000);
-    try mouseClickAt(&sess, 5, 3);
+    try mouseClickAt(&sess, 5, navBodyRow());
     try gridWaitFor(&sess, &grid, "# Alpha note", 5000);
     try std.testing.expect(aiRowContains(&grid, 0, "alpha.md"));
 
     // Agents tab click initializes/shows the real thread model.
-    try mouseClickAt(&sess, navTabCol(2) + 1, navTabsRow());
+    const agents_col = navTabStart(&grid, "Agents") orelse return error.TestUnexpectedResult;
+    try mouseClickAt(&sess, agents_col + 1, navTabsRow());
     try gridWaitFor(&sess, &grid, "thread 1", 5000);
     try std.testing.expect(grid.contains("NORMAL"));
     try frame.expectNoHorizontalOverflow(&grid, 120);
@@ -3693,7 +3698,7 @@ test "file tree: <leader>e shows files, Enter opens one" {
     // src/, test/), so the first row is a directory, not DESIGN.md.
     try sess.send(" e");
     waited = 0;
-    while (!grid.contains(" files ") or !grid.contains("build.zig")) {
+    while (!grid.contains("Files") or !grid.contains("build.zig")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -3703,14 +3708,14 @@ test "file tree: <leader>e shows files, Enter opens one" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(grid.contains(" files "));
+    try std.testing.expect(grid.contains("Files"));
     try std.testing.expect(grid.contains("build.zig"));
-    // dirs come first: row 2 (first entry row) is a directory with the
-    // closed folder glyph; "docs" is the first sorted first-level dir
-    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(3), "docs") != null);
+    // dirs come first: the first content row is a directory with the
+    // closed folder glyph; "docs" is the first sorted first-level dir.
+    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(navBodyRow()), "docs") != null);
     // nvim/snacks geometry: border, one padding cell (the cursor sits here),
     // then the tree branch and the icon — cursor and glyph never share a cell.
-    try std.testing.expect(std.mem.startsWith(u8, grid.rowText(3), "│ ├╴"));
+    try std.testing.expect(std.mem.startsWith(u8, grid.rowText(navBodyRow()), "│ ├╴"));
 
     // Enter on the selected directory (docs) expands it — its only child
     // (workspace-plan) appears, and the folder glyph flips open
@@ -3761,12 +3766,12 @@ test "file tree: <leader>e shows files, Enter opens one" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(grid.contains("# oz")); // DESIGN.md header (ASCII part)
-    try std.testing.expect(grid.contains(" files ")); // tree stays open after Enter
+    try std.testing.expect(navCompactRailVisible(&grid)); // rail stays after Enter
 
     // <space>e toggles the tree closed (and is the only toggle)
     try sess.send(" e");
     waited = 0;
-    while (grid.contains(" files ")) {
+    while (navCompactRailVisible(&grid)) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -3776,7 +3781,7 @@ test "file tree: <leader>e shows files, Enter opens one" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(!grid.contains(" files "));
+    try std.testing.expect(!navCompactRailVisible(&grid));
     try std.testing.expect(grid.contains("# oz"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
@@ -3829,7 +3834,7 @@ test "file tree: sidebar background matches the editor" {
     // row 4 = src (unselected), below the strip label+rule rows.
     try sess.send(" e");
     waited = 0;
-    while (!grid.contains(" files ") or !grid.contains("build.zig")) {
+    while (!grid.contains("Files") or !grid.contains("build.zig")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -3839,20 +3844,20 @@ test "file tree: sidebar background matches the editor" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(grid.contains(" files "));
+    try std.testing.expect(grid.contains("Files"));
     try std.testing.expect(grid.contains("build.zig"));
 
     // the selected row keeps its bg_sel highlight
-    try std.testing.expect(grid.rowHasBg(3, packRgb(0x2D, 0x4F, 0x67)));
+    try std.testing.expect(grid.rowHasBg(navBodyRow(), packRgb(0x2D, 0x4F, 0x67)));
     // an unselected row is now ALL the editor background (0x1F1F28) — tree
     // panel cells, the fg_faint borders and the editor side alike — where
     // before the panel was bg_float (0x223249)
     const tree_bg = packRgb(0x1F, 0x1F, 0x28);
-    try std.testing.expect(grid.rowAllBg(4, tree_bg));
-    try std.testing.expect(!grid.rowHasBg(4, packRgb(0x22, 0x32, 0x49)));
-    // the title/border rows share the editor bg too (fg_faint borders stay)
-    try std.testing.expect(grid.rowHasBg(2, tree_bg));
-    try std.testing.expect(!grid.rowHasBg(2, packRgb(0x22, 0x32, 0x49)));
+    try std.testing.expect(grid.rowAllBg(navBodyRow() + 1, tree_bg));
+    try std.testing.expect(!grid.rowHasBg(navBodyRow() + 1, packRgb(0x22, 0x32, 0x49)));
+    // the brand/tab rows share the editor bg too (fg_faint borders stay)
+    try std.testing.expect(grid.rowHasBg(navTabsRow(), tree_bg));
+    try std.testing.expect(!grid.rowHasBg(navTabsRow(), packRgb(0x22, 0x32, 0x49)));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     if (exit_code != 0) {
@@ -5544,11 +5549,11 @@ test "file tree: sidebar scrolls as the selection moves past the window" {
         try f.writeStreamingAll(io, "hello\n");
     }
 
-    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, null, 30, 100);
     defer sess.close();
     defer killPid(sess.pid);
 
-    var grid = try Grid.init(alloc);
+    var grid = try Grid.initSizedCols(alloc, 30, 100);
     defer grid.deinit(alloc);
     var waited: i32 = 0;
     while (!grid.contains("NORMAL")) {
@@ -5567,7 +5572,7 @@ test "file tree: sidebar scrolls as the selection moves past the window" {
     // test/), so row 2 (first entry row) is a directory, not a file.
     try sess.send(" e");
     waited = 0;
-    while (!grid.contains("files")) {
+    while (!grid.contains("Files")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -5577,7 +5582,7 @@ test "file tree: sidebar scrolls as the selection moves past the window" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(3), "docs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(navBodyRow()), "docs") != null);
 
     // Expand enough of the tree to overflow the ~20 visible sidebar rows:
     // l on docs (children), 5j to src + l, j to src/ai (new M1 module),
@@ -5615,12 +5620,12 @@ test "file tree: sidebar scrolls as the selection moves past the window" {
         // "docs" was the first entry; once the window scrolls it is gone
         // from the first entry row, and the selected entry (bg_sel) is
         // visible somewhere inside the sidebar window
-        var sr: usize = 2;
+        var sr: usize = navBodyRow();
         var has_sel = false;
-        while (sr < 22) : (sr += 1) {
+        while (sr < 30 - 2) : (sr += 1) {
             if (grid.rowHasBg(sr, packRgb(45, 79, 103))) has_sel = true;
         }
-        if (std.mem.indexOf(u8, grid.rowText(3), "docs") == null and has_sel) scrolled = true;
+        if (std.mem.indexOf(u8, grid.rowText(navBodyRow()), "docs") == null and has_sel) scrolled = true;
     }
     if (!scrolled) {
         std.debug.print("filetree grid after scroll:\n", .{});
@@ -5938,7 +5943,7 @@ test "picker: keys win over the file tree while both are open" {
     // <leader>e — file tree sidebar
     try sess.send(" e");
     waited = 0;
-    while (!grid.contains("files")) {
+    while (!grid.contains("Files")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -5948,8 +5953,8 @@ test "picker: keys win over the file tree while both are open" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    // the sidebar selection starts on the first entry row (title is row 1, entries from row 2)
-    try std.testing.expect(grid.rowHasBg(2, sel_bg));
+    // the sidebar selection starts on the first peek content row
+    try std.testing.expect(grid.rowHasBg(navBodyRow(), sel_bg));
 
     // <leader>sf — fuzzy file picker over the still-open file tree
     try sess.send(" sf");
@@ -5985,8 +5990,8 @@ test "picker: keys win over the file tree while both are open" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(grid.rowHasBg(list_top + 3, sel_bg));
-    // the sidebar highlight stays on row 2 (entries start below the title)
-    try std.testing.expect(grid.rowHasBg(2, sel_bg));
+    // the sidebar highlight stays on the first content row
+    try std.testing.expect(grid.rowHasBg(navBodyRow(), sel_bg));
 
     // One more ↓ (ESC[B) — arrow keys are also routed to the picker now;
     // before the fix the file tree ate them and its highlight moved to row
@@ -6004,7 +6009,7 @@ test "picker: keys win over the file tree while both are open" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(grid.rowHasBg(list_top + 4, sel_bg));
-    try std.testing.expect(grid.rowHasBg(2, sel_bg));
+    try std.testing.expect(grid.rowHasBg(navBodyRow(), sel_bg));
 
     // Esc closes the picker (':q' would be eaten by the filter), then quit
     try sess.send("\x1b");
@@ -6598,7 +6603,7 @@ test "picker confirm leaves file-tree mode; j/k control the buffer" {
     // file tree open, then grep picker "fn" → confirm jumps to a project file
     try sess.send(" e");
     waited = 0;
-    while (!grid.contains("files")) {
+    while (!grid.contains("Files")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -7737,7 +7742,7 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
     // directory, not the alphabetical first file.
     try sess.send(" e");
     waited = 0;
-    while (std.mem.indexOf(u8, grid.rowText(3), "docs") == null) {
+    while (std.mem.indexOf(u8, grid.rowText(navBodyRow()), "docs") == null) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -7747,7 +7752,7 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(3), "docs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(navBodyRow()), "docs") != null);
 
     // j × 7 → README.md. Current first level (dirs first, then uppercase
     // names before lowercase in byte order): docs, patches, src, test,
@@ -7757,7 +7762,7 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
     try sess.send("jjjjjjj\r");
     waited = 0;
     while (std.mem.indexOf(u8, grid.rowText(1), "README.md") == null and
-        std.mem.indexOf(u8, grid.rowText(3), "README.md") == null)
+        std.mem.indexOf(u8, grid.rowText(navBodyRow()), "README.md") == null)
     {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
@@ -7769,7 +7774,7 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(std.mem.indexOf(u8, grid.rowText(0), "README.md") != null);
-    try std.testing.expect(grid.contains("files")); // the tree did not close
+    try std.testing.expect(navCompactRailVisible(&grid)); // the rail did not close
 
     // The tree is still open with focus on the buffer (Enter moves focus).
     // Ctrl-w h → sidebar focus (the tree is the leftmost pane; h moves left
@@ -8444,7 +8449,7 @@ test "file tree: Ctrl-w h/l switches focus between sidebar and buffer" {
     // open file tree; default focus is the sidebar
     try sess.send(" e");
     waited = 0;
-    while (!grid.contains("files")) {
+    while (!grid.contains("Files")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -8454,11 +8459,11 @@ test "file tree: Ctrl-w h/l switches focus between sidebar and buffer" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    // j moves the sidebar selection to row 4 (entries start below the
-    // navigator title/border, which now sit below the two-row strip)
+    // j moves the sidebar selection one content row down (the peek starts
+    // below the two-row strip + four navigator header rows).
     try sess.send("j");
     waited = 0;
-    while (!grid.rowHasBg(4, sel_bg)) {
+    while (!grid.rowHasBg(navBodyRow() + 1, sel_bg)) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -8468,7 +8473,7 @@ test "file tree: Ctrl-w h/l switches focus between sidebar and buffer" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(grid.rowHasBg(4, sel_bg));
+    try std.testing.expect(grid.rowHasBg(navBodyRow() + 1, sel_bg));
 
     // Ctrl-w l → buffer focus (the tree is the leftmost pane; l moves right
     // out of it); j now moves the buffer cursor (line 2, 3…)
@@ -8529,9 +8534,9 @@ test "file tree: Ctrl-w h/l switches focus between sidebar and buffer" {
         }
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
-        // the sidebar selection (54,74,130) must have moved to row 5
-        // (two j's landed on the third entry below the title/border)
-        if (grid.rowHasBg(5, sel_bg)) sel_moved = true;
+        // the sidebar selection must have moved to the third content row
+        // (two j's landed on the third entry below the header)
+        if (grid.rowHasBg(navBodyRow() + 2, sel_bg)) sel_moved = true;
     }
     try std.testing.expect(sel_moved);
 
@@ -8550,10 +8555,10 @@ test "file tree: Ctrl-w h/l switches focus between sidebar and buffer" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
         break;
     }
-    try std.testing.expect(grid.contains("files"));
+    try std.testing.expect(grid.contains("Files"));
     try sess.send("\x1b");
     waited = 0;
-    while (grid.contains("files")) {
+    while (grid.contains("Files")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -8563,7 +8568,8 @@ test "file tree: Ctrl-w h/l switches focus between sidebar and buffer" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(!grid.contains("files"));
+    try std.testing.expect(!grid.contains("Files"));
+    try std.testing.expect(navCompactRailVisible(&grid));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     if (exit_code != 0) {
@@ -12793,7 +12799,7 @@ test "file tree: directory tree — folder glyphs, l expands, h folds" {
     // with the CLOSED folder glyph (dirs sort first, files after)
     try sess.send(" e");
     waited = 0;
-    while (!grid.contains(" files ")) {
+    while (!grid.contains("Files")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -12803,8 +12809,8 @@ test "file tree: directory tree — folder glyphs, l expands, h folds" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(grid.contains(" files "));
-    try std.testing.expect(rowContains(&grid, 3, "\u{f07b}")); // closed folder
+    try std.testing.expect(grid.contains("Files"));
+    try std.testing.expect(rowContains(&grid, navBodyRow(), "\u{f07b}")); // closed folder
 
     // l expands the selected dir — its child appears and the folder glyph
     // flips to the OPEN variant
@@ -15013,15 +15019,79 @@ fn absFileText(io: Io, alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(64 * 1024));
 }
 
-/// Navigator strip geometry (render.zig: "╭─ files │ notes │ agents ───╮"
-/// at contentTop()=2 for a single window (label row + shared strip rule row);
-/// the three labels start at 3/11/19.
+/// Navigator geometry, derived from the same pure model the renderer uses.
+/// A single-window frame starts the navigator at contentTop()=2; full/peek
+/// mode spends four rows on the brand border, workspace line, tabs and rule,
+/// so tabs sit on row 4 and content starts on row 6.
 fn navTabsRow() usize {
-    return 2;
+    return 2 + nav_model.full_header_rows - 2;
 }
 
-fn navTabCol(i: usize) usize {
-    return 3 + 8 * i;
+fn navBodyRow() usize {
+    return 2 + nav_model.full_header_rows;
+}
+
+/// Compact rail: OZ at contentTop, a rule, then two rows per icon button.
+fn navCompactTabRow(i: usize) usize {
+    return 2 + nav_model.compact_first_tab_row + i * nav_model.compact_tab_rows;
+}
+
+/// Column of the first cell (the icon) of the named full/peek tab. The label
+/// follows icon+space, so start = label column - 2. Only used outside hint
+/// mode, where the icon may be covered by a hint label.
+fn navTabStart(grid: *Grid, label: []const u8) ?usize {
+    const row = navTabsRow();
+    var c: usize = 1;
+    while (c + label.len <= nav_model.panel_width - 1) : (c += 1) {
+        var ok = true;
+        for (label, 0..) |ch, i| {
+            const cell = aiCellText(grid, row, c + i);
+            if (cell.len != 1 or cell[0] != ch) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return c - 2;
+    }
+    return null;
+}
+
+/// True when the compact icon rail's right border is drawn. Used by the
+/// <90-col tests to tell "rail visible" from "navigator fully closed".
+fn navCompactRailVisible(grid: *Grid) bool {
+    return std.mem.eql(u8, aiCellText(grid, 3, nav_model.compact_width - 1), "│");
+}
+
+/// Count badge drawn immediately after a full-mode tab label, if present.
+/// Notes has no badge until its cached list has been loaded.
+fn navTabCount(grid: *Grid, label: []const u8) ?usize {
+    const row = navTabsRow();
+    var label_col: ?usize = null;
+    var c: usize = 1;
+    while (c + label.len <= nav_model.panel_width - 1) : (c += 1) {
+        var ok = true;
+        for (label, 0..) |ch, i| {
+            const cell = aiCellText(grid, row, c + i);
+            if (cell.len != 1 or cell[0] != ch) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            label_col = c;
+            break;
+        }
+    }
+    var p = (label_col orelse return null) + label.len;
+    var n: usize = 0;
+    var any = false;
+    while (p < nav_model.panel_width - 1) : (p += 1) {
+        const cell = aiCellText(grid, row, p);
+        if (cell.len != 1 or !std.ascii.isDigit(cell[0])) break;
+        any = true;
+        n = n * 10 + (cell[0] - '0');
+    }
+    return if (any) n else null;
 }
 
 fn navSelectedBg() u32 {
@@ -15279,12 +15349,12 @@ test "ai workspace: 120-col docked rail keeps editor+filetree, streams, focus re
     try sess.send("\x1b"); // prompt -> editor (rail stays docked)
     try aiWaitRailFocus(&sess, &grid, rail_col, false, 3000);
     try sess.send(" e");
-    try gridWaitFor(&sess, &grid, "files", 5000);
+    try gridWaitFor(&sess, &grid, "Files", 5000);
     try gridWaitFor(&sess, &grid, "const answer = 42", 5000);
     try std.testing.expect(aiFindCell(&grid, "const answer = 42") != null);
     const content_cell = aiFindCell(&grid, "const answer = 42").?;
     try std.testing.expect(content_cell.col < rail_col);
-    try std.testing.expect(grid.contains("╭─ files"));
+    try std.testing.expect(grid.contains("╭─ OZ"));
     // Re-enter the rail from the file tree (Ctrl+w a) and attach to the
     // prompt with Enter. This is the editor -> rail re-entry path.
     try sess.send("\x17a");
@@ -15452,15 +15522,26 @@ test "ui chrome: 120x30 rail header, rules, tabs and status boundary" {
     defer grid.deinit(alloc);
     try gridWaitFor(&sess, &grid, "NORMAL", 8000);
 
-    // Navigator: explicit tab strip with separators and a filled active tab.
+    // Navigator: OZ brand border + workspace line + icon tabs with real
+    // counts, separator cells and a filled active tab.
     try sess.send(" e");
-    try gridWaitFor(&sess, &grid, "╭─ files │ notes", 5000);
-    const strip_end = grid.rowByteOf(navTabsRow(), 30);
-    try std.testing.expectEqualStrings("╭─ files │ notes │ agents ───╮", grid.rowText(navTabsRow())[0..strip_end]);
-    try std.testing.expectEqualStrings("│", aiCellText(&grid, navTabsRow(), 9));
-    try std.testing.expectEqualStrings("│", aiCellText(&grid, navTabsRow(), 17));
-    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, navTabsRow(), navTabCol(0)));
-    try std.testing.expectEqual(navEditorBg(), aiCellBg(&grid, navTabsRow(), navTabCol(1)));
+    try gridWaitFor(&sess, &grid, "╭─ OZ", 5000);
+    try gridWaitFor(&sess, &grid, "Files", 5000);
+    try std.testing.expect(aiRowContains(&grid, navTabsRow() - 1, "main"));
+    const files_col = navTabStart(&grid, "Files") orelse return error.TestUnexpectedResult;
+    const notes_col = navTabStart(&grid, "Notes") orelse return error.TestUnexpectedResult;
+    const agents_col = navTabStart(&grid, "Agents") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(aiRowContains(&grid, navTabsRow(), "Files"));
+    try std.testing.expect(aiRowContains(&grid, navTabsRow(), "Notes"));
+    try std.testing.expect(aiRowContains(&grid, navTabsRow(), "Agents"));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, navTabsRow(), notes_col - 1));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, navTabsRow(), agents_col - 1));
+    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, navTabsRow(), files_col));
+    try std.testing.expectEqual(navEditorBg(), aiCellBg(&grid, navTabsRow(), notes_col));
+    // Active-tab underline and the frame around the first content row.
+    try frame.expectCellUl(&grid, navTabsRow(), files_col, packRgb(0x7E, 0x9C, 0xD8));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, navBodyRow(), 0));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, navBodyRow(), 29));
 
     // Rail: AGENTS header band, readable count, active thread marker.
     try sess.send(" a");
@@ -15732,21 +15813,24 @@ test "ui chrome: theme matrix colors active tabs, separators and focused borders
         try gridWaitFor(&sess, &grid, "NORMAL", 8000);
         try gridWaitFor(&sess, &grid, "theme matrix fixture", 5000);
         try sess.send(" e");
-        try gridWaitFor(&sess, &grid, "╭─ files", 5000);
+        try gridWaitFor(&sess, &grid, "╭─ OZ", 5000);
+        try gridWaitFor(&sess, &grid, "Files", 5000);
 
-        var sample = ThemeStyleSample{};
         const nav_row = navTabsRow();
-        sample.nav_tab_bg = aiCellBg(&grid, nav_row, navTabCol(0));
-        sample.nav_tab_fg = grid.fg_buf[nav_row * grid.cols + navTabCol(0)];
-        sample.nav_tab_ul = frame.cellUl(&grid, nav_row, navTabCol(0));
-        sample.nav_sep_fg = grid.fg_buf[nav_row * grid.cols + 9]; // "│" at x=9
+        const files_col = navTabStart(&grid, "Files") orelse return error.TestUnexpectedResult;
+        const notes_col = navTabStart(&grid, "Notes") orelse return error.TestUnexpectedResult;
+        var sample = ThemeStyleSample{};
+        sample.nav_tab_bg = aiCellBg(&grid, nav_row, files_col);
+        sample.nav_tab_fg = grid.fg_buf[nav_row * grid.cols + files_col + 2];
+        sample.nav_tab_ul = frame.cellUl(&grid, nav_row, files_col);
+        sample.nav_sep_fg = grid.fg_buf[nav_row * grid.cols + notes_col - 1]; // "│"
         // Navigator owns the keyboard after <leader>e: active panel border.
         sample.nav_border_fg = grid.fg_buf[2 * grid.cols + 0];
 
         try std.testing.expectEqual(tc.bg_sel, sample.nav_tab_bg);
         try std.testing.expectEqual(tc.fg, sample.nav_tab_fg);
         try std.testing.expectEqual(tc.accent_alt, sample.nav_tab_ul);
-        try std.testing.expect(frame.cellUnderlined(&grid, nav_row, navTabCol(0)));
+        try std.testing.expect(frame.cellUnderlined(&grid, nav_row, files_col));
         try std.testing.expectEqual(tc.accent_alt, sample.nav_sep_fg);
         try std.testing.expect(sample.nav_sep_fg != tc.fg_faint);
         try std.testing.expectEqual(tc.win_sep_active, sample.nav_border_fg);
@@ -16268,7 +16352,7 @@ test "hints: 120x30 dock labels the filetree and activates the docs row" {
     // File tree rooted at the project cwd: row 3 is the first entry "docs"
     // (the navigator starts below the two-row buffer strip).
     try sess.send(" e");
-    try gridWaitFor(&sess, &grid, " files ", 5000);
+    try gridWaitFor(&sess, &grid, "Files", 5000);
     try gridWaitFor(&sess, &grid, "docs", 5000);
 
     // Docked rail with a thread + prompt, then Esc back to the editor. The
@@ -16300,15 +16384,15 @@ test "hints: 120x30 dock labels the filetree and activates the docs row" {
     // row's top-left (the inner column after the border). Derive the label
     // from the frame instead of hard-coding a letter.
     var label_buf: [3]u8 = undefined;
-    const label = hintLabelAt(&grid, &label_buf, 3, 1, want);
+    const label = hintLabelAt(&grid, &label_buf, navBodyRow(), 1, want);
     if (label.len != want) {
-        std.debug.print("docs hints: could not read label at (3,1): got {d} of {d} chars\n", .{ label.len, want });
+        std.debug.print("docs hints: could not read label at ({d},1): got {d} of {d} chars\n", .{ navBodyRow(), label.len, want });
         grid.dump();
         return error.TestUnexpectedResult;
     }
     // Borders stay intact under the overlay: the label starts inside the
     // panel, and the status bar keeps NORMAL + HINTS on its own row.
-    try std.testing.expectEqualStrings("│", aiCellText(&grid, 3, 0));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, navBodyRow(), 0));
     try frame.expectNoHorizontalOverflow(&grid, grid.cols);
 
     // Typing the full label expands docs exactly like Enter: its children
@@ -16611,40 +16695,71 @@ test "navigator: 120x30 tabs switch files/notes/agents with real content" {
     var grid = try Grid.initSizedCols(alloc, 30, 120);
     defer grid.deinit(alloc);
     try gridWaitFor(&sess, &grid, "NORMAL", 8000);
-
-    // Files: existing tree + tab strip in the top border row.
+    // Files: branded full navigator with OZ, workspace/branch, icon tabs.
     try sess.send(" e");
     try gridWaitFor(&sess, &grid, "build.zig", 6000);
-    try gridWaitFor(&sess, &grid, "╭─ files │ notes", 6000);
+    try gridWaitFor(&sess, &grid, "╭─ OZ", 6000);
     try std.testing.expect(!pathExists(io, notes_dir));
-    const strip = grid.rowText(navTabsRow());
-    try std.testing.expect(std.mem.indexOf(u8, strip, "╭─ files │ notes │ agents") != null);
-    try std.testing.expectEqualStrings("│", aiCellText(&grid, navTabsRow(), 9));
-    try std.testing.expectEqualStrings("│", aiCellText(&grid, navTabsRow(), 17));
-    try std.testing.expectEqualStrings("╭", aiCellText(&grid, navTabsRow(), 0));
-    try std.testing.expectEqualStrings("╮", aiCellText(&grid, navTabsRow(), 29));
-    // Active tab uses bg_sel; the inactive ones keep the editor bg.
-    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, navTabsRow(), navTabCol(0)));
-    try std.testing.expectEqual(navEditorBg(), aiCellBg(&grid, navTabsRow(), navTabCol(1)));
-    try std.testing.expectEqual(navEditorBg(), aiCellBg(&grid, navTabsRow(), navTabCol(2)));
 
-    // Tab -> Notes: empty state + lazy directory creation on first list.
+    const top_row = navTabsRow() - 2;
+    try std.testing.expect(aiRowContains(&grid, top_row, "OZ"));
+    try std.testing.expect(aiRowContains(&grid, top_row, "╮"));
+    // Real workspace + git branch from the running repo (never a placeholder).
+    try std.testing.expect(aiRowContains(&grid, navTabsRow() - 1, "main"));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, navTabsRow() - 1, 0));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, navTabsRow() - 1, 29));
+    // Rule row closes the header before the content.
+    try std.testing.expectEqualStrings("├", aiCellText(&grid, navTabsRow() + 1, 0));
+    try std.testing.expectEqualStrings("┤", aiCellText(&grid, navTabsRow() + 1, 29));
+
+    const tab_row = grid.rowText(navTabsRow());
+    try std.testing.expect(std.mem.indexOf(u8, tab_row, "Files") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tab_row, "Notes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tab_row, "Agents") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tab_row, "\u{f07b}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tab_row, "\u{f0219}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tab_row, "\u{f0c0}") != null);
+    // Real cached counts: Files is the visible tree-row count; Notes has no
+    // badge until its lazy list loads; Agents counts the real threads (0
+    // until the Agents view/rail creates the lazy session thread).
+    try std.testing.expect(navTabCount(&grid, "Files") != null);
+    try std.testing.expectEqual(@as(?usize, 0), navTabCount(&grid, "Agents"));
+    try std.testing.expectEqual(@as(?usize, null), navTabCount(&grid, "Notes"));
+
+    var files_col = navTabStart(&grid, "Files") orelse return error.TestUnexpectedResult;
+    var notes_col = navTabStart(&grid, "Notes") orelse return error.TestUnexpectedResult;
+    var agents_col = navTabStart(&grid, "Agents") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, navTabsRow(), notes_col - 1));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, navTabsRow(), agents_col - 1));
+    // Active tab uses bg_sel; the inactive ones keep the editor bg.
+    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, navTabsRow(), files_col));
+    try std.testing.expectEqual(navEditorBg(), aiCellBg(&grid, navTabsRow(), notes_col));
+    try std.testing.expectEqual(navEditorBg(), aiCellBg(&grid, navTabsRow(), agents_col));
+    try frame.expectCellUl(&grid, navTabsRow(), files_col, packRgb(0x7E, 0x9C, 0xD8));
+
+    // Tab -> Notes: empty state + lazy directory creation on first list. Its
+    // real count (0) appears once the cached list is loaded.
     try sess.send("\t");
     try gridWaitFor(&sess, &grid, "no notes yet", 5000);
     try std.testing.expect(pathExists(io, notes_dir));
-    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, navTabsRow(), navTabCol(1)));
-    try std.testing.expectEqual(navEditorBg(), aiCellBg(&grid, navTabsRow(), navTabCol(0)));
-    // Border frame intact around the tabs.
-    try std.testing.expectEqualStrings("│", aiCellText(&grid, 3, 0));
-    try std.testing.expectEqualStrings("│", aiCellText(&grid, 3, 29));
+    try std.testing.expectEqual(@as(?usize, 0), navTabCount(&grid, "Notes"));
+    files_col = navTabStart(&grid, "Files") orelse return error.TestUnexpectedResult;
+    notes_col = navTabStart(&grid, "Notes") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, navTabsRow(), notes_col));
+    try std.testing.expectEqual(navEditorBg(), aiCellBg(&grid, navTabsRow(), files_col));
+    // Border frame intact around the content.
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, navBodyRow(), 0));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, navBodyRow(), 29));
 
     // Tab -> Agents: real thread model, grouped under the current workspace.
     try sess.send("\t");
     try gridWaitFor(&sess, &grid, "thread 1", 5000);
-    try std.testing.expect(aiRowContains(&grid, 3, "main"));
-    try std.testing.expect(aiRowContains(&grid, 4, "thread 1"));
-    try std.testing.expect(aiRowContains(&grid, 4, "idle"));
-    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, navTabsRow(), navTabCol(2)));
+    try std.testing.expect(aiRowContains(&grid, navBodyRow(), "main"));
+    try std.testing.expect(aiRowContains(&grid, navBodyRow() + 1, "thread 1"));
+    try std.testing.expect(aiRowContains(&grid, navBodyRow() + 1, "idle"));
+    try std.testing.expectEqual(@as(?usize, 1), navTabCount(&grid, "Agents"));
+    agents_col = navTabStart(&grid, "Agents") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, navTabsRow(), agents_col));
 
     // Shift-Tab goes back to Notes, direct "1" returns to Files.
     try sess.send("\x1b[Z");
@@ -16687,7 +16802,7 @@ test "navigator: notes create, edit, save and reopen from the list" {
 
     // Files -> Notes, then `n`: a real note file + normal buffer.
     try sess.send(" e");
-    try gridWaitFor(&sess, &grid, "files", 5000);
+    try gridWaitFor(&sess, &grid, "Files", 5000);
     try sess.send("\t");
     try gridWaitFor(&sess, &grid, "no notes yet", 5000);
     try sess.send("n");
@@ -16798,10 +16913,10 @@ test "navigator: agents tab Enter attaches the selected real thread" {
 
     // Files -> Agents. thread 1 is the real lazily-created session thread.
     try sess.send(" e");
-    try gridWaitFor(&sess, &grid, "files", 5000);
+    try gridWaitFor(&sess, &grid, "Files", 5000);
     try sess.send("\t\t");
     try gridWaitFor(&sess, &grid, "thread 1", 5000);
-    try std.testing.expect(aiRowContains(&grid, 3, "main"));
+    try std.testing.expect(aiRowContains(&grid, navBodyRow(), "main"));
 
     // `n` on the navigator = aiNewThread: the rail opens on thread 2.
     try sess.send("n");
@@ -16862,20 +16977,21 @@ test "hints: navigator tab and note row labels activate targets" {
     try gridWaitFor(&sess, &grid, "NORMAL", 8000);
 
     try sess.send(" e");
-    try gridWaitFor(&sess, &grid, "files", 5000);
+    try gridWaitFor(&sess, &grid, "Files", 5000);
     try sess.send("\t");
     try gridWaitFor(&sess, &grid, "Alpha note", 5000);
 
-    // Enter hint mode; read the files-tab label from the DRAWN frame and
-    // activate it (the notes list must disappear, the tree must appear).
+    // Enter hint mode; the hint label covers the tab's icon cell, which is
+    // the target's top-left. Record the (pre-label) starts first.
+    const files_start = navTabStart(&grid, "Files") orelse return error.TestUnexpectedResult;
     try sess.send(" j");
     try gridWaitFor(&sess, &grid, "HINTS ·", 5000);
     const count = hintTargetCount(&grid) orelse return error.TestUnexpectedResult;
     const want = hintLabelLenFor(count);
     var label_buf: [3]u8 = undefined;
-    const files_label = hintLabelAt(&grid, &label_buf, navTabsRow(), navTabCol(0), want);
+    const files_label = hintLabelAt(&grid, &label_buf, navTabsRow(), files_start, want);
     if (files_label.len != want) {
-        std.debug.print("nav hints: no files-tab label at ({d},{d}): {d}/{d}\n", .{ navTabsRow(), navTabCol(0), files_label.len, want });
+        std.debug.print("nav hints: no files-tab label at ({d},{d}): {d}/{d}\n", .{ navTabsRow(), files_start, files_label.len, want });
         grid.dump();
         return error.TestUnexpectedResult;
     }
@@ -16883,19 +16999,20 @@ test "hints: navigator tab and note row labels activate targets" {
     try gridWaitFor(&sess, &grid, "build.zig", 5000);
     try gridWaitGone(&sess, &grid, "HINTS ·", 4000);
     try std.testing.expect(!grid.contains("Alpha note"));
-    try std.testing.expectEqualStrings("│", aiCellText(&grid, 3, 0));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, navBodyRow(), 0));
     try frame.expectNoHorizontalOverflow(&grid, grid.cols);
 
-    // Back to Notes and open the note through its drawn row label.
+    // Back to Notes and open the note through its drawn row label. The
+    // first content row is the note title; its target starts at column 1.
     try sess.send("2");
     try gridWaitFor(&sess, &grid, "Alpha note", 5000);
     try sess.send(" j");
     try gridWaitFor(&sess, &grid, "HINTS ·", 5000);
     const want2 = hintLabelLenFor(hintTargetCount(&grid) orelse return error.TestUnexpectedResult);
     var note_label_buf: [3]u8 = undefined;
-    const note_label = hintLabelAt(&grid, &note_label_buf, navTabsRow() + 1, 1, want2);
+    const note_label = hintLabelAt(&grid, &note_label_buf, navBodyRow(), 1, want2);
     if (note_label.len != want2) {
-        std.debug.print("nav hints: no note-row label at ({d},1): {d}/{d}\n", .{ navTabsRow() + 1, note_label.len, want2 });
+        std.debug.print("nav hints: no note-row label at ({d},1): {d}/{d}\n", .{ navBodyRow(), note_label.len, want2 });
         grid.dump();
         return error.TestUnexpectedResult;
     }
@@ -16943,7 +17060,7 @@ test "navigator: unavailable notes dir shows a clear error, no crash" {
     try gridWaitFor(&sess, &grid, "NORMAL", 8000);
 
     try sess.send(" e");
-    try gridWaitFor(&sess, &grid, "files", 5000);
+    try gridWaitFor(&sess, &grid, "Files", 5000);
     try sess.send("\t");
     try gridWaitFor(&sess, &grid, "! notes unavailable", 5000);
     try std.testing.expect(grid.contains("NORMAL"));
@@ -16959,7 +17076,7 @@ test "navigator: unavailable notes dir shows a clear error, no crash" {
     try aiQuit(&sess);
 }
 
-test "navigator: 80x24 tabs fit and the notes list scrolls" {
+test "navigator: 80x24 compact rail + notes peek scroll" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
@@ -16976,8 +17093,6 @@ test "navigator: 80x24 tabs fit and the notes list scrolls" {
     var notes_buf: [128]u8 = undefined;
     const notes_dir = try notesTestDir(io, &notes_buf);
     defer std.Io.Dir.cwd().deleteTree(io, notes_dir) catch {};
-    // 12 notes: 10 fit in the 20 content rows (2 rows each); j*10 scrolls
-    // exactly one note off the top.
     var i: usize = 1;
     while (i <= 12) : (i += 1) {
         var fname_buf: [32]u8 = undefined;
@@ -16996,35 +17111,298 @@ test "navigator: 80x24 tabs fit and the notes list scrolls" {
     defer grid.deinit(alloc);
     try gridWaitFor(&sess, &grid, "NORMAL", 8000);
 
+    // <leader>e at 80 opens the compact rail's 30-cell peek. The peek is a
+    // real navigator box (brand + tabs + content), not a label-only stub.
     try sess.send(" e");
-    try gridWaitFor(&sess, &grid, "╭─ files │ notes", 5000);
-    // 30-cell strip, exact fit inside the 80-col screen.
-    // 30 CELLS, not 30 bytes (box-drawing glyphs are 3 bytes each).
-    const strip_end = grid.rowByteOf(navTabsRow(), 30);
-    try std.testing.expectEqualStrings("╭─ files │ notes │ agents ───╮", grid.rowText(navTabsRow())[0..strip_end]);
-    try std.testing.expectEqualStrings("╮", aiCellText(&grid, navTabsRow(), 29));
-    try std.testing.expectEqualStrings("│", aiCellText(&grid, 3, 29));
+    try gridWaitFor(&sess, &grid, "╭─ OZ", 5000);
+    try gridWaitFor(&sess, &grid, "Files", 5000);
+    try std.testing.expectEqualStrings("╮", aiCellText(&grid, navTabsRow() - 2, 29));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, navTabsRow(), 29));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, navBodyRow(), 29));
     try frame.expectNoHorizontalOverflow(&grid, grid.cols);
 
+    // Files -> Notes through the peek; 12 notes, 7 fit in the peek's 15
+    // content rows (2 rows each). A page of j scrolls three notes off.
     try sess.send("\t");
     try gridWaitFor(&sess, &grid, "Note 12", 5000);
-    // Newest first: note-12's title row is the first content row.
-    try std.testing.expect(aiRowContains(&grid, 3, "Note 12"));
-    try std.testing.expect(aiRowContains(&grid, 4, "note-12.md"));
-    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, 3, 1));
+    try std.testing.expect(aiRowContains(&grid, navBodyRow(), "Note 12"));
+    try std.testing.expect(aiRowContains(&grid, navBodyRow() + 1, "note-12.md"));
+    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, navBodyRow(), 1));
 
-    // Scroll one full page (9 notes fit in the 18 note rows): the top note
-    // leaves, note 03 becomes visible at the bottom.
     try sess.send("jjjjjjjjj");
     try gridWaitGone(&sess, &grid, "Note 12", 5000);
-    try std.testing.expect(aiRowContains(&grid, 3, "Note 11"));
+    try std.testing.expect(aiRowContains(&grid, navBodyRow(), "Note 09"));
     try std.testing.expect(grid.contains("Note 03"));
     try frame.expectNoHorizontalOverflow(&grid, grid.cols);
 
     // ...and back up: the list restores the first note.
     try sess.send("kkkkkkkkk");
     try gridWaitFor(&sess, &grid, "Note 12", 5000);
-    try std.testing.expect(aiRowContains(&grid, 3, "Note 12"));
+    try std.testing.expect(aiRowContains(&grid, navBodyRow(), "Note 12"));
+
+    // Esc closes only the peek; the icon rail remains and the editor uses
+    // the full width again.
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "Note 12", 4000);
+    try std.testing.expect(grid.contains("OZ"));
+    try std.testing.expect(!grid.contains("╭─ OZ"));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 3, nav_model.compact_width - 1));
+    const marker = aiFindCell(&grid, "NAV80_MARKER");
+    try std.testing.expect(marker != null);
+    try std.testing.expect(marker.?.col >= nav_model.compact_width + nav_model.gutter);
+
+    try aiQuit(&sess);
+}
+
+test "navigator: 120x30 brand header shows workspace, real branch and counts" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    // Open a file inside the repo (the test cwd) so the workspace root stays
+    // the git checkout and the header can read the real branch.
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, "build.zig" }, null, 30, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "⎇", 5000); // async git status settled
+
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "╭─ OZ", 5000);
+    try gridWaitFor(&sess, &grid, "Files", 5000);
+    const top = navTabsRow() - 2;
+    try std.testing.expect(aiRowContains(&grid, top, "OZ"));
+    // OZ uses the theme accent (bold is not carried by the cell grid; the
+    // generated style is unit-covered by chrome's theme matrix).
+    try std.testing.expectEqual(packRgb(0xE6, 0xC3, 0x84), grid.fg_buf[top * grid.cols + 3]);
+    try std.testing.expectEqualStrings("╮", aiCellText(&grid, top, 29));
+    // "main / <branch>" is only produced when a real branch is available.
+    try std.testing.expect(aiRowContains(&grid, navTabsRow() - 1, "main / "));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, navTabsRow() - 1, 0));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, navTabsRow() - 1, 29));
+    // Real cached counts: Files > 0, Notes unknown until loaded, Agents 0.
+    try std.testing.expect(navTabCount(&grid, "Files") != null);
+    try std.testing.expectEqual(@as(?usize, null), navTabCount(&grid, "Notes"));
+    try std.testing.expectEqual(@as(?usize, 0), navTabCount(&grid, "Agents"));
+    // Active icon uses the accent marker color on bg_sel.
+    const files_col = navTabStart(&grid, "Files") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, navTabsRow(), files_col));
+    try std.testing.expectEqual(packRgb(0x7E, 0x9C, 0xD8), grid.fg_buf[navTabsRow() * grid.cols + files_col]);
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, navBodyRow(), 0));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, navBodyRow(), 29));
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    try aiQuit(&sess);
+}
+
+test "navigator: 80x24 compact rail 1/2/3, hints, outside click and drawer" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_compact_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var sub_buf: [200]u8 = undefined;
+    const sub = try std.fmt.bufPrint(&sub_buf, "{s}/sub", .{root});
+    try std.Io.Dir.cwd().createDirPath(io, sub);
+    try aiWriteFile(io, root, "second.txt", "INNER_COMPACT_MARKER\n");
+    var fixture_buf: [200:0]u8 = undefined;
+    const fixture = try bufPrintZ(&fixture_buf, "{s}/fixture.txt", .{root});
+    try aiWriteFile(io, root, "fixture.txt", "COMPACT_MARKER\n");
+
+    var notes_buf: [128]u8 = undefined;
+    const notes_dir = try notesTestDir(io, &notes_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, notes_dir) catch {};
+    try aiWriteFile(io, notes_dir, "alpha.md", "# Alpha note\n\ncompact note body\n");
+    const notes_env = try std.fmt.allocPrint(alloc, "OZ_NOTES_DIR={s}", .{notes_dir});
+    defer alloc.free(notes_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, fixture }, &.{notes_env}, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "COMPACT_MARKER", 5000);
+
+    // Explicit navigator entry opens the real 30-cell peek over the editor.
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "╭─ OZ", 5000);
+    try gridWaitFor(&sess, &grid, "Files", 5000);
+    try gridWaitFor(&sess, &grid, "sub", 5000);
+    try std.testing.expectEqualStrings("╮", aiCellText(&grid, navTabsRow() - 2, 29));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, navTabsRow(), 29));
+
+    // 2/3/1 switch the peek's real content while the navigator owns keys;
+    // Tab/Shift-Tab cycle the same model.
+    try sess.send("2");
+    try gridWaitFor(&sess, &grid, "Alpha note", 5000);
+    try sess.send("3");
+    try gridWaitFor(&sess, &grid, "thread 1", 5000);
+    try sess.send("1");
+    try gridWaitFor(&sess, &grid, "sub", 5000);
+    try sess.send("\t");
+    try gridWaitFor(&sess, &grid, "Alpha note", 5000);
+    try sess.send("\x1b[Z");
+    try gridWaitFor(&sess, &grid, "sub", 5000);
+
+    // Esc closes only the peek: the icon rail remains and the editor gets
+    // its full width back (text starts at the compact gutter).
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "╭─ OZ", 4000);
+    try std.testing.expect(navCompactRailVisible(&grid));
+    try std.testing.expect(aiRowContains(&grid, 2, "OZ"));
+    try std.testing.expectEqualStrings("\u{f07b}", aiCellText(&grid, navCompactTabRow(0), 2));
+    try std.testing.expectEqualStrings("\u{f0219}", aiCellText(&grid, navCompactTabRow(1), 2));
+    try std.testing.expectEqualStrings("\u{f0c0}", aiCellText(&grid, navCompactTabRow(2), 2));
+    // Active icon: bg_sel across both rows + accent left bar/icon; inactive
+    // Notes keeps the panel bg and fg_dim.
+    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, navCompactTabRow(0), 1));
+    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, navCompactTabRow(0) + 1, 1));
+    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, navCompactTabRow(0), 2));
+    try std.testing.expectEqual(packRgb(0x7E, 0x9C, 0xD8), grid.fg_buf[navCompactTabRow(0) * grid.cols]);
+    try std.testing.expectEqual(packRgb(0x7E, 0x9C, 0xD8), grid.fg_buf[navCompactTabRow(0) * grid.cols + 2]);
+    try std.testing.expectEqual(navEditorBg(), aiCellBg(&grid, navCompactTabRow(1), 1));
+    try std.testing.expectEqual(packRgb(0x72, 0x71, 0x69), grid.fg_buf[navCompactTabRow(1) * grid.cols + 2]);
+    const marker_cell = aiFindCell(&grid, "COMPACT_MARKER") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(marker_cell.col >= nav_model.compact_width + nav_model.gutter);
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    // Mouse: clicking an icon opens the peek; clicking the editor closes it
+    // without falling through to a cursor placement.
+    try mouseClickAt(&sess, 2, navCompactTabRow(1));
+    try gridWaitFor(&sess, &grid, "Alpha note", 5000);
+    // A click on the peek header (no target) must not fall through to the
+    // editor pane underneath and close the peek.
+    try mouseClickAt(&sess, 20, navTabsRow() - 1);
+    _ = try uiPump(&sess, &grid, 250);
+    try std.testing.expect(grid.contains("╭─ OZ"));
+    // A click outside the 30-cell peek does close it and returns the editor.
+    try mouseClickAt(&sess, 40, 10);
+    try gridWaitGone(&sess, &grid, "╭─ OZ", 4000);
+    try std.testing.expect(navCompactRailVisible(&grid));
+
+    // Keyboard hints target the compact icons too (labels sit at the rail's
+    // first cell), and activating one opens the corresponding peek.
+    try sess.send(" j");
+    try gridWaitFor(&sess, &grid, "HINTS ·", 5000);
+    const count = hintTargetCount(&grid) orelse return error.TestUnexpectedResult;
+    const want = hintLabelLenFor(count);
+    var label_buf: [3]u8 = undefined;
+    const notes_label = hintLabelAt(&grid, &label_buf, navCompactTabRow(1), 0, want);
+    if (notes_label.len != want) {
+        std.debug.print("compact hints: no notes icon label at ({d},0): {d}/{d}\n", .{ navCompactTabRow(1), notes_label.len, want });
+        grid.dump();
+        return error.TestUnexpectedResult;
+    }
+    try sess.send(notes_label);
+    try gridWaitFor(&sess, &grid, "Alpha note", 5000);
+    try std.testing.expect(grid.contains("╭─ OZ"));
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "╭─ OZ", 4000);
+
+    // Opening a note closes the peek and returns the editor.
+    try mouseClickAt(&sess, 2, navCompactTabRow(1));
+    try gridWaitFor(&sess, &grid, "Alpha note", 5000);
+    try mouseClickAt(&sess, 5, navBodyRow());
+    try gridWaitFor(&sess, &grid, "# Alpha note", 5000);
+    try gridWaitGone(&sess, &grid, "╭─ OZ", 4000);
+    try std.testing.expect(navCompactRailVisible(&grid));
+
+    // Opening a file from Files closes the peek as well. second.txt lives in
+    // the workspace root, so opening it does not re-root/close the tree.
+    try mouseClickAt(&sess, 2, navCompactTabRow(0));
+    try gridWaitFor(&sess, &grid, "sub", 5000);
+    try gridWaitFor(&sess, &grid, "second.txt", 5000);
+    try sess.send("jj\r");
+    try gridWaitFor(&sess, &grid, "INNER_COMPACT_MARKER", 5000);
+    try gridWaitGone(&sess, &grid, "╭─ OZ", 4000);
+    try std.testing.expect(navCompactRailVisible(&grid));
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    // Agent drawer still opens over the compact rail, never sharing it with
+    // the navigator peek; Esc closes the drawer and leaves the rail.
+    try sess.send("\x17a");
+    try gridWaitFor(&sess, &grid, "AGENTS", 5000);
+    try std.testing.expect(!grid.contains("╭─ OZ"));
+    try std.testing.expect(navCompactRailVisible(&grid));
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "AGENTS", 4000);
+    try std.testing.expect(navCompactRailVisible(&grid));
+
+    // Agents peek: `n` creates a real thread and opens the drawer, closing
+    // the peek (no stacked overlays).
+    try mouseClickAt(&sess, 2, navCompactTabRow(2));
+    try gridWaitFor(&sess, &grid, "thread 1", 5000);
+    try sess.send("n");
+    try gridWaitFor(&sess, &grid, "thread 2", 5000);
+    try gridWaitGone(&sess, &grid, "╭─ OZ", 4000);
+    try gridWaitFor(&sess, &grid, "AGENTS", 5000);
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "AGENTS", 4000);
+    try std.testing.expect(navCompactRailVisible(&grid));
+
+    // <leader>e hides the navigator completely; the editor keeps its width.
+    try sess.send(" e");
+    var waited: i32 = 0;
+    while (navCompactRailVisible(&grid)) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) {
+            waited += 100;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!navCompactRailVisible(&grid));
+    try std.testing.expect(aiFindCell(&grid, "INNER_COMPACT_MARKER") != null);
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    try aiQuit(&sess);
+}
+
+test "navigator: 60x24 compact peek and rail never overflow" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_compact60_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var fixture_buf: [200:0]u8 = undefined;
+    const fixture = try bufPrintZ(&fixture_buf, "{s}/fixture.txt", .{root});
+    try aiWriteFile(io, root, "fixture.txt", "COMPACT60_MARKER\n");
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, fixture }, null, 24, 60, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 60);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "╭─ OZ", 5000);
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, navBodyRow(), 29));
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "╭─ OZ", 4000);
+    try std.testing.expect(navCompactRailVisible(&grid));
+    const marker_cell = aiFindCell(&grid, "COMPACT60_MARKER") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(marker_cell.col >= nav_model.compact_width + nav_model.gutter);
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+
+    try mouseClickAt(&sess, 2, navCompactTabRow(0));
+    try gridWaitFor(&sess, &grid, "╭─ OZ", 5000);
+    try frame.expectNoHorizontalOverflow(&grid, grid.cols);
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "╭─ OZ", 4000);
+    try std.testing.expect(navCompactRailVisible(&grid));
 
     try aiQuit(&sess);
 }
@@ -18828,6 +19206,7 @@ test "tools: 80x24 drawer fits cards/chart and a hint expands the card" {
 // ---------------------------------------------------------------------------
 const frame = @import("frame.zig");
 const ai_ws = @import("ai_workspace");
+const nav_model = @import("navigator");
 
 const scenario_fixture =
     "GOLDEN_EDITOR_MARKER\n" ++
@@ -19237,6 +19616,9 @@ const Scenario = struct {
     cols: u16,
     setup: ScenarioSetup = .plain,
     filetree: bool = false,
+    /// The final frame is the resting compact icon rail (the peek was closed
+    /// by a step), not the 30-cell panel. Used by <90-col scenarios.
+    compact_rail: bool = false,
     rail: ScenarioRail = .hidden,
     /// Extra keystrokes after the state setup (filetree/rail/prompt).
     steps: []const ScenarioStep = &.{},
@@ -19298,7 +19680,17 @@ const scenario_matrix = [_]Scenario{
         .rows = 24,
         .cols = 80,
         .filetree = true,
-        .expect_text = &.{"files"},
+        .expect_text = &.{"Files"},
+    },
+    .{
+        .name = "navigator compact rail 80x24",
+        .tags = &.{ "@layout", "@navigator", "@compact", "@80col" },
+        .rows = 24,
+        .cols = 80,
+        .filetree = true,
+        .compact_rail = true,
+        .steps = &.{.{ .keys = "\x1b", .wait_for = "  OZ  " }},
+        .expect_text = &.{"OZ"},
     },
     .{
         .name = "filetree 100x30",
@@ -19306,7 +19698,7 @@ const scenario_matrix = [_]Scenario{
         .rows = 30,
         .cols = 100,
         .filetree = true,
-        .expect_text = &.{ "files", "GOLDEN_EDITOR_MARKER" },
+        .expect_text = &.{ "Files", "GOLDEN_EDITOR_MARKER" },
     },
     .{
         .name = "filetree 120x30",
@@ -19314,7 +19706,7 @@ const scenario_matrix = [_]Scenario{
         .rows = 30,
         .cols = 120,
         .filetree = true,
-        .expect_text = &.{ "files", "GOLDEN_EDITOR_MARKER" },
+        .expect_text = &.{ "Files", "GOLDEN_EDITOR_MARKER" },
     },
     .{
         .name = "ai rail 80x24 drawer",
@@ -19347,7 +19739,7 @@ const scenario_matrix = [_]Scenario{
         .cols = 80,
         .filetree = true,
         .rail = .drawer,
-        .expect_text = &.{ "files", "AGENTS", "changes 0" },
+        .expect_text = &.{ "OZ", "AGENTS", "changes 0" },
     },
     .{
         .name = "ai rail + filetree 100x30",
@@ -19356,7 +19748,7 @@ const scenario_matrix = [_]Scenario{
         .cols = 100,
         .filetree = true,
         .rail = .docked,
-        .expect_text = &.{ "files", "AGENTS", "changes 0", "GOLDEN_EDITOR_MARKER" },
+        .expect_text = &.{ "Files", "AGENTS", "changes 0", "GOLDEN_EDITOR_MARKER" },
     },
     .{
         .name = "ai rail + filetree 120x30",
@@ -19365,7 +19757,7 @@ const scenario_matrix = [_]Scenario{
         .cols = 120,
         .filetree = true,
         .rail = .docked,
-        .expect_text = &.{ "files", "AGENTS", "changes 0", "GOLDEN_EDITOR_MARKER" },
+        .expect_text = &.{ "Files", "AGENTS", "changes 0", "GOLDEN_EDITOR_MARKER" },
     },
     .{
         .name = "ai chat stream 120x30 dock",
@@ -19524,7 +19916,7 @@ const scenario_matrix = [_]Scenario{
         .filetree = true,
         .notes = true,
         .steps = &.{.{ .keys = "\t", .wait_for = "Scenario note" }},
-        .expect_text = &.{ "files", "notes", "agents", "Scenario note", "GOLDEN_EDITOR_MARKER" },
+        .expect_text = &.{ "Files", "Notes", "Agents", "Scenario note", "GOLDEN_EDITOR_MARKER" },
     },
     .{
         .name = "navigator agents 100x30",
@@ -19533,7 +19925,7 @@ const scenario_matrix = [_]Scenario{
         .cols = 100,
         .filetree = true,
         .steps = &.{.{ .keys = "\t\t", .wait_for = "thread 1" }},
-        .expect_text = &.{ "files", "notes", "agents", "thread 1", "idle" },
+        .expect_text = &.{ "Files", "Notes", "Agents", "thread 1", "idle" },
     },
 };
 
@@ -19542,7 +19934,7 @@ const scenario_matrix = [_]Scenario{
 /// fails with a clear message otherwise (instead of silently dropping it).
 const required_scenario_tags = [_][]const u8{
     "@layout",   "@ai",    "@filetree", "@stream", "@hints",  "@mouse",  "@navigator", "@notes", "@inline", "@tools",
-    "@approval", "@80col", "@100col",   "@120col", "@drawer", "@docked",
+    "@approval", "@80col", "@100col",   "@120col", "@drawer", "@docked", "@compact",
 };
 
 fn expectedRailMode(rail: ScenarioRail) ai_ws.RailMode {
@@ -19583,6 +19975,24 @@ fn findNavigatorBox(grid: *Grid) ?frame.Rect {
     return null;
 }
 
+/// The full/peek navigator is a closed box whose header contains one
+/// internal `├──┤` rule (below the tab strip). `frame.expectBorderBox` treats
+/// every interior row as `│`, so assert the real structure here.
+fn expectNavigatorPanel(grid: *Grid, rect: frame.Rect) !void {
+    try std.testing.expectEqualStrings("╭", frame.cellText(grid, rect.top, rect.left));
+    try std.testing.expectEqualStrings("╮", frame.cellText(grid, rect.top, rect.right));
+    try std.testing.expectEqualStrings("╰", frame.cellText(grid, rect.bottom, rect.left));
+    try std.testing.expectEqualStrings("╯", frame.cellText(grid, rect.bottom, rect.right));
+    const rule_row = rect.top + nav_model.full_header_rows - 1;
+    var r = rect.top + 1;
+    while (r < rect.bottom) : (r += 1) {
+        const want_left = if (r == rule_row) "├" else "│";
+        const want_right = if (r == rule_row) "┤" else "│";
+        try std.testing.expectEqualStrings(want_left, frame.cellText(grid, r, rect.left));
+        try std.testing.expectEqualStrings(want_right, frame.cellText(grid, r, rect.right));
+    }
+}
+
 fn assertScenario(sc: Scenario, grid: *Grid) !void {
     try std.testing.expectEqual(@as(usize, sc.rows), grid.rows);
     try std.testing.expectEqual(@as(usize, sc.cols), grid.cols);
@@ -19616,9 +20026,9 @@ fn assertScenario(sc: Scenario, grid: *Grid) !void {
         try std.testing.expectEqual(@as(u32, 0), lay.rail_width);
     }
 
-    if (sc.filetree) {
-        // One blank column separates the navigator box from editor content;
-        // the editor's first text cell is at column 31.
+    if (sc.filetree and cols >= nav_model.full_min_cols) {
+        // One blank column separates the 30-cell navigator box from editor
+        // content; the editor's first text cell is at column 31.
         try frame.expectCellBg(grid, 1, 30, aiEditorBg());
         try std.testing.expectEqual(@as(usize, 0), std.mem.trim(u8, frame.cellText(grid, 1, 30), " ").len);
         try std.testing.expect(std.mem.trim(u8, frame.cellText(grid, 1, 31), " ").len > 0);
@@ -19720,29 +20130,47 @@ fn assertScenario(sc: Scenario, grid: *Grid) !void {
             try std.testing.expect(label_cell.len == 1 and hintIsChar(label_cell[0]));
             try std.testing.expectEqualStrings("│", frame.cellText(grid, tabs_row, @as(usize, lay.rail_col)));
         }
-        if (sc.filetree) {
-            // Navigator tabs are targets too: their first cell carries a
-            // label glyph under the overlay.
-            var ti: usize = 0;
-            while (ti < 3) : (ti += 1) {
-                const cell = frame.cellText(grid, navTabsRow(), navTabCol(ti));
-                try std.testing.expect(cell.len == 1 and hintIsChar(cell[0]));
-            }
-        }
     }
 
     if (sc.filetree) {
-        const ft = findNavigatorBox(grid) orelse {
-            std.debug.print("scenario {s}: no 30-cell navigator box in {d}x{d}\n", .{
-                sc.name, sc.rows, sc.cols,
-            });
-            return error.TestUnexpectedResult;
-        };
-        try frame.expectBorderBox(grid, ft, null);
-        if (!sc.hints) try frame.expectTextInRegion(grid, ft, "files");
-        if (rail_rect) |rr| try frame.expectNoOverlap(ft, rr);
-        try frame.expectNoOverlap(ft, status_rect);
-        try std.testing.expect(ft.bottom <= @as(usize, rows) - 2);
+        // <90 cols with the Agent drawer open: opening the rail closed the
+        // peek, so the resting compact icon rail is what remains.
+        const compact_rail = sc.compact_rail or (cols < nav_model.full_min_cols and final_rail != .hidden);
+        if (compact_rail) {
+            const rail_w: usize = nav_model.compact_width;
+            try frame.expectTextInRegion(grid, frame.Rect{
+                .top = 2,
+                .left = 0,
+                .right = rail_w - 1,
+                .bottom = 2,
+            }, "OZ");
+            var rr: usize = 2;
+            while (rr + 2 < rows) : (rr += 1) {
+                try std.testing.expectEqualStrings("│", frame.cellText(grid, rr, rail_w - 1));
+            }
+            try std.testing.expectEqualStrings("\u{f07b}", frame.cellText(grid, navCompactTabRow(0), 2));
+            try std.testing.expectEqualStrings("\u{f0219}", frame.cellText(grid, navCompactTabRow(1), 2));
+            try std.testing.expectEqualStrings("\u{f0c0}", frame.cellText(grid, navCompactTabRow(2), 2));
+            // No content drawer, no overlap with the rail or status band.
+            try frame.expectNoOverlap(frame.Rect{
+                .top = 2,
+                .left = 0,
+                .right = rail_w - 1,
+                .bottom = rows - 3,
+            }, status_rect);
+        } else {
+            const ft = findNavigatorBox(grid) orelse {
+                std.debug.print("scenario {s}: no 30-cell navigator box in {d}x{d}\n", .{
+                    sc.name, sc.rows, sc.cols,
+                });
+                return error.TestUnexpectedResult;
+            };
+            try expectNavigatorPanel(grid, ft);
+            if (!sc.hints) try frame.expectTextInRegion(grid, ft, "Files");
+            if (rail_rect) |rr| try frame.expectNoOverlap(ft, rr);
+            try frame.expectNoOverlap(ft, status_rect);
+            try std.testing.expect(ft.bottom <= @as(usize, rows) - 2);
+        }
     }
 
     for (sc.expect_text) |needle| {
@@ -19888,7 +20316,7 @@ fn runScenario(sc: Scenario) !void {
 
     if (sc.filetree) {
         try sess.send(" e");
-        try gridWaitFor(&sess, &grid, "files", 5000);
+        try gridWaitFor(&sess, &grid, "Files", 5000);
     }
     if (sc.rail != .hidden) {
         // From the file tree, Ctrl+w a is the documented re-entry path;

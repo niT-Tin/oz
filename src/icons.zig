@@ -101,6 +101,26 @@ pub fn folder(open: bool) Icon {
         .{ .glyph = "\u{f07b}", .color = .namespace };
 }
 
+/// Navigator tab icons. Every glyph is from the same confirmed Nerd Font
+/// vocabulary as the file table above (no geometric/emoji glyphs that can
+/// render as tofu on a plain terminal):
+///   Files  — nf-fa-folder (U+F07B), shared with the file tree;
+///   Notes  — nf-md-file_document (U+F0219), the markdown/text page already
+///            used for .txt/requirements;
+///   Agents — nf-fa-users (U+F0C0), the Font Awesome group glyph.
+/// The compact rail and the full strip use the same three marks.
+pub const ui_files: Icon = .{ .glyph = "\u{f07b}", .color = .namespace };
+pub const ui_notes: Icon = .{ .glyph = "\u{f0219}", .color = .type };
+pub const ui_agents: Icon = .{ .glyph = "\u{f0c0}", .color = .accent_alt };
+
+pub fn tabIcon(tab: @import("app/navigator.zig").Tab) Icon {
+    return switch (tab) {
+        .files => ui_files,
+        .notes => ui_notes,
+        .agents => ui_agents,
+    };
+}
+
 const ExtEntry = struct { ext: []const u8, icon: Icon };
 const FileEntry = struct { name: []const u8, icon: Icon };
 
@@ -344,4 +364,17 @@ test "rgbOf: every Color slot resolves to a non-black RGB" {
         const rgb = rgbOf(theme.default, c);
         try std.testing.expect(rgb[0] != 0 or rgb[1] != 0 or rgb[2] != 0);
     }
+}
+
+test "ui: navigator tab icons are distinct Nerd Font glyphs" {
+    const nav = @import("app/navigator.zig");
+    const files = tabIcon(.files);
+    const notes = tabIcon(.notes);
+    const agents = tabIcon(.agents);
+    try std.testing.expectEqualStrings("\u{f07b}", files.glyph);
+    try std.testing.expectEqualStrings("\u{f0219}", notes.glyph);
+    try std.testing.expectEqualStrings("\u{f0c0}", agents.glyph);
+    try std.testing.expect(!std.mem.eql(u8, files.glyph, notes.glyph));
+    try std.testing.expect(!std.mem.eql(u8, notes.glyph, agents.glyph));
+    try std.testing.expectEqual(@as(usize, nav.count), 3);
 }

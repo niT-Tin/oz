@@ -230,6 +230,7 @@ fn ensureThreadVisible(self: *App) void {
 /// `<leader>a`: toggle the rail. Opening focuses the prompt; closing returns
 /// focus to the editor. See `ai.workspace.toggleRail` for the policy.
 pub fn toggleAiPanel(self: *App) !void {
+    self.navigator_peek = false; // never stack the drawer over a nav peek
     const state = ws.toggleRail(self.ai.rail_open, self.ai.focus);
     self.ai.rail_open = state.open;
     self.ai.focus = state.focus;
@@ -256,6 +257,7 @@ pub fn toggleAiPanel(self: *App) !void {
 /// list. Opens the rail when closed.
 pub fn focusAiRail(self: *App) !void {
     try ensureAi(self);
+    self.navigator_peek = false;
     self.ai.rail_pending_leader = false;
     const state = ws.focusRail();
     self.ai.rail_open = state.open;
@@ -279,6 +281,7 @@ fn aiLeaveRail(self: *App) void {
 /// policy), and attach to the new thread's prompt.
 pub fn aiNewThread(self: *App) !void {
     try ensureAi(self);
+    self.navigator_peek = false;
     try self.ai.clients.append(self.alloc, null);
     errdefer _ = self.ai.clients.pop();
     try self.ai.tool_states.append(self.alloc, .{});
@@ -305,6 +308,7 @@ fn selectThreadAtCursor(self: *App) void {
 /// indices are a no-op (hint targets can be stale for one frame).
 pub fn aiSelectThread(self: *App, idx: usize) void {
     if (idx >= self.ai.threads.items.items.len) return;
+    self.navigator_peek = false;
     const res = self.ai.threads.select(idx);
     if (res.cancelled) cancelClient(self, res.prev);
     self.ai.thread_cursor = idx;
@@ -318,6 +322,7 @@ pub fn aiSelectThread(self: *App, idx: usize) void {
 /// attaches to the active thread and moves keyboard focus to its input row.
 pub fn aiFocusPrompt(self: *App) !void {
     try ensureAi(self);
+    self.navigator_peek = false;
     self.ai.rail_open = true;
     self.ai.focus = .prompt;
     self.ai.tab = .chat;

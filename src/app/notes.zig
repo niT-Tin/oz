@@ -132,6 +132,7 @@ pub fn notesDidSave(self: *App, path: []const u8) void {
 pub fn openNoteAt(self: *App, idx: usize) !void {
     if (idx >= self.notes.items.items.len) return;
     self.notes.sel = idx;
+    self.navigator_peek = false; // opening the note returns to the editor
     self.ai.focus = .editor; // a hint action may run while the rail owns keys
     self.focus = .buffer;
     try self.openFile(self.notes.items.items[idx].path);
@@ -160,6 +161,7 @@ pub fn createNote(self: *App) void {
     self.notes.loaded = false;
     self.refreshNotes();
     self.notes.selectPath(path);
+    self.navigator_peek = false;
     self.ai.focus = .editor;
     self.focus = .buffer;
     self.openFile(path) catch |e| {
@@ -167,12 +169,74 @@ pub fn createNote(self: *App) void {
     };
 }
 
+/// True when the terminal is in the compact (<90-col) navigator mode.
+pub fn navigatorCompact(self: *App) bool {
+    return nav.modeForCols(self.vx.window().width) == .compact;
+}
+
+/// Focus the navigator from the keyboard. Full mode just takes focus;
+/// compact mode opens the peek so the focused pane has visible content
+/// (and closes the AI drawer: the two overlays never stack).
+pub fn navigatorEnter(self: *App) void {
+    if (self.navigatorCompact()) {
+        self.navigator_peek = true;
+        if (self.ai.rail_open and self.aiLayout().mode == .drawer) {
+            self.ai.rail_open = false;
+            self.ai.focus = .editor;
+        }
+    }
+    self.focus = .navigator;
+}
+
+/// Close the compact peek overlay (no-op in full mode) and return the
+/// keyboard to the editor. The icon rail stays visible.
+pub fn navigatorPeekClose(self: *App) void {
+    self.navigator_peek = false;
+    self.focus = .buffer;
+    self.ai.focus = .editor;
+}
+
+/// Close the navigator. In compact mode Esc closes only the peek overlay and
+/// keeps the icon rail; full mode hides the panel (the existing behavior).
+pub fn closeNavigator(self: *App) void {
+    if (self.navigatorCompact() and self.navigator_peek) {
+        self.navigatorPeekClose();
+        return;
+    }
+    self.navigator_peek = false;
+    self.filetree_active = false;
+    self.focus = .buffer;
+}
+
 /// Switch navigator tab. Entry side effects are the only "scan/load" points:
 /// Notes refreshes its cached list, Agents ensures the real thread model is
 /// initialized (thread 1 is a real thread, same as the rail's) and loads the
-/// provider config for the model label.
+/// provider config for the model label. In compact mode the same call opens
+/// (or, for the already-open tab, closes) the peek.
 pub fn navigatorSetTab(self: *App, tab: nav.Tab) !void {
-    if (!self.filetree_active) try self.toggleFiletree();
+    const was_active = self.filetree_active;
+    if (!was_active) try self.toggleFiletree();
+
+    if (self.navigatorCompact()) {
+        // Selecting the already-open tab toggles the peek closed (the demo's
+        // icon behavior); any other selection opens/switches it. A first
+        // entry through `toggleFiletree` already opened the requested tab.
+        if (was_active and self.navigator_peek and
+            nav.peekAfterSelect(true, self.navigator_tab, tab) == null)
+        {
+            self.navigatorPeekClose();
+            return;
+        }
+        self.navigator_peek = true;
+        // Compact peek and the drawer rail share the overlay slot.
+        if (self.ai.rail_open and self.aiLayout().mode == .drawer) {
+            self.ai.rail_open = false;
+            self.ai.focus = .editor;
+        }
+    } else {
+        self.navigator_peek = false;
+    }
+
     self.navigator_tab = tab;
     self.ai.focus = .editor; // navigator owns keys; the rail may stay visible
     self.focus = .navigator;
@@ -191,11 +255,6 @@ pub fn navigatorSetTab(self: *App, tab: nav.Tab) !void {
 
 pub fn navigatorCycleTab(self: *App, delta: i32) !void {
     try self.navigatorSetTab(nav.next(self.navigator_tab, delta));
-}
-
-fn closeNavigator(self: *App) void {
-    self.filetree_active = false;
-    self.focus = .buffer;
 }
 
 // ---- keys ----
@@ -258,6 +317,7 @@ pub fn navigatorAttachSelectedThread(self: *App) !void {
     try self.ensureAi();
     const n = self.ai.threads.items.items.len;
     if (n == 0) return;
+    self.navigator_peek = false;
     self.ai.rail_open = true;
     self.ai.rail_pending_leader = false;
     self.aiSelectThread(@min(self.ai.thread_cursor, n - 1));
@@ -267,6 +327,7 @@ pub fn navigatorAttachSelectedThread(self: *App) !void {
 /// `n` on the Agents tab: same new-thread path as the rail (`aiNewThread`).
 pub fn navigatorNewThread(self: *App) !void {
     try self.ensureAi();
+    self.navigator_peek = false;
     self.ai.rail_open = true;
     self.ai.rail_pending_leader = false;
     try self.aiNewThread();
@@ -336,21 +397,23 @@ pub fn navigatorKey(self: *App, key: vaxis.Key) !bool {
 /// observability; this keeps it aligned with the selected row as before).
 pub fn navigatorCursorRow(self: *App, a: std.mem.Allocator) u32 {
     const top = self.contentTop(a);
+    if (self.navigatorCompact() and !self.navigator_peek) return top;
+    const body = top + nav.full_header_rows;
     return switch (self.navigator_tab) {
         .files => blk: {
             const n = self.filetree_rows.items.len;
             const sel = if (n == 0) 0 else @min(self.filetree_sel, n - 1);
-            break :blk top + 1 + @as(u32, @intCast(sel -| self.filetree_top));
+            break :blk body + @as(u32, @intCast(sel -| self.filetree_top));
         },
         .notes => blk: {
             const n = self.notes.items.items.len;
             const sel = if (n == 0) 0 else @min(self.notes.sel, n - 1);
-            break :blk top + 1 + 2 * @as(u32, @intCast(sel -| self.notes.top));
+            break :blk body + 2 * @as(u32, @intCast(sel -| self.notes.top));
         },
         .agents => blk: {
             const n = self.ai.threads.items.items.len;
             const sel = if (n == 0) 0 else @min(self.ai.thread_cursor, n - 1);
-            break :blk top + 2 + @as(u32, @intCast(sel -| self.ai.thread_top));
+            break :blk body + 1 + @as(u32, @intCast(sel -| self.ai.thread_top));
         },
     };
 }

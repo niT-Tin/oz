@@ -150,6 +150,9 @@ pub const Action = union(enum) {
     agent_prompt_focus,
     /// Switch the left navigator tab (M2b1). Activating focuses the navigator.
     navigator_tab: NavigatorTab,
+    /// Close the compact (<90 col) navigator peek overlay and return the
+    /// keyboard to the editor. The icon rail stays visible.
+    navigator_peek_close,
     /// Open the note at this index in the cached Notes list (Enter semantics).
     note_open: usize,
     /// Approve the pending inline edit (same path as `a`/Enter in Changes).

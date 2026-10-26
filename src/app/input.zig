@@ -143,7 +143,7 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
                 if (self.filetree_active and self.focus == .buffer) {
                     const before = self.current_win;
                     self.navigateWindow(.left);
-                    if (self.current_win == before) self.focus = .navigator;
+                    if (self.current_win == before) self.navigatorEnter();
                 } else if (!self.filetree_active) {
                     self.navigateWindow(.left);
                 }
@@ -152,6 +152,7 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
             },
             'l' => {
                 if (self.filetree_active and self.focus == .navigator) {
+                    self.navigator_peek = false;
                     self.focus = .buffer;
                 } else {
                     self.navigateWindow(.right);
@@ -159,6 +160,7 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
             },
             'j' => {
                 if (self.filetree_active and self.focus == .navigator) {
+                    self.navigator_peek = false;
                     self.focus = .buffer;
                 } else {
                     self.navigateWindow(.down);
@@ -166,6 +168,7 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
             },
             'k' => {
                 if (self.filetree_active and self.focus == .navigator) {
+                    self.navigator_peek = false;
                     self.focus = .buffer;
                 } else {
                     self.navigateWindow(.up);
