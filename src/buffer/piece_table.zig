@@ -373,6 +373,22 @@ pub const PieceTable = struct {
         return self.doc_len - s;
     }
 
+    /// Byte length of the line's TEXT, excluding a `\r\n` / `\n` line
+    /// terminator. Same as `lineLen` except that a CRLF line's trailing
+    /// `\r` is part of the terminator, not the text. Use this for cursor
+    /// placement at EOL, rendering and "replace to end of line" ops; keep
+    /// `lineLen` for whole-line ranges (a linewise delete must remove the
+    /// `\r` too).
+    pub fn lineTextLen(self: *const PieceTable, line: u32) u32 {
+        const raw_len = self.lineLen(line);
+        if (line + 1 < self.lineCount() and raw_len > 0 and
+            self.byteAt(self.lineStart(line) + raw_len - 1) == '\r')
+        {
+            return raw_len - 1;
+        }
+        return raw_len;
+    }
+
     /// Line containing byte offset `pos`. `pos == len` maps to the last line.
     pub fn lineOf(self: *const PieceTable, pos: u32) u32 {
         std.debug.assert(pos <= self.doc_len);
@@ -677,6 +693,25 @@ test "line semantics: vim-style counting" {
     try std.testing.expectEqual(@as(u32, 1), pt2.lineCount());
     try std.testing.expectEqual(@as(u32, 3), pt2.lineLen(0));
     try std.testing.expectEqual(@as(u32, 0), pt2.lineOf(3)); // pos == len -> last line
+}
+
+test "lineTextLen excludes a CRLF terminator but not a literal trailing CR" {
+    var pt = try PieceTable.init(std.testing.allocator, "ab\r\ncd\r\n");
+    defer pt.deinit();
+    try std.testing.expectEqual(@as(u32, 3), pt.lineLen(0)); // "ab\r" (the \n is the terminator)
+    // The line's content is "ab\r" under the lineLen contract; lineTextLen
+    // drops the CR that belongs to the CRLF terminator.
+    try std.testing.expectEqual(@as(u32, 2), pt.lineTextLen(0));
+    try std.testing.expectEqual(@as(u32, 2), pt.lineTextLen(1));
+    try std.testing.expectEqual(@as(u32, 0), pt.lineTextLen(2)); // phantom line
+
+    // LF lines and a final line without a terminator keep every byte.
+    var mixed = try PieceTable.init(std.testing.allocator, "x\ny\r\nz\r");
+    defer mixed.deinit();
+    try std.testing.expectEqual(@as(u32, 1), mixed.lineTextLen(0));
+    try std.testing.expectEqual(@as(u32, 1), mixed.lineTextLen(1));
+    // last line has no '\n' after the CR, so the CR is real text
+    try std.testing.expectEqual(@as(u32, 2), mixed.lineTextLen(2));
 }
 
 test "line semantics: multi-line and empty lines" {

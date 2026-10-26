@@ -5,6 +5,7 @@ const vaxis = @import("vaxis");
 
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
+const nav_tabs = @import("navigator.zig");
 
 /// One node of the lazy directory tree (snacks-explorer style). `name`
 /// (basename) and `path` (relative, owned; dir paths carry a trailing
@@ -93,6 +94,7 @@ pub fn setProjectRoot(self: *App, file_path: []const u8) void {
     self.filetree_root = null;
     self.filetree_rows.clearRetainingCapacity();
     self.filetree_active = false;
+    self.navigator_peek = false;
     self.filetree_sel = 0;
     self.filetree_top = 0;
     self.focus = .buffer;
@@ -108,11 +110,20 @@ pub fn setProjectRoot(self: *App, file_path: []const u8) void {
 pub fn toggleFiletree(self: *App) !void {
     if (self.filetree_active) {
         self.filetree_active = false;
+        self.navigator_peek = false;
+        self.focus = .buffer;
         return;
     }
     self.filetree_top = 0;
     self.filetree_sel = 0;
-    self.focus = .filetree;
+    // <leader>e is the canonical Files entry; the tab strip can switch to
+    // Notes/Agents afterwards (Tab/Shift-Tab or 1/2/3).
+    self.navigator_tab = .files;
+    self.focus = .navigator;
+    // Compact mode has no inline list: the explicit navigator entry opens
+    // its peek so the focused pane has visible content. Esc returns to the
+    // editor and leaves the icon rail.
+    self.navigator_peek = nav_tabs.modeForCols(self.vx.window().width) == .compact;
     // Root the tree at the workspace's project root (or the process cwd
     // when none is set). Rebuild when the stored root differs, so opening a
     // file in a different directory switches <leader>e to that directory.
@@ -240,7 +251,9 @@ pub fn locateInFiletree(self: *App) !void {
     } else {
         try self.rebuildFiletreeRows();
     }
-    self.focus = .filetree;
+    self.navigator_tab = .files;
+    self.focus = .navigator;
+    self.navigator_peek = nav_tabs.modeForCols(self.vx.window().width) == .compact;
     if (self.cur().path) |p| {
         // Reveal the file's ancestors (expanding any folded dirs on the
         // way) and select the matching row.
@@ -287,15 +300,50 @@ pub fn revealPath(self: *App, path: []const u8) !?*TreeNode {
     return null;
 }
 
+/// Activate the selected row exactly like Enter: a directory toggles its
+/// expansion (focus stays in the tree); a file opens and focus moves back to
+/// the buffer so typing edits text instead of the tree. Shared by
+/// `filetreeKey` and the `<leader>j` hint action so the two cannot drift.
+pub fn activateFiletreeSelection(self: *App) !void {
+    const node = self.filetreeNodeAt(self.filetree_sel) orelse return;
+    if (node.is_dir) {
+        if (node.expanded) {
+            try self.collapseDir(node);
+        } else {
+            try self.expandDir(node);
+        }
+    } else {
+        // open the file but keep the tree visible — only <space>e
+        // (toggleFiletree) or Esc closes it; focus moves back to the buffer
+        // so typing edits, not the tree. In compact mode the peek closes:
+        // the opened buffer, not the drawer, is the result.
+        self.navigator_peek = false;
+        self.focus = .buffer;
+        try self.openFile(node.path);
+    }
+}
+
 /// j/k/Enter/Esc/h/l for the tree; returns true if consumed.
+/// Move the filetree selection by `delta`, clamped to the visible row list.
+/// Shared by j/k and the mouse wheel (one selection policy).
+pub fn moveFiletreeCursor(self: *App, delta: i32) void {
+    const n = self.filetree_rows.items.len;
+    if (n == 0) return;
+    var idx: i32 = @intCast(@min(self.filetree_sel, n - 1));
+    idx += delta;
+    if (idx < 0) idx = 0;
+    if (idx >= @as(i32, @intCast(n))) idx = @intCast(n - 1);
+    self.filetree_sel = @intCast(idx);
+}
+
 pub fn filetreeKey(self: *App, key: vaxis.Key) !bool {
     switch (key.codepoint) {
         'j', vaxis.Key.down => {
-            if (self.filetree_sel + 1 < self.filetree_rows.items.len) self.filetree_sel += 1;
+            moveFiletreeCursor(self, 1);
             return true;
         },
         'k', vaxis.Key.up => {
-            if (self.filetree_sel > 0) self.filetree_sel -= 1;
+            moveFiletreeCursor(self, -1);
             return true;
         },
         // h: fold the current dir; on an already-folded dir jump to its
@@ -321,25 +369,11 @@ pub fn filetreeKey(self: *App, key: vaxis.Key) !bool {
             return true;
         },
         vaxis.Key.enter => {
-            const node = self.filetreeNodeAt(self.filetree_sel) orelse return true;
-            if (node.is_dir) {
-                if (node.expanded) {
-                    try self.collapseDir(node);
-                } else {
-                    try self.expandDir(node);
-                }
-            } else {
-                // open the file but keep the tree visible — only
-                // <space>e (toggleFiletree) or Esc closes it; focus moves
-                // back to the buffer so typing edits, not the tree
-                self.focus = .buffer;
-                try self.openFile(node.path);
-            }
+            try self.activateFiletreeSelection();
             return true;
         },
         vaxis.Key.escape => {
-            self.filetree_active = false;
-            self.focus = .buffer;
+            self.closeNavigator();
             return true;
         },
         else => return false,

@@ -31,6 +31,7 @@
 
 - Modal 编辑，六模式：Normal / Insert / Visual / Visual Line / Visual Block / **Command**（vim `:` 命令模式，用户补充，见 §6.7）
 - Leader = `Space`，Insert 下 `jk` 退回 Normal，相对行号，块/beam 光标
+- Insert 的 `Esc` 退出 Insert 并同时关闭补全菜单（一次按键）：不再有"第一次 Esc 只关菜单、仍留在 Insert"的半插入状态；`Ctrl+e` 只隐藏菜单并留在 Insert（对应 blink.cmp 的 hide）
 - 无限 undo/redo、`.` 重复、数字前缀 count
 - 文本对象、surround、注释切换、对齐、自动配对、多光标
 - easymotion 等价物（`s` / `<leader>f`）
@@ -653,6 +654,7 @@ Client = {
 - CursorHold 单词自动高亮（120ms）、多主题切换（kanagawa-wave 默认）
 - 大文件降级策略落地
 - AI（spec §9）：行内补全源（Copilot/兼容 API，限 3 条与补全菜单合并）、chat 浮窗（选区提问）、外部 LLM API（DeepSeek 等）滚动翻译等内置能力
+  - [x] M1 chat 已提前落地（`<leader>a`、流式 OpenAI 兼容 API、选区上下文、取消/错误降级；详见 §17）
 
 **M4 通过 = spec 全量功能落地。**
 
@@ -705,3 +707,862 @@ Client = {
 1. 评审本设计（重点：§2 选型、§3 架构、§13 顺序）
 2. 确认后开始 **M0**：先搭 build（vaxis 依赖）+ 事件循环骨架，把当前 `src/main.zig` 的 kilo 风格代码迁移进新结构
 3. 每个 Milestone 结束提交一次可运行版本（git tag）
+
+---
+
+## 17. AI Chat（M1，`feat/ai-chat`）
+
+> 目标：先交付一个可日常使用的 **chat-first** 面板；tools / 自动改文件 / inline assistant 留到 M2/M3。与 spec §9 的"AI 能力"相比，本节只覆盖 M1 范围。
+
+### 17.1 模块划分
+
+```
+src/ai/
+  sse.zig      增量 SSE 解析（data: 多行、CRLF/LF、[DONE]、任意字节切分）
+  openai.zig   request JSON 构造、delta 解析、API error body 解析
+  context.zig  有界编辑器上下文（路径 / 选区 / 光标窗口，UTF-8 安全截断）
+  config.zig   纯环境变量解析（OZ_AI_*）
+  client.zig   单条在飞流：后台线程 + Mutex 队列 + 原子取消
+  panel.zig   模态面板按键分类（纯函数，可单测）
+src/app/ai.zig  会话状态 / 键处理 / 请求生命周期 / 渲染
+```
+
+- `src/ai/*` 不依赖 App，全部可单测；`app/ai.zig` 通过 App 字段方法组接入（`Aliases` 在 `app.zig`）。
+- 会话状态 `App.ai` 是 **session 级**（不随 workspace 切换）：关闭面板保留会话，workspace 切换不动 AI thread。
+- UI：居中 float，宽 `min(96, cols-4)`、高 `min(28, rows-4)`；圆角边框 + ` AI ` 标题 + 一行状态（model + idle/streaming…/cancelled/error）+ transcript + 底部 `❯ ` prompt。所有面板 cell 统一 `bg_float`，逐行按 **cell** 补齐，边框复用 filetree/picker 的宽度对齐经验。
+
+### 17.2 Provider 协议
+
+- `POST {OZ_AI_BASE_URL}/chat/completions`，body：
+  `{"model": ..., "stream": true, "messages":[{"role":"system"|"user"|"assistant","content":...}]}`。
+- SSE：只消费 `data:` 行；`[DONE]` 或 `choices[0].finish_reason` 结束；解析 `choices[0].delta.content`；malformed JSON 忽略（不让一条坏 chunk 终止整条流）。
+- 非 2xx：优先解析 `{"error":{"message":...}}`，否则用响应体前 8 KiB，面板显示一行 `HTTP <code>: <message>`。
+- TLS：`std.http.Client` + 标准 CA bundle（`rescan`），**不关闭证书校验**。API key 仅存在于 request 头 / 进程内存，不写日志、不落盘。
+- 每帧由 `App.run` 的 `drainAi()` 排空事件；后台 worker 只把 **owned bytes**（job spec / delta / error）跨线程传递，UI 线程永不阻塞。
+
+### 17.3 取消与上下文
+
+- Ctrl+c：主线程立刻置 `cancelled` 并 `client.requestCancel()`；此后排空到的事件全部丢弃，worker 在下一个 chunk 边界退出。Ctrl+n 清空会话并同样取消。
+- 上下文：始终 `Current file: <path>`；有 visual 选区时 `Selected lines A-B:` + 选中文本；否则 `Cursor line: N` + `Context (lines A-B):`（光标 ±10 行）。总输出 ≤8 KiB，按 UTF-8 边界截断，追加 `… [truncated]`。
+- 自动滚动：streaming 时跟随底部；Ctrl+j/k 或 PageUp/PageDown 手动滚动后关闭自动跟随，下一次发送重新开启。
+
+### 17.4 测试接缝（test-only，不对外文档化）
+
+`OZ_AI_MOCK_DIR=<dir>`：client 完全跳过 HTTP，改为
+
+1. 把**原始 request body** 原子写入 `<dir>/request.json`（temp + rename）；
+2. 若 `<dir>/error.txt` 存在，推送该文本为 error 事件并结束；
+3. 以 32 B / ~8 ms 的节奏回放 `<dir>/stream.sse`，让 e2e 能观察到真正的增量帧。
+
+该接缝用于 `zig build e2e` 的确定性断言（request body 含 model/prompt/选区、流式增量、取消、error）；生产路径仍是真实 HTTP。
+
+### 17.5 Roadmap
+
+- **M1（已完成）**：centered chat 面板、流式 SSE、上下文、取消、错误降级、mock e2e。
+- **M2**：workspace 化布局（右侧 Agent Rail + Workbox、Notes/Navigator、线程管理）与 inline assistant/diff。
+- **M3**：agent tools（read/search/apply edit，带权限确认）、tool cards、调用次数/平均耗时折线图、ACP client、MCP server 接入。
+
+---
+
+## 18. AI Workspace 布局（M2/M3，2026-10-25 已确认）
+
+参考可交互原型：`.demo/ai-workspace/`（local only，untracked）。原型不是生产代码，只用于确认布局与交互。
+
+### 18.1 布局原则
+
+```text
+[左侧 navigator] [中间 editor / notes] [右侧 Agent Rail + Workbox]
+```
+
+- 不使用“四栏并排”；右侧 rail 是第二个工作面，不是第三个侧栏。
+- Notes 是 **buffer**，不是固定特殊侧栏；Files/Notes/Agents 是左侧 navigator 的 tab。
+- Agent 是 **thread**，不是 pane：可以 attach/detach，关闭 pane 不删除 thread。
+- 线程列表默认按 workspace 分组、扁平排列；只有 parent/child subagent 缩进一层。
+- Workbox 是右侧单主视图 + tab：`Chat / Changes / Tools / Terminal`，避免同时铺开四块内容。
+
+### 18.2 宽度行为
+
+| 宽度 | 行为 |
+|---|---|
+| ≥ 110 列 | 三栏：navigator + editor + rail（rail 38–42 列） |
+| 90–109 列 | 三栏：rail 34 列，navigator 可收窄 |
+| < 90 列 | editor 单栏；左侧 navigator 收成 7 列 icon rail（选中时 30 列 peek），右侧 rail 作为 overlay drawer，Esc/`a` 关闭 |
+
+Narrow drawer 必须有焦点隔离，不能挤压编辑器到不可用宽度；navigator peek 与 Agent drawer 互斥，不能叠画。所有宽度按 cell 计算，不能出现横向溢出。
+
+### 18.3 区域职责
+
+- **Navigator**：`Files / Notes / Agents` 三个 tab；Files 复用现有文件树，Notes 是 note 列表，Agents 是紧凑线程列表。
+- **Agent Rail**：按 workspace 分组的线程；状态点（streaming / waiting approval / idle / error）、未读/待批准 badge、new thread、archive。
+- **Workbox Chat**：M1 的流式对话与输入；tool cards / approval cards 后续内联。
+- **Workbox Changes**：待审 diff / 文件变更，Approve/Reject 与 Chat approval、badge 联动。
+- **Workbox Tools**：M3 工具卡片 + 调用次数 + 平均耗时折线图；空状态不能伪造数据。
+- **Workbox Terminal**：agent 启动的终端输出（M3 后期）。
+
+### 18.4 里程碑拆分
+
+- **M2a（layout shell，已完成）**：右侧 dock rail / narrow drawer；线程模型与 thread rail；workbox Chat + Changes（空状态）+ Tools/Terminal 诚实占位；现有 `<leader>a` 改为打开/聚焦 rail；保留 M1 streaming/cancel/error。实现状态见 §18.7。
+- **M2b1（navigator + notes，已完成，2026-10-25）**：左侧 navigator 三 tab（files/notes/agents）、真实 note 文件 + 普通 buffer、Notes 列表、Agents 真实线程视图、tab/行 hint 目标；实现状态见 §18.8。
+- **M2b2（已完成，2026-10-25）**：visual 选区 inline assistant；紧凑 prompt；真实 diff；Changes 中显式 Approve/Reject + 单 undo group；`<leader>i`、hint 目标与 80 列适配。实现状态见 §18.9。
+- **M3a（tools）**：tool protocol、权限确认、tool cards、read/list/grep/edit/apply_patch；agent loop。
+- **M3b（metrics）**：per-tool count/avg/success/fail；最近 N 次耗时 ring buffer；braille/线条折线图；窄屏 sparkline fallback。
+
+### 18.5 焦点与按键（草案）
+
+> M2a 已按 §18.7 落地；下面保留最初的草案，实际策略以 §18.7 为准。
+
+- `<leader>a`：打开 rail 并聚焦 workbox 输入；再按 toggle/`Esc` 返回 editor（rail 保持可见）。
+- `Ctrl+w` 在 editor / navigator / rail 之间切换；`Tab` 在 workbox tab 间切换。
+- rail 聚焦时：`j/k` 选 thread，`Enter` attach，`n` new thread，`x` archive，`c/d/t` 切 Chat/Changes/Tools。
+- 输入框聚焦时，所有 editor 快捷键失效（沿用 M1 的 modal input guard）。
+- narrow 模式：`Esc` 关闭 drawer；`a` 重新打开。
+
+### 18.6 验收与测试
+
+- 所有布局在 80/100/120 列下边框/背景对齐，无 cell 溢出。
+- 线程创建/切换/流式隔离；切换线程不会把 A 的 delta 写进 B 的 transcript。
+- Chat/Changes badge 联动；空状态真实，不显示假工具/假数据。
+- 现有 e2e + 单测全绿（M2a 完成后：136 个 e2e、343 个单测）；新增 M2a e2e 覆盖 dock/drawer、thread 切换、focus guard。
+
+### 18.7 M2a 实现状态（已完成，2026-10-25）
+
+**布局（cell 精确，单一来源 `src/ai/workspace.zig: layout()`）**
+
+| 终端宽度 | rail | editor 可用宽度 |
+|---|---|---|
+| ≥ 110 | dock 38 列（含 1 列左边框） | `cols - 38` |
+| 90–109 | dock 34 列 | `cols - 34` |
+| < 90 | overlay drawer `min(34, cols - 8)` | `cols`（rail 覆盖在上层） |
+
+- rail 从第 0 行画到状态栏上方；状态栏始终全宽。dock 模式 rail 左边界即 editor 右边界，`layoutWindows` / tab bar / dashboard / split 全部改用 `aiEditorWidth()`，不会把 editor 画到 rail 上。
+- drawer 模式不挤压 editor，也不画假遮罩；左侧 editor 保持可见，Esc 关闭 drawer。rail 内部全部 cell 填 `bg_float`，左边界聚焦时 accent、失焦时 `fg_faint`。
+- rail 上方为紧凑线程栏：`▥ agents N +`、workspace 分组、线程状态点 + 标题 + 状态；下方为 Workbox：活动线程 header、tabs、body、Chat 的 prompt 行。
+
+**焦点策略（实际实现）**
+
+- `<leader>a` 是可见性 toggle：关闭 → 打开 rail 并聚焦 **prompt**（Workbox 切到 Chat）；已打开（editor 或线程列表聚焦时）→ 关闭 rail 并把焦点还给 editor。prompt 聚焦时所有可打印输入都归 prompt，因此不能在 prompt 内用 leader 关闭；先 Esc（回 editor，rail 保持）再 `<leader>a` 关闭，或 Tab 到线程列表再 `<leader>a`。
+- `<Ctrl-w> a`：从 editor 重新进入 rail 的**线程列表**（rail 关闭时也会打开）。这是 editor → rail 的固定回入口；Ctrl-w hjkl 不变。
+- prompt：Enter 发送，Ctrl+c 取消，Ctrl+n 新建线程，Tab → 线程列表（prompt 是单行，不接收 tab 字符），Ctrl+j/k 单行滚动，PageUp/PageDown 翻页，Esc → editor（narrow：关闭 drawer）。
+- 线程列表 / workbox：`j/k` 移动线程光标，Enter attach 并聚焦 prompt（切回 Chat），`n`/`+` 新建线程并聚焦其 prompt，`c/d/t/r` 切 Chat/Changes/Tools/Terminal，Tab/Shift+Tab 循环 tab，`q`/Esc → editor（narrow 关闭 drawer）。
+- dock 且 editor 聚焦时 rail 非模态：所有 editor 快捷键、pickers、command mode、宏录制、文件树、终端焦点均照旧；rail/prompt 聚焦时按键先在 AI 层消费，终端焦点仍最优先。
+- 焦点可见性：rail 左边框 accent（rail/prompt 聚焦）/ `fg_faint`（editor 聚焦）；prompt 显示 beam cursor，线程列表显示 block cursor。
+
+**线程切换策略（实际实现）**
+
+- `src/ai/workspace.zig: Threads` 持有 session 级 `items` / `active` / `next_number`；`src/app/ai.zig: Session` 另持有一一对应的 `clients`。线程标题由 `next_number` 生成（`thread 1`、`thread 2`…）。
+- 每个线程独立保存 messages、prompt draft、status、error、scroll/auto-scroll、view 尺寸和 cancel_requested；client 与线程索引一一对应。
+- 切换（`select`）离开一个 `streaming` 线程时：该线程 `status = cancelled`、`cancel_requested = true`，App 调 `client.requestCancel()`；transcript 冻结。迟到的 delta 在 `drainAi` 中按线程丢弃（`cancel_requested` 时直接 free，不写入任何 transcript），`applyDelta` 也拒绝非 streaming/已取消线程。
+- 同一时刻最多一个 streaming 线程：新建线程、Ctrl+n、以及 aiSend 的防御性循环都会取消其他 live stream。
+- 切回已取消线程显示冻结的 transcript（含 `[stream cancelled]` 标记），不会被后续事件修改；各线程的请求体只包含自己的 messages（验证见 e2e `thread B streams while A is frozen`）。
+- 关闭 rail 不删除线程、不取消流；workspace 切换也不动 `App.ai`；不落盘。
+
+**范围与限制**
+
+- 仅 M2a：不做 tools、真实文件编辑、diff/Approve、Notes/Navigator tab、inline assistant、工具计数/耗时图、agent shell。Changes 显示 `no pending changes`（badge 0）；Tools 显示 `tools arrive in M3`；Terminal 显示 `agent terminal arrives in M3` 并提示现有 `Alt+r`。
+- 线程 archive 未实现；鼠标操作见 §21（线程行可点击 attach、滚轮移动选择）。
+- 现有 `[stream cancelled]` 是 UI 标记，不是协议消息。
+
+**文件**
+
+- `src/ai/workspace.zig`：布局/焦点/线程模型 + 单测。
+- `src/ai/panel.zig`：prompt / rail 按键分类。
+- `src/app/ai.zig`：Session、每线程 client、drain、焦点路由、rail/Workbox 渲染。
+- `src/app/input.zig`、`src/app/render.zig`、`src/app.zig`：焦点路由、editor 宽度、状态栏与 cursor。
+- `test/e2e.zig`：M2a pty 测试（120 dock / 80 drawer / A-B 线程隔离 / tabs / M1 选区、取消、错误）。
+
+**验证**
+
+- `zig build test`：343/343 通过。
+- `zig build e2e`：136 个 pty 测试全部通过（exit 0，无失败输出）。
+
+---
+
+### 18.8 M2b1 实现状态（navigator tabs + notes，2026-10-25）
+
+**布局（cell 精确）**
+
+- 侧栏宽度不变（`filetree_width = 30`，`contentCol()` 仍为 30），因此 editor/split/rail 的全部宽度计算不变；80/100/120 列都没有横向溢出。
+- 顶栏即原 `╭─ files` 标题行，改为 tab strip：`╭─ files ─ notes ─ agents────╮`（30 cells 内精确放下）。active tab 用 `bg_sel` + bold，非 active 用 `fg_dim`；`files` 子串与面板左上 `╭` 保持原位，既有 `findBoxByTitle("files")`/row-2 几何断言继续成立。hint mode 下三个 tab 都是 target（label 覆盖 tab 首字符），因此 hints 场景用「30-cell box at column 0」而不是标题文本定位面板。
+- 内容区沿用原 filetree 几何：`contentTop()+1 .. status bar-1`，底部仍有闭合边框；每个 tab 的列表在该区域内滚动。
+
+**焦点与按键（实际实现）**
+
+- App focus 由 `Focus.filetree` 改名为 `Focus.navigator`（语义更新，行为沿用 Ctrl-w h/l + `<leader>e`）。
+- `<leader>e`：关闭 → 打开 navigator 并固定落在 **files**（`<leader>E` 同样落 files 并 reveal 当前文件）；已打开 → 关闭并把焦点还给 editor。
+- navigator 聚焦时：`Tab` 下一个 tab、`Shift-Tab` 上一个、`1/2/3` 直接 files/notes/agents（`src/app/navigator.zig` 纯模型）。这些按键先于 per-tab handler 消费，所以 files tab 的 `h/l` 仍是折叠/父目录，不与 tab 切换冲突。
+- Files：原 filetree keys 完全不变（j/k/Enter/h/l/Esc）。
+- Notes：`j/k`（含方向键）选择、Enter 打开、`n` 新建、`r` 刷新、Esc 关闭 navigator。
+- Agents：`j/k` 选择、Enter `aiSelectThread`（必要时先打开 rail）、`n` `aiNewThread`、Esc 关闭。选择光标复用 `ai.thread_cursor`，不是第二份线程光标；Enter 后键盘属于 rail prompt。
+- hint 动作新增 `navigator_tab` / `note_open`；`agent_thread_select` 现在会先把 rail 打开，保证从 navigator 触发时 attach 可见。切换 navigator tab / 打开 note 时把 AI focus 置回 editor（rail 可保持可见），避免 rail 模态吞掉后续导航键。
+
+**Notes 持久化（实际实现，`src/app/note_store.zig`）**
+
+- 路径优先级：`OZ_NOTES_DIR`（文档化的用户覆盖 + e2e seam）→ `$XDG_DATA_HOME/oz/notes` → `$HOME/.local/share/oz/notes`；任一为空则继续 fallback，全部缺失时 Notes tab 显示 `! notes unavailable`（不崩溃）。解析结果缓存，`OZ_NOTES_DIR` 相对路径会规范化成绝对路径。
+- 目录惰性创建：启动/打开 editor 不创建；首次进入 Notes tab（list）或首次 `n`（create）时才 `createDirPath`。`OZ_NOTES_DIR` 不可用时只在 tab 内显示错误与 status message。
+- 新建：`note-<N>.md` 取最小未占用 N（`noteNameNumber` 只识别这个窄格式），`O_EXCL` 创建，内容精确为 `# Untitled note\n\n`；绝不覆盖已有文件。打开走既有 `openFile`/`openInBuffer`，`:w` 走既有原子保存。
+- 列表：每篇 note 读前 8 KiB 提取 title（首个 ATX heading，否则文件名）与 snippet（首个非空、非 heading 行，去掉 `>`/列表符，最多 160 bytes 且不切断 UTF-8）。排序 = mtime 降序，mtime 相同按 filename 降序（确定性；刚创建的 note 在最上）。相对年龄 `now/Nm/Nh/Nd` 每帧只取一次时钟。
+- 缓存/刷新：`Store.items` 是缓存，只在 **tab 进入 / 新建后 / `:w` 保存了 note / `r`** 时重建；渲染只读缓存，不逐帧 scan。刷新按 path 保留选择；保存 note 后立即刷新（`notesDidSave`，仅当路径在 notes 目录内）。
+- notes 是全局/项目无关：`openInBuffer` 对 notes 路径跳过 `setProjectRoot`，所以打开 note 不会把 workspace 文件树/picker 根到数据目录。
+
+**范围与限制**
+
+- 仅 M2b1：没有 inline assistant、diff、Approve/Reject、tool cards；Changes/Tools/Terminal 仍是 M2a 的空状态/占位。
+- Notes 没有删除/重命名（破坏性操作需要单独设计）；没有 note 搜索/标签/附件；不做 notes 目录 watch（刷新是显式路径）。
+- 单行 snippet；超长标题按 cell 截断；时间只有相对粒度。
+- Agents tab 是线程模型的视图：线程本身仍是 session 级、不落盘、随 rail 关闭/workspace 切换保留；navigator 不新增线程状态。
+- hint target 仍受 128 容量限制；Notes 列表只注册可见行。
+
+**文件**
+
+- `src/app/navigator.zig`：Tab 模型 + 单测。
+- `src/app/note_store.zig`：路径解析、扫描、title/snippet、命名/创建、排序、age + 单测。
+- `src/app/notes.zig`：App 缓存/刷新/创建/打开/tab/keys/Agents 动作/cursor 行。
+- `src/app/render.zig`：navigator tab strip + files/notes/agents 渲染；hint targets。
+- `src/app.zig`、`src/app/input.zig`、`src/app/filetree.zig`、`src/app/hints.zig`、`src/app/hint_ui.zig`：类型/焦点/路由/动作接线。
+- `src/app/buffers.zig`、`src/app/search.zig`：notes 路径不改变项目根；保存后刷新缓存。
+- `test/e2e.zig` + TESTING.md：navigator/notes/agents/hints/80 列/错误路径 e2e 与 `@navigator`/`@notes` scenario。
+
+**验证**
+
+- `zig build test`：376/376 通过（新增 navigator/note_store 单测，未改动既有断言）。
+- `zig build e2e`：151/151 通过（原 145 + 6 个 M2b1 pty 测试），新增 scenario `navigator notes 120x30` / `navigator agents 100x30`。
+- 无 golden 变更（golden 帧不含 navigator）。
+
+---
+
+### 18.9 M2b2 实现状态（inline assistant + pending diff，2026-10-25）
+
+**入口与 prompt**
+
+- editor/visual/visual-line 有选区时 `<leader>i` 打开 **inline edit** prompt；`visual_block` 也按 anchor→cursor 的连续区间处理。没有选区时只在状态栏提示 `inline edit: select lines first`，不改变任何状态。已有 pending edit 时提示 `inline edit: reject the pending change first`（one-pending policy，绝不静默替换）。
+- prompt 是居中 float：宽 `min(64, cols-4)`、高 6、精确圆角边框；标题 `inline edit`。内部 4 行：model + 状态（`ready` / `streaming…` / `error`）、`❯ ` 输入行（beam cursor）、`Enter generate · Esc cancel`（错误时显示 `error: …`）、`lines A-B · N bytes · file`。80/100/120 列都不越界，也不覆盖状态栏。
+- 输入支持 UTF-8（vaxis 的完整 `key.text`）与 bracketed paste；换行/tab 在单行 prompt 中折叠为空格（tab → 4 spaces）。Enter 生成、Esc/Ctrl+c 取消、Ctrl+w 删除最后一个词。prompt 打开期间按键在 `handleKey` 最前被截获，editor/AI/tab/leader 快捷键与普通 vim 序列都不可达；visual 选区保持可见。
+- 只有 prompt 自身（及其流式状态）拥有键盘；`<leader>i` 之外的普通编辑键不会进入 buffer。
+
+**请求（独立于 chat thread）**
+
+- 新增独立 client `App.inline_edit.client`（`src/ai/client.zig` 复用，不复制 HTTP/SSE）；同一时刻最多一个 inline 流。chat/thread transcript 不读不写，请求体只有固定 system prompt + 一条 inline user message。
+- system prompt 要求只返回选区替换文本，不要 fences/解释；user message 含文件路径、1-based 行范围、instruction、选区文本。选区文本最多 16 KiB 且只按 UTF-8 边界截断；完整选区仍保存在 snapshot 中用于 diff/approval。
+- `OZ_AI_MOCK_DIR` 仍走同一 client seam（写 `request.json`、回放 `stream.sse`），e2e 用它验证请求体与流式行为。
+- Esc/Ctrl+c 调 `requestCancel()` 并立即关闭 prompt；之后到达的 delta/done 全部丢弃。错误（配置/启动/流）留在 prompt 的 `error:` 行，buffer/历史不变；可修改 instruction 后重试。
+
+**Pending edit 与 diff**
+
+- 流完成时（`done`）把 streamed text 经 `stripFences` 处理（仅当首行是 ```[lang]、末行是闭合 ``` 时剥离，其他情况逐字节保留），构造 `Pending`：buffer index、path、原始 byte range、原始文本、replacement、生成时 `history.revision`、1-based 行范围、缓存的 diff 行与统计。
+- diff 在完成时计算一次（行级 LCS；两侧超过 400 行时退化为“全部删除 + 全部添加”，仍真实），渲染只遍历可见行；不逐帧重建。context 行原样、`- ` 用 `diag_error`、`+ ` 用 `string`，行超宽按 cell 截断。
+- 完成即：必要时打开 rail、切到 **Changes**、badge 变 `changes 1`、焦点落在 workbox。Changes 固定显示 `path · lines A-B`、`-N +M`（stale 时追加 `stale selection`）、`[a] approve  [r] reject`、空白行和 diff 行；diff 不足时剩余行仍画左/右边框，空状态仍是 `no pending changes`。
+- 长 diff 可用 `j/k` 滚动（只改 `pending_scroll`，不重新 diff）。
+
+**Approve / Reject / undo**
+
+- Approve（`a` 或 Enter，或 hint 标签）先验证：buffer 仍存在（有 path 时按 path 重新定位）、`history.revision` 等于生成时值、range 在界内、`[start,end)` 当前字节等于 original。任一失败 → `stale selection`，pending 保留并标 stale，绝不应用到移动后的文本。
+- 验证通过后 `switchTo`（若需要）+ `applyEdit(start, end, replacement)`：`applyEdit` 内部 `beginGroup/record/endGroup`，因此整个替换是 **一个 undo group**；`u` 一次恢复原文。随后 dirty、cursor 落在 range start、清除 pending（badge 0）、焦点回 editor、状态栏 toast `inline edit applied · u to undo`。
+- Reject（`r`/`d` 或 hint 标签）只释放 pending、badge 0、焦点回 editor，不触碰 buffer/history/revision；toast `inline edit rejected`。不存在“静默 auto-apply”。
+- Changes 的 review 键只在“tab=Changes 且存在 pending”时覆盖：`a`/Enter approve、`r`/`d` reject、`j`/`k` scroll；无 pending 时 `r`/`d` 仍是原来的 Terminal/Changes tab 切换。hint action 新增 `inline_approve` / `inline_reject`，按钮 rect 在渲染时注册，`<leader>j` 可激活；这些键在输入框中不可达（prompt 先消费所有按键）。
+
+**与 chat/rail 的关系 / 限制**
+
+- inline 有独立 client 和独立状态；chat 线程仍各自一份 client/transcript，两者可并存流式，互不写入。inline 完成会打开 rail 并抢占焦点，但不会 attach/修改 thread。
+- 只支持一个 pending、一个 inline 流；不提供多文件/多 hunk 队列或“替换为第二个候选”。block 选区按连续区间处理，不做矩形替换。
+- diff 是行级 LCS（上限 400 行/侧），没有 word-level diff、语法高亮或 hunk 折叠；长行截断而非软换行。
+- pending 不存在 workspace 隔离：切换 workspace 后 pending 仍显示，approve 会因找不到对应 path/revision 而 stale，必须 Reject；这是安全失败而非静默丢失。
+- 不自动保存：approve 只改 buffer（dirty），写盘仍由用户 `:w`。
+
+**文件**
+
+- `src/app/inline.zig`：纯选区映射、bounded UTF-8、fence 剥离、行 LCS diff、snapshot/pending/one-pending policy + 单测。
+- `src/app/inline_ui.zig`：prompt、独立 client、stream drain、approve/reject、Changes 渲染、hint 按钮。
+- `src/app.zig`、`src/app/input.zig`、`src/app/render.zig`、`src/app/ai.zig`、`src/app/hints.zig`、`src/app/hint_ui.zig`：状态/路由/rail badge/diff/hint 接线。
+- `src/editor/key_event.zig`、`src/editor/mode.zig`、`src/editor/keymap_list.zig`：`<leader>i`。
+- `test/e2e.zig` + TESTING.md：approve/undo、reject/one-pending、stale、cancel、80 列/hint、`@inline` scenario。
+
+**验证**
+
+- `zig build test`：389/389 通过（原 376 + 13 个 inline 纯模型单测，未改动既有断言）。
+- `zig build e2e`：156/156 通过（原 151 + 5 个 inline pty 测试），新增 scenario `inline edit 120x30` 与 required tag `@inline`。
+- 无 golden 变更（inline prompt/diff 不进入固定 golden 帧）。
+
+---
+
+### 18.10 UI chrome clarity（feat/ui-chrome，2026-10-25）
+
+只改视觉层次，不改键位、行为、数据或提示目标；goldens 因布局变化显式重建。目标是让 TUI 的四个工作面（navigator / editor / rail / workbox）和底部状态区一眼可分，接近批准原型的清晰度。active tab / separator 的具体颜色随后在 §18.10.1 全部主题化，本节中写死的 accent/fg_dim 描述由该节取代。
+
+- **状态带**：`status_row_count` 从 1 改为 2（一行 `─` 规则 + 一行状态）。编辑器、rail、floats 的高度计算统一走该常量，因此内容不会画进状态带；编辑器与 rail 各让出一行。状态行分 `[workspace] │ [MODE] │ line/col │ ⎇ branch`，右侧 `agent … │ dock/drawer`；80 列仍走 compact/mini fallback，不横向溢出。`[MODE]` 用 accent 背景的 badge，普通行保持 bg_status。
+- **Agent Rail**：`AGENTS  N` header band（bg_status）+ workspace `name / workspace`；active thread 用 ASCII `>` + bold，非 active 状态用 `o/*/x/!`。thread list 与 workbox header、tab strip 与 body 之间各一条 `├──` rule；active tab 同时有 `>`、accent 与 bg_sel（monochrome 下仍可区分）。38-cell rail 的 tabs 使用带呼吸感的 `>chat│ changes N │ tools │ terminal`（35 cells 内精确放下），34-cell rail（100 dock / 80 drawer）继续用紧凑 `>chat│changes N│tools│terminal`；hint target 随 label 起点移动。rail 左侧固定留 1 列空白 gutter：dock 模式不计入 editor 宽度，drawer 模式在 editor 之后覆盖最后一列，因此 text/blame 均不触碰 `│`。`▥`、`●/○/◌/✖`、`▸/▾` 等易 tofu 的装饰字形不再用于 AI/nav chrome；tool card 状态图标也改为 ASCII。rail 左边界未聚焦时用 `fg_dim`（原来 `fg_faint` 太容易消失在 bg_float 里）。
+- **Navigator**：top strip 为 `╭─ files │ notes │ agents ───╮`（精确 30 cells），active tab accent + bg_sel + bold，inactive dim，`│` 明确分隔；标签起始列仍为 3/11/19，hint target 不变。box 与 editor 之间固定 1 列空白 gutter（`contentCol()` 从 30 变为 31），editor text/cursor/tab 都不再贴住 `╮`。Notes/Agents 的 selected row 保留 bg_sel fill；Notes 选中标记与 Agents active thread 标记改为 ASCII `>`，Agents 的组标题去掉 `▾`。
+- **Blame ghost**：仍在 editor content pane 内绘制；rail 打开时（dock 或 drawer）额外 clip 到 `rail_col - rail_gutter`，即 rail 前固定保留一个空格，不触碰 agent 列。rail/workbox 仍最后绘制，因此 ghost 永远不能覆盖 rail 文本；放不下时直接截断/丢弃，绝不画一列进 rail。
+- **性能**：规则行用 `writeCell` 写静态 `─`，状态文本使用栈 buffer，不新增普通帧堆分配；rail header count 沿用 frame arena（vaxis 在 render 前引用文本）。
+- **测试**：491 unit / 178 e2e（主题化后为 493 unit / 179 e2e，见 §18.10.1）。新增 120 dock 与 80 drawer 的 chrome e2e（header band、两条 rule、tab 分隔/active 样式、status 规则行与 section 分隔、禁止 glyph 扫描、nav/rail 空白 gutter）和 blame/rail 裁剪 e2e；goldens 仅通过 `OZ_UPDATE_GOLDEN=1` 重建（最终 gutter 轮只改 120 dock 的 tab 行：38-cell rail 的 separator 呼吸空间；80 drawer 的短行从未占用新 gutter，故 cell 不变）。
+
+#### 18.10.1 Theme-aware chrome（feat/theme-chrome，2026-10-25）
+
+用户反馈 active tab 与部分分隔线在所有主题下都读成同一种灰色。本节把 active tab / rule / panel border 的颜色从 renderer 里零散的 `theme.*` 取值提升为 `src/app/chrome.zig` 的纯风格函数，navigator、buffer tab bar、workbox 共用，避免三处漂移。
+
+- **active tab**（navigator / buffer / workbox）：`bg_sel` 软选择底 + `fg` 加粗文字 + `accent_alt` 单下划线（SGR 4 + 58 真彩色，等价 demo 的蓝色 inset underline）；workbox 的 `>` marker 与 active buffer icon 同用 `accent_alt`。不是灰色，也不是整块饱和 accent 填充；monochrome 下仍靠 bold + `>` + underline 区分。catppuccin-latte / flexoki-light 等浅色主题同样成立（单测检查 `fg`/`bg_sel` 对比度 ≥3:1，16 个主题实测最低 3.61:1，即 catppuccin-frappe）。
+- **separators / rules**：`separatorStyle(theme, emphasis)` 统一取 `accent_alt`：minor（navigator tab `│`、workbox tab `│`、status section `│`）加 `.dim=true`；major（workbox 两条 `├──` rule、status 顶部通栏 `─`）保持全亮。panel border 走 `panelBorderStyle(theme, focused)`：未聚焦 `win_sep`，聚焦 `win_sep_active`（主题 accent），navigator 与 rail 一致。
+- **active thread row**：`>` marker 使用 `accent_alt`；prompt/rail 聚焦时整行仍是 `bg_sel`，否则落在 `bg_float` rail 底上，不再只有灰色。
+- **scope/性能**：只映射样式，无键位、行为、hint target 或布局改动；helper 返回 `vaxis.Style` 值，无每帧分配。`fg_faint` 仅保留给非 active 的次要文字。
+- **测试**：493 unit / 179 e2e。单测覆盖全部 16 个主题（active tab = `bg_sel`/`fg`/bold/`accent_alt` underline；minor/major/panel 均非 `fg_faint` 且跨主题不同；浅色主题有效）；新增 `ui chrome: theme matrix ...` e2e，用临时 HOME + `~/.cache/oz/theme`（生产 `loadTheme` seam）分别加载 kanagawa-wave / catppuccin-mocha / flexoki-light，逐 cell 校验 nav/buffer/workbox active tab 的 fg/bg/underline、tab/rule/status 分隔线的 accent、focused rail/navigator border，并断言三种主题的实际渲染色两两不同。goldens 通过 `OZ_UPDATE_GOLDEN=1` 重建：只有 fg/bg style run 变化（active buffer tab 底色、workbox marker/underline、rule/status 颜色），row text 未变。
+
+#### 18.11 Two-row buffer strip（feat/ui-polish，2026-10-25）
+
+用户反馈顶部 buffer tabs 太小、不像批准 demo 的 `.buffer-bar`。本节只放大/重组 buffer strip，不改键位、buffer 模型、关闭语义或其它工作面；内容整体下移一行，goldens 因布局变化显式重建。
+
+- **两行结构**：第 0 行是 tab labels，第 1 行是编辑器区域通栏 `─` rule + active tab 的 `accent_alt` inset underline segment；内容从两行之下开始。split 时每个 column-overlap layer 各占一个 label row，所有 layer 共享同一条 rule row（`tabBarRows = layers + 1`），因此 stacked pane 不会重复画 rule，也不会让内容画进 strip。高度极小时 `tabBarRows` clamp 到可用行数，dashboard/空 buffer 仍保留 strip 与 rule，不塌陷。
+- **tab 几何**（纯模块 `src/app/tabstrip.zig`）：body 最小 20、最大 26 cells；固定 2-cell 左侧内边距 + devicon + 空格 + filename + 保留的 dirty 列（`●`）+ 空格 + close `×` + 2-cell 右内边距；tab 之间一条 `│`。dirty 列即使 clean 也保留，输入时 tab 宽度不跳动；close 位置固定在 body 右端，hint target 与之同源。粗算：`fixed_cells = 9`，name region = body - 9（11..17 cells）。
+- **宽度/滚动**：filename 超宽时 middle-ellipsis（保留可读前缀 + `…` + 8-cell 后缀），比 CSS 的尾部省略更能在窄 cell 中保留扩展名/尾标识；`plan()` 在总宽超限时以 active tab 为锚，先向右再向左填充可见邻居，返回每个可见 tab 的 x/width/name 区/close 列。80/100/120 下切换 buffer 始终完整显示 active tab；不可见邻居由 `hidden_left/right` 表示，不画越界内容，也无额外滚动键位。
+- **样式**：label row 底色 `bg_status`（bar 层级），inactive tab 用 `fg_dim`（diff/note 未 active 时仍用 `constant`/`type` 语义色），active tab 保持 §18.10.1 的 `bg_sel` + `fg` bold + `accent_alt` underline；active icon/marker 同 accent。rule row 用 `win_sep` 的 dim hairline（demo `.buffer-bar` 的 border），active segment 用亮 `accent_alt`，因此 rule 与 active inset 在 cell 层面可区分。split 的每个 pane 各自按自己的 active buffer 画 underline。
+- **hint / 关闭**：tab 的 select target 从 icon（左内边距之后）开始且覆盖 tab body；clean/dirty 均可注册 close target。新增 `hints.Action.buffer_close`，动作直接调用既有 `closeBufferAt`（`:bd` / `<leader>bk` 同一条路径，最后一个 buffer 不注册 target，无第二套破坏性逻辑）。关闭 dirty buffer 仍是既有语义，不新增确认框。
+- **性能/测试**：plan 为 O(tabs)、固定可见槽位、零分配；renderer 复用 frame arena 的 spec 映射，无每帧堆分配增长。单测覆盖 min/max width、icon/name/dirty/close 几何、middle-ellipsis 分配、active 可见性（80/100/120）、>64 visible 的截断、空/单 tab/clamp；e2e 新增 `ui buffer strip:` 三尺寸（120x30/100x30/80x24）和 split shared-rule 测试：逐 cell 校验 two-row 高度、rule/underline、`bg_sel` active、`×` 与 close hint 动作、内容首行、无水平溢出。
+- **测试计数**：510 unit / 185 e2e。
+
+#### 18.12 Motion（feat/ui-polish，2026-10-25）
+
+目标是把 demo 的 `dot-pulse` / `running-pulse` / `badge-pop` 语言带进 TUI，但只在有真实活动时动；空闲编辑器没有任何 timer 或逐帧重绘。纯函数在 `src/app/animation.zig`，不依赖 App/vaxis/分配。
+
+- **streaming pulse**：thread 的 dot/status 颜色在 `accent` ↔ `accent_alt` 之间按 `stream_pulse_ms = 900` 三角波插值（`pulseColor`），只对 `.streaming` 状态生效；idle/cancelled/error 保持静态语义色。rail thread row 与 workbox header 的 status 文案同步脉冲，active marker 仍可读。
+- **running tool spinner/pulse**：running card 的 icon 每 `spinner_step_ms = 120` 循环 ASCII `| / - \`，status 文案与 icon 颜色同步 pulse；ok/err/approval 等终态立即回到静态 icon/颜色。终态后不再有状态变化。
+- **Changes badge flash**：workbox 的 `changes N` 在 pending count 真正变化时获得 `badge_flash_ms = 420` 的颜色脉冲 + bold；`review_flash_start_ms` 是显式 deadline，`reviewFlashActive()` 到期即 false。首次打开 rail 初始化基线，不误闪。
+- **run loop / idle safety**：`animationActive() = aiStreaming() or inlineStreaming() or reviewFlashActive()`；tool-only batch 已被 `aiStreaming()` 的 tool_jobs 分支覆盖。loop 仅在该谓词为真时进入 1ms poll slice（16ms 渲染节流），谓词为假后回到阻塞 `pollEvent`；flash 到期不需要额外 wake。`frame_now_ms` 每帧只取一次，所有元素同相。
+- **可测性**：`wrapMs`/`triangle`/`spinnerGlyph`/`flashActive`/`flashProgress`/`blend`/`pulseColor`/`caretVisible` 全部纯函数并单测负时钟、端点、deadline 与 0 周期；内部 e2e seam `OZ_AI_TOOL_DELAY_MS`（默认未设）让 running card 在测试中停留数帧。e2e `animation:` 用长 SSE 流与带 delay 的 tool mock 各抓多帧，断言 status fg / spinner glyph 至少出现两种值；完成后断言 300ms 内 PTY 零输出、cell 不再变化（idle 无 churn）。
+- **限制**：TUI 无 opacity/transform，pulse 用 RGB 插值；badge flash 只有单测 deadline 与渲染路径，没有单独 e2e（不计入“至少两种动画”的验收）；caret blink helper 已就绪但硬件光标保持现状。
+
+#### 18.13 Navigator brand + compact rail（feat/navigator-brand，2026-10-26）
+
+用户要求把批准 demo 的左侧 navigator 落到 TUI：完整宽度要有 `OZ` 品牌头、`workspace / branch`、带图标/真实计数的 `Files / Notes / Agents` tabs；窄宽度要像 demo 一样只剩 `OZ + 三个图标` 的 rail，点图标弹出内容。只改 navigator 的视觉/几何，不改 tab 模型、notes/thread 数据或既有键位语义。
+
+- **断点与几何（纯模块 `src/app/navigator.zig`）**：`modeForCols(cols)` 在 **≥90** 用完整面板（30 cells 含边框），**<90** 用紧凑 rail（`compact_width = 7`，含右侧边框）。editor 内容列 `editorCol = panelWidth + 1`：完整 31、紧凑 8；完整/peek 的 header 固定 4 行（品牌边框、workspace、tabs、`├──┤` rule），内容从面板顶 +4 开始；紧凑 rail 是 `OZ`（row 0）、hairline（row 1）、三个两行高按钮（row 2/4/6）。`contentCol()`/`editorAreaWidth()` 用同一模型；`layoutWindows` 的总宽改为 `aiEditorWidth - contentCol`（此前漏减 navigator 列，导致文本在 navigator/rail 下折行），split/tab-layer/focused-width 全部走该值。
+- **品牌头**：完整面板顶边框画 `╭─ OZ ─────╮`（`accent` + bold），下一行 `│ main / feat/navigator-brand │`（`fg_dim`，真实 `curWsName()` + `git_branch`；分支未知时只显示 workspace，过长按 cell 截断加 `…`）。分支是异步 git status 的真实值，测试用仓库内文件打开时等待 status 后再断言；/tmp 非 git 测试只断言 workspace。
+- **完整 tabs**：`Files / Notes / Agents` 前各加一个已确认的 Nerd Font 图标（folder `U+F07B`、md file document `U+F0219`、fa-users `U+F0C0`，见 `src/icons.zig`），label 大写以对齐 demo。计数是真实缓存：`filetree_rows` 可见行、`notes.items`（**未加载时不画 badge**，不伪造 0）、`ai.threads` 真实线程数。`layoutTabs` 把 28 个 interior cells 装下：首选 `icon + space + label + count` 的紧凑 badge 加 1-cell `│` 分隔；放不下时先去掉分隔 gap，再整体省略 badge，但绝不截断 label。active tab 继续用 §18.10.1 的 `bg_sel` + `fg` bold + `accent_alt` underline；图标/计数同步 accent。tab 的 hint/mouse rect 由同一 layout 的 start/width 生成。
+- **紧凑 rail / peek**：rail 顶部居中 `OZ`，一条 `──` hairline，然后三个两行高按钮；active 按钮整行 `bg_sel` + 左侧 accent `│` inset + accent 图标（inactive `fg_dim`）。`<leader>e`/`Ctrl-w h` 或点击/hint/`1/2/3`/Tab 打开 30-cell peek；peek 复用同一个完整面板渲染（含 `×` 关闭目标与真实内容），`Esc`、peek 外点击、打开 file/note/agent 关闭并把键盘交回 editor；peek 与 AI drawer 互斥（打开一个关闭另一个），因此不会叠画。焦点离开 navigator 时 render 收口关闭 peek，避免“焦点在 editor、面板还盖着”的悬空状态。紧凑模式 `Ctrl-w l/j/k` 关闭 peek 回 editor；非 git/非 workspace 切换时 `closeTransientUi` 清理 peek，切回曾聚焦 navigator 的 workspace 时按 `focus` 恢复 peek。
+- **性能/正确性**：计数只读已有缓存（notes 仍只在 tab 进入/create/save/`r` 刷新），没有逐帧文件系统扫描；peek 关闭时零额外绘制/分配，peek 打开才复用完整面板的 frame-arena 绘制。所有动态文本（workspace/branch/count）都 dupe 到 frame arena 后再交给 vaxis（vaxis 保存 grapheme slice 到 render，栈缓冲会变 U+FFFD）。新增 `hints.Action.navigator_peek_close`。
+- **测试**：navigator 纯模型新增断点/editor 列、`layoutTabs`（1/2/3 位计数、超宽省略、Notes 未知、无计数）和 `workspaceLine`/peek toggle 单测；e2e 新增 120 品牌头（真实 workspace/branch + 真实计数）、80 紧凑 rail 的 `1/2/3`/Tab、hint/鼠标开关、file/note/agent 关闭 peek、AI drawer 互斥、60x24 无 overflow，更新既有 navigator/mouse/chrome/theme/scenario 断言；新增 `@compact` scenario（`navigator compact rail 80x24`）。当前 **535 unit / 198 e2e**；golden 帧不含 navigator，未重建。`./tools/verify.sh` PASS。
+
+---
+
+## 19. Keyboard Hints（qutebrowser 风格，M2.6）
+
+参考：[qutebrowser quickstart](https://www.qutebrowser.org/doc/quickstart.html) 的 hint mode：按 `f` 给所有可点击目标加标签，输入标签直接触发，不需要鼠标。oz 是 TUI，没有 DOM，但所有“可点击/可聚焦”的区域（文件树行、buffer tab、agent thread、workbox tab、审批按钮）都可以注册成 target。
+
+### 19.1 为什么需要
+
+AI workspace 把目标分散到 navigator、editor、agent rail、workbox 四处。只用 `j/k` + `Tab` 到达某个具体 tab/thread/approval 的路径太长；hint mode 把“找到目标”变成一次视觉扫描 + 1–2 个字符，适合键盘用户。
+
+### 19.2 键位（避免与 vim 冲突）
+
+- `<leader>j`：进入 **primary hint mode**（jump）。
+- `<leader>J`：进入 **secondary hint mode**（后续：在新 split/新 thread 打开；M2.6b）。
+- 不占用 plain `f`：normal mode 的 `f{char}` 是 vim 查找，必须保留。
+- hint mode 内：可打印标签字符输入、Backspace 删除、Esc 取消；不进入 insert/command/picker。
+- 激活后当前模式/焦点不变；动作完成后回到原焦点（除非动作本身要求切换）。
+- 后续可加 `gi` 风格“聚焦第一个输入框”，但 M2.6a 先用 `<leader>a` / `<Ctrl-w>a`。
+
+### 19.3 标签算法
+
+- 字符集 `asdfghjkl`（9 个）：1 个目标 1 字符；10–81 个目标 2 字符；82–729 个目标 3 字符；超过 729 截断并显示 `+N more`。
+- **固定长度**，不做“唯一前缀自动触发”，避免输入到一半误触；输入长度 == label 长度时执行。
+- 目标按 **从上到下、从左到右** 的屏幕位置排序；同位置按注册顺序，保证确定性。
+- 标签唯一；前缀输入只高亮匹配目标；无匹配时清空输入并 flash。
+- 目标不可见/被裁剪时不注册；注册 rect 必须 clamp 到屏幕内。
+- 标签绘制在 target rect 的左上角（覆盖 1–3 个 cell），使用 accent bg + 深色 fg；不做半透明。
+
+### 19.4 Target 注册与动作
+
+新增纯模块 `src/app/hints.zig`：
+
+```zig
+pub const Action = union(enum) {
+    filetree_select: usize,
+    filetree_activate: usize,
+    buffer_select: usize,
+    agent_thread_select: usize,
+    workbox_tab: WorkboxTab,
+    agent_new,
+    // M2.6b: change_accept/reject, tool_approve/deny, ...
+};
+
+pub const Target = struct { rect: Rect, action: Action };
+```
+
+- `Hints.beginFrame()`：hint mode 激活时清空；普通帧零开销。
+- 各渲染函数在绘制目标时调用 `self.hints.add(rect, action)`。
+- 渲染最后 `drawOverlay()`：计算/绘制标签、当前前缀高亮。
+- 输入路由在 `handleKey` 最前（在 macro/picker/editor 之前）；动作由 App 的 `execHintAction` 映射到现有方法，不复制业务逻辑。
+- 初始 target：文件树行、buffer tab、agent thread 行、workbox tab、`+` 新建线程、navigator tab（M2b 后）。
+- 审批/工具卡片在 M3 注册同一 API，不另造点击系统。
+
+### 19.5 性能
+
+- 只有 hint mode 激活的帧才收集 target；普通编辑/流式帧不增加 O(n) 以上的固定开销。
+- 固定容量数组（例如 128 targets），不每帧分配；标签在栈上/复用 buffer 生成。
+- overlay 绘制 O(targets)，最后一遍，不触发额外 layout pass。
+- 目标注册使用已有 Rect，不做 DOM/树遍历；不确定/离屏目标直接跳过。
+- 输入每次最多触发一次 render；流式 AI 仍可继续 drain，不阻塞。
+
+### 19.6 里程碑
+
+- **M2.6a（已完成，2026-10-25）**：`<leader>j`、标签生成、tint 覆盖层、文件树/buffer/agent/workbox tab 的目标与动作、Esc/Backspace、单元 + e2e。实现状态见 §19.8。
+- **M2.6b**：`<leader>J` secondary actions（split 打开、新 thread）、approval/diff/tool 按钮、`gi` 聚焦输入、目标优先级/去重。
+- **M3**：工具卡片、审批、metrics 的按钮自动注册为 hint target；不引入第二套键盘导航。M3a 已注册 Chat tool card（展开/收起）与既有 Workbox tab；审批按钮留到 M3b。
+
+### 19.7 测试
+
+- 单元：0/1/9/10/81/82 targets 的标签长度/唯一性/顺序；前缀匹配/回退/无效；动作 payload；rect clamp；容量截断。
+- e2e：120 dock 打开 hint mode，断言覆盖标签、输入文件树标签打开/展开、输入 buffer tab 标签切换、Esc 取消无副作用；80 drawer 输入 workbox/agent 标签；标签不越界、不覆盖 status bar；普通 `f` 仍是 find-char。
+- 新增 required scenario tag `@hints`；golden 增加 `hints-120x30`（可选）。
+- 性能：微基准只测纯标签生成/匹配（固定 128 targets），不在 e2e 中用墙钟断言。
+
+### 19.8 M2.6a 实现状态（已完成，2026-10-25）
+
+**入口**：`<leader>j`。editor normal / dashboard / 文件树聚焦 / AI 线程列表聚焦均可用。AI rail 聚焦时会先消费所有可打印键，因此线程列表的 `<leader>j` 在 `src/app/ai.zig:handleAiRailKey` 里识别（`rail_pending_leader`）；prompt 聚焦时空格属于输入文本，hint 不从输入框触发（先 Esc/Tab 离开输入框）。文件树聚焦时，pending leader 期间文件树不再吃掉序列尾键（`Mode.leaderPending`），否则 `<leader>j` 的 `j` 会变成移动文件树光标。
+
+**目标（当前约 20 个，取决于布局）**
+
+| 目标 | Action | 复用方法 |
+|---|---|---|
+| 文件树可见行 | `filetree_activate` | `activateFiletreeSelection`（Enter 抽出的同一函数） |
+| buffer tab（单窗口 / split tab bar） | `buffer_select` | `switchTo` |
+| AI 线程行 | `agent_thread_select` | `aiSelectThread`（Enter attach 语义） |
+| Workbox Chat/Changes/Tools/Terminal | `workbox_tab` | `aiSetWorkboxTab` |
+| 新建线程 `+` | `agent_new` | `aiNewThread` |
+| AI 输入框行 | `agent_prompt_focus` | `aiFocusPrompt` |
+
+`Action.filetree_select` 保留在 union 中（API 完整性），M2.6a 不注册——单独的“只选中”没有可观察效果。dashboard 的 `[No Name]` 空 tab 不注册（动作不可观察）。审批/tool 卡片留给 M3 通过同一个 `addHintTarget` API 注册。
+
+**动作与焦点**：`src/app/hint_ui.zig:execHintAction` 只调用上表的既有方法，先做越界检查；动作抛错时 `catch` 转成状态消息，不 panic。焦点由动作本身决定：文件树展开留在文件树、打开文件回 editor（Enter 语义）；buffer 切换回 editor；线程 attach/`+`/输入框聚焦 prompt；Workbox tab 保持当前焦点。Esc/Backspace/无效前缀不修改任何业务状态。
+
+**标签与绘制**：纯模型 `src/app/hints.zig` 不 import App/vaxis：固定 128 容量、comptime 静态标签表（O(1) 生成、零分配）、稳定 row-major 排序（同位置按注册顺序）、前缀/回退/无效前缀/flash、`statusText` 写入 State 自带 buffer（vaxis cell 引用文本直到 `vx.render()`，不能放栈上）。标签画在目标内容区左上角（不盖边框），靠近右边界时整体左移 clamp，且永不绘制终端最后一列；匹配前缀为 accent bg + 深色 fg，其余 dim。状态文字替换状态栏右侧的 AI 状态块：`HINTS · N targets · Esc cancel` / `HINTS · no match · Esc cancel` / `HINTS · no targets`。
+
+**性能**：普通帧只有 `beginFrame` 的一次布尔判断；target 收集只在 hint 帧；排序 n≤128 插入排序；每键前缀匹配 O(n)；overlay 在 `vx.render()` 前一遍绘制，O(targets)，无额外 layout pass。标签生成/匹配的复杂度在模块头注释与单测中固定（729 标签 O(n) 不变量）。
+
+**与最初设计的差异 / 限制**
+
+- 在 §19.2 的 editor/dashboard 之外，额外支持线程列表入口；否则 80 列 drawer 下 prompt 聚焦会吞掉空格，hint 不可达。
+- 容量 128 < 729，`+N more` 在 App 中不可达；纯模型与单测覆盖该分支。
+- target 集合每帧重建。若帧间 target 数变化（resize / rail 开关等），已输入前缀会被清空，避免指向重排后的标签；目标动作本身不改变目标集。
+- 没有 golden：标签会覆盖目标文本，target 数还依赖仓库根目录条目；语义断言（从画面读出标签、状态文字、边框、水平溢出）比整帧 golden 更稳定，见 `test/e2e.zig` 的 hints 测试与 `@hints` scenario。
+- 鼠标支持见 §21：hint target 同时作为命中区域，鼠标与键盘共享同一批动作方法，没有第二套业务逻辑。
+- M2b1 追加 `navigator_tab`（复用 `navigatorSetTab`）与 `note_open`（复用 `openNoteAt`）两个动作；`agent_thread_select` 现在先打开 rail，保证从 navigator 的 Agents tab 触发时 attach 可见。navigator 的 tab strip 与 Notes 行都注册为 target，e2e 从画面读取标签后激活。
+- M2b2 追加 `inline_approve` / `inline_reject`：Changes 的 pending diff 渲染 `[a] approve  [r] reject` 两行按钮时注册矩形，动作分别复用 `inlineApprove` / `inlineReject`，与键盘 `a`/Enter、`r`/`d` 是同一条路径。
+- M3b1 追加 `agent_approve` / `agent_reject`：通用 Changes review 渲染器（`inline_ui.drawDiffReview`）把按钮动作作为参数传入，agent edit 走 `agentEditApprove` / `agentEditReject`，与键盘路径一致。
+
+---
+
+## 20. Agent Tools 与 Metrics（M3）
+
+### 20.1 目标
+
+M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时请求批准、并把调用过程可视化”。M3a 先做只读工具；M3b 再做写入/补丁审批和完整 metrics 图表。任何工具都不得绕过 workspace 边界或用户批准。
+
+### 20.2 工具协议
+
+- 复用 OpenAI-compatible `tools` + `tool_choice:"auto"`；工具定义与流式 `delta.tool_calls[]` 解析在 `src/ai/tools.zig`（M3 core）。
+- 支持并行 tool calls；按 index 累积 arguments 片段，finalize 后校验 JSON object。
+- 工具结果用 `role:"tool"` + `tool_call_id` 回填，content bounded（≤64 KiB），UTF-8 安全。
+- 一轮最多 N 次工具调用（例如 8）和最多 M 轮（例如 6），超限停止并显示原因；避免无限 agent loop。
+- 取消：与 chat 共用取消路径；取消后丢弃未完成的 tool calls，不执行。
+
+### 20.3 只读工具（M3a）
+
+`read_file` / `list_directory` / `grep`：
+
+- 路径必须限制在 workspace root 内：拒绝绝对路径、`..`、NUL、指向 root 外的 symlink；输出只显示相对路径。
+- 读取上限 64 KiB / 2000 行；目录最多 500 项；grep 最多 200 个匹配、单文件 1 MiB、深度 8；超出显示 truncation marker。
+- grep 为字面量匹配（不引入正则执行风险），可带简单 glob；跳过二进制。
+- 执行在后台线程/现有 worker 中，不阻塞 UI；结果回到对应 thread，不能串线。
+
+### 20.4 权限与审批
+
+- 读工具默认 allow；`edit_file` / `apply_patch` / terminal 默认 confirm；未知工具 deny。terminal **没有任何 auto-allow 开关**：权限判定恒为 confirm，执行必须经过人工 Allow（M3b3）。
+- 审批卡片出现在 Chat 内联；文件写入同步到 Workbox Changes（`changes N`），terminal 命令在 Workbox Terminal tab 审批（`[a] allow [r] deny`，badge 用高亮 label 而不是加宽 tab）；`<leader>j` hint target 与鼠标都可选中 Allow/Deny。
+- M3a 的写入工具只返回 `approval_required`/未实现，不落盘；M3b1 已把 `edit_file` 接到 pending diff/apply 路径（§20.9），M3b2 把 `apply_patch` 接到同一审批路径（§20.10）；M3b3 把 `terminal` 接到独立的人工审批 + 后台执行路径（§20.12）。
+- 审批决定绑定 stage 时的 tool card/参数摘要；approve 时重新校验路径、整文件文本与 `history.revision`，参数/内容变化不得复用旧批准。
+
+### 20.5 Tool cards 与 metrics
+
+- Chat 中每个 tool call 显示紧凑卡片：name、参数摘要、状态（running/ok/error/denied）、耗时、结果摘要；失败不能伪装成功。
+- Workbox `Tools` tab：按工具聚合
+  - calls / ok / error / denied
+  - average / max（该工具全部真实执行样本）
+  - **p95**（该工具最近至多 32 次真实执行样本的整数 nearest-rank：`ceil(0.95*n)-1`，clamp 到 `[0, n-1]`；n=0 时没有值，显示 `no latency samples`，绝不伪造 0ms）
+  - 最近 32 次耗时 ring buffer（每工具固定 `recent_capacity = 32`；p95 和图表共用这同一批真实样本）
+  - Tools tab 顶栏的聚合 p95 汇总每个工具各自的 recent window（每工具 ≤32，最多 8 工具 = ≤256 个真实样本，仍为 nearest-rank）；per-tool 卡片则只统计该工具的窗口。两者语义在 §20.11 固定。
+  - 折线图使用 `src/chart.zig`（M3a 已接入 Tools tab），窄屏 fallback sparkline；没有数据时显示真实空状态。
+- Metrics 只统计真实调用；mock/e2e 数据不得进入发布 UI。
+- 图表只在数据变化时重算，按 workbox 尺寸缓存；普通帧 O(visible cards)，不每帧重跑 diff/chart。
+- Chat tool card 通过同一 `<leader>j` target API 选中，激活 = 展开/收起结果详情（真实动作；不 invent 无效果目标）。
+
+### 20.6 里程碑
+
+- **M3a（已完成，2026-10-25）**：只读 executor + tool loop + Chat tool cards + Tools tab 真实统计 + chart 接入 + 审批占位；e2e mock。实现状态见 §20.8。
+- **M3b1（已完成，2026-10-25）**：`edit_file` staged diff + 人工 approve/reject + buffer-only apply/undo、审批按钮 hint、`approved`/`rejected` 卡片与 decision metrics。实现状态见 §20.9。
+- **M3b2（已完成，2026-10-25；multi-file 2026-10-26）**：`apply_patch` 1..8 文件 unified diff 解析/全量预校验/整文件 staged review；单文件保持 buffer-only approve/undo，多文件是一组显式跨文件 disk transaction + 跨文件 undo/redo。实现状态见 §20.10。
+- **M3c（已完成，2026-10-26）**：每工具 recent-window p95（整数 nearest-rank，≤32 个真实样本）+ Tools tab 卡片/顶栏展示与 80/100/120 紧凑 fallback。实现状态见 §20.11。
+- **M3b3（已完成，2026-10-26）**：`terminal` 工具 + 每命令显式人工 Allow/Deny + 后台 `/bin/sh -c`（captured workspace root、空 stdin、bounded env）+ 10s 上限/64 KiB 合并输出 + 真实进程组 kill + 结果回填/follow-up/metrics。**不是**通用 shell UI；编辑器终端（Alt+r）不变。实现状态见 §20.12。
+- **M3b 余下**：跨会话 metrics 持久化、性能基准。
+- **后续**：MCP/ACP、跨会话 metrics 持久化。
+
+### 20.7 测试
+
+- Core：tools 协议/accumulator（已有 26 单测）、executor 路径逃逸/大小上限/二进制/错误、chart（已有 17 单测）。
+- E2E：只读 tool call 一轮/多轮、并行 calls、错误工具、超轮次、取消、审批 deny/allow（M3b）、卡片 stats、Tools tab 空/有数据、80/100/120 布局、hint 选中；M3b3 另有 terminal 的真实 spawn/deny/timeout/输出上限/线程隔离/鼠标审批测试（`@terminal`）。
+- 每个工具调用必须能在 mock 请求体/响应中复现；不能依赖真实网络。
+- 性能：executor 在 worker，UI 帧不等待；metrics/chart 重算次数可断言（例如只在数据变化时）。
+
+### 20.8 M3a 实现状态（已完成，2026-10-25）
+
+**Transport（`src/ai/client.zig` + `src/ai/openai.zig` + `src/ai/tools.zig`）**
+
+- 每个 chat client worker 持有一个 `ai.tools.Accumulator`：每个有效 JSON chunk 在保留 `openai.parseDelta` 文本 delta 的同时喂给 accumulator；流结束（`finish_reason`/`[DONE]`/EOF）时 `finalize` 并按 index 顺序 push 一个 `Event.tool_calls`（owned），随后才 push `Event.done`。纯文本流零行为变化。
+- 并行 calls/交错 fragments/文本+calls 都由 accumulator 处理；`invalid index`、缺 id/name、非法 arguments 等**有效 JSON 内的协议错误** push `tool call protocol: <Error>` 聊天错误，不 panic、不执行半截调用。语法非法的 JSON chunk 仍按 M1 策略忽略（网关 keep-alive/metadata 兼容）。
+- 请求：`turn.buildMessages` 把 thread transcript 映射为 OpenAI messages（user/assistant/tool 保持原顺序，空 assistant 占位跳过，带 tool_calls 的空文本 assistant 保留）；`tools.appendTools` 追加 `tools` + `tool_choice:"auto"`。assistant tool-call turn 用 `tools.buildAssistantToolCallsJson` 序列化，tool result 用 `tools.buildToolResultContent`（≤64 KiB、UTF-8 安全、`error: ` 前缀）；OpenAI writer 对带 tool_calls 的空 content 写 `null`。
+- 测试 seam（仅 `OZ_AI_MOCK_DIR`）：第 n 个请求写 `request.json`（最新）+ `request-<n>.json`，优先回放 `stream-<n>.sse`/`error-<n>.txt`，否则 fallback `stream.sse`/`error.txt`。既有测试不受影响。
+
+**Agent loop（`src/app/ai.zig`）**
+
+- 每 thread 一个 `ToolThreadState`（与 `threads.items` 平行）：捕获当轮 workspace root（`currentRootDir`，绝对、无 trailing slash）、round/call 计数、in-flight batch、stream terminal、follow-up 状态、generation、当前 batch 的 card message indices、transcript note、`agent.Metrics`。
+- 一轮 user turn：首个请求带 tools；响应结束时若有 tool calls：把 calls 附到本轮 assistant message，为每个 call 建 card（running），按 `agent.planBatch` admission（prefix）：前 N 个交给 worker；超限的立即写为 `unsupported` + `error: ... limit ...; not executed`，并写回一条真实的 `role:"tool"` 结果。`rounds` 按 batch 计，`calls` 按实际 admitted 计。
+- worker 完成后：填 card 的 status/content/duration（`ok`/`error`/`unsupported`；M3a 的 `edit_file` 占位为 `approval required`，M3b1 起改由 App 层 stage，见 §20.9），记录 metrics，然后自动 follow-up；follow-up 仍是同一 thread 的 client（`joinAfterTerminal` 消除 done/worker 重用的 Busy race），消息序列为 assistant(tool_calls) → tool results → 下一条 assistant。
+- **限制**：最多 4 个 tool batch（`agent.max_tool_rounds`）、最多 8 个执行调用（`agent.max_tool_calls_per_turn`）。到达任一上限后下一请求 **不带 tools**（最终 no-tools turn），保证仍能拿到最终文本；若模型在最终轮仍返回 tool calls，只生成 `unsupported` card/结果并停止。超限时 Chat transcript 显示 `tool loop stopped: max rounds/calls (N) ...`；Tools tab 的计数仍是真实值。
+- `edit_file`/`apply_patch` 只走 executor 的 `approval_required`（不落盘），`terminal`/未知工具 `unsupported`；`ai/tool_exec.zig` 内没有任何写 syscall。（M3b1 起 `edit_file` 在 App 层 stage，executor 的 fallback 仍不写；见 §20.9。）
+- 取消/切线程：现有 `cancelClient` 同时 requestCancel transport、`generation += 1`、冻结 running cards 为 `cancelled`、requestCancel worker；随后 worker 的结果因 generation/`cancel_requested` 不匹配被丢弃，绝不写入任何 transcript。`Ctrl+c` 在 stream 已结束但 tool/follow-up 仍活动时也会停止 loop。
+
+**Worker（`src/app/tool_job.zig`）**
+
+- 每 thread 最多一个 `Job`（后台 `std.Thread`），在 worker 内构造一次 `tool_exec.Executor`（realpath 一次），顺序执行 batch；调用之间检查 cancel。结果数组由 worker 写好，`done` release 发布；run loop 的 `drainToolJobs` acquire 消费，UI 帧从不读取文件/不等待 IO。
+- 每 call 用 monotonic `awake` ms 计时；`read_file` 64 KiB/2000 行、list 500、grep 200/1 MiB/深度 8 等上限仍在 executor 内。`aiStreaming()` 把未消费 job 也视为 active，run loop 以 1ms slice poll（不阻塞按键）。
+
+**UI**
+
+- Chat tool card：2–4 行紧凑卡片（icon + name + 右对齐状态；args summary；结果 excerpt / `not executed` / `⋯ working`），running/ok/error/approval/unsupported/cancelled 有不同 icon/颜色/文案；卡片是 transcript 行，随 Chat 滚动。`<leader>j` target 注册在可见卡片首行，激活切换 `tool_expanded`（最多 8 行真实结果 + `…`）。不伪造结果。
+- Tools tab：无 metrics 显示 `no tool calls yet`（空状态真实）；有数据时第一行 `tools · N calls · avg Xms · p95 Yms`（窄栏按 34/38 cells 与 80 drawer 依次退化为 `N calls · avg Xms · p95 Yms` → `avg Xms · p95 Yms` → `p95 Yms`），每个工具 3 行 `name · calls N` / `ok · err [· appr · unsup]` / `avg Xms · p95 Yms · max Zms`（放不下时先掉 max，再退化为 `p95 Yms`；没有执行样本时 `no latency samples`）；工具多时显示 `+N more tools`。
+- Chart：有执行样本时用 `chart.render`（≥24×4 braille，否则 sparkline）渲染所有工具最近 32 个真实 duration，legend 为工具名，轴为 `0ms`/y_max + `older`/`now`。`ChartCache` 以 (thread, metrics.revision, width, height) 为 key；只有 metrics 变化或布局变化才重算，画布 cell 直接复制到 vaxis。颜色取主题 syntax palette（最多 8 series）。
+- 状态：thread list/workbench header/status bar 在 batch 或 follow-up pending 时显示 `tools…`（不是 `idle`/`streaming…`）；完成后恢复正常状态。
+- 80x24 drawer：按 body_rows 预算 visible cards + chart 高度（chart 最小 2 行，否则省略），所有行由 `drawRailRow` 精确填满，不越界；hint label 只画在 panel 内。card 名称/状态/arguments 在 80 列下按 cell 截断。
+
+**只读边界与限制**
+
+- 只执行 `read_file`/`list_directory`/`grep`；写入工具在 M3a 永远返回 approval/unsupported，不创建 pending diff、不写盘。没有 terminal/shell/网络工具。（M3b1 扩展见 §20.9：`edit_file` 在 App 层 staged，executor 仍然只读。）
+- `read_file`/`grep` 只读 workspace root（拒绝绝对路径、`..`、NUL、越界 symlink；输出 workspace-relative）。这是 best-effort confinement，不声称 TOCTOU 安全（与 §20.3 一致）。
+- metrics 是 per-thread、session 级、不持久化；被取消/被 generation 丢弃的 in-flight 调用不计数（只统计真正应用回该 thread 的结果）。p95（§20.11）只覆盖每工具最近 ≤32 个真实样本；没有跨会话图表、没有 mock 数据注入发布 UI。
+- tool card 展开通过 hint 或鼠标点击（见 §21）；M3b 再加审批按钮与完整 hint 覆盖。
+- 最终 no-tools turn 由 `agent.max_*` 常量触发；如果 provider 忽略无 tools 请求仍返回 tool_calls，只记录 unsupported 后停止（有界）。
+- 未新增 terminal/MCP/ACP；`ai/tool_exec.zig` 的 caps 与 §20.3 一致。
+
+**文件**
+
+- `src/ai/agent.zig`：loop bounds、card 文案/args summary/excerpt、metrics/ring/chart key + 单测。
+- `src/ai/turn.zig`：transcript → OpenAI request messages（assistant tool_calls / role tool）+ 单测。
+- `src/ai/client.zig`、`src/ai/openai.zig`、`src/ai/tools.zig`：streaming tool_calls、request writer、assistant JSON/content builder + 单测。
+- `src/ai/workspace.zig`：tool role/message/card 字段与 thread helpers + 单测。
+- `src/app/ai.zig`：Session sidecars、request/follow-up、drain、cards/tools tab/chart cache、hints/status。
+- `src/app/tool_job.zig`：后台 read-only worker。
+- `src/app/render.zig`、`src/app.zig`、`src/app/hints.zig`、`src/app/hint_ui.zig`：run-loop drain、alias、hint action/wiring。
+- `test/e2e.zig` + TESTING.md：9 个 M3a pty 测试、`@tools` scenario、mock 轮次 fixture。
+
+**验证**
+
+- `zig build test`：466/466 通过（原 449 + 17 个 M3a 单测，未改动既有断言）。
+- `zig build e2e`：165/165 通过（原 156 + 9 个 M3a pty 测试；scenario matrix 新增 `ai tools read 120x30`）。
+- 无 golden 变更（tool cards/metrics 不进入固定 golden 帧）；`tools arrive in M3` 的旧空状态测试更新为 `no tool calls yet`（产品要求变化，断言不回退）。
+
+---
+
+### 20.9 M3b1 实现状态（staged edit approval，2026-10-25）
+
+**范围与策略**
+
+- M3b1 只实现 `edit_file` 的人工审批；`apply_patch`/`terminal`/未知工具仍不执行（本地 `unsupported`）。这是 M3b 的第一个切片，不含 patch 解析、terminal 沙箱、审批队列/持久化。（M3b2 在此之后接入 `apply_patch`，见 §20.10；M3b3 再接入 `terminal`，见 §20.12；本节保留为 M3b1 当时的状态。）
+- 工具调用不再到达 executor：`src/app/ai.zig:aiHandleToolCalls` 按 `ai.tools.classify` 分流。只有 `read_file`/`list_directory`/`grep` 进入后台 worker；`edit_file` 在 App 线程 stage；`apply_patch`/`terminal`/未知立即生成真实的 unsupported 卡片与 `role:"tool"` 结果，不启动 worker。
+- stage 只读目标：优先使用已打开 buffer 的当前文本（含未保存修改），否则 `readFileAlloc` 上限 256 KiB；**不打开新 buffer、不写临时文件、不改 dirty**。路径复用 `ai/tool_exec.zig` 的 `normalizeWorkspacePath` / `isWithin`：拒绝绝对路径、`..`、NUL、越界 symlink；canonical path 必须位于**当轮捕获**的 workspace root 内（不是当前可见 workspace）。
+- `old_string` 必须非空；未设 `replace_all` 时必须恰好出现一次；`replace_all` 至少一次且最多 512 次。任何失败返回真实 `error:` 卡片，不 stage。
+- diff 复用 `inline.buildDiff`（行级 LCS），不实现第二套 diff 引擎。为避免大文件整文件 diff，预览按“变更行 ±3 行上下文”合并 hunk，总预览 ≤240 行 / ≤16 hunks；超出时显示真实的 `… N more occurrence(s) not shown` 或 `preview truncated`，stats 行标记 `preview`。`-N +M` 是实际展示 hunk 的行级统计。完整 snapshot 只用于 staleness/apply，不逐帧重算。
+- 同一时刻只允许一个 review（agent 或 inline）：agent stage 在 inline prompt/stream/pending 存在时返回 `resolve the pending edit first`；inline start 在 agent pending 存在时同样拒绝。第二笔 `edit_file` 卡片为 `.err` + `error: resolve the pending edit first; not executed`，不排队。
+
+**Pending 与 UI**
+
+- `PendingAgentEdit`（`src/app/agent_edit.zig`）保存 thread/card index、canonical/relative path、完整 target snapshot、old/new、replace_all、单 span `[span_start, span_end)` + `span_replacement`、缓存 diff/stats、staged-from-buffer 的 buffer index + `history.revision`、以及 `stale` 标志。
+- 卡片状态：stage 成功 → `approval required` + `-N +M · staged · review in Changes`；approve → `approved` + `-N +M · applied · u to undo`；reject → `rejected` + `-N +M · discarded`；stale 仍为 `approval required` + `stale edit`。`api_text`（发给模型的 tool result）始终保持 stage 时的 `approval required: edit_file staged for review; not applied`，不篡改历史。
+- stage 成功自动打开 rail、切 **Changes**、badge `changes 1`、焦点 rail。Changes 使用新增的通用 `inline_ui.drawDiffReview(ReviewView)`（inline 与 agent 共用同一渲染/截断/闭合逻辑），`[a] approve  [r] reject` 注册 `agent_approve` / `agent_reject` hint target；`j/k` 滚动缓存 diff。无可见 pending 时 `a/r/d/j/k` 不被消费，`r`/`d` 仍是 Terminal/Changes tab 切换。
+- approve：target 未打开时先重新 canonicalize（必须仍是 captured root 内的同一路径）、只读重读校验，再 `openInBuffer`；已打开则按绝对 path 定位。随后校验 staged-from-buffer 的 `history.revision` 完全相等、当前整个文本与 snapshot 逐字节相等、`old_string` 出现次数仍等于 stage 时数量。任一失败 → toast/stats `stale edit`，pending 保留可 reject，buffer/history 不变。
+- 通过后 `switchTo` + `applyEdit(span_start, span_end, span_replacement)`：整个替换（包括 `replace_all` 的多处）是**一个 undo group**，`u` 一次恢复。dirty 由 `markDirtyRange` 设置；**不调用 save**，`:w` 仍是用户动作。approve 后焦点回 editor，toast `agent edit approved · u to undo`。reject toast `agent edit rejected`，不碰 buffer/history/dirty。
+- pending 线程隔离：badge/review 只在 `pending.thread_index == threads.active` 时可见；切线程隐藏但保留，approve/reject 在别的线程拒绝执行（提示切回）。pending 是 session 级、单实例；退出即丢弃（不持久化）。
+- metrics：stage 记录一次 `approval_required`；approve 通过 `recordDecision(approved)` 计入 `ok`（不增加 calls、不产生 latency sample），reject 计入 `denied`；Tools tab 显示 `appr` / `denied`。只统计真实 stage/decision。
+
+**限制**
+
+- 只支持单文件、单个连续 span 的 `edit_file`；`replace_all` 的多处被合并为一个 span 以便一次 undo，不生成 per-hunk undo。
+- `apply_patch` 仍未实现；terminal/未知工具不执行。没有跨会话/重启的 approval 队列；pending 绑定当前进程的 thread/card index。
+- 预览是有界 hunk，不是整文件 unified diff；超过 256 KiB 的文件拒绝 stage；没有 word-level diff、hunk 折叠或软换行。
+- stage 后自动 follow-up 已把 “staged/not applied” 结果发给模型；之后 approve 只更新本地卡片，模型 transcript 不会追认该批准（M3b 后续可加通知）。这是本切片的明确限制，不是假成功。
+- 路径校验是 best-effort（与 executor 相同，不声称 TOCTOU 安全）；符号链接别名可能被当作不同路径处理。
+- 鼠标见 §21；hint、键盘与鼠标共用同一 approve/reject 方法。
+
+**文件**
+
+- `src/app/agent_edit.zig`：纯参数校验、occurrence/span、bounded hunk diff、pending/staleness、one-review policy + 单测。
+- `src/app/agent_edit_ui.zig`：workspace 只读加载、stage/approve/reject、Changes 渲染、按键/hint、thread 可见性。
+- `src/app/ai.zig`：工具调用分流（read-only worker / edit stage / unsupported）、卡片文案/状态、badge、Changes 路由、Tools tab denied。
+- `src/app/inline_ui.zig`：抽取通用 `drawDiffReview` + `ReviewView`；inline 行为不变。
+- `src/ai/agent.zig`、`src/ai/workspace.zig`：`approved`/`rejected` 卡片状态、decision metrics/`denied`、`setToolDecision`。
+- `src/app/hints.zig`、`src/app/hint_ui.zig`：`agent_approve` / `agent_reject`。
+- `src/ai/tool_exec.zig`：公开 workspace path 规则；`apply_patch` 防御性返回 `unsupported`；`edit_file` 的 executor fallback 仍不写。
+- `test/e2e.zig` + TESTING.md：6 个 M3b1 pty 测试、`@approval` scenario。
+
+**验证**
+
+- `zig build test`：474/474 通过（新增 7 个 `agent_edit` 纯模型单测 + 1 个 decision metrics 单测）。
+- `zig build e2e`：170/170 通过（原 M3a 的 edit_file 占位测试替换为 6 个 M3b1 pty 测试；scenario matrix 新增 `ai approval 120x30` 与 required tag `@approval`）。
+- 无 golden 变更（approval diff/卡片不进入固定 golden 帧）。
+
+---
+
+### 20.10 M3b2 实现状态（staged `apply_patch` approval，single-file 2026-10-25；multi-file 2026-10-26）
+
+**范围与策略**
+
+- `apply_patch` 支持 **1..8 个 modified files**：`diff --git`/`index`/`---`/`+++`/`@@` sections 可以背靠背出现，顺序即 review/write 顺序。单文件仍保持 M3b2 最初的 **buffer-only** 语义；多文件是新的 **whole-set disk transaction** 语义（见下）。
+- `src/app/ai.zig:aiHandleToolCalls` 仍把 `edit_file` 与 `apply_patch` 分流到 App 层 stage（`agent_edit_ui.stageToolCall` / `stagePatchToolCall`），executor/worker 只看到只读调用；任何工具执行路径都没有写 syscall。
+- `agent_patch.parseSet` 解析 1..`max_files` 个 section：每个 section 必须至少有一个 `@@` hunk；同一 normalized path 出现两次 → `DuplicatePath`；`a/`/`b/` 前缀只在 old/new 拼写确实构成 git 前缀对时才剥离（`--no-prefix` 下真实以 `a/`/`b/` 开头的路径不会被误改）。Markdown 围栏与 CRLF 传输会被规范化。
+- 明确拒绝（typed error，真实 error card，不 stage、不部分应用）：多文件超过 8 个、重复路径、增删文件（`/dev/null`/`new file mode`/`deleted file mode`）、binary、rename/copy、mode 变更、malformed header/hunk/counts、空 section、context/removal 不匹配、hunk 越界或乱序、`new_start` 与实际应用结果不一致、路径 absolute/`..`/NUL/符号链接逃逸/越出 captured root、文件缺失。
+- 预算：patch ≤256 KiB；每个文件的 old/result ≤256 KiB；整个 set 的 old+result 总量 ≤2 MiB；≤8 files；总 hunks ≤256、单文件 ≤128；hunk-body 行总数 ≤16K、单文件 ≤8K。超出即 typed error，不静默截断应用。
+- 路径与目标复用 M3b1 confinement：`tool_exec.normalizeWorkspacePath` + `isWithin`，canonical path 必须位于**当轮捕获**的 workspace root；stage 只读，优先使用已打开 buffer（含未保存修改），否则读盘。
+- `agent_patch.validateSet` 在 stage 前对**每个文件**应用全部 hunk，收集所有失败（文件 + reason），任一失败即丢弃整个 set；只有全部成功才产生 `Pending`。stage 过程不写任何文件。
+- `agent_patch.apply` 以单个文件的旧全文为基准，按顺序复制未变行、校验 context/removal、应用全部 hunk；任一 hunk 不匹配即整体失败。
+
+**Pending 与 UI**
+
+- `Pending` 改为 `files: []PendingFile`：每个 file 持有 canonical path、display path、old/new full text、buffer index/revision、保留的 parsed patch（approve 时重新执行 hunk 校验）和完整 preview。单文件兼容字段（`span_start/span_end`、`verify`/`verifyPatch`）保留；多文件没有连续 span。
+- 卡片：单文件保持 `-N +M · staged · review in Changes` 与固定 tool result。多文件为 `K files · -N +M · <有界 file list>`（最多 2 个名字，长路径显式 `…`，其余显示 `+N more`）；`role:"tool"` 结果包含全部 8 个以内的 path（长 path 显式截断），并明确 `staged for review; not applied`。
+- Changes 多文件 review：顶部 total stats，随后每文件一行（`> path` 为 active），超出可用高度时只显示 active 附近的有界窗口，并显示 `… file i/N · j/k select`；active file 的完整 diff 在下半部。`j`/`k` 选择文件，`J`/`K` 滚动当前 diff，Enter/`a` approve、`r`/`d` reject；每个可见文件行都是 `<leader>j` hint / 鼠标 target，Approve/Reject 按钮 target 不变。单文件仍走原 `inline_ui.drawDiffReview`。
+- 同一时刻只有一个 review（agent 或 inline）；pending 线程隔离，切线程隐藏 badge/review 但保留，必须回到 staging thread 才能 apply/reject。
+- 80x24 drawer 也使用同一多文件布局（有界 file 窗口 + diff），不横向溢出。
+
+**Apply / undo**
+
+- 单文件：approve 后重新 canonicalize（必要时打开 buffer）、校验 buffer revision、整文件文本与重新执行的 patch；通过后**一次 buffer 替换 = 一个 undo group**（dirty，不写盘），`:w` 仍是用户动作。
+- 多文件：approve 先对每个文件重新校验 canonical path、buffer revision、old text 与 retained hunks；任一失败 → `stale patch: <file>`，保留 review，**不写任何文件**。全部通过后：
+  1. 再次 realpath 每个目标（防 symlink 替换）；
+  2. 两个阶段写：先把每个 new text 写入同目录 sibling temp（保留原 mode），全部 temp 成功后才逐个 `rename` 覆盖目标；
+  3. phase-1 失败：清理 temp，目标全部未动；phase-2 某个 rename 失败：删除未 rename 的 temp，并用内存中的 old text **回滚已经 rename 的文件**；回滚本身失败会在卡片/状态栏如实报告，绝不声称成功；
+  4. 事务成功后更新所有已打开 buffer（整文件替换、一个 history group、clean、cursor/view 截断），当前 buffer 同步 LSP，其他 buffer 在下次 switch 时 full sync；
+  5. 如果 apply 前没有任何目标被打开，则打开第一个目标以便用户看到结果。
+- 多文件 undo：`Session.patch_undo: UndoSet` 保存每个文件的 old/new text、路径、apply 时的 buffer/revision。在多文件 set 的任一 buffer 按 `u`，只有**所有**相关 buffer revision 与磁盘内容仍等于 apply 结果时才执行跨文件 undo：先以同一 two-phase transaction 把 old text 写回所有文件，再对打开过的 buffer 执行历史 undo；`Ctrl+r` 对称 redo。任一项 stale/被编辑/disk 改变 → 拒绝并提示，不部分恢复。
+- metrics：stage 记一次 `approval_required`，approve/reject 记一次 decision；一次 `apply_patch` 调用只算一次 call。自动 follow-up 已经发出 “staged/not applied”，之后本地 approve 不改写模型 transcript（与 M3b1 相同）。
+- 单文件 apply 成功后清空上一组 multi undo unit；新的 multi apply 替换上一组。跨文件 undo 只保留**最近一组**。
+
+**限制**
+
+- 语义不对称是有意的：单文件保持 buffer-only（`:w` 落盘），多文件 approve 即写盘。若需要统一语义，需要另一个设计切片，不能在本切片悄悄改变已有单文件 e2e。
+- 跨文件写不是 filesystem-wide atomic commit：保证是“所有 temp 成功前不动任何目标” + “rename 失败时 best-effort 回滚并如实报告”。没有 journal/事务恢复；进程在 rename 中途被杀仍可能留下部分新文件。
+- 没有 add/delete/rename/copy、binary 或 mode 变更；没有 partial apply；没有 per-hunk undo。
+- 多文件 preview 使用全局预算而不是单文件 240 行/16 hunks 的显示截断，因此 stats 是全量准确值；单文件保持原有 bounded preview。
+- 跨文件 undo 只保留最近一组；如果 apply 时未打开的文件后来被打开，undo 会拒绝直到关闭该 buffer（避免丢弃用户未保存内容）。任何相关文件在 apply 后被编辑或磁盘被外部修改，undo 会拒绝并保留 unit。
+- 路径校验是 best-effort（与 executor 相同，不声称 TOCTOU 安全），但 multi apply/undo 会在写前再次 realpath；符号链接别名可能被当作不同路径。
+- 无 terminal/shell/网络；pending 不跨进程持久化。
+
+**文件**
+
+- `src/app/agent_patch.zig`：`parseSet` 多 section 解析、`validateSet` 全量预校验、`buildPreviewWithLimits`、hunk 应用/重建全文 + 单测。
+- `src/app/agent_edit.zig`：`PendingFile`/多文件 `Pending`、`commitFiles` two-phase transaction、`UndoSet`、`verifyFile`/`staleFile` + 单测。
+- `src/app/agent_edit_ui.zig`：多目标解析/加载、`stageMultiPatch`、跨文件 disk transaction、buffer/LSP/dirty 更新、multi Changes 布局、跨文件 undo/redo。
+- `src/app/inline_ui.zig`：`drawMultiDiffReview` + 有界 file-row 窗口；单文件 renderer 不变。
+- `src/app/highlight.zig` / `src/app/hints.zig` / `src/app/hint_ui.zig`：`u`/`Ctrl+r` 跨文件 hook、`agent_patch_file` 目标。
+- `src/app/ai.zig` / `src/ai/tools.zig`：多文件 stage 卡片/真实 tool result、schema 描述。
+- `test/e2e.zig` + TESTING.md：多文件 approve/undo/redo、deny、stale、80x24 hint、unsafe/binary/extra 拒绝；`ai patch multi 120x30` scenario、`@patch-multi`。
+
+**验证**
+
+- `zig build test`：556/556 通过（新增 `agent_patch` parseSet/validate/commit 与 `agent_edit` 多文件 pending/commitFiles/UndoSet 单测）。
+- `zig build e2e`：213/213 通过（新增 5 个 multi-file pty 测试；scenario matrix 新增 `ai patch multi 120x30` / `@patch-multi`）。
+- 无 golden 变更（approval 卡片/diff 不进入固定 golden 帧）。
+
+---
+
+### 20.11 M3c 实现状态（recent-window p95，2026-10-26）
+
+**语义（唯一事实来源）**
+
+- `agent.Stats.p95RecentMs() ?u32`：只统计该工具 **最近至多 32 次真实执行**（ok/error；approval_required/unsupported/denied 没有耗时样本）的 `recent` ring。整数 nearest-rank：升序排序后取 0-based `ceil(0.95*n)-1`，并 clamp 到 `[0, n-1]`；n=0 → `null`，绝不返回伪造的 `0ms`。
+- `agent.Metrics.p95RecentMs() ?u32`：Tools tab **顶栏**使用，按工具收集各自的 recent window（每工具 ≤32、最多 8 个工具 = ≤256 个真实样本）后做同一 nearest-rank；它不是“全局最近 32 次调用”的另一种定义，DESIGN/README 都明确这一点。per-tool 卡片只用 `Stats.p95RecentMs()`。
+- **不变量**：p95 与图表/avg/max 使用同一批真实 duration；不新增计时、不改 `duration_count`/`total_ms`/`max_ms`/`recent`/`revision`，也不改 chart samples。读取 p95 是纯函数：在固定栈数组 `[recent_capacity]u32` 上排序副本，无堆分配、无锁、无 IO。
+- 与 avg/max 的域不同且已标注：avg/max 覆盖该工具全部执行样本，p95 只覆盖 recent 32；n<20 时 p95 是窗口最大值（nearest-rank 的自然结果，不是 bug）。
+
+**UI**
+
+- per-tool latency 行：`avg Xms · p95 Yms · max Zms`；34/38-cell rail、80 drawer 放不下时先掉 `max` → `avg Xms · p95 Yms`，再退化为 `p95 Yms`，最后由 `drawRailTextRow` 做 grapheme-safe clip（不横向溢出）。无执行样本仍是 `no latency samples`。
+- 顶栏：`tools · N calls · avg Xms · p95 Yms`；窄栏依次退化 `N calls · avg Xms · p95 Yms` → `avg Xms · p95 Yms` → `p95 Yms`，保证 34/38 cells 与 80 drawer 仍显示 p95 标签。
+- 不新增 golden 帧；空态（`no tool calls yet`）与 approval-only（`no latency samples`）不出现 p95。
+
+**实现与文件**
+
+- `src/ai/agent.zig`：`nearestRankP95`（固定栈副本 + `std.sort.insertion`，O(32²) 最坏）、`Stats.p95RecentMs`、`Metrics.p95RecentMs` + 单测（1/2/20/21/32 样本、重复值、全相等、乱序、ring 回绕、empty→null、revision/ring/counters 不变）。
+- `src/app/ai.zig`：Tools tab summary/latency 候选串按 cell 宽度选择；字符串沿用既有 frame allocator（vaxis 在 frame flush 前保留 grapheme slice，栈缓冲会被提前复用），p95 的采样/排序本身只在固定栈数组上进行、不增加堆分配。
+- `test/e2e.zig`：`tools:` 80/100/120 mock loop 断言 `p95 ` 标签、解析真实值并在合理范围（单样本时 `avg == p95`）；空态/approval-only 断言不出现 p95；scenario matrix 的 `ai tools read 120x30` 也断言标签。
+
+**验证**
+
+- `zig build test`：531/531 通过（新增 2 个 p95 单测；既有 529 不变）。
+- `zig build e2e`：195/195 通过（不新增 pty 测试块；扩展既有 `tools:` 断言与空态/approval 反断言，scenario matrix 新增 `ai tools read 100x30` 并加强 120x30 期望）。
+- 无 golden 变更（goldens 不渲染 Tools tab）。
+
+---
+
+### 20.12 M3b3 实现状态（approved `terminal` tool，2026-10-26）
+
+**范围与策略**
+
+- 新增 `terminal` agent tool：让模型请求**一条**非交互 shell 命令，但**绝不自动执行**。每个命令先在 App 层 stage 为 pending approval；只有人工 Allow 后才 spawn。它不是通用 shell UI，也不是第二个编辑器终端：无 PTY、无按键转发、无 scrollback；既有 `Alt+r` 终端（`src/term.zig`/`src/app/terminal.zig`）完全不改。
+- 一个 session 同时最多一个 terminal approval/命令（比“每 thread 一个”更严格）；第二个 `terminal` 调用得到真实错误卡片/`role:"tool"` 结果，不排队。
+- pending approval 按 thread 隔离并跨线程切换保留（隐藏、无进程）；运行中的命令在离开其 thread / Ctrl+c 时被真实 kill，结果丢弃（避免未观察 thread 的后台惊喜）。文件 review（`agent_edit`）仍是独立槽位，互不清除。
+- 只有人工动作能触发执行：`stageToolCall` 不 spawn，`Job.start` 只被 `allow` 调用；模型 follow-up 文本、工具协议本身都不会执行命令。pending 期间该 thread 的自动 follow-up 被挂起（`maybeFollowup` 检测 pending/job，settle 到 idle），Allow/Deny 后才带上真实结果恢复 loop，因此模型看到的是最终输出/exit code，而不是“staged”。
+- 文件 diff/审批与 terminal 审批可共存；terminal 的 Allow 不阻塞已 staged 的文件 review，文件 review 的后续本地决定仍不回写模型 transcript（§20.9 的既有限制）。
+
+**工具协议（`src/ai/tools.zig`）**
+
+- `definitions` 增加 `terminal`，严格 schema：`{ command: string, timeout_ms?: integer 100..10000 }`，`required: ["command"]`，`additionalProperties: false`；description 明确“以用户权限在 workspace root 运行、运行前必须人工批准、无沙箱/无网络隔离、输出 64 KiB / 时间 100–10000 ms”。`tools` 与 `tool_choice:"auto"` 不变。
+- `tools.Permission`：terminal 恒为 `confirm`；`Policy` 删除 `allow_terminal`，不存在任何 auto-allow 开关。未知工具仍 `deny`。
+- `src/ai/tool_exec.zig` 仍把 `terminal` 返回 `unsupported`（防御性），read-only executor 没有任何 shell/spawn 路径；正常执行只走 App 的 dedicated job。
+
+**Staging 与校验（`src/app/agent_terminal.zig` + `src/ai/terminal_tool.zig`）**
+
+- 纯模块 `terminal_tool.zig` 负责：严格参数解析/typed error、timeout 区间（拒绝而非静默 clamp；`clampTimeout` 只作 spawner 防御）、命令长度 ≤4096 bytes、拒绝空/空白/NUL/非 UTF-8/未知字段、转义显示、64 KiB `OutputBuffer`、真实结果文本。
+- stage 时只读校验 captured root 仍是 directory；不打开文件、不写盘、不 spawn。保存 command 原始 bytes、escaped display、timeout、root、thread/card、loop generation。
+- 失败（busy/参数错误/root 不可用）产生真实 `error:` 卡片与结果，记录 `.err`，不 stage、不执行。
+- stage 成功自动打开 rail 并切到 **Terminal** tab（focus rail），卡片 `approval required`、args 行为 escaped command（>200 bytes 时显式 `… (+N bytes)`，完整命令在 Terminal tab），第三行显示 timeout/用户权限提示；`role:"tool"` 结果固定 `approval required: terminal command staged for review; not executed`。
+
+**执行（`src/app/terminal_job.zig`）**
+
+- Allow 后后台 `std.Thread` spawn `/bin/sh -c <command>`：`cwd` = 当轮 captured workspace root；`stdin = .ignore`（空）；bounded env 仅复制 `PATH/HOME/TERM/LANG/LC_ALL/TMPDIR`（缺 PATH 时用固定 `/usr/local/bin:/usr/bin:/bin`）；`pgid = 0` 建独立进程组。
+- 输出：poll(2) 循环读 stdout/stderr，最多保存 64 KiB **合并**输出（另计 dropped bytes）；超过上限继续读并丢弃，子进程不会因管道满而阻塞。逐次 poll 不阻塞 UI；worker 线程独立。
+- 时间：`timeout_ms` 100–10000（默认 5000）；watchdog 线程 5 ms 粒度检查 deadline/cancel，到点/取消向 `-pid` 发 SIGKILL，杀掉整个进程组；worker wait 返回后 join watchdog。spawn 失败/read 失败/nonzero/signal 都产生真实 `.err` 结果，不伪造成功。
+- 结果文本含 `error: exit code N` / `exit: 0` / `signal` / `timeout; process group killed` + `duration` + 可选 `output_truncated: N bytes dropped` + `---` + bounded output；经 `tools.buildToolResultContent` 再套 64 KiB/UTF-8 协议上限。卡片的展示文本是 status + 截断标记 + 首行 excerpt。
+- timeout/cancel 后结果仍回到模型（timeout 是 error result，模型可恢复）；用户显式 Ctrl+c / 切线程导致的 cancel 不发 follow-up（与既有取消语义一致，transcript 冻结）。
+
+**决策与线程策略**
+
+- Deny（Terminal tab `r`/`d`、hint/mouse）：不 spawn，卡片 `rejected`，metrics `denied`，`role:"tool"` 结果更新为 `denied: user rejected the command; not executed`，随后恢复 follow-up。文件/进程均未改变。
+- Allow（`a`/Enter、hint/mouse）：spawn；卡片 `running`；完成后 `ok`/`error`，记录真实 duration；恢复 follow-up。spawn 前若 thread 已取消/失败则不执行，卡片 `cancelled`。
+- Ctrl+c：`cancelForThread` 将 pending/running 命令标记 `cancelled`、清 pending、requestCancel（真实 kill）；线程标 cancelled，无 follow-up。`deinitAi`/`App.destroy` 会 join job，避免进程泄漏。
+- 线程切换：pending approval 保留（隐藏）；running 命令 kill、卡片 `cancelled`、结果丢弃。回到原 thread 后 badge/tab 重新可见。terminal 状态在 thread list/workbench header 显示 `approval…` / `terminal…`（不是 `idle`）。
+- pending/running 期间 `aiSend` 拒绝新 prompt（`resolve the pending terminal command first`），因为该 turn 的 follow-up 尚未完成；切线程仍允许（pending 隐藏保留）。
+
+**UI（`src/app/ai.zig`）**
+
+- Chat 卡片：`terminal` + escaped command + `approval required`（warn） + timeout/“runs with your permissions”；running 显示 spinner/`working`；完成显示 `ok/error` + exit code/duration + bounded excerpt；rejected/cancelled 有独立状态。卡片仍是 `<leader>j` 展开目标（展开显示 result body 行）。
+- **Terminal tab** 是审批/结果面（不是 shell）：header（`terminal · approval required|running|ok|error|rejected|cancelled`）、`runs with your permissions · not sandboxed`、`cwd: <captured root tail>`、`[a] allow  [r] deny`（hint/mouse target）或 `running… · Ctrl+c stops`、`timeout Nms · max 10000ms`、完整 escaped command（按 body 宽度换行，>512 行时显式 display clip）、完成后 bounded output 行；`j/k` 与滚轮滚动（clamp）。空态显示 `no pending terminal command` + `the terminal tool asks before it runs` + `editor terminal: Alt+r`。
+- Terminal tab 不新增 tab 宽度/标签：pending 时 label 使用 warning 色 + bold（34/38-cell tab row 已满，不能安全加 `terminal 1` badge）；Changes badge 语义不变。
+- 只有 Terminal tab + rail focus 时 `a/r/d/j/k` 才被审批/滚动消费；其他 tab 的既有键位不变，Alt+r 终端不受影响。鼠标点击走与键盘完全相同的 `aiAgentTerminalAllow/Deny`，没有第二套业务逻辑。
+- 80x24 drawer 与 100/120 docked 都无横向溢出；所有 body 行由 `drawRailRow` 精确闭合。
+
+**Metrics（`src/ai/agent.zig`）**
+
+- stage 记一次 `.approval_required`（`calls +1`，无 latency）；deny 走 `recordDecision(.rejected)`（`denied +1`，不增加 calls）；Allow 完成走新 `Metrics.recordExecution(status, duration)`：ok/error 计数 + 真实 recent duration，**不重复计 calls**。timeout 记 `.err` + 真实 duration。
+- Tools tab 因此显示 `terminal · calls N`、ok/err/denied、真实 avg/max/p95；取消/被丢弃的 in-flight 结果不计数（与 M3a 一致）。p95 语义仍为每工具最近 ≤32 个真实执行样本（§20.11）。
+
+**安全边界与明确限制**
+
+- **没有沙箱**：命令以用户权限运行，可读写任意用户可访问文件、访问网络、启动子进程；不声称 seccomp/container/网络隔离。唯一的保证是“每个命令必须人工批准”+“cwd 固定 workspace root”+空 stdin + bounded env/output/time。
+- 命令显示采用可逆转义（`\n`/`\t`/`\\`/`\xNN`），防止命令向 oz UI 注入终端 escape；**执行字节原样**，不重新引用/不截断。完整命令（≤4 KiB）在 Terminal tab 可滚动查看；Chat 卡片是显式 bounded summary。
+- 进程组 kill 覆盖 shell 及其未 `setsid` 的子进程；显式 `setsid`/daemonize 的进程可以逃逸（文档化，非安全边界）。极小的 pid/pgid 复用窗口不做原子保证。
+- 命令可修改文件/仓库（包括未保存 buffer 之外的内容）；审批 UI 明确显示 cwd 和“以你的权限运行”，但没有 per-file/command 策略、allowlist 或 dry-run。允许一次不等于允许下次：每个命令都重新 stage。
+- 不提供 PTY/tty、交互 stdin、环境变量选择 UI、shell 选择（固定 `/bin/sh`）、working-directory 参数（固定 captured root）、后台持久化/重连；session 退出即丢弃 pending。
+- pending approval 与模型 transcript 的既有局限：Deny/Allow 的最终结果在 follow-up 中发送，因此模型会看到最终结果；但审批动作本身不产生额外 assistant 消息，模型不知道“谁在何时点击”。文件 review 的本地决定仍不会追认（§20.9）。
+- terminal 与文件 review 可以同时 pending；两者 UI 分离（Terminal/Changes），没有统一审批队列。
+
+**文件**
+
+- `src/ai/terminal_tool.zig`：严格参数校验、timeout clamp、escaped display、OutputBuffer、结果文本 + 单测。
+- `src/app/terminal_job.zig`：真实 POSIX spawn/poll/watchdog/进程组 kill + 单测。
+- `src/app/agent_terminal.zig`：pending/stage/allow/deny/cancel/thread policy、结果应用、metrics、卡片文案。
+- `src/ai/tools.zig`：terminal definition/schema、`Policy` 去掉 auto-allow、权限/单测。
+- `src/ai/tool_exec.zig`：terminal 防御性 `unsupported` 文案（不变语义）。
+- `src/ai/agent.zig`：terminal args 摘要、`recordExecution`、metrics + 单测。
+- `src/app/ai.zig`：工具调用分流、follow-up 暂停/恢复、drain、status、Terminal tab 渲染/按键/滚动、hints。
+- `src/app/hints.zig`、`src/app/hint_ui.zig`、`src/app.zig`、`src/app/render.zig`：`agent_terminal_allow/deny`、session 字段、run-loop drain。
+- `src/tests.zig`：纯模块/后台 job 单测注册。
+- `test/e2e.zig` + TESTING.md：10 个 `terminal:` pty 测试、`ai terminal approval 120x30` scenario、required tag `@terminal`。
+
+**验证**
+
+- `zig build test`：544/544 通过（M3b3 新增 13 个单测：terminal_tool 5、terminal_job 7、terminal metrics 1；既有 531 不变）。
+- `zig build e2e`：本 worktree HEAD 为 **202/205**（新增 10 个 `terminal:` pty 测试全部通过；scenario matrix 新增 `ai terminal approval 120x30`；既有 195 不变）。3 个失败是既有 checkout 敏感测试，与 terminal 无关：`relative CLI path` 硬编码 4 层主 checkout 的 `../../../../tmp`、`file tree ...` 依赖固定的仓库根/目录子项数量、`grep picker ...` 依赖 ripgrep 结果顺序且新增源码符号改变了排序；详见 TESTING 的已知 gaps。`tools/verify.sh` 因此在本 worktree 报 FAIL（diff-check/unit 通过，e2e 仅这 3 个失败）。
+- 无 golden 变更（terminal 审批/结果不进入固定 golden 帧）。
+
+---
+
+## 21. Mouse 支持（feat/mouse，2026-10-26）
+
+### 21.1 范围与不变量
+
+- **v1 目标**：鼠标左键点击窗口/标签/行/按钮，滚轮滚动编辑器与列表。点击必须真正执行既有动作，不新增第二套业务逻辑。
+- **不变量**：鼠标只能调用键盘/hint 已经存在的 App 方法（`execHintAction`、`switchWindowTo`、`closeBufferAt`、`aiSelectThread`、`aiSetWorkboxTab`、`aiFocusPrompt`、approve/reject…）。审批、stale 校验、dirty 语义、workspace 边界与 `:w` 仍是用户动作，鼠标不能绕过。
+- **v1 不做**：拖拽、分隔线 resize、右键/中键菜单、文本拖选、终端内鼠标转发、精确 grapheme/soft-wrap 逐 cell 反查。
+- **布局**：80/100/120 列均使用同一套目标矩形；鼠标不改变任何布局、golden 或状态栏几何。
+
+### 21.2 生命周期（vaxis）
+
+- `src/app/render.zig:run` 在 enter alt screen + bracketed paste 之后调用 `enableMouse`：
+  - 强制 `caps.sgr_pixels = false`，即使终端宣告 SGR pixel 模式也使用 **cell 坐标**（命中矩形都是 cell）；`setMouseMode(true)` 失败只关闭鼠标功能，应用继续以键盘模式启动。
+  - 启用后 `defer disableMouse`；正常退出在 `exitAltScreen` 之前显式关闭，错误路径由 defer 兜底。
+  - `disableMouse` 幂等：成功后清 `vx.state.mouse`，避免 `Vaxis.deinit` 再发一次 reset；失败则保留状态让 deinit 重试。e2e 断言退出后 reset 恰好一次、且在 enable 之后。
+- vaxis 的 `mouse_set` 同时打开 1002/1003/1004/1006（cell）。loop 只处理 **left press** 与 **wheel press**；motion/drag/release/未绑定按键返回 false，不会触发渲染，也不会接管终端自身的拖选。
+- **复制/选择**：应用无法阻止终端上报鼠标；常规终端用 **Shift+拖拽** 绕过 mouse reporting 做本地选择/复制（终端相关）。若终端仍上报带 Shift 的事件，oz 直接忽略，交给终端语义。
+- `Alt+r/w/e` 终端键位不受影响；鼠标报告的增强不会改变键盘路径。1b47588 的 vaxis 日志抑制仍由 `src/main.zig` 的 scope levels 保证。
+
+### 21.3 命中测试（`src/app/mouse.zig` + `mouse_ui.zig`）
+
+- **单一几何来源**：hint 渲染路径本来就在绘制时注册每个可点击目标（buffer tab、close ×、filetree/notes/agents 行、navigator tab、AI thread、workbox tab、`+`、prompt、tool card、Approve/Reject）。鼠标帧把 `if (self.hints.collecting)` 放宽为 `mouseTargetsCollecting()`，`addHintTarget` 同时写入鼠标 registry，因此矩形/action 不会与 hint 漂移；**hint 标签仍只在 hint mode 绘制**（overlay 仍以 `hints.active` 为门）。
+- **mouse-only 目标**：
+  - 每个 split leaf：点击聚焦 + 定位光标，滚轮移动该窗口光标；
+  - 分隔线：1 cell 厚的显式 no-op（v1 不 resize），按面积优先于相邻 pane；
+  - 滚轮区域：编辑器 pane、navigator 列表（按当前 tab）、AI thread list、workbox body。
+- **优先级**：命中所有包含该 cell 的目标，取 **面积最小** 者；面积相同取后注册（绘制更上层）者。因此 close `×`(1×1) > tab、按钮(整段标签) > card/行、分隔线 > pane。
+- **容量/分配**：`max_targets = 256` 固定数组，每帧 `beginFrame` O(1) 清零，无堆分配；越界/屏幕外矩形裁剪或丢弃。
+- **模态隔离**：hint mode、picker、diag/nav list、git preview、inline prompt、command mode 下鼠标完全忽略；drawer rail 覆盖编辑器时，rail 外的目标不会从抽屉下方“穿透”接收点击/滚轮。
+- **空区域**：编辑器 pane 空白处只聚焦/定位；状态栏、面板空白、无目标 body 全部 no-op，不伪造动作。
+
+### 21.4 点击动作
+
+- 所有 hint action 直接调用 `execHintAction`，与 `<leader>j` 完全同一路径；指针点击前会：
+  - 若处于 Insert，先执行 `exitInsert()`（保留文本、结束 undo group）；
+  - 清 pending leader/operator/replace、multi-cursor 与旧 status message；
+  - 终端若持有焦点且点击发生在终端外，先取消终端焦点；
+  - buffer/tree/notes/navigator 目标把键盘焦点交回 editor；AI thread/workbox/prompt 目标保留 AI focus，由既有方法决定。
+- terminal overlay 优先命中：点击终端矩形聚焦子进程；点击其他位置回到编辑器。wheel 在终端聚焦或位于终端矩形上时 **不抢**（vaxis terminal widget 无鼠标转发）。
+- 点击 tab 的 `×` 仍走 `closeBufferAt`（与 `:bd`/`<leader>bk` 相同；最后一个 buffer 不注册 close 目标）；点击 Approve/Reject 仍走 `inlineApprove`/`agentEditApprove` 等，stale/one-pending/线程隔离规则不变。
+
+### 21.5 编辑器 pane 定位
+
+- 点击 leaf 后先按 **该窗口** 的当前渲染状态反查：
+  - gutter 宽度（相对行号 digits+1）；点击 gutter 落在行首；
+  - 从 `view_top` 起按 `lineDisplayRows`（fold 折叠 + soft wrap + inlay hint 宽度）累加，得到目标 line 与 wrap chunk；
+  - 文本 cell → byte：按 UTF-8 codepoint 逐个累加 `vaxis.gwidth`，tab = `tab_width`，并插入排序后的 inlay hint 宽度；宽字符第二格映射回该字符起点；行尾之后映射到行尾（Normal 模式再回退到最后一个 codepoint 起点，类似 `$`）。
+- **安全限制**：单行只拷贝/映射前 256 KiB；soft wrap 的 chunk 起点按 `chunk * content_width` 近似（渲染在宽字符处可能提前换行）；grapheme cluster/emoji ZWJ 按 codepoint 近似。非折行 ASCII/CJK 的常见情况精确，单元测试覆盖。
+- 点击 pane 不触发编辑、不改变文本；随后 `switchWindowTo` 执行既有 buffer/LSP/inlay/diag/hover 失效策略。
+
+### 21.6 滚轮
+
+- 每个 notch = **3 行**；无平滑滚动/加速。
+- 编辑器：移动该 pane 的 cursor（fold-aware，保持列），不是独立于 cursor 的 viewport —— 渲染器本就保持 cursor 可见，这样行为与 `j/k` 一致且不会下一帧被拉回。Insert 中滚轮仍只移动光标，不退出 Insert。
+- filetree/notes/agents：移动同一 selection（与 `j/k` 共用 helper，clamp 到 `[0,len-1]`），不改变 tab/focus。
+- AI thread list：移动 `thread_cursor`（clamp）；workbox：Chat 滚动 transcript（`aiScroll`），Changes 滚动 inline/agent diff（既有 `j/k` 的 scroll clamp），Tools/Terminal 无滚动状态则 no-op。
+- 终端聚焦/覆盖时滚轮完全不处理；所有滚动都 clamp，不产生 overflow，不启动 busy loop（只有成功改变状态的事件返回 true，触发正常渲染）。
+
+### 21.7 文件与测试
+
+- `src/app/mouse.zig`：纯 hit-test 优先级/边界、scroll clamp、display-row→line、cell→byte、inlay hint 插入；14 个 L1 单测。
+- `src/app/mouse_ui.zig`：生命周期、目标收集入口、点击/滚轮分发、pane 映射、rail/terminal 覆盖规则。
+- `src/app/hint_ui.zig`、`src/app/hints.zig`：hint target 同时喂鼠标 registry；label 绘制/匹配行为不变。
+- `src/app/{render,ai,inline_ui}.zig`：mouse-only pane/separator/scroll 注册 + 目标收集条件；`app/{ai,notes,filetree,inline_ui,agent_edit_ui}.zig` 公开既有 scroll/selection helper。
+- `test/e2e.zig`：6 个 `mouse:` pty 测试（tab 点击/关闭 + 80/100/120、navigator、split/光标映射/分隔线、AI thread/tab/prompt/transcript、approve/reject 真安全、mouse 生命周期 + Alt+r + 终端点击/滚轮），SGR 1006 序列由 `sendMouseButton` 注入；`@mouse` scenario tag。
+- 验证：`./tools/verify.sh` PASS（最终计数见 TESTING.md）。
+
+### 21.8 明确限制
+
+- **CJK/折行精确性**：wide-grapheme 的 wrap 边界与 emoji ZWJ 的 cell 归属是近似；非折行 ASCII/CJK 精确。
+- **终端转发**：vaxis terminal widget 不支持鼠标输入；点击只聚焦，wheel no-op，不伪造 child 点击。
+- **选择/复制**：mouse reporting 会接管默认拖选；依赖终端的 Shift 拖选绕过；无法从应用侧强制。
+- **无拖拽**：不做 tab 拖拽、分隔线 resize、文本拖选、右键菜单、双击选词。
+- **pixel 模式**：强制 cell 坐标，不使用像素级 offset（v1 不需要）。

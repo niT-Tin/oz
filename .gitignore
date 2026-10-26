@@ -1,4 +1,5 @@
 zig-out/
+.verify/
 .zig-cache
 .zig-cache/
 zig-pkg

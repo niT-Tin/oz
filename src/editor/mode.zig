@@ -538,6 +538,9 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
                 return .pending;
             },
             'o' => return emitAction(state, .document_outline), // <leader>o outline
+            'a' => return emitAction(state, .ai_toggle), // <leader>a AI chat
+            'i' => return emitAction(state, .inline_edit), // <leader>i inline edit
+            'j' => return emitAction(state, .hint_mode), // <leader>j hint mode
             'h' => {
                 state.pending_leader_h = true; // <leader>h — git hunk family
                 return .pending;
@@ -934,6 +937,8 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .term_float => emitAction(state, .term_float),
         .term_bottom => emitAction(state, .term_bottom),
         .term_right => emitAction(state, .term_right),
+        .ai_toggle => emitAction(state, .ai_toggle),
+        .inline_edit => emitAction(state, .inline_edit),
         .next_buffer => emitAction(state, .next_buffer),
         .prev_buffer => emitAction(state, .prev_buffer),
         .leader => blk: {
@@ -956,7 +961,7 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         // never produced by the keymap tables (the fold actions come from
         // the pending_z handler and the workspace actions from the
         // pending_leader_tab handler, never through dispatchNormal)
-        .insert_char, .insert_exit, .fold_toggle, .fold_open, .fold_close, .fold_open_all, .fold_close_all, .workspace_new, .workspace_pick, .workspace_rename, .workspace_delete, .workspace_kill_session, .workspace_prev, .workspace_next, .noop => .pending,
+        .insert_char, .insert_exit, .fold_toggle, .fold_open, .fold_close, .fold_open_all, .fold_close_all, .hint_mode, .workspace_new, .workspace_pick, .workspace_rename, .workspace_delete, .workspace_kill_session, .workspace_prev, .workspace_next, .noop => .pending,
     };
 }
 
@@ -1135,7 +1140,7 @@ fn emitAction(state: *State, action: KeyEvent.ActionId) Result {
     // za/zo/zc/zR/zM fold commands are view/buffer state (no edit), so '.'
     // must not replay them either.
     switch (action) {
-        .undo, .redo, .repeat_last, .normal_mode, .insert_char, .scroll_cursor_center, .scroll_cursor_top, .scroll_cursor_bottom, .fold_toggle, .fold_open, .fold_close, .fold_open_all, .fold_close_all, .term_float, .term_bottom, .term_right, .workspace_new, .workspace_pick, .workspace_rename, .workspace_delete, .workspace_kill_session, .workspace_prev, .workspace_next => {},
+        .undo, .redo, .repeat_last, .normal_mode, .insert_char, .scroll_cursor_center, .scroll_cursor_top, .scroll_cursor_bottom, .fold_toggle, .fold_open, .fold_close, .fold_open_all, .fold_close_all, .term_float, .term_bottom, .term_right, .ai_toggle, .hint_mode, .workspace_new, .workspace_pick, .workspace_rename, .workspace_delete, .workspace_kill_session, .workspace_prev, .workspace_next => {},
         else => {
             state.last_action = action;
             state.last_count = count;
@@ -1252,6 +1257,17 @@ fn countValue(state: *const State) u32 {
     }
     return if (v == 0) 1 else v;
 }
+/// True while a `<leader>` sequence is awaiting its next key (including the
+/// `s`/`b`/`r`/`l`/`t`/`h`/TAB sub-families). Key routers that run BEFORE the
+/// mode state machine (the file tree) must let the sequence finish instead of
+/// consuming its tail — otherwise `<leader>j` from the tree would move the
+/// tree selection and leave a dangling leader prefix.
+pub fn leaderPending(state: *const State) bool {
+    return state.pending_leader or state.pending_leader_s or state.pending_leader_b or
+        state.pending_leader_r or state.pending_leader_l or state.pending_leader_t or
+        state.pending_leader_h or state.pending_leader_tab;
+}
+
 /// True when no count/operator/prefix sequence is pending — the next key
 /// starts a fresh command. The macro-recording caller uses this to decide
 /// whether a bare 'q' STOPS recording: vim only treats 'q' as stop when it
@@ -1568,6 +1584,15 @@ test "SPC TAB dispatches the 7 workspace actions (not '.'-repeatable)" {
         try testing.expectEqual(c[1], r.action.action);
         try testing.expectEqual(@as(?Repeat, null), s.last_repeat);
     }
+}
+
+test "SPC a dispatches the AI chat toggle (not '.'-repeatable)" {
+    var s = State.init();
+    try testing.expectEqual(.pending, tag(handle(&s, press(' '), Keymaps.normal)));
+    const r = handle(&s, press('a'), Keymaps.normal);
+    try testing.expectEqual(.action, tag(r));
+    try testing.expectEqual(KeyEvent.ActionId.ai_toggle, r.action.action);
+    try testing.expectEqual(@as(?Repeat, null), s.last_repeat);
 }
 
 test "surround: ysw' adds with motion, ds( deletes, cs'\" changes" {

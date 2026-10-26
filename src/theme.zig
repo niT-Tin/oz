@@ -24,9 +24,9 @@ pub const Theme = struct {
     // foreground
     fg: Rgb, // main text
     fg_dim: Rgb, // inlay hints, ghost text, muted
-    fg_faint: Rgb, // inactive tab, secondary text
-    accent: Rgb, // active tab, logo, brand (kanagawa carpYellow)
-    accent_alt: Rgb, // secondary accent (springBlue / crystalBlue)
+    fg_faint: Rgb, // non-active secondary text (inactive tabs use fg_dim)
+    accent: Rgb, // logo, brand, focused panel border (kanagawa carpYellow)
+    accent_alt: Rgb, // active tab underline/marker, chrome rules (springBlue / crystalBlue)
     // window split separators (vim-style boundary lines between panes)
     win_sep: Rgb, // inactive separator (dim)
     win_sep_active: Rgb, // separator adjacent to the focused window

@@ -1,6 +1,7 @@
 //! lsp_edit — App method group split out of src/main.zig (physical move).
 
 const std = @import("std");
+const editor = @import("../editor/root.zig");
 const lsp_types = @import("../lsp/types.zig");
 const lsp_nav = @import("../lsp/navigation.zig");
 const json_rpc = @import("../util/json_rpc.zig");
@@ -530,32 +531,40 @@ pub fn acceptCompletion(self: *App) !void {
 }
 
 /// Drop the completion menu and free its candidate words (the list keeps
-/// its capacity for the next trigger).
+/// its capacity for the next trigger). Also clears the request bookkeeping
+/// so a menu/in-flight manual request from THIS session can never leak into
+/// the next one (notably `completion_waiting_enter`, which used to swallow
+/// the first Enter after re-entering insert).
 pub fn closeCompletion(self: *App) void {
-    if (!self.completion_active and self.completion_words.items.len == 0) return;
     for (self.completion_words.items) |*it| it.deinit(self.alloc);
     self.completion_words.clearRetainingCapacity();
     self.completion_active = false;
     self.completion_sel = 0;
     self.completion_pos = 0;
+    self.completion_manual = false;
+    self.completion_waiting_enter = false;
 }
 
 /// Enter in insert mode (vim semantics): split the current line at the
 /// cursor and carry the original line's leading indentation (the run of
 /// spaces/tabs before the cursor) over to the new line. The cursor lands
 /// right after the carried indentation (insertText advances it). Done as
-/// one edit so it is a single undo step.
+/// one edit so it is a single undo step. The split uses the line's own
+/// ending (`\n` / `\r\n`), so a CRLF buffer never acquires a bare LF line.
 pub fn insertNewline(self: *App) !void {
-    // safety net: the '\n' insertion must join the insert-session group
+    // safety net: the newline insertion must join the insert-session group
     if (!self.in_insert) {
         self.cur().history.beginGroup();
         self.in_insert = true;
     }
     const pt = &self.cur().pt;
-    const cursor = self.curCursor().*;
-    const line = pt.lineOf(cursor);
+    const line = pt.lineOf(self.curCursor().*);
     const line_start = pt.lineStart(line);
-    const col = cursor - line_start;
+    // Never split inside a CRLF terminator: a cursor parked between \r
+    // and \n (stale motions, old files) would otherwise emit "\r\r\n".
+    const text_end = line_start + pt.lineTextLen(line);
+    if (self.curCursor().* > text_end) self.curCursor().* = text_end;
+    const col = self.curCursor().* - line_start;
     // leading indentation of the original line, capped at the cursor
     var indent_end: u32 = 0;
     while (indent_end < col) : (indent_end += 1) {
@@ -565,15 +574,18 @@ pub fn insertNewline(self: *App) !void {
     const indent = try self.alloc.alloc(u8, @intCast(indent_end));
     defer self.alloc.free(indent);
     pt.copyRange(line_start, indent);
-    const text = try std.fmt.allocPrint(self.alloc, "\n{s}", .{indent});
-    defer self.alloc.free(text);
-    try self.insertText(text);
+    const ending = editor.line_open.preferredEnding(pt, line);
+    const open = try editor.line_open.plan(self.alloc, ending, indent, false);
+    defer open.deinit(self.alloc);
+    try self.insertText(open.text);
 }
 
 /// Ctrl+k in insert mode (emacs kill-line): delete from the cursor to the
 /// end of the line. When the cursor is already at the end of the line,
 /// delete the trailing newline instead, joining the next line (no-op on
-/// the last line).
+/// the last line). The line TEXT ends before a CRLF terminator's '\r', and
+/// joining lines removes the whole terminator (`\r\n` or `\n`), never half
+/// of it.
 pub fn deleteToEol(self: *App) !void {
     // safety net: the kill must join the insert-session group
     if (!self.in_insert) {
@@ -581,10 +593,11 @@ pub fn deleteToEol(self: *App) !void {
         self.in_insert = true;
     }
     const pt = &self.cur().pt;
-    const cursor = self.curCursor().*;
-    const line = pt.lineOf(cursor);
+    const line = pt.lineOf(self.curCursor().*);
     const line_start = pt.lineStart(line);
-    const line_end = line_start + pt.lineLen(line);
+    const line_end = line_start + pt.lineTextLen(line);
+    if (self.curCursor().* > line_end) self.curCursor().* = line_end;
+    const cursor = self.curCursor().*;
     const col = cursor - line_start;
     if (cursor < line_end) {
         // LSP range in the PRE-EDIT document: [cursor, line_end).
@@ -598,11 +611,15 @@ pub fn deleteToEol(self: *App) !void {
         self.adjustInlayHintsDelete(line, col, deleted);
         self.markDirtyRange(start_pos, end_pos, "");
     } else if (line_end < pt.len()) {
-        // at end of line: swallow the trailing newline (joins next line)
+        // at end of line: swallow the whole terminator (joins next line)
+        const term_len: u32 = if (pt.byteAt(line_end) == '\r' and
+            line_end + 1 < pt.len() and pt.byteAt(line_end + 1) == '\n') 2 else 1;
+        var term: [2]u8 = undefined;
+        pt.copyRange(line_end, term[0..term_len]);
         const start_pos = self.lspPositionAt(pt, line_end);
-        const end_pos = self.lspPositionAt(pt, line_end + 1);
-        try self.cur().history.record(pt, line_end, 1, "");
-        self.adjustInlayHintsDelete(line, col, "\n");
+        const end_pos = self.lspPositionAt(pt, line_end + term_len);
+        try self.cur().history.record(pt, line_end, term_len, "");
+        self.adjustInlayHintsDelete(line, col, term[0..term_len]);
         self.markDirtyRange(start_pos, end_pos, "");
     } else {
         return; // last line, nothing to delete

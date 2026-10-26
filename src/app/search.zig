@@ -198,6 +198,22 @@ pub fn invalidateInlayHints(self: *App) void {
     self.inlay_stale = true;
 }
 
+/// Re-anchor inlay hints for a WHOLE-LINE open (`o` / `O`).
+///
+/// Unlike a text insertion, no bytes are inserted inside the edited line:
+/// a hint anchored at its end (zls emits the type hint at the end of the
+/// declared name, which can be the last token on a line) belongs to that
+/// line, not to character 0 of the new empty row. Moving it there made the
+/// insert cursor count the stale label's width and ride in the middle of
+/// the new line (the "insert mode looks garbled" report). Hints move only
+/// by LINE: lines below the insertion shift down one; for O the edited
+/// line shifts too. Columns are untouched (CRLF offsets included).
+pub fn adjustInlayHintsLineOpen(self: *App, line: u32, above: bool) void {
+    for (self.inlay_hints.items) |*h| {
+        if (h.line > line or (above and h.line == line)) h.line += 1;
+    }
+}
+
 /// Shift inlay hints after inserting `text` at the pre-edit position
 /// (line, col). Same-line inserts shift later hints right; newline
 /// inserts push hints below down a line (and re-anchor those past the
@@ -338,6 +354,9 @@ pub fn writeBuffer(self: *App) !bool {
         return false;
     };
     self.cur().dirty = false;
+    // A saved note changed the list's title/snippet/mtime: refresh the
+    // navigator cache now (only for paths under the notes dir).
+    self.notesDidSave(path);
     // the file on disk changed: refresh git marks/branch (async)
     self.scheduleGitStatus();
     try self.setMsg(try std.fmt.allocPrint(self.alloc, "written: {s}", .{path}));

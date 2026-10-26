@@ -14,7 +14,12 @@ const term = @import("../term.zig");
 
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
+const nav_tabs = @import("navigator.zig");
+const note_store = @import("note_store.zig");
 const autil = @import("util.zig");
+const chrome = @import("chrome.zig");
+const tabstrip = @import("tabstrip.zig");
+const animation = @import("animation.zig");
 const git_job = @import("git_job.zig");
 const markdown = @import("markdown.zig");
 
@@ -36,19 +41,21 @@ const kindGlyph = App.kindGlyph;
 
 // ---- rendering ----
 
-pub const filetree_width: u32 = 30;
+pub const filetree_width: u32 = nav_tabs.panel_width;
+/// Blank column between the navigator's right border and editor content.
+pub const filetree_gutter: u32 = nav_tabs.gutter;
 
-/// Tab-bar rows: one per column-overlap layer of the pane layout.
-/// Panes whose column spans overlap (horizontal splits stack
-/// full-width panes) draw their tabs on separate rows so tabs never
-/// overwrite each other; vertical splits share a row (their spans are
-/// disjoint). Column spans don't depend on the split heights, so a
-/// nominal content height is fine here.
-pub fn tabBarRows(self: *App, a: std.mem.Allocator) u32 {
+/// Tab-label layers: one per column-overlap layer of the pane layout.
+/// Panes whose column spans overlap (horizontal splits stack full-width
+/// panes) draw their tabs on separate rows so tabs never overwrite each
+/// other; vertical splits share a row (their spans are disjoint). Column
+/// spans don't depend on the split heights, so a nominal content height is
+/// enough here.
+pub fn tabLayerCount(self: *App, a: std.mem.Allocator) u32 {
     if (self.windows.items.len <= 1) return 1;
     const height: u32 = self.vx.window().height;
     if (height <= status_row_count) return 1;
-    const layout = self.layoutWindows(a, 1, height - status_row_count - 1, self.contentCol(), self.vx.window().width) catch return 1;
+    const layout = self.layoutWindows(a, 1, height - status_row_count - 1, self.contentCol(), self.editorAreaWidth()) catch return 1;
     const leaves = layout.leaves;
     // greedy interval coloring: assign each pane to the lowest layer
     // whose rightmost pane ends at or before this pane's column start
@@ -70,7 +77,19 @@ pub fn tabBarRows(self: *App, a: std.mem.Allocator) u32 {
             layer_end.items[li] = lr.col + lr.width;
         }
     }
-    return layers;
+    return @max(layers, 1);
+}
+
+/// Rows owned by the buffer strip: one label layer per pane-column layer
+/// plus ONE shared bottom rule/underline row. Content starts below both, so
+/// the active tab can carry the demo's accent inset line without making the
+/// label text cramped. The bar never consumes the content or status band:
+/// at a pathologically short height it clamps to the rows that exist.
+pub fn tabBarRows(self: *App, a: std.mem.Allocator) u32 {
+    const height: u32 = self.vx.window().height;
+    if (height <= status_row_count) return 1;
+    const max_bar = height - status_row_count;
+    return @min(self.tabLayerCount(a) + 1, max_bar);
 }
 
 /// Sort panes by column for tab streaming: left to right, wider first
@@ -90,8 +109,31 @@ pub fn contentTop(self: *App, a: std.mem.Allocator) u32 {
     return self.tabBarRows(a);
 }
 
-pub fn contentCol(self: *const App) u32 {
-    return if (self.filetree_active) filetree_width else 0;
+pub fn contentCol(self: *App) u32 {
+    // Full mode keeps the 30-cell panel; compact mode reserves only the
+    // 7-cell icon rail. In both, one blank column separates the navigator's
+    // right border from editor text.
+    return nav_tabs.editorCol(self.filetree_active, self.vx.window().width);
+}
+
+/// Width of the editor's usable area after the navigator takes its column
+/// slice. Layouts/splits/tab layers must use this (not `aiEditorWidth`,
+/// which is the full span from column 0 to the rail) or a navigator-open
+/// pane would wrap text underneath the navigator/rail.
+pub fn editorAreaWidth(self: *App) u32 {
+    return self.aiEditorWidth() -| self.contentCol();
+}
+
+/// First row of the navigator's real content (below brand, workspace, tabs
+/// and the closing rule) in full/peek mode.
+pub fn navigatorBodyTop(self: *App, a: std.mem.Allocator) u32 {
+    return self.contentTop(a) + nav_tabs.full_header_rows;
+}
+
+/// True when the compact icon rail's peek drawer should be drawn/owned.
+pub fn navigatorPeekActive(self: *App) bool {
+    return self.filetree_active and self.navigator_peek and
+        nav_tabs.modeForCols(self.vx.window().width) == .compact;
 }
 
 /// Width of the relative-line-number gutter in cells: digits of the
@@ -199,7 +241,7 @@ pub fn utf16Column(self: *App, line: u32, byte_col: u32) u32 {
 pub fn byteColumnFromUtf16(self: *App, line: u32, utf16_col: u32) u32 {
     const pt = &self.cur().pt;
     const ls = pt.lineStart(line);
-    const end = ls + pt.lineLen(line);
+    const end = ls + pt.lineTextLen(line);
     var p = ls;
     var units: u32 = 0;
     while (p < end) {
@@ -248,7 +290,7 @@ pub fn screenCellCol(self: *App, win: vaxis.Window, line: u32, byte_pos: u32) u3
 pub fn isBlankLine(self: *App, buf: *Buffer, l: u32) bool {
     _ = self;
     const ls = buf.pt.lineStart(l);
-    const ll = buf.pt.lineLen(l);
+    const ll = buf.pt.lineTextLen(l);
     var chunk: [128]u8 = undefined;
     var off: u32 = 0;
     while (off < ll) {
@@ -268,7 +310,7 @@ pub fn isBlankLine(self: *App, buf: *Buffer, l: u32) bool {
 pub fn lineIndentLevels(self: *App, buf: *Buffer, l: u32) u32 {
     _ = self;
     const ls = buf.pt.lineStart(l);
-    const ll = buf.pt.lineLen(l);
+    const ll = buf.pt.lineTextLen(l);
     var chunk: [128]u8 = undefined;
     var cols: u32 = 0;
     var off: u32 = 0;
@@ -327,7 +369,7 @@ pub fn blankContextLevels(self: *App, buf: *Buffer, line: u32, line_count: u32) 
 pub fn lineDisplayRows(self: *App, win: vaxis.Window, buf: *Buffer, buf_index: usize, line: u32, content_width: u32) u32 {
     const cw = @max(content_width, 1);
     const ls = buf.pt.lineStart(line);
-    const ll = buf.pt.lineLen(line);
+    const ll = buf.pt.lineTextLen(line);
     var cells: u32 = 0;
     // chunked copyRange scan (per-byte byteAt is O(pieces) — see lineCellCol)
     var chunk: [4096]u8 = undefined;
@@ -439,6 +481,21 @@ fn markdownImageRows(self: *App, win: vaxis.Window, info: markdown.Line, content
     _ = content_width;
     const image = info.image orelse return 0;
     const path = image.path orelse return 0;
+    if (!self.vx.caps.kitty_graphics) return 0;
+    if (self.markdown_images.get(path) == null) {
+        // Capability responses and image loads can arrive after the layout
+        // was built; load on demand here so the first frame that renders the
+        // image can place it, instead of caching a zero-row placeholder.
+        const key = self.alloc.dupe(u8, path) catch return 0;
+        const loaded = loadMarkdownImage(self, path) catch {
+            self.markdown_images.put(key, .failed) catch self.alloc.free(key);
+            return 0;
+        };
+        self.markdown_images.put(key, .{ .loaded = loaded }) catch {
+            self.alloc.free(key);
+            return 0;
+        };
+    }
     const entry = self.markdown_images.get(path) orelse return 0;
     const loaded = switch (entry) {
         .loaded => |img| img,
@@ -989,7 +1046,7 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
             }
         }
 
-        const line_len = buf.pt.lineLen(line);
+        const line_len = buf.pt.lineTextLen(line);
         const line_start = buf.pt.lineStart(line);
         // Soft wrap: the WHOLE line renders over as many screen rows as
         // its display cells need — no right-edge clipping. Only the bytes
@@ -1064,7 +1121,7 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
                 // V (visual_line) selects whole lines
                 if (self.state.mode == .visual_line) {
                     sel_start = buf.pt.lineStart(buf.pt.lineOf(sel_start));
-                    sel_end = buf.pt.lineStart(buf.pt.lineOf(sel_end)) + buf.pt.lineLen(buf.pt.lineOf(sel_end));
+                    sel_end = buf.pt.lineStart(buf.pt.lineOf(sel_end)) + buf.pt.lineTextLen(buf.pt.lineOf(sel_end));
                 }
                 // Ctrl+v (visual_block) selects a rectangle
                 if (self.state.mode == .visual_block) {
@@ -1776,48 +1833,362 @@ pub fn hoverLineSegs(self: *App, a: std.mem.Allocator, line: []const u8, cols: u
     }
     return segs.items;
 }
-/// Render the file-tree sidebar into `win`. Extracted from render() so the
-/// dashboard path (which returns before the window loop) can draw the tree too.
-pub fn renderFiletree(self: *App, a: std.mem.Allocator, win: vaxis.Window, height: u32) !void {
+/// Render the left navigator. Two layouts:
+///   * >= 90 cols — the closed 30-cell panel: branded top border (`OZ`),
+///     workspace/branch line, icon+label+count tab strip, then the active
+///     tab's real content.
+///   * < 90 cols  — a 7-cell icon rail (`OZ`, folder/notes/agents). Selecting
+///     an icon opens the same 30-cell panel as a peek overlay over the
+///     editor; Esc/outside-click closes it. The editor keeps its full width
+///     underneath in both compact states.
+/// Files keeps the tree's exact rendering/keys; Notes and Agents render from
+/// the cached note list and the real thread model. Counts come from those
+/// existing caches — never from a per-frame filesystem scan.
+pub fn renderNavigator(self: *App, a: std.mem.Allocator, win: vaxis.Window, height: u32) !void {
+    if (height <= status_row_count) return;
+    const mode = nav_tabs.modeForCols(win.width);
+    if (mode == .compact) {
+        // Keyboard focus leaving the navigator closes the peek, so a user
+        // can never type into the editor under an open overlay.
+        if (self.focus != .navigator) self.navigator_peek = false;
+        if (self.navigator_peek) {
+            try renderNavigatorPanel(self, a, win, height, true);
+        } else {
+            try renderCompactRail(self, a, win, height);
+        }
+    } else {
+        self.navigator_peek = false;
+        try renderNavigatorPanel(self, a, win, height, false);
+    }
+}
+
+/// The 30-cell navigator box. `peek` adds the close affordance and is only
+/// used in compact mode; full mode draws the same box in place.
+fn renderNavigatorPanel(self: *App, a: std.mem.Allocator, win: vaxis.Window, height: u32, peek: bool) !void {
     const ft_col: u32 = 0;
-    const ft_width = filetree_width;
+    const ft_width: u32 = nav_tabs.panel_width;
     const ft_top = self.contentTop(a);
     const ft_bottom = height - status_row_count; // above the status bar
-    const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg } };
-    // Paint the whole panel with the editor background first — without
-    // this only the border columns and the text-width of each item
-    // got the bg, leaving the interior terminal-default (patchy).
+    if (ft_bottom < ft_top + nav_tabs.full_header_rows + 1) return;
+    const usable = ft_width - 2; // cells between the two borders
+    const panel_bg: vaxis.Color = .{ .rgb = self.theme.bg };
+    const nav_focused = self.focus == .navigator and self.ai.focus == .editor;
+    const border_style = chrome.panelBorderStyle(self.theme, nav_focused, panel_bg);
+    const brand_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = panel_bg, .bold = true };
+
+    // Paint the whole panel before anything else: every interior cell then
+    // has the editor background, not a terminal-default hole.
     const panel = win.child(.{
         .x_off = @intCast(ft_col),
         .y_off = @intCast(ft_top),
         .width = @intCast(ft_width),
         .height = @intCast(ft_bottom - ft_top),
     });
-    panel.fill(.{ .style = .{ .bg = .{ .rgb = self.theme.bg } } });
-    // left border column and panel background
-    const left_col = ft_col;
-    const inner_left = ft_col + 1;
-    const inner_w = ft_width -| 1;
-    var brow: u32 = ft_top;
-    while (brow < ft_bottom) : (brow += 1) {
-        const border_seg = [_]vaxis.Segment{.{
-            .text = "│",
-            .style = border_style,
-        }};
-        _ = win.print(&border_seg, .{ .row_offset = @intCast(brow), .col_offset = @intCast(left_col), .wrap = .none });
+    panel.fill(.{ .style = .{ .bg = panel_bg } });
+
+    // Body geometry: header rows (border/workspace/tabs/rule) + content +
+    // the bottom border.
+    const body_top = ft_top + nav_tabs.full_header_rows;
+    const body_bottom = ft_bottom - 1; // bottom border row
+    const content_bottom = @max(body_top, body_bottom);
+
+    // Vertical borders first; header rows overwrite only the interior.
+    {
+        var r: u32 = ft_top + 1;
+        while (r < body_bottom) : (r += 1) {
+            const left = [_]vaxis.Segment{.{ .text = "│", .style = border_style }};
+            _ = win.print(&left, .{ .row_offset = @intCast(r), .col_offset = @intCast(ft_col), .wrap = .none });
+            const right = [_]vaxis.Segment{.{ .text = "│", .style = border_style }};
+            _ = win.print(&right, .{ .row_offset = @intCast(r), .col_offset = @intCast(ft_col + ft_width - 1), .wrap = .none });
+        }
     }
-    // title row: " files " with a top border (╭─ files ────╮)
+
+    // Branded top border: ╭─ OZ ─────────────────────╮
     {
         var segs = std.ArrayList(vaxis.Segment).empty;
-        try segs.append(a, .{ .text = "╭─ files ", .style = border_style });
-        // inner_w cells between the borders; "╭─ files " is 9 cells
-        var cx: u32 = 9;
-        while (cx < inner_w) : (cx += 1) {
+        try segs.append(a, .{ .text = "╭─ ", .style = border_style });
+        try segs.append(a, .{ .text = "OZ", .style = brand_style });
+        try segs.append(a, .{ .text = " ", .style = border_style });
+        var used: u32 = 6; // "╭─ " + "OZ" + " "
+        while (used + 1 < ft_width) : (used += 1) {
             try segs.append(a, .{ .text = "─", .style = border_style });
         }
         try segs.append(a, .{ .text = "╮", .style = border_style });
-        _ = win.print(segs.items, .{ .row_offset = @intCast(ft_top), .col_offset = @intCast(left_col), .wrap = .none });
+        _ = win.print(segs.items, .{ .row_offset = @intCast(ft_top), .col_offset = @intCast(ft_col), .wrap = .none });
     }
+
+    // Workspace / branch line. The compact peek adds a close `×` at the
+    // inner right edge (the demo's nav-head close affordance).
+    {
+        var ws_buf: [512]u8 = undefined;
+        const line = nav_tabs.workspaceLine(self.curWsName(), self.git_branch, &ws_buf);
+        const text_budget: u32 = usable -| 1 -| (if (peek) @as(u32, 1) else 0);
+        var shown = buffer.utf8.truncateWidth(line, text_budget);
+        const ellipsized = shown.len < line.len and text_budget > 0;
+        if (ellipsized) shown = buffer.utf8.truncateWidth(line, text_budget - 1);
+        // vaxis stores grapheme slices until vx.render(); the workspace-line
+        // scratch buffer is stack-local, so keep the printed slice alive in
+        // the frame arena (the same reason other labels dupe).
+        shown = try a.dupe(u8, shown);
+        const dim: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = panel_bg };
+
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        try segs.append(a, .{ .text = "│", .style = border_style });
+        try segs.append(a, .{ .text = " ", .style = dim });
+        try segs.append(a, .{ .text = shown, .style = dim });
+        var used: u32 = 2 + @as(u32, @intCast(buffer.utf8.displayWidth(shown)));
+        if (ellipsized) {
+            try segs.append(a, .{ .text = "…", .style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = panel_bg } });
+            used += 1;
+        }
+        // Close button column (peek) or trailing padding (full).
+        while (used < usable) : (used += 1) {
+            try segs.append(a, .{ .text = " ", .style = dim });
+        }
+        if (peek) {
+            try segs.append(a, .{ .text = "×", .style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = panel_bg, .bold = true } });
+            if (self.mouseTargetsCollecting()) {
+                self.addHintTarget(.{
+                    .row = ft_top + 1,
+                    .col = ft_col + ft_width - 2,
+                    .width = 1,
+                    .height = 1,
+                }, .navigator_peek_close);
+            }
+        }
+        try segs.append(a, .{ .text = "│", .style = border_style });
+        _ = win.print(segs.items, .{ .row_offset = @intCast(ft_top + 1), .col_offset = @intCast(ft_col), .wrap = .none });
+    }
+
+    try renderNavigatorTabs(self, a, win, ft_top + 2);
+
+    // Closing rule under the tab strip: ├────────────────────────────┤
+    {
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        try segs.append(a, .{ .text = "├", .style = border_style });
+        var cx: u32 = 0;
+        while (cx < usable) : (cx += 1) {
+            try segs.append(a, .{ .text = "─", .style = border_style });
+        }
+        try segs.append(a, .{ .text = "┤", .style = border_style });
+        _ = win.print(segs.items, .{ .row_offset = @intCast(ft_top + 3), .col_offset = @intCast(ft_col), .wrap = .none });
+    }
+
+    // Mouse-only wheel region: the content body (never the header rows).
+    self.addMouseScrollTarget(body_top, ft_col, ft_width, body_bottom -| body_top, switch (self.navigator_tab) {
+        .files => .navigator_files,
+        .notes => .navigator_notes,
+        .agents => .navigator_agents,
+    });
+
+    switch (self.navigator_tab) {
+        .files => try renderFiletreeRows(self, a, win, body_top, content_bottom, usable),
+        .notes => try renderNotesRows(self, a, win, body_top, content_bottom, usable),
+        .agents => try renderAgentsRows(self, a, win, body_top, content_bottom, usable),
+    }
+
+    // Bottom border.
+    {
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        try segs.append(a, .{ .text = "╰", .style = border_style });
+        var cx: u32 = 0;
+        while (cx < usable) : (cx += 1) {
+            try segs.append(a, .{ .text = "─", .style = border_style });
+        }
+        try segs.append(a, .{ .text = "╯", .style = border_style });
+        _ = win.print(segs.items, .{ .row_offset = @intCast(body_bottom), .col_offset = @intCast(ft_col), .wrap = .none });
+    }
+}
+
+/// Compact icon rail (cols < 90): `OZ` + one two-row button per tab, with a
+/// right border and no content. The 30-cell peek drawer is the content view.
+fn renderCompactRail(self: *App, a: std.mem.Allocator, win: vaxis.Window, height: u32) !void {
+    const rail_w: u32 = nav_tabs.compact_width;
+    const content_w = rail_w - 1;
+    const top = self.contentTop(a);
+    const bottom = height -| status_row_count;
+    if (bottom <= top or content_w == 0) return;
+
+    const panel_bg: vaxis.Color = .{ .rgb = self.theme.bg };
+    const nav_focused = self.focus == .navigator and self.ai.focus == .editor;
+    const border_style = chrome.panelBorderStyle(self.theme, nav_focused, panel_bg);
+    const brand_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = panel_bg, .bold = true };
+    const rule_style = chrome.separatorStyle(self.theme, .minor, panel_bg);
+
+    const panel = win.child(.{
+        .x_off = 0,
+        .y_off = @intCast(top),
+        .width = @intCast(rail_w),
+        .height = @intCast(bottom - top),
+    });
+    panel.fill(.{ .style = .{ .bg = panel_bg } });
+
+    // Right border (the demo's compact rail has no left border; the editor
+    // starts after a one-cell gutter at `compact_width + 1`).
+    {
+        var r: u32 = top;
+        while (r < bottom) : (r += 1) {
+            const seg = [_]vaxis.Segment{.{ .text = "│", .style = border_style }};
+            _ = win.print(&seg, .{ .row_offset = @intCast(r), .col_offset = @intCast(rail_w - 1), .wrap = .none });
+        }
+    }
+
+    // OZ mark, centered in the six content cells.
+    {
+        const oz = [_]vaxis.Segment{
+            .{ .text = "  ", .style = .{ .bg = panel_bg } },
+            .{ .text = "OZ", .style = brand_style },
+            .{ .text = "  ", .style = .{ .bg = panel_bg } },
+        };
+        _ = win.print(&oz, .{ .row_offset = @intCast(top), .col_offset = 0, .wrap = .none });
+    }
+
+    // Hairline under the brand head.
+    if (top + 1 < bottom) {
+        var cx: u32 = 0;
+        while (cx < content_w) : (cx += 1) {
+            const seg = [_]vaxis.Segment{.{ .text = "─", .style = rule_style }};
+            _ = win.print(&seg, .{ .row_offset = @intCast(top + 1), .col_offset = @intCast(cx), .wrap = .none });
+        }
+    }
+
+    // One two-row button per tab, icon only:  OZ / rule / [icon][icon][icon].
+    const active_bg: vaxis.Color = .{ .rgb = self.theme.bg_sel };
+    var i: usize = 0;
+    while (i < nav_tabs.count) : (i += 1) {
+        const tab = nav_tabs.all[i];
+        const row = top + nav_tabs.compact_first_tab_row + @as(u32, @intCast(i)) * nav_tabs.compact_tab_rows;
+        if (row + 1 >= bottom) break;
+        const active = self.navigator_tab == tab;
+        const bg: vaxis.Color = if (active) active_bg else panel_bg;
+        const icon = icons.tabIcon(tab);
+        const icon_style: vaxis.Style = if (active)
+            .{ .fg = .{ .rgb = self.theme.accent_alt }, .bg = bg, .bold = true }
+        else
+            .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = bg };
+
+        // Both rows of the button share the selection background.
+        const blank = "      "; // compact content width, no per-frame alloc
+        var rr: u32 = 0;
+        while (rr < nav_tabs.compact_tab_rows) : (rr += 1) {
+            const segs = [_]vaxis.Segment{.{ .text = blank[0..content_w], .style = .{ .bg = bg } }};
+            _ = win.print(&segs, .{ .row_offset = @intCast(row + rr), .col_offset = 0, .wrap = .none });
+        }
+        if (active) {
+            // Accent inset bar, the terminal equivalent of the demo's 2px
+            // active rail marker; drawn on both rows.
+            var bar_r: u32 = 0;
+            while (bar_r < nav_tabs.compact_tab_rows) : (bar_r += 1) {
+                const bar = [_]vaxis.Segment{.{ .text = "│", .style = .{
+                    .fg = .{ .rgb = self.theme.accent_alt },
+                    .bg = bg,
+                    .bold = true,
+                } }};
+                _ = win.print(&bar, .{ .row_offset = @intCast(row + bar_r), .col_offset = 0, .wrap = .none });
+            }
+        }
+        // Icon centered horizontally in the six content cells.
+        const icon_col: u32 = 2;
+        const icon_seg = [_]vaxis.Segment{.{ .text = icon.glyph, .style = icon_style }};
+        _ = win.print(&icon_seg, .{ .row_offset = @intCast(row), .col_offset = icon_col, .wrap = .none });
+
+        if (self.mouseTargetsCollecting()) {
+            self.addHintTarget(.{
+                .row = row,
+                .col = 0,
+                .width = content_w,
+                .height = nav_tabs.compact_tab_rows,
+            }, .{ .navigator_tab = tab });
+        }
+    }
+}
+
+/// Full-mode tab strip: folder/notes/agents icons, labels and compact real
+/// count badges. `layoutTabs` fits the strip into the 28 inner cells and
+/// drops badges (never labels) if a huge count cannot fit; the same layout
+/// drives the hint/mouse rectangles.
+fn renderNavigatorTabs(self: *App, a: std.mem.Allocator, win: vaxis.Window, row: u32) !void {
+    const inner: u16 = nav_tabs.panel_width - 2;
+    const counts: nav_tabs.Counts = .{
+        self.filetree_rows.items.len,
+        if (self.notes.loaded and self.notes.err == null) self.notes.items.items.len else null,
+        self.ai.threads.items.items.len,
+    };
+    const layout = nav_tabs.layoutTabs(counts, inner);
+    const active_label = chrome.activeTabStyle(self.theme);
+    const active_icon = chrome.activeTabMarkerStyle(self.theme);
+    const active_count: vaxis.Style = .{
+        .fg = .{ .rgb = self.theme.accent_alt },
+        .bg = .{ .rgb = self.theme.bg_sel },
+        .bold = true,
+        .ul = .{ .rgb = self.theme.accent_alt },
+        .ul_style = .single,
+    };
+    const inactive_icon: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg } };
+    const inactive_label = chrome.inactiveTabStyle(self.theme, .{ .rgb = self.theme.bg });
+    const inactive_count: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg } };
+    const gap_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg } };
+    const sep_style = chrome.separatorStyle(self.theme, .minor, .{ .rgb = self.theme.bg });
+    const border_style = chrome.panelBorderStyle(self.theme, self.focus == .navigator and self.ai.focus == .editor, .{ .rgb = self.theme.bg });
+
+    var segs = std.ArrayList(vaxis.Segment).empty;
+    try segs.append(a, .{ .text = "│", .style = border_style });
+
+    var used: u16 = 0;
+    var ti: usize = 0;
+    while (ti < nav_tabs.count) : (ti += 1) {
+        const tab = nav_tabs.all[ti];
+        const start = layout.starts[ti];
+        // The fitter leaves one cell between tabs whenever possible; draw
+        // it as the demo's dim accent separator. A zero-gap fallback (only
+        // when even compact badges overflow) has no separator cell.
+        if (ti > 0 and used < start) {
+            try segs.append(a, .{ .text = "│", .style = sep_style });
+            used += 1;
+        }
+        while (used < start) : (used += 1) {
+            try segs.append(a, .{ .text = " ", .style = gap_style });
+        }
+        const active = self.navigator_tab == tab;
+        const icon = icons.tabIcon(tab);
+        const icon_style: vaxis.Style = if (active) active_icon else inactive_icon;
+        const label_style: vaxis.Style = if (active) active_label else inactive_label;
+        try segs.append(a, .{ .text = icon.glyph, .style = icon_style });
+        try segs.append(a, .{ .text = " ", .style = .{ .bg = icon_style.bg } });
+        try segs.append(a, .{ .text = nav_tabs.label(tab), .style = label_style });
+        if (layout.has_count[ti]) {
+            if (counts[ti]) |n| {
+                // Frame-arena text: vaxis holds the slice until render.
+                const text = std.fmt.allocPrint(a, "{d}", .{n}) catch "";
+                try segs.append(a, .{ .text = text, .style = if (active) active_count else inactive_count });
+            }
+        }
+        used = start + layout.widths[ti];
+    }
+    while (used < inner) : (used += 1) {
+        try segs.append(a, .{ .text = " ", .style = gap_style });
+    }
+    try segs.append(a, .{ .text = "│", .style = border_style });
+    _ = win.print(segs.items, .{ .row_offset = @intCast(row), .col_offset = 0, .wrap = .none });
+
+    if (self.mouseTargetsCollecting()) {
+        ti = 0;
+        while (ti < nav_tabs.count) : (ti += 1) {
+            self.addHintTarget(.{
+                .row = row,
+                .col = 1 + layout.starts[ti],
+                .width = layout.widths[ti],
+                .height = 1,
+            }, .{ .navigator_tab = nav_tabs.all[ti] });
+        }
+    }
+}
+
+/// Files tab: the pre-M2b1 filetree row loop unchanged (same geometry,
+/// selection, scroll window and absolute-row hint payload).
+fn renderFiletreeRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, body_top: u32, body_bottom: u32, usable: u32) !void {
+    const ft_col: u32 = 0;
+    const inner_left = ft_col + 1;
     // vim-style scroll window (same semantics as the picker)
     const ft_len = self.filetree_rows.items.len;
     // clamp the selection when the tree shrank (collapse) BEFORE the
@@ -1828,7 +2199,7 @@ pub fn renderFiletree(self: *App, a: std.mem.Allocator, win: vaxis.Window, heigh
     } else if (self.filetree_sel >= ft_len) {
         self.filetree_sel = ft_len - 1;
     }
-    const ft_vis = @min(ft_len, @as(usize, ft_bottom - ft_top - 2));
+    const ft_vis = @min(ft_len, @as(usize, body_bottom -| body_top));
     if (ft_len > ft_vis) {
         if (self.filetree_top + ft_vis > ft_len) self.filetree_top = ft_len - ft_vis;
         if (self.filetree_sel < self.filetree_top) self.filetree_top = self.filetree_sel;
@@ -1845,7 +2216,6 @@ pub fn renderFiletree(self: *App, a: std.mem.Allocator, win: vaxis.Window, heigh
         // ("├╴"/"└╴"), then icon + space + name. The terminal cursor sits
         // on the padding cell (col 1), not on the icon, so the block cursor
         // no longer touches the glyph.
-        const usable = ft_width - 2; // cells between the two borders
         const icon = if (node.is_dir) icons.folder(node.expanded) else icons.forPath(node.path, false);
 
         // ancestors, top-down. frow.depth is the number of visible
@@ -1904,37 +2274,249 @@ pub fn renderFiletree(self: *App, a: std.mem.Allocator, win: vaxis.Window, heigh
         const pads = try a.alloc(u8, usable -| content_cells);
         @memset(pads, ' ');
         if (pads.len > 0) try segs.append(a, .{ .text = pads, .style = style });
-        _ = win.print(segs.items, .{ .row_offset = @intCast(ft_top + 1 + k), .col_offset = @intCast(inner_left), .wrap = .none });
-    }
-    // right border column — mirrors the left one so the panel is a
-    // closed box. The title row's "╮" and the bottom row's "╯"
-    // already cap the two corners, so only the interior rows need the
-    // "│" (the item rows' trailing padding is what it covers).
-    {
-        const right_col = ft_col + ft_width - 1;
-        var rrow: u32 = ft_top + 1;
-        const rlast = ft_bottom - 1; // bottom border row
-        while (rrow < rlast) : (rrow += 1) {
-            const border_seg = [_]vaxis.Segment{.{
-                .text = "│",
-                .style = border_style,
-            }};
-            _ = win.print(&border_seg, .{ .row_offset = @intCast(rrow), .col_offset = @intCast(right_col), .wrap = .none });
+        _ = win.print(segs.items, .{ .row_offset = @intCast(body_top + @as(u32, @intCast(k))), .col_offset = @intCast(inner_left), .wrap = .none });
+        if (self.mouseTargetsCollecting()) {
+            // Inner row rect (starts after the left border so a label never
+            // breaks the panel frame). Payload is the absolute row index in
+            // filetree_rows, not the visible slot.
+            self.addHintTarget(.{
+                .row = body_top + @as(u32, @intCast(k)),
+                .col = inner_left,
+                .width = usable,
+                .height = 1,
+            }, .{ .filetree_activate = ri });
         }
     }
-    // bottom border
-    {
+}
+
+/// Notes tab: two rows per note (title + right-aligned age, then
+/// filename · snippet). The list is the cached `Store`, refreshed by the
+/// action paths, never by this renderer; rows scroll in note units.
+fn renderNotesRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, body_top: u32, body_bottom: u32, usable: u32) !void {
+    const inner_left: u32 = 1;
+    const content_top = body_top;
+    const content_rows: usize = @intCast(body_bottom -| body_top);
+    const base_bg: vaxis.Color = .{ .rgb = self.theme.bg };
+
+    if (self.notes.err) |msg| {
+        const err_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.diag_error }, .bg = base_bg };
+        const head = [_]vaxis.Segment{.{ .text = " ! notes unavailable", .style = err_style }};
+        _ = win.print(&head, .{ .row_offset = @intCast(content_top), .col_offset = @intCast(inner_left), .wrap = .none });
+        if (content_rows >= 2) {
+            const line = try std.fmt.allocPrint(a, " {s}", .{msg});
+            const shown = buffer.utf8.truncateWidth(line, usable);
+            const seg = [_]vaxis.Segment{.{ .text = shown, .style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = base_bg } }};
+            _ = win.print(&seg, .{ .row_offset = @intCast(content_top + 1), .col_offset = @intCast(inner_left), .wrap = .none });
+        }
+        return;
+    }
+    if (self.notes.items.items.len == 0) {
+        const seg = [_]vaxis.Segment{.{ .text = " no notes yet", .style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = base_bg } }};
+        _ = win.print(&seg, .{ .row_offset = @intCast(content_top), .col_offset = @intCast(inner_left), .wrap = .none });
+        if (content_rows >= 2) {
+            const seg2 = [_]vaxis.Segment{.{ .text = " n creates a note", .style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = base_bg } }};
+            _ = win.print(&seg2, .{ .row_offset = @intCast(content_top + 1), .col_offset = @intCast(inner_left), .wrap = .none });
+        }
+        return;
+    }
+
+    const n = self.notes.items.items.len;
+    if (self.notes.sel >= n) self.notes.sel = n - 1;
+    const vis = @max(@as(usize, 1), content_rows / 2);
+    if (n > vis) {
+        if (self.notes.top + vis > n) self.notes.top = n - vis;
+        if (self.notes.sel < self.notes.top) self.notes.top = self.notes.sel;
+        if (self.notes.sel >= self.notes.top + vis) self.notes.top = self.notes.sel - vis + 1;
+    } else self.notes.top = 0;
+
+    const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+    var k: usize = 0;
+    while (k < vis) : (k += 1) {
+        const idx = self.notes.top + k;
+        if (idx >= n) break;
+        const row1 = content_top + 2 * @as(u32, @intCast(k));
+        if (row1 >= body_bottom) break;
+        const note = &self.notes.items.items[idx];
+        const selected = idx == self.notes.sel;
+        const bg: vaxis.Color = if (selected) .{ .rgb = self.theme.bg_sel } else base_bg;
+        const base_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = bg };
+
+        var age_buf: [16]u8 = undefined;
+        const age_raw = note_store.formatAge(now, note.mtime_ns, &age_buf);
+        const age = try a.dupe(u8, age_raw);
+        const age_cells: u32 = @intCast(buffer.utf8.displayWidth(age));
+        var title_budget: u32 = usable -| 2; // marker + space
+        var show_age = false;
+        if (age_cells + 1 < title_budget) {
+            title_budget -= age_cells + 1;
+            show_age = true;
+        }
+        const title = buffer.utf8.truncateWidth(note.title, title_budget);
+        const title_cells: u32 = @intCast(buffer.utf8.displayWidth(title));
+
         var segs = std.ArrayList(vaxis.Segment).empty;
-        try segs.append(a, .{ .text = "╰", .style = border_style });
-        // inner_w - 1 dashes: "╰" takes the left border column and
-        // "╯" must land ON the right border column (ft_width-1) —
-        // inner_w dashes would push it one cell past the edge
-        var cx: u32 = 0;
-        while (cx < inner_w -| 1) : (cx += 1) {
-            try segs.append(a, .{ .text = "─", .style = border_style });
+        try segs.append(a, .{
+            .text = if (selected) "> " else "  ",
+            .style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = bg },
+        });
+        try segs.append(a, .{ .text = title, .style = base_style });
+        var filled: u32 = 2 + title_cells;
+        if (show_age) {
+            const pad = usable -| filled -| age_cells;
+            if (pad > 0) {
+                const spaces = try a.alloc(u8, pad);
+                @memset(spaces, ' ');
+                try segs.append(a, .{ .text = spaces, .style = base_style });
+                filled += pad;
+            }
+            try segs.append(a, .{ .text = age, .style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = bg } });
+            filled += age_cells;
         }
-        try segs.append(a, .{ .text = "╯", .style = border_style });
-        _ = win.print(segs.items, .{ .row_offset = @intCast(ft_bottom - 1), .col_offset = @intCast(left_col), .wrap = .none });
+        if (filled < usable) {
+            const spaces = try a.alloc(u8, usable - filled);
+            @memset(spaces, ' ');
+            try segs.append(a, .{ .text = spaces, .style = base_style });
+        }
+        _ = win.print(segs.items, .{ .row_offset = @intCast(row1), .col_offset = @intCast(inner_left), .wrap = .none });
+        if (self.mouseTargetsCollecting()) {
+            self.addHintTarget(.{
+                .row = row1,
+                .col = inner_left,
+                .width = usable,
+                .height = 1,
+            }, .{ .note_open = idx });
+        }
+
+        if (row1 + 1 < body_bottom) {
+            const row2 = row1 + 1;
+            var line = std.ArrayList(u8).empty;
+            try line.appendSlice(a, "  ");
+            try line.appendSlice(a, note.filename);
+            if (note.snippet.len > 0) {
+                try line.appendSlice(a, " · ");
+                try line.appendSlice(a, note.snippet);
+            }
+            const shown = buffer.utf8.truncateWidth(line.items, usable);
+            const shown_cells: u32 = @intCast(buffer.utf8.displayWidth(shown));
+            var segs2 = std.ArrayList(vaxis.Segment).empty;
+            try segs2.append(a, .{ .text = shown, .style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = bg } });
+            if (shown_cells < usable) {
+                const spaces = try a.alloc(u8, usable - shown_cells);
+                @memset(spaces, ' ');
+                try segs2.append(a, .{ .text = spaces, .style = .{ .bg = bg } });
+            }
+            _ = win.print(segs2.items, .{ .row_offset = @intCast(row2), .col_offset = @intCast(inner_left), .wrap = .none });
+        }
+    }
+}
+
+/// Agents tab: one workspace group header (current workspace + provider
+/// model), then the session's REAL threads with an ASCII status marker, name
+/// and status label. The attached thread carries `>` + bold; the selected
+/// row keeps the fill. Enter = the same `aiSelectThread` attach path as the
+/// rail; `n` = `aiNewThread`. No synthetic rows, no second thread model.
+fn renderAgentsRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, body_top: u32, body_bottom: u32, usable: u32) !void {
+    const inner_left: u32 = 1;
+    const content_top = body_top;
+    const content_rows: usize = @intCast(body_bottom -| body_top);
+    const base_bg: vaxis.Color = .{ .rgb = self.theme.bg };
+
+    var header = std.ArrayList(u8).empty;
+    try header.appendSlice(a, " ");
+    try header.appendSlice(a, self.curWsName());
+    if (self.ai.config) |cfg| {
+        try header.appendSlice(a, " · ");
+        try header.appendSlice(a, cfg.model);
+    }
+    const head_shown = buffer.utf8.truncateWidth(header.items, usable);
+    const head_seg = [_]vaxis.Segment{.{ .text = head_shown, .style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = base_bg } }};
+    _ = win.print(&head_seg, .{ .row_offset = @intCast(content_top), .col_offset = @intCast(inner_left), .wrap = .none });
+
+    const list_top = content_top + 1;
+    const avail = content_rows -| 1;
+    if (avail == 0) return;
+    const n = self.ai.threads.items.items.len;
+    if (n == 0) {
+        const seg = [_]vaxis.Segment{.{ .text = " no threads yet", .style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = base_bg } }};
+        _ = win.print(&seg, .{ .row_offset = @intCast(list_top), .col_offset = @intCast(inner_left), .wrap = .none });
+        return;
+    }
+    if (self.ai.thread_cursor >= n) self.ai.thread_cursor = n - 1;
+    if (n > avail) {
+        if (self.ai.thread_top + avail > n) self.ai.thread_top = n - avail;
+        if (self.ai.thread_cursor < self.ai.thread_top) self.ai.thread_top = self.ai.thread_cursor;
+        if (self.ai.thread_cursor >= self.ai.thread_top + avail) {
+            self.ai.thread_top = self.ai.thread_cursor - avail + 1;
+        }
+    } else self.ai.thread_top = 0;
+
+    var k: usize = 0;
+    while (k < avail) : (k += 1) {
+        const idx = self.ai.thread_top + k;
+        if (idx >= n) break;
+        const thread = &self.ai.threads.items.items[idx];
+        const row = list_top + @as(u32, @intCast(k));
+        const selected = idx == self.ai.thread_cursor;
+        const bg: vaxis.Color = if (selected) .{ .rgb = self.theme.bg_sel } else base_bg;
+        const label = thread.statusLabel();
+        const label_cells: u32 = @intCast(buffer.utf8.displayWidth(label));
+        var title_budget: u32 = usable -| 2; // dot + space
+        var show_status = false;
+        if (label_cells + 1 < title_budget) {
+            title_budget -= label_cells + 1;
+            show_status = true;
+        }
+        const title = buffer.utf8.truncateWidth(thread.title, title_budget);
+        const title_cells: u32 = @intCast(buffer.utf8.displayWidth(title));
+        const dot_color = switch (thread.status) {
+            .idle => self.theme.fg_faint,
+            .streaming => self.theme.accent,
+            .cancelled => self.theme.fg_dim,
+            .err => self.theme.diag_error,
+        };
+        const attached = idx == self.ai.threads.active;
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        // ASCII marker (`>` attached, `o` otherwise): no tofu-prone glyph,
+        // and the attached row stays distinct in monochrome via bold.
+        try segs.append(a, .{
+            .text = if (attached) ">" else "o",
+            .style = .{
+                .fg = .{ .rgb = if (attached) self.theme.accent else dot_color },
+                .bg = bg,
+                .bold = attached,
+            },
+        });
+        try segs.append(a, .{ .text = " ", .style = .{ .bg = bg } });
+        try segs.append(a, .{
+            .text = title,
+            .style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = bg, .bold = attached },
+        });
+        var filled: u32 = 2 + title_cells;
+        if (show_status) {
+            const pad = usable -| filled -| label_cells;
+            if (pad > 0) {
+                const spaces = try a.alloc(u8, pad);
+                @memset(spaces, ' ');
+                try segs.append(a, .{ .text = spaces, .style = .{ .bg = bg } });
+                filled += pad;
+            }
+            try segs.append(a, .{ .text = label, .style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = bg } });
+            filled += label_cells;
+        }
+        if (filled < usable) {
+            const spaces = try a.alloc(u8, usable - filled);
+            @memset(spaces, ' ');
+            try segs.append(a, .{ .text = spaces, .style = .{ .bg = bg } });
+        }
+        _ = win.print(segs.items, .{ .row_offset = @intCast(row), .col_offset = @intCast(inner_left), .wrap = .none });
+        if (self.mouseTargetsCollecting()) {
+            self.addHintTarget(.{
+                .row = row,
+                .col = inner_left,
+                .width = usable,
+                .height = 1,
+            }, .{ .agent_thread_select = idx });
+        }
     }
 }
 
@@ -2139,6 +2721,206 @@ pub fn drawRichPopup(
     }
 }
 
+/// Bottom chrome: a solid status band with a horizontal rule on its first
+/// row. Reserving two rows (`App.status_row_count`) keeps every editor and
+/// rail cell above the band; the rule gives the status text a hard boundary
+/// from the document instead of blending into it.
+pub fn drawStatusChrome(self: *App, win: vaxis.Window) void {
+    const rows: u32 = win.height;
+    if (rows <= status_row_count) return;
+    const rule_row = rows - status_row_count;
+    const bg = vaxis.Color{ .rgb = self.theme.bg_status };
+    const band = win.child(.{
+        .x_off = 0,
+        .y_off = @intCast(rule_row),
+        .width = @intCast(win.width),
+        .height = @intCast(status_row_count),
+    });
+    band.fill(.{ .style = .{ .bg = bg } });
+    // The top rule is the strongest horizontal chrome boundary above the
+    // status text: full secondary accent, not the old fixed gray.
+    const rule_style = chrome.separatorStyle(self.theme, .major, bg);
+    var col: u32 = 0;
+    while (col < win.width) : (col += 1) {
+        win.writeCell(@intCast(col), @intCast(rule_row), .{
+            .char = .{ .grapheme = "─", .width = 1 },
+            .style = rule_style,
+        });
+    }
+}
+
+/// Fill one strip row span with the strip's flat background. The buffer
+/// strip is a distinct chrome band (demo `.buffer-bar`), so every cell in
+/// its rows owns a background even where there is no tab.
+fn fillStripRow(win: vaxis.Window, row: u32, col: u32, width: u32, bg: vaxis.Color) void {
+    if (width == 0) return;
+    const child = win.child(.{
+        .x_off = @intCast(col),
+        .y_off = @intCast(row),
+        .width = @intCast(width),
+        .height = 1,
+    });
+    child.fill(.{ .style = .{ .bg = bg } });
+}
+
+const BufferTabKind = enum { plain, diff, note };
+
+fn bufferTabKind(self: *App, buf: *const Buffer) BufferTabKind {
+    const path = buf.path orelse return .plain;
+    if (self.notesIsPath(path)) return .note;
+    const ext = std.fs.path.extension(path);
+    if (std.ascii.eqlIgnoreCase(ext, ".diff") or
+        std.ascii.eqlIgnoreCase(ext, ".patch"))
+    {
+        return .diff;
+    }
+    return .plain;
+}
+
+/// Draw one planned tab strip (a single-window strip or one pane's tabs on
+/// its split layer) and the active-tab underline segment on the shared rule
+/// row. `origin` is the screen column of plan x=0; `buf_map` maps a plan
+/// slot's spec index back to a buffer index. All geometry comes from the
+/// pure `tabstrip.plan`, so the close target and underline cannot drift from
+/// the drawn label.
+pub fn drawBufferTabPlan(
+    self: *App,
+    a: std.mem.Allocator,
+    win: vaxis.Window,
+    label_row: u32,
+    rule_row: u32,
+    origin: u32,
+    p: tabstrip.Plan,
+    buf_map: []const usize,
+) !void {
+    const t = self.theme;
+    const strip_bg = vaxis.Color{ .rgb = t.bg_status };
+    const active_underline = vaxis.Style{
+        .fg = .{ .rgb = t.accent_alt },
+        .bg = strip_bg,
+        .bold = true,
+    };
+    const dashboard = self.isDashboard();
+    var i: usize = 0;
+    while (i < p.count) : (i += 1) {
+        const slot = p.slots[i];
+        const buf_idx = buf_map[slot.index];
+        if (buf_idx >= self.buffers.items.len) continue;
+        const buf = &self.buffers.items[buf_idx];
+        const tab_x = origin + slot.x;
+        const body_bg: vaxis.Color = if (slot.active)
+            .{ .rgb = t.bg_sel }
+        else
+            strip_bg;
+        fillStripRow(win, label_row, tab_x, slot.width, body_bg);
+        if (!slot.first_visible and slot.x > 0) {
+            win.writeCell(@intCast(tab_x - 1), @intCast(label_row), .{
+                .char = .{ .grapheme = "│", .width = 1 },
+                .style = chrome.separatorStyle(t, .minor, strip_bg),
+            });
+        }
+        const icon = icons.forPath(if (buf.path) |path| path else "", false);
+        const icon_style: vaxis.Style = if (slot.active)
+            chrome.activeTabMarkerStyle(t)
+        else
+            .{
+                .fg = .{ .rgb = icons.rgbOf(t, icon.color) },
+                .bg = strip_bg,
+            };
+        if (slot.width > tabstrip.pad_left) {
+            win.writeCell(@intCast(tab_x + tabstrip.pad_left), @intCast(label_row), .{
+                .char = .{ .grapheme = icon.glyph, .width = 1 },
+                .style = icon_style,
+            });
+        }
+        const name = if (buf.path) |path| std.fs.path.basename(path) else "[No Name]";
+        var kind_fg = t.fg_dim;
+        switch (bufferTabKind(self, buf)) {
+            .plain => {},
+            .diff => kind_fg = t.constant,
+            .note => kind_fg = t.type,
+        }
+        const name_style: vaxis.Style = if (slot.active)
+            chrome.activeTabStyle(t)
+        else
+            .{ .fg = .{ .rgb = kind_fg }, .bg = strip_bg };
+        if (slot.name_alloc > 0) {
+            var text = name;
+            if (slot.truncated) {
+                // Middle truncation: readable prefix + `…` + extension.
+                // `cellFitSuffix` is grapheme-aligned, so the suffix never
+                // splits a wide glyph; the loop shrinks it only if the
+                // prefix/suffix would overlap in the original name.
+                const split = tabstrip.nameSplit(slot.name_alloc);
+                const pref = autil.cellFitPrefix(win, name, split.prefix);
+                var suffix_cells = split.suffix;
+                var suf = autil.cellFitSuffix(win, name, suffix_cells);
+                while (suffix_cells > 0 and pref.slice.len + suf.slice.len > name.len) {
+                    suffix_cells -= 1;
+                    suf = autil.cellFitSuffix(win, name, suffix_cells);
+                }
+                text = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ pref.slice, tabstrip.ellipsis, suf.slice });
+            }
+            if (text.len > 0) {
+                const seg = [_]vaxis.Segment{.{ .text = text, .style = name_style }};
+                _ = win.print(&seg, .{
+                    .row_offset = @intCast(label_row),
+                    .col_offset = @intCast(origin + slot.name_x),
+                    .wrap = .none,
+                });
+            }
+        }
+        if (slot.dirty and slot.name_alloc > 0) {
+            win.writeCell(@intCast(origin + slot.name_x + slot.name_alloc), @intCast(label_row), .{
+                .char = .{ .grapheme = "●", .width = 1 },
+                .style = .{ .fg = .{ .rgb = t.constant }, .bg = body_bg },
+            });
+        }
+        if (slot.closeable) {
+            win.writeCell(@intCast(origin + slot.close_x), @intCast(label_row), .{
+                .char = .{ .grapheme = "×", .width = 1 },
+                .style = .{
+                    .fg = .{ .rgb = if (slot.active) t.fg_dim else t.fg_faint },
+                    .bg = body_bg,
+                },
+            });
+        }
+        if (self.mouseTargetsCollecting()) {
+            // The select target starts at the icon so the hint label covers
+            // the tab's identity, not its two-cell left padding. The close
+            // cell is its own target, wired to the SAME close-buffer path as
+            // the keyboard commands.
+            if (!dashboard and slot.width > tabstrip.pad_left) {
+                self.addHintTarget(.{
+                    .row = label_row,
+                    .col = tab_x + tabstrip.pad_left,
+                    .width = slot.width -| tabstrip.pad_left,
+                    .height = 1,
+                }, .{ .buffer_select = buf_idx });
+            }
+            if (slot.closeable) {
+                self.addHintTarget(.{
+                    .row = label_row,
+                    .col = origin + slot.close_x,
+                    .width = tabstrip.close_cells,
+                    .height = 1,
+                }, .{ .buffer_close = buf_idx });
+            }
+        }
+        if (slot.active and rule_row < self.vx.window().height) {
+            // Demo `inset 0 1px 0 blue`: a bright accent segment on the
+            // shared bottom rule, spanning the full active tab width.
+            var x: u32 = 0;
+            while (x < slot.width) : (x += 1) {
+                win.writeCell(@intCast(tab_x + x), @intCast(rule_row), .{
+                    .char = .{ .grapheme = "─", .width = 1 },
+                    .style = active_underline,
+                });
+            }
+        }
+    }
+}
+
 pub fn render(self: *App) !void {
     // vaxis cells reference the text slices passed to print, so all text
     // must stay alive until vx.render(); a per-frame arena handles that.
@@ -2160,9 +2942,24 @@ pub fn render(self: *App) !void {
     win.fill(.{ .style = .{ .bg = .{ .rgb = self.theme.bg } } });
 
     const height: u32 = win.height;
+    // feat/mouse: reset the hit-test target list for this frame. Cheap (one
+    // branch) unless mouse reporting is enabled; the same registrations that
+    // feed hint labels also feed hit-testing on mouse frames.
+    self.beginMouseFrame(height, win.width);
     if (height <= status_row_count) return;
-    // Content area rows: below the tab bar, above the status bar.
-    const content_rows = height - status_row_count - self.tabBarRows(a);
+    // One timestamp for every animated element this frame (streaming dots,
+    // tool spinners, badge flash). Idle frames compute it but draw nothing
+    // time-dependent.
+    self.frame_now_ms = self.nowMs();
+    // M2.6a hints: clear this frame's target list. One boolean test per
+    // frame outside hint mode; normal frames never touch the fixed array.
+    self.hints.beginFrame(height, win.width);
+    // Content area rows: below the two-row buffer strip, above the status
+    // band. The strip's rows are real layout rows, so the cursor/viewport
+    // math below can never paint into them.
+    const bar_rows = self.tabBarRows(a);
+    const content_top = bar_rows;
+    const content_rows = height - status_row_count - bar_rows;
 
     // Clamp the focused window's cursor/viewport BEFORE any lineOf /
     // column math below: switching windows or buffers can leave a stale
@@ -2179,145 +2976,134 @@ pub fn render(self: *App) !void {
     // cursor offset, mc highlight and easymotion labels
     const gutter = self.gutterWidth(line_count);
 
-    // tab bar. Single window: one entry per buffer, current highlighted,
-    // + dirty marker — solid blocks separated by a 1-cell base-bg gap.
-    // Split windows: each buffer's tab appears EXACTLY ONCE, in the pane
-    // that last showed it (last_win) — a buffer displayed in a pane
-    // belongs to that pane, a buffer hidden from every pane keeps its
-    // tab in the pane it was last in. The pane's OWN buffer carries the
-    // active style, so a buffer moving panes (<leader>bh/bl) is visible
-    // on the tab bar.
-    if (self.windows.items.len <= 1) {
-        var tab_i: usize = 0;
-        // the tab bar belongs to the BUFFER area: with the file tree
-        // open it starts at the content column (right of the sidebar),
-        // not glued above the tree at x=0
-        var col: u16 = @intCast(self.contentCol());
-        while (tab_i < self.buffers.items.len) : (tab_i += 1) {
-            const buf = &self.buffers.items[tab_i];
-            const name = if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
-            const dirty = if (buf.dirty) "\u{25cf}" else " ";
-            const label = try std.fmt.allocPrint(a, " {s}{s} ", .{ name, dirty });
-            const tab_style: vaxis.Style = if (tab_i == self.current)
-                // bg_status, NOT bg_sel: tests (and the eye) read bg_sel
-                // as an editor selection — the tab bar must not emit it
-                .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_status }, .bold = true }
-            else
-                .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
-            // file icon in the tab's own semantic color (devicons style);
-            // the name keeps the plain tab style
-            const icon = icons.forPath(if (buf.path) |p| p else "", false);
-            const icon_style: vaxis.Style = .{
-                .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) },
-                .bg = tab_style.bg,
-                .bold = (tab_i == self.current),
-            };
-            const segs = [_]vaxis.Segment{
-                .{ .text = icon.glyph, .style = icon_style },
-                .{ .text = label, .style = tab_style },
-                .{ .text = " ", .style = .{ .bg = .{ .rgb = self.theme.bg } } },
-            };
-            _ = win.print(&segs, .{ .row_offset = 0, .col_offset = col, .wrap = .none });
-            col +|= @intCast(1 + label.len + 1);
-            if (col >= win.width) break;
+    // ---- two-row buffer strip (DESIGN §18.11) ----
+    // Row 0..layers-1: labels (one row per pane-column layer). The last row
+    // is a shared full-width rule with the active tab's accent inset
+    // segment. Panes whose column spans overlap keep their own layer; a
+    // vertical split shares one label row, so the strip does not waste rows.
+    const strip_col = self.contentCol();
+    const strip_right = self.aiEditorWidth();
+    const strip_w = strip_right -| strip_col;
+    const strip_bg = vaxis.Color{ .rgb = self.theme.bg_status };
+    const label_rows = bar_rows - 1; // shared rule row = last strip row
+    const rule_row = bar_rows - 1;
+    if (strip_w > 0) {
+        var label_r: u32 = 0;
+        while (label_r < label_rows and label_r < height) : (label_r += 1) {
+            fillStripRow(win, label_r, strip_col, strip_w, strip_bg);
         }
-    } else if (self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), win.width)) |tab_layout| {
-        // each buffer's tab appears EXACTLY ONCE, owned by the pane that
-        // displays it (the focused pane wins when several panes show the
-        // same buffer); a buffer hidden from every pane keeps its tab in
-        // the pane that last showed it. Panes whose column spans overlap
-        // (horizontal splits) draw on separate tab-bar rows so tabs never
-        // overwrite each other; within a row, tabs stream left to right
-        // from each pane's column, borrowing space to the right when a
-        // pane is too narrow to fit its tabs (labels clip only at the
-        // row's right edge). The pane's displayed buffer carries the
-        // active style, so <leader>bh/bl visibly moves the tab.
-        const leaves = tab_layout.leaves;
-        const pane_layer = a.alloc(u32, leaves.len) catch return;
-        var order: std.ArrayList(usize) = .empty;
-        for (0..leaves.len) |i| order.append(a, i) catch return;
-        std.mem.sort(usize, order.items, TabSort{ .leaves = leaves }, TabSort.lt);
-        var layer_end: std.ArrayList(u32) = .empty;
-        var layers: u32 = 0;
-        for (order.items) |oi| {
-            const lr = leaves[oi];
-            var lli: usize = 0;
-            while (lli < layers and layer_end.items[lli] > lr.col) lli += 1;
-            if (lli == layers) {
-                layer_end.append(a, lr.col + lr.width) catch return;
-                layers += 1;
-            } else {
-                layer_end.items[lli] = lr.col + lr.width;
+        if (rule_row < height) {
+            fillStripRow(win, rule_row, strip_col, strip_w, strip_bg);
+            var rc: u32 = 0;
+            while (rc < strip_w) : (rc += 1) {
+                win.writeCell(@intCast(strip_col + rc), @intCast(rule_row), .{
+                    .char = .{ .grapheme = "─", .width = 1 },
+                    .style = .{
+                        .fg = .{ .rgb = self.theme.win_sep },
+                        .bg = strip_bg,
+                        .dim = true,
+                    },
+                });
             }
-            pane_layer[oi] = @intCast(lli);
         }
-        var lli: u32 = 0;
-        while (lli < layers) : (lli += 1) {
-            // right edge of the layer's widest span: tabs clip here
-            var right: u32 = 0;
-            for (order.items) |oi| {
-                if (pane_layer[oi] == lli) right = @max(right, leaves[oi].col + leaves[oi].width);
+        // Scratch maps reused by every pane; the spec array is frame-arena
+        // storage (the vaxis cells reference the printed labels until render).
+        const tab_specs = try a.alloc(tabstrip.Spec, self.buffers.items.len);
+        const tab_bufs = try a.alloc(usize, self.buffers.items.len);
+        if (self.windows.items.len <= 1) {
+            var n: usize = 0;
+            for (self.buffers.items, 0..) |*buf, bi| {
+                const name = if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
+                tab_specs[n] = .{
+                    .name_cells = @intCast(autil.cellWidth(win, name)),
+                    .dirty = buf.dirty,
+                    .active = bi == self.current,
+                    .closeable = self.buffers.items.len > 1,
+                };
+                tab_bufs[n] = bi;
+                n += 1;
             }
-            var pos: u32 = 0;
+            const p = tabstrip.plan(tab_specs[0..n], strip_w);
+            try self.drawBufferTabPlan(a, win, 0, rule_row, strip_col, p, tab_bufs[0..n]);
+        } else if (self.layoutWindows(a, content_top, content_rows, strip_col, strip_w)) |tab_layout| {
+            // Each buffer's tab appears EXACTLY ONCE, owned by the pane that
+            // displays it (the focused pane wins when several panes show the
+            // same buffer); a buffer hidden from every pane keeps its tab in
+            // the pane that last showed it. Panes whose column spans overlap
+            // (horizontal splits) draw on separate label rows; within a row,
+            // tabs stream left to right and each pane's active tab is kept
+            // fully visible by tabstrip.plan.
+            const leaves = tab_layout.leaves;
+            const pane_layer = a.alloc(u32, leaves.len) catch return;
+            var order: std.ArrayList(usize) = .empty;
+            for (0..leaves.len) |i| order.append(a, i) catch return;
+            std.mem.sort(usize, order.items, TabSort{ .leaves = leaves }, TabSort.lt);
+            var layer_end: std.ArrayList(u32) = .empty;
+            var layers: u32 = 0;
             for (order.items) |oi| {
-                if (pane_layer[oi] != lli) continue;
                 const lr = leaves[oi];
-                // start at the pane's own column, or right after the
-                // previous pane's tabs when they overflow this span
-                pos = @max(pos, lr.col);
-                const own = self.windows.items[lr.win].buf;
-                var tab_i: usize = 0;
-                var col = pos;
-                while (tab_i < self.buffers.items.len) : (tab_i += 1) {
-                    // owner: the pane showing the buffer (the focused
-                    // pane wins when several panes show it); a hidden
-                    // buffer keeps the pane that last showed it
-                    var owner: usize = self.buffers.items[tab_i].last_win;
-                    if (owner >= self.windows.items.len) owner = self.windows.items.len - 1;
-                    // last_win is only a hint for buffers hidden from every
-                    // pane: a buffer that IS displayed belongs to a pane that
-                    // displays it. Without this, a buffer visible only in the
-                    // right pane kept its tab on the left if last_win still
-                    // pointed there (the split tab-bar race).
-                    for (self.windows.items, 0..) |w, wi| {
-                        if (w.buf == tab_i) {
-                            owner = wi;
-                            break;
-                        }
-                    }
-                    if (self.windows.items[self.current_win].buf == tab_i) owner = self.current_win;
-                    if (owner != lr.win) continue;
-                    const buf = &self.buffers.items[tab_i];
-                    const name = if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
-                    const dirty = if (buf.dirty) "\u{25cf}" else " ";
-                    const label = try std.fmt.allocPrint(a, " {s}{s} ", .{ name, dirty });
-                    const active = tab_i == own;
-                    const tab_style: vaxis.Style = if (active)
-                        .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_status }, .bold = true }
-                    else
-                        .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
-                    const icon = icons.forPath(if (buf.path) |p| p else "", false);
-                    const icon_style: vaxis.Style = .{
-                        .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) },
-                        .bg = tab_style.bg,
-                        .bold = active,
-                    };
-                    // clip only at the row's right edge: tabs may borrow
-                    // space right of their own (too narrow) pane span
-                    const fit = autil.cellFitPrefix(win, label, right -| col -| 1);
-                    if (fit.cells == 0) break;
-                    const segs = [_]vaxis.Segment{
-                        .{ .text = icon.glyph, .style = icon_style },
-                        .{ .text = fit.slice, .style = tab_style },
-                    };
-                    _ = win.print(&segs, .{ .row_offset = @intCast(lli), .col_offset = @intCast(col), .wrap = .none });
-                    col += @intCast(1 + fit.cells + 1); // icon + label + gap
-                    if (col >= right) break;
+                var lli: usize = 0;
+                while (lli < layers and layer_end.items[lli] > lr.col) lli += 1;
+                if (lli == layers) {
+                    layer_end.append(a, lr.col + lr.width) catch return;
+                    layers += 1;
+                } else {
+                    layer_end.items[lli] = lr.col + lr.width;
                 }
-                pos = col;
+                pane_layer[oi] = @intCast(lli);
             }
-        }
-    } else |_| {}
+            const draw_layers = @min(layers, label_rows);
+            var lli: u32 = 0;
+            while (lli < draw_layers) : (lli += 1) {
+                fillStripRow(win, lli, strip_col, strip_w, strip_bg);
+                // right edge of the layer's widest span: tabs clip here
+                var right: u32 = 0;
+                for (order.items) |oi| {
+                    if (pane_layer[oi] == lli) right = @max(right, leaves[oi].col + leaves[oi].width);
+                }
+                var pos: u32 = 0;
+                for (order.items) |oi| {
+                    if (pane_layer[oi] != lli) continue;
+                    const lr = leaves[oi];
+                    // start at the pane's own column, or right after the
+                    // previous pane's tabs when they overflow this span
+                    pos = @max(pos, lr.col);
+                    const own = self.windows.items[lr.win].buf;
+                    var n: usize = 0;
+                    var tab_i: usize = 0;
+                    while (tab_i < self.buffers.items.len) : (tab_i += 1) {
+                        // owner: the pane showing the buffer (the focused
+                        // pane wins when several panes show it); a hidden
+                        // buffer keeps the pane that last showed it
+                        var owner: usize = self.buffers.items[tab_i].last_win;
+                        if (owner >= self.windows.items.len) owner = self.windows.items.len - 1;
+                        for (self.windows.items, 0..) |w, wi| {
+                            if (w.buf == tab_i) {
+                                owner = wi;
+                                break;
+                            }
+                        }
+                        if (self.windows.items[self.current_win].buf == tab_i) owner = self.current_win;
+                        if (owner != lr.win) continue;
+                        const buf = &self.buffers.items[tab_i];
+                        const name = if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
+                        tab_specs[n] = .{
+                            .name_cells = @intCast(autil.cellWidth(win, name)),
+                            .dirty = buf.dirty,
+                            .active = tab_i == own,
+                            .closeable = self.buffers.items.len > 1,
+                        };
+                        tab_bufs[n] = tab_i;
+                        n += 1;
+                    }
+                    const avail = right -| pos;
+                    const p = tabstrip.plan(tab_specs[0..n], avail);
+                    try self.drawBufferTabPlan(a, win, lli, rule_row, pos, p, tab_bufs[0..n]);
+                    pos += p.used;
+                }
+            }
+        } else |_| {}
+    }
 
     // dashboard (no file open): snacks.nvim style — a big ASCII logo, a
     // subtitle, a centered key menu, then the recent-files list (j/k/Enter).
@@ -2329,7 +3115,7 @@ pub fn render(self: *App) !void {
         const label_style: vaxis.Style = .{ .fg = .{ .rgb = t.fg } };
         // content area between the sidebar and the right edge
         const area_col: u32 = self.contentCol();
-        const area_w: u32 = win.width -| area_col;
+        const area_w: u32 = self.aiEditorWidth() -| area_col;
         // horizontal centering helper: the column that centers a `width`-cell
         // block inside the content area (never negative)
         const centerCol = struct {
@@ -2430,8 +3216,21 @@ pub fn render(self: *App) !void {
         // the dashboard returns before the window loop, so the file tree
         // (rendered after that loop) would never draw over it — draw it
         // here too, or <leader>e on the dashboard shows a stale screen
-        if (self.filetree_active) try renderFiletree(self, a, win, height);
+        if (self.filetree_active) try renderNavigator(self, a, win, height);
         if (term.supported) try self.drawTerm(a, win);
+        // <leader>a works on the dashboard too: draw the rail last (it
+        // places the cursor only when the rail/prompt owns focus; otherwise
+        // the dashboard's recent-row cursor stays visible).
+        if (self.ai.rail_open) try self.drawAiRail(a, win);
+        // M2b2 inline prompt floats above the rail; hint labels remain the
+        // topmost overlay below.
+        if (self.inlinePromptOpen()) try self.drawInlinePrompt(a, win);
+        // The dashboard has no status text, but the same bottom rule keeps
+        // its content from running into the terminal edge.
+        self.drawStatusChrome(win);
+        // M2.6a: labels + status indicator are the topmost layer, and must be
+        // drawn after rail/filetree/dashboard before the frame is flushed.
+        try self.drawHintOverlay(a, win);
         hideInactiveMarkdownImages(self);
         try self.vx.render(self.tty.writer());
         return;
@@ -2439,7 +3238,7 @@ pub fn render(self: *App) !void {
 
     // split windows: every leaf gets a rectangle and renders its buffer;
     // the focused window carries syntax highlighting and the selection
-    const layout = try self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), win.width);
+    const layout = try self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), self.editorAreaWidth());
     const leaves = layout.leaves;
     var cur_rect: LeafRect = .{ .win = self.current_win, .row = 0, .col = 0, .height = 0, .width = 0 };
     for (leaves) |lr| {
@@ -2447,8 +3246,13 @@ pub fn render(self: *App) !void {
             cur_rect = lr;
             continue;
         }
+        // Mouse-only: each split leaf is clickable (focus + cursor
+        // placement) and scrollable. Registered from the SAME layout rect
+        // the pane draws into, so hit geometry cannot drift.
+        self.addMousePaneTarget(lr.win, lr.row, lr.col, lr.height, lr.width);
         try self.renderWindowLines(a, lr, false);
     }
+    self.addMousePaneTarget(cur_rect.win, cur_rect.row, cur_rect.col, cur_rect.height, cur_rect.width);
     try self.renderWindowLines(a, cur_rect, true);
     hideInactiveMarkdownImages(self);
 
@@ -2460,6 +3264,9 @@ pub fn render(self: *App) !void {
     // are dim. The bg is the editor background so the line fully hides
     // whatever buffer text it covers — no ghosting from the window below.
     for (layout.seps) |sep| {
+        // A separator click is an explicit v1 no-op (no resize); its
+        // 1-cell-thick rect wins over the adjacent pane by area.
+        self.addMouseSeparatorTarget(sep.row, sep.col, sep.len, sep.horizontal);
         const sep_style: vaxis.Style = .{
             .fg = .{ .rgb = if (sep.active) self.theme.win_sep_active else self.theme.win_sep },
             .bg = .{ .rgb = self.theme.bg },
@@ -2486,7 +3293,7 @@ pub fn render(self: *App) !void {
     // file tree sidebar (nvim neo-tree style: the panel shares the
     // EDITOR background — Normal bg, not a float — so sidebar and text
     // area read as one surface; only the fg_faint border separates them)
-    if (self.filetree_active) try renderFiletree(self, a, win, height);
+    if (self.filetree_active) try renderNavigator(self, a, win, height);
 
     // multi-cursor word highlights (overlay)
     if (self.mc_active) {
@@ -2539,6 +3346,15 @@ pub fn render(self: *App) !void {
     // embedded terminal overlay: drawn after the panes so it covers
     // them; the modal overlays below float above it
     if (term.supported) try self.drawTerm(a, win);
+
+    // Agent Rail / drawer (M2a): drawn after the editor panes and terminal
+    // so it covers exactly its reserved cells. Pickers/hovers below are
+    // genuine modal overlays and may draw above it.
+    if (self.ai.rail_open) try self.drawAiRail(a, win);
+
+    // Inline edit prompt (M2b2): a compact centered float above the rail and
+    // editor, below the hint overlay. It owns a beam cursor while open.
+    if (self.inlinePromptOpen()) try self.drawInlinePrompt(a, win);
 
     // fuzzy picker overlay (telescope/snacks style: a solid bg_float
     // floating window with a border, a title and an in-panel input row,
@@ -2882,6 +3698,7 @@ pub fn render(self: *App) !void {
 
     // status bar (or command line in command mode)
     if (self.state.mode == .command) {
+        self.drawStatusChrome(win);
         const prompt_char: []const u8 = switch (self.cmdline_kind) {
             .ex => ":",
             .search_fwd => "/",
@@ -3321,10 +4138,20 @@ pub fn render(self: *App) !void {
                     }
                     // the ghost must stay inside THIS pane: win.width is
                     // the whole screen, and a split's neighbor owns the
-                    // columns past the pane's right edge
+                    // columns past the pane's right edge. With the Agent
+                    // Rail open (docked OR drawer) the ghost is also clipped
+                    // one cell before the rail border, so a long blame never
+                    // touches/enters the agent column and a one-cell gap
+                    // keeps the rail's left rule readable.
                     const pane_end = cur_rect.col + cur_rect.width;
-                    if (b_sp.row < cur_rect.height and start_col < pane_end) {
-                        const fit = autil.cellFitPrefix(win, label, pane_end - start_col);
+                    var ghost_end = pane_end;
+                    if (self.ai.rail_open) {
+                        const lay = self.aiLayout();
+                        const rail_limit = lay.rail_col -| lay.rail_gutter;
+                        if (rail_limit < ghost_end) ghost_end = rail_limit;
+                    }
+                    if (b_sp.row < cur_rect.height and start_col < ghost_end) {
+                        const fit = autil.cellFitPrefix(win, label, ghost_end - start_col);
                         if (fit.cells > 0) {
                             const seg = [_]vaxis.Segment{.{
                                 .text = fit.slice,
@@ -3363,14 +4190,28 @@ pub fn render(self: *App) !void {
         }
     }
 
-    const mode_str = switch (self.state.mode) {
-        .normal => " NORMAL ",
-        .insert => " INSERT ",
-        .visual_char, .visual_line, .visual_block => " VISUAL ",
-        .command => " COMMAND ",
+    // The status band is painted after every document overlay so its rule is
+    // the visible boundary above the status text (pickers that return early
+    // have their own modal chrome).
+    self.drawStatusChrome(win);
+    const mode_name = switch (self.state.mode) {
+        .normal => "NORMAL",
+        .insert => "INSERT",
+        .visual_char, .visual_line, .visual_block => "VISUAL",
+        .command => "COMMAND",
     };
+    var mode_buf: [16]u8 = undefined;
+    const mode_badge = std.fmt.bufPrint(&mode_buf, "[{s}]", .{mode_name}) catch mode_name;
     const status_col = self.screenCellCol(win, cursor_line, self.curCursor().*);
     const ws_name = self.curWsName();
+    var ws_buf: [256]u8 = undefined;
+    const ws_label = std.fmt.bufPrint(&ws_buf, "[{s}]", .{ws_name}) catch ws_name;
+    var cursor_buf: [96]u8 = undefined;
+    const cursor_text = std.fmt.bufPrint(
+        &cursor_buf,
+        "line {d}/{d} col {d}",
+        .{ cursor_line + 1, line_count, status_col },
+    ) catch "line ?";
     // vim-style macro recording indicator: "recording @x" while q is live
     // (the transient message set at q{reg} vanishes on the next keystroke;
     // this one persists for the whole recording).
@@ -3382,37 +4223,108 @@ pub fn render(self: *App) !void {
     // build.zig while its build_runner analyses the project) — show "…"
     // so a slow response isn't mistaken for a dead completion that
     // silently turns the next Enter into a newline.
-    const status = if (self.completion_slot != null)
-        try std.fmt.allocPrint(
-            a,
-            "[{s}] {s} line {d}/{d} col {d}  …{s}",
-            .{ ws_name, mode_str, cursor_line + 1, line_count, status_col, rec },
-        )
-    else if (self.msg) |m|
-        try std.fmt.allocPrint(
-            a,
-            "[{s}] {s} line {d}/{d} col {d}  {s}{s}",
-            .{ ws_name, mode_str, cursor_line + 1, line_count, status_col, m, rec },
-        )
-    else
-        try std.fmt.allocPrint(
-            a,
-            "[{s}] {s} line {d}/{d} col {d}{s}",
-            .{ ws_name, mode_str, cursor_line + 1, line_count, status_col, rec },
-        );
-    const status_seg = [_]vaxis.Segment{.{
-        .text = status,
-        .style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_status } },
-    }};
-    _ = win.print(&status_seg, .{ .row_offset = @intCast(height - 1), .wrap = .none });
-    // git branch (M3a): "  ⎇ main" right after the mode/message text, in
-    // the accent color — the design's StatusLine git component.
+    const completion_marker: []const u8 = if (self.completion_slot != null) "  …" else "";
+
+    const status_bg = vaxis.Color{ .rgb = self.theme.bg_status };
+    const status_fg: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = status_bg };
+    const status_dim: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = status_bg };
+    const status_sep = chrome.separatorStyle(self.theme, .minor, status_bg);
+    const status_accent: vaxis.Style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = status_bg };
+    const status_badge: vaxis.Style = .{
+        .fg = .{ .rgb = self.theme.bg },
+        .bg = .{ .rgb = self.theme.accent },
+        .bold = true,
+    };
+    const status_row: u32 = height - 1;
+    var used_cells: u32 = 0;
+    const printStatus = struct {
+        fn one(win_: vaxis.Window, text: []const u8, style: vaxis.Style, row: u32, col: *u32) void {
+            const seg = [_]vaxis.Segment{.{ .text = text, .style = style }};
+            _ = win_.print(&seg, .{ .row_offset = @intCast(row), .col_offset = @intCast(col.*), .wrap = .none });
+            col.* += @intCast(autil.cellWidth(win_, text));
+        }
+    }.one;
+    // Sections: workspace │ mode badge │ file/cursor │ git branch. `│`
+    // separators are drawn in every state so the row reads as a status line,
+    // not as the document's last line.
+    printStatus(win, ws_label, status_fg, status_row, &used_cells);
+    printStatus(win, " │ ", status_sep, status_row, &used_cells);
+    printStatus(win, mode_badge, status_badge, status_row, &used_cells);
+    printStatus(win, " │ ", status_sep, status_row, &used_cells);
+    printStatus(win, cursor_text, status_fg, status_row, &used_cells);
+    if (completion_marker.len > 0) printStatus(win, completion_marker, status_fg, status_row, &used_cells);
+    if (self.msg) |m| {
+        printStatus(win, "  ", status_fg, status_row, &used_cells);
+        printStatus(win, m, status_fg, status_row, &used_cells);
+    }
+    if (rec.len > 0) printStatus(win, rec, status_fg, status_row, &used_cells);
+    // git branch (M3a): the design's StatusLine git section, after a
+    // separator so it never merges with a long status message.
     if (self.git_branch) |b| {
-        const branch_seg = [_]vaxis.Segment{.{
-            .text = try std.fmt.allocPrint(a, "  ⎇ {s}", .{std.mem.trim(u8, b, " \t\r\n")}),
-            .style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_status } },
-        }};
-        _ = win.print(&branch_seg, .{ .row_offset = @intCast(height - 1), .col_offset = @intCast(status.len), .wrap = .none });
+        printStatus(win, " │ ", status_sep, status_row, &used_cells);
+        printStatus(win, "⎇ ", status_accent, status_row, &used_cells);
+        printStatus(win, std.mem.trim(u8, b, " \t\r\n"), status_accent, status_row, &used_cells);
+    }
+
+    // AI workspace status (M2a): active thread · model · status, flush right
+    // on the status bar, followed by an explicit dock/drawer layout cell.
+    // Hint mode owns that slot (HINTS · N targets · Esc cancel) and
+    // suppresses both so the indicators never share cells.
+    if (!self.hints.active) {
+        const layout_text: ?[]const u8 = if (self.ai.rail_open)
+            (if (self.aiLayout().mode == .docked) "dock" else "drawer")
+        else
+            null;
+        const layout_cells: u32 = if (layout_text) |text| @intCast(autil.cellWidth(win, text)) else 0;
+        const layout_reserved: u32 = if (layout_text != null) layout_cells + 3 else 0;
+        const avail = win.width -| used_cells -| 2 -| layout_reserved;
+        const ai_status_text: ?[]const u8 = try self.aiStatusText(a);
+        if (ai_status_text) |full_ai_text| {
+            var ai_text = full_ai_text;
+            var ai_cells: u32 = @intCast(autil.cellWidth(win, ai_text));
+            if (ai_cells > avail) {
+                if (try self.aiStatusTextCompact(a)) |compact| {
+                    ai_text = compact;
+                    ai_cells = @intCast(autil.cellWidth(win, ai_text));
+                }
+            }
+            if (ai_cells > avail) {
+                if (try self.aiStatusTextMini(a)) |mini| {
+                    ai_text = mini;
+                    ai_cells = @intCast(autil.cellWidth(win, ai_text));
+                }
+            }
+            if (ai_cells <= avail) {
+                const ai_status = self.ai.threads.activeStatus();
+                const ai_style: vaxis.Style = .{
+                    .fg = .{ .rgb = if (ai_status == .streaming) self.theme.accent else self.theme.fg_dim },
+                    .bg = status_bg,
+                };
+                const ai_seg = [_]vaxis.Segment{.{ .text = ai_text, .style = ai_style }};
+                _ = win.print(&ai_seg, .{
+                    .row_offset = @intCast(status_row),
+                    .col_offset = @intCast(win.width - layout_reserved - ai_cells),
+                    .wrap = .none,
+                });
+            }
+        }
+        if (layout_text) |text| {
+            if (win.width >= layout_cells + 3) {
+                const sep_col = win.width - layout_cells - 3;
+                const sep_seg = [_]vaxis.Segment{.{ .text = " │ ", .style = status_sep }};
+                _ = win.print(&sep_seg, .{
+                    .row_offset = @intCast(status_row),
+                    .col_offset = @intCast(sep_col),
+                    .wrap = .none,
+                });
+                const layout_seg = [_]vaxis.Segment{.{ .text = text, .style = status_dim }};
+                _ = win.print(&layout_seg, .{
+                    .row_offset = @intCast(status_row),
+                    .col_offset = @intCast(win.width - layout_cells),
+                    .wrap = .none,
+                });
+            }
+        }
     }
 
     // terminal focused: the widget's draw() already placed the child's
@@ -3425,15 +4337,19 @@ pub fn render(self: *App) !void {
             }
         }
     }
-    // cursor position — in the file tree when the tree has focus,
-    // otherwise in the buffer
-    if (self.filetree_active and self.focus == .filetree) {
-        // Items render at contentTop()+1+k (below the "╭─ files" title
-        // row) with text starting at column 1 (after the left border) —
-        // the cursor must land on the same row/column as the highlight.
-        const sel_row: u32 = self.contentTop(a) + 1 + @as(u32, @intCast(self.filetree_sel -| self.filetree_top));
+    // cursor position — drawAiRail already placed the prompt/thread cursor
+    // when the rail or prompt owns focus; otherwise the editor cursor wins.
+    var editor_cursor_hidden = false;
+    if (self.inlinePromptOpen()) {
+        // cursor was placed by drawInlinePrompt
+    } else if (self.ai.rail_open and self.ai.focus != .editor) {
+        // rail cursor was set by drawAiRail
+    } else if (self.filetree_active and self.focus == .navigator) {
+        // The navigator's selected row depends on the active tab (tree row,
+        // note title row, or thread row); column 1 is the inner padding cell
+        // shared by all three, after the left border.
         self.vx.screen.cursor = .{
-            .row = @intCast(sel_row),
+            .row = @intCast(self.navigatorCursorRow(a)),
             .col = 1,
         };
     } else if (self.nav_list_active) {
@@ -3450,15 +4366,30 @@ pub fn render(self: *App) !void {
         // highlighted source row disagree. Columns still use byte-to-cell
         // mapping for CJK, hints and soft wrap.
         const c_sp = self.focusedScreenPos(win, cur_rect, cursor_line, self.curCursor().*);
+        const cursor_col = cur_rect.col + gutter + c_sp.col;
         const cursor_row = self.rendered_cursor_row orelse cur_rect.row + @min(c_sp.row, cur_rect.height -| 1);
+        // In drawer mode the editor keeps its full layout width but the
+        // rail floats over it. A cursor that would sit on the rail's gutter
+        // or underneath the panel is hidden rather than painted on top of
+        // the drawer chrome.
+        if (self.ai.rail_open) {
+            const lay = self.aiLayout();
+            if (lay.mode == .drawer and cursor_col >= lay.rail_col -| lay.rail_gutter) {
+                editor_cursor_hidden = true;
+            }
+        }
         self.vx.screen.cursor = .{
             .row = @intCast(@min(cursor_row, cur_rect.row + cur_rect.height -| 1)),
-            .col = @intCast(cur_rect.col + gutter + c_sp.col), // window offset + gutter
+            .col = @intCast(cursor_col),
         };
     }
-    self.vx.screen.cursor_vis = true;
+    self.vx.screen.cursor_vis = !editor_cursor_hidden;
     self.vx.screen.cursor_shape = if (self.state.mode == .insert) .beam else .block;
 
+    // M2.6a: final overlay pass — labels over every collected target and the
+    // compact hint indicator on the status bar. Drawn after everything else
+    // (editor, rail/workbox, filetree, floats) so it is topmost.
+    try self.drawHintOverlay(a, win);
     try self.vx.render(self.tty.writer());
 }
 
@@ -3493,6 +4424,20 @@ pub fn scopeAnimActive(self: *App) bool {
     return now - a.start_ms < ScopeAnim.duration_ms;
 }
 
+/// True while a short Changes-badge flash is still inside its deadline.
+/// Once this is false the run loop stops polling for it (no idle churn).
+pub fn reviewFlashActive(self: *App) bool {
+    return animation.flashActive(self.review_flash_start_ms, self.nowMs(), animation.badge_flash_ms);
+}
+
+/// True while any TUI animation needs frames: AI streaming/tool work, the
+/// inline assistant stream, or a badge flash. Scope/blame/git holds add
+/// themselves separately in the run loop. Idle editors return false, so the
+/// loop blocks in pollEvent and no timer runs.
+pub fn animationActive(self: *App) bool {
+    return self.aiStreaming() or self.inlineStreaming() or self.reviewFlashActive();
+}
+
 pub fn run(self: *App) !void {
     try self.vx.enterAltScreen(self.tty.writer());
     // Bracketed paste (DECSET 2004): the terminal wraps pasted text in
@@ -3501,6 +4446,12 @@ pub fn run(self: *App) !void {
     // newline triggers Enter's auto-indent and wrecks the indentation).
     // vx.deinit resets the mode (state.bracketed_paste check there).
     try self.vx.setBracketedPaste(self.tty.writer(), true);
+    // feat/mouse: enable SGR cell mouse reporting (button + wheel). A failure
+    // is non-fatal (keyboard-only startup); the defer guarantees cleanup on
+    // every exit path, and the explicit call before leaving the alt screen
+    // restores the terminal in the normal path.
+    self.enableMouse();
+    defer self.disableMouse();
     try self.loop.start();
     defer self.loop.stop();
     // monotonic ms of the last frame we actually drew — poll-mode
@@ -3540,6 +4491,21 @@ pub fn run(self: *App) !void {
                 git_ready = true;
             }
         }
+        // AI stream events: append deltas / settle status before the frame
+        // renders, like the LSP/git slots above. Repaint immediately so
+        // tokens appear incrementally.
+        const ai_ready = self.drainAi() catch false;
+        // Background read-only tool batches (M3a): consume finished results
+        // and start the automatic follow-up request. The worker never blocks
+        // this loop; `aiStreaming()` keeps the poll slice short while it runs.
+        const ai_tools_ready = self.drainToolJobs() catch false;
+        // M3b3 approved terminal commands: a finished background job flips
+        // the card to ok/error and resumes the model follow-up. Never blocks
+        // the frame.
+        const ai_terminal_ready = self.drainTerminal() catch false;
+        // Inline assistant stream (M2b2): dedicated client, never a chat
+        // thread. Repaint on deltas/completion/errors.
+        const inline_ready = self.drainInline() catch false;
         // A finished async LSP attach installs its client (and opens the
         // document) — render so diagnostics/inlay requests can start.
         const lsp_ready = self.finishLspStart();
@@ -3578,7 +4544,7 @@ pub fn run(self: *App) !void {
                 }
             }
         }
-        if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready or lsp_ready or term_ready) {
+        if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready or lsp_ready or term_ready or ai_ready or ai_tools_ready or ai_terminal_ready or inline_ready) {
             try self.render();
             last_render_ms = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
             continue;
@@ -3635,7 +4601,7 @@ pub fn run(self: *App) !void {
         // animation's last spread) and the loop would block forever
         // without ever drawing it. Force that one render.
         var poll_transition = false;
-        if (self.scopeAnimActive() or self.blameHoldActive() or self.gitHoldActive() or (term.supported and self.term_pane != null)) {
+        if (self.scopeAnimActive() or self.blameHoldActive() or self.gitHoldActive() or self.animationActive() or (term.supported and self.term_pane != null)) {
             std.Io.sleep(self.io, .fromMilliseconds(1), .real) catch {};
             self.poll_mode_active = true;
         } else if (self.poll_mode_active) {
@@ -3654,26 +4620,50 @@ pub fn run(self: *App) !void {
         // one by one (handleKey), byte-faithful — no accumulation needed
         const term_focused = term.supported and self.term_pane != null and self.term_pane.?.focused;
         while (try self.loop.tryEvent()) |event| {
-            handled = true;
             switch (event) {
+                .mouse => |m| {
+                    // Left press = click, wheel = scroll. Motion/drag/
+                    // release/unbound buttons return false, so moving the
+                    // mouse cannot cause renders or steal terminal selection.
+                    if (try self.handleMouse(m)) handled = true;
+                },
                 .key_press => |key| {
+                    handled = true;
                     // mid-paste keystrokes are paste content, not input:
                     // buffer them (paste_end inserts the whole thing) so
                     // auto-indent/auto-pairs can't mangle pasted text
                     if (self.pasting and !term_focused) {
+                        if (self.ai.rail_open and self.ai.focus == .prompt) {
+                            if (key.text) |text| try self.aiPaste(text);
+                            continue;
+                        } else if (self.ai.rail_open and self.ai.focus == .rail) {
+                            continue;
+                        }
                         try self.pasteAccumulate(key);
                         continue;
                     }
                     try self.handleKey(key);
                 },
                 .paste_start => {
+                    handled = true;
                     self.pasting = true;
                     self.paste_buf.clearRetainingCapacity();
                 },
                 .paste_end => {
+                    handled = true;
                     if (!self.pasting) continue;
                     self.pasting = false;
                     if (term_focused) continue; // child got the keys already
+                    if (self.inlinePromptOpen()) {
+                        try self.inlinePaste(self.paste_buf.items);
+                        self.paste_buf.clearRetainingCapacity();
+                        continue;
+                    }
+                    if (self.ai.rail_open and self.ai.focus != .editor) {
+                        if (self.ai.focus == .prompt) try self.aiPaste(self.paste_buf.items);
+                        self.paste_buf.clearRetainingCapacity();
+                        continue;
+                    }
                     switch (self.state.mode) {
                         .insert => if (self.mc_active)
                             try self.mcInsertText(self.paste_buf.items)
@@ -3687,6 +4677,7 @@ pub fn run(self: *App) !void {
                     }
                 },
                 .paste => |text| {
+                    handled = true;
                     // OSC 52 clipboard reply — terminal focus: forward the
                     // paste to the child
                     if (term.supported) {
@@ -3697,11 +4688,16 @@ pub fn run(self: *App) !void {
                             }
                         }
                     }
-                    if (self.state.mode == .insert) {
+                    if (self.inlinePromptOpen()) {
+                        try self.inlinePaste(text);
+                    } else if (self.ai.rail_open and self.ai.focus != .editor) {
+                        try self.aiPaste(text);
+                    } else if (self.state.mode == .insert) {
                         if (self.mc_active) try self.mcInsertText(text) else try self.insertText(text);
                     }
                 },
                 .winsize => |ws| {
+                    handled = true;
                     try self.vx.resize(self.alloc, self.tty.writer(), ws);
                 },
                 else => {},
@@ -3721,11 +4717,17 @@ pub fn run(self: *App) !void {
                 self.scheduleGitStatus();
             }
         }
-        if (handled or poll_transition or now_ms - last_render_ms >= 16) {
+        // Render on a handled event, on the poll-mode → blocking transition,
+        // and on the 16ms animation cadence while polling. In blocking mode
+        // an ignored event (mouse motion/drag/release, focus reports) must
+        // NOT trigger a frame: mouse movement then causes no renders and no
+        // busy loop (feat/mouse).
+        if (handled or poll_transition or (self.poll_mode_active and now_ms - last_render_ms >= 16)) {
             try self.render();
             last_render_ms = now_ms;
         }
     }
 
+    self.disableMouse();
     try self.vx.exitAltScreen(self.tty.writer());
 }

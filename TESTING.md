@@ -1,0 +1,655 @@
+# Testing & verification
+
+This document describes oz's test layers, the machine verification entry
+point, and the policy for agents/humans changing UI, layout, or AI workspace
+behavior. The goal is that a UI regression is a failing command with a raw
+log, not "looks wrong on my terminal".
+
+## Quick start
+
+```sh
+./tools/verify.sh               # authoritative local run: diff check + unit + e2e
+zig build test                  # L1 unit + L2 render snapshots
+zig build e2e                   # L3 pty end-to-end (Linux)
+zig build test -Dtest-filter="property:"   # one group (compile-time filter)
+zig build e2e -Dtest-filter="scenario matrix"
+zig build e2e -Dtest-filter="navigator"
+zig build e2e -Dtest-filter="golden"
+```
+
+Current counts on `feat/patch-multi` (based on `5d57e73`):
+**556 unit tests** and **213 e2e tests**. `tools/verify.sh` PASSes all three
+commands in this worktree (diff check, 556/556 unit, 213/213 e2e; the
+`terminal:` and multi-file `approval:` suites included). `tools/verify.sh`
+writes `.verify/unit.log`, `.verify/e2e.log`, and
+`.verify/verify.json` (schema version 1, git commit/dirty flag, exact command
+strings, timestamps, exit codes, log SHA-256s, parsed pass/fail counts). It
+runs every command even after a failure and exits non-zero if any command
+fails. `.verify/` is git-ignored.
+
+CI (`.github/workflows/ci.yml`) runs the same script on pull requests and on
+pushes to `master`, uploads `.verify/` even on failure, and is authoritative.
+`release.yml` remains tag-only and is not involved.
+
+Zig test steps use `has_side_effects = true`, so `zig build test` and
+`zig build e2e` always execute the freshly built test binary instead of
+replaying a cached successful run.
+
+## Test layers
+
+| Layer | What it covers | Where |
+|---|---|---|
+| **Model/unit (L1)** | Pure logic: piece table, motions, keymaps, SSE/OpenAI config parsing, AI workspace layout/focus/thread model, navigator tab model, note store (paths/titles/sorting/creation), inline selection mapping/fences/diff/pending policy, M3a agent loop bounds/card formatting/metrics/chart cache key + transcript→request assembly, M3c recent-window p95 (nearest-rank, ring wraparound, empty→null, no revision change), M3b1 staged `edit_file` args/occurrence/span/bounded-preview/pending policy and approval decision metrics; M3b2 multi/single-file unified-diff parse/validate, per-file patch pending, two-phase commit rollback, cross-file undo set, bounded/full hunk preview and `verifyFile`; M3b3 terminal argument validation/timeout bounds/escaped display/output cap/result text, real `/bin/sh` spawn/cancel/timeout/output-cap job wrapper, and one-call terminal execution metrics | `src/**/*.zig` `test` blocks, aggregated by `src/tests.zig` |
+| **Protocol fixtures** | SSE chunking, request JSON (incl. assistant tool-call turns and `role:"tool"` results), streamed `tool_calls` fragments/parallel calls/malformed protocol, config env parsing, AI client cancellation/error paths; mock LSP JSON-RPC | `src/ai/sse.zig`, `src/ai/openai.zig`, `src/ai/tools.zig`, `src/ai/client.zig`, `src/ai/config.zig`, mock LSP tests |
+| **Semantic frames (L3)** | Real `oz` binary in a pty; ANSI stream reconstructed into a cell grid; assertions on regions, borders, text, overlap, overflow | `test/e2e.zig` + `test/frame.zig` |
+| **Scenario matrix** | Data-driven pairwise matrix over terminal widths, filetree, and AI rail states; fresh pty per scenario; tags enforced | `test/e2e.zig` (`scenario_matrix`) |
+| **Goldens** | Cell-exact text + fg/bg frames for representative AI workspace sizes | `test/golden/`, `test/golden.zig` |
+| **Property sweeps** | Deterministic exhaustive invariants over widths/heights/focus transitions | `src/ai/workspace.zig` (`property:` tests) |
+
+### Semantic frame helpers
+
+`test/frame.zig` provides reusable assertions over the reconstructed grid:
+
+- `expectCellBg` / `expectRegionBg` / `expectRegionFg` / `expectRegionPainted`
+- `expectCellUl` plus `cellUl` / `cellUnderlined` — the ANSI parser now
+  records SGR 4 and SGR 58 (underline color), so active-tab underlines can be
+  asserted as theme colors instead of being inferred from fg/bg
+- `expectBorderBox` — validates corners and both vertical borders (optionally
+  the border foreground), replacing copied popup-geometry checks
+- `expectTextInRegion` — cell-boundary-aware text search inside a rectangle
+- `expectNoOverlap` — panes/floats must not share a cell
+- `expectNoHorizontalOverflow` — catches wide glyphs in the last usable
+  column and painted cells past an explicit content width
+- `boxRect` / `findBoxByTitle` — derive a region from the **drawn** box
+  corners instead of hard-coding coordinates
+
+Cursor position is intentionally not exposed: the ANSI parser consumes
+CSI `H`/`f`/`G` as drawing writes and does not separate vaxis's final cursor
+placement. Tests assert visible focus state instead (accent rail border,
+status text, cursorline background). Do not add a cursor oracle based on the
+current parser.
+
+### Scenario matrix
+
+Scenarios live in one `scenario_matrix` array. Each `Scenario` declares:
+
+- `name`, `tags`, `rows`, `cols`
+- setup (`plain` or `ai_mock`), `filetree`/`rail` state
+- optional extra key `steps` and a `prompt` (send/stream)
+- expected text/absent text and mock request-body substrings
+
+The runner spawns a fresh pty per scenario, waits for `NORMAL`, drives the
+keys, settles the stream, and applies the semantic assertions. The matrix
+currently covers 3 widths × filetree {closed,open} × rail {closed,open}, AI
+streaming at 120 (dock) and 80 (drawer), hints overlays, and the navigator's
+Notes/Agents tabs. A notes scenario gets a fresh temp `OZ_NOTES_DIR` with one
+fixture note; the navigator box is located without its title text (hint labels
+intentionally cover the tab words).
+
+Scenario tags: `@layout @ai @filetree @stream @hints @mouse @navigator
+@notes @inline @tools @approval @terminal @patch-multi @80col @100col @120col
+@drawer @docked @compact`. A new
+feature adds its tag here and to at least one scenario. `@mouse` marks the
+scenarios whose clickable/target geometry the pointer tests also exercise
+(hints + approval); pointer sequences themselves are driven by the dedicated
+`mouse:` pty tests, because the matrix scenario format only carries keys.
+
+Every scenario must carry tags; `required_scenario_tags` is the declared
+feature set. A test fails with `UncoveredScenarioTag` if a declared tag has
+no scenario, and with `UndeclaredScenarioTag` if a scenario introduces a tag
+that is not in the set. Add new layout/AI features by adding the tag and at
+least one scenario.
+
+### Goldens
+
+Two focused frames are stored under `test/golden/`:
+
+- `ai-dock-120x30.txt` — docked rail + editor
+- `ai-drawer-80x24.txt` — narrow overlay drawer
+
+Format is plain text: header/size, one text row per screen row, then
+run-length-encoded packed-RGB `bg` and `fg` rows covering every cell
+(`-` means the default/unpainted color). It is diffable in code review and
+needs no image codec/OCR. The frame setup uses a fixed non-git temp cwd, a
+fixed fixture file, a fresh `HOME`, a fixed theme, and the mock stream; there
+are no timestamps or volatile paths in the frame.
+
+Normal runs compare and fail with `error.GoldenMismatch`, printing the first
+differing lines and writing:
+
+- `.verify/golden/<name>.actual.txt` — the full actual frame
+- `.verify/golden/<name>.diff.txt` — expected/actual differing lines
+
+CI uploads `.verify/`, so these are available even on failure.
+
+Goldens are **never** updated by a normal run. To update intentionally:
+
+```sh
+OZ_UPDATE_GOLDEN=1 zig build e2e -Dtest-filter="golden"
+git diff -- test/golden/        # review EVERY changed cell/style run
+```
+
+The update prints the exact files written. A missing golden is an error, not
+an automatic create.
+
+### UI chrome assertions
+
+The chrome changes are covered by two focused pty tests (`ui chrome:` filter)
+at 120x30 dock and 80x24 drawer plus the scenario matrix:
+
+- the rail header band (`AGENTS  1`), the two `├──` rules (thread list/workbox
+  header, tab strip/body), the `│`-separated workbox tabs (spaced at 38 cells,
+  compact at 34/80) and the active tab's `>` marker + `bg_sel`/accent style
+  (switching to Changes moves the marker);
+- the navigator: the branded `╭─ OZ ─────╮` border, the real
+  `workspace / branch` line, the `Files / Notes / Agents` icon tabs with
+  separators and active `bg_sel`/underline, the 4-row header + `├──┤` rule, and
+  the one-cell blank gutter between the 30-cell box and editor text (full
+  mode); at <90 columns the 7-cell `OZ` + icon rail and its 30-cell peek,
+  with the editor starting at column 8 after the peek is closed;
+- the one-cell blank rail gutter in dock and drawer modes (text never touches
+  the rail's `│`, and drawer cursors under the panel are hidden);
+- the bottom status band: full-width rule row, `[MODE]` badge with accent
+  background, `│` section separators, and the `dock`/`drawer` layout cell;
+- the theme matrix (`ui chrome: theme matrix ...`): three real starts with a
+  fresh `HOME` and a written `~/.cache/oz/theme` (kanagawa-wave,
+  catppuccin-mocha, flexoki-light), asserting the navigator/buffer/workbox
+  active tabs' fg/bg/underline, the `>` markers, the minor/major separator
+  colors, the status top rule, and focused vs inactive panel borders — plus a
+  cross-theme check that those rendered samples are pairwise different;
+- a scan for tofu-prone chrome glyphs (`▥ ● ○ ◌ ✖ ▸ ▾`) in the rail and
+  navigator regions; and
+- a real-git blame test at 120 dock and 80 drawer: the ghost is truncated one
+  cell before the rail, the gap cell stays blank, the rail's own text is not
+  overwritten, and the commit summary never appears in the rail.
+
+The goldens changed only because the chrome moved rows/styles: header band,
+active markers, the two rules, the status band, and the 38-cell tab separator
+spacing in the final gutter pass. The theme-chrome pass changed style runs
+only: active buffer tab `bg_sel`, workbox marker/label underline and marker
+background, `accent_alt` rules/tab separators, status top rule and section
+separators, and the active thread marker. Row text is unchanged. They were
+regenerated with `OZ_UPDATE_GOLDEN=1` and reviewed cell-by-cell.
+
+### Buffer strip and motion assertions
+
+The `feat/ui-polish` strip is covered by the `ui buffer strip:` tests at
+120x30, 100x30 and 80x24 plus one split test:
+
+- row 0 is the label row and row 1 is the editor-wide rule row; the first
+  content line is row 2 (single window) or row 3 (two stacked label layers);
+- five real files (short, long/truncated, plain, note, diff) prove the 20–26
+  cell tab width, the `×` close cell, `│` separators, middle-ellipsis, and
+  that `gT` moves a complete `accent_alt` underline span together with the
+  `bg_sel` body (the rule row itself is the neutral `win_sep` hairline);
+- hint mode read from the drawn frame: the tab select label sits at the icon,
+  the close label at the close cell, and activating the close label removes
+  the real buffer through the existing `closeBufferAt` path;
+- the split test asserts two label rows, one shared rule row, one active
+  underline on the focused pane, content starting below all three rows, and
+  no horizontal overflow.
+
+Motion is covered by pure unit tests (`src/app/animation.zig`) and two pty
+tests:
+
+- `streaming status pulses...`: a long mock SSE stream keeps the workbox
+  header's `streaming` label alive; sampled frames must show at least two
+  distinct fg colors in the `accent`↔`accent_alt` pulse. After completion the
+  label settles to the static dim `idle` color, 300 ms of pty reads must be
+  empty, and the row must not change.
+- `running tool spinner...`: `OZ_AI_TOOL_DELAY_MS=700` (internal e2e seam,
+  unset in production) holds the worker so the running card is observable;
+  sampled frames must show at least two `| / - \` glyphs. After the result and
+  idle, the icon is a static terminal-state glyph, the cell does not change,
+  and 300 ms of reads is empty.
+- The Changes badge flash uses the same `flashActive` deadline in the run
+  loop; it is unit-tested at the helper level and does not add an idle timer.
+
+Goldens were regenerated once with `OZ_UPDATE_GOLDEN=1` after the strip grew:
+row 0/1 now carry the label/rule cells, every content row shifted down by one,
+and the 80x24 golden additionally pins the static idle status color (the
+padding style is explicit so a shrinking streaming label cannot leave a stale
+pulse fg).
+
+### Navigator brand + compact rail
+
+The full navigator model is unit-tested in `src/app/navigator.zig`: the 90-col
+breakpoint, `editorCol` (31 full / 8 compact), `layoutTabs` count-badge fitting
+(exactly 28 cells, labels never truncated, Notes badge omitted until its cache
+is loaded), real `workspace / branch` formatting, and the same-icon peek
+toggle. The e2e suite adds:
+
+- `navigator: 120x30 brand header shows workspace, real branch and counts` —
+  OZ border, `main / <branch>` (repository cwd), Files/Agents counts, frame.
+- `navigator: 80x24 compact rail 1/2/3, hints, outside click and drawer` —
+  peek from `<leader>e`, `1/2/3` + Tab/Shift-Tab switching, Esc back to the
+  7-cell rail, editor marker at column 8, icon click, outside click, compact
+  hint labels activating a peek, note/file/agent open closing the peek, and
+  the AI drawer never stacking with the peek.
+- `navigator: 60x24 compact peek and rail never overflow` — 30-cell peek and
+  7-cell rail at the minimum width.
+- The scenario matrix adds `navigator compact rail 80x24` (`@compact`) and
+  the existing `filetree 80x24` scenario still proves the auto-opened peek is
+  a real 30-cell box. The matrix's navigator assertions derive the tab
+  rows/headers from `src/app/navigator.zig` (no hard-coded strip constants).
+
+No golden changed: `ai-dock-120x30.txt` / `ai-drawer-80x24.txt` do not open
+the navigator, so their cells are unchanged. Update goldens only with
+`OZ_UPDATE_GOLDEN=1`.
+
+### Notes test seam (`OZ_NOTES_DIR`)
+
+Notes live in a global data directory, so tests must never touch the real
+`$HOME`. `OZ_NOTES_DIR` is the first path source in production too
+(`OZ_NOTES_DIR` > `$XDG_DATA_HOME/oz/notes` > `$HOME/.local/share/oz/notes`);
+every navigator/notes e2e points it at a fresh `/tmp/oz_notes_*` directory
+that is deleted afterwards. The error-path test uses
+`OZ_NOTES_DIR=/dev/null/notes` to prove the Notes tab reports a clear error
+and the editor stays usable.
+
+### M3a agent-tool fixtures and e2e
+
+`OZ_AI_MOCK_DIR` gained per-request fixtures for the automatic tool loop: the
+nth request writes `request.json` (latest) plus `request-<n>.json`, and replays
+`stream-<n>.sse` when present (falling back to `stream.sse` for the one-shot M1
+tests). `error-<n>.txt` likewise falls back to `error.txt`. Existing text-only
+tests are unchanged.
+
+The M3a pty tests (`test/e2e.zig`, filter `tools:`) cover:
+
+- a real `read_file` through two mock rounds: card running→ok, result excerpt,
+  follow-up `request-2.json` with assistant `tool_calls` + `role:"tool"` +
+  `tool_call_id`, Tools tab `calls 1`/`ok 1`/avg/p95/max and a braille chart
+  (the single real sample makes `avg == p95`; a parsed p95 must be ≤60s);
+- parallel `read_file` + `grep` calls in one delta: both cards, both
+  `tool_call_id`s in the follow-up, `2 calls`, chart;
+- a missing file: real `error:` card and `ok 0 · err 1`, while the follow-up
+  final text still arrives;
+- `edit_file` is no longer an M3a block: it is staged by the M3b1 path below
+  (the old placeholder test was replaced, not deleted);
+- four tool rounds: execution stops, the transcript note names the bound, the
+  fifth request is the final **no-tools** request (no `tools`/`tool_choice`),
+  and no sixth request exists; Tools tab `calls 4`;
+- a nine-call single batch: only the first eight execute, the ninth is a real
+  `unsupported` tool result (`tool call limit (8) reached; not executed`),
+  the follow-up is the final no-tools request, and Tools tab shows
+  `calls 9` / `ok 8 · err 0 · unsup 1`;
+- Ctrl+c during the follow-up stream: `cancelled` + frozen transcript, no
+  `request-3.json`, and a second thread's Tools tab is still
+  `no tool calls yet` (no cross-thread cards/metrics);
+- 80x24 drawer: cards/chart fit with no horizontal overflow, and a drawn hint
+  label on the card toggles the expanded result (only the second fixture line
+  becomes visible);
+- a valid-JSON tool-call entry missing `index`: the client surfaces a typed
+  `tool call protocol` chat error, no card executes and no follow-up request
+  is written.
+
+The unit tests pin the bounded loop admission (`planBatch`), limit notes,
+card status/argument/excerpt formatting, metrics average/max/ring/revision,
+M3c p95 nearest-rank across 1/2/20/21/32 samples (duplicates, all-equal,
+unsorted, ring wraparound, empty→null, revision/ring/counters untouched),
+chart cache-key invalidation, `assistant tool_calls`/tool-result wire JSON, and
+the transcript message order used by the follow-up request.
+
+Known gaps at M3a (intentional, documented in DESIGN §20.8): metrics are
+session/per-thread only (no cross-session persistence); calls cancelled
+before their worker result is applied are not counted; `edit_file`/`apply_patch`
+approval is M3b1/M3b2 and `terminal` approval is M3b3; tool-card expansion is
+hint/mouse-activatable but has no card cursor; the chart legend lists tool names but has no
+per-series average annotation. p95 covers only the per-tool recent window
+(≤32 real samples; header pools those windows, ≤256), so it is not an
+all-time percentile. The `stream-<n>.sse` seam is test-only and never used
+against a real provider.
+
+### M3b1 staged edit approval fixtures and e2e
+
+The M3b1 pty tests (`test/e2e.zig`, filter `approval:`) cover the complete
+stage → review → decide path with real disk fixtures:
+
+- an `edit_file` call stages a diff (`changes 1`, `-1 +1`, removed/added lines),
+  the Chat card says `approval required`, the follow-up `role:"tool"` result
+  says `staged for review; not applied`, the target file on disk and the
+  buffer/dirty flag are untouched;
+- approve applies the replacement to the in-memory buffer (dirty), leaves the
+  file unchanged, `u` restores the whole edit as one undo group, Ctrl+r redoes
+  it, and `:w` is the only step that rewrites the file;
+- reject through the drawn `[r] reject` hint label clears the review, leaves
+  buffer/history/file byte-identical and marks the card `rejected`; Tools shows
+  `calls 1` / `ok 0 · err 0 · appr 1 · denied 1`;
+- after approve, Tools shows the same call as `ok 1 · err 0 · appr 1` with no
+  fabricated latency sample;
+- a buffer edit after staging refuses with `stale edit`, keeps the diff
+  reviewable and does not corrupt the user's edited buffer; reject then
+  restores the normal empty state;
+- an 80x24 drawer renders the diff/buttons without horizontal overflow and the
+  drawn Approve hint label applies the edit; the review body stays a closed
+  panel when empty;
+- a second `edit_file` while one is pending produces
+  `resolve the pending edit first` (card/result) instead of a queue; creating
+  a second thread hides the review (`changes 0`) but switching back preserves
+  it and approve still applies to the staging thread's buffer;
+- `apply_patch` is no longer an M3a/M3b1 unsupported block: it is staged by
+  the M3b2 path below (the old placeholder test was rewritten, not deleted).
+  A batch mixing `apply_patch` with an unknown tool stages the patch and keeps
+  the unknown tool truthfully `unsupported`; Tools counts the staged call and
+  the decisions. `terminal` is no longer part of this test: it has its own
+  approval path (§ M3b3 below).
+
+The scenario matrix adds `ai approval 120x30` (tag `@approval`): it stages an
+edit against the opened scenario buffer, checks the Changes diff/card, approves
+and asserts the applied buffer plus `changes 0`/`approved`.
+
+Unit tests pin the pure half: schema parsing, unique/ambiguous/missing
+`old_string`, `replace_all` span replacement, multi-hunk context merging,
+bounded preview/omitted-occurrence notes, staleness (`verify`), thread-scoped
+visibility/one-review policy, and approval/rejection metrics that do not count
+as a second call.
+
+Known M3b1 gaps (documented in DESIGN §20.9): only `edit_file`; single-file,
+single-contiguous-span apply (replace_all merges occurrences into one undo
+group); no approval queue or cross-session persistence (terminal was added
+later by M3b3, see below); ≤256 KiB stage cap; bounded hunk preview rather than a whole-file
+unified diff; the model transcript keeps the original "staged/not applied"
+tool result even after a later local approval; no mouse.
+
+### M3b2 staged `apply_patch` fixtures and e2e (single- and multi-file)
+
+The M3b2 pty tests (`test/e2e.zig`, filter `approval:`) cover the complete
+single-file patch stage → review → decide path with real disk fixtures:
+
+- a two-hunk `apply_patch` stages (`changes 1`, `-2 +2`, all four changed
+  lines), the Chat card says `approval required`, the follow-up `role:"tool"`
+  result says `apply_patch staged for review; not applied`, and the buffer,
+  dirty flag and file are untouched;
+- approve applies **both hunks as one whole-file undo group** (dirty), leaves
+  the file unchanged until `:w`, one `u` restores the entire pre-patch text,
+  Ctrl+r redoes it, and `:w` is the only disk write; the card is `approved`
+  and Tools shows `calls 1` / `ok 1 · err 0 · appr 1` with no fabricated
+  latency sample;
+- reject through the drawn `[r] reject` hint label clears the review, leaves
+  buffer/history/file/dirty byte-identical, marks the card `rejected` and
+  records `appr 1 · denied 1`;
+- a buffer edit after staging refuses with `stale patch`, keeps the diff
+  reviewable and does not corrupt the user's edited buffer; reject cleans up;
+- an 80x24 drawer renders the patch diff/buttons without horizontal overflow
+  and the drawn Approve hint applies the patch.
+
+Multi-file coverage (also `approval:`):
+
+- two files (both already open) stage as one review: `changes 1`,
+  `2 files · -2 +2`, both file rows, and the active file's diff; the Chat card
+  carries the bounded file list (`a.txt, b.txt`) and the follow-up tool result
+  is `apply_patch (2 files: a.txt, b.txt) staged for review; not applied`.
+  Nothing is written before approve;
+- `j` selects the second file's diff and `k` returns; approve writes **both**
+  files, refreshes both open buffers (clean, no dirty marker) and shows
+  `applied to disk`; one `u` restores both buffers **and** both disk files,
+  Ctrl+r redoes the whole set; Tools stays `calls 1` / `appr 1`;
+- mouse click on the drawn `[r] reject` label denies the set: both files,
+  both buffers and history stay byte-identical, card `rejected`;
+- editing one open target after staging refuses the whole set with
+  `stale patch: b.txt`, keeps the review, writes neither file, and leaves the
+  user's edited buffer intact;
+- an 80x24 multi-file review fits without horizontal overflow and the drawn
+  Approve hint writes both files, including one that was never opened;
+- duplicate sections (same normalized path twice), unsafe absolute paths,
+  binary patches, `new file mode` additions and mode changes are rejected in
+  one 4-call batch: real `error:` cards, no stage, `changes 0`, no dirty flag,
+  exact per-call errors in the follow-up request, Tools `4 calls` /
+  `ok 0 · err 4`, guard file byte-identical.
+
+The scenario matrix adds `ai patch approval 120x30` (`@approval`, unchanged
+single-file) and `ai patch multi 120x30` (tags `@layout @ai @tools @approval
+@patch-multi @120col`): the latter opens a second `/tmp` fixture, stages a
+two-file patch, checks the Changes file list/active diff (`j` switches files),
+approves, and asserts the second patched buffer plus `changes 0`; the request
+body contains the multi-file staged result.
+
+Unit tests pin the pure half in `src/app/agent_patch.zig` and
+`src/app/agent_edit.zig`: single/multi-hunk apply with line-number drift,
+omitted counts, zero-count insert/delete, `\ No newline at end of file` on
+both sides, malformed headers/hunks/counts, context and newline mismatches,
+out-of-range/overlapping hunks, add-delete/binary/rename/mode rejection,
+absolute/`..`/NUL/mismatched paths, `a/`/`b/` path-prefix preservation for
+no-prefix diffs, patch/hunk/line caps (including per-file hunk/line budgets),
+empty-file patches, `parseSet` 2/3-file order and duplicate/too-many-files
+rejection, one malformed section rejecting the set, `validateSet` returning
+the full per-file reason list with no new text, the multi-file pending's
+per-file old/new snapshots/totals/staleness, `commitFiles` phase-1 no-write
+and phase-2 rollback (including rollback failure reporting), and the cross-file
+`UndoSet` live/target swap.
+
+Known M3b2 gaps (documented in DESIGN §20.10): multi-file is limited to
+**1–8 modified files** with no add/delete/rename/copy/binary/mode changes and
+no partial apply. Single-file approval remains buffer-only (`:w` writes);
+multi-file approval is an explicit whole-set disk write — a deliberate
+asymmetry. The multi-file commit is **not** a filesystem-wide atomic
+transaction: it guarantees "no target changes before every temp exists" and
+restores already-renamed files from in-memory old text on a later rename
+failure, with rollback failures reported truthfully; there is no journal or
+crash recovery. Cross-file undo keeps only the most recent set and refuses
+when any file changed since apply or a file that was closed/opened later makes
+the history state ambiguous. Multi-file previews use the global patch budgets
+so their stats are exact (the single-file review keeps its historical
+240-line/16-hunk bound). The model transcript keeps the original
+"staged/not applied" result after a later local approval, and pending state is
+not persisted across restarts.
+
+### M3c recent-window p95
+
+`Stats.p95RecentMs() ?u32` is the integer nearest-rank p95 of the tool's
+`recent` ring: ascending sort, 0-based `ceil(0.95*n)-1`, clamped; n=0 → null.
+It uses a fixed `[recent_capacity]u32` stack copy (no heap allocation) and
+never touches `revision`, counters, chart samples or the ring itself. The
+Tools-tab header uses `Metrics.p95RecentMs()`, which pools each tool's recent
+window (≤32 per tool, ≤256 total) with the same nearest-rank rule; that
+pooling is explicit in DESIGN §20.11 so the header is not misread as a
+"last 32 calls overall" statistic.
+
+The pty tests extend the existing tools tests rather than adding new test
+blocks: 120x30 asserts the `p95 ` label, parses it and checks it is ≤60s and
+equal to `avg` for the one real sample; the 80x24 drawer asserts the label
+still fits with no horizontal overflow; the empty Tools tab and an
+approval-only tool (no latency sample) assert p95 does **not** appear; the
+scenario matrix's `ai tools read 120x30` and `ai tools read 100x30` rows also
+expect `p95 `. No golden changes: neither golden frame renders the Tools tab.
+
+### M3b3 approved `terminal` fixtures and e2e
+
+The M3b3 pty tests (`test/e2e.zig`, filter `terminal:`; this filter also
+matches the three pre-existing editor-terminal tests) add ten approval tests
+with real mock rounds and real child processes:
+
+- a streamed `terminal` call stages (`terminal · approval required`,
+  `[a] allow`, exact escaped command, `timeout 5000ms`); **no process** is
+  spawned and the editor fixture on disk is byte-identical until Allow. Allow
+  runs the background command, flips the card/Terminal tab to `ok`, shows
+  `exit 0` and the real output, creates only the command's intended side file,
+  and the follow-up `request-2.json` carries `role:"tool"`, the matching
+  `tool_call_id`, `exit: 0` and the output. Tools shows `calls 1` / `ok 1` /
+  avg/p95 from the real duration; the Chat card and Terminal tab are both
+  checked.
+- Deny (`r`) spawns nothing, shows `rejected` / `denied · not executed`,
+  leaves the target file untouched, writes a truthful denied result into
+  `request-2.json` and records `denied 1` without a latency sample.
+- a failing command (`printf …; exit 7`) reports `error` / `exit 7` and the
+  real output; the follow-up contains `error: exit code 7` and Tools shows
+  `err 1`.
+- a 150 ms timeout of `(sleep 1; printf LATE > late.txt) & wait` is killed by
+  the watchdog **as a process group**: the error/card arrives promptly, the
+  background subshell never writes `late.txt` after waiting 1.3 s, and the
+  follow-up contains `timeout; process group killed`.
+- `yes TRUNCLINE | head -c 70000` is capped at 64 KiB: the result/follow-up is
+  `<80 KiB` JSON, contains `output_truncated: N bytes dropped`, and the card
+  shows the truncation marker before the excerpt.
+- `<leader>j` hint labels on `[a] allow` execute the same Allow path, and a
+  real mouse click on `[r] deny` executes the same Deny path in a second turn
+  (staged through the prompt after Enter attaches it).
+- an 80x24 drawer renders the approval panel/buttons without horizontal
+  overflow; `r` denies with no process and the layout stays closed.
+- Ctrl+c while running kills the command, freezes `cancelled · command
+  stopped`, sends **no** follow-up (`request-2.json` absent) and a delayed
+  background side effect never appears.
+- switching to a new thread while a command runs kills it (no `late.txt`, no
+  follow-up); the new thread's Terminal tab is empty (no cross-thread card)
+  and returning to thread 1 shows the frozen `cancelled` state.
+- a **pending** (un-approved) command survives a thread switch hidden, has
+  spawned nothing while away, is still `approval required` with `[a] allow`
+  on return, and can then be denied with a truthful follow-up.
+
+The scenario matrix adds `ai terminal approval 120x30` (tags `@approval
+@terminal`): it stages a command against the /tmp fixture root, allows it,
+asserts `terminal · ok` + the real marker + the follow-up card, and checks
+`request.json` for `role:"tool"`, `terminal` and the output marker.
+
+Unit tests pin the pure half: strict schema/unknown-field/empty/NUL/>4 KiB
+rejection, timeout 100..10000 acceptance (and rejection outside), defensive
+`clampTimeout`, escaped command display (control bytes/backslash/newline/
+invalid UTF-8), bounded card summaries with an explicit `… (+N bytes)`
+marker, 64 KiB `OutputBuffer` accounting/dropped bytes, result text for
+ok/exit-error/signal/timeout/read-error/truncation, terminal permission always
+`confirm`, and `recordExecution` (one `calls` count at stage, real duration on
+execution, no second call). `src/app/terminal_job.zig` is exercised with real
+`/bin/sh` children: output/exit capture, nonzero/stderr, a 100 ms timeout
+(returns in <2.5 s), cancellation, the 64 KiB cap, and a bad spawn.
+
+Known M3b3 gaps (documented in DESIGN §20.12): **no sandbox / no network
+isolation** — the command runs with the user's permissions; the environment
+is only allowlisted, not isolated; `setsid`/daemon children can escape the
+process-group kill; no PTY/interactive stdin/shell choice/cwd parameter; one
+pending command per session (second call refused); pending/approval state is
+not persisted; local approval decisions are not re-announced to the model
+beyond the final tool result; a running command is killed on thread switch or
+Ctrl+c (result discarded). Terminal and file reviews are separate slots and
+may coexist.
+
+### Property tests
+
+`src/ai/workspace.zig` sweeps deterministic invariants (fast, no RNG):
+
+- widths 40..200: dock/editor widths partition `cols`; drawer width ≤ cols;
+  breakpoint monotonicity; exact 90/110 breakpoints
+- heights 0..200 and every workbox tab: metrics stay inside the rail, thread
+  rows are bounded, prompt/body rows never overflow
+- extreme widths/heights (including `maxInt(u32)`) do not panic or overflow
+- every focus-transition combination lands in a valid state (closed rail is
+  always editor-focused)
+
+## Agent / verifier policy
+
+1. **No "I ran it" without evidence.** Report exact commands, exit codes,
+   and pass/fail counts. On this repo, the raw evidence is
+   `.verify/verify.json` plus `.verify/*.log`; CI is authoritative.
+2. **Fail before, pass after.** For a fix, first reproduce the failure
+   (or show the current failing assertion); then show the same command
+   passing after the change.
+3. **Do not edit tests or goldens to hide a failure.** Existing expectations
+   are evidence. If a product requirement changed, update the test and the
+   golden explicitly, call it out in the commit message, and keep the
+   assertion at least as strong. Never delete an assertion or narrow it to
+   make CI green.
+4. **No silent golden updates.** Only `OZ_UPDATE_GOLDEN=1`, then review the
+   diff. A commit containing golden changes must explain them.
+5. **Protected paths.** Treat `test/**`, `test/golden/**`, and
+   `tools/verify.sh` as review-sensitive. Test-only helper modules
+   (`test/frame.zig`, `test/golden.zig`) may grow, but assertions and golden
+   content need justification.
+6. **Clean-worktree verification.** `verify.json.git.dirty` is true when
+   tracked files differ from `HEAD` (untracked files are not counted). Commit
+   the change under test, then run `tools/verify.sh`; a dirty run is useful
+   during development but is not a release/CI claim.
+7. **Version, not environment.** If a failure is environment-dependent
+   (missing tree-sitter, no `/dev/ptmx`), `tools/verify.sh` fails; do not
+   accept a partial run as success. Run `./.scripts/bootstrap-deps.sh` once.
+
+## Current coverage matrix
+
+| Area | Covered by |
+|---|---|
+| Editor modes/motions/undo/registers/splits | L1 + existing L3 tests |
+| File tree, picker, dashboard, popups | L3 `assertPopupBox` + semantic frame helpers |
+| AI layout widths (80/100/120), rail/drawer, filetree combinations | scenario matrix |
+| AI chat send/stream at 120 (dock) and 80 (drawer) | scenario matrix + goldens |
+| AI thread isolation/cancel/error, selection context | existing deep L3 tests |
+| Layout arithmetic / focus state | property sweeps |
+| AI/frame cell colors and borders | goldens + semantic assertions |
+| UI chrome (rail header/rules/tabs, nav/rail blank gutters, navigator tab separators, status band, blame clipping, tofu-glyph scan) | L3 `ui chrome:` tests + `git: blame ghost clips before the agent rail` + scenario matrix + goldens |
+| Two-row buffer strip (20–26 cell tabs, middle-ellipsis, active underline, close hint, split layers) | L1 `src/app/tabstrip.zig` + L3 `ui buffer strip:` tests + goldens |
+| Motion (streaming pulse, running tool spinner, badge flash deadline, idle no-churn) | L1 `src/app/animation.zig` + L3 `animation:` tests + goldens |
+| Keyboard hints (labels, status, target actions, Esc) | L1 pure model (`src/app/hints.zig`) + L3 `hints:` tests + `@hints` matrix scenarios |
+| Mouse click/wheel (hit priority, scroll clamp, cell→byte mapping, lifecycle, panes/tabs/rows/buttons, terminal focus, drawer overlay, Shift selection escape hatch) | L1 `src/app/mouse.zig` + L3 `mouse:` pty tests (SGR 1006 press/release/wheel) + `@mouse` scenarios |
+| Navigator tabs, notes list/create/save/reopen, agents attach | L1 (`src/app/navigator.zig`, `src/app/note_store.zig`) + L3 `navigator:` tests + `@navigator`/`@notes` matrix scenarios |
+| Navigator brand + counts, compact rail/peek, close transitions, hint/mouse icons, 60/80/120 geometry | L1 breakpoint/tab-layout/workspace-line tests + L3 `navigator:` brand/compact tests + `@compact` scenario |
+| Notes path fallback/error handling | L1 resolution/creation tests + L3 unavailable-dir e2e (`OZ_NOTES_DIR=/dev/null/notes`) |
+| Inline assistant (selection→prompt→stream→Changes diff→Approve/Reject, stale, cancel, 80-col, hints) | L1 `src/app/inline.zig` + L3 `inline:` tests + `@inline` scenario |
+| Staged agent writes (`edit_file` + single/multi-file `apply_patch`: parse/occurrence/hunk/diff/stale/one pending, per-file validate, two-phase write/rollback, cross-file undo/redo), approve/reject, 80-col hints, thread scoping | L1 `src/app/agent_edit.zig` + `src/app/agent_patch.zig` + `src/ai/agent.zig` decision metrics + L3 `approval:` tests + `@approval`/`@patch-multi` scenarios |
+| M3 tool metrics (counts, avg/max, recent-window nearest-rank p95, 32-sample chart, empty/approval-only states, 80/100/120 fit) | L1 `src/ai/agent.zig` p95/metrics tests + L3 `tools:` tests + `@tools` scenario |
+| Approved terminal tool (strict args/timeout/output caps, real spawn/exit/timeout/kill, explicit Allow/Deny via key/hint/mouse, follow-up result, metrics, thread switch/cancel isolation, 80/120 fit) | L1 `src/ai/terminal_tool.zig` + `src/app/terminal_job.zig` + `src/ai/agent.zig` `recordExecution` + `src/ai/tools.zig` permission/schema + L3 `terminal:` pty tests + `@terminal` scenario |
+| Mock LSP protocol | L4 mock server e2e |
+| Deterministic build/test run | `tools/verify.sh` + CI |
+
+Known gaps / deliberate limitations:
+
+- No mutation testing and no fault-injection harness (e.g. allocation failure,
+  signal injection); cancellation/error paths are covered by unit/mock tests
+  but not by systematic fault injection.
+- The browser does not apply: oz is a terminal application.
+- Cursor position observability is not available (see above).
+- Goldens cover two AI workspace frames by design, not every screen/theme.
+- There is intentionally no hint-overlay golden: labels cover the target text and
+  the target count depends on the repository-root filetree entries, so a full-frame
+  golden would be dominated by volatile rows. The dedicated `hints:` e2e tests
+  read labels back from the drawn cells and assert status/border/overflow instead.
+- The file-tree L3 test navigates by key count and is sensitive to new
+  top-level repository entries; adding a visible root directory can shift it.
+  Keep this in mind when adding repo-root fixtures.
+- Notes have no delete/rename and no directory watch: the list is refreshed
+  only on Notes-tab entry, create, `:w` of a note, or `r`. Tests assert those
+  explicit refresh points, not per-frame scans.
+- Inline edit has one pending replacement and one live inline stream; there is
+  no multi-file queue, word-level diff, hunk folding or soft-wrapped diff line.
+  The diff is a line-level LCS capped at 400 lines per side (larger selections
+  use an accurate all-removed/all-added fallback), computed once on completion.
+  Approval is revision/path/range checked; after a workspace switch the pending
+  diff has no matching buffer and must be rejected (safe failure, never apply).
+  There is no auto-save: approve only edits the buffer.
+- Agent staged edits are M3b1/M3b2: `edit_file` (occurrence replacement) and
+  `apply_patch` for 1–8 modified files, one review at a time (shared with
+  inline), no persistence across restarts. Single-file `apply_patch` remains a
+  buffer-only whole-file replacement (one history group; `:w` writes). Multi-
+  file approval is an explicit whole-set disk transaction: per-file
+  validate → temp writes → renames, with best-effort rollback of already-
+  renamed files (not filesystem-wide atomic; no journal/crash recovery) and
+  one cross-file undo unit (most recent set only; refuses when a file changed
+  since apply or the open/closed history state is ambiguous). Reject and every
+  validation failure write nothing. `apply_patch` rejects
+  add-delete/binary/rename/copy/mode patches and duplicate/unsafe paths; it
+  never partially applies on validation. The automatic follow-up already sent
+  the staged "not applied" tool result, so a later approval updates the local
+  card but not the model transcript. Pending edits are thread-scoped: switching
+  threads hides the badge/review but keeps it, and apply/reject requires
+  returning to that thread.
+- The navigator Agents tab is a view of the same session thread model; it is
+  not persisted and is covered through that model's existing tests plus one
+  attach/switch e2e, not a second state machine.
+- Mouse v1: no drag/resize, middle/right buttons, double-click selection or
+  terminal mouse forwarding. Wheel = 3 lines/notch (cursor scroll in the
+  editor). Soft-wrap chunks and emoji/ZWJ grapheme clusters map approximately;
+  non-wrapped ASCII/CJK click-to-cursor is exact and unit-tested. Plain drag
+  is owned by mouse reporting — Shift+drag delegates to the terminal's local
+  selection (terminal-dependent, not enforceable by oz).
+- CI caches the Zig tarball and the small global Zig cache only; the ~1 GB
+  `.vendor/tree-sitter` sources and multi-GB local compile cache are fetched/
+  rebuilt each run to keep cache keys small and deterministic.
+- `zig build`/`zig build test` require the vendored tree-sitter sources; run
+  `./.scripts/bootstrap-deps.sh` after a fresh clone.
+
+## Troubleshooting
+
+- `.verify/unit.log` / `.verify/e2e.log` hold complete stdout+stderr.
+- `verify.json.commands[].exit_code` records each command independently.
+- `verify.json.tests.unit/e2e` shows parsed pass counts; `null` means the
+  summary line was not parseable (inspect the log).
+- A golden mismatch is not "flaky" unless two runs produce different actual
+  frames; compare `.verify/golden/*.actual.txt` across runs before updating.
+- Scenario failures print the scenario name and tags, then dump the grid.

@@ -17,6 +17,25 @@ const isWordByte = App.isWordByte;
 // ---- input ----
 
 pub fn handleKey(self: *App, key: vaxis.Key) !void {
+    // Keyboard hints (M2.6a): while the overlay is active it owns every key
+    // — label characters, Backspace and Esc. Routed before terminal/macro/
+    // AI/picker/editor handling so label chars can never leak into a
+    // register, the command line or a prompt. Returning here does NOT stop
+    // the run loop from draining AI streams/background jobs.
+    if (self.hints.active) {
+        try self.handleHintKey(key);
+        return;
+    }
+
+    // Inline edit prompt (M2b2): while the compact float owns the keyboard,
+    // every key is prompt input — never an editor shortcut or leader
+    // sequence. Placed before the terminal/AI/editor dispatch for the same
+    // modality reason as hint mode.
+    if (self.inlinePromptOpen()) {
+        try self.handleInlineKey(key);
+        return;
+    }
+
     // Terminal focus first: every key belongs to the child (Esc /
     // Alt+r/w/e are intercepted inside handleTerminalKey).
     if (term.supported) {
@@ -26,6 +45,15 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
                 return;
             }
         }
+    }
+
+    // AI workspace: while the rail or its prompt owns the keyboard, every
+    // key belongs to the AI surface. Placed before the macro recorder so AI
+    // typing never lands in a register. An editor-focused docked rail is NOT
+    // modal: normal editing continues beside it.
+    if (self.ai.rail_open and self.ai.focus != .editor) {
+        try self.handleAiKey(key);
+        return;
     }
 
     // Macro recording (vim q): a bare 'q' stops recording — but only as a
@@ -91,7 +119,10 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
 
     // Ctrl-w window commands: switch keyboard focus between split windows
     // (vim Ctrl-w hjkl geometric navigation) and the file-tree sidebar.
-    // Not in insert mode — there Ctrl+w still deletes the word before it.
+    // Ctrl-w a is the Agent Rail re-entry point (it opens the rail when
+    // closed); without it an editor-focused docked rail would be
+    // unreachable from the keyboard. Not in insert mode — there Ctrl+w
+    // still deletes the word before it.
     if (key.codepoint == 'w' and key.mods.ctrl and self.state.mode != .insert) {
         self.pending_window = true;
         return;
@@ -112,34 +143,40 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
                 if (self.filetree_active and self.focus == .buffer) {
                     const before = self.current_win;
                     self.navigateWindow(.left);
-                    if (self.current_win == before) self.focus = .filetree;
+                    if (self.current_win == before) self.navigatorEnter();
                 } else if (!self.filetree_active) {
                     self.navigateWindow(.left);
                 }
-                // from the tree (tree open, focus == .filetree) there is
+                // from the navigator (tree open, focus == .navigator) there is
                 // nothing further left
             },
             'l' => {
-                if (self.filetree_active and self.focus == .filetree) {
+                if (self.filetree_active and self.focus == .navigator) {
+                    self.navigator_peek = false;
                     self.focus = .buffer;
                 } else {
                     self.navigateWindow(.right);
                 }
             },
             'j' => {
-                if (self.filetree_active and self.focus == .filetree) {
+                if (self.filetree_active and self.focus == .navigator) {
+                    self.navigator_peek = false;
                     self.focus = .buffer;
                 } else {
                     self.navigateWindow(.down);
                 }
             },
             'k' => {
-                if (self.filetree_active and self.focus == .filetree) {
+                if (self.filetree_active and self.focus == .navigator) {
+                    self.navigator_peek = false;
                     self.focus = .buffer;
                 } else {
                     self.navigateWindow(.up);
                 }
             },
+            // Agent Rail (M2a): open/focus the thread list. Keep the
+            // editor's Ctrl-w hjkl contract untouched.
+            'a' => try self.focusAiRail(),
             else => {},
         }
         return;
@@ -147,9 +184,14 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
 
     // File tree navigation (j/k/Enter/Esc); other keys fall through.
     // Only the focused pane reacts: with buffer focus the sidebar stays
-    // visible but hjkl move the buffer cursor.
-    if (self.filetree_active and self.focus == .filetree) {
-        if (try self.filetreeKey(key)) return;
+    // visible but hjkl move the buffer cursor. A pending <leader> sequence
+    // owns the next key (e.g. <leader>j = hint mode; the tail is `j`, which
+    // the tree would otherwise consume as cursor movement).
+    // Navigator (M2b1): Files keeps the filetree keys; Notes/Agents have
+    // their own handlers; Tab/Shift-Tab + 1/2/3 switch tabs. The pending
+    // <leader> check stays first so <leader>j reaches the hint action.
+    if (self.filetree_active and self.focus == .navigator and !editor.Mode.leaderPending(&self.state)) {
+        if (try self.navigatorKey(key)) return;
     }
 
     // Dashboard (no file open): j/k/Enter navigate recent files and the
@@ -262,12 +304,12 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
             return;
         }
         // ---- insert-mode completion (Ctrl+n and auto-suggest) ----
-        // Esc while the menu is open only dismisses it (stays in insert);
-        // a second Esc exits the insert session as usual.
-        if (self.completion_active and key.codepoint == vaxis.Key.escape) {
-            self.closeCompletion();
-            return;
-        }
+        // Esc always leaves insert, closing an open menu as part of the
+        // same keypress (vim/blink default: Esc is the insert-exit key, not
+        // a menu-only dismiss). The old menu-only Esc left a half-insert
+        // state where the next `o` was typed as text — the report that
+        // `o`/`O` "did the wrong thing" after a Zig/zls suggestion. Ctrl+e
+        // remains the stay-in-insert "hide menu" mapping.
         // Ctrl+e: hide the menu (blink.cmp mapping), stay in insert.
         if (self.completion_active and key.codepoint == 'e' and key.mods.ctrl and !key.mods.alt and !key.mods.super) {
             self.closeCompletion();

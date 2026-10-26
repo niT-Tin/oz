@@ -11,6 +11,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const buffer = @import("buffer/root.zig");
+const logging = @import("logging.zig");
 
 const app_mod = @import("app.zig");
 const autil = @import("app/util.zig");
@@ -19,9 +20,23 @@ const App = app_mod.App;
 
 // Silence vaxis's per-frame debug logging (pollutes the tty byte stream and
 // interferes with e2e screen reconstruction).
+//
+// Every embedded-terminal diagnostic scope is capped at `.err` here AND
+// dropped entirely by `logging.logFn` (vaxis logs some shell-integration
+// traffic with `log.err`). Those scopes are `.terminal` (unhandled OSC 7/8/
+// 133, CSI), `.vaxis_terminal` (per-cell URI write warnings) and
+// `.vaxis_parser` (input-parser warnings) — dumping them onto the pty floods
+// the editor UI during normal `Alt+r` use. `.vaxis` core errors still reach
+// stderr for genuine failures.
 pub const std_options: std.Options = .{
     .log_level = .info,
-    .log_scope_levels = &.{.{ .scope = .vaxis, .level = .err }},
+    .log_scope_levels = &.{
+        .{ .scope = .vaxis, .level = .err },
+        .{ .scope = .terminal, .level = .err },
+        .{ .scope = .vaxis_terminal, .level = .err },
+        .{ .scope = .vaxis_parser, .level = .err },
+    },
+    .logFn = logging.logFn,
 };
 
 pub fn main(init: std.process.Init) !void {

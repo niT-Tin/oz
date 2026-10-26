@@ -113,7 +113,7 @@ pub fn jumpToLocation(self: *App, loc: lsp_nav.NavLocation) void {
         // current buffer
         const pt = &self.cur().pt;
         const line = @min(loc.line, pt.lineCount() -| 1);
-        self.curCursor().* = pt.lineStart(line) + @min(loc.character, pt.lineLen(line));
+        self.curCursor().* = pt.lineStart(line) + @min(loc.character, pt.lineTextLen(line));
         return;
     };
     defer self.alloc.free(path);
@@ -126,7 +126,7 @@ pub fn jumpToLocation(self: *App, loc: lsp_nav.NavLocation) void {
     }
     const pt = &self.cur().pt;
     const line = @min(loc.line, pt.lineCount() -| 1);
-    self.curCursor().* = pt.lineStart(line) + @min(loc.character, pt.lineLen(line));
+    self.curCursor().* = pt.lineStart(line) + @min(loc.character, pt.lineTextLen(line));
 }
 
 /// Keys while the gr/gI location list is open. Returns true when consumed.

@@ -22,6 +22,12 @@ const term = @import("term.zig");
 
 const autil = @import("app/util.zig");
 const git_job = @import("app/git_job.zig");
+const app_ai = @import("app/ai.zig");
+const app_hints = @import("app/hints.zig");
+const app_mouse = @import("app/mouse.zig");
+const app_inline = @import("app/inline_ui.zig");
+const app_agent_edit = @import("app/agent_edit_ui.zig");
+const app_agent_terminal = @import("app/agent_terminal.zig");
 const markdown = @import("app/markdown.zig");
 
 const GitJobKind = git_job.GitJobKind;
@@ -38,7 +44,10 @@ const gitPreviewLineCount = git_job.gitPreviewLineCount;
 /// positions the cursor/ghost/menu must use the same value or columns drift.
 pub const tab_width: u32 = 4;
 
-pub const status_row_count: u32 = 1;
+/// Bottom chrome rows: one separator rule + the status line. Every layout
+/// (editor rows, rail rows, floats) reserves both so no content paints over
+/// the status boundary.
+pub const status_row_count: u32 = 2;
 
 /// Current-line blame CursorHold delay (ms) — nvim updatetime-style; the
 /// ghost appears this long after the cursor settles (<leader>tb).
@@ -67,6 +76,11 @@ pub const NavAction = enum { none, hover, definition, declaration, references, i
 pub const InlayHint = struct { line: u32, character: u32, label: []const u8 };
 
 pub const GitPreview = @import("app/git.zig").GitPreview;
+
+// M2b1 navigator tabs + global note store (pure models live in app/*.zig)
+pub const NavigatorTab = @import("app/navigator.zig").Tab;
+pub const NoteStore = @import("app/note_store.zig").Store;
+pub const Note = @import("app/note_store.zig").Note;
 
 pub const LspStartJob = @import("app/lsp.zig").LspStartJob;
 
@@ -231,7 +245,7 @@ pub const App = struct {
     /// way; only the focused pane reacts to keys. Named `Focus` so the
     /// Workspace struct can swap it alongside the rest of the file-tree
     /// state (the tree is per workspace; see Workspace).
-    pub const Focus = enum { buffer, filetree };
+    pub const Focus = enum { buffer, navigator };
 
     /// Doom-Emacs-style workspace: one independent buffer set + window
     /// layout + file tree (swap-on-switch model, see docs/workspace-plan.md
@@ -421,6 +435,18 @@ pub const App = struct {
     /// the window; the window scrolls only when it crosses an edge.
     filetree_top: usize = 0,
     focus: Focus = .buffer,
+    // ---- navigator tabs + notes (M2b1, DESIGN §18.8) ----
+    /// Active left-navigator tab. Global (the navigator view mode) while the
+    /// filetree content/selection remains per workspace.
+    navigator_tab: NavigatorTab = .files,
+    /// Compact-mode (<90 cols) peek overlay: the icon rail is always the
+    /// resting state; selecting an icon opens the 30-cell full navigator
+    /// over the editor. Closed by Esc, an outside click, opening a file/note/
+    /// agent, or giving the keyboard back to the editor.
+    navigator_peek: bool = false,
+    /// Cached global markdown note list (project independent). Refreshed on
+    /// tab entry/create/save/r only; frames never scan the filesystem.
+    notes: NoteStore = .{},
     /// Ctrl-w seen, awaiting the window-motion key (h/l/j/k).
     pending_window: bool = false,
     /// Content hash at insert-session entry, so an insert session that ends
@@ -640,6 +666,18 @@ pub const App = struct {
     /// render on that transition so the final state (ghost appearing as the
     /// CursorHold expires, animation's last spread) is never skipped.
     poll_mode_active: bool = false,
+    /// Monotonic ms captured once at the start of the current render. Every
+    /// animated element in that frame reads the same timestamp, so a dot and
+    /// its status label pulse in phase and a unit test can reason about one
+    /// frame at a time.
+    frame_now_ms: i64 = 0,
+    /// Changes badge flash (§18.12): a short pulse after the pending count
+    /// changes. The start is a hard deadline the run loop can query; 0 means
+    /// "never flashed". `review_flash_count` is the count observed last
+    /// frame, initialized on the first AI frame.
+    review_flash_start_ms: i64 = 0,
+    review_flash_count: usize = 0,
+    review_flash_seen: bool = false,
     /// Cached scopeAt result for the last rendered (window, buffer, cursor,
     /// revision) — recomputed only when the tree or the cursor byte changed.
     scope_cache: ?ScopeCache = null,
@@ -673,10 +711,41 @@ pub const App = struct {
     /// stable address — a plain App field, never a reallocating list.
     term_pane: ?TermPane = null,
 
+    // ---- M1 AI chat (<leader>a) ----
+    /// Session-wide chat state (panel visibility, conversation, stream
+    /// status). Not per workspace: the thread survives panel close and
+    /// workspace switches.
+    ai: app_ai.Session = .{},
+    /// M2b2 inline assistant: prompt, dedicated stream client, pending diff.
+    inline_edit: app_inline.Session = .{},
+    /// M3b1 staged agent edits: one pending diff, thread-scoped.
+    agent_edit: app_agent_edit.Session = .{},
+    /// M3b3 staged `terminal` approval + running job (session-wide, one).
+    agent_terminal: app_agent_terminal.Session = .{},
+
+    // ---- M2.6a keyboard hints (<leader>j) ----
+    /// Modal target-selection state (DESIGN.md §19). Pure value: fixed
+    /// target array, no allocation, no deinit. Inactive frames only pay one
+    /// boolean test (`collecting`).
+    hints: app_hints.State = .{},
+
+    // ---- feat/mouse: hit-test registry (no allocation) ----
+    /// Mouse support target registry + lifecycle flag. Collection reuses the
+    /// hint target rectangles on every frame while mouse reporting is enabled;
+    /// labels are still drawn only in hint mode. See src/app/mouse_ui.zig.
+    mouse: app_mouse.State = .{},
+
     /// The active buffer (the focused window's buffer; per-buffer document
     /// state lives here, per-window cursor/viewport in `windows`).
     pub fn cur(self: *App) *Buffer {
         return &self.buffers.items[self.windows.items[self.current_win].buf];
+    }
+
+    /// Monotonic milliseconds since boot for animation timing. Never used as
+    /// a wall-clock/date; a clock adjustment merely shifts a phase (the pure
+    /// helpers wrap negative values safely).
+    pub fn nowMs(self: *App) i64 {
+        return @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
     }
 
     /// The focused window's cursor (byte offset in its buffer).
@@ -699,7 +768,7 @@ pub const App = struct {
         const height: u32 = win.height;
         if (height <= status_row_count) return 1;
         const content_rows = height - status_row_count - self.tabBarRows(arena.allocator());
-        const layout = self.layoutWindows(arena.allocator(), self.contentTop(arena.allocator()), content_rows, self.contentCol(), win.width) catch return content_rows;
+        const layout = self.layoutWindows(arena.allocator(), self.contentTop(arena.allocator()), content_rows, self.contentCol(), self.editorAreaWidth()) catch return content_rows;
         for (layout.leaves) |leaf| {
             if (leaf.win == self.current_win) return leaf.height;
         }
@@ -718,11 +787,11 @@ pub const App = struct {
         const height: u32 = win.height;
         if (height <= status_row_count) return @max(win.width -| gutter, 1);
         const content_rows = height - status_row_count - self.tabBarRows(arena.allocator());
-        const layout = self.layoutWindows(arena.allocator(), self.contentTop(arena.allocator()), content_rows, self.contentCol(), win.width) catch return @max(win.width -| gutter, 1);
+        const layout = self.layoutWindows(arena.allocator(), self.contentTop(arena.allocator()), content_rows, self.contentCol(), self.editorAreaWidth()) catch return @max(self.editorAreaWidth() -| gutter, 1);
         for (layout.leaves) |leaf| {
             if (leaf.win == self.current_win) return @max(leaf.width -| gutter, 1);
         }
-        return @max(win.width -| gutter, 1);
+        return @max(self.editorAreaWidth() -| gutter, 1);
     }
 
     /// H/M/L: resolve a viewport motion to a document LINE using the focused
@@ -1246,7 +1315,7 @@ pub const App = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const content_rows = height - status_row_count - self.tabBarRows(a);
-        const layout = self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), self.vx.window().width) catch return null;
+        const layout = self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), self.editorAreaWidth()) catch return null;
         const leaves = layout.leaves;
         var cur_rect: ?LeafRect = null;
         for (leaves) |lr| {
@@ -1402,6 +1471,12 @@ pub const App = struct {
         // pieces it borrows (env_map, io, the vaxis loop its wake posts to)
         // go away.
         self.cancelLspStart();
+        // Stop and join the AI stream worker before the io/env it borrowed
+        // and the vaxis loop it renders into go away.
+        self.deinitAi();
+        self.deinitInline();
+        self.deinitAgentEdit();
+        self.deinitAgentTerminal();
         var image_it = self.markdown_images.iterator();
         while (image_it.next()) |entry| {
             switch (entry.value_ptr.*) {
@@ -1456,6 +1531,7 @@ pub const App = struct {
         if (self.filetree_root) |root| self.freeFiletreeNode(root);
         self.filetree_rows.deinit(self.alloc);
         if (self.project_root) |p| self.alloc.free(p);
+        self.notes.deinit(self.alloc);
         for (self.recent_files.items) |f| self.alloc.free(f);
         self.recent_files.deinit(self.alloc);
         for (self.picker_files.items) |f| self.alloc.free(f);
@@ -1559,6 +1635,27 @@ pub const App = struct {
     pub const clearHover = @import("app/navigation.zig").clearHover;
     pub const jumpToLocation = @import("app/navigation.zig").jumpToLocation;
     pub const navListKey = @import("app/navigation.zig").navListKey;
+    // ---- keyboard hints (M2.6a) → src/app/hint_ui.zig ----
+    pub const HintAction = app_hints.Action;
+    pub const HintRect = app_hints.Rect;
+    pub const beginHintMode = @import("app/hint_ui.zig").beginHintMode;
+    pub const addHintTarget = @import("app/hint_ui.zig").addHintTarget;
+    pub const drawHintOverlay = @import("app/hint_ui.zig").drawHintOverlay;
+    pub const handleHintKey = @import("app/hint_ui.zig").handleHintKey;
+    pub const execHintAction = @import("app/hint_ui.zig").execHintAction;
+    // ---- mouse (feat/mouse) → src/app/mouse_ui.zig ----
+    pub const MouseState = app_mouse.State;
+    pub const MouseClickAction = app_mouse.ClickAction;
+    pub const MouseScroll = app_mouse.Scroll;
+    pub const enableMouse = @import("app/mouse_ui.zig").enableMouse;
+    pub const disableMouse = @import("app/mouse_ui.zig").disableMouse;
+    pub const beginMouseFrame = @import("app/mouse_ui.zig").beginMouseFrame;
+    pub const mouseTargetsCollecting = @import("app/mouse_ui.zig").mouseTargetsCollecting;
+    pub const addMouseHintTarget = @import("app/mouse_ui.zig").addMouseHintTarget;
+    pub const addMousePaneTarget = @import("app/mouse_ui.zig").addMousePaneTarget;
+    pub const addMouseSeparatorTarget = @import("app/mouse_ui.zig").addMouseSeparatorTarget;
+    pub const addMouseScrollTarget = @import("app/mouse_ui.zig").addMouseScrollTarget;
+    pub const handleMouse = @import("app/mouse_ui.zig").handleMouse;
     // ---- terminal → src/app/terminal.zig ----
     pub const termCwd = @import("app/terminal.zig").termCwd;
     pub const termRect = @import("app/terminal.zig").termRect;
@@ -1632,6 +1729,7 @@ pub const App = struct {
     pub const invalidateInlayHints = @import("app/search.zig").invalidateInlayHints;
     pub const adjustInlayHintsInsert = @import("app/search.zig").adjustInlayHintsInsert;
     pub const adjustInlayHintsDelete = @import("app/search.zig").adjustInlayHintsDelete;
+    pub const adjustInlayHintsLineOpen = @import("app/search.zig").adjustInlayHintsLineOpen;
     pub const lineHints = @import("app/search.zig").lineHints;
     pub const absolutePath = @import("app/search.zig").absolutePath;
     pub const writeBuffer = @import("app/search.zig").writeBuffer;
@@ -1694,6 +1792,8 @@ pub const App = struct {
     pub const locateInFiletree = @import("app/filetree.zig").locateInFiletree;
     pub const revealPath = @import("app/filetree.zig").revealPath;
     pub const filetreeKey = @import("app/filetree.zig").filetreeKey;
+    pub const moveFiletreeCursor = @import("app/filetree.zig").moveFiletreeCursor;
+    pub const activateFiletreeSelection = @import("app/filetree.zig").activateFiletreeSelection;
     pub const freeFiletreeNode = @import("app/filetree.zig").freeFiletreeNode;
     pub const detectProjectRoot = @import("app/filetree.zig").detectProjectRoot;
     pub const currentRootDir = @import("app/filetree.zig").currentRootDir;
@@ -1701,6 +1801,24 @@ pub const App = struct {
     pub const setProjectRoot = @import("app/filetree.zig").setProjectRoot;
     pub const TreeNode = @import("app/filetree.zig").TreeNode;
     pub const FiletreeRow = @import("app/filetree.zig").FiletreeRow;
+    // ---- notes + navigator (M2b1) → src/app/notes.zig ----
+    pub const notesDir = @import("app/notes.zig").notesDir;
+    pub const notesIsPath = @import("app/notes.zig").notesIsPath;
+    pub const refreshNotes = @import("app/notes.zig").refreshNotes;
+    pub const notesDidSave = @import("app/notes.zig").notesDidSave;
+    pub const openNoteAt = @import("app/notes.zig").openNoteAt;
+    pub const createNote = @import("app/notes.zig").createNote;
+    pub const navigatorSetTab = @import("app/notes.zig").navigatorSetTab;
+    pub const navigatorScrollBy = @import("app/notes.zig").navigatorScrollBy;
+    pub const navigatorCycleTab = @import("app/notes.zig").navigatorCycleTab;
+    pub const navigatorKey = @import("app/notes.zig").navigatorKey;
+    pub const navigatorCompact = @import("app/notes.zig").navigatorCompact;
+    pub const navigatorEnter = @import("app/notes.zig").navigatorEnter;
+    pub const navigatorPeekClose = @import("app/notes.zig").navigatorPeekClose;
+    pub const closeNavigator = @import("app/notes.zig").closeNavigator;
+    pub const navigatorAttachSelectedThread = @import("app/notes.zig").navigatorAttachSelectedThread;
+    pub const navigatorNewThread = @import("app/notes.zig").navigatorNewThread;
+    pub const navigatorCursorRow = @import("app/notes.zig").navigatorCursorRow;
     // ---- lsp_edit → src/app/lsp_edit.zig ----
     pub const requestRename = @import("app/lsp_edit.zig").requestRename;
     pub const execRename = @import("app/lsp_edit.zig").execRename;
@@ -1769,10 +1887,89 @@ pub const App = struct {
     pub const execOpMotion = @import("app/highlight.zig").execOpMotion;
     pub const execAction = @import("app/highlight.zig").execAction;
     pub const replaceCharsAtCursor = @import("app/highlight.zig").replaceCharsAtCursor;
+    // ---- AI workspace → src/app/ai.zig ----
+    pub const toggleAiPanel = app_ai.toggleAiPanel;
+    pub const focusAiRail = app_ai.focusAiRail;
+    pub const aiNewThread = app_ai.aiNewThread;
+    pub const aiSelectThread = app_ai.aiSelectThread;
+    pub const aiFocusPrompt = app_ai.aiFocusPrompt;
+    pub const aiSetWorkboxTab = app_ai.aiSetWorkboxTab;
+    pub const aiToggleToolCard = app_ai.aiToggleToolCard;
+    pub const aiScrollWheel = app_ai.aiScrollWheel;
+    pub const aiMoveThreadCursor = app_ai.aiMoveThreadCursor;
+    pub const ensureAi = app_ai.ensureAi;
+    pub const aiLoadConfig = app_ai.aiLoadConfig;
+    pub const aiSetError = app_ai.aiSetError;
+    pub const aiSetErrorFmt = app_ai.aiSetErrorFmt;
+    pub const aiStreaming = app_ai.aiStreaming;
+    pub const deinitAi = app_ai.deinitAi;
+    pub const handleAiKey = app_ai.handleAiKey;
+    pub const aiPaste = app_ai.aiPaste;
+    pub const aiScroll = app_ai.aiScroll;
+    pub const aiCancel = app_ai.aiCancel;
+    pub const aiSend = app_ai.aiSend;
+    pub const drainAi = app_ai.drainAi;
+    pub const drainToolJobs = app_ai.drainToolJobs;
+    pub const aiLayout = app_ai.aiLayout;
+    pub const aiEditorWidth = app_ai.aiEditorWidth;
+    pub const aiStatusText = app_ai.aiStatusText;
+    pub const aiStatusTextCompact = app_ai.aiStatusTextCompact;
+    pub const aiStatusTextMini = app_ai.aiStatusTextMini;
+    pub const drawAiRail = app_ai.drawAiRail;
+    pub const AiSession = app_ai.Session;
+    pub const AiMessage = app_ai.Message;
+    pub const AiStatus = app_ai.Status;
+    pub const AiThread = app_ai.AgentThread;
+    pub const AiFocus = app_ai.Focus;
+    pub const AiWorkboxTab = app_ai.WorkboxTab;
+    // ---- inline assistant (M2b2) → src/app/inline_ui.zig ----
+    pub const inlinePromptOpen = app_inline.inlinePromptOpen;
+    pub const inlinePendingCount = app_inline.inlinePendingCount;
+    pub const inlineStreaming = app_inline.inlineStreaming;
+    pub const deinitInline = app_inline.deinitInline;
+    pub const startInlineEdit = app_inline.startInlineEdit;
+    pub const handleInlineKey = app_inline.handleInlineKey;
+    pub const inlinePaste = app_inline.inlinePaste;
+    pub const submitInlineEdit = app_inline.submitInlineEdit;
+    pub const inlineCancel = app_inline.inlineCancel;
+    pub const drainInline = app_inline.drainInline;
+    pub const inlineApprove = app_inline.inlineApprove;
+    pub const inlineReject = app_inline.inlineReject;
+    pub const inlineScrollBy = app_inline.inlineScrollBy;
+    pub const handleInlineChangesKey = app_inline.handleInlineChangesKey;
+    pub const drawInlinePrompt = app_inline.drawInlinePrompt;
+    pub const drawInlineChanges = app_inline.drawInlineChanges;
+    pub const InlineSession = app_inline.Session;
+    // ---- staged agent edits (M3b1) → src/app/agent_edit_ui.zig ----
+    pub const deinitAgentEdit = app_agent_edit.deinitAgentEdit;
+    pub const agentEditAnyPending = app_agent_edit.agentEditAnyPending;
+    pub const agentEditVisible = app_agent_edit.agentEditVisible;
+    pub const agentEditPendingCount = app_agent_edit.agentEditPendingCount;
+    pub const reviewPendingCount = app_agent_edit.reviewPendingCount;
+    pub const agentEditApprove = app_agent_edit.agentEditApprove;
+    pub const agentEditReject = app_agent_edit.agentEditReject;
+    pub const agentPatchUndo = app_agent_edit.agentPatchUndo;
+    pub const agentPatchRedo = app_agent_edit.agentPatchRedo;
+    pub const agentEditSelectFile = app_agent_edit.agentEditSelectFile;
+    pub const agentEditScrollBy = app_agent_edit.agentEditScrollBy;
+    pub const handleAgentEditChangesKey = app_agent_edit.handleAgentEditChangesKey;
+    pub const drawAgentEditChanges = app_agent_edit.drawAgentEditChanges;
+    pub const AgentEditSession = app_agent_edit.Session;
+    // ---- staged terminal tool approval (M3b3) → src/app/agent_terminal.zig ----
+    pub const deinitAgentTerminal = app_agent_terminal.deinitAgentTerminal;
+    pub const agentTerminalPendingCount = app_agent_terminal.pendingCount;
+    pub const aiAgentTerminalAllow = app_ai.aiAgentTerminalAllow;
+    pub const aiAgentTerminalDeny = app_ai.aiAgentTerminalDeny;
+    pub const drainTerminal = app_ai.drainTerminal;
+    pub const AgentTerminalSession = app_agent_terminal.Session;
     // ---- render → src/app/render.zig ----
     pub const tabBarRows = @import("app/render.zig").tabBarRows;
+    pub const tabLayerCount = @import("app/render.zig").tabLayerCount;
     pub const contentTop = @import("app/render.zig").contentTop;
     pub const contentCol = @import("app/render.zig").contentCol;
+    pub const editorAreaWidth = @import("app/render.zig").editorAreaWidth;
+    pub const navigatorBodyTop = @import("app/render.zig").navigatorBodyTop;
+    pub const navigatorPeekActive = @import("app/render.zig").navigatorPeekActive;
     pub const gutterWidth = @import("app/render.zig").gutterWidth;
     pub const lineCellCol = @import("app/render.zig").lineCellCol;
     pub const textWidth = @import("app/render.zig").textWidth;
@@ -1791,10 +1988,14 @@ pub const App = struct {
     pub const hoverCodeLineSegs = @import("app/render.zig").hoverCodeLineSegs;
     pub const hoverLineSegs = @import("app/render.zig").hoverLineSegs;
     pub const drawRichPopup = @import("app/render.zig").drawRichPopup;
+    pub const drawStatusChrome = @import("app/render.zig").drawStatusChrome;
+    pub const drawBufferTabPlan = @import("app/render.zig").drawBufferTabPlan;
     pub const render = @import("app/render.zig").render;
     pub const blameHoldActive = @import("app/render.zig").blameHoldActive;
     pub const gitHoldActive = @import("app/render.zig").gitHoldActive;
     pub const scopeAnimActive = @import("app/render.zig").scopeAnimActive;
+    pub const reviewFlashActive = @import("app/render.zig").reviewFlashActive;
+    pub const animationActive = @import("app/render.zig").animationActive;
     pub const run = @import("app/render.zig").run;
     pub const filetree_width = @import("app/render.zig").filetree_width;
     pub const TabSort = @import("app/render.zig").TabSort;

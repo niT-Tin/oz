@@ -176,7 +176,9 @@ pub fn openInBuffer(self: *App, path: []const u8) !void {
         buf.history = buffer.History.init(self.alloc);
         self.clearSpanCache(buf);
         buf.path = new_path;
-        self.setProjectRoot(abs);
+        // Notes live in the global data dir: they are project-independent,
+        // so opening one must not root the workspace's tree/picker there.
+        if (!self.notesIsPath(abs)) self.setProjectRoot(abs);
         try self.addRecent(abs);
         // the buffer's tab stays in this pane; it is already the current
         // buffer, so just re-run the per-buffer activation (LSP attach,
@@ -203,7 +205,7 @@ pub fn openInBuffer(self: *App, path: []const u8) !void {
         .history = buffer.History.init(self.alloc),
         .path = try self.alloc.dupe(u8, abs),
     });
-    self.setProjectRoot(abs);
+    if (!self.notesIsPath(abs)) self.setProjectRoot(abs);
     try self.addRecent(abs);
     self.targetWindowForOpen(null);
     self.switchTo(self.buffers.items.len - 1);
@@ -306,8 +308,13 @@ pub fn contentHash(self: *App) u64 {
     return h;
 }
 
-/// Called when an insert session begins (all entry paths).
+/// Called when an insert session begins (all entry paths). A fresh
+/// session must never inherit the previous one's completion menu or its
+/// pending-request bookkeeping (a stale `completion_waiting_enter` made
+/// the first Enter on the new line show "completion pending…" instead of
+/// inserting a newline).
 pub fn beginInsertSession(self: *App) void {
+    self.closeCompletion();
     self.insert_base_hash = self.contentHash();
     self.insert_was_dirty = self.cur().dirty;
 }

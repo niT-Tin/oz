@@ -53,6 +53,7 @@ pub fn deinitBuffer(self: *App, buf: *Buffer) void {
 /// point at the outgoing workspace's buffers, so this must run BEFORE any
 /// workspace swap or teardown.
 fn closeTransientUi(self: *App) void {
+    self.navigator_peek = false;
     self.closePicker();
     self.closeCompletion();
     self.clearHover();
@@ -71,6 +72,12 @@ fn closeTransientUi(self: *App) void {
 /// switchTo's cleanup (buffers.zig) plus teardownLsp and the scope
 /// animation/cache reset.
 fn afterWsActivate(self: *App) void {
+    // Compact navigator invariant: owning the keyboard also shows the peek.
+    // Workspace slots store focus/filetree_active, so returning to a
+    // workspace that was navigating its tree restores the visible drawer.
+    if (self.filetree_active and self.focus == .navigator and self.navigatorCompact()) {
+        self.navigator_peek = true;
+    }
     self.teardownLsp(false);
     self.ensureLsp();
     self.visual_anchor = null;
