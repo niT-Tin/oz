@@ -3595,8 +3595,20 @@ test "grep picker: fixed-size panel with split syntax preview" {
     // colors "const" with the keyword color (kanagawa oniViolet). The left
     // list never renders "const" keyword-colored (fzy only colors the query
     // chars "pub fn"), so this proves the PREVIEW column is highlighted.
-    // the preview file read is async: wait for its content, not just the
-    // header, before scanning for the highlighted line
+    // The preview file read is async, and ripgrep's result order is not a
+    // contract (new `pub fn build*` symbols can move build.zig down the
+    // list). Walk the result list deterministically until build.zig is
+    // selected, then wait for its preview content.
+    var nudges: usize = 0;
+    while (!grid.contains("const target") and nudges < 24) : (nudges += 1) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) {
+            try sess.send("\x0e");
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
     waited = 0;
     while (!grid.contains("const target")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
@@ -20741,8 +20753,8 @@ const scenario_matrix = [_]Scenario{
 /// feature adds its tag here and to at least one Scenario; the coverage test
 /// fails with a clear message otherwise (instead of silently dropping it).
 const required_scenario_tags = [_][]const u8{
-    "@layout",   "@ai",       "@filetree", "@stream", "@hints",  "@mouse",  "@navigator", "@notes", "@inline", "@tools",
-    "@approval", "@terminal", "@80col",    "@100col", "@120col", "@drawer", "@docked", "@compact",
+    "@layout",   "@ai",       "@filetree", "@stream", "@hints",  "@mouse",  "@navigator", "@notes",   "@inline", "@tools",
+    "@approval", "@terminal", "@80col",    "@100col", "@120col", "@drawer", "@docked",    "@compact",
 };
 
 fn expectedRailMode(rail: ScenarioRail) ai_ws.RailMode {
