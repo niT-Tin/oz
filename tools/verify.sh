@@ -125,6 +125,21 @@ e2e_failed=$(parse_failed "$verify_dir/e2e.log")
 if [ "$unit_passed" != null ] && [ "$unit_failed" = null ]; then unit_failed=0; fi
 if [ "$e2e_passed" != null ] && [ "$e2e_failed" = null ]; then e2e_failed=0; fi
 
+# A failed CI run is otherwise just a count in the job summary; print the
+# captured runner's failure lines (and the tail) so the job log identifies
+# the failing test without downloading the artifact.
+if [ "$unit_code" -ne 0 ]; then
+    echo "=== unit failure log ==="
+    grep -E "^error:|failed|FAIL|panic|expected" "$verify_dir/unit.log" | tail -n 40 || true
+    tail -n 80 "$verify_dir/unit.log" || true
+fi
+if [ "$e2e_code" -ne 0 ]; then
+    echo "=== e2e failure log ==="
+    grep -E "^error:|failed|FAIL|panic|expected" "$verify_dir/e2e.log" | tail -n 40 || true
+    tail -n 120 "$verify_dir/e2e.log" || true
+fi
+
+
 overall=passed
 if [ "$diff_code" -ne 0 ] || [ "$unit_code" -ne 0 ] || [ "$e2e_code" -ne 0 ]; then
     overall=failed

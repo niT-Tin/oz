@@ -91,4 +91,5 @@ jobs:
           name: verify-${{ github.run_id }}
           path: .verify/
           if-no-files-found: warn
+          include-hidden-files: true
           retention-days: 14
