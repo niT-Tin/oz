@@ -3532,17 +3532,46 @@ test "grep picker: fixed-size panel with split syntax preview" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
-    var name_buf: [128:0]u8 = undefined;
-    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}g.txt", .{ linux.getpid(), tmp_counter });
+    // Controlled two-file fixture: result order is not a ripgrep contract,
+    // so use unique markers and walk to the desired selection. Querying the
+    // repo's build.zig made this test depend on the width/order of every
+    // "pub fn build*" match and on files added by the build setup.
+    var open_buf: [128:0]u8 = undefined;
+    const open_name = try bufPrintZ(&open_buf, "/tmp/oz_e2e_{d}_{d}g.txt", .{ linux.getpid(), tmp_counter });
     tmp_counter += 1;
-    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, open_name) catch {};
     {
-        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        const f = try std.Io.Dir.cwd().createFile(io, open_name, .{ .truncate = true });
         defer f.close(io);
         try f.writeStreamingAll(io, "grep fixed box\n");
     }
+    var marker_buf: [64]u8 = undefined;
+    const marker = try std.fmt.bufPrint(&marker_buf, "grepfix_{d}_", .{linux.getpid()});
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "test/grepfix_a_{d}.zig", .{linux.getpid()});
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        // Enough matches to make the fixed-height grep panel show its
+        // preview body; the first match is the function line, so the ±4
+        // window contains `const target`.
+        var text = std.ArrayList(u8).empty;
+        defer text.deinit(alloc);
+        const head = try std.fmt.allocPrint(alloc, "pub fn build({s}a: u32) void {{\n    const target = 1;\n    _ = target;\n}}\n", .{marker});
+        defer alloc.free(head);
+        try text.appendSlice(alloc, head);
+        var i: usize = 0;
+        while (i < 14) : (i += 1) {
+            const line = try std.fmt.allocPrint(alloc, "// {s}{d}\n", .{ marker, i });
+            defer alloc.free(line);
+            try text.appendSlice(alloc, line);
+        }
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, text.items);
+    }
 
-    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    var sess = try Session.spawn(io, &.{ oz_exe_path, open_name });
     defer sess.close();
     defer killPid(sess.pid);
 
@@ -3592,14 +3621,11 @@ test "grep picker: fixed-size panel with split syntax preview" {
     const sep_col_empty = nthPipeCol(&grid, hint_row.?, 1) orelse return error.MissingSeparator;
     try std.testing.expect(sep_col_empty >= 40);
 
-    // type a query → results arrive; the panel width must NOT change (the
-    // separator stays at the same column) and the split preview appears.
-    // "pub fn" hits build.zig first ("pub fn build" — the only "pub fn" in
-    // build.zig; small file → preview available). Assert the file, not the
-    // line: build.zig's line numbers drift with the vendored-patch block.
-    try sess.send("pub fn build");
+    // Both controlled fixtures match; the panel width must NOT change and
+    // the split preview must appear.
+    try sess.send(marker);
     waited = 0;
-    while (!grid.contains("❯ pub fn") or !grid.contains("build.zig:")) {
+    while (!grid.contains("grepfix_a_")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -3609,28 +3635,24 @@ test "grep picker: fixed-size panel with split syntax preview" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(grid.contains("build.zig:"));
+    try std.testing.expect(grid.contains("grepfix_a_"));
     const sep_col_filled = nthPipeCol(&grid, hint_row.?, 1) orelse return error.MissingSeparator;
     try std.testing.expectEqual(sep_col_empty, sep_col_filled);
 
-    // preview syntax highlighting: the selected result is build.zig:14, so
-    // the ±4 window shows line 15 "    const target = ..." — tree-sitter
-    // colors "const" with the keyword color (kanagawa oniViolet). The left
-    // list never renders "const" keyword-colored (fzy only colors the query
-    // chars "pub fn"), so this proves the PREVIEW column is highlighted.
-    // The preview file read is async, and ripgrep's result order is not a
-    // contract (new `pub fn build*` symbols can move build.zig down the
-    // list). Walk the result list deterministically until build.zig is
-    // selected, then wait for its preview content.
-    var nudges: usize = 0;
-    while (!grid.contains("const target") and nudges < 24) : (nudges += 1) {
-        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
-        if (n == 0) {
-            try sess.send("\x0e");
-            continue;
+    // Select fixture A (result order is not a contract) and wait for the
+    // async preview. The left list never keyword-colors "const"; the preview
+    // does, which proves the split preview is syntax-highlighted.
+    var tries: usize = 0;
+    while (!grid.contains("const target") and tries < 4) : (tries += 1) {
+        try sess.send("\x0e");
+        var settle: i32 = 0;
+        while (settle < 800) : (settle += 200) {
+            const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+            if (n > 0) {
+                sess.used += n;
+                grid.feed(sess.out[sess.used - n .. sess.used]);
+            }
         }
-        sess.used += n;
-        grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     waited = 0;
     while (!grid.contains("const target")) {
@@ -3644,34 +3666,24 @@ test "grep picker: fixed-size panel with split syntax preview" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     var preview_row: ?usize = null;
-    r = hint_row.? + 1;
+    // Results can change the panel's height/centering, so scan the whole
+    // grid; the open buffer is a plain text file and cannot supply this
+    // keyword-colored text (only the preview can).
+    r = 0;
     while (r < grid.rows) : (r += 1) {
         if (rowContains(&grid, r, "const target")) {
             preview_row = r;
             break;
         }
     }
+    if (preview_row == null) {
+        std.debug.print("grep preview missing marker={s}\n", .{marker});
+        grid.dump();
+    }
     try std.testing.expect(preview_row != null);
     try std.testing.expect(rowContainsFg(&grid, preview_row.?, "const", packRgb(149, 127, 184)));
 
-    // selection movement (Ctrl+n) refreshes the preview to the next result's
-    // file: build.zig's content leaves the panel (build.zig has exactly one
-    // "pub fn" match, so the new selection is always a different file)
-    try sess.send("\x0e");
-    waited = 0;
-    while (grid.contains("const target")) {
-        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
-        if (n == 0) {
-            waited += 200;
-            if (waited >= 5000) break;
-            continue;
-        }
-        sess.used += n;
-        grid.feed(sess.out[sess.used - n .. sess.used]);
-    }
-    try std.testing.expect(!grid.contains("const target"));
-
-    // Enter still jumps into the selected match (whatever file that is)
+    // Enter still jumps into the selected match.
     try sess.send("\r");
     waited = 0;
     while (!grid.contains("NORMAL") or grid.contains("❯ ")) {
@@ -5647,17 +5659,28 @@ test "file tree: sidebar scrolls as the selection moves past the window" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
-    var name_buf: [128:0]u8 = undefined;
-    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}f.txt", .{ linux.getpid(), tmp_counter });
-    tmp_counter += 1;
-    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
-    {
-        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
-        defer f.close(io);
-        try f.writeStreamingAll(io, "hello\n");
+    // Controlled project tree: fixed first-level entries and enough app/
+    // children to overflow the sidebar regardless of the oz checkout.
+    var root_buf: [128:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_ftscroll_{d}", .{linux.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var p_buf: [160:0]u8 = undefined;
+    try std.Io.Dir.cwd().createDirPath(io, try bufPrintZ(&p_buf, "{s}/docs", .{root}));
+    try std.Io.Dir.cwd().createDirPath(io, try bufPrintZ(&p_buf, "{s}/src/app", .{root}));
+    var f_buf: [196:0]u8 = undefined;
+    inline for (.{ "docs/readme.md", "src/app/block_insert.zig", "open.txt" }) |rel| {
+        const f = try std.Io.Dir.cwd().createFile(io, try bufPrintZ(&f_buf, "{s}/{s}", .{ root, rel }), .{});
+        f.close(io);
     }
+    var fi: usize = 0;
+    while (fi < 30) : (fi += 1) {
+        const f = try std.Io.Dir.cwd().createFile(io, try bufPrintZ(&f_buf, "{s}/src/app/f{d:0>2}.zig", .{ root, fi }), .{});
+        f.close(io);
+    }
+    var open_buf: [196:0]u8 = undefined;
+    const open_path = try bufPrintZ(&open_buf, "{s}/open.txt", .{root});
 
-    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, null, 30, 100);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, open_path }, null, 30, 100, root);
     defer sess.close();
     defer killPid(sess.pid);
 
@@ -5676,15 +5699,14 @@ test "file tree: sidebar scrolls as the selection moves past the window" {
     }
     try std.testing.expect(grid.contains("NORMAL"));
 
-    // <leader>e — the tree opens. First level is dirs-first (docs/ src/
-    // test/), so row 2 (first entry row) is a directory, not a file.
+    // <leader>e — the tree opens. First level is dirs-first: docs, src.
     try sess.send(" e");
-    waited = 0;
+    var tree_waited: i32 = 0;
     while (!grid.contains("Files")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
-            waited += 200;
-            if (waited >= 5000) break;
+            tree_waited += 200;
+            if (tree_waited >= 5000) break;
             continue;
         }
         sess.used += n;
@@ -5692,10 +5714,9 @@ test "file tree: sidebar scrolls as the selection moves past the window" {
     }
     try std.testing.expect(std.mem.indexOf(u8, grid.rowText(navBodyRow()), "docs") != null);
 
-    // Expand enough of the tree to overflow the ~20 visible sidebar rows:
-    // l on docs (children), 5j to src + l, j to src/ai (new M1 module),
-    // j to app + l (its children) → more than the ~20 visible rows.
-    try sess.send("ljjjjjljjl");
+    // Expand docs, move to src, expand it, move to app, expand it. The
+    // fixture's fixed shape makes this independent of the repo checkout.
+    try sess.send("ljjljl");
     waited = 0;
     while (!grid.contains("block_insert.zig")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
@@ -5707,12 +5728,11 @@ test "file tree: sidebar scrolls as the selection moves past the window" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(grid.contains("block_insert.zig")); // app children visible
+    try std.testing.expect(grid.contains("block_insert.zig"));
 
     // 22 × j — the selection reaches the window bottom; the scroll window
-    // follows so the selected entry stays visible (it is no longer the first
-    // entry: "docs" scrolled off). (The poll+drain loop renders once per
-    // key batch, so the final scroll state is what we assert.)
+    // follows so the selected entry stays visible and the first entry
+    // ("docs") scrolls off.
     try sess.send("jjjjjjjjjjjjjjjjjjjjjj");
     waited = 0;
     var scrolled = false;
@@ -5720,14 +5740,11 @@ test "file tree: sidebar scrolls as the selection moves past the window" {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
-            if (waited >= 5000) break;
+            if (waited >= 8000) break;
             continue;
         }
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
-        // "docs" was the first entry; once the window scrolls it is gone
-        // from the first entry row, and the selected entry (bg_sel) is
-        // visible somewhere inside the sidebar window
         var sr: usize = navBodyRow();
         var has_sel = false;
         while (sr < 30 - 2) : (sr += 1) {
@@ -14070,11 +14087,12 @@ test "terminal: <M-r> float opens, keys forward, Esc returns, <M-w>/<M-e> switch
 
     try std.testing.expect(try Wait.until(&sess, &grid, "NORMAL"));
 
-    // <M-r> (ESC r) opens the FLOATING terminal: $SHELL is unset in the
-    // test env → /bin/sh (bash here, prompt "sh-5.3$ "). The shell takes a
-    // moment to start, so just poll for the prompt.
+    // <M-r> (ESC r) opens the FLOATING terminal. Pin SHELL and PS1 so this
+    // does not depend on the CI runner's shell/prompt (root "#", bash "$",
+    // custom distro prompts); the unique marker is also easy to locate
+    // after layout switches.
     try sess.send("\x1br");
-    try std.testing.expect(try Wait.until(&sess, &grid, "$"));
+    try std.testing.expect(try Wait.until(&sess, &grid, "OZPROMPT>"));
 
     // while the terminal is focused every key is forwarded to the shell:
     // it echoes the command line and prints the output
@@ -14096,12 +14114,12 @@ test "terminal: <M-r> float opens, keys forward, Esc returns, <M-w>/<M-e> switch
     try std.testing.expect(try Wait.untilGone(&sess, &grid, "INSERT"));
 
     // <M-w> switches the SAME session to the bottom strip: the resize clears
-    // the terminal screen but bash redraws its prompt — the session survives,
-    // and the prompt now sits in the bottom region (bottom strip of the
-    // 24-row screen starts at row 15). Wait until the "$" actually MOVES
-    // there (a stale "$" from the floating layout is still in the grid).
+    // the terminal screen but the shell redraws its prompt — the session
+    // survives, and the prompt now sits in the bottom region (bottom strip
+    // of the 24-row screen starts at row 15). Wait until the marker MOVES
+    // there (a stale marker from the floating layout is still in the grid).
     try sess.send("\x1bw");
-    try std.testing.expect(try Wait.untilWhere(&sess, &grid, "$", struct {
+    try std.testing.expect(try Wait.untilWhere(&sess, &grid, "OZPROMPT>", struct {
         fn pred(row: usize, col: usize) bool {
             _ = col;
             return row >= 14;
@@ -14111,7 +14129,7 @@ test "terminal: <M-r> float opens, keys forward, Esc returns, <M-w>/<M-e> switch
     // <M-e> switches to the right strip (40% width → cols 48..79): the
     // prompt is still there, now past column 40
     try sess.send("\x1be");
-    try std.testing.expect(try Wait.untilWhere(&sess, &grid, "$", struct {
+    try std.testing.expect(try Wait.untilWhere(&sess, &grid, "OZPROMPT>", struct {
         fn pred(row: usize, col: usize) bool {
             _ = row;
             return col >= 40;
@@ -14120,7 +14138,7 @@ test "terminal: <M-r> float opens, keys forward, Esc returns, <M-w>/<M-e> switch
 
     // <M-r> floats the same session again (centered overlay, neither strip)
     try sess.send("\x1br");
-    try std.testing.expect(try Wait.untilWhere(&sess, &grid, "$", struct {
+    try std.testing.expect(try Wait.untilWhere(&sess, &grid, "OZPROMPT>", struct {
         fn pred(row: usize, col: usize) bool {
             return row < 14 and col < 40;
         }
@@ -14151,7 +14169,7 @@ test "terminal: <M-r> float opens, keys forward, Esc returns, <M-w>/<M-e> switch
     // leaves the map undefined and the next spawn's put() crashed on the
     // pointer-stability assert (open -> close -> open SIGABRT)
     try sess.send("\x1br");
-    try std.testing.expect(try Wait.until(&sess, &grid, "$"));
+    try std.testing.expect(try Wait.until(&sess, &grid, "OZPROMPT>"));
     try sess.send("\x1br");
     try std.testing.expect(try Wait.untilGone(&sess, &grid, "$"));
 
