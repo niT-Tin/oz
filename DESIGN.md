@@ -1463,7 +1463,7 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 **验证**
 
 - `zig build test`：544/544 通过（M3b3 新增 13 个单测：terminal_tool 5、terminal_job 7、terminal metrics 1；既有 531 不变）。
-- `zig build e2e`：205/205 通过（新增 10 个 `terminal:` pty 测试；scenario matrix 新增 `ai terminal approval 120x30`；既有 195 不变）。
+- `zig build e2e`：本 worktree HEAD 为 **202/205**（新增 10 个 `terminal:` pty 测试全部通过；scenario matrix 新增 `ai terminal approval 120x30`；既有 195 不变）。3 个失败是既有 checkout 敏感测试，与 terminal 无关：`relative CLI path` 硬编码 4 层主 checkout 的 `../../../../tmp`、`file tree ...` 依赖固定的仓库根/目录子项数量、`grep picker ...` 依赖 ripgrep 结果顺序且新增源码符号改变了排序；详见 TESTING 的已知 gaps。`tools/verify.sh` 因此在本 worktree 报 FAIL（diff-check/unit 通过，e2e 仅这 3 个失败）。
 - 无 golden 变更（terminal 审批/结果不进入固定 golden 帧）。
 
 ---
