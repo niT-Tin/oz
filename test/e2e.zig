@@ -65,7 +65,7 @@ const Pty = struct {
         );
         errdefer _ = linux.close(slave);
         // give the pty a window size so the child's terminal queries succeed
-        const ws = Winsize{ .ws_row = rows, .ws_col = 80, .ws_xpixel = 0, .ws_ypixel = 0 };
+        const ws = Winsize{ .ws_row = rows, .ws_col = 80, .ws_xpixel = 800, .ws_ypixel = rows * 20 };
         _ = linux.ioctl(master, TIOCSWINSZ, @intFromPtr(&ws));
         return .{ .master = master, .slave = slave };
     }
@@ -525,6 +525,24 @@ const Grid = struct {
                         self.stashPending(bytes[i..]);
                         return;
                     }
+                    continue;
+                }
+                if (bytes[i + 1] == '_') {
+                    // APC (including Kitty graphics): payload is not terminal text.
+                    var k = i + 2;
+                    var found = false;
+                    while (k + 1 < bytes.len) : (k += 1) {
+                        if (bytes[k] == 0x1b and bytes[k + 1] == '\\') {
+                            k += 2;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        self.stashPending(bytes[i..]);
+                        return;
+                    }
+                    i = k;
                     continue;
                 }
                 if (bytes[i + 1] == ']') {
@@ -3764,6 +3782,12 @@ test "markdown: inline rendering with conceal, injection and decorations" {
             \\- [ ] todo
             \\- [x] done
             \\
+            \\| Name | 值 |
+            \\| --- | ---: |
+            \\| oz | 中文 |
+            \\
+            \\![remote](https://example.com/a.png)
+            \\
             \\```zig
             \\const zx = 1;
             \\```
@@ -3809,6 +3833,15 @@ test "markdown: inline rendering with conceal, injection and decorations" {
     try std.testing.expect(!grid.contains("[ ]"));
     try std.testing.expect(!grid.contains("[x]"));
 
+    // block layout: aligned table borders, remote-image fallback and fence chrome
+    try std.testing.expect(grid.contains("┌──────┬──────┐"));
+    try std.testing.expect(grid.contains("├──────┼──────┤"));
+    try std.testing.expect(grid.contains("│ oz   │ 中文 │"));
+    try std.testing.expect(grid.contains("└──────┴──────┘"));
+    try std.testing.expect(grid.contains("  remote "));
+    try std.testing.expect(!grid.contains("https://example.com/a.png"));
+    try std.testing.expect(grid.contains("╭ zig"));
+
     // fence injection: the zig keyword inside ```zig gets keyword gold
     try std.testing.expect(grid.containsFg("const", packRgb(149, 127, 184)));
 
@@ -3831,12 +3864,50 @@ test "markdown: inline rendering with conceal, injection and decorations" {
     try std.testing.expect(!grid.contains("# Title"));
     try std.testing.expect(grid.contains("Title"));
 
+    // The terminal cursor and cursorline must stay on the same rendered row
+    // across markdown virtual borders (table header and fence opener).
+    try sess.send("7j");
+    try gridWaitFor(&sess, &grid, "| Name | 值 |", 5000);
+    try std.testing.expect(grid.rowHasBg(grid.row, packRgb(0x2A, 0x2A, 0x37)));
+    try sess.send("6j");
+    try gridWaitFor(&sess, &grid, "```zig", 5000);
+    try std.testing.expect(grid.rowHasBg(grid.row, packRgb(0x2A, 0x2A, 0x37)));
+
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     if (exit_code != 0) {
         const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
         const start = if (idx) |i| i -| 300 else sess.used -| 2000;
         std.debug.print("MD EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
     }
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "markdown: local PNG uses Kitty graphics placement" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var image_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const image_path_len = try std.Io.Dir.cwd().realPathFile(io, "docs/screenshots/editor.png", &image_path_buf);
+    const document = try std.fmt.allocPrint(alloc, "![pixel]({s})\n", .{image_path_buf[0..image_path_len]});
+    defer alloc.free(document);
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}image.md", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    try writeTestFile(io, "/tmp", std.fs.path.basename(name), document);
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+    try sess.send("\x1b_Gi=1;OK\x1b\\");
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "pixel", 8000);
+    try sess.send("j");
+    try std.testing.expect(try sess.waitFor("\x1b_Ga=p,i=", 3000));
+    try std.testing.expect(!grid.contains("docs/screenshots/editor.png"));
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
@@ -12815,7 +12886,7 @@ test "git: marks stay glued to their lines while typing (instant shift, no refre
     try std.testing.expect(try Wait.until(&sess, &grid, "NORMAL"));
     try std.testing.expect(try Wait.until(&sess, &grid, "\u{258e}"));
     const row_after = Wait.markRow(&grid, "\u{258e}").?;
-    std.debug.print("gitshift: sign row after refresh={d}\n", .{ row_after });
+    std.debug.print("gitshift: sign row after refresh={d}\n", .{row_after});
     try std.testing.expect(row_after == row_before + 2);
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");

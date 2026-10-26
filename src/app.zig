@@ -22,6 +22,7 @@ const term = @import("term.zig");
 
 const autil = @import("app/util.zig");
 const git_job = @import("app/git_job.zig");
+const markdown = @import("app/markdown.zig");
 
 const GitJobKind = git_job.GitJobKind;
 const GitApplyOp = git_job.GitApplyOp;
@@ -64,7 +65,6 @@ pub const NavAction = enum { none, hover, definition, declaration, references, i
 
 /// An inlay hint: dim label shown inline at (line, character).
 pub const InlayHint = struct { line: u32, character: u32, label: []const u8 };
-
 
 pub const GitPreview = @import("app/git.zig").GitPreview;
 
@@ -188,6 +188,12 @@ pub const App = struct {
         decors_cache_start: u32 = 0,
         decors_cache_end: u32 = 0,
         decors_cache_rev: u64 = 0,
+        markdown_arena: ?std.heap.ArenaAllocator = null,
+        markdown_layout: ?*markdown.Layout = null,
+        markdown_cache_rev: u64 = 0,
+        markdown_cache_top: u32 = 0,
+        markdown_cache_rows: u32 = 0,
+        markdown_cache_width: u32 = 0,
     };
 
     /// One split window: which buffer it shows plus its own cursor/viewport.
@@ -269,7 +275,6 @@ pub const App = struct {
         project_root: ?[]u8 = null,
     };
 
-
     io: std.Io,
     alloc: std.mem.Allocator,
     env_map: *std.process.Environ.Map,
@@ -290,6 +295,12 @@ pub const App = struct {
     windows: std.ArrayList(Window) = .empty,
     win_root: ?*WinNode = null,
     current_win: usize = 0,
+    markdown_frame: ?*const markdown.Layout = null,
+    markdown_frame_buf: usize = std.math.maxInt(usize),
+    markdown_images: std.StringHashMap(union(enum) { loaded: vaxis.Image, failed: void }),
+    markdown_placed_images: std.ArrayList(u32) = .empty,
+    markdown_visible_images: std.ArrayList(u32) = .empty,
+    rendered_cursor_row: ?u32 = null,
 
     // ---- workspaces (Doom-Emacs style; see src/app/workspace.zig) ----
     /// Every workspace (never empty — always ≥1). The slot at `current_ws`
@@ -1334,6 +1345,7 @@ pub const App = struct {
             .tty = tty,
             .tty_buffer = tty_buffer,
             .loop = undefined,
+            .markdown_images = .init(init.gpa),
             .state = editor.Mode.State.init(),
             .buffers = .empty,
             .cmdline = .empty,
@@ -1390,6 +1402,17 @@ pub const App = struct {
         // pieces it borrows (env_map, io, the vaxis loop its wake posts to)
         // go away.
         self.cancelLspStart();
+        var image_it = self.markdown_images.iterator();
+        while (image_it.next()) |entry| {
+            switch (entry.value_ptr.*) {
+                .loaded => |image| self.vx.freeImage(self.tty.writer(), image.id),
+                .failed => {},
+            }
+            self.alloc.free(entry.key_ptr.*);
+        }
+        self.markdown_images.deinit();
+        self.markdown_placed_images.deinit(self.alloc);
+        self.markdown_visible_images.deinit(self.alloc);
         self.vx.deinit(self.alloc, self.tty.writer());
         self.tty.deinit();
         self.alloc.free(self.tty_buffer);
@@ -1740,6 +1763,7 @@ pub const App = struct {
     // ---- highlight → src/app/highlight.zig ----
     pub const visibleSpansFor = @import("app/highlight.zig").visibleSpansFor;
     pub const visibleDecorsFor = @import("app/highlight.zig").visibleDecorsFor;
+    pub const visibleMarkdownFor = @import("app/highlight.zig").visibleMarkdownFor;
     pub const loadRecent = @import("app/highlight.zig").loadRecent;
     pub const saveRecent = @import("app/highlight.zig").saveRecent;
     pub const execOpMotion = @import("app/highlight.zig").execOpMotion;

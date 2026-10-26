@@ -39,6 +39,7 @@ pub fn deinitBuffer(self: *App, buf: *Buffer) void {
     buf.folds.deinit(self.alloc);
     if (buf.spans_cache.len > 0) self.alloc.free(buf.spans_cache);
     if (buf.decors_cache.len > 0) self.alloc.free(buf.decors_cache);
+    if (buf.markdown_arena) |*arena| arena.deinit();
     if (buf.hl) |*h| h.deinit();
     if (buf.span_cache) |*sc| self.alloc.free(sc.spans);
     if (buf.path) |p| self.alloc.free(p);
