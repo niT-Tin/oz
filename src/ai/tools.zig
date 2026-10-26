@@ -5,17 +5,19 @@
 //! agent loop will wire together:
 //!
 //!   - `tools` request definitions for read_file, list_directory, grep,
-//!     edit_file and apply_patch, plus a helper that appends `tools` and
-//!     `tool_choice:"auto"` to an existing `openai.buildRequestBody` object;
+//!     edit_file, apply_patch and terminal, plus a helper that appends
+//!     `tools` and `tool_choice:"auto"` to an existing
+//!     `openai.buildRequestBody` object;
 //!   - an accumulator for streamed `choices[0].delta.tool_calls[]` fragments
 //!     (parallel calls, arbitrary argument splits, bounded buffers);
 //!   - `role:"tool"` result messages with bounded, JSON-escaped content;
 //!   - a deterministic permission policy (allow/confirm/deny) that never
 //!     auto-allows writes or terminal access by default.
 //!
-//! `terminal` is recognised by the permission policy but deliberately not
-//! advertised in `definitions`: there is no executor yet, and the protocol
-//! core does not fake one. Content deltas are not accumulated here; the
+//! `terminal` is advertised with a strict schema, but this module never runs
+//! anything: the App stages it for explicit human approval (M3b3). Its
+//! permission is always `confirm` — there is no policy switch that can
+//! auto-allow shell execution. Content deltas are not accumulated here; the
 //! existing `openai.parseDelta`/client path already owns that stream. The
 //! accumulator only records whether text was seen alongside tool calls.
 const std = @import("std");
@@ -44,7 +46,8 @@ pub const Kind = enum {
     grep,
     edit_file,
     apply_patch,
-    /// Reserved for a later milestone; no definition is advertised yet.
+    /// M3b3: one non-interactive shell command. Always staged for explicit
+    /// human approval; never auto-allowed.
     terminal,
 };
 
@@ -154,6 +157,27 @@ const apply_patch_parameters =
     \\}
 ;
 
+const terminal_parameters =
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "command": {
+    \\      "type": "string",
+    \\      "minLength": 1,
+    \\      "description": "Shell command (executed verbatim by /bin/sh -c in the workspace root)."
+    \\    },
+    \\    "timeout_ms": {
+    \\      "type": "integer",
+    \\      "minimum": 100,
+    \\      "maximum": 10000,
+    \\      "description": "Wall-clock limit in milliseconds; 100-10000. Omit for 5000."
+    \\    }
+    \\  },
+    \\  "required": ["command"],
+    \\  "additionalProperties": false
+    \\}
+;
+
 /// Tools advertised to the model. Order is deterministic; `tools` JSON is
 /// built from this array in the same order.
 pub const definitions = [_]Definition{
@@ -187,6 +211,12 @@ pub const definitions = [_]Definition{
         .description = "Apply a single-file unified diff patch. Requires user confirmation by default.",
         .parameters_json = apply_patch_parameters,
     },
+    .{
+        .kind = .terminal,
+        .name = "terminal",
+        .description = "Run ONE shell command with the user's own permissions in the workspace root. Requires explicit user approval before it runs; never executes automatically. Not sandboxed and not network-restricted. Combined output is capped at 64 KiB and runtime at 100-10000 ms (process group killed on timeout).",
+        .parameters_json = terminal_parameters,
+    },
 };
 
 /// Resolve an exact tool name. Unknown names return null.
@@ -197,8 +227,7 @@ pub fn definition(name: []const u8) ?Definition {
     return null;
 }
 
-/// Classify an exact tool name. `terminal` is classified even though it is
-/// not advertised yet, so the permission policy already has a safe answer.
+/// Classify an exact tool name. Unknown names return null (denied by policy).
 pub fn classify(name: []const u8) ?Kind {
     inline for (@typeInfo(Kind).@"enum".field_names) |field_name| {
         if (std.mem.eql(u8, name, field_name)) return @field(Kind, field_name);
@@ -792,8 +821,6 @@ pub const Policy = struct {
     allow_reads: bool = true,
     /// Mutating tools (edit_file/apply_patch) still require confirmation.
     allow_writes: bool = false,
-    /// Terminal execution still requires confirmation; terminal is reserved.
-    allow_terminal: bool = false,
 };
 
 pub const default_policy: Policy = .{};
@@ -812,7 +839,9 @@ pub fn decideWith(policy: Policy, tool_name: []const u8, arguments_json: []const
     return switch (kind) {
         .read_file, .list_directory, .grep => if (policy.allow_reads) .allow else .confirm,
         .edit_file, .apply_patch => if (policy.allow_writes) .allow else .confirm,
-        .terminal => if (policy.allow_terminal) .allow else .confirm,
+        // No policy switch can auto-allow shell execution: terminal is
+        // confirm (human allow) or deny (unknown names) only.
+        .terminal => .confirm,
     };
 }
 
@@ -947,14 +976,30 @@ test "tools: definitions produce valid OpenAI tools JSON" {
     }
 }
 
-test "tools: lookup, classification and reserved terminal" {
+test "tools: lookup, classification and terminal definition" {
     try std.testing.expectEqual(Kind.read_file, definition("read_file").?.kind);
     try std.testing.expectEqual(Kind.apply_patch, definition("apply_patch").?.kind);
-    try std.testing.expect(definition("terminal") == null);
+    try std.testing.expectEqual(Kind.terminal, definition("terminal").?.kind);
     try std.testing.expect(definition("nope") == null);
     try std.testing.expectEqual(Kind.terminal, classify("terminal").?);
     try std.testing.expectEqual(Kind.grep, classify("grep").?);
     try std.testing.expect(classify("Grep") == null);
+
+    // The terminal schema is strict and bounded; the model gets exactly the
+    // command/timeout contract the App validates before staging.
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, definition("terminal").?.parameters_json, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("object", obj.get("type").?.string);
+    try std.testing.expect(obj.get("additionalProperties").?.bool == false);
+    const props = obj.get("properties").?.object;
+    try std.testing.expect(props.get("command") != null);
+    const timeout = props.get("timeout_ms").?.object;
+    try std.testing.expectEqualStrings("integer", timeout.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 100), timeout.get("minimum").?.integer);
+    try std.testing.expectEqual(@as(i64, 10000), timeout.get("maximum").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), obj.get("required").?.array.items.len);
 }
 
 test "tools: appendTools composes with openai request bodies" {
@@ -1373,8 +1418,9 @@ test "tools: default permission policy is conservative" {
 
     try std.testing.expectEqual(Permission.confirm, decide("edit_file", "{}"));
     try std.testing.expectEqual(Permission.confirm, decide("apply_patch", "{}"));
-    // Reserved tool: classified safely even though it is not advertised.
-    try std.testing.expectEqual(Permission.confirm, decide("terminal", "{}"));
+    // Terminal is advertised but can only ever be confirmed (human allow) or
+    // denied (unknown). There is no auto-allow.
+    try std.testing.expectEqual(Permission.confirm, decide("terminal", "{\"command\":\"echo hi\"}"));
 
     try std.testing.expectEqual(Permission.deny, decide("shell", "{}"));
     try std.testing.expectEqual(Permission.deny, decide("Read_File", "{}"));
@@ -1387,9 +1433,9 @@ test "tools: policy overrides are explicit and unknown tools stay denied" {
     // Enabling writes does not implicitly enable terminal.
     try std.testing.expectEqual(Permission.confirm, decideWith(.{ .allow_writes = true }, "terminal", "{}"));
     try std.testing.expectEqual(Permission.confirm, decideWith(.{ .allow_reads = false }, "grep", "{}"));
-    try std.testing.expectEqual(Permission.allow, decideWith(.{ .allow_terminal = true }, "terminal", "{}"));
 
-    const permissive: Policy = .{ .allow_reads = true, .allow_writes = true, .allow_terminal = true };
+    const permissive: Policy = .{ .allow_reads = true, .allow_writes = true };
+    try std.testing.expectEqual(Permission.confirm, decideWith(permissive, "terminal", "{}"));
     try std.testing.expectEqual(Permission.deny, decideWith(permissive, "rm_rf", "{}"));
 }
 

@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const tools = @import("tools.zig");
+const terminal_tool = @import("terminal_tool.zig");
 
 /// Hard agent-loop bounds for one user turn. Exposed as `pub const` so tests
 /// and the e2e assertions can name the numbers instead of hard-coding them.
@@ -181,6 +182,7 @@ fn appendFmt(out: *std.ArrayList(u8), alloc: std.mem.Allocator, comptime fmt: []
 ///   grep           -> "\"needle\" in src · *.zig"
 ///   edit_file      -> "src/main.zig (replace)"
 ///   apply_patch    -> "patch: 12 lines"
+///   terminal       -> escaped command (bounded, explicit marker) + timeout
 ///   unknown        -> bounded, sanitized raw JSON
 ///
 /// The full `arguments_json` is never shown verbatim (it can be 64 KiB).
@@ -195,10 +197,28 @@ pub fn summarizeArguments(
     defer parsed.deinit();
     if (parsed.value != .object) return boundedSanitized(alloc, arguments_json, max_args_summary_bytes);
 
+    const obj = &parsed.value.object;
+
+    // terminal has its own bounded display helper; handle it before the
+    // generic summary buffer is allocated (no empty-list deinit/errdefer).
+    if (std.mem.eql(u8, name, "terminal")) {
+        if (obj.get("command")) |command_value| {
+            if (command_value == .string) {
+                var timeout_ms: u32 = terminal_tool.default_timeout_ms;
+                if (obj.get("timeout_ms")) |t| {
+                    if (t == .integer and t.integer > 0 and t.integer <= std.math.maxInt(u32)) {
+                        timeout_ms = @intCast(t.integer);
+                    }
+                }
+                return terminal_tool.commandForCard(alloc, command_value.string, timeout_ms);
+            }
+        }
+        return boundedSanitized(alloc, arguments_json, max_args_summary_bytes);
+    }
+
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     try out.ensureTotalCapacity(alloc, max_args_summary_bytes + 3);
-    const obj = &parsed.value.object;
 
     const path_value = if (obj.get("path")) |p| p else null;
     const path = if (path_value) |p| (if (p == .string and p.string.len > 0) p.string else null) else null;
@@ -260,7 +280,6 @@ pub fn summarizeArguments(
         try appendFmt(&out, alloc, "patch: {d} lines", .{lines});
         return out.toOwnedSlice(alloc);
     }
-
     // Unknown tool: a bounded raw summary is still truthful (the card says
     // unsupported; this only identifies what was requested).
     return boundedSanitized(alloc, arguments_json, max_args_summary_bytes);
@@ -442,6 +461,24 @@ pub const Metrics = struct {
         return null;
     }
 
+    /// Get the bucket for `name`, creating it (bounded by `max_metric_tools`).
+    /// Returns null once the bucket table is full (call counters are then not
+    /// recorded rather than allocating without bound).
+    fn ensureStats(self: *Metrics, alloc: std.mem.Allocator, name: []const u8) ?*Stats {
+        if (self.get(name)) |stats| return stats;
+        if (self.occupied >= max_metric_tools) return null;
+        const owned = alloc.dupe(u8, name) catch return null;
+        var idx: usize = 0;
+        while (idx < max_metric_tools and self.items[idx] != null) : (idx += 1) {}
+        if (idx >= max_metric_tools) {
+            alloc.free(owned);
+            return null;
+        }
+        self.items[idx] = .{ .name = owned };
+        self.occupied += 1;
+        return &self.items[idx].?;
+    }
+
     /// Record one real tool result. `running`/`cancelled` are display states,
     /// not calls, and are ignored. Executed calls (ok/error) feed the latency
     /// ring; approval_required/unsupported only increment their counters.
@@ -453,21 +490,7 @@ pub const Metrics = struct {
         duration_ms: u32,
     ) void {
         if (status == .running or status == .cancelled) return;
-        var stats = self.get(name);
-        if (stats == null) {
-            if (self.occupied >= max_metric_tools) return;
-            const owned = alloc.dupe(u8, name) catch return;
-            var idx: usize = 0;
-            while (idx < max_metric_tools and self.items[idx] != null) : (idx += 1) {}
-            if (idx >= max_metric_tools) {
-                alloc.free(owned);
-                return;
-            }
-            self.items[idx] = .{ .name = owned };
-            self.occupied += 1;
-            stats = &self.items[idx].?;
-        }
-        const s = stats.?;
+        const s = self.ensureStats(alloc, name) orelse return;
         s.calls += 1;
         switch (status) {
             .ok => {
@@ -496,25 +519,34 @@ pub const Metrics = struct {
         name: []const u8,
         verdict: Verdict,
     ) void {
-        var stats = self.get(name);
-        if (stats == null) {
-            if (self.occupied >= max_metric_tools) return;
-            const owned = alloc.dupe(u8, name) catch return;
-            var idx: usize = 0;
-            while (idx < max_metric_tools and self.items[idx] != null) : (idx += 1) {}
-            if (idx >= max_metric_tools) {
-                alloc.free(owned);
-                return;
-            }
-            self.items[idx] = .{ .name = owned };
-            self.occupied += 1;
-            stats = &self.items[idx].?;
-        }
-        const s = stats.?;
+        const s = self.ensureStats(alloc, name) orelse return;
         switch (verdict) {
             .approved => s.ok += 1,
             .rejected => s.denied += 1,
         }
+        self.revision +%= 1;
+    }
+
+    /// Record the real execution outcome of a call whose `calls` counter was
+    /// already recorded when it was admitted (M3b3 terminal: the command is
+    /// staged as `approval_required` first, then allowed and executed). This
+    /// adds ok/error counters and a real latency sample without counting the
+    /// call twice. Non-executed outcomes are ignored.
+    pub fn recordExecution(
+        self: *Metrics,
+        alloc: std.mem.Allocator,
+        name: []const u8,
+        status: CardStatus,
+        duration_ms: u32,
+    ) void {
+        if (status != .ok and status != .err) return;
+        const s = self.ensureStats(alloc, name) orelse return;
+        switch (status) {
+            .ok => s.ok += 1,
+            .err => s.errors += 1,
+            else => unreachable,
+        }
+        self.addDuration(s, duration_ms);
         self.revision +%= 1;
     }
 
@@ -674,6 +706,24 @@ test "agent: argument summaries are bounded and tool-specific" {
     const ctl = try summarizeArguments(alloc, "nope", "{\"path\":\"a\\u0001b\"}not json");
     defer alloc.free(ctl);
     try std.testing.expect(std.mem.indexOfScalar(u8, ctl, 1) == null);
+
+    // terminal: the card gets the escaped command (control bytes cannot leak
+    // into the UI) plus a non-default timeout; over-long commands are bounded
+    // with an explicit marker.
+    const term = try summarizeArguments(alloc, "terminal", "{\"command\":\"echo\\nhi\",\"timeout_ms\":250}");
+    defer alloc.free(term);
+    try std.testing.expectEqualStrings("echo\\nhi · timeout 250ms", term);
+
+    var long_cmd: [600]u8 = @splat('z');
+    var long_json: std.ArrayList(u8) = .empty;
+    defer long_json.deinit(alloc);
+    try long_json.appendSlice(alloc, "{\"command\":\"");
+    try long_json.appendSlice(alloc, &long_cmd);
+    try long_json.appendSlice(alloc, "\"}");
+    const term_long = try summarizeArguments(alloc, "terminal", long_json.items);
+    defer alloc.free(term_long);
+    try std.testing.expect(term_long.len <= terminal_tool.max_card_command_bytes + 32);
+    try std.testing.expect(std.mem.indexOf(u8, term_long, "… (+") != null);
 }
 
 test "agent: result excerpt skips headers, keeps errors, truncates UTF-8" {
@@ -916,6 +966,43 @@ test "agent: approval decisions do not count as a second call" {
     try std.testing.expectEqual(@as(u32, 1), staged.denied);
     try std.testing.expectEqual(@as(u32, 1), staged.ok);
     try std.testing.expectEqual(@as(u32, 0), staged.duration_count);
+}
+
+test "agent: staged terminal execution records one call and real duration" {
+    const alloc = std.testing.allocator;
+    var m: Metrics = .{};
+    defer m.deinit(alloc);
+
+    // Staged for approval: one call, one approval_required, no latency yet.
+    m.record(alloc, "terminal", .approval_required, 0);
+    const term = m.get("terminal").?;
+    try std.testing.expectEqual(@as(u32, 1), term.calls);
+    try std.testing.expectEqual(@as(u32, 1), term.approval_required);
+    try std.testing.expectEqual(@as(u32, 0), term.ok);
+    try std.testing.expectEqual(@as(u32, 0), term.duration_count);
+
+    // Allowed and executed: the same call gains a real sample, no second
+    // call count.
+    const before = m.revision;
+    m.recordExecution(alloc, "terminal", .ok, 12);
+    try std.testing.expectEqual(@as(u32, 1), term.calls);
+    try std.testing.expectEqual(@as(u32, 1), term.ok);
+    try std.testing.expectEqual(@as(u32, 1), term.duration_count);
+    try std.testing.expectEqual(@as(?u32, 12), term.averageMs());
+    try std.testing.expectEqual(@as(?u32, 12), term.p95RecentMs());
+    try std.testing.expect(m.revision != before);
+
+    // A second execution outcome (would be another call staged first) adds
+    // ok/error + sample only; running/cancelled/approval markers are ignored.
+    m.recordExecution(alloc, "terminal", .err, 4);
+    m.recordExecution(alloc, "terminal", .running, 99);
+    m.recordExecution(alloc, "terminal", .cancelled, 99);
+    m.recordExecution(alloc, "terminal", .approval_required, 99);
+    try std.testing.expectEqual(@as(u32, 1), term.calls);
+    try std.testing.expectEqual(@as(u32, 1), term.ok);
+    try std.testing.expectEqual(@as(u32, 1), term.errors);
+    try std.testing.expectEqual(@as(u32, 2), term.duration_count);
+    try std.testing.expectEqual(@as(?u32, 8), term.averageMs());
 }
 
 test "agent: chart cache key invalidates on thread/revision/size" {

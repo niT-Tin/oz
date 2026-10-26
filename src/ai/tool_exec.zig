@@ -15,8 +15,10 @@
 //! Write tools are never executed. `edit_file` returns
 //! `status = .approval_required` as a defensive fallback (M3b1 stages edits in
 //! the app and never sends them here); `apply_patch`, `terminal` and unknown
-//! names return `status = .unsupported`. There is no shell, no network, and no
-//! write syscall anywhere in this module.
+//! names return `status = .unsupported`. M3b3 likewise stages `terminal` in
+//! the App with explicit human approval and runs it in `app/terminal_job.zig`;
+//! this read-only executor never spawns a shell. There is no shell, no
+//! network, and no write syscall anywhere in this module.
 //!
 //! ## Workspace confinement
 //!
@@ -224,7 +226,9 @@ pub const Executor = struct {
     }
 
     fn unsupportedTerminal(self: *Executor) ExecuteError!Outcome {
-        const content = try self.alloc.dupe(u8, "unsupported in M3a: terminal execution is not available");
+        // M3b3 executes terminal commands only in the App's approved
+        // `terminal_job` path; the read-only executor is never routed there.
+        const content = try self.alloc.dupe(u8, "unsupported: terminal commands are staged and run by the app after explicit approval; the read-only executor never spawns a shell");
         errdefer self.alloc.free(content);
         const summary = try self.alloc.dupe(u8, "unsupported: terminal execution");
         return .{ .status = .unsupported, .content = content, .summary = summary };
