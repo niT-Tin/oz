@@ -14087,17 +14087,14 @@ test "terminal: <M-r> float opens, keys forward, Esc returns, <M-w>/<M-e> switch
 
     try std.testing.expect(try Wait.until(&sess, &grid, "NORMAL"));
 
-    // <M-r> (ESC r) opens the FLOATING terminal. Pin SHELL and PS1 so this
-    // does not depend on the CI runner's shell/prompt (root "#", bash "$",
-    // custom distro prompts); the unique marker is also easy to locate
-    // after layout switches.
+    // <M-r> (ESC r) opens the FLOATING terminal. The runner's prompt is
+    // environment-dependent (root "#", custom bash prompts, no prompt for a
+    // noninteractive shell), so do not wait for a prompt: give the shell a
+    // moment to start, then prove input forwarding with a unique echo.
     try sess.send("\x1br");
-    try std.testing.expect(try Wait.until(&sess, &grid, "OZPROMPT>"));
-
-    // while the terminal is focused every key is forwarded to the shell:
-    // it echoes the command line and prints the output
-    try sess.send("echo TERM_E2E_OK\r");
-    try std.testing.expect(try Wait.until(&sess, &grid, "TERM_E2E_OK"));
+    std.Io.sleep(io, .fromMilliseconds(700), .real) catch {};
+    try sess.send("echo TERM_FLOAT_OK\r");
+    try std.testing.expect(try Wait.until(&sess, &grid, "TERM_FLOAT_OK"));
 
     // Esc returns to Normal: the editor must receive keys again. A lone Esc
     // is ambiguous if coalesced with the next byte in one pty read (ESC+i
@@ -14113,47 +14110,45 @@ test "terminal: <M-r> float opens, keys forward, Esc returns, <M-w>/<M-e> switch
     try sess.send("\x1b");
     try std.testing.expect(try Wait.untilGone(&sess, &grid, "INSERT"));
 
-    // <M-w> switches the SAME session to the bottom strip: the resize clears
-    // the terminal screen but the shell redraws its prompt — the session
-    // survives, and the prompt now sits in the bottom region (bottom strip
-    // of the 24-row screen starts at row 15). Wait until the marker MOVES
-    // there (a stale marker from the floating layout is still in the grid).
+    // <M-w> switches the SAME session to the bottom strip. The shell survives
+    // the resize; send a fresh echo and require its output to appear in the
+    // bottom region (stale output from the floating layout is still in the
+    // grid, which is why this is a position-aware wait).
     try sess.send("\x1bw");
-    try std.testing.expect(try Wait.untilWhere(&sess, &grid, "OZPROMPT>", struct {
+    std.Io.sleep(io, .fromMilliseconds(400), .real) catch {};
+    try sess.send("echo TERM_BOTTOM_OK\r");
+    try std.testing.expect(try Wait.untilWhere(&sess, &grid, "TERM_BOTTOM_OK", struct {
         fn pred(row: usize, col: usize) bool {
             _ = col;
             return row >= 14;
         }
     }.pred));
 
-    // <M-e> switches to the right strip (40% width → cols 48..79): the
-    // prompt is still there, now past column 40
+    // <M-e> switches to the right strip (40% width → cols 48..79): a fresh
+    // echo lands past column 40.
     try sess.send("\x1be");
-    try std.testing.expect(try Wait.untilWhere(&sess, &grid, "OZPROMPT>", struct {
+    std.Io.sleep(io, .fromMilliseconds(400), .real) catch {};
+    try sess.send("echo TERM_RIGHT_OK\r");
+    try std.testing.expect(try Wait.untilWhere(&sess, &grid, "TERM_RIGHT_OK", struct {
         fn pred(row: usize, col: usize) bool {
             _ = row;
             return col >= 40;
         }
     }.pred));
 
-    // <M-r> floats the same session again (centered overlay, neither strip)
+    // <M-r> floats the same session again (centered overlay, neither strip).
     try sess.send("\x1br");
-    try std.testing.expect(try Wait.untilWhere(&sess, &grid, "OZPROMPT>", struct {
+    std.Io.sleep(io, .fromMilliseconds(400), .real) catch {};
+    try sess.send("echo TERM_FLOAT_AGAIN_OK\r");
+    try std.testing.expect(try Wait.untilWhere(&sess, &grid, "TERM_FLOAT_AGAIN_OK", struct {
         fn pred(row: usize, col: usize) bool {
             return row < 14 and col < 40;
         }
     }.pred));
 
-    // <M-r> again closes the terminal: the prompt disappears from the grid.
-    //
-    // KNOWN ISSUE: this step currently FAILS because oz's terminal teardown
-    // is broken — see the test's failure dump. Closing a live terminal
-    // deadlocks oz (4/5 runs, vaxis handleSigChild blocked on global_vt_mutex
-    // inside the interrupted main thread / iterating the deinit'd global_vts
-    // map) or aborts it (1/5 runs, "incorrect alignment" panic in
-    // Command.zig:111). The same-key close therefore never completes.
+    // <M-r> again closes the terminal: its floating marker disappears.
     try sess.send("\x1br");
-    const closed = try Wait.untilGone(&sess, &grid, "$");
+    const closed = try Wait.untilGone(&sess, &grid, "TERM_FLOAT_AGAIN_OK");
     if (!closed) {
         std.debug.print("terminal did not close after second <M-r>:\n", .{});
         grid.dump();
@@ -14165,13 +14160,14 @@ test "terminal: <M-r> float opens, keys forward, Esc returns, <M-w>/<M-e> switch
     }
     try std.testing.expect(closed);
 
-    // reopen: the global_vts map must survive the teardown — its deinit
-    // leaves the map undefined and the next spawn's put() crashed on the
-    // pointer-stability assert (open -> close -> open SIGABRT)
+    // reopen: the global_vts map must survive the teardown — a fresh echo
+    // proves the new session forwards keys.
     try sess.send("\x1br");
-    try std.testing.expect(try Wait.until(&sess, &grid, "OZPROMPT>"));
+    std.Io.sleep(io, .fromMilliseconds(700), .real) catch {};
+    try sess.send("echo TERM_REOPEN_OK\r");
+    try std.testing.expect(try Wait.until(&sess, &grid, "TERM_REOPEN_OK"));
     try sess.send("\x1br");
-    try std.testing.expect(try Wait.untilGone(&sess, &grid, "$"));
+    try std.testing.expect(try Wait.untilGone(&sess, &grid, "TERM_REOPEN_OK"));
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
