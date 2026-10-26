@@ -119,6 +119,16 @@ pub const Decor = struct {
         heading,
         /// Line-level: this range is a fenced code block (band).
         fence,
+        fence_delimiter,
+        fence_info,
+        /// Block-level table and its header/body separator.
+        table,
+        table_delimiter,
+        table_cell,
+        table_align,
+        /// Inline image and its local/remote destination.
+        image,
+        image_destination,
     };
 };
 
@@ -505,8 +515,8 @@ fn upperBound(comptime T: type, items: []const T, key: T) usize {
 
 /// Rainbow style for a bracket at `depth`: bracket0 + depth % 7.
 fn bracketStyle(depth: u32) Style {
-    const base: u8 = @intFromEnum(Style.bracket0);
-    return @enumFromInt(base + @as(u8, @intCast(depth % 7)));
+    const base: u8 = @backingInt(Style.bracket0);
+    return @fromBackingInt(@intCast(base + @as(u8, @intCast(depth % 7))));
 }
 
 /// Bracket nesting depth = the number of `getParent()` steps from `node` up
@@ -585,9 +595,9 @@ pub const Highlighter = struct {
 
     /// Grammars with a bundled query file (src/syntax/queries/<lang>.scm).
     const LANGUAGES = [_][]const u8{
-        "zig",       "rust",   "go",   "python", "typescript", "tsx",
-        "javascript", "json",  "c",    "cpp",    "bash",        "lua",
-        "toml",      "yaml",   "markdown", "markdown_inline",
+        "zig",        "rust", "go",       "python",          "typescript", "tsx",
+        "javascript", "json", "c",        "cpp",             "bash",       "lua",
+        "toml",       "yaml", "markdown", "markdown_inline",
     };
 
     pub fn init(allocator: std.mem.Allocator, lang_name: []const u8) !Highlighter {
@@ -1149,6 +1159,22 @@ pub const Highlighter = struct {
                 try out.append(arena, .{ .start = s, .end = e, .kind = .heading, .aux = level });
             } else if (std.mem.eql(u8, name, "md.fence")) {
                 try out.append(arena, .{ .start = s, .end = e, .kind = .fence });
+            } else if (std.mem.eql(u8, name, "md.fence_delimiter")) {
+                try out.append(arena, .{ .start = s, .end = e, .kind = .fence_delimiter });
+            } else if (std.mem.eql(u8, name, "md.fence_info")) {
+                try out.append(arena, .{ .start = s, .end = e, .kind = .fence_info });
+            } else if (std.mem.eql(u8, name, "md.table")) {
+                try out.append(arena, .{ .start = s, .end = e, .kind = .table });
+            } else if (std.mem.eql(u8, name, "md.table_delimiter")) {
+                try out.append(arena, .{ .start = s, .end = e, .kind = .table_delimiter });
+            } else if (std.mem.eql(u8, name, "md.table_cell")) {
+                try out.append(arena, .{ .start = s, .end = e, .kind = .table_cell });
+            } else if (std.mem.eql(u8, name, "md.table_align")) {
+                try out.append(arena, .{ .start = s, .end = e, .kind = .table_align });
+            } else if (std.mem.eql(u8, name, "md.image")) {
+                try out.append(arena, .{ .start = s, .end = e, .kind = .image });
+            } else if (std.mem.eql(u8, name, "md.image_destination")) {
+                try out.append(arena, .{ .start = s, .end = e, .kind = .image_destination });
             } else if (std.mem.eql(u8, name, "md.checkbox_on")) {
                 try out.append(arena, .{ .start = s, .end = e, .kind = .replace, .aux = 1, .replacement = "\u{f046}" });
             } else if (std.mem.eql(u8, name, "md.checkbox_off")) {
@@ -1377,9 +1403,9 @@ test "highlight: rainbow brackets — inner brackets have a deeper style than ou
     const if_brace = spanAt(spans.items, @intCast(if_lbrace)).?;
 
     // all four brackets get rainbow styles (never plain .punctuation)
-    const base: u8 = @intFromEnum(Style.bracket0);
+    const base: u8 = @backingInt(Style.bracket0);
     for ([_]Style{ fn_paren, fn_brace, if_paren, if_brace }) |st| {
-        const off = @as(u8, @intFromEnum(st)) -% base;
+        const off = @as(u8, @backingInt(st)) -% base;
         if (off > 6) {
             dumpSpans(src, spans.items);
             try std.testing.expect(false);
@@ -1387,10 +1413,10 @@ test "highlight: rainbow brackets — inner brackets have a deeper style than ou
     }
 
     // the nesting formula: inner (deeper in the tree) ordinal > outer ordinal
-    const ord_if_paren: u8 = @intFromEnum(if_paren);
-    const ord_fn_paren: u8 = @intFromEnum(fn_paren);
-    const ord_if_brace: u8 = @intFromEnum(if_brace);
-    const ord_fn_brace: u8 = @intFromEnum(fn_brace);
+    const ord_if_paren: u8 = @backingInt(if_paren);
+    const ord_fn_paren: u8 = @backingInt(fn_paren);
+    const ord_if_brace: u8 = @backingInt(if_brace);
+    const ord_fn_brace: u8 = @backingInt(fn_brace);
     if (!(ord_if_paren > ord_fn_paren) or !(ord_if_brace > ord_fn_brace)) {
         dumpSpans(src, spans.items);
     }
@@ -1631,6 +1657,7 @@ test "decor: markdown conceal/replace/heading/fence ranges" {
                 if (std.mem.eql(u8, dtext, "[ ]") and d.aux == 0) cb_off = true;
                 if (std.mem.eql(u8, dtext, "[x]") and d.aux == 1) cb_on = true;
             },
+            else => {},
         }
     }
     try std.testing.expect(heading != null);
@@ -2079,6 +2106,3 @@ test "scopeAt: nested call/initializer wrappers are transparent (build.zig case)
     const sc2 = hl.scopeAt(@intCast(in_imports)).?;
     try std.testing.expectEqual(@as(u32, 12), sc2.indent_col);
 }
-
-
-

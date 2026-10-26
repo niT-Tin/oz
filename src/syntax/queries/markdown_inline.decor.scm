@@ -36,3 +36,7 @@
 
 (image
   (link_title) @md.conceal)
+
+(image) @md.image
+(image
+  (link_destination) @md.image_destination)

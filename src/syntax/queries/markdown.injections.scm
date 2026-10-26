@@ -11,4 +11,7 @@
 
 ; every (inline) node → markdown_inline (no @injection.language capture:
 ; syncInjections defaults a bare content match to "markdown_inline"):
-(inline) @injection.content
+[
+  (inline)
+  (pipe_table_cell)
+] @injection.content

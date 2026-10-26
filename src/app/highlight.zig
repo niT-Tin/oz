@@ -8,6 +8,7 @@ const term = @import("../term.zig");
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const autil = @import("util.zig");
+const markdown = @import("markdown.zig");
 
 const Buffer = App.Buffer;
 
@@ -151,6 +152,35 @@ pub fn visibleDecorsFor(self: *App, buf: *Buffer, arena: std.mem.Allocator, view
     buf.decors_cache_end = end;
     buf.decors_cache_rev = rev;
     return buf.decors_cache;
+}
+
+pub fn visibleMarkdownFor(
+    self: *App,
+    buf: *Buffer,
+    win: @import("vaxis").Window,
+    decors: []const syntax.Decor,
+    view_top: u32,
+    content_rows: u32,
+    content_width: u32,
+) !?*markdown.Layout {
+    const hl = if (buf.hl) |*h| h else return null;
+    if (hl.decor_query == null) return null;
+    const rev = buf.history.revision;
+    if (buf.markdown_layout != null and buf.markdown_cache_rev == rev and
+        buf.markdown_cache_top == view_top and buf.markdown_cache_rows == content_rows and
+        buf.markdown_cache_width == content_width) return buf.markdown_layout;
+
+    if (buf.markdown_arena) |*old| old.deinit();
+    buf.markdown_arena = std.heap.ArenaAllocator.init(self.alloc);
+    buf.markdown_layout = null;
+    const a = buf.markdown_arena.?.allocator();
+    const layout = try markdown.build(a, &buf.pt, decors, win, content_width, buf.path);
+    buf.markdown_layout = layout;
+    buf.markdown_cache_rev = rev;
+    buf.markdown_cache_top = view_top;
+    buf.markdown_cache_rows = content_rows;
+    buf.markdown_cache_width = content_width;
+    return layout;
 }
 
 /// Load recent files from ~/.cache/oz/recent (one path per line).

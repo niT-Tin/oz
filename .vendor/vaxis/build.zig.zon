@@ -5,8 +5,7 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zigimg = .{
-            .url = "git+https://github.com/neurocyte/zigimg?ref=master#9d06b1d3a1098e249de49b718b65534a9842adef",
-            .hash = "zigimg-0.1.0-8_eo2hMmGABy_2fEUpMKx_y2pVirwapMFGCrMoNwzu6v",
+            .path = "../zigimg",
         },
         .uucode = .{
             .url = "git+https://github.com/neurocyte/uucode?ref=zig-0.17#ca42546a7219a0ba9b41a20e85dd65ea0b79cdc0",

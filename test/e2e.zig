@@ -71,7 +71,12 @@ const Pty = struct {
         );
         errdefer _ = linux.close(slave);
         // give the pty a window size so the child's terminal queries succeed
-        const ws = Winsize{ .ws_row = rows, .ws_col = cols, .ws_xpixel = 0, .ws_ypixel = 0 };
+        const ws = Winsize{
+            .ws_row = rows,
+            .ws_col = cols,
+            .ws_xpixel = cols * 10,
+            .ws_ypixel = rows * 20,
+        };
         _ = linux.ioctl(master, TIOCSWINSZ, @intFromPtr(&ws));
         return .{ .master = master, .slave = slave };
     }
@@ -579,6 +584,24 @@ const Grid = struct {
                         self.stashPending(bytes[i..]);
                         return;
                     }
+                    continue;
+                }
+                if (bytes[i + 1] == '_') {
+                    // APC (including Kitty graphics): payload is not terminal text.
+                    var k = i + 2;
+                    var found = false;
+                    while (k + 1 < bytes.len) : (k += 1) {
+                        if (bytes[k] == 0x1b and bytes[k + 1] == '\\') {
+                            k += 2;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        self.stashPending(bytes[i..]);
+                        return;
+                    }
+                    i = k;
                     continue;
                 }
                 if (bytes[i + 1] == ']') {
@@ -4434,6 +4457,12 @@ test "markdown: inline rendering with conceal, injection and decorations" {
             \\- [ ] todo
             \\- [x] done
             \\
+            \\| Name | 值 |
+            \\| --- | ---: |
+            \\| oz | 中文 |
+            \\
+            \\![remote](https://example.com/a.png)
+            \\
             \\```zig
             \\const zx = 1;
             \\```
@@ -4479,6 +4508,15 @@ test "markdown: inline rendering with conceal, injection and decorations" {
     try std.testing.expect(!grid.contains("[ ]"));
     try std.testing.expect(!grid.contains("[x]"));
 
+    // block layout: aligned table borders, remote-image fallback and fence chrome
+    try std.testing.expect(grid.contains("┌──────┬──────┐"));
+    try std.testing.expect(grid.contains("├──────┼──────┤"));
+    try std.testing.expect(grid.contains("│ oz   │ 中文 │"));
+    try std.testing.expect(grid.contains("└──────┴──────┘"));
+    try std.testing.expect(grid.contains("  remote "));
+    try std.testing.expect(!grid.contains("https://example.com/a.png"));
+    try std.testing.expect(grid.contains("╭ zig"));
+
     // fence injection: the zig keyword inside ```zig gets keyword gold
     try std.testing.expect(grid.containsFg("const", packRgb(149, 127, 184)));
 
@@ -4501,12 +4539,70 @@ test "markdown: inline rendering with conceal, injection and decorations" {
     try std.testing.expect(!grid.contains("# Title"));
     try std.testing.expect(grid.contains("Title"));
 
+    // The terminal cursor and cursorline must stay on the same rendered row
+    // across markdown virtual borders (table header and fence opener).
+    try sess.send("7j");
+    try gridWaitFor(&sess, &grid, "| Name | 值 |", 5000);
+    try std.testing.expect(grid.rowHasBg(grid.row, packRgb(0x2A, 0x2A, 0x37)));
+    try sess.send("6j");
+    try gridWaitFor(&sess, &grid, "```zig", 5000);
+    try std.testing.expect(grid.rowHasBg(grid.row, packRgb(0x2A, 0x2A, 0x37)));
+
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     if (exit_code != 0) {
         const idx = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "panic");
         const start = if (idx) |i| i -| 300 else sess.used -| 2000;
         std.debug.print("MD EXIT DUMP code={d}:\n{s}\n", .{ exit_code, sess.out[start..sess.used] });
     }
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "markdown: local PNG uses Kitty graphics placement" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var image_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const image_path_len = try std.Io.Dir.cwd().realPathFile(io, "docs/screenshots/editor.png", &image_path_buf);
+    const document = try std.fmt.allocPrint(alloc, "![pixel]({s})\n", .{image_path_buf[0..image_path_len]});
+    defer alloc.free(document);
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}image.md", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    try writeTestFile(io, "/tmp", std.fs.path.basename(name), document);
+
+    // A taller pty keeps the 20-row image and the line below it in view, so
+    // moving the cursor off the image line exercises preview concealment
+    // without scrolling the image out of the viewport.
+    var sess = try Session.spawnEnvRows(io, &.{ oz_exe_path, name }, null, 40);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "pixel", 8000);
+    // The e2e pty does not answer vaxis's capability queries; inject the
+    // graphics response after the initial frame, then the image load and
+    // placement happen on the next frame.
+    try sess.send("\x1b_Gi=1;OK\x1b\\");
+    try sess.send("j");
+    try std.testing.expect(try sess.waitFor("\x1b_Ga=p,i=", 3000));
+    // waitFor() drains the pty into sess.out but does not feed the virtual
+    // grid; feed the post-j frame until the cursor line's raw markdown
+    // source has been concealed.
+    var conceal_waited: i32 = 0;
+    while (grid.contains("docs/screenshots/editor.png")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) {
+            conceal_waited += 100;
+            if (conceal_waited >= 3000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(!grid.contains("docs/screenshots/editor.png"));
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 

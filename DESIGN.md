@@ -649,7 +649,7 @@ Client = {
 
 - sticky context、折叠（缩进驱动 + 摘要行，ts 精化为可选优化）、zen 模式
 - [x] 彩虹括号 + indent guide/scope 高亮动画（M4 前已落地）
-- [x] markdown 内联渲染（块级+行内高亮走 markdown/markdown_inline 双 grammar injection；fence 代码按 fence 语言注入上色；conceal 隐藏 `**`/`` ` ``/链接骨架/标题 `#` 前缀，光标行 anti-conceal，Insert/Visual/多光标/easymotion 时禁用；checkbox → Nerd Font 图标；标题/代码块整行背景带；表格仅上色，strikethrough 不做）
+- [x] markdown 内联与块级渲染（块级+行内高亮走 markdown/markdown_inline 双 grammar injection，表格单元格也进入 inline injection；fence 代码按语言注入上色并显示语言栏、边框和正文边界；conceal 隐藏 `**`/`` ` ``/链接骨架/标题 `#` 前缀，光标行 anti-conceal，Insert/Visual/多光标/easymotion 时禁用；checkbox → Nerd Font 图标；表格按 grapheme/CJK 单元格宽度对齐并绘制完整边框，支持左/右/居中对齐；本地图片经 Kitty graphics 按路径缓存、等比缩放并预留虚拟行，非 Kitty/远程/解码失败时显示可读占位，不自动下载远程资源；strikethrough 不做）
 - 颜色预览（#rrggbb）、TODO/FIXME 高亮 + leader tt 列表
 - CursorHold 单词自动高亮（120ms）、多主题切换（kanagawa-wave 默认）
 - 大文件降级策略落地
