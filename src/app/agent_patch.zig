@@ -1,27 +1,30 @@
-//! Staged `apply_patch` support (M3b2): pure single-file unified-diff parsing,
-//! exact application to the old full text, and a bounded review preview.
+//! Staged `apply_patch` support (M3b2): pure unified-diff parsing for one or
+//! more modified files, exact application to each old full text, and a bounded
+//! review preview.
 //!
 //! Deliberately App/vaxis/filesystem-independent: `src/app/agent_edit_ui.zig`
-//! resolves the patch path inside the captured workspace root, reads the
-//! target text (open buffer first, disk second), applies the hunks here, and
-//! stages the resulting whole-file replacement through the same
-//! `PendingAgentEdit` review/approve path as `edit_file`. The executor is
-//! never asked to write, and nothing here touches a buffer or a file.
+//! resolves every patch path inside the captured workspace root, reads the
+//! target texts (open buffer first, disk second), validates the whole set
+//! here, and stages one multi-file review. The executor is never asked to
+//! write, and nothing here touches a buffer or a file.
 //!
 //! Scope and invariants (this slice):
-//!   - exactly one file per patch: `diff --git`/`index`/`---`/`+++` are
-//!     optional but at least one path source is required;
+//!   - one file per `diff --git`/`---` section; sections are accepted
+//!     back-to-back in patch order (1..`max_files`, multi-file is 2+);
+//!     duplicate normalized paths are rejected;
 //!   - add/delete (`/dev/null`), binary, rename/copy and mode changes are
 //!     rejected with typed errors; there is never a partial apply;
-//!   - at least one `@@` hunk; hunk counts may be omitted (default 1);
+//!   - at least one `@@` hunk per file; hunk counts may be omitted (default 1);
 //!   - context/removal lines must match the old text byte-for-byte, hunks
 //!     must be in order and inside the file, and the new-file line numbers
 //!     must agree with the applied result (drift from earlier hunks);
 //!   - `\ No newline at end of file` is honored and validated against the
 //!     old text and the reconstructed new text;
-//!   - patch bytes, hunk count, hunk-body lines, the old text and the
-//!     reconstructed text are all bounded so one tool call cannot stage an
-//!     unbounded change.
+//!   - patch bytes, file count, total/per-file hunk counts, hunk-body lines,
+//!     the old texts and the reconstructed texts are all bounded so one tool
+//!     call cannot stage an unbounded change;
+//!   - `validateSet` applies every file before anything is staged or written
+//!     and returns a per-file reason list when any file fails.
 const std = @import("std");
 const inline_model = @import("inline.zig");
 const tool_exec = @import("../ai/tool_exec.zig");
@@ -29,14 +32,27 @@ const tool_exec = @import("../ai/tool_exec.zig");
 /// Maximum patch text accepted for one call.
 pub const max_patch_bytes: usize = 256 * 1024;
 
-/// Maximum staged old/result text. Shared with `agent_edit.max_stage_bytes`.
+/// Maximum staged old/result text per file. Shared with
+/// `agent_edit.max_stage_bytes`.
 pub const max_stage_bytes: usize = 256 * 1024;
 
-/// Maximum number of hunks in one patch.
+/// Maximum total staged old+result bytes for one multi-file set.
+pub const max_total_stage_bytes: usize = 2 * 1024 * 1024;
+
+/// Maximum number of modified files in one patch.
+pub const max_files: usize = 8;
+
+/// Maximum number of hunks in one patch (all files together).
 pub const max_hunks: usize = 256;
+
+/// Maximum number of hunks in one file.
+pub const max_hunks_per_file: usize = 128;
 
 /// Maximum total hunk-body lines (context/removal/addition) in one patch.
 pub const max_hunk_lines: usize = 16 * 1024;
+
+/// Maximum hunk-body lines in one file.
+pub const max_hunk_lines_per_file: usize = 8 * 1024;
 
 /// Upper bound on previewed lines (all shown hunks together).
 pub const max_preview_lines: u32 = 240;
@@ -88,7 +104,10 @@ pub const ParseError = error{
     NulByte,
     NotUtf8,
     MissingPath,
+    /// Single-file `parse` only: the input contained more than one section.
     MultiFile,
+    TooManyFiles,
+    DuplicatePath,
     AddDeleteFile,
     BinaryPatch,
     RenameOrCopy,
@@ -138,6 +157,8 @@ pub const Hunk = struct {
     }
 };
 
+pub const Stats = struct { removed: u32, added: u32 };
+
 pub const Patch = struct {
     /// Normalized workspace-relative path (not canonicalized against a root;
     /// the UI resolves that through `tool_exec` confinement before staging).
@@ -145,10 +166,58 @@ pub const Patch = struct {
     hunks: []Hunk,
 
     pub fn deinit(self: *Patch, alloc: std.mem.Allocator) void {
-        alloc.free(self.path);
+        if (self.path.len > 0) alloc.free(self.path);
         for (self.hunks) |*hunk| hunk.deinit(alloc);
-        alloc.free(self.hunks);
+        if (self.hunks.len > 0) alloc.free(self.hunks);
         self.* = undefined;
+    }
+
+    /// Full removed/added line counts from the parsed hunks. Unlike the
+    /// bounded preview's stats this never undercounts: the caller may show
+    /// only a prefix of the diff but the counts still describe the whole file.
+    pub fn stats(self: *const Patch) Stats {
+        var removed: u32 = 0;
+        var added: u32 = 0;
+        for (self.hunks) |*hunk| {
+            for (hunk.lines) |line| switch (line.kind) {
+                .remove => removed += 1,
+                .add => added += 1,
+                .context => {},
+            };
+        }
+        return .{ .removed = removed, .added = added };
+    }
+};
+
+/// One parsed patch: ordered file sections, exactly as they appeared. The
+/// order is deterministic (patch order) and is the order the review UI and
+/// the write transaction use.
+pub const PatchSet = struct {
+    files: []Patch,
+
+    pub fn deinit(self: *PatchSet, alloc: std.mem.Allocator) void {
+        for (self.files) |*file| file.deinit(alloc);
+        if (self.files.len > 0) alloc.free(self.files);
+        self.* = undefined;
+    }
+
+    /// Move one file out of the set. The caller then owns (and must deinit)
+    /// the returned Patch; `self` keeps a deinitializable empty slot.
+    pub fn takeFile(self: *PatchSet, index: usize) Patch {
+        const file = self.files[index];
+        self.files[index] = .{ .path = &.{}, .hunks = &.{} };
+        return file;
+    }
+
+    pub fn totals(self: *const PatchSet) Stats {
+        var removed: u32 = 0;
+        var added: u32 = 0;
+        for (self.files) |*file| {
+            const s = file.stats();
+            removed +|= s.removed;
+            added +|= s.added;
+        }
+        return .{ .removed = removed, .added = added };
     }
 };
 
@@ -471,9 +540,95 @@ fn isBinaryLine(line: []const u8) bool {
         std.mem.startsWith(u8, line, "GIT binary patch");
 }
 
-/// Parse a bounded, single-file unified diff. The returned `Patch` owns its
-/// path and hunk text; `deinit` frees them.
-pub fn parse(alloc: std.mem.Allocator, input: []const u8) ParseError!Patch {
+const Section = struct {
+    git_old: ?[]u8 = null,
+    git_new: ?[]u8 = null,
+    hdr_old: ?[]u8 = null,
+    hdr_new: ?[]u8 = null,
+    hunks: std.ArrayList(Hunk) = .empty,
+
+    fn deinit(self: *Section, alloc: std.mem.Allocator) void {
+        if (self.git_old) |p| alloc.free(p);
+        if (self.git_new) |p| alloc.free(p);
+        if (self.hdr_old) |p| alloc.free(p);
+        if (self.hdr_new) |p| alloc.free(p);
+        for (self.hunks.items) |*hunk| hunk.deinit(alloc);
+        self.hunks.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn hasPaths(self: *const Section) bool {
+        return self.git_old != null or self.git_new != null or
+            self.hdr_old != null or self.hdr_new != null;
+    }
+};
+
+/// Resolve one section's path source and append the finished `Patch` to the
+/// set. Consumes `section` (including on failure): callers can reset it to a
+/// fresh value and their own `deinit` stays a no-op.
+fn finalizeSection(
+    alloc: std.mem.Allocator,
+    section: *Section,
+    files: *std.ArrayList(Patch),
+    seen: *std.StringHashMap(void),
+) ParseError!void {
+    defer section.deinit(alloc);
+    if (files.items.len >= max_files) return error.TooManyFiles;
+    if (section.hunks.items.len == 0) return error.NoHunks;
+    var file_lines: usize = 0;
+    for (section.hunks.items) |hunk| file_lines += hunk.lines.len;
+    if (file_lines > max_hunk_lines_per_file) return error.TooManyLines;
+
+    var source: []const u8 = undefined;
+    if (section.git_old) |go| {
+        const gn = section.git_new orelse return error.MalformedHeader;
+        if (isDevNull(go) or isDevNull(gn)) return error.AddDeleteFile;
+        const pair = try splitFilePair(go, gn);
+        if (section.hdr_old) |ho| {
+            const hn = section.hdr_new orelse return error.MalformedHeader;
+            if (isDevNull(ho) or isDevNull(hn)) return error.AddDeleteFile;
+            const h_old = if (pair.old_strip) stripDiffPrefix(ho) else ho;
+            const h_new = if (pair.new_strip) stripDiffPrefix(hn) else hn;
+            if (!std.mem.eql(u8, h_old, pair.old) or !std.mem.eql(u8, h_new, pair.new)) {
+                return error.PathMismatch;
+            }
+        } else if (section.hdr_new != null) {
+            return error.MalformedHeader;
+        }
+        source = pair.old;
+    } else {
+        const ho = section.hdr_old orelse return error.MissingPath;
+        const hn = section.hdr_new orelse return error.MalformedHeader;
+        if (isDevNull(ho) or isDevNull(hn)) return error.AddDeleteFile;
+        const pair = try splitFilePair(ho, hn);
+        source = pair.old;
+    }
+
+    const normalized = tool_exec.normalizeWorkspacePath(alloc, source) catch |e| return mapPathError(e);
+    defer alloc.free(normalized);
+    if (std.mem.eql(u8, normalized, ".")) return error.PathEmpty;
+    // Duplicate detection uses the normalized spelling, so `a/x`, `x`, and a
+    // second `diff --git` section naming the same file are all one file.
+    if (seen.contains(normalized)) return error.DuplicatePath;
+
+    const owned_path = try alloc.dupe(u8, normalized);
+    errdefer alloc.free(owned_path);
+    const owned_hunks = try section.hunks.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_hunks) |*hunk| hunk.deinit(alloc);
+        alloc.free(owned_hunks);
+    }
+    // The map borrows `owned_path`; it is deinit'd (without freeing keys)
+    // before parseSet returns, so ownership can move into the Patch.
+    try seen.put(owned_path, {});
+    try files.append(alloc, .{ .path = owned_path, .hunks = owned_hunks });
+}
+
+/// Parse a bounded unified diff with 1..`max_files` modified-file sections.
+/// Sections may be separated by `diff --git` and/or back-to-back `---`/`+++`
+/// headers. The returned set preserves patch order; every file owns its path
+/// and hunk text.
+pub fn parseSet(alloc: std.mem.Allocator, input: []const u8) ParseError!PatchSet {
     if (input.len == 0) return error.EmptyPatch;
     if (input.len > max_patch_bytes) return error.PatchTooLarge;
     if (std.mem.indexOfScalar(u8, input, 0) != null) return error.NulByte;
@@ -502,22 +657,17 @@ pub fn parse(alloc: std.mem.Allocator, input: []const u8) ParseError!Patch {
     if (begin >= stop) return error.EmptyPatch;
     const lines = raw_lines[begin..stop];
 
-    var git_old: ?[]u8 = null;
-    var git_new: ?[]u8 = null;
-    var hdr_old: ?[]u8 = null;
-    var hdr_new: ?[]u8 = null;
-    defer {
-        if (git_old) |p| alloc.free(p);
-        if (git_new) |p| alloc.free(p);
-        if (hdr_old) |p| alloc.free(p);
-        if (hdr_new) |p| alloc.free(p);
-    }
-
-    var hunks: std.ArrayList(Hunk) = .empty;
+    var files: std.ArrayList(Patch) = .empty;
     errdefer {
-        for (hunks.items) |*hunk| hunk.deinit(alloc);
-        hunks.deinit(alloc);
+        for (files.items) |*file| file.deinit(alloc);
+        files.deinit(alloc);
     }
+    var seen = std.StringHashMap(void).init(alloc);
+    defer seen.deinit();
+
+    var section = Section{};
+    errdefer section.deinit(alloc);
+    var total_hunks: usize = 0;
     var total_hunk_lines: usize = 0;
     var index: usize = 0;
     while (index < lines.len) {
@@ -527,10 +677,16 @@ pub fn parse(alloc: std.mem.Allocator, input: []const u8) ParseError!Patch {
             continue;
         }
         if (std.mem.startsWith(u8, line, "diff --git ")) {
-            if (git_old != null or hdr_old != null or hunks.items.len > 0) return error.MultiFile;
+            if (section.hunks.items.len > 0) {
+                try finalizeSection(alloc, &section, &files, &seen);
+            } else if (section.hasPaths()) {
+                // A new file section before the previous one had a hunk is
+                // malformed; never silently drop the empty section.
+                return error.NoHunks;
+            }
             const parsed = try parseGitHeader(alloc, line["diff --git ".len..]);
-            git_old = parsed.old;
-            git_new = parsed.new;
+            section.git_old = parsed.old;
+            section.git_new = parsed.new;
             index += 1;
             continue;
         }
@@ -539,15 +695,20 @@ pub fn parse(alloc: std.mem.Allocator, input: []const u8) ParseError!Patch {
             continue;
         }
         if (std.mem.startsWith(u8, line, "--- ")) {
-            if (hdr_old != null or hdr_new != null or hunks.items.len > 0) return error.MultiFile;
-            hdr_old = try parseHeaderPath(alloc, line[4..]);
+            if (section.hdr_old != null or section.hdr_new != null) {
+                if (section.hunks.items.len == 0) return error.MalformedHeader;
+                try finalizeSection(alloc, &section, &files, &seen);
+            } else if (section.hunks.items.len > 0) {
+                try finalizeSection(alloc, &section, &files, &seen);
+            }
+            section.hdr_old = try parseHeaderPath(alloc, line[4..]);
             index += 1;
             continue;
         }
         if (std.mem.startsWith(u8, line, "+++ ")) {
-            if (hdr_new != null or hunks.items.len > 0) return error.MultiFile;
-            if (hdr_old == null) return error.MalformedHeader;
-            hdr_new = try parseHeaderPath(alloc, line[4..]);
+            if (section.hdr_new != null or section.hunks.items.len > 0) return error.MalformedHeader;
+            if (section.hdr_old == null) return error.MalformedHeader;
+            section.hdr_new = try parseHeaderPath(alloc, line[4..]);
             index += 1;
             continue;
         }
@@ -559,50 +720,39 @@ pub fn parse(alloc: std.mem.Allocator, input: []const u8) ParseError!Patch {
             const header = try parseHunkHeader(line);
             index += 1;
             var hunk = try parseHunkBody(alloc, lines, &index, header, &total_hunk_lines);
-            hunks.append(alloc, hunk) catch |e| {
+            if (section.hunks.items.len >= max_hunks_per_file) {
+                hunk.deinit(alloc);
+                return error.TooManyHunks;
+            }
+            section.hunks.append(alloc, hunk) catch |e| {
                 hunk.deinit(alloc);
                 return e;
             };
-            if (hunks.items.len > max_hunks) return error.TooManyHunks;
+            total_hunks += 1;
+            if (total_hunks > max_hunks) return error.TooManyHunks;
             continue;
         }
         if (std.mem.startsWith(u8, line, "diff ")) return error.MalformedHeader;
         return error.MalformedHunk;
     }
 
-    if (hunks.items.len == 0) return error.NoHunks;
-
-    var source: []const u8 = undefined;
-    if (git_old) |go| {
-        const gn = git_new.?;
-        if (isDevNull(go) or isDevNull(gn)) return error.AddDeleteFile;
-        const pair = try splitFilePair(go, gn);
-        if (hdr_old) |ho| {
-            const hn = hdr_new orelse return error.MalformedHeader;
-            if (isDevNull(ho) or isDevNull(hn)) return error.AddDeleteFile;
-            const h_old = if (pair.old_strip) stripDiffPrefix(ho) else ho;
-            const h_new = if (pair.new_strip) stripDiffPrefix(hn) else hn;
-            if (!std.mem.eql(u8, h_old, pair.old) or !std.mem.eql(u8, h_new, pair.new)) {
-                return error.PathMismatch;
-            }
-        } else if (hdr_new != null) {
-            return error.MalformedHeader;
-        }
-        source = pair.old;
-    } else {
-        const ho = hdr_old orelse return error.MissingPath;
-        const hn = hdr_new orelse return error.MalformedHeader;
-        if (isDevNull(ho) or isDevNull(hn)) return error.AddDeleteFile;
-        const pair = try splitFilePair(ho, hn);
-        source = pair.old;
+    if (section.hunks.items.len > 0) {
+        try finalizeSection(alloc, &section, &files, &seen);
+    } else if (section.hasPaths()) {
+        return error.NoHunks;
     }
+    if (files.items.len == 0) return error.NoHunks;
+    return .{ .files = try files.toOwnedSlice(alloc) };
+}
 
-    const normalized = tool_exec.normalizeWorkspacePath(alloc, source) catch |e| return mapPathError(e);
-    defer alloc.free(normalized);
-    if (std.mem.eql(u8, normalized, ".")) return error.PathEmpty;
-    const owned_path = try alloc.dupe(u8, normalized);
-    errdefer alloc.free(owned_path);
-    return .{ .path = owned_path, .hunks = try hunks.toOwnedSlice(alloc) };
+/// Single-file compatibility wrapper used by the existing callers/tests.
+/// Multi-file input is rejected with `error.MultiFile`; use `parseSet` for
+/// the staged multi-file path.
+pub fn parse(alloc: std.mem.Allocator, input: []const u8) ParseError!Patch {
+    var set = try parseSet(alloc, input);
+    defer set.deinit(alloc);
+    if (set.files.len != 1) return error.MultiFile;
+    return set.takeFile(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -773,6 +923,18 @@ fn appendNote(alloc: std.mem.Allocator, list: *std.ArrayList(inline_model.DiffLi
 /// shown hunks are bounded; omitted hunks/lines are summarized truthfully and
 /// the `-N +M` stats count only what is displayed.
 pub fn buildPreview(alloc: std.mem.Allocator, patch: *const Patch) error{OutOfMemory}!Preview {
+    return buildPreviewWithLimits(alloc, patch, max_preview_lines, max_preview_hunks);
+}
+
+/// Preview with explicit limits. Multi-file staging passes the global patch
+/// budgets so every file's diff is complete and the card/Changes stats are
+/// exact; the single-file path keeps the historical bounded preview.
+pub fn buildPreviewWithLimits(
+    alloc: std.mem.Allocator,
+    patch: *const Patch,
+    line_limit: u32,
+    hunk_limit: usize,
+) error{OutOfMemory}!Preview {
     var out: std.ArrayList(inline_model.DiffLine) = .empty;
     errdefer {
         for (out.items) |line| alloc.free(line.text);
@@ -786,7 +948,7 @@ pub fn buildPreview(alloc: std.mem.Allocator, patch: *const Patch) error{OutOfMe
     var omitted_hunks: usize = 0;
 
     outer: for (patch.hunks, 0..) |*hunk, hi| {
-        if (shown_hunks >= max_preview_hunks) {
+        if (shown_hunks >= hunk_limit) {
             preview.partial = true;
             omitted_hunks = patch.hunks.len - hi;
             break;
@@ -801,7 +963,7 @@ pub fn buildPreview(alloc: std.mem.Allocator, patch: *const Patch) error{OutOfMe
         shown_hunks += 1;
 
         for (hunk.lines) |line| {
-            if (shown_lines >= max_preview_lines) {
+            if (shown_lines >= line_limit) {
                 preview.partial = true;
                 break :outer;
             }
@@ -833,6 +995,91 @@ pub fn buildPreview(alloc: std.mem.Allocator, patch: *const Patch) error{OutOfMe
     }
     preview.lines = try out.toOwnedSlice(alloc);
     return preview;
+}
+
+// ---------------------------------------------------------------------------
+// Whole-set validation
+// ---------------------------------------------------------------------------
+
+pub const ValidationIssue = struct {
+    /// Index in `PatchSet.files` / the caller's old-text array.
+    index: usize,
+    /// Path borrowed from the parsed set; valid until the set is freed.
+    path: []const u8,
+    err: ApplyError,
+};
+
+pub const Validation = union(enum) {
+    /// One owned new full text per file, in patch order.
+    ok: [][]u8,
+    /// At least one file failed; no new text is returned and nothing may be
+    /// staged or written.
+    rejected: []ValidationIssue,
+
+    pub fn deinit(self: *Validation, alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .ok => |texts| {
+                for (texts) |text| alloc.free(text);
+                alloc.free(texts);
+            },
+            .rejected => |issues| alloc.free(issues),
+        }
+        self.* = undefined;
+    }
+};
+
+/// Apply every file's hunks to its old full text before anything is staged or
+/// written. Collects every failure (not just the first) so the caller can
+/// show a clear per-file reason list. When any file fails, all successfully
+/// reconstructed texts are freed and the set must be rejected as a whole.
+pub fn validateSet(
+    alloc: std.mem.Allocator,
+    set: *const PatchSet,
+    old_texts: []const []const u8,
+) error{OutOfMemory}!Validation {
+    std.debug.assert(old_texts.len == set.files.len);
+    var applied: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (applied.items) |text| alloc.free(text);
+        applied.deinit(alloc);
+    }
+    var issues: std.ArrayList(ValidationIssue) = .empty;
+    errdefer issues.deinit(alloc);
+
+    var total_old: usize = 0;
+    var total_new: usize = 0;
+    for (set.files, 0..) |*file, i| {
+        const old_text = old_texts[i];
+        total_old = std.math.add(usize, total_old, old_text.len) catch max_total_stage_bytes + 1;
+        const result = apply(alloc, file, old_text) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                try issues.append(alloc, .{ .index = i, .path = file.path, .err = e });
+                continue;
+            },
+        };
+        total_new = std.math.add(usize, total_new, result.len) catch max_total_stage_bytes + 1;
+        const total_combined = std.math.add(usize, total_old, total_new) catch max_total_stage_bytes + 1;
+        if (old_text.len > max_stage_bytes or result.len > max_stage_bytes or
+            total_old > max_total_stage_bytes or total_new > max_total_stage_bytes or
+            total_combined > max_total_stage_bytes)
+        {
+            alloc.free(result);
+            try issues.append(alloc, .{ .index = i, .path = file.path, .err = error.TooLarge });
+            continue;
+        }
+        applied.append(alloc, result) catch |e| {
+            alloc.free(result);
+            return e;
+        };
+    }
+
+    if (issues.items.len > 0) {
+        for (applied.items) |text| alloc.free(text);
+        applied.deinit(alloc);
+        return .{ .rejected = try issues.toOwnedSlice(alloc) };
+    }
+    return .{ .ok = try applied.toOwnedSlice(alloc) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1311,4 +1558,250 @@ test "agent_patch: fenced and no-prefix single-file patches parse" {
     const from_git = try applyText(alloc, git_only, "x\n");
     defer alloc.free(from_git);
     try testing.expectEqualStrings("y\n", from_git);
+}
+
+test "agent_patch: parses multiple files in order with mixed hunk counts" {
+    const alloc = testing.allocator;
+    const patch_text =
+        \\diff --git a/one.txt b/one.txt
+        \\index 1111111..2222222 100644
+        \\--- a/one.txt
+        \\+++ b/one.txt
+        \\@@ -1,2 +1,2 @@
+        \\ one
+        \\-old one
+        \\+new one
+        \\@@ -3 +3 @@
+        \\-old one extra
+        \\+new one extra
+        \\--- a/two.txt
+        \\+++ b/two.txt
+        \\@@ -1 +1,2 @@
+        \\-old two
+        \\+new two
+        \\+extra two
+        \\diff --git a/three.txt b/three.txt
+        \\--- a/three.txt
+        \\+++ b/three.txt
+        \\@@ -2,2 +2,2 @@
+        \\ keep three
+        \\-old three
+        \\+new three
+        \\
+    ;
+    var set = try parseSet(alloc, patch_text);
+    defer set.deinit(alloc);
+    try testing.expectEqual(@as(usize, 3), set.files.len);
+    try testing.expectEqualStrings("one.txt", set.files[0].path);
+    try testing.expectEqualStrings("two.txt", set.files[1].path);
+    try testing.expectEqualStrings("three.txt", set.files[2].path);
+    try testing.expectEqual(@as(usize, 2), set.files[0].hunks.len);
+    try testing.expectEqual(@as(usize, 1), set.files[1].hunks.len);
+    try testing.expectEqual(@as(usize, 1), set.files[2].hunks.len);
+    const totals = set.totals();
+    try testing.expectEqual(@as(u32, 4), totals.removed);
+    try testing.expectEqual(@as(u32, 5), totals.added);
+
+    const old_texts = [_][]const u8{ "one\nold one\nold one extra\n", "old two\n", "zero\nkeep three\nold three\n" };
+    var validation = try validateSet(alloc, &set, &old_texts);
+    defer validation.deinit(alloc);
+    switch (validation) {
+        .ok => |texts| {
+            try testing.expectEqual(@as(usize, 3), texts.len);
+            try testing.expectEqualStrings("one\nnew one\nnew one extra\n", texts[0]);
+            try testing.expectEqualStrings("new two\nextra two\n", texts[1]);
+            try testing.expectEqualStrings("zero\nkeep three\nnew three\n", texts[2]);
+        },
+        .rejected => return error.TestUnexpectedResult,
+    }
+
+    // Each file exposes its own complete preview (multi staging passes the
+    // global budgets instead of the single-file display cap).
+    const preview = try buildPreviewWithLimits(alloc, &set.files[1], 1000, 100);
+    defer {
+        for (preview.lines) |line| alloc.free(line.text);
+        alloc.free(preview.lines);
+    }
+    try testing.expectEqual(@as(u32, 1), preview.removed);
+    try testing.expectEqual(@as(u32, 2), preview.added);
+    try testing.expect(!preview.partial);
+}
+
+test "agent_patch: duplicate, unsafe and oversized file sets are rejected" {
+    const alloc = testing.allocator;
+
+    // Same normalized path twice (`a/dup.txt`, then `dup.txt`).
+    try expectParseError(error.DuplicatePath,
+        \\--- a/dup.txt
+        \\+++ b/dup.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+b
+        \\--- dup.txt
+        \\+++ dup.txt
+        \\@@ -1 +1 @@
+        \\-c
+        \\+d
+        \\
+    );
+    // A second section with an absolute path rejects the whole set.
+    try expectParseError(error.PathAbsolute,
+        \\--- a/ok.txt
+        \\+++ b/ok.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+b
+        \\--- /etc/passwd
+        \\+++ /etc/passwd
+        \\@@ -1 +1 @@
+        \\-c
+        \\+d
+        \\
+    );
+    // A `..` section also rejects before any file is returned.
+    try expectParseError(error.PathParent,
+        \\--- a/ok.txt
+        \\+++ b/ok.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+b
+        \\--- a/../escape.txt
+        \\+++ b/../escape.txt
+        \\@@ -1 +1 @@
+        \\-c
+        \\+d
+        \\
+    );
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    var i: usize = 0;
+    while (i <= max_files) : (i += 1) {
+        const section = try std.fmt.allocPrint(
+            alloc,
+            "--- a/f{d}.txt\n+++ b/f{d}.txt\n@@ -1 +1 @@\n-a\n+b\n",
+            .{ i, i },
+        );
+        defer alloc.free(section);
+        try buf.appendSlice(alloc, section);
+    }
+    try expectParseError(error.TooManyFiles, buf.items);
+}
+
+test "agent_patch: one malformed section rejects the entire set" {
+    try expectParseError(error.MalformedCounts,
+        \\--- a/one.txt
+        \\+++ b/one.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+b
+        \\--- a/two.txt
+        \\+++ b/two.txt
+        \\@@ -1,2 +1,2 @@
+        \\-only one line
+        \\+nope
+        \\
+    );
+    try expectParseError(error.NoHunks,
+        \\--- a/one.txt
+        \\+++ b/one.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+b
+        \\--- a/empty.txt
+        \\+++ b/empty.txt
+        \\
+    );
+    try expectParseError(error.BinaryPatch,
+        \\--- a/one.txt
+        \\+++ b/one.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+b
+        \\diff --git a/img.bin b/img.bin
+        \\Binary files a/img.bin and b/img.bin differ
+        \\
+    );
+}
+
+test "agent_patch: per-file hunk budget and total validation errors" {
+    const alloc = testing.allocator;
+    var many: std.ArrayList(u8) = .empty;
+    defer many.deinit(alloc);
+    try many.appendSlice(alloc, "--- a/f.txt\n+++ b/f.txt\n");
+    var h: usize = 0;
+    while (h <= max_hunks_per_file) : (h += 1) {
+        const line = try std.fmt.allocPrint(alloc, "@@ -{d},1 +{d},1 @@\n x\n", .{ h + 1, h + 1 });
+        defer alloc.free(line);
+        try many.appendSlice(alloc, line);
+    }
+    try expectParseError(error.TooManyHunks, many.items);
+
+    // Validation collects every failing file instead of stopping at the
+    // first; the caller can show a real per-file list and write nothing.
+    var set = try parseSet(alloc,
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-old a
+        \\+new a
+        \\--- a/b.txt
+        \\+++ b/b.txt
+        \\@@ -1 +1 @@
+        \\-old b
+        \\+new b
+        \\
+    );
+    defer set.deinit(alloc);
+    const stale = [_][]const u8{ "wrong a\n", "old b\n" };
+    var rejected = try validateSet(alloc, &set, &stale);
+    defer rejected.deinit(alloc);
+    switch (rejected) {
+        .ok => return error.TestUnexpectedResult,
+        .rejected => |issues| {
+            try testing.expectEqual(@as(usize, 1), issues.len);
+            try testing.expectEqual(@as(usize, 0), issues[0].index);
+            try testing.expectEqualStrings("a.txt", issues[0].path);
+            try testing.expectEqual(error.ContextMismatch, issues[0].err);
+        },
+    }
+
+    const stale_both = [_][]const u8{ "wrong a\n", "wrong b\n" };
+    var rejected_both = try validateSet(alloc, &set, &stale_both);
+    defer rejected_both.deinit(alloc);
+    switch (rejected_both) {
+        .ok => return error.TestUnexpectedResult,
+        .rejected => |issues| {
+            try testing.expectEqual(@as(usize, 2), issues.len);
+            try testing.expectEqualStrings("a.txt", issues[0].path);
+            try testing.expectEqualStrings("b.txt", issues[1].path);
+        },
+    }
+}
+
+test "agent_patch: single-file wrapper still rejects multi-file input" {
+    const alloc = testing.allocator;
+    try testing.expectError(error.MultiFile, parse(alloc,
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+A
+        \\--- a/b.txt
+        \\+++ b/b.txt
+        \\@@ -1 +1 @@
+        \\-b
+        \\+B
+        \\
+    ));
+    var set = try parseSet(alloc,
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+A
+        \\
+    );
+    defer set.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), set.files.len);
 }
