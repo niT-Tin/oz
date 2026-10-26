@@ -15050,7 +15050,8 @@ fn aiWriteFile(io: Io, dir: []const u8, name: []const u8, text: []const u8) !voi
 fn aiReadFile(io: Io, alloc: std.mem.Allocator, dir: []const u8, name: []const u8) ![]u8 {
     var buf: [256]u8 = undefined;
     const path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name });
-    return std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, path, alloc, .limited(64 * 1024));
+    // Requests may carry a bounded 64 KiB tool result plus JSON framing.
+    return std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, path, alloc, .limited(128 * 1024));
 }
 
 /// The rail's reserved width at a terminal width (mirrors ai/workspace.zig;
@@ -15987,7 +15988,8 @@ test "ai workspace: workbox tabs show honest empty states and badge 0" {
     try std.testing.expect(!grid.contains("older"));
 
     try sess.send("r");
-    try gridWaitFor(&sess, &grid, "agent terminal arrives in M3", 3000);
+    try gridWaitFor(&sess, &grid, "no pending terminal command", 3000);
+    try gridWaitFor(&sess, &grid, "editor terminal: Alt+r", 3000);
     try gridWaitFor(&sess, &grid, "editor terminal: Alt+r", 3000);
     try std.testing.expect(!grid.contains("$ "));
 
@@ -17050,6 +17052,22 @@ fn aiPatchArgs(alloc: std.mem.Allocator, patch_text: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "{{\"patch\":{s}}}", .{quoted});
 }
 
+/// JSON arguments for one `terminal` call (M3b3).
+fn aiTerminalArgs(alloc: std.mem.Allocator, command: []const u8, timeout_ms: ?u32) ![]u8 {
+    const quoted = try aiJsonQuote(alloc, command);
+    defer alloc.free(quoted);
+    if (timeout_ms) |t| {
+        return std.fmt.allocPrint(alloc, "{{\"command\":{s},\"timeout_ms\":{d}}}", .{ quoted, t });
+    }
+    return std.fmt.allocPrint(alloc, "{{\"command\":{s}}}", .{quoted});
+}
+
+fn aiFileExists(io: Io, path: []const u8) bool {
+    var file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch return false;
+    file.close(io);
+    return true;
+}
+
 /// One OpenAI tool-call stream chunk sequence with `specs` as parallel calls
 /// in a single delta (index = position). `arguments` is JSON-escaped here.
 fn aiToolCallsSse(alloc: std.mem.Allocator, specs: []const AiToolSpec) ![]u8 {
@@ -17787,7 +17805,7 @@ test "approval: second write while pending is refused; pending survives a thread
     try aiQuit(&sess);
 }
 
-test "approval: apply_patch stages while terminal and unknown stay unsupported" {
+test "approval: apply_patch stages while an unknown tool stays unsupported" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
@@ -17818,7 +17836,6 @@ test "approval: apply_patch stages while terminal and unknown stay unsupported" 
     defer alloc.free(patch_args);
     const round1 = try aiToolCallsSse(alloc, &.{
         .{ .id = "call_patch", .name = "apply_patch", .args = patch_args },
-        .{ .id = "call_term", .name = "terminal", .args = "{\"command\":\"rm -rf /\"}" },
         .{ .id = "call_unknown", .name = "mystery", .args = "{}" },
     });
     defer alloc.free(round1);
@@ -17849,7 +17866,6 @@ test "approval: apply_patch stages while terminal and unknown stay unsupported" 
 
     try sess.send("c");
     try gridWaitFor(&sess, &grid, "apply_patch", 8000);
-    try gridWaitFor(&sess, &grid, "terminal", 8000);
     try gridWaitFor(&sess, &grid, "mystery", 8000);
     try gridWaitFor(&sess, &grid, "approval required", 8000);
     try gridWaitFor(&sess, &grid, "unsupported", 8000);
@@ -17860,10 +17876,8 @@ test "approval: apply_patch stages while terminal and unknown stay unsupported" 
     const req2 = try aiReadFile(io, alloc, dir, "request-2.json");
     defer alloc.free(req2);
     try std.testing.expect(std.mem.indexOf(u8, req2, "approval required: apply_patch staged for review; not applied") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req2, "terminal execution is not available") != null);
     try std.testing.expect(std.mem.indexOf(u8, req2, "unsupported tool: mystery") != null);
     try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_patch\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_term\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_unknown\"") != null);
 
     // Nothing touched the file or the buffer before a human decision.
@@ -17879,13 +17893,12 @@ test "approval: apply_patch stages while terminal and unknown stay unsupported" 
     try std.testing.expect(!grid.contains("STAGED"));
     try expectNoDirtyMarker(&grid);
 
-    // Rejected patch + unsupported terminal/unknown all show real metrics.
+    // Rejected patch + unsupported unknown both show real metrics.
     try sess.send("\x17a");
     try aiWaitRailFocus(&sess, &grid, aiRailCol(120), true, 3000);
     try sess.send("t");
-    try gridWaitFor(&sess, &grid, "3 calls", 5000);
+    try gridWaitFor(&sess, &grid, "2 calls", 5000);
     try gridWaitFor(&sess, &grid, "apply_patch", 3000);
-    try gridWaitFor(&sess, &grid, "terminal", 3000);
     try gridWaitFor(&sess, &grid, "mystery", 3000);
     try gridWaitFor(&sess, &grid, "appr 1", 3000);
     try gridWaitFor(&sess, &grid, "denied 1", 3000);
@@ -17894,6 +17907,774 @@ test "approval: apply_patch stages while terminal and unknown stay unsupported" 
     const after = try absFileText(io, alloc, editor);
     defer alloc.free(after);
     try std.testing.expectEqualStrings("UNSUP editor marker\n", after);
+
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+
+test "terminal: stages approval, runs nothing before allow, then executes and follows up" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_term_run_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/term.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "TERM_EDITOR_ORIGINAL\n");
+    }
+    var ran_buf: [220:0]u8 = undefined;
+    const ran = try bufPrintZ(&ran_buf, "{s}/ran.txt", .{root});
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const command = "printf 'TERM_OUTPUT_OK\\n'; printf RAN > ran.txt";
+    const args = try aiTerminalArgs(alloc, command, null);
+    defer alloc.free(args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_term_ok", .name = "terminal", .args = args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "TERMINAL_FOLLOWUP_DONE");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "TERM_EDITOR_ORIGINAL", 5000);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("run the terminal tool");
+    try sess.send("\r");
+
+    // Approval surface: command, timeout and explicit buttons. No process has
+    // been spawned and the editor file is untouched.
+    try gridWaitFor(&sess, &grid, "approval required", 10000);
+    try gridWaitFor(&sess, &grid, "terminal · approval required", 5000);
+    try gridWaitFor(&sess, &grid, "[a] allow", 5000);
+    try gridWaitFor(&sess, &grid, "your permissions · not sandboxed", 5000);
+    try gridWaitFor(&sess, &grid, "printf", 5000);
+    try gridWaitFor(&sess, &grid, "timeout 5000ms", 5000);
+    // The thread stays parked on the approval (status `approval…`), not idle,
+    // and no follow-up request may be sent before the human decides.
+    try gridWaitFor(&sess, &grid, "approval…", 5000);
+    try std.testing.expect(!aiFileExists(io, ran));
+    const before = try absFileText(io, alloc, editor);
+    defer alloc.free(before);
+    try std.testing.expectEqualStrings("TERM_EDITOR_ORIGINAL\n", before);
+    try frame.expectNoHorizontalOverflow(&grid, 120);
+
+    // Explicit allow -> background command -> real output + exit status.
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "terminal · ok", 8000);
+    try gridWaitFor(&sess, &grid, "TERM_OUTPUT_OK", 8000);
+    try gridWaitFor(&sess, &grid, "exit 0", 5000);
+    try gridWaitFor(&sess, &grid, "idle", 8000);
+    try std.testing.expect(aiFileExists(io, ran));
+
+    // The model follow-up carries the real tool result (Chat tab).
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "TERMINAL_FOLLOWUP_DONE", 10000);
+    const req2 = try aiReadFile(io, alloc, dir, "request-2.json");
+    defer alloc.free(req2);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"role\":\"tool\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_term_ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "exit: 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "TERM_OUTPUT_OK") != null);
+
+    const after = try absFileText(io, alloc, editor);
+    defer alloc.free(after);
+    try std.testing.expectEqualStrings("TERM_EDITOR_ORIGINAL\n", after);
+
+    // Chat card carries the same real status; Tools tab counts the call and
+    // its real duration.
+    try gridWaitFor(&sess, &grid, "exit 0 · TERM_OUTPUT_OK", 5000);
+    try gridWaitFor(&sess, &grid, "ok ", 3000);
+    try sess.send("t");
+    try gridWaitFor(&sess, &grid, "1 calls", 5000);
+    try gridWaitFor(&sess, &grid, "ok 1", 5000);
+    try gridWaitFor(&sess, &grid, "avg ", 5000);
+    try frame.expectNoHorizontalOverflow(&grid, 120);
+
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+
+test "terminal: deny spawns no process, reports rejected and metrics" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_term_deny_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/term.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "DENY_EDITOR_MARKER\n");
+    }
+    var side_buf: [220:0]u8 = undefined;
+    const side = try bufPrintZ(&side_buf, "{s}/deny_side.txt", .{root});
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const args = try aiTerminalArgs(alloc, "printf NOPE > deny_side.txt", 2500);
+    defer alloc.free(args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_term_deny", .name = "terminal", .args = args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "DENY_FOLLOWUP_DONE");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "DENY_EDITOR_MARKER", 5000);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("stage a denied terminal command");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "terminal · approval required", 10000);
+    try gridWaitFor(&sess, &grid, "[a] allow", 5000);
+    try gridWaitFor(&sess, &grid, "timeout 2500ms", 5000);
+    try std.testing.expect(!aiFileExists(io, side));
+
+    try sess.send("r");
+    try gridWaitFor(&sess, &grid, "terminal · rejected", 5000);
+    try gridWaitFor(&sess, &grid, "denied · not executed", 5000);
+    try std.testing.expect(!aiFileExists(io, side));
+    const disk = try absFileText(io, alloc, editor);
+    defer alloc.free(disk);
+    try std.testing.expectEqualStrings("DENY_EDITOR_MARKER\n", disk);
+
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "DENY_FOLLOWUP_DONE", 10000);
+    try gridWaitFor(&sess, &grid, "rejected", 5000);
+    try gridWaitFor(&sess, &grid, "denied · not executed", 3000);
+    const req2 = try aiReadFile(io, alloc, dir, "request-2.json");
+    defer alloc.free(req2);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_term_deny\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "denied: user rejected the command; not executed") != null);
+
+    try sess.send("t");
+    try gridWaitFor(&sess, &grid, "1 calls", 5000);
+    try gridWaitFor(&sess, &grid, "denied 1", 5000);
+    try std.testing.expect(!grid.contains("TERM_OUTPUT"));
+
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+
+test "terminal: failing command reports the real exit code and error result" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_term_fail_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/term.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "FAIL_EDITOR_MARKER\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const args = try aiTerminalArgs(alloc, "printf 'FAIL_OUT\\n'; exit 7", null);
+    defer alloc.free(args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_term_fail", .name = "terminal", .args = args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "FAIL_FOLLOWUP_DONE");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "FAIL_EDITOR_MARKER", 5000);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("run a failing command");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "[a] allow", 10000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "terminal · error", 8000);
+    try gridWaitFor(&sess, &grid, "exit 7", 5000);
+    try gridWaitFor(&sess, &grid, "FAIL_OUT", 5000);
+    try gridWaitFor(&sess, &grid, "idle", 8000);
+
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "FAIL_FOLLOWUP_DONE", 10000);
+    try gridWaitFor(&sess, &grid, "exit 7 · FAIL_OUT", 5000);
+    const req2 = try aiReadFile(io, alloc, dir, "request-2.json");
+    defer alloc.free(req2);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "error: exit code 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "FAIL_OUT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_term_fail\"") != null);
+
+    try sess.send("t");
+    try gridWaitFor(&sess, &grid, "err 1", 5000);
+
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+
+test "terminal: timeout kills the process group, bounded, no late side effect" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_term_timeout_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/term.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "TIMEOUT_EDITOR_MARKER\n");
+    }
+    var late_buf: [220:0]u8 = undefined;
+    const late = try bufPrintZ(&late_buf, "{s}/late.txt", .{root});
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    // The delayed write runs in a background subshell in the same process
+    // group, so killing only the shell would still create `late.txt`.
+    const args = try aiTerminalArgs(alloc, "(sleep 1; printf LATE > late.txt) & wait", 150);
+    defer alloc.free(args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_term_timeout", .name = "terminal", .args = args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "TIMEOUT_FOLLOWUP_DONE");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "TIMEOUT_EDITOR_MARKER", 5000);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("run until the deadline");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "timeout 150ms", 10000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "terminal · error", 4000);
+    try gridWaitFor(&sess, &grid, "timeout · killed", 4000);
+    try gridWaitFor(&sess, &grid, "idle", 8000);
+    // If only the shell had died, the background subshell would write this
+    // after ~1s; the group kill must prevent it.
+    std.Io.sleep(io, .fromMilliseconds(1300), .real) catch {};
+    try std.testing.expect(!aiFileExists(io, late));
+
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "TIMEOUT_FOLLOWUP_DONE", 10000);
+    const req2 = try aiReadFile(io, alloc, dir, "request-2.json");
+    defer alloc.free(req2);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "timeout; process group killed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "\"tool_call_id\":\"call_term_timeout\"") != null);
+
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+
+test "terminal: output is capped at 64 KiB with a truthful truncation marker" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_term_cap_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/term.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "CAP_EDITOR_MARKER\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const args = try aiTerminalArgs(alloc, "yes TRUNCLINE | head -c 70000", 8000);
+    defer alloc.free(args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_term_cap", .name = "terminal", .args = args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "CAP_FOLLOWUP_DONE");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "CAP_EDITOR_MARKER", 5000);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("flood the terminal tool output");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "[a] allow", 10000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "terminal · ok", 8000);
+    try gridWaitFor(&sess, &grid, "output truncated", 5000);
+    try gridWaitFor(&sess, &grid, "idle", 8000);
+
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "CAP_FOLLOWUP_DONE", 10000);
+    const req2 = try aiReadFile(io, alloc, dir, "request-2.json");
+    defer alloc.free(req2);
+    try std.testing.expect(req2.len < 80 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "output_truncated:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req2, "bytes dropped") != null);
+    // The protocol's own 64 KiB cap may append its generic marker after our
+    // detailed header/marker; either truthful form is accepted.
+    try std.testing.expect(std.mem.indexOf(u8, req2, "[truncated]") != null or
+        std.mem.indexOf(u8, req2, "[output truncated:") != null);
+
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+
+test "terminal: hint allow and mouse deny use the real approval path" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_term_hint_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/term.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "HINT_EDITOR_MARKER\n");
+    }
+    var denied_buf: [220:0]u8 = undefined;
+    const denied = try bufPrintZ(&denied_buf, "{s}/mouse_deny.txt", .{root});
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const args1 = try aiTerminalArgs(alloc, "printf 'HINT_APPROVE_OK\\n'", null);
+    defer alloc.free(args1);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_term_hint", .name = "terminal", .args = args1 },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "HINT_FOLLOWUP_DONE");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const args3 = try aiTerminalArgs(alloc, "printf NOPE > mouse_deny.txt", null);
+    defer alloc.free(args3);
+    const round3 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_term_mouse", .name = "terminal", .args = args3 },
+    });
+    defer alloc.free(round3);
+    try aiWriteFile(io, dir, "stream-3.sse", round3);
+    const round4 = try aiTextSse(alloc, "MOUSE_FOLLOWUP_DONE");
+    defer alloc.free(round4);
+    try aiWriteFile(io, dir, "stream-4.sse", round4);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "HINT_EDITOR_MARKER", 5000);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("first terminal command");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "[a] allow", 10000);
+    const allow_cell = aiFindCell(&grid, "[a] allow") orelse return error.TestUnexpectedResult;
+    try sess.send(" j");
+    try gridWaitFor(&sess, &grid, "HINTS ·", 5000);
+    const want = hintLabelLenFor(hintTargetCount(&grid) orelse return error.TestUnexpectedResult);
+    var label_buf: [3]u8 = undefined;
+    const label = hintLabelAt(&grid, &label_buf, allow_cell.row, allow_cell.col, want);
+    if (label.len != want) {
+        std.debug.print("terminal hint: no allow label ({d}/{d})\n", .{ label.len, want });
+        grid.dump();
+        return error.TestUnexpectedResult;
+    }
+    try sess.send(label);
+    try gridWaitFor(&sess, &grid, "terminal · ok", 8000);
+    try gridWaitFor(&sess, &grid, "exit 0", 8000);
+    try gridWaitFor(&sess, &grid, "idle", 8000);
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "HINT_FOLLOWUP_DONE", 10000);
+
+    // Second turn: Enter attaches the prompt (the rail owns printable keys),
+    // then click the real Deny target with the mouse.
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "❯ ", 3000);
+    try sess.send("second terminal command");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "terminal · approval required", 10000);
+    try gridWaitFor(&sess, &grid, "[r] deny", 5000);
+    const deny_cell = aiFindCell(&grid, "[r] deny") orelse return error.TestUnexpectedResult;
+    try mouseClickAt(&sess, deny_cell.col + 3, deny_cell.row);
+    try gridWaitFor(&sess, &grid, "terminal · rejected", 5000);
+    try gridWaitFor(&sess, &grid, "denied · not executed", 5000);
+    try std.testing.expect(!aiFileExists(io, denied));
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "MOUSE_FOLLOWUP_DONE", 10000);
+    try gridWaitFor(&sess, &grid, "rejected", 5000);
+    try frame.expectNoHorizontalOverflow(&grid, 120);
+
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+
+test "terminal: 80x24 drawer approval fits and keyboard deny leaves no process" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_term_80_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/term.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "DRAWER_TERM_MARKER\n");
+    }
+    var side_buf: [220:0]u8 = undefined;
+    const side = try bufPrintZ(&side_buf, "{s}/drawer_side.txt", .{root});
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const args = try aiTerminalArgs(alloc, "printf NOPE > drawer_side.txt", 3000);
+    defer alloc.free(args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_term_80", .name = "terminal", .args = args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "DRAWER_FOLLOWUP_DONE");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "DRAWER_TERM_MARKER", 5000);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("drawer terminal");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "terminal · approval required", 10000);
+    try gridWaitFor(&sess, &grid, "[a] allow", 5000);
+    try gridWaitFor(&sess, &grid, "timeout 3000ms", 5000);
+    try frame.expectNoHorizontalOverflow(&grid, 80);
+
+    try sess.send("r");
+    try gridWaitFor(&sess, &grid, "terminal · rejected", 5000);
+    try gridWaitFor(&sess, &grid, "denied · not executed", 5000);
+    try std.testing.expect(!aiFileExists(io, side));
+    try frame.expectNoHorizontalOverflow(&grid, 80);
+
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "DRAWER_FOLLOWUP_DONE", 10000);
+
+    // Drawer mode: Esc closes the overlay and returns to the editor.
+    try sess.send("\x1b");
+    std.Io.sleep(io, .fromMilliseconds(250), .real) catch {};
+    try aiQuit(&sess);
+}
+
+test "terminal: Ctrl+c kills a running command and sends no follow-up" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_term_ctrlc_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/term.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "CTRLC_EDITOR_MARKER\n");
+    }
+    var late_buf: [220:0]u8 = undefined;
+    const late = try bufPrintZ(&late_buf, "{s}/ctrl_late.txt", .{root});
+    var req2_buf: [260]u8 = undefined;
+    const req2_path = try std.fmt.bufPrint(&req2_buf, "{s}/request-2.json", .{root});
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const args = try aiTerminalArgs(alloc, "(sleep 1; printf LATE > ctrl_late.txt) & wait", 10000);
+    defer alloc.free(args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_term_ctrlc", .name = "terminal", .args = args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "CTRLC_FOLLOWUP_SHOULD_NOT_APPEAR");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "CTRLC_EDITOR_MARKER", 5000);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("start then ctrl+c");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "[a] allow", 10000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "terminal · running", 5000);
+    try sess.send("\x03");
+    try gridWaitFor(&sess, &grid, "terminal · cancelled", 5000);
+    try gridWaitFor(&sess, &grid, "cancelled · command stopped", 5000);
+    std.Io.sleep(io, .fromMilliseconds(1300), .real) catch {};
+    try std.testing.expect(!aiFileExists(io, late));
+    const dir_req2 = req2_path; // keep the path construction explicit
+    _ = dir_req2;
+    try std.testing.expect(!pathExists(io, req2_path));
+    try std.testing.expect(!grid.contains("CTRLC_FOLLOWUP_SHOULD_NOT_APPEAR"));
+
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+
+test "terminal: thread switch kills a running command; no result crosses threads" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_term_switch_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/term.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "SWITCH_EDITOR_MARKER\n");
+    }
+    var late_buf: [220:0]u8 = undefined;
+    const late = try bufPrintZ(&late_buf, "{s}/switch_late.txt", .{root});
+    var req2_buf: [260]u8 = undefined;
+    const req2_path = try std.fmt.bufPrint(&req2_buf, "{s}/request-2.json", .{root});
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const args = try aiTerminalArgs(alloc, "(sleep 1; printf LATE > switch_late.txt) & wait", 10000);
+    defer alloc.free(args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_term_switch", .name = "terminal", .args = args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "SWITCH_FOLLOWUP_SHOULD_NOT_APPEAR");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "SWITCH_EDITOR_MARKER", 5000);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("start then leave");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "[a] allow", 10000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "terminal · running", 5000);
+    try sess.send("n");
+    try gridWaitFor(&sess, &grid, "thread 2", 5000);
+    // Thread 2's Terminal tab is empty, not the other thread's result.
+    // A new thread focuses the prompt; Tab returns to the thread list.
+    try sess.send("\t");
+    try sess.send("r");
+    try gridWaitFor(&sess, &grid, "no pending terminal command", 5000);
+    try std.testing.expect(!grid.contains("running…"));
+    std.Io.sleep(io, .fromMilliseconds(1300), .real) catch {};
+    try std.testing.expect(!aiFileExists(io, late));
+    try std.testing.expect(!pathExists(io, req2_path));
+
+    // Back to thread 1: the frozen card says cancelled, and no follow-up ran.
+    try sess.send("k");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "thread 1", 5000);
+    // Selecting a thread focuses its prompt/Chat; re-open the Terminal tab.
+    try sess.send("\t");
+    try sess.send("r");
+    try gridWaitFor(&sess, &grid, "terminal · cancelled", 5000);
+    try gridWaitFor(&sess, &grid, "cancelled · command stopped", 5000);
+    try std.testing.expect(!grid.contains("SWITCH_FOLLOWUP_SHOULD_NOT_APPEAR"));
+
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+
+test "terminal: a pending approval survives a thread switch and is still denyable" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_term_pending_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var editor_buf: [220:0]u8 = undefined;
+    const editor = try bufPrintZ(&editor_buf, "{s}/term.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, editor, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "PENDING_EDITOR_MARKER\n");
+    }
+    var side_buf: [220:0]u8 = undefined;
+    const side = try bufPrintZ(&side_buf, "{s}/pending_side.txt", .{root});
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const args = try aiTerminalArgs(alloc, "printf NOPE > pending_side.txt", 4000);
+    defer alloc.free(args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_term_pending", .name = "terminal", .args = args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "PENDING_FOLLOWUP_DONE");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "PENDING_EDITOR_MARKER", 5000);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("stage and switch away");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "terminal · approval required", 10000);
+    try std.testing.expect(!aiFileExists(io, side));
+
+    try sess.send("n");
+    try gridWaitFor(&sess, &grid, "thread 2", 5000);
+    try sess.send("\t");
+    try sess.send("r");
+    try gridWaitFor(&sess, &grid, "no pending terminal command", 5000);
+    try sess.send("k");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "thread 1", 5000);
+    try sess.send("\t");
+    try sess.send("r");
+    try gridWaitFor(&sess, &grid, "terminal · approval required", 5000);
+    try gridWaitFor(&sess, &grid, "[a] allow", 5000);
+    try std.testing.expect(!aiFileExists(io, side));
+
+    try sess.send("r");
+    try gridWaitFor(&sess, &grid, "terminal · rejected", 5000);
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "PENDING_FOLLOWUP_DONE", 10000);
+    try std.testing.expect(!aiFileExists(io, side));
 
     try sess.send("\x1b");
     try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
@@ -19265,6 +20046,9 @@ const Scenario = struct {
     /// M3b2: round 1 stages an apply_patch on the scenario's own opened
     /// buffer; the scenario approves and expects the patched buffer.
     patch_approval_fixture: bool = false,
+    /// M3b3: round 1 stages a terminal command; the scenario allows it and
+    /// expects the real output/follow-up (cwd = /tmp, the fixture's root).
+    terminal_fixture: bool = false,
 };
 
 /// Pairwise layout matrix: 3 widths × filetree {closed,open} × rail
@@ -19517,6 +20301,30 @@ const scenario_matrix = [_]Scenario{
         },
     },
     .{
+        .name = "ai terminal approval 120x30",
+        .tags = &.{ "@layout", "@ai", "@tools", "@approval", "@terminal", "@120col" },
+        .rows = 30,
+        .cols = 120,
+        .setup = .ai_mock,
+        .terminal_fixture = true,
+        .rail = .docked,
+        .steps = &.{
+            .{ .keys = "run the terminal fixture\r", .wait_for = "terminal · approval required" },
+            .{ .keys = "", .wait_for = "[a] allow" },
+            .{ .keys = "", .wait_for = "timeout 5000ms" },
+            .{ .keys = "a", .wait_for = "terminal · ok" },
+            .{ .keys = "", .wait_for = "TERM_SCENARIO_MARKER" },
+            .{ .keys = "", .wait_for = "idle" },
+            .{ .keys = "c", .wait_for = "exit 0 · TERM_SCENARIO_MARKER" },
+        },
+        .expect_text = &.{ "exit 0", "TERM_SCENARIO_MARKER", "GOLDEN_EDITOR_MARKER" },
+        .request_contains = &.{
+            "\"role\":\"tool\"",
+            "terminal",
+            "TERM_SCENARIO_MARKER",
+        },
+    },
+    .{
         .name = "navigator notes 120x30",
         .tags = &.{ "@layout", "@navigator", "@notes", "@120col" },
         .rows = 30,
@@ -19541,8 +20349,8 @@ const scenario_matrix = [_]Scenario{
 /// feature adds its tag here and to at least one Scenario; the coverage test
 /// fails with a clear message otherwise (instead of silently dropping it).
 const required_scenario_tags = [_][]const u8{
-    "@layout",   "@ai",    "@filetree", "@stream", "@hints",  "@mouse",  "@navigator", "@notes", "@inline", "@tools",
-    "@approval", "@80col", "@100col",   "@120col", "@drawer", "@docked",
+    "@layout",   "@ai",       "@filetree", "@stream", "@hints",  "@mouse",  "@navigator", "@notes", "@inline", "@tools",
+    "@approval", "@terminal", "@80col",    "@100col", "@120col", "@drawer", "@docked",
 };
 
 fn expectedRailMode(rail: ScenarioRail) ai_ws.RailMode {
@@ -19827,6 +20635,17 @@ fn runScenario(sc: Scenario) !void {
             const round2 = try aiTextSse(alloc, "mock reply patch approval scenario done");
             defer alloc.free(round2);
             try aiWriteFile(io, d, "stream-2.sse", round2);
+        } else if (sc.terminal_fixture) {
+            const args = try aiTerminalArgs(alloc, "printf 'TERM_SCENARIO_MARKER\\n'", null);
+            defer alloc.free(args);
+            const round1 = try aiToolCallsSse(alloc, &.{
+                .{ .id = "call_scenario_term", .name = "terminal", .args = args },
+            });
+            defer alloc.free(round1);
+            try aiWriteFile(io, d, "stream-1.sse", round1);
+            const round2 = try aiTextSse(alloc, "mock reply terminal scenario done");
+            defer alloc.free(round2);
+            try aiWriteFile(io, d, "stream-2.sse", round2);
         } else if (sc.tool_fixture) {
             // The scenario's opened file lives in /tmp, so /tmp is its
             // project root; the tool path is relative and fixed.
@@ -19876,7 +20695,7 @@ fn runScenario(sc: Scenario) !void {
 
     // Tool scenarios run with cwd=/tmp so the workspace root is exactly the
     // directory holding the opened fixture (no dependency on repo .git).
-    var sess = if (sc.tool_fixture or sc.approval_fixture or sc.patch_approval_fixture)
+    var sess = if (sc.tool_fixture or sc.approval_fixture or sc.patch_approval_fixture or sc.terminal_fixture)
         try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, name }, env_extra, sc.rows, sc.cols, "/tmp")
     else
         try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, env_extra, sc.rows, sc.cols);
