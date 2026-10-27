@@ -9637,32 +9637,28 @@ test "windows: :vs keeps the old window left; :e lands in the left window when s
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
-    var na_buf: [128:0]u8 = undefined;
-    const na = try bufPrintZ(&na_buf, "/tmp/oz_{d}_{d}a.txt", .{ linux.getpid(), tmp_counter });
-    tmp_counter += 1;
-    defer std.Io.Dir.cwd().deleteFile(io, na) catch {};
-    {
-        const f = try std.Io.Dir.cwd().createFile(io, na, .{ .truncate = true });
+    // Short basenames in a private dir: tab labels are shown as basenames,
+    // and long /tmp names can put the suffix on the other side of a split
+    // boundary even though the tab itself starts on the correct side.
+    var dir_buf: [128:0]u8 = undefined;
+    const dir = try bufPrintZ(&dir_buf, "/tmp/ozsplit_{d}", .{linux.getpid()});
+    try std.Io.Dir.cwd().createDir(io, dir, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var na_buf: [160:0]u8 = undefined;
+    const na = try bufPrintZ(&na_buf, "{s}/a.txt", .{dir});
+    var nb_buf: [160:0]u8 = undefined;
+    const nb = try bufPrintZ(&nb_buf, "{s}/b.txt", .{dir});
+    var nc_buf: [160:0]u8 = undefined;
+    const nc = try bufPrintZ(&nc_buf, "{s}/c.txt", .{dir});
+    for ([_][]const u8{ "AAA\n", "BBB\n", "CCC\n" }, 0..) |content, fi| {
+        const path = switch (fi) {
+            0 => na,
+            1 => nb,
+            else => nc,
+        };
+        const f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
         defer f.close(io);
-        try f.writeStreamingAll(io, "AAA\n");
-    }
-    var nb_buf: [128:0]u8 = undefined;
-    const nb = try bufPrintZ(&nb_buf, "/tmp/oz_{d}_{d}b.txt", .{ linux.getpid(), tmp_counter });
-    tmp_counter += 1;
-    defer std.Io.Dir.cwd().deleteFile(io, nb) catch {};
-    {
-        const f = try std.Io.Dir.cwd().createFile(io, nb, .{ .truncate = true });
-        defer f.close(io);
-        try f.writeStreamingAll(io, "BBB\n");
-    }
-    var nc_buf: [128:0]u8 = undefined;
-    const nc = try bufPrintZ(&nc_buf, "/tmp/oz_{d}_{d}c.txt", .{ linux.getpid(), tmp_counter });
-    tmp_counter += 1;
-    defer std.Io.Dir.cwd().deleteFile(io, nc) catch {};
-    {
-        const f = try std.Io.Dir.cwd().createFile(io, nc, .{ .truncate = true });
-        defer f.close(io);
-        try f.writeStreamingAll(io, "CCC\n");
+        try f.writeStreamingAll(io, content);
     }
 
     var sess = try Session.spawn(io, &.{ oz_exe_path, na });
