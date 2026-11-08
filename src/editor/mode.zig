@@ -588,9 +588,18 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
             resetPending(state);
             return .pending;
         }
-        if (key.codepoint == 0 or key.codepoint > 0xFF) return .pending; // not a usable target
+        var cp = key.codepoint;
+        if (cp == 0 or cp > 0x10FFFF or
+            (cp >= 0xD800 and cp <= 0xDFFF))
+        {
+            // Fuzzy terminals/IMEs may report UTF-8 only in `text`.
+            const text = key.text orelse return .pending;
+            cp = std.unicode.utf8Decode(text) catch return .pending;
+        }
+        if (cp == 0 or cp > 0x10FFFF or
+            (cp >= 0xD800 and cp <= 0xDFFF)) return .pending;
         const motion = findMotion(find_action);
-        const ch: u8 = @intCast(key.codepoint);
+        const ch: u21 = @intCast(cp);
         state.motion_args.last = .{ .motion = motion, .ch = ch };
         return emitMotion(state, motion, .{ .ch = ch });
     }
@@ -635,8 +644,9 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         }
         switch (key.codepoint) {
             'g' => return emitMotion(state, .first_line, .{}),
-            // ge = end of previous word
+            // ge / gE = end of previous word / WORD
             'e' => return emitMotion(state, .word_prev_end, .{}),
+            'E' => return emitMotion(state, .word_prev_end_big, .{}),
             // gt / gT — next / previous buffer
             't' => return emitAction(state, .next_buffer),
             'T' => return emitAction(state, .prev_buffer),
@@ -791,6 +801,10 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .word_next => emitMotion(state, .word_next, .{}),
         .word_next_end => emitMotion(state, .word_next_end, .{}),
         .word_prev => emitMotion(state, .word_prev, .{}),
+        .word_next_big => emitMotion(state, .word_next_big, .{}),
+        .word_next_end_big => emitMotion(state, .word_next_end_big, .{}),
+        .word_prev_big => emitMotion(state, .word_prev_big, .{}),
+        .word_prev_end_big => emitMotion(state, .word_prev_end_big, .{}),
         // ActionId.word_prev_end exists but no keymap key produces it in M0
         // (ge is handled by the 'g' prefix) and Motion has no such member.
         .word_prev_end => .pending,
@@ -1076,6 +1090,8 @@ fn isInclusive(motion: Motion.Motion) bool {
     return switch (motion) {
         .word_next_end, // e
         .word_prev_end, // ge
+        .word_next_end_big, // E
+        .word_prev_end_big, // gE
         .line_end, // $
         .find, // f
         .find_back, // F
@@ -1183,6 +1199,9 @@ fn actionToMotion(action: KeyEvent.ActionId) ?Motion.Motion {
         .word_next => .word_next,
         .word_next_end => .word_next_end,
         .word_prev => .word_prev,
+        .word_next_big => .word_next_big,
+        .word_next_end_big => .word_next_end_big,
+        .word_prev_big => .word_prev_big,
         .line_start => .line_start,
         .line_start_bol => .line_start_bol,
         .line_end => .line_end,
@@ -1441,7 +1460,7 @@ fn handleSurround(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result
 const testing = std.testing;
 const Keymaps = @import("keymaps.zig");
 
-fn press(cp: u8) vaxis.Key {
+fn press(cp: u21) vaxis.Key {
     return .{ .codepoint = cp };
 }
 
@@ -1780,6 +1799,40 @@ test "d] cancels the pending operator instead of arming the diagnostic prefix" {
     const r = handle(&s, press('w'), Keymaps.normal);
     try testing.expectEqual(.motion, tag(r));
     try testing.expectEqual(Motion.Motion.word_next, r.motion.motion);
+}
+
+test "W/E/B and gE map to big-word motions; f accepts CJK targets" {
+    var s = State.init();
+    const rw = handle(&s, press('W'), Keymaps.normal);
+    try testing.expectEqual(.motion, tag(rw));
+    try testing.expectEqual(Motion.Motion.word_next_big, rw.motion.motion);
+    const re = handle(&s, press('E'), Keymaps.normal);
+    try testing.expectEqual(Motion.Motion.word_next_end_big, re.motion.motion);
+    const rb = handle(&s, press('B'), Keymaps.normal);
+    try testing.expectEqual(Motion.Motion.word_prev_big, rb.motion.motion);
+
+    var s2 = State.init();
+    _ = handle(&s2, press('g'), Keymaps.normal);
+    const rge = handle(&s2, press('E'), Keymaps.normal);
+    try testing.expectEqual(.motion, tag(rge));
+    try testing.expectEqual(Motion.Motion.word_prev_end_big, rge.motion.motion);
+
+    // f + 世 must keep the full codepoint, not truncate to one byte.
+    var s3 = State.init();
+    _ = handle(&s3, press('f'), Keymaps.normal);
+    const rf = handle(&s3, press(0x4E16), Keymaps.normal);
+    try testing.expectEqual(.motion, tag(rf));
+    try testing.expectEqual(Motion.Motion.find, rf.motion.motion);
+    try testing.expectEqual(@as(u21, 0x4E16), rf.motion.args.ch);
+    const rs = handle(&s3, press(';'), Keymaps.normal);
+    try testing.expectEqual(@as(u21, 0x4E16), rs.motion.args.ch);
+
+    // Some terminals report the character only in key.text.
+    var s4 = State.init();
+    _ = handle(&s4, press('f'), Keymaps.normal);
+    const rt = handle(&s4, .{ .codepoint = 0, .text = "界" }, Keymaps.normal);
+    try testing.expectEqual(.motion, tag(rt));
+    try testing.expectEqual(@as(u21, 0x754C), rt.motion.args.ch);
 }
 
 test "]d / [d still emit diagnostic navigation from a clean state" {

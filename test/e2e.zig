@@ -1681,6 +1681,67 @@ test "smoke: spawn oz, render a file, quit cleanly" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+test "normal: Unicode w/W/E and f/t jump by CJK character" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}zh.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "你好世界 abc\n");
+    }
+
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, null, 30, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+
+    // w: 你(0) -> 好(2 cells) -> 世(4) -> 界(6) -> abc(9).
+    try sess.send("w");
+    try gridWaitFor(&sess, &grid, "col 2", 3000);
+    try sess.send("w");
+    try gridWaitFor(&sess, &grid, "col 4", 3000);
+    try sess.send("w");
+    try gridWaitFor(&sess, &grid, "col 6", 3000);
+    try sess.send("w");
+    try gridWaitFor(&sess, &grid, "col 9", 3000);
+
+    // W ignores the CJK/punctuation class and skips the whole WORD.
+    try sess.send("0");
+    try gridWaitFor(&sess, &grid, "col 0", 3000);
+    try sess.send("W");
+    try gridWaitFor(&sess, &grid, "col 9", 3000);
+    try sess.send("b");
+    try gridWaitFor(&sess, &grid, "col 6", 3000);
+    try sess.send("B");
+    try gridWaitFor(&sess, &grid, "col 0", 3000);
+
+    // f/t target a full Chinese codepoint; t stops one character before it.
+    try sess.send("0");
+    try gridWaitFor(&sess, &grid, "col 0", 3000);
+    try sess.send("f世");
+    try gridWaitFor(&sess, &grid, "col 4", 3000);
+    try sess.send("0");
+    try gridWaitFor(&sess, &grid, "col 0", 3000);
+    try sess.send("t世");
+    try gridWaitFor(&sess, &grid, "col 2", 3000);
+
+    // E: end of the first whitespace-delimited WORD (界, col 6).
+    try sess.send("0");
+    try gridWaitFor(&sess, &grid, "col 0", 3000);
+    try sess.send("E");
+    try gridWaitFor(&sess, &grid, "col 6", 3000);
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
 test "insert text in insert mode, esc back to normal" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;

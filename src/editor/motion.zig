@@ -33,6 +33,10 @@ pub const Motion = enum {
     word_next_end, // e
     word_prev, // b
     word_prev_end, // ge (emitted by Mode's 'g' prefix)
+    word_next_big, // W
+    word_next_end_big, // E
+    word_prev_big, // B
+    word_prev_end_big, // gE
     line_start, // ^ (first non-blank)
     line_start_bol, // 0 (column 0)
     line_end, // $ (last non-newline char)
@@ -61,10 +65,10 @@ pub const Motion = enum {
 };
 
 pub const Args = struct {
-    /// target char for find/till motions
-    ch: u8 = 0,
+    /// target codepoint for find/till motions (Unicode, not just ASCII)
+    ch: u21 = 0,
     /// last find/till motion + char for ';'/',' repeat
-    last: ?struct { motion: Motion, ch: u8 } = null,
+    last: ?struct { motion: Motion, ch: u21 } = null,
 };
 
 /// Apply `motion` `count` times to `cursor` (byte offset, in place).
@@ -115,6 +119,10 @@ fn moveOnce(pt: *const PieceTable, motion: Motion, args: Args, pos_in: u32) u32 
         .word_next_end => wordNextEnd(pt, pos),
         .word_prev => wordPrev(pt, pos),
         .word_prev_end => wordPrevEnd(pt, pos),
+        .word_next_big => wordNextBig(pt, pos),
+        .word_next_end_big => wordNextEndBig(pt, pos),
+        .word_prev_big => wordPrevBig(pt, pos),
+        .word_prev_end_big => wordPrevEndBig(pt, pos),
         .line_start => lineFirstNonBlank(pt, pos),
         .line_start_bol => pt.lineStart(pt.lineOf(pos)),
         .line_end => lineEnd(pt, pos),
@@ -308,63 +316,128 @@ pub fn toLineKeepCol(pt: *const PieceTable, pos: u32, target_line: u32) u32 {
 
 // ------------------------------- word motions -------------------------------
 
-/// Word characters: [a-zA-Z0-9_] plus any non-ASCII byte (groups multibyte
-/// text like vim's default iskeyword range, so CJK doesn't split per byte).
-fn isWordByte(b: u8) bool {
-    return (b >= 'a' and b <= 'z') or
-        (b >= 'A' and b <= 'Z') or
-        (b >= '0' and b <= '9') or
-        b == '_' or
-        b >= 0x80;
-}
+/// Character classes for `w`/`W`/`b`/`e`. ASCII alphanumerics and `_` form
+/// keyword runs; ASCII punctuation forms one run; whitespace separates both.
+/// Every non-ASCII codepoint is a one-character `wide` word, so `w` on CJK
+/// stops at each Chinese/Japanese/Korean character instead of skipping the
+/// whole sentence. `big` motions (`W`/`B`/`E`) ignore all classes and use
+/// whitespace only.
+const CharClass = enum { blank, keyword, wide, punct };
 
-/// Blanks separate words: space, tab, '\n' (word motions cross lines) and
-/// '\r'. Every other non-word byte is a single-character punctuation word.
-fn isBlankByte(b: u8) bool {
-    return b == ' ' or b == '\t' or b == '\n' or b == '\r';
-}
-
-/// The start of the last character in the line segment [start, start+line_len).
+/// Start of the last character in the line segment [start, start+line_len).
 /// Multibyte-safe: lineEnd/$/j/k/}/e must land on a character boundary, not
-/// the last byte (a CJK char's continuation byte would corrupt the cursor).
+/// the last byte (a CJK continuation byte would corrupt the cursor).
 fn lastCharStart(pt: *const PieceTable, start: u32, line_len: u32) u32 {
     if (line_len == 0) return start;
     var scan = DocScan.init(pt, true);
     return prevCharBoundary(&scan, start + line_len);
 }
 
-/// w — start of the next word (crosses newlines; each punctuation char is a
-/// word of its own). With no next word, vim lands on the last character of
-/// the buffer; `lastCharOfDoc` computes that position.
-fn wordNext(pt: *const PieceTable, pos: u32) u32 {
+const Char = struct {
+    cp: u21,
+    len: u32,
+};
+
+fn classOf(cp: u21) CharClass {
+    if (cp == ' ' or cp == '\t' or cp == '\n' or cp == '\r') return .blank;
+    if (cp < 0x80) {
+        if ((cp >= 'a' and cp <= 'z') or
+            (cp >= 'A' and cp <= 'Z') or
+            (cp >= '0' and cp <= '9') or
+            cp == '_') return .keyword;
+        return .punct;
+    }
+    return .wide;
+}
+
+/// Decode the codepoint at `pos` through the sliding window. Malformed UTF-8
+/// counts as one 1-byte character, matching the boundary helpers.
+fn decodeAt(scan: *DocScan, pos: u32) Char {
+    const b = scan.byte(pos);
+    if (b < 0x80) return .{ .cp = b, .len = 1 };
+    const len = utf8SeqLen(b);
+    if (len == 1 or pos + len > scan.pt.len()) return .{ .cp = b, .len = 1 };
+    var bytes: [4]u8 = undefined;
+    bytes[0] = b;
+    var k: u32 = 1;
+    while (k < len) : (k += 1) {
+        const c = scan.byte(pos + k);
+        if (c < 0x80 or c >= 0xC0) return .{ .cp = b, .len = 1 };
+        bytes[@intCast(k)] = c;
+    }
+    const cp = std.unicode.utf8Decode(bytes[0..len]) catch
+        return .{ .cp = b, .len = 1 };
+    return .{ .cp = cp, .len = len };
+}
+
+fn classAt(scan: *DocScan, pos: u32) CharClass {
+    return classOf(decodeAt(scan, pos).cp);
+}
+
+fn nextPos(scan: *DocScan, pos: u32) u32 {
+    const ch = decodeAt(scan, pos);
+    return @min(pos + ch.len, scan.pt.len());
+}
+
+fn prevPos(scan: *DocScan, pos: u32) u32 {
+    return prevCharBoundary(scan, pos);
+}
+
+fn skipBlanks(scan: *DocScan, pos: u32) u32 {
+    var p = pos;
+    while (p < scan.pt.len() and classAt(scan, p) == .blank) p = nextPos(scan, p);
+    return p;
+}
+
+/// End (exclusive) of the current word/WORD run.
+fn runEnd(scan: *DocScan, pos: u32, big: bool) u32 {
+    var p = pos;
+    if (big) {
+        while (p < scan.pt.len() and classAt(scan, p) != .blank) p = nextPos(scan, p);
+        return p;
+    }
+    const c = classAt(scan, pos);
+    if (c == .wide) return nextPos(scan, pos);
+    while (p < scan.pt.len() and classAt(scan, p) == c) p = nextPos(scan, p);
+    return p;
+}
+
+/// Start of the last character in the word/WORD run containing `pos`.
+fn runLastCharStart(scan: *DocScan, pos: u32, big: bool) u32 {
+    const c = classAt(scan, pos);
+    if (!big and c == .wide) return pos;
+    return prevPos(scan, runEnd(scan, pos, big));
+}
+
+/// True when the character at `pos` is the last character of its word/WORD.
+fn atRunEnd(scan: *DocScan, pos: u32, big: bool) bool {
+    const c = classAt(scan, pos);
+    if (c == .blank) return false;
+    if (!big and c == .wide) return true;
+    const p = nextPos(scan, pos);
+    if (p >= scan.pt.len()) return true;
+    const nc = classAt(scan, p);
+    return if (big) nc == .blank else nc != c;
+}
+
+/// w / W — start of the next word. `big` ignores punctuation and treats any
+/// non-blank run as one WORD.
+fn wordNextGeneric(pt: *const PieceTable, pos: u32, big: bool) u32 {
     const len = pt.len();
     if (pos >= len) return pos;
     var scan = DocScan.init(pt, false);
-    const c = scan.byte(pos);
-    if (isWordByte(c)) {
-        // Skip the rest of the current word, then any blanks.
-        var p = pos;
-        while (p < len and isWordByte(scan.byte(p))) : (p += 1) {}
-        while (p < len and isBlankByte(scan.byte(p))) : (p += 1) {}
-        return if (p >= len) wordEndFallback(pt, pos) else p;
-    }
-    if (isBlankByte(c)) {
-        var p = pos;
-        while (p < len and isBlankByte(scan.byte(p))) : (p += 1) {}
-        return if (p >= len) wordEndFallback(pt, pos) else p;
-    }
-    // On punctuation: a run of punctuation is one word (vim: "..." is one
-    // word). Skip the whole run, then blanks, landing on the next word.
     var p = pos;
-    while (p < len and !isWordByte(scan.byte(p)) and !isBlankByte(scan.byte(p))) : (p += 1) {}
-    while (p < len and isBlankByte(scan.byte(p))) : (p += 1) {}
+    if (classAt(&scan, pos) == .blank) {
+        p = skipBlanks(&scan, pos);
+    } else {
+        p = skipBlanks(&scan, runEnd(&scan, pos, big));
+    }
     return if (p >= len) wordEndFallback(pt, pos) else p;
 }
 
-/// vim `w` with no word ahead: the last character of the buffer — the last
-/// line's last char. A trailing '\n' only terminates the last content line,
-/// so an empty artificial last line is skipped. Never moves the cursor
-/// backward (already at/past it: stay).
+/// vim `w` with no word ahead: the last character of the buffer. A trailing
+/// '\n' only terminates the last content line, so an empty artificial last
+/// line is skipped. Never moves the cursor backward.
 fn wordEndFallback(pt: *const PieceTable, pos: u32) u32 {
     var last = pt.lineCount() - 1;
     if (last > 0 and pt.lineTextLen(last) == 0) last -= 1;
@@ -374,99 +447,101 @@ fn wordEndFallback(pt: *const PieceTable, pos: u32) u32 {
     return if (end_pos > pos) end_pos else pos;
 }
 
-/// e — end of the next word (end of the current word when mid-word).
-fn wordNextEnd(pt: *const PieceTable, pos: u32) u32 {
+/// e / E — end of the current/next word. On a one-character CJK word every
+/// character is already an end, so `e` moves to the next CJK character.
+fn wordNextEndGeneric(pt: *const PieceTable, pos: u32, big: bool) u32 {
     const len = pt.len();
     if (pos >= len) return pos;
     var scan = DocScan.init(pt, false);
-    const c = scan.byte(pos);
-    if (isWordByte(c)) {
-        if (pos + 1 < len and isWordByte(scan.byte(pos + 1))) {
-            // Mid-word: end of the current word.
-            var p = pos + 1;
-            while (p < len and isWordByte(scan.byte(p))) : (p += 1) {}
-            return prevCharBoundary(&scan, p);
-        }
-        // On the last char of a word: end of the NEXT word.
-        var p = pos + 1;
-        while (p < len and isBlankByte(scan.byte(p))) : (p += 1) {}
+    const c = classAt(&scan, pos);
+    if (c == .blank) {
+        const p = skipBlanks(&scan, pos);
         if (p >= len) return pos;
-        if (isWordByte(scan.byte(p))) {
-            while (p < len and isWordByte(scan.byte(p))) : (p += 1) {}
-            return prevCharBoundary(&scan, p);
-        }
-        // punctuation run: e lands on its last char (vim: "..." -> last dot)
-        while (p < len and !isWordByte(scan.byte(p)) and !isBlankByte(scan.byte(p))) : (p += 1) {}
-        return prevCharBoundary(&scan, p);
+        return runLastCharStart(&scan, p, big);
     }
-    if (isBlankByte(c)) {
-        var p = pos;
-        while (p < len and isBlankByte(scan.byte(p))) : (p += 1) {}
-        if (p >= len) return pos;
-        if (isWordByte(scan.byte(p))) {
-            while (p < len and isWordByte(scan.byte(p))) : (p += 1) {}
-            return prevCharBoundary(&scan, p);
-        }
-        while (p < len and !isWordByte(scan.byte(p)) and !isBlankByte(scan.byte(p))) : (p += 1) {}
-        return prevCharBoundary(&scan, p);
-    }
-    // On punctuation: end of the next punctuation run (vim: e over "..."
-    // stops on the last dot), skipping any blanks after the run.
-    var p = pos + 1;
-    while (p < len and isBlankByte(scan.byte(p))) : (p += 1) {}
+    if (!atRunEnd(&scan, pos, big)) return runLastCharStart(&scan, pos, big);
+    const p = skipBlanks(&scan, nextPos(&scan, pos));
     if (p >= len) return pos;
-    if (isWordByte(scan.byte(p))) {
-        while (p < len and isWordByte(scan.byte(p))) : (p += 1) {}
-        return prevCharBoundary(&scan, p);
-    }
-    // punctuation run: land on its last character
-    while (p < len and !isWordByte(scan.byte(p)) and !isBlankByte(scan.byte(p))) : (p += 1) {}
-    return prevCharBoundary(&scan, p);
+    return runLastCharStart(&scan, p, big);
 }
 
-/// b — start of the word the byte before the cursor belongs to (skipping
-/// blanks). Mid-word (or mid punctuation run) this is the current word's
-/// start; at a word start it is the previous word's start — a run of
-/// punctuation is one word, same as `w` (vim semantics).
-fn wordPrev(pt: *const PieceTable, pos: u32) u32 {
+/// b / B — start of the previous word/WORD (crossing blanks and newlines).
+fn wordPrevGeneric(pt: *const PieceTable, pos: u32, big: bool) u32 {
     if (pos == 0) return 0;
     var scan = DocScan.init(pt, true);
-    var p = pos - 1;
-    // Skip blanks backwards; if only blanks precede the cursor, land on the
-    // first byte of the document.
-    while (p > 0 and isBlankByte(scan.byte(p))) : (p -= 1) {}
-    if (isBlankByte(scan.byte(p))) return 0;
-    // Land on the start of the word/punctuation run containing p.
-    const word_run = isWordByte(scan.byte(p));
-    while (p > 0) : (p -= 1) {
-        const b = scan.byte(p - 1);
-        if (isBlankByte(b) or isWordByte(b) != word_run) break;
+    var p = prevPos(&scan, pos);
+    while (classAt(&scan, p) == .blank) {
+        if (p == 0) return 0;
+        p = prevPos(&scan, p);
+    }
+    if (big) {
+        while (p > 0) {
+            const q = prevPos(&scan, p);
+            if (classAt(&scan, q) == .blank) break;
+            p = q;
+        }
+        return p;
+    }
+    const c = classAt(&scan, p);
+    if (c == .wide) return p;
+    while (p > 0) {
+        const q = prevPos(&scan, p);
+        if (classAt(&scan, q) != c) break;
+        p = q;
     }
     return p;
 }
 
-/// ge — end of the word strictly before the cursor (vim semantics): the
-/// nearest position p < pos whose byte is non-blank and whose right neighbor
-/// is blank, of the other class (word vs punctuation), or past the document
-/// end. With no word end before the cursor (inside/at the first word), vim
-/// lands on the first byte of the buffer.
-fn wordPrevEnd(pt: *const PieceTable, pos: u32) u32 {
+/// ge / gE — end of the word/WORD strictly before the cursor.
+fn wordPrevEndGeneric(pt: *const PieceTable, pos: u32, big: bool) u32 {
     var scan = DocScan.init(pt, true);
     var p = pos;
     while (p > 0) {
-        p = prevCharBoundary(&scan, p); // previous character's start
-        const c = scan.byte(p);
-        if (isBlankByte(c)) continue;
-        // p is a word's last character iff the next character starts a
-        // different class (word/blank/punct) or p is the doc's last char.
-        // Multibyte-safe: walking char-by-char (not byte-by-byte) so CJK
-        // words don't fall through to 0.
-        const next = nextCharBoundary(&scan, p);
-        if (next >= pt.len()) return p;
-        const nc = scan.byte(next);
-        if (isBlankByte(nc) or isWordByte(nc) != isWordByte(c)) return p;
+        p = prevPos(&scan, p);
+        if (classAt(&scan, p) == .blank) continue;
+        if (atRunEnd(&scan, p, big)) return p;
     }
     return 0;
+}
+
+/// w — start of the next word. Each CJK codepoint is its own word.
+fn wordNext(pt: *const PieceTable, pos: u32) u32 {
+    return wordNextGeneric(pt, pos, false);
+}
+
+/// W — start of the next whitespace-delimited WORD.
+fn wordNextBig(pt: *const PieceTable, pos: u32) u32 {
+    return wordNextGeneric(pt, pos, true);
+}
+
+/// e — end of the next word.
+fn wordNextEnd(pt: *const PieceTable, pos: u32) u32 {
+    return wordNextEndGeneric(pt, pos, false);
+}
+
+/// E — end of the next WORD.
+fn wordNextEndBig(pt: *const PieceTable, pos: u32) u32 {
+    return wordNextEndGeneric(pt, pos, true);
+}
+
+/// b — start of the previous word.
+fn wordPrev(pt: *const PieceTable, pos: u32) u32 {
+    return wordPrevGeneric(pt, pos, false);
+}
+
+/// B — start of the previous WORD.
+fn wordPrevBig(pt: *const PieceTable, pos: u32) u32 {
+    return wordPrevGeneric(pt, pos, true);
+}
+
+/// ge — end of the previous word.
+fn wordPrevEnd(pt: *const PieceTable, pos: u32) u32 {
+    return wordPrevEndGeneric(pt, pos, false);
+}
+
+/// gE — end of the previous WORD.
+fn wordPrevEndBig(pt: *const PieceTable, pos: u32) u32 {
+    return wordPrevEndGeneric(pt, pos, true);
 }
 
 // ------------------------------ line motions --------------------------------
@@ -559,34 +634,38 @@ fn pageMove(pt: *const PieceTable, pos: u32, lines: u32, dir: i8) u32 {
 
 // ------------------------------ find / till ---------------------------------
 
-/// f/F/t/T — search `ch` within the current line only (never across '\n').
-/// dir: +1 searches forward from pos+1, -1 backward from pos-1.
-/// till: land one char before the match (forward) / after it (backward).
-/// Not found (or no target char): stays put.
-fn findInLine(pt: *const PieceTable, pos: u32, ch: u8, dir: i8, till: bool) u32 {
+/// f/F/t/T — search `ch` (a codepoint, so Chinese/emoji targets work) within
+/// the current line only (never across '\n'). dir: +1 searches forward from
+/// the next character, -1 backward from the previous character. till: land one
+/// character before the match (forward) / after it (backward). Not found (or
+/// no target char): stays put.
+fn findInLine(pt: *const PieceTable, pos: u32, ch: u21, dir: i8, till: bool) u32 {
     if (ch == 0) return pos;
     const line = pt.lineOf(pos);
     const start = pt.lineStart(line);
     const end = start + pt.lineTextLen(line);
     var scan = DocScan.init(pt, dir < 0);
     if (dir > 0) {
-        var i = pos + 1;
-        while (i < end) : (i += 1) {
-            if (scan.byte(i) == ch) {
-                if (till) {
-                    const t = i - 1;
-                    return if (t < start) start else t; // can't land before col 0
-                }
-                return i;
+        var p = pos;
+        while (p < end) {
+            p = nextCharBoundary(&scan, p);
+            if (p >= end) break;
+            if (decodeAt(&scan, p).cp == ch) {
+                if (!till) return p;
+                const t = prevCharBoundary(&scan, p);
+                return if (t < start) start else t;
             }
         }
     } else {
-        var i = pos;
-        while (i > start) : (i -= 1) {
-            if (scan.byte(i - 1) == ch) {
-                if (till) return i; // one char after the match
-                return i - 1;
+        var p = pos;
+        while (p > start) {
+            const q = prevCharBoundary(&scan, p);
+            if (decodeAt(&scan, q).cp == ch) {
+                if (!till) return q;
+                const t = nextCharBoundary(&scan, q);
+                return @min(t, end);
             }
+            p = q;
         }
     }
     return pos;
@@ -969,6 +1048,69 @@ test "word motions: consecutive punctuation is one word (a->b)" {
     try check(&pt2, .word_next, args, 7, 1, 11); // ()-> run -> b of baz
     try check(&pt2, .word_next_end, args, 7, 1, 10); // ( -> > (run end)
     try check(&pt2, .word_next_end, args, 10, 1, 13); // > -> z (baz end)
+}
+
+test "word motions: CJK is one character per word; w/e/b/ge" {
+    // "你好世界": 你0-2 好3-5 世6-8 界9-11. Every CJK codepoint is a word.
+    var pt = try PieceTable.init(testing.allocator, "你好世界");
+    defer pt.deinit();
+    const args = Args{};
+    try check(&pt, .word_next, args, 0, 1, 3);
+    try check(&pt, .word_next, args, 3, 1, 6);
+    try check(&pt, .word_next, args, 6, 1, 9);
+    try check(&pt, .word_next, args, 9, 1, 9); // last char: stay
+    try check(&pt, .word_next_end, args, 0, 1, 3);
+    try check(&pt, .word_next_end, args, 3, 1, 6);
+    try check(&pt, .word_next_end, args, 9, 1, 9);
+    try check(&pt, .word_prev, args, 9, 1, 6);
+    try check(&pt, .word_prev, args, 6, 1, 3);
+    try check(&pt, .word_prev, args, 3, 1, 0);
+    try check(&pt, .word_prev_end, args, 9, 1, 6);
+    try check(&pt, .word_prev_end, args, 6, 1, 3);
+    try check(&pt, .word_prev_end, args, 3, 1, 0);
+
+    // Mixed ASCII + CJK: keyword runs stay whole, CJK does not.
+    var pt2 = try PieceTable.init(testing.allocator, "abc你好 def");
+    defer pt2.deinit();
+    try check(&pt2, .word_next, args, 0, 1, 3); // abc -> 你
+    try check(&pt2, .word_next, args, 3, 1, 6); // 你 -> 好
+    try check(&pt2, .word_next, args, 6, 1, 10); // 好 -> def
+    try check(&pt2, .word_prev, args, 10, 1, 6); // def -> 好
+}
+
+test "WORD motions: W/E/B/gE ignore punctuation and CJK runs" {
+    // "你好 世界": 你0-2 好3-5 ' '6 世7-9 界10-12.
+    var pt = try PieceTable.init(testing.allocator, "你好 世界");
+    defer pt.deinit();
+    const args = Args{};
+    try check(&pt, .word_next_big, args, 0, 1, 7); // whole WORD 你好 -> 世
+    try check(&pt, .word_next_big, args, 7, 1, 10); // last WORD -> last char
+    try check(&pt, .word_next_end_big, args, 0, 1, 3); // end of 你好
+    try check(&pt, .word_next_end_big, args, 3, 1, 10); // end of 世界
+    try check(&pt, .word_prev_big, args, 10, 1, 7);
+    try check(&pt, .word_prev_big, args, 7, 1, 0);
+    try check(&pt, .word_prev_end_big, args, 10, 1, 3); // previous WORD end
+    try check(&pt, .word_prev_end_big, args, 3, 1, 0);
+
+    // "a->b c": w stops at punctuation, W treats "a->b" as one WORD.
+    var pt2 = try PieceTable.init(testing.allocator, "a->b c");
+    defer pt2.deinit();
+    try check(&pt2, .word_next, args, 0, 1, 1);
+    try check(&pt2, .word_next_big, args, 0, 1, 5);
+}
+
+test "find/till: Unicode target codepoints and character-wise till" {
+    // "你好世界": 你0 好3 世6 界9.
+    var pt = try PieceTable.init(testing.allocator, "你好世界");
+    defer pt.deinit();
+    const shi: u21 = 0x4E16; // 世
+    const jie: u21 = 0x754C; // 界
+    try check(&pt, .find, .{ .ch = shi }, 0, 1, 6);
+    try check(&pt, .till, .{ .ch = shi }, 0, 1, 3); // one character before 世
+    try check(&pt, .find_back, .{ .ch = shi }, 9, 1, 6);
+    try check(&pt, .till_back, .{ .ch = shi }, 12, 1, 9); // one character after 世
+    try check(&pt, .find, .{ .ch = jie }, 0, 1, 9);
+    try check(&pt, .find, .{ .ch = shi }, 7, 1, 7); // inside 界: no match after
 }
 
 test "line motions ^ 0 $ across indentation" {

@@ -9,7 +9,8 @@
 **编辑（vim 系）**
 
 - Normal / Insert / Visual / Visual Line / Visual Block / Command 六种模式
-- 完整移动与 count：hjkl、w/e/b/ge、^/0/$、gg/G、{/}、%、f/F/t/T、Ctrl-u/d/f/b
+- 完整移动与 count：hjkl、w/W/e/E/b/B/ge/gE、^/0/$、gg/G、{/}、%、f/F/t/T、Ctrl-u/d/f/b
+- Unicode 移动：`w/e/b/ge` 把每个中文字/emoji 当作一个词，逐字跳；`W/E/B/gE` 按空白分 WORD；`f/F/t/T` 支持中文/emoji 目标
 - 文本对象、surround、注释、对齐、EasyMotion（s / `<leader>f`）、多光标（Ctrl+n）
 - 撤销/重做（分组 + 分支语义）、寄存器语义（linewise/charwise yank & put）并与系统剪贴板互通（OSC52 + pbcopy/wl-copy/xclip/xsel，对齐 nvim `clipboard=unnamedplus`）
 - 键盘宏：`q{reg}` 录制（再按 q 停止）、`@{reg}` 回放（支持 `3@a` 次数与 `@@` 重复），可视模式下 `@` 对选区逐行回放（`:'<,'>normal!` 语义），状态栏显示 `recording @x`

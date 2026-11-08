@@ -26,6 +26,10 @@ pub const ActionId = enum {
     word_next_end, // e
     word_prev, // b
     word_prev_end, // ge
+    word_next_big, // W
+    word_next_end_big, // E
+    word_prev_big, // B
+    word_prev_end_big, // gE
     line_start, // ^ (first non-blank)
     line_start_bol, // 0 (column 0)
     line_end, // $ (last non-newline char)

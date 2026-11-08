@@ -276,6 +276,7 @@ main(init):
 | 模式/命令 | `i a o v V Ctrl+v`、`u Ctrl+r .`、`/ ?`、`<leader>*` 家族 |
 
 - Operator + Motion 组合统一在 `Operator.zig`：`apply(op, motion, count)`
+- Unicode：`w/e/b/ge` 把每个非 ASCII codepoint（中文/emoji）当作一个词，逐字跳；`W/E/B/gE` 按空白分 WORD；`f/F/t/T` 的目标是完整 codepoint，`t/T` 按整字符停靠
 - 文本对象返回 `Selection`，与 Operator 正交组合
 
 ### 6.4 位移增强：EasyMotion（`editor/EasyMotion.zig`）
