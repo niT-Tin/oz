@@ -12223,7 +12223,9 @@ test "lsp: editing — rename, format, inlay hints, outline" {
 
     // <leader>rn — cursor to "foo" (word end), rename to "renamedSymbol" via
     // the prefilled command line (mock replaces [0,4) with renamedSymbol)
-    try sess.send("e rn");
+    // Start from a known document position after the insert/jk checks;
+    // their final cursor is not guaranteed to precede this identifier.
+    try sess.send("gg0we rn");
     try gridWaitFor(&sess, &grid, ":foo", 5000);
     try sess.send("\r");
     waited = 0;
@@ -13671,7 +13673,17 @@ test "git: blame ghost stays inside its pane in a split" {
 
     // :vs → both panes show the long line; focus the LEFT (40-col) pane
     try sess.send(":vs\r");
-    try std.testing.expect(try Wait.until(&sess, &grid, "\u{2502}")); // │
+    // The tab/status chrome also contains │. Wait for the content-row
+    // divider, then use its cell coordinate rather than slicing UTF-8 at
+    // byte 40 (the divider itself occupies three bytes).
+    const split_deadline = std.Io.Timestamp.now(io, .awake).nanoseconds + 5000 * std.time.ns_per_ms;
+    while (glyphCol(&grid, 2, "│", 0) == null and std.Io.Timestamp.now(io, .awake).nanoseconds < split_deadline) {
+        const nn = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (nn == 0) continue;
+        sess.used += nn;
+        grid.feed(sess.out[sess.used - nn .. sess.used]);
+    }
+    const pane_boundary = glyphCol(&grid, 2, "│", 0) orelse return error.TestUnexpectedResult;
     try sess.send("\x17h");
     // the current-line blame ghost appears on the cursor line. It must be
     // clipped to the LEFT pane: its TAIL ("init", the commit summary,
@@ -13680,30 +13692,11 @@ test "git: blame ghost stays inside its pane in a split" {
     // inside the neighbor's columns. The ghost's prefix ("E2E") sits at
     // col 33-35, so only the tail can detect the leak.
     var placed = false;
-    var leaked = false;
     var waited: i32 = 0;
     while (!placed and waited < 5000) {
         const row1 = grid.rowText(2);
-        const left = if (row1.len > 40) row1[0..40] else row1;
-        const right = if (row1.len > 40) row1[40..] else "";
-        if (std.mem.indexOf(u8, right, "init") != null) leaked = true;
+        const left = row1[0..grid.rowByteOf(2, pane_boundary)];
         if (std.mem.indexOf(u8, left, "E2E") != null) {
-            // the ghost is on the left — give the post-Ctrl-w-h frame a
-            // moment to settle, then re-check the tail
-            var quiet: i32 = 0;
-            while (quiet < 300) {
-                const nn = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
-                if (nn == 0) {
-                    quiet += 50;
-                    continue;
-                }
-                sess.used += nn;
-                grid.feed(sess.out[sess.used - nn .. sess.used]);
-                quiet = 0;
-            }
-            const r2 = grid.rowText(2);
-            const rr2 = if (r2.len > 40) r2[40..] else "";
-            if (std.mem.indexOf(u8, rr2, "init") != null) leaked = true;
             placed = true;
             break;
         }
@@ -13715,6 +13708,17 @@ test "git: blame ghost stays inside its pane in a split" {
         sess.used += nn;
         grid.feed(sess.out[sess.used - nn .. sess.used]);
     }
+    // Only the completed left-focus frame is under test. The preceding
+    // full-width/right-focus frame may legitimately contain the full blame
+    // tail on the right; latching that while Ctrl-w h is pending is a false
+    // leak, and a partial ANSI write is not a completed frame either.
+    try gridSettle(&sess, &grid, 300, 5000);
+    try std.testing.expectEqual(@as(?usize, pane_boundary), glyphCol(&grid, 2, "│", 0));
+    const final_row = grid.rowText(2);
+    const final_left = final_row[0..grid.rowByteOf(2, pane_boundary)];
+    const final_right = final_row[grid.rowByteOf(2, pane_boundary + 1)..];
+    placed = placed and std.mem.indexOf(u8, final_left, "E2E") != null;
+    const leaked = std.mem.indexOf(u8, final_right, "init") != null;
     if (!placed or leaked) {
         std.debug.print("ghost placement: placed={} leaked={} row1='{s}'\n", .{ placed, leaked, grid.rowText(2) });
         grid.dump();
@@ -15066,10 +15070,13 @@ test "dashboard: snacks-style layout and menu keys" {
 
     // 'f' opens the fuzzy file picker from the dashboard
     try sess.send("f");
-    const picker = try wsWait(&sess, &grid, "Files", 5000);
+    // "Files" also occurs in the dashboard's "Recent Files" menu, and the
+    // dashboard remains visible behind the picker. Observe its actual title.
+    const picker = try wsWait(&sess, &grid, "╭ Files ", 5000);
     if (!picker) grid.dump();
     try std.testing.expect(picker);
     try sess.send("\x1b"); // back to the dashboard
+    try gridWaitGone(&sess, &grid, "╭ Files ", 5000);
     const back = try wsWait(&sess, &grid, "Find File", 5000);
     if (!back) grid.dump();
     try std.testing.expect(back);
@@ -15200,13 +15207,12 @@ test "popup geometry: hover/completion borders align; markdown rendered" {
     try std.testing.expect(!grid.contains("**mock docs**"));
     try std.testing.expect(!grid.contains("```"));
 
-    // Esc leaves insert mode AND closes the completion menu/docs in one
-    // press; the second Esc is a normal-mode no-op. Send them as separate
-    // key events (a single write can be read as an alt sequence).
+    // One Esc must both close the completion/docs and leave Insert. A
+    // redundant second Esc followed by ':' can be decoded as Alt-':' if
+    // NORMAL is already on screen, so wait for this actual mode transition.
     try sess.send("\x1b");
     try gridWaitGone(&sess, &grid, "mock docs", 3000);
-    try sess.send("\x1b");
-    try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 5000);
     const exit_code = try sess.commandAndWaitExit(":qa\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
@@ -15709,8 +15715,12 @@ test "ai workspace: 80-col drawer overlays the full-width editor without overflo
     // Editor focus after the drawer closes.
     try sess.send("i");
     try sess.send("X");
-    try sess.send("\x1b");
     try gridWaitFor(&sess, &grid, "XLINESTART", 4000);
+    // The inserted text can render before Esc is decoded. Observe Insert
+    // first, then the real Normal frame before sending ':' to quit.
+    try gridWaitFor(&sess, &grid, "[INSERT]", 3000);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
 
     try aiQuit(&sess);
 }
