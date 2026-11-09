@@ -37,11 +37,13 @@ pub const WorkboxTab = ws.WorkboxTab;
 pub const ToolThreadState = struct {
     /// Captured when a user turn starts. Follow-ups keep using the same
     /// workspace root even if the visible workspace switched meanwhile.
+    acp_permission: ?[]u8 = null,
     root: ?[]u8 = null,
     /// Tool batches started in this user turn (agent.max_tool_rounds).
-    rounds: u8 = 0,
+    rounds: u16 = 0,
     /// Tool calls admitted for execution this user turn.
-    calls: u8 = 0,
+    calls: u16 = 0,
+    limits: agent.Limits = .{},
     /// A worker batch is in flight (cards show running).
     active: bool = false,
     /// The current stream's terminal event arrived.
@@ -55,13 +57,14 @@ pub const ToolThreadState = struct {
     /// Bumped whenever work is cancelled; stale job results are discarded.
     generation: u64 = 0,
     /// Message indices of the cards the in-flight job fills, in call order.
-    pending_cards: [agent.max_tool_calls_per_turn]usize = @splat(0),
+    pending_cards: [ai.tools.max_tool_calls]usize = @splat(0),
     pending_card_count: usize = 0,
     /// Dim transcript note explaining a stopped loop (owned).
     note: ?[]u8 = null,
     metrics: agent.Metrics = .{},
 
     fn deinit(self: *ToolThreadState, alloc: std.mem.Allocator) void {
+        if (self.acp_permission) |v| alloc.free(v);
         if (self.root) |r| alloc.free(r);
         if (self.note) |n| alloc.free(n);
         self.metrics.deinit(alloc);
@@ -99,6 +102,9 @@ pub const Session = struct {
     chart_cache: ChartCache = .{},
     rail_open: bool = false,
     agent_focus: bool = false,
+    rail_width: ?u32 = null,
+    focus_rail_width: ?u32 = null,
+    rail_resizing: bool = false,
     focus_restore_filetree: ?bool = null,
     focus: Focus = .editor,
     tab: WorkboxTab = .chat,
@@ -139,7 +145,23 @@ fn setToolNote(self: *App, idx: usize, text: []const u8) void {
 /// never draws over editor cells (and drawer mode keeps the editor full
 /// width underneath).
 pub fn aiLayout(self: *App) ws.Layout {
-    return ws.layoutMode(self.vx.window().width, self.ai.rail_open, self.ai.agent_focus);
+    return ws.layoutCustom(self.vx.window().width, self.ai.rail_open, self.ai.agent_focus, if (self.ai.agent_focus) self.ai.focus_rail_width else self.ai.rail_width);
+}
+
+pub fn setAiRailWidth(self: *App, width: u32) void {
+    const clamped = ws.clampRailWidth(self.vx.window().width, width);
+    if (self.ai.agent_focus) self.ai.focus_rail_width = clamped else self.ai.rail_width = clamped;
+}
+
+/// Ctrl-w < / > adjusts four cells; Ctrl-w = restores the responsive default.
+pub fn resizeAiRail(self: *App, delta: ?i32) void {
+    if (!self.ai.rail_open) return;
+    if (delta) |d| {
+        const width: i64 = @as(i64, self.aiLayout().rail_width) + d;
+        self.setAiRailWidth(@intCast(@max(width, 1)));
+    } else {
+        if (self.ai.agent_focus) self.ai.focus_rail_width = null else self.ai.rail_width = null;
+    }
 }
 
 pub fn aiEditorWidth(self: *App) u32 {
@@ -158,6 +180,10 @@ fn cancelClient(self: *App, idx: usize) void {
         if (self.ai.clients.items[idx]) |c| c.requestCancel();
     }
     if (toolState(self, idx)) |st| {
+        if (st.acp_permission) |v| {
+            self.alloc.free(v);
+            st.acp_permission = null;
+        }
         st.generation +%= 1;
         st.active = false;
         st.pending_followup = false;
@@ -177,6 +203,7 @@ fn resetToolTurn(self: *App, idx: usize) void {
     const st = toolState(self, idx) orelse return;
     st.rounds = 0;
     st.calls = 0;
+    st.limits = if (self.ai.config) |cfg| cfg.tool_limits else .{};
     st.active = false;
     st.stream_done = false;
     st.pending_followup = false;
@@ -501,6 +528,26 @@ pub fn deinitAi(self: *App) void {
 // ---- input ----
 
 pub fn handleAiKey(self: *App, key: vaxis.Key) !void {
+    if (self.pending_window) {
+        self.pending_window = false;
+        switch (key.codepoint) {
+            '<' => self.resizeAiRail(-4),
+            '>' => self.resizeAiRail(4),
+            '=' => self.resizeAiRail(null),
+            else => {},
+        }
+        return;
+    }
+    if (key.codepoint == 'w' and key.mods.ctrl and !key.mods.alt and !key.mods.super) {
+        self.pending_window = true;
+        return;
+    }
+    if (toolState(self, self.ai.threads.active)) |st| {
+        if (st.acp_permission != null and !key.mods.ctrl and !key.mods.alt and !key.mods.super and (key.codepoint == 'a' or key.codepoint == 'r')) {
+            decideAcpPermission(self, key.codepoint == 'a');
+            return;
+        }
+    }
     switch (self.ai.focus) {
         .editor => {},
         .rail => try handleAiRailKey(self, key),
@@ -740,7 +787,14 @@ fn startThreadRequest(self: *App, idx: usize, plan: *RequestPlan) !void {
         if (streaming or tool_live) cancelClient(self, oi);
     }
     const client = try ensureThreadClient(self, idx);
+    const st_acp = toolState(self, idx);
+    const thread_messages = self.ai.threads.items.items[idx].messages.items;
+    const acp_prompt = if (thread_messages.len >= 2) thread_messages[thread_messages.len - 2].api_text else null;
     client.start(.{
+        .acp_command = cfg.acp_command,
+        .acp_cwd = cfg.acp_cwd,
+        .acp_root = if (st_acp) |s| s.root else null,
+        .acp_prompt = acp_prompt,
         .url = plan.url,
         .api_key = cfg.api_key,
         .body = plan.body,
@@ -816,12 +870,29 @@ fn setStatusMsg(self: *App, text: []const u8) void {
 
 /// Hint/mouse/keyboard Allow for a staged terminal command. Never called
 /// from the tool protocol path: only an explicit human action reaches this.
+fn decideAcpPermission(self: *App, allow: bool) void {
+    const idx = self.ai.threads.active;
+    const st = toolState(self, idx) orelse return;
+    const title = st.acp_permission orelse return;
+    self.alloc.free(title);
+    st.acp_permission = null;
+    if (self.ai.clients.items[idx]) |c| c.decidePermission(allow);
+}
+
 pub fn aiAgentTerminalAllow(self: *App) void {
+    if (toolState(self, self.ai.threads.active)) |st| if (st.acp_permission != null) {
+        decideAcpPermission(self, true);
+        return;
+    };
     resolveTerminalDecision(self, app_agent_terminal.allow(self));
 }
 
 /// Hint/mouse/keyboard Deny for a staged terminal command.
 pub fn aiAgentTerminalDeny(self: *App) void {
+    if (toolState(self, self.ai.threads.active)) |st| if (st.acp_permission != null) {
+        decideAcpPermission(self, false);
+        return;
+    };
     resolveTerminalDecision(self, app_agent_terminal.deny(self));
 }
 
@@ -871,7 +942,7 @@ pub fn drainTerminal(self: *App) !bool {
 
 fn stopToolLoop(self: *App, idx: usize, reason: agent.LimitReason) void {
     const st = toolState(self, idx) orelse return;
-    const note = agent.limitNote(self.alloc, reason, .{}) catch return;
+    const note = agent.limitNote(self.alloc, reason, st.limits) catch return;
     defer self.alloc.free(note);
     setToolNote(self, idx, note);
     st.final_only = true;
@@ -977,7 +1048,7 @@ pub fn aiSend(self: *App) !void {
     // reading the same workspace even if the visible workspace changes.
     const st = toolState(self, idx) orelse return error.ToolStateUnavailable;
     if (st.root) |old| self.alloc.free(old);
-    st.root = self.currentRootDir() catch null;
+    st.root = try self.currentRootDir();
     resetToolTurn(self, idx);
 
     self.ai.threads.appendUser(self.alloc, idx, prompt, api_text) catch |e| {
@@ -1070,7 +1141,7 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
         return;
     }
 
-    const plan = agent.planBatch(st.?.rounds, st.?.calls, .{}, calls.len);
+    const plan = agent.planBatch(st.?.rounds, st.?.calls, st.?.limits, calls.len);
     // Read-only calls are admitted to the background worker; write tools are
     // handled locally. `worker_calls` owns only the read-only subset and is
     // transferred to `tool_job.Job.startInSlot` (which frees it on failure).
@@ -1095,8 +1166,8 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
     st.?.pending_card_count = 0;
 
     const limit_text: ?[]u8 = if (plan.reason) |reason| (switch (reason) {
-        .rounds => std.fmt.allocPrint(self.alloc, "error: tool round limit ({d}) reached; not executed", .{agent.max_tool_rounds}),
-        .calls => std.fmt.allocPrint(self.alloc, "error: tool call limit ({d}) reached; not executed", .{agent.max_tool_calls_per_turn}),
+        .rounds => std.fmt.allocPrint(self.alloc, "error: tool round limit ({d}) reached; not executed", .{st.?.limits.rounds}),
+        .calls => std.fmt.allocPrint(self.alloc, "error: tool call limit ({d}) reached; not executed", .{st.?.limits.calls}),
     } catch null) else null;
     defer if (limit_text) |text| self.alloc.free(text);
 
@@ -1157,7 +1228,7 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
                 worker_calls[worker_count] = call;
                 worker_count += 1;
                 freed[i] = true;
-                if (st.?.pending_card_count < agent.max_tool_calls_per_turn) {
+                if (st.?.pending_card_count < st.?.pending_cards.len) {
                     st.?.pending_cards[st.?.pending_card_count] = msg_index;
                     st.?.pending_card_count += 1;
                 }
@@ -1281,8 +1352,8 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
     st.?.rounds +|= 1;
     st.?.calls +|= @intCast(plan.execute);
     if (plan.reason) |reason| stopToolLoop(self, idx, reason);
-    if (st.?.calls >= agent.max_tool_calls_per_turn) stopToolLoop(self, idx, .calls);
-    if (st.?.rounds >= agent.max_tool_rounds) stopToolLoop(self, idx, .rounds);
+    if (st.?.calls >= st.?.limits.calls) stopToolLoop(self, idx, .calls);
+    if (st.?.rounds >= st.?.limits.rounds) stopToolLoop(self, idx, .rounds);
 
     if (worker_count == 0) {
         if (worker_calls.len > 0) self.alloc.free(worker_calls);
@@ -1462,6 +1533,16 @@ pub fn drainAi(self: *App) !bool {
         while (client.pop()) |ev| {
             changed = true;
             switch (ev) {
+                .acp_permission => |title| {
+                    if (t.cancel_requested) {
+                        self.alloc.free(title);
+                        continue;
+                    }
+                    if (toolState(self, idx)) |st| {
+                        if (st.acp_permission) |v| self.alloc.free(v);
+                        st.acp_permission = title;
+                    } else self.alloc.free(title);
+                },
                 .phase => |phase| {
                     if (t.cancel_requested) continue;
                     t.request.setPhase(phase);
@@ -1510,6 +1591,14 @@ pub fn drainAi(self: *App) !bool {
             // can reuse the client immediately (no Busy race).
             t.request.finish(self.nowMs());
             client.joinAfterTerminal();
+            if (self.ai.config) |cfg| if (cfg.acp_command != null) {
+                if (toolState(self, idx)) |state| if (state.acp_permission) |v| {
+                    self.alloc.free(v);
+                    state.acp_permission = null;
+                };
+                const conflicts = app_agent_edit.refreshAfterAcp(self);
+                if (conflicts > 0) setToolNote(self, idx, "ACP finished: some buffers conflict with disk; local edits preserved, review before saving");
+            };
             const st = toolState(self, idx);
             if (st) |s| s.stream_done = true;
             if (!t.cancel_requested and t.status == .streaming) {
@@ -3249,6 +3338,10 @@ fn drawChatBody(
         try appendWrappedPlain(a, &rows, content_w, "[stream cancelled]", st.faint);
     }
     if (toolState(self, self.ai.threads.active)) |tool_state| {
+        if (tool_state.acp_permission) |title| {
+            const notice = try std.fmt.allocPrint(a, "ACP permission: {s} · a allow once / r reject / Ctrl+c cancel", .{title});
+            try appendWrappedPlain(a, &rows, content_w, notice, st.error_style);
+        }
         if (tool_state.note) |note| {
             try appendWrappedPlain(a, &rows, content_w, note, st.faint);
         }

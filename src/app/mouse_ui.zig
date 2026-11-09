@@ -119,15 +119,30 @@ pub fn addMouseScrollTarget(self: *App, row: u32, col: u32, width: u32, height: 
 // ---------------------------------------------------------------------------
 
 /// Handle one vaxis mouse event. Returns true when something changed and the
-/// run loop should render. Motion/drag/release events and unbound buttons
-/// return false: they must not cause frames or steal terminal selection.
+/// run loop should render. Drag is handled only after pressing the Agent
+/// border; ordinary motion/release never repaint or steal terminal selection.
 pub fn handleMouse(self: *App, m: vaxis.Mouse) !bool {
     if (!self.mouse.enabled) return false;
+    const win = self.vx.window();
+    if (self.ai.rail_resizing) {
+        if (!self.ai.rail_open or mouseBlocked(self) or m.mods.shift or win.width == 0) {
+            self.ai.rail_resizing = false;
+            return false;
+        }
+        if (m.type == .release) {
+            self.ai.rail_resizing = false;
+            return false;
+        }
+        if (m.type == .drag or (m.type == .motion and m.button == .left)) {
+            const border: u32 = @intCast(std.math.clamp(@as(i64, m.col), 0, @as(i64, win.width)));
+            self.setAiRailWidth(win.width - border);
+            return true;
+        }
+    }
     // Plain Shift-drag is the terminal's own text-selection escape hatch;
     // if a terminal still reports a Shift-modified mouse event, leave it to
     // the terminal instead of acting on a target under the drag.
     if (m.mods.shift) return false;
-    const win = self.vx.window();
     if (win.width == 0 or win.height == 0) return false;
     // Targets are collected from the last rendered frame. After a resize the
     // screen size no longer matches them — ignore until the next render so a
@@ -137,6 +152,16 @@ pub fn handleMouse(self: *App, m: vaxis.Mouse) !bool {
     if (@as(i64, m.col) >= @as(i64, win.width) or @as(i64, m.row) >= @as(i64, win.height)) return false;
     const col: u32 = @intCast(m.col);
     const row: u32 = @intCast(m.row);
+
+    if (m.button == .left and m.type == .press and !mouseBlocked(self) and
+        self.ai.rail_open and row + app_mod.status_row_count < win.height)
+    {
+        const lay = self.aiLayout();
+        if (col <= lay.rail_col and col +| 1 >= lay.rail_col) {
+            self.ai.rail_resizing = true;
+            return true;
+        }
+    }
 
     switch (m.button) {
         .wheel_up => {

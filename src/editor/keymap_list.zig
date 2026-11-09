@@ -164,6 +164,7 @@ pub const entries: []const Entry = &.{
     // ---- 窗口 ----
     .{ .keys = "ctrl-w h l", .desc = "窗口焦点向左/右（有文件树时切换树焦点）", .group = "窗口" },
     .{ .keys = "ctrl-w j k", .desc = "窗口焦点向下/上", .group = "窗口" },
+    .{ .keys = "ctrl-w < > =", .desc = "Agent 面板缩窄 / 加宽 / 恢复默认（也可拖动左边框）", .group = "窗口" },
     .{ .keys = "gt gT", .desc = "下一个/上一个标签页（Buffer）", .group = "窗口" },
 
     // ---- Workspace ----

@@ -7,6 +7,7 @@
 const std = @import("std");
 
 pub const piece_table = @import("buffer/piece_table.zig");
+pub const disk_file = @import("buffer/file.zig");
 pub const utf8 = @import("buffer/utf8.zig");
 pub const history = @import("buffer/history.zig");
 pub const ops = @import("buffer/ops.zig");
@@ -88,3 +89,5 @@ pub const app_markdown = @import("app/markdown.zig");
 test {
     std.testing.refAllDecls(@This());
 }
+
+pub const ai_acp = @import("ai/acp.zig");

@@ -17,6 +17,7 @@
 //!     `stream.sse` in small paced chunks (plus an optional `error.txt`).
 //!     Deliberately undocumented outside the code/DESIGN.
 const std = @import("std");
+const acp = @import("acp.zig");
 const sse = @import("sse.zig");
 const openai = @import("openai.zig");
 const telemetry = @import("telemetry.zig");
@@ -24,6 +25,7 @@ const tools = @import("tools.zig");
 
 pub const Event = union(enum) {
     /// Transport progressed without changing the transcript.
+    acp_permission: []u8,
     phase: telemetry.Phase,
     /// Provider-reported token accounting (DeepSeek sends a final usage-only chunk).
     usage: telemetry.Usage,
@@ -41,6 +43,7 @@ pub const Event = union(enum) {
 
     pub fn deinit(self: Event, alloc: std.mem.Allocator) void {
         switch (self) {
+            .acp_permission => |d| alloc.free(d),
             .delta => |d| alloc.free(d),
             .err => |e| alloc.free(e),
             .tool_calls => |calls| tools.freeCalls(alloc, calls),
@@ -51,6 +54,10 @@ pub const Event = union(enum) {
 
 pub const Spec = struct {
     /// Full completions endpoint URL (already includes /chat/completions).
+    acp_command: ?[]const u8 = null,
+    acp_cwd: ?[]const u8 = null,
+    acp_root: ?[]const u8 = null,
+    acp_prompt: ?[]const u8 = null,
     url: []const u8,
     /// Optional `Authorization: Bearer ...` credential.
     api_key: ?[]const u8 = null,
@@ -64,6 +71,10 @@ pub const Spec = struct {
 };
 
 const Job = struct {
+    acp_command: ?[]u8,
+    acp_cwd: ?[]u8,
+    acp_root: ?[]u8,
+    acp_prompt: ?[]u8,
     url: []u8,
     api_key: ?[]u8,
     body: []u8,
@@ -74,6 +85,9 @@ const Job = struct {
     seq: u32,
 
     fn deinit(self: *Job, alloc: std.mem.Allocator) void {
+        inline for (.{ "acp_command", "acp_cwd", "acp_root", "acp_prompt" }) |f| {
+            if (@field(self, f)) |v| alloc.free(v);
+        }
         alloc.free(self.url);
         if (self.api_key) |k| alloc.free(k);
         alloc.free(self.body);
@@ -85,6 +99,8 @@ const Job = struct {
 pub const Client = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
+    acp_connection: ?acp.Connection = null,
+    permission: std.atomic.Value(u8) = .init(0),
     mutex: std.Io.Mutex = .init,
     events: std.ArrayList(Event) = .empty,
     cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -105,6 +121,7 @@ pub const Client = struct {
     pub fn deinit(self: *Client) void {
         self.requestCancel();
         self.joinThread();
+        if (self.acp_connection) |*c| c.deinit();
         for (self.events.items) |ev| ev.deinit(self.alloc);
         self.events.deinit(self.alloc);
     }
@@ -137,8 +154,20 @@ pub const Client = struct {
         }
         errdefer if (mock_dir) |m| self.alloc.free(m);
 
+        var acp_fields: [4]?[]u8 = @splat(null);
+        errdefer for (acp_fields) |v| {
+            if (v) |b| self.alloc.free(b);
+        };
+        inline for (.{ "acp_command", "acp_cwd", "acp_root", "acp_prompt" }, 0..) |f, i| {
+            if (@field(spec, f)) |v| acp_fields[i] = self.alloc.dupe(u8, v) catch return error.OutOfMemory;
+        }
+        self.permission.store(0, .release);
         self.request_seq +%= 1;
         self.job = .{
+            .acp_command = acp_fields[0],
+            .acp_cwd = acp_fields[1],
+            .acp_root = acp_fields[2],
+            .acp_prompt = acp_fields[3],
             .url = url,
             .api_key = api_key,
             .body = body,
@@ -150,7 +179,6 @@ pub const Client = struct {
         self.running.store(true, .release);
         self.thread = std.Thread.spawn(.{}, workerMain, .{self}) catch {
             self.running.store(false, .release);
-            if (self.job) |*j| j.deinit(self.alloc);
             self.job = null;
             return error.ThreadSpawnFailed;
         };
@@ -256,7 +284,9 @@ pub const Client = struct {
         defer done.store(true, .release);
         defer if (self.cancel.load(.acquire)) self.push(.cancelled) catch {};
         const job = &self.job.?;
-        const result = if (job.mock_dir) |dir|
+        const result = if (job.acp_command != null)
+            self.runAcp(job)
+        else if (job.mock_dir) |dir|
             self.runMock(job, dir)
         else
             self.runHttp(job);
@@ -264,6 +294,32 @@ pub const Client = struct {
             error.Cancelled, error.Canceled => {},
             else => self.pushErrorFmt("{s}", .{@errorName(e)}),
         };
+    }
+
+    pub fn acpText(self: *Client, text: []const u8) !void {
+        try self.push(.{ .delta = try self.alloc.dupe(u8, text) });
+    }
+    pub fn acpPermission(self: *Client, title: []const u8) !bool {
+        self.permission.store(0, .release);
+        try self.push(.{ .acp_permission = try self.alloc.dupe(u8, title) });
+        while (self.permission.load(.acquire) == 0) {
+            try self.checkCancel();
+            try std.Io.sleep(self.io, .fromMilliseconds(10), .real);
+        }
+        return self.permission.load(.acquire) == 1;
+    }
+    pub fn decidePermission(self: *Client, allow: bool) void {
+        self.permission.store(if (allow) 1 else 2, .release);
+    }
+    fn runAcp(self: *Client, job: *const Job) !void {
+        errdefer if (self.acp_connection) |*c| {
+            c.deinit();
+            self.acp_connection = null;
+        };
+        if (self.acp_connection == null) self.acp_connection = try acp.Connection.start(self.alloc, self.io, job.acp_command.?, job.acp_cwd orelse job.acp_root.?);
+        try self.push(.{ .phase = .streaming });
+        try self.acp_connection.?.prompt(job.acp_root.?, job.acp_prompt.?, self);
+        try self.push(.done);
     }
 
     // ---- mock transport (e2e seam) ----
@@ -374,7 +430,7 @@ pub const Client = struct {
         // than gzip's 32 KiB window. A gzip SSE body then reads as immediate
         // EOF, producing a silent empty completion. Only request identity.
         req.accept_encoding = @splat(false);
-        req.accept_encoding[@intFromEnum(std.http.ContentEncoding.identity)] = true;
+        req.accept_encoding[@backingInt(std.http.ContentEncoding.identity)] = true;
         req.transfer_encoding = .{ .content_length = job.body.len };
         var body = req.sendBodyUnflushed(&.{}) catch |e| {
             self.pushErrorFmt("send failed: {s}", .{@errorName(e)});
@@ -648,6 +704,7 @@ test "client: mock stream emits phases, deltas, DeepSeek usage and done" {
         if (client.pop()) |ev| {
             defer ev.deinit(alloc);
             switch (ev) {
+                .acp_permission => unreachable,
                 .phase => |phase| switch (phase) {
                     .waiting => saw_waiting = true,
                     .streaming => saw_streaming = true,
@@ -710,6 +767,7 @@ test "client: SSE error payload becomes a terminal error" {
         if (client.pop()) |ev| {
             defer ev.deinit(alloc);
             switch (ev) {
+                .acp_permission => unreachable,
                 .err => |e| {
                     try std.testing.expect(std.mem.indexOf(u8, e, "Insufficient Balance") != null);
                     saw_error = true;
@@ -752,6 +810,7 @@ test "client: stream with no text or tool calls reports an empty response" {
         if (client.pop()) |ev| {
             defer ev.deinit(alloc);
             switch (ev) {
+                .acp_permission => unreachable,
                 .err => |e| {
                     try std.testing.expect(std.mem.indexOf(u8, e, "empty response") != null);
                     try std.testing.expect(std.mem.indexOf(u8, e, "insufficient_system_resource") != null);
@@ -791,6 +850,7 @@ test "client: mock error.txt becomes an error event" {
     while (saw_err == null and waited_ms < 3000) : (waited_ms += 5) {
         if (client.pop()) |ev| {
             switch (ev) {
+                .acp_permission => unreachable,
                 .err => |e| saw_err = e,
                 .phase, .usage, .delta, .done, .cancelled => ev.deinit(alloc),
                 .tool_calls => |calls| {
@@ -996,6 +1056,7 @@ test "client: tool_calls fragments accumulate while text deltas still stream" {
     while (!done and waited_ms < 3000) : (waited_ms += 5) {
         if (client.pop()) |ev| {
             switch (ev) {
+                .acp_permission => unreachable,
                 .delta => |d| {
                     defer alloc.free(d);
                     try got.appendSlice(alloc, d);
@@ -1054,6 +1115,7 @@ test "client: malformed tool-call fields become a chat error, not a panic" {
     while (err_text == null and waited_ms < 3000) : (waited_ms += 5) {
         if (client.pop()) |ev| {
             switch (ev) {
+                .acp_permission => unreachable,
                 .err => |e| err_text = e,
                 else => ev.deinit(alloc),
             }
@@ -1098,6 +1160,7 @@ test "client: per-request mock fixtures and request-<n>.json for follow-ups" {
     while (calls == null and waited_ms < 3000) : (waited_ms += 5) {
         if (client.pop()) |ev| {
             switch (ev) {
+                .acp_permission => unreachable,
                 .tool_calls => |c| calls = c,
                 else => ev.deinit(alloc),
             }
@@ -1119,6 +1182,7 @@ test "client: per-request mock fixtures and request-<n>.json for follow-ups" {
     while (!done and waited_ms < 3000) : (waited_ms += 5) {
         if (client.pop()) |ev| {
             switch (ev) {
+                .acp_permission => unreachable,
                 .delta => |d| {
                     defer alloc.free(d);
                     try got.appendSlice(alloc, d);
@@ -1146,4 +1210,87 @@ test "client: per-request mock fixtures and request-<n>.json for follow-ups" {
     const latest = try tmp.dir.readFileAlloc(io, "request.json", alloc, .limited(4096));
     defer alloc.free(latest);
     try std.testing.expectEqualStrings("{\"round\":2}", latest);
+}
+
+fn testAcp(mode: []const u8, allow: bool, expected_error: ?[]const u8, turns: usize) !void {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const script = try std.fs.path.join(a, &.{ root, "test/fixtures/acp_agent.py" });
+    defer a.free(script);
+    const command = try std.json.Stringify.valueAlloc(a, .{ "python3", "-u", script, mode }, .{});
+    defer a.free(command);
+    var c = Client.init(a, io);
+    defer c.deinit();
+    for (0..turns) |turn| {
+        try c.start(.{ .url = "", .body = "", .acp_command = command, .acp_root = root, .acp_prompt = "hello" });
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(a);
+        var terminal = false;
+        var saw_permission = false;
+        var failed = false;
+        var ticks: usize = 0;
+        while (!terminal and ticks < 3000) : (ticks += 1) {
+            if (c.pop()) |ev| {
+                defer ev.deinit(a);
+                switch (ev) {
+                    .delta => |bytes| try text.appendSlice(a, bytes),
+                    .acp_permission => {
+                        saw_permission = true;
+                        c.decidePermission(allow);
+                    },
+                    .done => terminal = true,
+                    .cancelled => {
+                        terminal = true;
+                        failed = true;
+                    },
+                    .err => |message| {
+                        terminal = true;
+                        failed = true;
+                        if (expected_error) |expected| try std.testing.expect(std.mem.indexOf(u8, message, expected) != null) else return error.UnexpectedAcpError;
+                    },
+                    .phase => {},
+                    else => return error.UnexpectedAcpEvent,
+                }
+            } else try std.Io.sleep(io, .fromMilliseconds(2), .real);
+            if (std.mem.eql(u8, mode, "hang") and ticks == 20) c.requestCancel();
+        }
+        try std.testing.expect(terminal);
+        c.joinAfterTerminal();
+        if (expected_error == null and !std.mem.eql(u8, mode, "hang")) {
+            try std.testing.expect(!failed);
+            const reply = try std.fmt.allocPrint(a, "ACP_REPLY_{d} 中文", .{turn + 1});
+            defer a.free(reply);
+            try std.testing.expect(std.mem.indexOf(u8, text.items, reply) != null);
+            try std.testing.expect(std.mem.indexOf(u8, text.items, "WRONG_SESSION") == null);
+        } else try std.testing.expect(failed);
+        if (std.mem.eql(u8, mode, "permission")) {
+            try std.testing.expect(saw_permission);
+            try std.testing.expect(std.mem.indexOf(u8, text.items, if (allow) "PERMISSION_yes" else "PERMISSION_no") != null);
+        }
+    }
+}
+test "ACP fragmented UTF-8, tool updates, session isolation and two turns" {
+    try testAcp("normal", false, null, 2);
+}
+test "ACP permission string IDs allow once" {
+    try testAcp("permission", true, null, 1);
+}
+test "ACP permission rejects explicitly" {
+    try testAcp("permission", false, null, 1);
+}
+test "ACP disconnect and malformed JSON settle as errors" {
+    try testAcp("disconnect", false, "AcpDisconnected", 1);
+    try testAcp("malformed", false, "SyntaxError", 1);
+}
+test "ACP rejects version mismatch and remote errors" {
+    try testAcp("version", false, "UnsupportedAcpVersion", 1);
+    try testAcp("error", false, "AcpRemoteError", 1);
+}
+test "ACP frame size bound" {
+    try testAcp("oversized", false, "AcpFrameTooLarge", 1);
+}
+test "ACP cancellation interrupts blocked harness" {
+    try testAcp("hang", false, null, 1);
 }

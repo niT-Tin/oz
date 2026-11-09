@@ -6,6 +6,16 @@
 
 ---
 
+## 文件安全与 Agent 交互更新（2026-11）
+
+- 文档从磁盘加载时持有独立快照，直接移交 PieceTable 的 origin；不再以可被外部截断的文件 mmap 支撑活动文档。
+- 每个命名 buffer 记录 canonical 保存目标与 BLAKE3 磁盘基线（新文件为不存在）。普通保存对比内容，在写同目录临时文件前后都复核；符号链接写真实目标，保留链接、打开路径/LSP URI 与文件权限。
+- 内容冲突拒绝保存，buffer/history/dirty 保留；`:w!`/`:wq!` 显式覆盖内容冲突。目标路径重定向即使 force 也拒绝。临时文件 exclusive 创建，写失败清理，sync 后 rename；这是乐观冲突检测，不宣称跨进程 compare-and-swap。
+- Agent 多文件 approve/undo/redo 更新 buffer 的磁盘基线；undo 恢复 dirty buffer 时，基线仍采用实际恢复到磁盘的内容。
+- Agent 左边框可以拖动；`Ctrl-w < / > / =` 在 editor、线程列表、输入框中缩窄/加宽（4 列）/重置。Coding 与 Agent-focus 各存本次运行的宽度偏好；终端缩小只夹紧实际布局，放大后恢复偏好。
+- 自定义 rail 最小 24 列；dock 为 editor 保留至少 40 列（另加 1 列 gutter），drawer 保留至少 8 列外部内容。默认未手动调整时继续沿用原有 breakpoints/宽度。
+- 工具循环默认每用户 turn 32 轮/128 次调用；`OZ_AI_MAX_TOOL_ROUNDS`（1–256）、`OZ_AI_MAX_TOOL_CALLS`（1–1024）配置并在 turn 开始捕获。触顶后仍保留一次 no-tools 收尾请求；Ctrl+c 与线程切换的取消语义不变。
+
 ## 0. 决策记录（ADR 摘要）
 
 | # | 决策 | 结论 | 理由 |
@@ -1232,7 +1242,7 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 - 每 thread 一个 `ToolThreadState`（与 `threads.items` 平行）：捕获当轮 workspace root（`currentRootDir`，绝对、无 trailing slash）、round/call 计数、in-flight batch、stream terminal、follow-up 状态、generation、当前 batch 的 card message indices、transcript note、`agent.Metrics`。
 - 一轮 user turn：首个请求带 tools；响应结束时若有 tool calls：把 calls 附到本轮 assistant message，为每个 call 建 card（running），按 `agent.planBatch` admission（prefix）：前 N 个交给 worker；超限的立即写为 `unsupported` + `error: ... limit ...; not executed`，并写回一条真实的 `role:"tool"` 结果。`rounds` 按 batch 计，`calls` 按实际 admitted 计。
 - worker 完成后：填 card 的 status/content/duration（`ok`/`error`/`unsupported`；M3a 的 `edit_file` 占位为 `approval required`，M3b1 起改由 App 层 stage，见 §20.9），记录 metrics，然后自动 follow-up；follow-up 仍是同一 thread 的 client（`joinAfterTerminal` 消除 done/worker 重用的 Busy race），消息序列为 assistant(tool_calls) → tool results → 下一条 assistant。
-- **限制**：最多 4 个 tool batch（`agent.max_tool_rounds`）、最多 8 个执行调用（`agent.max_tool_calls_per_turn`）。到达任一上限后下一请求 **不带 tools**（最终 no-tools turn），保证仍能拿到最终文本；若模型在最终轮仍返回 tool calls，只生成 `unsupported` card/结果并停止。超限时 Chat transcript 显示 `tool loop stopped: max rounds/calls (N) ...`；Tools tab 的计数仍是真实值。
+- **限制**：默认最多 32 个 tool batch（`agent.max_tool_rounds`）、最多 128 个执行调用（`agent.max_tool_calls_per_turn`），可通过 `OZ_AI_MAX_TOOL_ROUNDS` / `OZ_AI_MAX_TOOL_CALLS` 配置。到达任一上限后下一请求 **不带 tools**（最终 no-tools turn），保证仍能拿到最终文本；若模型在最终轮仍返回 tool calls，只生成 `unsupported` card/结果并停止。超限时 Chat transcript 显示 `tool loop stopped: max rounds/calls (N) ...`；Tools tab 的计数仍是真实值。
 - `edit_file`/`apply_patch` 只走 executor 的 `approval_required`（不落盘），`terminal`/未知工具 `unsupported`；`ai/tool_exec.zig` 内没有任何写 syscall。（M3b1 起 `edit_file` 在 App 层 stage，executor 的 fallback 仍不写；见 §20.9。）
 - 取消/切线程：现有 `cancelClient` 同时 requestCancel transport、`generation += 1`、冻结 running cards 为 `cancelled`、requestCancel worker；随后 worker 的结果因 generation/`cancel_requested` 不匹配被丢弃，绝不写入任何 transcript。`Ctrl+c` 在 stream 已结束但 tool/follow-up 仍活动时也会停止 loop。
 
@@ -1605,3 +1615,11 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 - 纯模型覆盖 rail 三档宽度、Agent-focus、metrics、UTF-8 wrap；PTY 覆盖 Coding/Agent-focus 往返、图标、hints、流式、审批和鼠标。goldens 包含 `ai-dock-120x30`、`ai-dock-100x30`、`ai-drawer-80x24`、`ai-focus-120x30`，使用稳定 fixture 路径，连续运行不会因 PID 改变而漂移。
 - 请求 telemetry 另有 usage-only chunk、阶段/耗时/上下文纯模型与 DeepSeek-shaped PTY 断言；四张 AI golden 固定 `<1s` 的完成态与估算上下文行，窄屏不截断关键指标。
 - 当前套件：**598 unit / 235 e2e**，最终以 `./tools/verify.sh` 的记录为准。
+
+### ACP v1 backend
+
+`src/ai/acp.zig` owns newline-delimited JSON-RPC framing (8 MiB per frame), process/session lifetime, numeric client request IDs, string-or-number server request IDs, v1 initialization, session creation and prompt responses. The existing asynchronous Client transports ACP events through its owned queue; App continues polling until a terminal event. Each editor thread keeps one connection between turns. Cancellation interrupts blocked I/O and kills/reaps the process group; errors drop the connection so retry creates a fresh session. A connection rejects a changed project root rather than sending a different project's context into its existing session.
+
+The client advertises no terminal or filesystem capabilities. Agents own their tool implementations and model/context budgets. Unknown requests receive JSON-RPC method-not-found, unknown notifications are ignored, and foreign-session message updates are discarded. Tool lifecycle updates are transcript text, never oz tool-loop requests. Permission requests show serialized tool details and wait for a human one-shot decision. Only allow_once/reject_once options are selected; absent matching options or invalid sessions produce rejection/cancellation. Oversized permission details are denied. No always-allow policy is inferred.
+
+External writes are already committed by the harness. After a turn, clean open buffers in the visible workspace refresh as undoable replacements and synchronize LSP; dirty buffers and their save baselines are preserved. Retargeted/deleted paths produce a conflict note. ACP is separate from inline replacement generation, which directs users to the Agent panel. Sessions/transcripts are currently in memory only: no loadSession, backend history replay, model selector, or MCP configuration UI is claimed. Commands are explicitly configured by the user's environment, never loaded from repository-local settings.

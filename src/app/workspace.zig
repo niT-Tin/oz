@@ -36,6 +36,7 @@ const Workspace = App.Workspace;
 pub fn deinitBuffer(self: *App, buf: *Buffer) void {
     buf.history.deinit();
     buf.pt.deinit();
+    if (buf.disk) |*disk| disk.deinit(self.alloc);
     buf.folds.deinit(self.alloc);
     if (buf.spans_cache.len > 0) self.alloc.free(buf.spans_cache);
     if (buf.decors_cache.len > 0) self.alloc.free(buf.decors_cache);

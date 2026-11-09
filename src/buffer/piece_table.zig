@@ -64,9 +64,15 @@ pub const PieceTable = struct {
 
     /// Create a table from initial content (copied). O(n).
     pub fn init(allocator: std.mem.Allocator, initial: []const u8) !PieceTable {
+        return initOwned(allocator, try allocator.dupe(u8, initial));
+    }
+
+    /// Take ownership of a stable snapshot, including on initialization
+    /// failure. Used by file loading to avoid a second full-size copy.
+    pub fn initOwned(allocator: std.mem.Allocator, initial: []u8) !PieceTable {
         var self = PieceTable{
             .allocator = allocator,
-            .origin = try allocator.dupe(u8, initial),
+            .origin = initial,
             .add = .empty,
             .pieces = .empty,
             .line_starts = .empty,

@@ -19,6 +19,7 @@
 //! single-file approve still edits the in-memory buffer only and leaves
 //! `:w` as the user's separate action.
 const std = @import("std");
+const disk_file = @import("../buffer/file.zig");
 const vaxis = @import("vaxis");
 
 const app_mod = @import("../app.zig");
@@ -987,6 +988,7 @@ fn replaceBufferText(self: *App, idx: usize, text: []const u8) !void {
     try buf.history.record(&buf.pt, 0, buf.pt.len(), text);
     buf.history.endGroup();
     buf.dirty = false;
+    if (buf.disk) |*disk| disk.didWrite(text);
     buf.folds.clearRetainingCapacity();
     self.clearSpanCache(buf);
     for (self.windows.items) |*window| {
@@ -1684,6 +1686,8 @@ fn patchHistoryStep(self: *App, direction: PatchHistoryDirection) bool {
 
     for (set.files, 0..) |*file, i| {
         if (buffer_indices[i]) |idx| {
+            // Undo can restore a dirty buffer distinct from the disk bytes.
+            if (self.buffers.items[idx].disk) |*disk| disk.didWrite(set.targetDiskText(i));
             if (use_history[i]) {
                 const hist = &self.buffers.items[idx].history;
                 switch (direction) {
@@ -1902,4 +1906,42 @@ fn drawMultiAgentEdit(
         .approve_action = .agent_approve,
         .reject_action = .agent_reject,
     });
+}
+
+/// External harnesses already write disk. Refresh clean buffers as undoable
+/// changes; preserve dirty buffers and their original conflict baselines.
+pub fn refreshAfterAcp(self: *App) usize {
+    var conflicts: usize = 0;
+    for (self.buffers.items, 0..) |*buf, i| {
+        const path = buf.path orelse continue;
+        const disk = if (buf.disk) |*d| d else continue;
+        const real = std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.alloc) catch {
+            conflicts += 1;
+            continue;
+        };
+        defer self.alloc.free(real);
+        if (!std.mem.eql(u8, real, disk.target)) {
+            conflicts += 1;
+            continue;
+        }
+        const text = readDiskText(self, path) catch {
+            conflicts += 1;
+            continue;
+        };
+        defer self.alloc.free(text);
+        const fingerprint = disk_file.hash(text);
+        if (disk.fingerprint) |old| if (std.mem.eql(u8, &old, &fingerprint)) continue;
+        if (bufferTextEquals(self, i, text)) {
+            if (!buf.dirty) disk.didWrite(text);
+            continue;
+        }
+        if (buf.dirty) {
+            conflicts += 1;
+            continue;
+        }
+        replaceBufferText(self, i, text) catch {
+            conflicts += 1;
+        };
+    }
+    return conflicts;
 }

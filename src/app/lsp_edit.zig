@@ -234,6 +234,7 @@ fn planDocument(self: *App, doc: workspace_edit.Document) !?EditPlan {
         try workspace_edit.Prepared.reserve(&self.buffers.items[i].history);
     } else {
         new_buffer = .{ .pt = try buffer.PieceTable.init(self.alloc, old), .history = buffer.History.init(self.alloc) };
+        new_buffer.?.disk = try @import("../buffer/file.zig").Baseline.init(self.alloc, self.io, path, old);
         try workspace_edit.Prepared.reserve(&new_buffer.?.history);
     }
     own_uri = false;

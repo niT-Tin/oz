@@ -153,6 +153,7 @@ pub const App = struct {
         pt: buffer.PieceTable,
         history: buffer.History,
         path: ?[]u8 = null,
+        disk: ?@import("buffer/file.zig").Baseline = null,
         dirty: bool = false,
         /// tree-sitter highlighter for THIS buffer (independent of any
         /// window) — lazily built on the first render of a window showing it,
@@ -1733,6 +1734,7 @@ pub const App = struct {
     pub const lineHints = @import("app/search.zig").lineHints;
     pub const absolutePath = @import("app/search.zig").absolutePath;
     pub const writeBuffer = @import("app/search.zig").writeBuffer;
+    pub const writeBufferForce = @import("app/search.zig").writeBufferForce;
     pub const saveFile = @import("app/search.zig").saveFile;
     pub const openFile = @import("app/search.zig").openFile;
     pub const insertText = @import("app/search.zig").insertText;
@@ -1913,6 +1915,8 @@ pub const App = struct {
     pub const drainAi = app_ai.drainAi;
     pub const drainToolJobs = app_ai.drainToolJobs;
     pub const aiLayout = app_ai.aiLayout;
+    pub const resizeAiRail = app_ai.resizeAiRail;
+    pub const setAiRailWidth = app_ai.setAiRailWidth;
     pub const aiEditorWidth = app_ai.aiEditorWidth;
     pub const aiStatusText = app_ai.aiStatusText;
     pub const aiStatusTextCompact = app_ai.aiStatusTextCompact;

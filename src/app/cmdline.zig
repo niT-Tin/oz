@@ -246,6 +246,7 @@ pub fn execCommand(self: *App, cmd: editor.ex_command.Command) !void {
     switch (cmd) {
         .empty => {},
         .write => _ = try self.writeBuffer(),
+        .write_force => _ = try self.writeBufferForce(true),
         .quit => {
             // Closing a split keeps its buffers alive. The last window's
             // close performs the session-wide dirty check.
@@ -265,6 +266,9 @@ pub fn execCommand(self: *App, cmd: editor.ex_command.Command) !void {
             if (try self.writeBuffer()) self.closeWindow();
         },
         .edit => |path| try self.openFile(path),
+        .write_quit_force => {
+            if (try self.writeBufferForce(true)) self.closeWindow();
+        },
         .buffer_next => try self.switchBuffer(1),
         .buffer_prev => try self.switchBuffer(-1),
         .buffer_delete => self.closeCurrentBuffer(),

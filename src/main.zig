@@ -11,6 +11,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const buffer = @import("buffer/root.zig");
+const disk_file = @import("buffer/file.zig");
 const logging = @import("logging.zig");
 
 const app_mod = @import("app.zig");
@@ -75,6 +76,7 @@ pub fn main(init: std.process.Init) !void {
                         app.clearSpanCache(app.cur());
                         if (app.cur().path) |p| app.alloc.free(p);
                         app.cur().path = try app.absolutePath(file_path);
+                        app.cur().disk = try disk_file.Baseline.init(app.alloc, app.io, app.cur().path.?, null);
                     },
                     // a directory is not a file — refuse it with a message
                     // instead of dying deep in the read path below.
@@ -96,14 +98,22 @@ pub fn main(init: std.process.Init) !void {
                 try app.setMsg(try app.alloc.dupe(u8, "file too large (>4GiB)"));
                 continue;
             }
+            var loaded = try app.loadPieceTable(file, size);
+            var own_loaded = true;
+            errdefer if (own_loaded) loaded.deinit();
+            const loaded_path = try app.absolutePath(file_path);
+            errdefer if (own_loaded) app.alloc.free(loaded_path);
+            const disk = try disk_file.Baseline.init(app.alloc, app.io, loaded_path, loaded.origin);
             app.cur().pt.deinit();
-            app.cur().pt = try app.loadPieceTable(file, size);
+            app.cur().pt = loaded;
+            app.cur().disk = disk;
             app.clearSpanCache(app.cur());
             if (app.cur().path) |p| app.alloc.free(p);
             // Store an absolute path so LSP (uri building, server matching)
             // works for relative CLI args like `oz build.zig` — filetypeOf
             // and ensureLsp both consume this.
-            app.cur().path = try app.absolutePath(file_path);
+            app.cur().path = loaded_path;
+            own_loaded = false;
             // recent history must hold the same (absolute) form every other
             // entry uses, or the dashboard's relative entries break after a
             // cwd change (and dedupe against absolute entries fails).

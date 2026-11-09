@@ -20482,7 +20482,8 @@ test "approval: malformed or missing-target apply_patch calls never stage" {
     try aiQuit(&sess);
 }
 
-test "tools: four-round bound stops execution and sends one final no-tools request" {
+fn toolRoundBudgetCase(bounded: bool) !void {
+    const rounds: usize = if (bounded) 4 else 6;
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
@@ -20503,7 +20504,7 @@ test "tools: four-round bound stops execution and sends one final no-tools reque
     const dir = try aiMockDir(io, &dir_buf);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
     var round: usize = 1;
-    while (round <= 4) : (round += 1) {
+    while (round <= rounds) : (round += 1) {
         var name_buf: [32]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "stream-{d}.sse", .{round});
         var id_buf: [32]u8 = undefined;
@@ -20516,11 +20517,13 @@ test "tools: four-round bound stops execution and sends one final no-tools reque
     }
     const final_sse = try aiTextSse(alloc, "ROUND_CAP final reply");
     defer alloc.free(final_sse);
-    try aiWriteFile(io, dir, "stream-5.sse", final_sse);
+    var final_buf: [32]u8 = undefined;
+    const final_name = try std.fmt.bufPrint(&final_buf, "stream-{d}.sse", .{rounds + 1});
+    try aiWriteFile(io, dir, final_name, final_sse);
     const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
     defer alloc.free(mock_env);
 
-    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, if (bounded) &.{ mock_env, "OZ_AI_MODEL=mock-model", "OZ_AI_MAX_TOOL_ROUNDS=4" } else &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
     defer sess.close();
     defer killPid(sess.pid);
     var grid = try Grid.initSizedCols(alloc, 30, 120);
@@ -20532,32 +20535,39 @@ test "tools: four-round bound stops execution and sends one final no-tools reque
 
     try gridWaitFor(&sess, &grid, "ROUND_CAP final reply", 20000);
     try gridWaitFor(&sess, &grid, "idle", 5000);
-    try std.testing.expect(grid.contains("tool loop stopped: max rounds"));
-    try std.testing.expect(!grid.contains("call_round_5"));
+    try std.testing.expectEqual(bounded, grid.contains("tool loop stopped: max rounds"));
+
     try frame.expectNoHorizontalOverflow(&grid, grid.cols);
 
-    // Five requests total: 1 initial + 3 tool follow-ups + 1 final no-tools
-    // (the 4th tool round is followed by the final request). No 6th request.
-    var req_buf: [300]u8 = undefined;
+    // Low configured limits still send exactly one final no-tools request;
+    // the default must continue through six tool rounds with tools available.
     var last_path_buf: [512]u8 = undefined;
-    const req5_path = try std.fmt.bufPrint(&last_path_buf, "{s}/request-5.json", .{dir});
-    try std.testing.expect(pathExists(io, req5_path));
-    const req5 = try aiReadFile(io, alloc, dir, "request-5.json");
-    defer alloc.free(req5);
-    try std.testing.expect(std.mem.indexOf(u8, req5, "\"tool_choice\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, req5, "\"tools\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, req5, "\"role\":\"tool\"") != null);
-    const req6_path = try std.fmt.bufPrint(&req_buf, "{s}/request-6.json", .{dir});
-    try std.testing.expect(!pathExists(io, req6_path));
+    var request_buf: [40]u8 = undefined;
+    const last_name = try std.fmt.bufPrint(&request_buf, "request-{d}.json", .{rounds + 1});
+    const last = try aiReadFile(io, alloc, dir, last_name);
+    defer alloc.free(last);
+    try std.testing.expectEqual(!bounded, std.mem.indexOf(u8, last, "\"tool_choice\"") != null);
+    try std.testing.expectEqual(!bounded, std.mem.indexOf(u8, last, "\"tools\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, last, "\"role\":\"tool\"") != null);
+    const unexpected = try std.fmt.bufPrint(&last_path_buf, "{s}/request-{d}.json", .{ dir, rounds + 2 });
+    try std.testing.expect(!pathExists(io, unexpected));
 
     try sess.send("\t");
     try sess.send("t");
-    try gridWaitFor(&sess, &grid, "calls 4", 5000);
-    try gridWaitFor(&sess, &grid, "ok 4 · err 0", 5000);
+    try gridWaitFor(&sess, &grid, if (bounded) "calls 4" else "calls 6", 5000);
+    try gridWaitFor(&sess, &grid, if (bounded) "ok 4 · err 0" else "ok 6 · err 0", 5000);
 
     try sess.send("\x1b");
     try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
     try aiQuit(&sess);
+}
+
+test "tools: configured four-round bound sends one final no-tools request" {
+    try toolRoundBudgetCase(true);
+}
+
+test "tools: default budget continues beyond four tool rounds" {
+    try toolRoundBudgetCase(false);
 }
 
 /// A long text stream: enough paced chunks that a Ctrl+c after the first
@@ -20614,7 +20624,7 @@ test "tools: eight-call cap reports the overflow and sends a final no-tools requ
     const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
     defer alloc.free(mock_env);
 
-    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, editor }, &.{ mock_env, "OZ_AI_MODEL=mock-model", "OZ_AI_MAX_TOOL_CALLS=8" }, 30, 120, root);
     defer sess.close();
     defer killPid(sess.pid);
     var grid = try Grid.initSizedCols(alloc, 30, 120);
@@ -22200,6 +22210,122 @@ test "scenario matrix: every required tag is covered" {
     }
 }
 
+test "ai resize: keyboard, drag, hit targets and reopen retain the requested width" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    inline for ([_]u16{ 80, 100, 120 }) |cols| {
+        var name_buf: [128:0]u8 = undefined;
+        const name = try wsTempFile(io, &name_buf, "resize.txt", "RESIZE_EDITOR_MARKER\n");
+        defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+        var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, null, 30, cols);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(alloc, 30, cols);
+        defer grid.deinit(alloc);
+        try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+        try aiEnterRail(&sess, &grid);
+        const start = aiRailCol(cols);
+        try sess.send("draft text\x17>");
+        try gridSettle(&sess, &grid, 100, 3000);
+        try std.testing.expectEqualStrings("│", aiCellText(&grid, 5, start - 4));
+        try std.testing.expect(grid.contains("draft text"));
+        try sess.send("\x17<");
+        try gridSettle(&sess, &grid, 100, 3000);
+        try std.testing.expectEqualStrings("│", aiCellText(&grid, 5, start));
+        try sendMouseButton(&sess, start, 5, 0, false);
+        try sendMouseButton(&sess, start - 12, 5, 32, false);
+        try sendMouseButton(&sess, start - 12, 5, 0, true);
+        try gridSettle(&sess, &grid, 100, 3000);
+        try std.testing.expectEqualStrings("│", aiCellText(&grid, 5, start - 12));
+        try std.testing.expect(grid.contains("draft text"));
+        try frame.expectNoHorizontalOverflow(&grid, cols);
+        // Mouse targets are rebuilt for the resized surface.
+        const tools_tab = aiFindCell(&grid, "tools") orelse return error.TestUnexpectedResult;
+        try mouseClickAt(&sess, tools_tab.col + 1, tools_tab.row);
+        try gridWaitFor(&sess, &grid, "no tool calls yet", 4000);
+        const chat_tab = aiFindCell(&grid, "chat") orelse return error.TestUnexpectedResult;
+        try mouseClickAt(&sess, chat_tab.col + 1, chat_tab.row);
+        try gridWaitFor(&sess, &grid, "draft text", 4000);
+        try sess.send("\x1b");
+        if (cols >= 90) {
+            try aiWaitRailFocus(&sess, &grid, start - 12, false, 3000);
+            try sess.send(" a");
+        }
+        try gridWaitGone(&sess, &grid, "AGENTS", 4000);
+        try aiEnterRail(&sess, &grid);
+        try std.testing.expectEqualStrings("│", aiCellText(&grid, 5, start - 12));
+        try std.testing.expect(grid.contains("draft text"));
+        try sess.send("\x17=");
+        try gridSettle(&sess, &grid, 100, 3000);
+        try std.testing.expectEqualStrings("│", aiCellText(&grid, 5, start));
+        // Dragging to either terminal edge clamps both the rail and editor.
+        try sendMouseButton(&sess, start, 5, 0, false);
+        try sendMouseButton(&sess, cols - 1, 5, 32, false);
+        try sendMouseButton(&sess, cols - 1, 5, 0, true);
+        try gridSettle(&sess, &grid, 100, 3000);
+        try std.testing.expectEqualStrings("│", aiCellText(&grid, 5, cols - 24));
+        try frame.expectNoHorizontalOverflow(&grid, cols);
+        try sendMouseButton(&sess, cols - 24, 5, 0, false);
+        try sendMouseButton(&sess, 0, 5, 32, false);
+        try sendMouseButton(&sess, 0, 5, 0, true);
+        try gridSettle(&sess, &grid, 100, 3000);
+        try std.testing.expectEqualStrings("│", aiCellText(&grid, 5, if (cols >= 90) 41 else 8));
+        try frame.expectNoHorizontalOverflow(&grid, cols);
+        try sess.send("\x17=");
+        try gridSettle(&sess, &grid, 100, 3000);
+        try sess.send("\x1b");
+        if (cols >= 90) try aiWaitRailFocus(&sess, &grid, start, false, 3000) else try gridWaitGone(&sess, &grid, "AGENTS", 3000);
+        try aiQuit(&sess);
+    }
+}
+
+test "ai resize: terminal shrink clamps without forgetting the wide preference" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var name_buf: [128:0]u8 = undefined;
+    const name = try wsTempFile(io, &name_buf, "resize_terminal.txt", "RESIZE_TERMINAL_MARKER\n");
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, null, 30, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try aiEnterRail(&sess, &grid);
+    // The two presets retain independent choices.
+    try sess.send("\x17>");
+    try gridSettle(&sess, &grid, 100, 3000);
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 5, 78));
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, 78, false, 3000);
+    try sess.send("\x17A\x17>");
+    try gridSettle(&sess, &grid, 100, 3000);
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 5, 64));
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, 64, false, 3000);
+    try sess.send("\x17A");
+    try gridSettle(&sess, &grid, 100, 3000);
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 5, 78));
+    // Drag to 70 cells, then shrink the terminal to a 90-column dock.
+    try sendMouseButton(&sess, 78, 5, 0, false);
+    try sendMouseButton(&sess, 50, 5, 32, false);
+    try sendMouseButton(&sess, 50, 5, 0, true);
+    try gridSettle(&sess, &grid, 100, 3000);
+    for ([_]u16{ 90, 120 }) |cols| {
+        const size = Winsize{ .ws_row = 30, .ws_col = cols, .ws_xpixel = cols * 10, .ws_ypixel = 600 };
+        _ = linux.ioctl(sess.pty.master, TIOCSWINSZ, @intFromPtr(&size));
+        var resized = try Grid.initSizedCols(alloc, 30, cols);
+        defer resized.deinit(alloc);
+        try gridWaitFor(&sess, &resized, "AGENTS", 5000);
+        try gridSettle(&sess, &resized, 100, 3000);
+        try std.testing.expectEqualStrings("│", aiCellText(&resized, 5, if (cols == 90) 41 else 50));
+        try frame.expectNoHorizontalOverflow(&resized, cols);
+    }
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, 50, false, 3000);
+    try aiQuit(&sess);
+}
+
 test "ai workspace: Ctrl-w A switches Agent-focus and restores navigator layouts" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -22852,6 +22978,130 @@ fn safetyReplaceFile(io: Io, alloc: std.mem.Allocator, path: []const u8, text: [
     try std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), path, io);
 }
 
+test "file safety: external truncate preserves the snapshot, edits and undo" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    inline for ([_]bool{ false, true }) |via_edit| {
+        var root_buf: [128]u8 = undefined;
+        const root = try aiMockDir(io, &root_buf);
+        defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        const body = try alloc.alloc(u8, 10 * 5000);
+        defer alloc.free(body);
+        for (0..5000) |i| @memcpy(body[i * 10 ..][0..10], "body line\n");
+        const content = try std.mem.concat(alloc, u8, &.{ "SNAPSHOT_FIRST\n", body, "SNAPSHOT_LAST\n" });
+        defer alloc.free(content);
+        try aiWriteFile(io, root, "file.txt", content);
+        const path = try std.fmt.allocPrint(alloc, "{s}/file.txt", .{root});
+        defer alloc.free(path);
+        var sess = try Session.spawnCwd(io, if (via_edit) &.{oz_exe_path} else &.{ oz_exe_path, path }, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.init(alloc);
+        defer grid.deinit(alloc);
+        if (via_edit) {
+            try gridWaitFor(&sess, &grid, "终端文本编辑器", 8000);
+            try sess.send(":e file.txt\r");
+        }
+        try gridWaitFor(&sess, &grid, "SNAPSHOT_FIRST", 8000);
+        try sess.send("iLOCAL_");
+        try gridWaitFor(&sess, &grid, "LOCAL_SNAPSHOT_FIRST", 5000);
+        try sess.send("\x1b");
+        try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+        try aiWriteFile(io, root, "file.txt", "");
+        try sess.send("G");
+        try gridWaitFor(&sess, &grid, "SNAPSHOT_LAST", 5000);
+        try sess.send("u");
+        try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+        try sess.send("gg");
+        try gridWaitFor(&sess, &grid, "SNAPSHOT_FIRST", 5000);
+        try std.testing.expect(!grid.contains("LOCAL_SNAPSHOT_FIRST"));
+        try sess.send("\x12");
+        try gridWaitFor(&sess, &grid, "LOCAL_SNAPSHOT_FIRST", 5000);
+        try sess.send(":wq\r");
+        try gridWaitFor(&sess, &grid, "file changed on disk", 5000);
+        try std.testing.expect(try sess.tryWaitExit() == null);
+        try expectLspDisk(io, alloc, path, "");
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq!\r"));
+        const expected = try std.mem.concat(alloc, u8, &.{ "LOCAL_", content });
+        defer alloc.free(expected);
+        try expectLspDisk(io, alloc, path, expected);
+    }
+}
+
+test "file safety: saving a relative symlink preserves the link, target and mode" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "real.txt", "LINK_ORIGINAL\n");
+    const path = try std.fmt.allocPrint(alloc, "{s}/real.txt", .{root});
+    defer alloc.free(path);
+    const link = try std.fmt.allocPrint(alloc, "{s}/link.txt", .{root});
+    defer alloc.free(link);
+    const chmod_out = try runCmdCapture(io, alloc, &.{ "chmod", "751", path }, root);
+    defer alloc.free(chmod_out);
+    const mode_before = (try std.Io.Dir.cwd().statFile(io, path, .{})).permissions;
+    try std.Io.Dir.cwd().symLink(io, "real.txt", link, .{});
+    var sess = try Session.spawnCwd(io, &.{ oz_exe_path, link }, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "LINK_ORIGINAL", 8000);
+    try sess.send("iEDIT_");
+    try gridWaitFor(&sess, &grid, "EDIT_LINK_ORIGINAL", 5000);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+    try sess.send(":w\r");
+    try gridWaitFor(&sess, &grid, "written:", 5000);
+    // A second save must use the newly committed baseline as well.
+    try sess.send("iAGAIN_");
+    try gridWaitFor(&sess, &grid, "AGAIN_", 5000);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    try std.testing.expectEqual(std.Io.File.Kind.sym_link, (try std.Io.Dir.cwd().statFile(io, link, .{ .follow_symlinks = false })).kind);
+    try std.testing.expectEqual(mode_before, (try std.Io.Dir.cwd().statFile(io, path, .{})).permissions);
+    const saved = try absFileText(io, alloc, path);
+    defer alloc.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "EDIT_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "AGAIN_") != null);
+    try expectLspDisk(io, alloc, link, saved);
+}
+
+test "file safety: atomic replacement refuses normal save and permits explicit force" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "file.txt", "BASELINE\n");
+    const path = try std.fmt.allocPrint(alloc, "{s}/file.txt", .{root});
+    defer alloc.free(path);
+    var sess = try Session.spawnCwd(io, &.{ oz_exe_path, path }, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "BASELINE", 8000);
+    try sess.send("iMY_");
+    try gridWaitFor(&sess, &grid, "MY_BASELINE", 5000);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+    try safetyReplaceFile(io, alloc, path, "EXTERNAL\n");
+    try sess.send(":wq\r");
+    try gridWaitFor(&sess, &grid, "file changed on disk", 5000);
+    try std.testing.expect(try sess.tryWaitExit() == null);
+    try std.testing.expect(grid.contains("MY_BASELINE"));
+    try expectLspDisk(io, alloc, path, "EXTERNAL\n");
+    try sess.send(":w!\r");
+    try gridWaitFor(&sess, &grid, "written:", 5000);
+    try expectNoDirtyMarker(&grid);
+    try expectLspDisk(io, alloc, path, "MY_BASELINE\n");
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+}
+
 test "safety: quit write-quit and delete protect hidden dirty buffers and workspaces" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -23342,4 +23592,79 @@ test "tools: cancelled worker keeps retry input until its slot is reclaimed" {
     try sess.send("\x1b");
     try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa\r"));
+}
+
+fn acpEditorScenario(mode: []const u8, dirty: bool, allow: bool) !void {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "acp.txt", "ACP_ORIGINAL\n");
+    var file_buf: [220:0]u8 = undefined;
+    const file = try bufPrintZ(&file_buf, "{s}/acp.txt", .{root});
+    const script = try std.Io.Dir.cwd().realPathFileAlloc(io, "test/fixtures/acp_agent.py", alloc);
+    defer alloc.free(script);
+    const command = try std.json.Stringify.valueAlloc(alloc, .{ "python3", "-u", script, mode }, .{});
+    defer alloc.free(command);
+    const command_env = try std.fmt.allocPrint(alloc, "OZ_ACP_COMMAND={s}", .{command});
+    defer alloc.free(command_env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, file }, &.{command_env}, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    if (dirty) {
+        try sess.send("iLOCAL_\x1b");
+        try gridWaitFor(&sess, &grid, "LOCAL_ACP_ORIGINAL", 3000);
+    }
+    try aiEnterRail(&sess, &grid);
+    try sess.send("hello\r");
+    if (std.mem.eql(u8, mode, "permission")) {
+        try gridWaitFor(&sess, &grid, "ACP permission", 5000);
+        try sess.send(if (allow) "a" else "r");
+        try gridWaitFor(&sess, &grid, if (allow) "PERMISSION_yes" else "PERMISSION_no", 5000);
+    }
+    if (std.mem.eql(u8, mode, "hang")) {
+        try gridWaitFor(&sess, &grid, "Ctrl+c stop", 5000);
+        try sess.send("\x03");
+        try gridWaitFor(&sess, &grid, "cancelled", 5000);
+    } else {
+        try gridWaitFor(&sess, &grid, "ACP_REPLY_1", 5000);
+        try gridWaitFor(&sess, &grid, "idle", 5000);
+        if (std.mem.eql(u8, mode, "normal")) {
+            try sess.send("second\r");
+            try gridWaitFor(&sess, &grid, "ACP_REPLY_2", 5000);
+            try gridWaitFor(&sess, &grid, "idle", 5000);
+            try std.testing.expect(!grid.contains("conflict"));
+        }
+        if (std.mem.eql(u8, mode, "edit")) {
+            try gridWaitFor(&sess, &grid, if (dirty) "LOCAL_ACP_ORIGINAL" else "ACP_DISK_CHANGED", 5000);
+            if (dirty) try gridWaitFor(&sess, &grid, "conflict", 5000) else try expectNoDirtyMarker(&grid);
+        }
+    }
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
+    try aiQuit(&sess);
+}
+test "ACP editor: generic command and persistent conversation" {
+    try acpEditorScenario("normal", false, false);
+}
+test "ACP editor: permission allow and reject" {
+    try acpEditorScenario("permission", false, true);
+    try acpEditorScenario("permission", false, false);
+}
+test "ACP editor: cancel blocked harness" {
+    try acpEditorScenario("hang", false, false);
+}
+test "ACP editor: external writes refresh clean buffers" {
+    try acpEditorScenario("edit", false, false);
+}
+test "ACP editor: external writes preserve dirty buffers" {
+    try acpEditorScenario("edit", true, false);
+}
+
+test "ACP editor: unchanged disk does not conflict with local edits" {
+    try acpEditorScenario("normal", true, false);
 }

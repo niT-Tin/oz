@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const buffer = @import("../buffer/root.zig");
+const disk_file = @import("../buffer/file.zig");
 const json_rpc = @import("../util/json_rpc.zig");
 
 const app_mod = @import("../app.zig");
@@ -89,22 +90,17 @@ pub fn targetWindowForOpen(self: *App, buf_idx: ?usize) void {
     self.current_win = self.firstLeaf(root);
 }
 
-/// Load `file` (size bytes) into a PieceTable without copying the file
-/// into the heap: a read-only PRIVATE mmap backs the origin piece, so a
-/// 50MB file costs one mapping, not a 50MB heap copy (RSS ~1× the file
-/// instead of 2×). Falls back to read + copy when the file is empty or
-/// the mapping fails (special filesystems, quota, …). The caller keeps
-/// `file` open only until this returns — the mapping survives the close.
+/// Own a snapshot: external in-place writes/truncation must never mutate
+/// the document's origin or SIGBUS a later render/undo/save.
 pub fn loadPieceTable(self: *App, file: std.Io.File, size: u64) !buffer.PieceTable {
-    if (size == 0) return buffer.PieceTable.init(self.alloc, "");
     const len: usize = @intCast(size);
-    const mapping = std.posix.mmap(null, len, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0) catch {
-        const bytes = try self.alloc.alloc(u8, len);
-        defer self.alloc.free(bytes);
-        _ = try file.readPositionalAll(self.io, bytes, 0);
-        return buffer.PieceTable.init(self.alloc, bytes);
-    };
-    return buffer.PieceTable.initMapped(self.alloc, mapping);
+    const bytes = try self.alloc.alloc(u8, len);
+    var owned = true;
+    errdefer if (owned) self.alloc.free(bytes);
+    if (try file.readPositionalAll(self.io, bytes, 0) != len or (try file.stat(self.io)).size != size)
+        return error.FileChanged;
+    owned = false;
+    return buffer.PieceTable.initOwned(self.alloc, bytes);
 }
 
 /// Open `path` in a new buffer unless it is already open (then switch).
@@ -168,14 +164,20 @@ pub fn openInBuffer(self: *App, path: []const u8) !void {
         const buf = &self.buffers.items[idx];
         // load BEFORE swapping so a load failure leaves the scratch buffer
         // intact (deinit-then-assign would strand a dead piece table)
-        const new_pt = try self.loadPieceTable(file, size);
+        var new_pt = try self.loadPieceTable(file, size);
+        var own_loaded = true;
+        errdefer if (own_loaded) new_pt.deinit();
         const new_path = try self.alloc.dupe(u8, abs);
+        errdefer if (own_loaded) self.alloc.free(new_path);
+        const disk = try disk_file.Baseline.init(self.alloc, self.io, abs, new_pt.origin);
         buf.pt.deinit();
         buf.pt = new_pt;
         buf.history.deinit();
         buf.history = buffer.History.init(self.alloc);
         self.clearSpanCache(buf);
         buf.path = new_path;
+        buf.disk = disk;
+        own_loaded = false;
         // Notes live in the global data dir: they are project-independent,
         // so opening one must not root the workspace's tree/picker there.
         if (!self.notesIsPath(abs)) self.setProjectRoot(abs);
@@ -200,11 +202,20 @@ pub fn openInBuffer(self: *App, path: []const u8) !void {
         return;
     }
 
+    var new_pt = try self.loadPieceTable(file, size);
+    var own_loaded = true;
+    errdefer if (own_loaded) new_pt.deinit();
+    const new_path = try self.alloc.dupe(u8, abs);
+    errdefer if (own_loaded) self.alloc.free(new_path);
+    var disk = try disk_file.Baseline.init(self.alloc, self.io, abs, new_pt.origin);
+    errdefer if (own_loaded) disk.deinit(self.alloc);
     try self.buffers.append(self.alloc, .{
-        .pt = try self.loadPieceTable(file, size),
+        .pt = new_pt,
         .history = buffer.History.init(self.alloc),
-        .path = try self.alloc.dupe(u8, abs),
+        .path = new_path,
+        .disk = disk,
     });
+    own_loaded = false;
     if (!self.notesIsPath(abs)) self.setProjectRoot(abs);
     try self.addRecent(abs);
     self.targetWindowForOpen(null);

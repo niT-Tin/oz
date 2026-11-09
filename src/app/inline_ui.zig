@@ -259,6 +259,10 @@ pub fn submitInlineEdit(self: *App) !void {
         setInlineErrorFmt(self, "config: {s}", .{@errorName(e)});
         return;
     };
+    if (cfg.acp_command != null) {
+        setInlineError(self, "ACP edits run in the Agent panel; use <leader>a");
+        return;
+    }
     const body = inline_model.buildRequestBody(
         self.alloc,
         cfg.model,
@@ -371,6 +375,7 @@ pub fn drainInline(self: *App) !bool {
         changed = true;
         if (!s.request_active) continue; // late events after cancel/complete
         switch (ev) {
+            .acp_permission => c.decidePermission(false),
             .delta => |text| {
                 if (s.status != .streaming) continue;
                 if (s.streamed.items.len + text.len > inline_model.max_replacement_bytes) {

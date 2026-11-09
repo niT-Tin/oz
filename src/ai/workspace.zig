@@ -61,8 +61,20 @@ pub fn layout(cols: u32, open: bool) Layout {
 }
 
 pub fn layoutMode(cols: u32, open: bool, agent_focus: bool) Layout {
+    return layoutCustom(cols, open, agent_focus, null);
+}
+
+/// Keep the requested width separately from this terminal-size clamp, so a
+/// temporary narrow terminal does not destroy the user's preferred size.
+pub fn clampRailWidth(cols: u32, requested: u32) u32 {
+    const available = if (cols >= mid_cols) cols -| 41 else cols -| drawer_margin;
+    const maximum = @max(available, 1);
+    return std.math.clamp(requested, @min(24, maximum), maximum);
+}
+
+pub fn layoutCustom(cols: u32, open: bool, agent_focus: bool, requested: ?u32) Layout {
     if (!open) return .{ .mode = .hidden, .editor_width = cols };
-    const rw = if (agent_focus and cols >= wide_cols) rail_focus_width else railWidth(cols);
+    const rw = if (requested) |width| clampRailWidth(cols, width) else if (agent_focus and cols >= wide_cols) rail_focus_width else railWidth(cols);
     const rail_col = cols -| rw;
     const rail_gutter: u32 = 1;
     if (cols >= mid_cols) {
@@ -608,6 +620,28 @@ pub const Threads = struct {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "workspace layout: custom widths clamp and restore across terminal sizes" {
+    for (0..201) |n| {
+        const cols: u32 = @intCast(n);
+        for ([_]u32{ 0, 24, 48, 80, std.math.maxInt(u32) }) |request| {
+            const custom = layoutCustom(cols, true, false, request);
+            try std.testing.expectEqual(if (cols == 0) @as(u32, 1) else cols, @max(cols, custom.rail_width));
+            try std.testing.expect(custom.rail_col <= cols);
+            if (cols >= mid_cols) {
+                try std.testing.expect(custom.editor_width >= 40);
+                try std.testing.expectEqual(cols, custom.editor_width + custom.rail_gutter + custom.rail_width);
+            } else {
+                try std.testing.expectEqual(cols, custom.editor_width);
+                if (cols > drawer_margin) try std.testing.expect(custom.rail_col >= drawer_margin);
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 60), layoutCustom(120, true, false, 60).rail_width);
+    try std.testing.expectEqual(@as(u32, 49), layoutCustom(90, true, false, 60).rail_width);
+    try std.testing.expectEqual(@as(u32, 60), layoutCustom(160, true, false, 60).rail_width);
+    try std.testing.expectEqual(layoutMode(120, true, false), layoutCustom(120, true, false, null));
+}
 
 test "workspace layout: 120/110/100/90 dock, 89/80 drawer, hidden" {
     const l120 = layout(120, true);

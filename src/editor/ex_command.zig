@@ -7,12 +7,14 @@ pub const Command = union(enum) {
     empty,
     /// :w — write the current buffer.
     write,
+    write_force,
     /// :q — quit (fails if the buffer is modified; caller decides).
     quit,
     /// :q! — quit without writing.
     quit_force,
     /// :wq — write then quit.
     write_quit,
+    write_quit_force,
     /// :qa — quit every window/buffer, refusing unsaved changes.
     quit_all,
     /// :qa! — explicitly discard every workspace's unsaved changes.
@@ -99,6 +101,9 @@ pub fn parse(line: []const u8) Command {
     if (std.mem.eql(u8, word, "w") or std.mem.eql(u8, word, "write")) {
         return if (args.len == 0) .write else .unknown;
     }
+    if (std.mem.eql(u8, word, "w!") or std.mem.eql(u8, word, "write!")) {
+        return if (args.len == 0) .write_force else .unknown;
+    }
     if (std.mem.eql(u8, word, "q") or std.mem.eql(u8, word, "quit")) {
         return if (args.len == 0) .quit else .unknown;
     }
@@ -111,6 +116,9 @@ pub fn parse(line: []const u8) Command {
         std.mem.eql(u8, word, "new")) return .split;
     if (std.mem.eql(u8, word, "wq") or std.mem.eql(u8, word, "x")) {
         return if (args.len == 0) .write_quit else .unknown;
+    }
+    if (std.mem.eql(u8, word, "wq!") or std.mem.eql(u8, word, "x!")) {
+        return if (args.len == 0) .write_quit_force else .unknown;
     }
     if (std.mem.eql(u8, word, "e") or std.mem.eql(u8, word, "edit")) {
         return if (args.len == 0) .unknown else .{ .edit = args };
@@ -196,6 +204,11 @@ pub fn unescapeSubSep(alloc: std.mem.Allocator, src: []const u8) ![]u8 {
 }
 
 test "parse: write/quit family" {
+    try std.testing.expect(parse("w!") == .write_force);
+    try std.testing.expect(parse("write!") == .write_force);
+    try std.testing.expect(parse("wq!") == .write_quit_force);
+    try std.testing.expect(parse("x!") == .write_quit_force);
+    try std.testing.expect(parse("w! other.txt") == .unknown);
     try std.testing.expect(parse("w") == .write);
     try std.testing.expect(parse("  w  ") == .write);
     try std.testing.expect(parse("q") == .quit);

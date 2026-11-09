@@ -345,11 +345,23 @@ pub fn absolutePath(self: *App, path: []const u8) ![]u8 {
 /// when there is no file name or the write fails, so callers like :wq
 /// must NOT proceed to quit on failure.
 pub fn writeBuffer(self: *App) !bool {
+    return writeBufferForce(self, false);
+}
+
+pub fn writeBufferForce(self: *App, force: bool) !bool {
     const path = self.cur().path orelse {
         try self.setMsg(try self.alloc.dupe(u8, "E32: No file name"));
         return false;
     };
-    self.saveFile(path) catch |e| {
+    saveFileForce(self, path, force) catch |e| {
+        if (e == error.FileChanged) {
+            try self.setMsg(try self.alloc.dupe(u8, "E13: file changed on disk; :w! to overwrite"));
+            return false;
+        }
+        if (e == error.PathChanged) {
+            try self.setMsg(try self.alloc.dupe(u8, "write refused: file target changed; reopen the file"));
+            return false;
+        }
         try self.setMsg(try std.fmt.allocPrint(self.alloc, "write failed: {s}", .{@errorName(e)}));
         return false;
     };
@@ -364,28 +376,16 @@ pub fn writeBuffer(self: *App) !bool {
 }
 
 pub fn saveFile(self: *App, path: []const u8) !void {
+    return saveFileForce(self, path, false);
+}
+
+fn saveFileForce(self: *App, path: []const u8, force: bool) !void {
     const len = self.cur().pt.len();
     const buf = try self.alloc.alloc(u8, len);
     defer self.alloc.free(buf);
     self.cur().pt.copyRange(0, buf);
-    // Write to a sibling temp file and rename it over `path` — NEVER
-    // truncate the open file in place: the buffer's origin may be an
-    // mmap of it, and truncating a mapped file SIGBUSes every later read
-    // of the mapping (the file no longer backs those pages). Temp+rename
-    // also makes saves atomic for other readers (they never see a
-    // half-written file) and keeps the old inode alive for the mapping.
-    const tmp = try std.fmt.allocPrint(self.alloc, "{s}.oztmp{d}", .{ path, std.c.getpid() });
-    defer self.alloc.free(tmp);
-    var flags: std.Io.Dir.CreateFileOptions = .{ .truncate = true };
-    // Preserve the original file's mode (executable bit etc.) on the
-    // replacement file.
-    if (std.Io.Dir.cwd().statFile(self.io, path, .{})) |st| {
-        flags.permissions = st.permissions;
-    } else |_| {}
-    var f = try std.Io.Dir.cwd().createFile(self.io, tmp, flags);
-    defer f.close(self.io);
-    try f.writeStreamingAll(self.io, buf);
-    try std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), path, self.io);
+    const disk = if (self.cur().disk) |*d| d else return error.MissingDiskBaseline;
+    try disk.write(self.alloc, self.io, path, buf, force);
 }
 
 pub fn openFile(self: *App, path: []const u8) !void {

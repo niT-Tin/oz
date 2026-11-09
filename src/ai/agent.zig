@@ -4,7 +4,7 @@
 //! owns the actual loop (transport + worker) and calls into this module for
 //! the bounded decisions and the textual pieces:
 //!
-//!   - `Limits` / `planBatch`: at most 4 tool rounds and 8 calls per user
+//!   - `Limits` / `planBatch`: configurable bounded tool rounds/calls per user
 //!     turn. Over-limit calls are reported truthfully and never executed.
 //!   - `CardStatus` + `cardStatusText`: the compact card labels (`ok 3ms`,
 //!     `approval required`, `approved`/`rejected`, …).
@@ -30,8 +30,10 @@ const terminal_tool = @import("terminal_tool.zig");
 
 /// Hard agent-loop bounds for one user turn. Exposed as `pub const` so tests
 /// and the e2e assertions can name the numbers instead of hard-coding them.
-pub const max_tool_rounds: u8 = 4;
-pub const max_tool_calls_per_turn: u8 = 8;
+pub const max_tool_rounds: u16 = 32;
+pub const max_tool_calls_per_turn: u16 = 128;
+pub const hard_max_tool_rounds: u16 = 256;
+pub const hard_max_tool_calls: u16 = 1024;
 
 /// Recent latency window per tool (Tools tab chart / sparkline).
 pub const recent_capacity: usize = 32;
@@ -47,8 +49,8 @@ pub const max_args_summary_bytes: usize = 120;
 pub const max_excerpt_bytes: usize = 160;
 
 pub const Limits = struct {
-    rounds: u8 = max_tool_rounds,
-    calls: u8 = max_tool_calls_per_turn,
+    rounds: u16 = max_tool_rounds,
+    calls: u16 = max_tool_calls_per_turn,
 };
 
 pub const LimitReason = enum { rounds, calls };
@@ -66,7 +68,7 @@ pub const BatchPlan = struct {
 
 /// Pure loop-budget decision. `rounds` counts already-started batches,
 /// `calls` counts already-admitted calls in this user turn.
-pub fn planBatch(rounds: u8, calls: u8, limits: Limits, requested: usize) BatchPlan {
+pub fn planBatch(rounds: u16, calls: u16, limits: Limits, requested: usize) BatchPlan {
     if (requested == 0) return .{ .execute = 0, .skipped = 0, .reason = null };
     if (rounds >= limits.rounds) {
         return .{ .execute = 0, .skipped = requested, .reason = .rounds };
@@ -626,7 +628,7 @@ pub const ChartKey = struct {
 // ---------------------------------------------------------------------------
 
 test "agent: batch plan enforces rounds then calls" {
-    const limits = Limits{};
+    const limits = Limits{ .rounds = 4, .calls = 8 };
     const p1 = planBatch(0, 0, limits, 2);
     try std.testing.expectEqual(@as(usize, 2), p1.execute);
     try std.testing.expectEqual(@as(usize, 0), p1.skipped);
@@ -654,12 +656,22 @@ test "agent: batch plan enforces rounds then calls" {
     try std.testing.expect(empty.reason == null);
 }
 
+test "agent: defaults admit useful work beyond the old caps and large budgets do not wrap" {
+    const usual = planBatch(4, 8, .{}, 3);
+    try std.testing.expectEqual(@as(usize, 3), usual.execute);
+    try std.testing.expect(usual.reason == null);
+    const large = planBatch(255, 1023, .{ .rounds = hard_max_tool_rounds, .calls = hard_max_tool_calls }, 2);
+    try std.testing.expectEqual(@as(usize, 1), large.execute);
+    try std.testing.expectEqual(@as(usize, 1), large.skipped);
+    try std.testing.expectEqual(LimitReason.calls, large.reason.?);
+}
+
 test "agent: limit note names the bound and stays owned" {
     const alloc = std.testing.allocator;
-    const r = try limitNote(alloc, .rounds, .{});
+    const r = try limitNote(alloc, .rounds, .{ .rounds = 4, .calls = 8 });
     defer alloc.free(r);
     try std.testing.expectEqualStrings("tool loop stopped: max rounds (4) reached", r);
-    const c = try limitNote(alloc, .calls, .{});
+    const c = try limitNote(alloc, .calls, .{ .rounds = 4, .calls = 8 });
     defer alloc.free(c);
     try std.testing.expectEqualStrings("tool loop stopped: max calls (8) reached", c);
 }

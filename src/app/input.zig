@@ -179,6 +179,9 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
             // the wider Agent-focus layout without replacing either binding.
             'a' => try self.focusAiRail(),
             'A' => try self.toggleAiFocus(),
+            '<' => self.resizeAiRail(-4),
+            '>' => self.resizeAiRail(4),
+            '=' => self.resizeAiRail(null),
             else => {},
         }
         return;

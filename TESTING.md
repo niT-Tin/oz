@@ -18,7 +18,7 @@ zig build e2e -Dtest-filter="golden"
 ```
 
 Current counts after merging the editor-integrity fixes with the AI workspace:
-**598 unit tests** and **235 e2e tests**. `tools/verify.sh` covers diff check,
+**604 unit tests** and **241 e2e tests**. `tools/verify.sh` covers diff check,
 all unit tests and all e2e tests (including Agent-focus, `terminal:` and
 multi-file `approval:`). `tools/verify.sh`
 writes `.verify/unit.log`, `.verify/e2e.log`, and
@@ -34,6 +34,27 @@ pushes to `master`, uploads `.verify/` even on failure, and is authoritative.
 Zig test steps use `has_side_effects = true`, so `zig build test` and
 `zig build e2e` always execute the freshly built test binary instead of
 replaying a cached successful run.
+
+## File safety and Agent regressions
+
+- `zig build e2e -Dtest-filter="file safety:"`: CLI and `:e` loading retain
+  owned snapshots after external truncation; navigation/undo/redo remain live;
+  `:wq` refuses conflicts without exiting; explicit `:wq!` saves the retained
+  bytes. Symlink saves preserve the link and mode across consecutive writes;
+  atomic external replacements survive normal saves until explicit `:w!`.
+- `zig build test -Dtest-filter="disk baseline:"`: external creation of a new
+  buffer's path, baseline updates after saves, and refusing retargeted/dangling
+  symlinks even with force. The testing allocator checks baseline ownership.
+- `zig build e2e -Dtest-filter="ai resize:"`: real border drag and Ctrl-w
+  resizing at 80/100/120 columns, both size clamps, mouse targets after resize,
+  preserved drafts/reopen widths, separate Agent-focus width and SIGWINCH
+  shrink/grow restoring the requested width.
+- `tools: default budget` executes six real read-file rounds through mock SSE
+  and keeps tools available in request seven. Configured four-round/eight-call
+  tests still verify a single final no-tools request and truthful overflow.
+- Config tests reject zero/malformed/oversized budgets. Defaults are 32 rounds
+  and 128 calls per user turn, configurable up to 256/1024. Per-batch card
+  storage follows the protocol's 32-call batch bound, independent of turn limits.
 
 ## Test layers
 
@@ -285,10 +306,10 @@ The M3a pty tests (`test/e2e.zig`, filter `tools:`) cover:
   final text still arrives;
 - `edit_file` is no longer an M3a block: it is staged by the M3b1 path below
   (the old placeholder test was replaced, not deleted);
-- four tool rounds: execution stops, the transcript note names the bound, the
+- an explicitly configured four-tool-round budget: execution stops, the transcript note names the bound, the
   fifth request is the final **no-tools** request (no `tools`/`tool_choice`),
   and no sixth request exists; Tools tab `calls 4`;
-- a nine-call single batch: only the first eight execute, the ninth is a real
+- an explicitly configured eight-call budget with a nine-call batch: only the first eight execute, the ninth is a real
   `unsupported` tool result (`tool call limit (8) reached; not executed`),
   the follow-up is the final no-tools request, and Tools tab shows
   `calls 9` / `ok 8 · err 0 · unsup 1`;
@@ -672,3 +693,13 @@ Known gaps / deliberate limitations:
 - A golden mismatch is not "flaky" unless two runs produce different actual
   frames; compare `.verify/golden/*.actual.txt` across runs before updating.
 - Scenario failures print the scenario name and tags, then dump the grid.
+
+ACP regressions use `test/fixtures/acp_agent.py` (Python 3; no network, credentials or model usage). `zig build test` covers argv configuration, fragmented UTF-8, two turns on one session, foreign-session filtering, string permission IDs, allow/reject, malformed JSON, disconnects, version negotiation, remote errors, frame limits and cancellation. `zig build e2e -Dtest-filter='ACP editor'` covers the real Agent panel, permission decisions, cancellation, clean-buffer refresh and dirty-buffer preservation. These fixtures do not replace authenticated compatibility testing against installed Kimi/Codex/DeepSeek versions.
+
+Real DeepSeek Harness checkout smoke (opt-in, Linux/Python 3):
+
+```sh
+python3 test/deepseek_smoke.py /home/leoz/sources/deepseek-harness
+```
+
+Prepare that checkout with its locked pnpm dependencies, `pnpm run build:native-system`, and `pnpm exec tsx scripts/generate-typert.ts`. The smoke creates an isolated DSH home, persistence directory and local deterministic provider. It checks real profile initialization/session creation/close and stdout purity, then drives the built oz through a PTY for two turns and checks editor context delivery. It exercises the actual `deepseek` preset, including `pnpm --silent` (plain pnpm may write runner/install messages to the JSON-RPC stream). No remote model calls or user credentials are needed; this smoke is separate from the deterministic Zig suite because it requires another repository and its build prerequisites.
