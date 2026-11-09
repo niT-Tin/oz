@@ -85,6 +85,8 @@ pub const Script = enum {
     edit_safety,
     /// The same rename fixture in documentChanges form (nullable versions).
     edit_safety_documents,
+    /// Rename returns real b.zig while hover observes the opened symlink.
+    edit_safety_alias,
 
     pub fn parse(name: []const u8) ?Script {
         if (std.mem.eql(u8, name, "hello")) return .hello;
@@ -96,6 +98,7 @@ pub const Script = enum {
         if (std.mem.eql(u8, name, "rich")) return .rich;
         if (std.mem.eql(u8, name, "edit_safety")) return .edit_safety;
         if (std.mem.eql(u8, name, "edit_safety_documents")) return .edit_safety_documents;
+        if (std.mem.eql(u8, name, "edit_safety_alias")) return .edit_safety_alias;
         return null;
     }
 };
@@ -231,8 +234,8 @@ pub fn handleMessage(
             const prefix = completionPrefix(a, state, uri, line, col);
             try pushResponse(alloc, &out, id, try buildCompletionResult(a, prefix, script));
         } else if (std.mem.eql(u8, method, "textDocument/hover")) {
-            const result = if (script == .edit_safety or script == .edit_safety_documents)
-                try buildSafetyHover(a, state, msg.params)
+            const result = if (script == .edit_safety or script == .edit_safety_documents or script == .edit_safety_alias)
+                try buildSafetyHover(a, state, msg.params, if (script == .edit_safety_alias) "linked-b.zig" else "b.zig")
             else
                 try buildHoverResult(a, script);
             try pushResponse(alloc, &out, id, result);
@@ -256,7 +259,7 @@ pub fn handleMessage(
         } else if (std.mem.eql(u8, method, "textDocument/signatureHelp")) {
             try pushResponse(alloc, &out, id, try buildSignatureResult(a));
         } else if (std.mem.eql(u8, method, "textDocument/formatting")) {
-            if (script == .edit_safety or script == .edit_safety_documents) {
+            if (script == .edit_safety or script == .edit_safety_documents or script == .edit_safety_alias) {
                 const uri = requestDocumentUri(msg.params) orelse return error.MissingDocumentUri;
                 const body = try json_rpc.encodeResponse(alloc, id, try buildSafetyEdits(a, "FORMATTED_A"));
                 errdefer alloc.free(body);
@@ -272,7 +275,7 @@ pub fn handleMessage(
                 try pushResponse(alloc, &out, id, try buildFormatResult(a, state));
             }
         } else if (std.mem.eql(u8, method, "textDocument/rename")) {
-            if (script == .edit_safety or script == .edit_safety_documents) {
+            if (script == .edit_safety or script == .edit_safety_documents or script == .edit_safety_alias) {
                 try pushResponse(alloc, &out, id, try buildSafetyRename(a, msg.params, script == .edit_safety_documents));
             } else {
                 try pushResponse(alloc, &out, id, try buildRenameResult(a, state));
@@ -754,12 +757,12 @@ fn buildSafetyRename(a: std.mem.Allocator, params: ?std.json.Value, document_cha
 /// Hover requested from A reports B's last didOpen/didChange text. Rename
 /// responses do not update this copy themselves, so a stale hidden document
 /// is observable without selecting B (which could otherwise repair it).
-fn buildSafetyHover(a: std.mem.Allocator, state: *State, params: ?std.json.Value) !std.json.Value {
+fn buildSafetyHover(a: std.mem.Allocator, state: *State, params: ?std.json.Value, peer: []const u8) !std.json.Value {
     const uri_a = requestDocumentUri(params) orelse return error.MissingDocumentUri;
     const slash = std.mem.lastIndexOfScalar(u8, uri_a, '/') orelse return error.MissingDocumentUri;
-    const uri_b = try std.fmt.allocPrint(a, "{s}/b.zig", .{uri_a[0..slash]});
+    const uri_b = try std.fmt.allocPrint(a, "{s}/{s}", .{ uri_a[0..slash], peer });
     const text = recordedTextOf(state, uri_b) orelse "<not opened>";
-    const label = try std.fmt.allocPrint(a, "server b.zig: {s}", .{std.mem.trimEnd(u8, text, "\r\n")});
+    const label = try std.fmt.allocPrint(a, "server {s}: {s}", .{ peer, std.mem.trimEnd(u8, text, "\r\n") });
     var contents = try std.json.ObjectMap.init(a, &.{}, &.{});
     try contents.put(a, "kind", .{ .string = "plaintext" });
     try contents.put(a, "value", .{ .string = label });
@@ -1163,6 +1166,7 @@ fn printUsage(io: std.Io) void {
         \\  edit_safety  formatting waits for another didOpen; rename edits
         \\           b.zig then the requesting URI through changes.
         \\  edit_safety_documents  same rename through documentChanges.
+        \\  edit_safety_alias  rename real b.zig, hover its opened symlink URI.
         \\
         \\options:
         \\  --verbose  log received/sent messages to stderr
@@ -1310,6 +1314,7 @@ test "Script.parse" {
     try testing.expect(Script.parse("silent") == .silent);
     try testing.expect(Script.parse("edit_safety") == .edit_safety);
     try testing.expect(Script.parse("edit_safety_documents") == .edit_safety_documents);
+    try testing.expect(Script.parse("edit_safety_alias") == .edit_safety_alias);
     try testing.expect(Script.parse("bogus") == null);
 }
 

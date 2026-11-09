@@ -133,7 +133,9 @@ fn sendEditRequest(self: *App, client: anytype, method: []const u8, params: std.
 
 const EditPlan = struct {
     path: ?[]u8,
-    uri: []u8,
+    /// URI registered from the buffer's stored path, which can differ from
+    /// the server's response URI when it resolves a symlink/URI alias.
+    buffer_uri: []u8,
     /// Borrows the prepared undo group's owned after bytes (which move into
     /// the buffer history on commit), and stays valid through LSP sync.
     text: []const u8,
@@ -144,7 +146,7 @@ const EditPlan = struct {
 
     fn deinit(self: *EditPlan, app: *App) void {
         if (self.path) |p| app.alloc.free(p);
-        app.alloc.free(self.uri);
+        app.alloc.free(self.buffer_uri);
         if (!self.installed) self.prepared.deinit(app.alloc);
         if (self.new_buffer) |*b| app.deinitBuffer(b);
     }
@@ -183,11 +185,25 @@ fn planDocument(self: *App, doc: workspace_edit.Document) !?EditPlan {
     var index: ?usize = null;
     for (self.buffers.items, 0..) |b, i| {
         if (b.path) |p| if (try sameEditPath(self, p, path)) {
+            if (index != null) return error.AmbiguousDocument;
             index = i;
-            break;
         };
     }
+    const buffer_path = if (index) |i| self.buffers.items[i].path.? else path;
+    const buffer_uri = try lsp_types.pathToFileUri(self.alloc, buffer_path);
+    var own_uri = true;
+    defer if (own_uri) self.alloc.free(buffer_uri);
+    if (self.lsp_client) |client| {
+        // Two registered URI mirrors cannot safely share one buffer's
+        // synced revision. Refuse before installation and reset the client
+        // rather than leaving either mirror stale after future edits.
+        if (!std.mem.eql(u8, doc.uri, buffer_uri) and client.isDocOpen(doc.uri)) {
+            return error.AmbiguousDocumentUri;
+        }
+    }
     if (doc.version) |version| {
+        // A version belongs to the response's exact wire URI; do not infer
+        // one from another spelling of the same filesystem object.
         const client = self.lsp_client orelse return error.StaleDocumentVersion;
         if (client.documentVersion(doc.uri) != version) return error.StaleDocumentVersion;
     }
@@ -220,9 +236,9 @@ fn planDocument(self: *App, doc: workspace_edit.Document) !?EditPlan {
         new_buffer = .{ .pt = try buffer.PieceTable.init(self.alloc, old), .history = buffer.History.init(self.alloc) };
         try workspace_edit.Prepared.reserve(&new_buffer.?.history);
     }
-    const uri = try self.alloc.dupe(u8, doc.uri);
+    own_uri = false;
     own_path = false;
-    return .{ .path = path, .uri = uri, .text = prepared.group.edits.items[0].after, .buffer_index = index, .prepared = prepared, .new_buffer = new_buffer };
+    return .{ .path = path, .buffer_uri = buffer_uri, .text = prepared.group.edits.items[0].after, .buffer_index = index, .prepared = prepared, .new_buffer = new_buffer };
 }
 
 fn applyEditResponse(self: *App, result: std.json.Value) !void {
@@ -283,7 +299,9 @@ fn applyEditResponse(self: *App, result: std.json.Value) !void {
     }
     if (self.lsp_client) |client| {
         for (plans.items) |p| {
-            client.syncDocument(p.uri, p.text) catch {
+            // Use the buffer identity for both existing and newly installed
+            // buffers. A response URI is not a reason to open a second copy.
+            client.syncDocument(p.buffer_uri, p.text) catch {
                 // Applied text stays intact, but no later request may use a
                 // server whose hidden-document coordinates are now stale.
                 self.teardownLsp(false);
@@ -308,7 +326,10 @@ pub fn processFormat(self: *App) bool {
         if (self.format_request) |*r| r.deinit(self.alloc);
         self.format_request = null;
     }
-    applyEditResponse(self, result) catch |e| editErrorMsg(self, e);
+    applyEditResponse(self, result) catch |e| {
+        if (e == error.AmbiguousDocument or e == error.AmbiguousDocumentUri) self.teardownLsp(false);
+        editErrorMsg(self, e);
+    };
     return true;
 }
 

@@ -22875,25 +22875,31 @@ fn expectLspDisk(io: Io, alloc: std.mem.Allocator, path: []const u8, expected: [
     try std.testing.expectEqualStrings(expected, text);
 }
 
-fn runLspEditSafety(which: enum { format_switch, format_percent, rename_changes, rename_documents }) !void {
+fn runLspEditSafety(which: enum { format_switch, format_percent, rename_changes, rename_documents, rename_alias, rename_alias_ambiguous }) !void {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
     var root_buf: [128]u8 = undefined;
     const root = try aiMockDir(io, &root_buf);
     defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const alias = which == .rename_alias or which == .rename_alias_ambiguous;
     const a_name = if (which == .format_percent) "a%20b.zig" else "a.zig";
-    const b_name = if (which == .format_percent) "a b.zig" else "b.zig";
+    const b_name = if (which == .format_percent) "a b.zig" else if (alias) "linked-b.zig" else "b.zig";
     try aiWriteFile(io, root, a_name, "aaa\n");
-    try aiWriteFile(io, root, b_name, "bbb\n");
+    try aiWriteFile(io, root, if (alias) "b.zig" else b_name, "bbb\n");
     const a_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, a_name });
     defer alloc.free(a_path);
     const b_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, b_name });
     defer alloc.free(b_path);
+    if (alias) try std.Io.Dir.cwd().symLink(io, "b.zig", b_path, .{});
     var mock_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const mock_len = try std.Io.Dir.cwd().realPathFile(io, "zig-out/bin/mock_lsp", &mock_path_buf);
     const mock_env = try std.fmt.allocPrint(alloc, "OZ_LSP_CMD={s}", .{mock_path_buf[0..mock_len]});
     defer alloc.free(mock_env);
-    const script_env = if (which == .rename_documents) "OZ_MOCK_SCRIPT=edit_safety_documents" else "OZ_MOCK_SCRIPT=edit_safety";
+    const script_env = switch (which) {
+        .rename_documents => "OZ_MOCK_SCRIPT=edit_safety_documents",
+        .rename_alias, .rename_alias_ambiguous => "OZ_MOCK_SCRIPT=edit_safety_alias",
+        else => "OZ_MOCK_SCRIPT=edit_safety",
+    };
     var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, a_path }, &.{ mock_env, script_env }, 30, 120, root);
     defer sess.close();
     defer killPid(sess.pid);
@@ -22940,13 +22946,33 @@ fn runLspEditSafety(which: enum { format_switch, format_percent, rename_changes,
     } else {
         // Both files are open, but the reply intentionally orders B first
         // while the request and focus belong to A.
-        try sess.send(":e b.zig\r");
+        const switch_b = try std.fmt.allocPrint(alloc, ":e {s}\r", .{b_name});
+        defer alloc.free(switch_b);
+        try sess.send(switch_b);
         try gridWaitFor(&sess, &grid, "bbb", 5000);
+        if (which == .rename_alias_ambiguous) try sess.send(":e b.zig\r");
         try sess.send(":e a.zig\r");
         try gridWaitFor(&sess, &grid, "aaa", 5000);
         try sess.send("l rn");
         try gridWaitFor(&sess, &grid, ":aaa", 5000);
         try sess.send("\r");
+        if (which == .rename_alias_ambiguous) {
+            try gridWaitFor(&sess, &grid, "LSP edit refused: AmbiguousDocument", 8000);
+            try std.testing.expect(grid.contains("aaa"));
+            try std.testing.expect(!grid.contains("RENAMED_A"));
+            try expectNoDirtyMarker(&grid);
+            try expectLspDisk(io, alloc, a_path, "aaa\n");
+            try expectLspDisk(io, alloc, b_path, "bbb\n");
+            try sess.send(switch_b);
+            try gridWaitFor(&sess, &grid, "bbb", 5000);
+            try std.testing.expect(!grid.contains("RENAMED_B"));
+            try expectNoDirtyMarker(&grid);
+            try sess.send(":e b.zig\r");
+            try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa\r"));
+            try expectLspDisk(io, alloc, a_path, "aaa\n");
+            try expectLspDisk(io, alloc, b_path, "bbb\n");
+            return;
+        }
         try gridWaitFor(&sess, &grid, "RENAMED_A", 8000);
         try std.testing.expect(!grid.contains("RENAMED_B"));
         // Each tab carries a real dirty marker; neither URI writes itself.
@@ -22954,12 +22980,14 @@ fn runLspEditSafety(which: enum { format_switch, format_percent, rename_changes,
         // Keep focus on A while asking the server about its recorded B.
         // Switching to B first could hide a missing didChange by resyncing it.
         try sess.send("K");
-        try gridWaitFor(&sess, &grid, "server b.zig: RENAMED_B", 8000);
+        const server_text = if (alias) "server linked-b.zig: RENAMED_B" else "server b.zig: RENAMED_B";
+        const server_prefix = if (alias) "server linked-b.zig:" else "server b.zig:";
+        try gridWaitFor(&sess, &grid, server_text, 8000);
         try std.testing.expect(grid.contains("RENAMED_A"));
         // Hover is dismissed by cursor motion; normal-mode Esc only clears
         // pending mode state and does not close this non-modal float.
         try sess.send("h");
-        try gridWaitGone(&sess, &grid, "server b.zig:", 5000);
+        try gridWaitGone(&sess, &grid, server_prefix, 5000);
         try expectLspDisk(io, alloc, a_path, "aaa\n");
         try expectLspDisk(io, alloc, b_path, "bbb\n");
         try sess.send(":w\r");
@@ -22968,7 +22996,7 @@ fn runLspEditSafety(which: enum { format_switch, format_percent, rename_changes,
         try gridWaitFor(&sess, &grid, a_written, 5000);
         try expectLspDisk(io, alloc, a_path, "RENAMED_A\n");
         try expectLspDisk(io, alloc, b_path, "bbb\n");
-        try sess.send(":e b.zig\r");
+        try sess.send(switch_b);
         try gridWaitFor(&sess, &grid, "RENAMED_B", 5000);
         try std.testing.expect(!grid.contains("RENAMED_A"));
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, grid.rowText(0), "\u{25cf}"));
@@ -22997,6 +23025,14 @@ test "lsp edit safety: rename changes routes both URI targets with B first" {
 
 test "lsp edit safety: rename documentChanges routes both URI targets with B first" {
     try runLspEditSafety(.rename_documents);
+}
+
+test "lsp edit safety: rename syncs the opened symlink URI before the next request" {
+    try runLspEditSafety(.rename_alias);
+}
+
+test "lsp edit safety: duplicate canonical buffers refuse the entire rename" {
+    try runLspEditSafety(.rename_alias_ambiguous);
 }
 
 // A mixed batch has fewer worker calls than admitted protocol calls: staged

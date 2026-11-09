@@ -44,7 +44,8 @@ exercise actual saved bytes as well as screen state:
   operators, backward find/Visual Line ranges, and vertical-motion insertion.
 - `zig build e2e -Dtest-filter="safety:"`: hidden buffer/workspace dirty
   protection, explicit force close, split `:wq`, and asynchronous LSP edit
-  routing (`changes` and `documentChanges`, with the other URI first).
+  routing (`changes` and `documentChanges`, with the other URI first),
+  including synchronization through an opened symbolic-link URI.
 - `zig build e2e -Dtest-filter="approval: multi-file disk baseline"`:
   external atomic replacements before approve/undo, plus independent dirty
   buffer and disk restoration.
