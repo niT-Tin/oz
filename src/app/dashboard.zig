@@ -44,7 +44,7 @@ pub fn dashboardKey(self: *App, key: vaxis.Key) !bool {
             return true;
         },
         'q' => {
-            self.quit = true;
+            @import("buffers.zig").requestQuit(self, false);
             return true;
         },
         'n' => {

@@ -17,8 +17,8 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-Current counts for the AI workspace visual redesign and request telemetry:
-**581 unit tests** and **220 e2e tests**. `tools/verify.sh` covers diff check,
+Current counts after merging the editor-integrity fixes with the AI workspace:
+**598 unit tests** and **235 e2e tests**. `tools/verify.sh` covers diff check,
 all unit tests and all e2e tests (including Agent-focus, `terminal:` and
 multi-file `approval:`). `tools/verify.sh`
 writes `.verify/unit.log`, `.verify/e2e.log`, and
@@ -36,6 +36,36 @@ Zig test steps use `has_side_effects = true`, so `zig build test` and
 replaying a cached successful run.
 
 ## Test layers
+
+The data-integrity regression groups added after the November 2026 review
+exercise actual saved bytes as well as screen state:
+
+- `zig build e2e -Dtest-filter="text regression:"`: CJK/emoji inclusive
+  operators, backward find/Visual Line ranges, and vertical-motion insertion.
+- `zig build e2e -Dtest-filter="safety:"`: hidden buffer/workspace dirty
+  protection, explicit force close, split `:wq`, and asynchronous LSP edit
+  routing (`changes` and `documentChanges`, with the other URI first),
+  including synchronization through an opened symbolic-link URI.
+- `zig build e2e -Dtest-filter="approval: multi-file disk baseline"`:
+  external atomic replacements before approve/undo, plus independent dirty
+  buffer and disk restoration.
+- `zig build test -Dtest-filter="client:"`: real loopback peers that stay
+  silent during HTTP headers, SSE body or TLS handshake; cancel/retry and
+  shutdown must finish without waiting for the peer.
+- `zig build test -Dtest-filter="tool_job"`: a cancelled worker retains its
+  slot until reaped, including completed results not yet drained.
+
+Dirty-tab close expectations now assert E37 and retained unsaved content;
+`:bd!` is used only for explicit cleanup. This replaces the earlier test
+expectation that clicking × silently discarded the buffer.
+LSP notification coalescing now preserves each URI and request ordering:
+only adjacent full-text changes to the same document may replace one
+another. The queue regression retains both sides of a request barrier,
+instead of moving a later document state ahead of that request.
+Shared PTY waits and exit drains use monotonic deadlines even while bytes
+keep arriving, so a redrawing terminal cannot suppress the test timeout.
+Terminal startup probes separate legacy Alt+r from subsequent typing, then
+assert a uniquely formatted shell response instead of assuming a `$` prompt.
 
 | Layer | What it covers | Where |
 |---|---|---|

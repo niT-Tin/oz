@@ -84,10 +84,8 @@ const OutFrame = union(enum) {
 };
 
 /// Outbound frame queue for the writer thread. didChange frames carry the
-/// FULL document text, so a queued-but-unsent didChange is stale the moment
-/// a newer edit exists — it is REPLACED in place (coalesced, pre-encode)
-/// instead of piling up obsolete full-text frames faster than the server
-/// drains them.
+/// FULL document text. Adjacent changes to the same URI can be coalesced;
+/// a different URI or a raw request is an ordering barrier.
 const OutQueue = struct {
     io: std.Io,
     mutex: std.Io.Mutex = .init,
@@ -101,14 +99,17 @@ const OutQueue = struct {
         defer self.mutex.unlock(self.io);
         if (frame == .did_change) {
             if (self.did_change_idx) |i| {
-                self.items.items[i].deinit(alloc);
-                self.items.items[i] = frame;
-                self.cond.signal(self.io);
-                return;
+                const previous = self.items.items[i].did_change;
+                if (std.mem.eql(u8, previous.uri, frame.did_change.uri)) {
+                    self.items.items[i].deinit(alloc);
+                    self.items.items[i] = frame;
+                    self.cond.signal(self.io);
+                    return;
+                }
             }
         }
         try self.items.append(alloc, frame);
-        if (frame == .did_change) self.did_change_idx = self.items.items.len - 1;
+        self.did_change_idx = if (frame == .did_change) self.items.items.len - 1 else null;
         self.cond.signal(self.io);
     }
 
@@ -176,13 +177,13 @@ pub const Client = struct {
     /// dupe) that deinit must free; OZ_LSP_CMD's entry is a borrowed env slice.
     argv_override_first_owned: bool = false,
 
-    /// Documents currently open in the server (uri hash → {}). didOpen
+    /// Documents currently open in the server (uri hash → last sent version). didOpen
     /// inserts, didClose removes. Buffer switches do NOT close the previous
     /// document (LSP servers track several), so switching back to an open,
     /// unchanged document costs nothing — the App checks `isDocOpen` and
     /// skips the re-open (and its full-text copy) entirely. Lazily
     /// initialized (hand-built test Clients skip it).
-    open_docs: ?std.AutoHashMap(u64, void) = null,
+    open_docs: ?std.AutoHashMap(u64, i32) = null,
 
     thread: ?std.Thread = null,
     /// Writer thread: post-handshake frames (didChange, requests) are QUEUED
@@ -602,9 +603,9 @@ pub const Client = struct {
     }
 
     /// Lazily-created set of documents the server has open.
-    fn docs(self: *Client) *std.AutoHashMap(u64, void) {
+    fn docs(self: *Client) *std.AutoHashMap(u64, i32) {
         if (self.open_docs == null) {
-            self.open_docs = std.AutoHashMap(u64, void).init(self.alloc);
+            self.open_docs = std.AutoHashMap(u64, i32).init(self.alloc);
         }
         return &self.open_docs.?;
     }
@@ -617,37 +618,32 @@ pub const Client = struct {
         return d.contains(hashUri(uri));
     }
 
+    pub fn documentVersion(self: *const Client, uri: []const u8) ?i32 {
+        const d = self.open_docs orelse return null;
+        return d.get(hashUri(uri));
+    }
+
     fn didOpen(self: *Client, text: []const u8) !void {
-        var td = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
-        errdefer td.deinit(self.alloc);
-        // freeValue frees every .string it finds, so every string must be a
-        // heap copy (dupe) — borrowed slices would be freed and crash.
-        const uri_copy = try self.alloc.dupe(u8, self.uri);
-        errdefer self.alloc.free(uri_copy);
-        try td.put(self.alloc, "uri", .{ .string = uri_copy });
-        // The version counter covers didOpen too: versions must strictly
-        // increase across the document's whole lifetime (1, 2, 3, ...).
+        try self.didOpenDocument(self.uri, text);
+    }
+
+    fn didOpenDocument(self: *Client, uri: []const u8, text: []const u8) !void {
+        // notify serializes synchronously; an arena owns only the JSON maps,
+        // while URI/text remain borrowed until that serialization completes.
+        // There is one cleanup path even when encoding or writing fails.
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var td = try std.json.ObjectMap.init(a, &.{}, &.{});
+        try td.put(a, "uri", .{ .string = uri });
         self.version += 1;
-        try td.put(self.alloc, "version", .{ .integer = self.version });
-        // languageId is required by the LSP textDocumentItem schema; servers
-        // (clangd) refuse to add a document without it. Use the server's
-        // declared id when it differs from the filetype — rust-analyzer
-        // rejects the bare extension "rs" and only accepts "rust".
-        const lang_copy = try self.alloc.dupe(u8, server_config.languageIdFor(self.lang));
-        errdefer self.alloc.free(lang_copy);
-        try td.put(self.alloc, "languageId", .{ .string = lang_copy });
-        // text lives INSIDE textDocument (TextDocumentItem); putting it at the
-        // top level makes strict servers (zls) fail to parse the notification.
-        const text_copy = try self.alloc.dupe(u8, text);
-        errdefer self.alloc.free(text_copy);
-        try td.put(self.alloc, "text", .{ .string = text_copy });
-        var params = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
-        errdefer params.deinit(self.alloc);
-        try params.put(self.alloc, "textDocument", .{ .object = td });
-        var v = std.json.Value{ .object = params };
-        defer self.freeDidOpenParams(&v);
-        try self.notify("textDocument/didOpen", v);
-        self.docs().put(hashUri(self.uri), {}) catch {};
+        try td.put(a, "version", .{ .integer = self.version });
+        try td.put(a, "languageId", .{ .string = server_config.languageIdFor(self.lang) });
+        try td.put(a, "text", .{ .string = text });
+        var params = try std.json.ObjectMap.init(a, &.{}, &.{});
+        try params.put(a, "textDocument", .{ .object = td });
+        try self.notify("textDocument/didOpen", .{ .object = params });
+        self.docs().put(hashUri(uri), self.version) catch {};
     }
 
     /// Send a textDocument/didChange. `range` non-null sends an incremental
@@ -656,58 +652,57 @@ pub const Client = struct {
     /// null sends a full-document replacement (the fallback for edits whose
     /// range is not tracked: undo/redo, multi-cursor ops, paste, …).
     pub fn didChange(self: *Client, range: ?types.Range, text: []const u8) !void {
+        try self.didChangeDocument(self.uri, range, text);
+    }
+
+    /// Synchronize a hidden edited document without retargeting the focused
+    /// document. Requests sent next must see every edit in a workspace set.
+    pub fn syncDocument(self: *Client, uri: []const u8, text: []const u8) !void {
+        if (self.isDocOpen(uri)) {
+            try self.didChangeDocument(uri, null, text);
+        } else try self.didOpenDocument(uri, text);
+    }
+
+    fn didChangeDocument(self: *Client, uri: []const u8, range: ?types.Range, text: []const u8) !void {
         self.version += 1;
         if (self.writer != null and range == null) {
-            // Async full-text path: hand the raw text to the writer thread,
-            // which JSON-encodes off the UI thread and coalesces pre-encode
-            // (a queued full text is replaced by the newer edit before it is
-            // ever stringified). Incremental frames are tiny, so they keep
-            // the inline-encode path below and are queued as raw frames.
-            // The uri is captured now: by the time the writer encodes, the
-            // main thread may have retargeted the client.
-            const uri_copy = try self.alloc.dupe(u8, self.uri);
+            // Capture the URI and bytes before the writer runs; focus and
+            // other document versions may change while the frame is queued.
+            const uri_copy = try self.alloc.dupe(u8, uri);
             errdefer self.alloc.free(uri_copy);
             const copy = try self.alloc.dupe(u8, text);
             errdefer self.alloc.free(copy);
             try self.out.push(self.alloc, .{ .did_change = .{ .uri = uri_copy, .text = copy, .version = self.version } });
+            self.docs().put(hashUri(uri), self.version) catch {};
             return;
         }
-        var td = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
-        errdefer td.deinit(self.alloc);
-        const uri_copy = try self.alloc.dupe(u8, self.uri);
-        errdefer self.alloc.free(uri_copy);
-        try td.put(self.alloc, "uri", .{ .string = uri_copy });
-        try td.put(self.alloc, "version", .{ .integer = self.version });
-        var change = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
-        errdefer change.deinit(self.alloc);
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var td = try std.json.ObjectMap.init(a, &.{}, &.{});
+        try td.put(a, "uri", .{ .string = uri });
+        try td.put(a, "version", .{ .integer = self.version });
+        var change = try std.json.ObjectMap.init(a, &.{}, &.{});
         if (range) |r| {
-            var range_obj = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
-            errdefer range_obj.deinit(self.alloc);
-            var start_obj = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
-            errdefer start_obj.deinit(self.alloc);
-            try start_obj.put(self.alloc, "line", .{ .integer = r.start.line });
-            try start_obj.put(self.alloc, "character", .{ .integer = r.start.character });
-            var end_obj = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
-            errdefer end_obj.deinit(self.alloc);
-            try end_obj.put(self.alloc, "line", .{ .integer = r.end.line });
-            try end_obj.put(self.alloc, "character", .{ .integer = r.end.character });
-            try range_obj.put(self.alloc, "start", .{ .object = start_obj });
-            try range_obj.put(self.alloc, "end", .{ .object = end_obj });
-            try change.put(self.alloc, "range", .{ .object = range_obj });
+            var range_obj = try std.json.ObjectMap.init(a, &.{}, &.{});
+            var start_obj = try std.json.ObjectMap.init(a, &.{}, &.{});
+            try start_obj.put(a, "line", .{ .integer = r.start.line });
+            try start_obj.put(a, "character", .{ .integer = r.start.character });
+            var end_obj = try std.json.ObjectMap.init(a, &.{}, &.{});
+            try end_obj.put(a, "line", .{ .integer = r.end.line });
+            try end_obj.put(a, "character", .{ .integer = r.end.character });
+            try range_obj.put(a, "start", .{ .object = start_obj });
+            try range_obj.put(a, "end", .{ .object = end_obj });
+            try change.put(a, "range", .{ .object = range_obj });
         }
-        const text_copy = try self.alloc.dupe(u8, text);
-        errdefer self.alloc.free(text_copy);
-        try change.put(self.alloc, "text", .{ .string = text_copy });
-        var changes = std.json.Array.init(self.alloc);
-        errdefer changes.deinit();
+        try change.put(a, "text", .{ .string = text });
+        var changes = std.json.Array.init(a);
         try changes.append(.{ .object = change });
-        var params = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
-        errdefer params.deinit(self.alloc);
-        try params.put(self.alloc, "textDocument", .{ .object = td });
-        try params.put(self.alloc, "contentChanges", .{ .array = changes });
-        var v = std.json.Value{ .object = params };
-        defer self.freeDidChangeParams(&v);
-        try self.notify("textDocument/didChange", v);
+        var params = try std.json.ObjectMap.init(a, &.{}, &.{});
+        try params.put(a, "textDocument", .{ .object = td });
+        try params.put(a, "contentChanges", .{ .array = changes });
+        try self.notify("textDocument/didChange", .{ .object = params });
+        self.docs().put(hashUri(uri), self.version) catch {};
     }
 
     pub fn didClose(self: *Client) !void {
@@ -1222,19 +1217,42 @@ test "out queue: didChange frames coalesce, other frames queue in order" {
     try q.push(alloc, .{ .did_change = .{ .uri = try alloc.dupe(u8, "file:///t.zig"), .text = try alloc.dupe(u8, "change-v2"), .version = 2 } });
     // a non-coalesced frame keeps its place AFTER the queued change
     try q.push(alloc, .{ .raw = try alloc.dupe(u8, "request") });
-    // a third change replaces v2 in place (still before the request)
+    // A later edit must stay AFTER the request that used v2 coordinates.
     try q.push(alloc, .{ .did_change = .{ .uri = try alloc.dupe(u8, "file:///t.zig"), .text = try alloc.dupe(u8, "change-v3"), .version = 3 } });
 
     const a = q.pop().?;
     defer a.deinit(alloc);
     try std.testing.expect(a == .did_change);
-    try std.testing.expectEqualStrings("change-v3", a.did_change.text); // v1/v2 coalesced away
-    try std.testing.expectEqual(@as(i32, 3), a.did_change.version);
+    try std.testing.expectEqualStrings("change-v2", a.did_change.text); // only v1 coalesced away
+    try std.testing.expectEqual(@as(i32, 2), a.did_change.version);
     const b = q.pop().?;
     defer b.deinit(alloc);
     try std.testing.expectEqualStrings("request", b.raw); // order preserved
+    const c = q.pop().?;
+    defer c.deinit(alloc);
+    try std.testing.expectEqualStrings("change-v3", c.did_change.text);
+    try std.testing.expectEqual(@as(i32, 3), c.did_change.version);
     try std.testing.expect(q.pop() == null);
     try std.testing.expect(q.did_change_idx == null);
+}
+
+test "out queue: edits to different documents never coalesce away a target" {
+    const alloc = std.testing.allocator;
+    var q = OutQueue{ .io = std.testing.io };
+    defer q.deinit(alloc);
+    for ([_][]const u8{ "file:///b.zig", "file:///a.zig", "file:///b.zig" }, 0..) |uri, i| {
+        try q.push(alloc, .{ .did_change = .{
+            .uri = try alloc.dupe(u8, uri),
+            .text = try alloc.dupe(u8, "updated"),
+            .version = @intCast(i + 1),
+        } });
+    }
+    for ([_][]const u8{ "file:///b.zig", "file:///a.zig", "file:///b.zig" }) |uri| {
+        const frame = q.pop().?;
+        defer frame.deinit(alloc);
+        try std.testing.expectEqualStrings(uri, frame.did_change.uri);
+    }
+    try std.testing.expect(q.pop() == null);
 }
 
 // ---------------------------------------------------------------------------
@@ -1292,6 +1310,40 @@ test "didOpen/didChange: document version is monotonic (1, 2, 3, ...)" {
         defer msg.deinit(alloc);
         const td = msg.params.?.object.get("textDocument").?;
         try std.testing.expectEqualStrings(want, td.object.get("version").?.number_string);
+    }
+}
+
+test "didOpen/didChange: hidden document synchronization preserves focus and versions" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const fds = try std.Io.Threaded.pipe2(.{});
+    const read_end = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+    const write_end = std.Io.File{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+    defer read_end.close(io);
+    defer write_end.close(io);
+    var client = try testClient(alloc, io, write_end);
+    defer cleanupClient(alloc, &client);
+    try client.didOpen("source");
+    try client.syncDocument("file:///b.zig", "before");
+    try client.syncDocument("file:///b.zig", "RENAMED_B");
+    try std.testing.expectEqualStrings("file:///t.zig", client.uri);
+    try std.testing.expectEqual(@as(?i32, 1), client.documentVersion("file:///t.zig"));
+    try std.testing.expectEqual(@as(?i32, 3), client.documentVersion("file:///b.zig"));
+    var reader = FrameReader.init(alloc, read_end, io);
+    defer reader.deinit();
+    for ([_][]const u8{ "file:///t.zig", "file:///b.zig", "file:///b.zig" }, 0..) |uri, i| {
+        const body = (try reader.next()).?;
+        defer alloc.free(body);
+        var msg = try json_rpc.parseMessage(alloc, body);
+        defer msg.deinit(alloc);
+        const params = msg.params.?.object;
+        const td = params.get("textDocument").?.object;
+        try std.testing.expectEqualStrings(uri, td.get("uri").?.string);
+        if (i == 2) {
+            try std.testing.expectEqualStrings("textDocument/didChange", msg.method.?);
+            const changes = params.get("contentChanges").?.array.items;
+            try std.testing.expectEqualStrings("RENAMED_B", changes[0].object.get("text").?.string);
+        }
     }
 }
 

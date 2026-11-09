@@ -16,6 +16,7 @@ A terminal text editor written in Zig.
 - Undo/redo (grouped + branch semantics), register semantics (linewise/charwise yank & put) with system clipboard interop (OSC52 + pbcopy/wl-copy/xclip/xsel, nvim `clipboard=unnamedplus` style)
 - Keyboard macros: `q{reg}` records (q stops), `@{reg}` replays with count support (`3@a`, `@@`); in Visual mode `@` runs the macro once per selected line (`:'<,'>normal!` semantics); `recording @x` status indicator
 - Splits (:sp/:vs + Ctrl-w family), buffer tab bar, relative line numbers, code folding
+- Unsaved-content protection: `:q`/`:wq` close one window; exiting checks every workspace's buffers. `:qa`, `:bd` and tab × refuse to discard unsaved text; `:qa!`/`:bd!` explicitly discard it.
 
 **Syntax & UI**
 

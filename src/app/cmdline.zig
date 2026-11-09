@@ -247,26 +247,28 @@ pub fn execCommand(self: *App, cmd: editor.ex_command.Command) !void {
         .empty => {},
         .write => _ = try self.writeBuffer(),
         .quit => {
-            // vim E37: refuse to quit when the current buffer has
-            // unsaved changes — data loss is worse than a message.
-            if (self.cur().dirty) {
-                try self.setMsg(try self.alloc.dupe(u8, "E37: No write since last change (add ! to override)"));
-                return;
-            }
+            // Closing a split keeps its buffers alive. The last window's
+            // close performs the session-wide dirty check.
             self.closeWindow(); // :q closes the focused window (or its buffer when it is the last window)
         },
-        .quit_force => self.closeWindow(),
-        .quit_all => self.quit = true,
+        .quit_force => {
+            if (self.windows.items.len <= 1) {
+                @import("buffers.zig").requestQuit(self, true);
+            } else self.closeWindow();
+        },
+        .quit_all => @import("buffers.zig").requestQuit(self, false),
+        .quit_all_force => @import("buffers.zig").requestQuit(self, true),
         .vsplit => try self.splitWindow(.vertical),
         .split => try self.splitWindow(.horizontal),
         .write_quit => {
             // only quit when the write actually succeeded
-            if (try self.writeBuffer()) self.quit = true;
+            if (try self.writeBuffer()) self.closeWindow();
         },
         .edit => |path| try self.openFile(path),
         .buffer_next => try self.switchBuffer(1),
         .buffer_prev => try self.switchBuffer(-1),
         .buffer_delete => self.closeCurrentBuffer(),
+        .buffer_delete_force => @import("buffers.zig").closeCurrentBufferForce(self, true),
         .buffer_list => try self.listBuffers(),
         .noh => try self.setMsg(try self.alloc.dupe(u8, "")),
         .help => try self.openKeymapPicker(),

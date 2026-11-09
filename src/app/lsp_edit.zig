@@ -5,6 +5,9 @@ const editor = @import("../editor/root.zig");
 const lsp_types = @import("../lsp/types.zig");
 const lsp_nav = @import("../lsp/navigation.zig");
 const json_rpc = @import("../util/json_rpc.zig");
+const buffer = @import("../buffer/root.zig");
+const workspace_edit = @import("../lsp/workspace_edit.zig");
+const edit_range = @import("../editor/edit_range.zig");
 
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
@@ -61,8 +64,7 @@ pub fn execRename(self: *App) !void {
     // path leaks it.
     defer self.alloc.free(name_copy);
     try params.object.put(self.alloc, "newName", .{ .string = name_copy });
-    client.request("textDocument/rename", params, &self.format_slot) catch return;
-    self.format_req_seq = self.edit_seq;
+    sendEditRequest(self, client, "textDocument/rename", params) catch |e| editErrorMsg(self, e);
 }
 
 /// Free a manually-built {textDocument:{uri(dupe)}, ...} params object
@@ -105,54 +107,229 @@ pub fn requestFormat(self: *App) !void {
     try params.put(self.alloc, "options", .{ .object = options });
     var params_value = std.json.Value{ .object = params };
     defer self.freeSimpleDocParams(&params_value);
-    client.request("textDocument/formatting", params_value, &self.format_slot) catch return;
-    self.format_req_seq = self.edit_seq;
+    sendEditRequest(self, client, "textDocument/formatting", params_value) catch |e| editErrorMsg(self, e);
 }
 
-/// Consume a formatting/rename response (TextEdit[]) and apply the edits
-/// right-to-left so earlier offsets stay valid. Returns true when a
-/// response was consumed.
+fn editErrorMsg(self: *App, e: anyerror) void {
+    const msg = std.fmt.allocPrint(self.alloc, "LSP edit refused: {s}", .{@errorName(e)}) catch return;
+    self.setMsg(msg) catch {};
+}
+
+fn sendEditRequest(self: *App, client: anytype, method: []const u8, params: std.json.Value) !void {
+    var request: workspace_edit.Request = .{
+        .path = try self.alloc.dupe(u8, self.cur().path orelse return),
+        .workspace = self.current_ws,
+        .buffer_index = self.current,
+        .revision = self.cur().history.revision,
+        .edit_seq = self.edit_seq,
+    };
+    errdefer request.deinit(self.alloc);
+    try client.request(method, params, &self.format_slot);
+    if (self.format_slot) |*v| json_rpc.freeValue(self.alloc, v);
+    self.format_slot = null;
+    if (self.format_request) |*r| r.deinit(self.alloc);
+    self.format_request = request;
+}
+
+const EditPlan = struct {
+    path: ?[]u8,
+    /// URI registered from the buffer's stored path, which can differ from
+    /// the server's response URI when it resolves a symlink/URI alias.
+    buffer_uri: []u8,
+    /// Borrows the prepared undo group's owned after bytes (which move into
+    /// the buffer history on commit), and stays valid through LSP sync.
+    text: []const u8,
+    buffer_index: ?usize,
+    prepared: workspace_edit.Prepared,
+    new_buffer: ?App.Buffer = null,
+    installed: bool = false,
+
+    fn deinit(self: *EditPlan, app: *App) void {
+        if (self.path) |p| app.alloc.free(p);
+        app.alloc.free(self.buffer_uri);
+        if (!self.installed) self.prepared.deinit(app.alloc);
+        if (self.new_buffer) |*b| app.deinitBuffer(b);
+    }
+};
+
+fn canonicalEditPath(self: *App, path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.alloc) catch |e| {
+        if (e == error.OutOfMemory) return error.OutOfMemory;
+        // Unsaved/new buffers can have no inode yet; still normalize ./..
+        // so equivalent URI spellings cannot create duplicate plans.
+        return std.fs.path.resolve(self.alloc, &.{path});
+    };
+}
+
+fn sameEditPath(self: *App, stored: []const u8, canonical: []const u8) !bool {
+    const path = try canonicalEditPath(self, stored);
+    defer self.alloc.free(path);
+    return std.mem.eql(u8, path, canonical);
+}
+
+fn planDocument(self: *App, doc: workspace_edit.Document) !?EditPlan {
+    if (!std.mem.startsWith(u8, doc.uri, "file:///") and
+        !std.mem.startsWith(u8, doc.uri, "file://localhost/")) return error.NonLocalDocument;
+    const decoded = try lsp_types.fileUriToPath(self.alloc, doc.uri);
+    defer self.alloc.free(decoded);
+    if (!std.fs.path.isAbsolute(decoded) or std.mem.indexOfScalar(u8, decoded, 0) != null) return error.InvalidUri;
+    const path = try canonicalEditPath(self, decoded);
+    var own_path = true;
+    defer if (own_path) self.alloc.free(path);
+    for (self.workspaces.items, 0..) |ws, wi| {
+        if (wi == self.current_ws) continue;
+        for (ws.buffers.items) |b| {
+            if (b.path) |p| if (try sameEditPath(self, p, path)) return error.TargetInAnotherWorkspace;
+        }
+    }
+    var index: ?usize = null;
+    for (self.buffers.items, 0..) |b, i| {
+        if (b.path) |p| if (try sameEditPath(self, p, path)) {
+            if (index != null) return error.AmbiguousDocument;
+            index = i;
+        };
+    }
+    const buffer_path = if (index) |i| self.buffers.items[i].path.? else path;
+    const buffer_uri = try lsp_types.pathToFileUri(self.alloc, buffer_path);
+    var own_uri = true;
+    defer if (own_uri) self.alloc.free(buffer_uri);
+    if (self.lsp_client) |client| {
+        // Two registered URI mirrors cannot safely share one buffer's
+        // synced revision. Refuse before installation and reset the client
+        // rather than leaving either mirror stale after future edits.
+        if (!std.mem.eql(u8, doc.uri, buffer_uri) and client.isDocOpen(doc.uri)) {
+            return error.AmbiguousDocumentUri;
+        }
+    }
+    if (doc.version) |version| {
+        // A version belongs to the response's exact wire URI; do not infer
+        // one from another spelling of the same filesystem object.
+        const client = self.lsp_client orelse return error.StaleDocumentVersion;
+        if (client.documentVersion(doc.uri) != version) return error.StaleDocumentVersion;
+    }
+    const old = if (index) |i| blk: {
+        const pt = &self.buffers.items[i].pt;
+        const text = try self.alloc.alloc(u8, pt.len());
+        pt.copyRange(0, text);
+        break :blk text;
+    } else blk: {
+        const f = try std.Io.Dir.cwd().openFile(self.io, path, .{ .mode = .read_only });
+        defer f.close(self.io);
+        const size = (try f.stat(self.io)).size;
+        if (size >= std.math.maxInt(u32)) return error.DocumentTooLarge;
+        const text = try self.alloc.alloc(u8, @intCast(size));
+        errdefer self.alloc.free(text);
+        if (try f.readPositionalAll(self.io, text, 0) != text.len) return error.FileChanged;
+        break :blk text;
+    };
+    defer self.alloc.free(old);
+    const new = try workspace_edit.replacement(self.alloc, old, doc.edits);
+    defer self.alloc.free(new);
+    if (std.mem.eql(u8, old, new)) return null;
+    var prepared = try workspace_edit.Prepared.init(self.alloc, old, new);
+    errdefer prepared.deinit(self.alloc);
+    var new_buffer: ?App.Buffer = null;
+    errdefer if (new_buffer) |*b| self.deinitBuffer(b);
+    if (index) |i| {
+        try workspace_edit.Prepared.reserve(&self.buffers.items[i].history);
+    } else {
+        new_buffer = .{ .pt = try buffer.PieceTable.init(self.alloc, old), .history = buffer.History.init(self.alloc) };
+        try workspace_edit.Prepared.reserve(&new_buffer.?.history);
+    }
+    own_uri = false;
+    own_path = false;
+    return .{ .path = path, .buffer_uri = buffer_uri, .text = prepared.group.edits.items[0].after, .buffer_index = index, .prepared = prepared, .new_buffer = new_buffer };
+}
+
+fn applyEditResponse(self: *App, result: std.json.Value) !void {
+    const request = self.format_request orelse return;
+    if (request.workspace != self.current_ws or request.edit_seq != self.edit_seq or
+        request.buffer_index >= self.buffers.items.len) return error.StaleEditResponse;
+    const origin = &self.buffers.items[request.buffer_index];
+    if (origin.path == null or !std.mem.eql(u8, origin.path.?, request.path) or
+        origin.history.revision != request.revision) return error.StaleEditResponse;
+    const source_uri = try lsp_types.pathToFileUri(self.alloc, request.path);
+    defer self.alloc.free(source_uri);
+    const docs = try workspace_edit.documents(self.alloc, result, source_uri);
+    defer self.alloc.free(docs);
+    var plans: std.ArrayList(EditPlan) = .empty;
+    defer {
+        for (plans.items) |*p| p.deinit(self);
+        plans.deinit(self.alloc);
+    }
+    for (docs) |doc| {
+        var plan = (try planDocument(self, doc)) orelse continue;
+        errdefer plan.deinit(self);
+        for (plans.items) |p| {
+            if (std.mem.eql(u8, p.path.?, plan.path.?)) return error.DuplicateDocument;
+        }
+        try plans.append(self.alloc, plan);
+    }
+    // No allocation or fallible edit occurs after the first installation.
+    try self.buffers.ensureUnusedCapacity(self.alloc, plans.items.len);
+    var edited_current = false;
+    for (plans.items) |*p| {
+        const idx = p.buffer_index orelse blk: {
+            var b = p.new_buffer.?;
+            p.new_buffer = null;
+            b.path = p.path;
+            p.path = null;
+            b.last_win = self.current_win;
+            self.buffers.appendAssumeCapacity(b);
+            break :blk self.buffers.items.len - 1;
+        };
+        const b = &self.buffers.items[idx];
+        p.prepared.commit(&b.pt, &b.history);
+        p.installed = true;
+        p.buffer_index = idx;
+        b.dirty = true;
+        b.folds.clearRetainingCapacity();
+        b.syntax_revision = std.math.maxInt(u64);
+        self.clearSpanCache(b);
+        for (self.windows.items) |*w| if (w.buf == idx) {
+            w.cursor = edit_range.charStart(&b.pt, @min(w.cursor, b.pt.len()));
+            w.view_top = @min(w.view_top, b.pt.lineCount() - 1);
+        };
+        self.edit_seq +|= 1;
+        edited_current = edited_current or idx == self.current;
+    }
+    if (edited_current) {
+        self.invalidateInlayHints();
+        self.gitMarksStaleNow();
+    }
+    if (self.lsp_client) |client| {
+        for (plans.items) |p| {
+            // Use the buffer identity for both existing and newly installed
+            // buffers. A response URI is not a reason to open a second copy.
+            client.syncDocument(p.buffer_uri, p.text) catch {
+                // Applied text stays intact, but no later request may use a
+                // server whose hidden-document coordinates are now stale.
+                self.teardownLsp(false);
+                const msg = self.alloc.dupe(u8, "LSP edits applied; language server sync failed") catch return;
+                self.setMsg(msg) catch {};
+                return;
+            };
+            const b = &self.buffers.items[p.buffer_index.?];
+            b.lsp_synced_rev = b.history.revision;
+        }
+    }
+}
+
+/// Consume a response using the requesting document's identity, then validate
+/// and prepare every URI before changing any buffer. Focus is left intact.
 pub fn processFormat(self: *App) bool {
     var result = self.format_slot orelse return false;
+    self.format_slot = null; // detach before any server teardown can free it
     defer {
         json_rpc.freeValue(self.alloc, &result);
         self.format_slot = null;
+        if (self.format_request) |*r| r.deinit(self.alloc);
+        self.format_request = null;
     }
-    // Stale response: the document changed after this request was sent
-    // (edits typed between <leader>lf and the reply). The TextEdits were
-    // computed against the old text; applying them would corrupt the
-    // buffer, so drop them like the inlay-hint path does.
-    if (self.edit_seq != self.format_req_seq) return true;
-    var edits = std.ArrayList(lsp_nav.TextEdit).empty;
-    defer {
-        for (edits.items) |*e| self.alloc.free(e.new_text);
-        edits.deinit(self.alloc);
-    }
-    // formatting → TextEdit[]; rename → WorkspaceEdit {changes:{uri:[edits]}}
-    const edits_value: ?std.json.Value = if (result == .array)
-        result
-    else if (result == .object) blk: {
-        const changes = result.object.get("changes") orelse break :blk null;
-        if (changes != .object) break :blk null;
-        var it = changes.object.iterator();
-        break :blk if (it.next()) |e| e.value_ptr.* else null;
-    } else null;
-    if (edits_value) |ev| {
-        lsp_nav.parseTextEdits(self.alloc, ev, &self.cur().pt, &edits) catch return true;
-    }
-    if (edits.items.len == 0) return true;
-    self.cur().history.beginGroup();
-    var i = edits.items.len;
-    while (i > 0) {
-        i -= 1;
-        const e = edits.items[i];
-        if (e.end < e.start) continue;
-        self.cur().history.record(&self.cur().pt, e.start, e.end - e.start, e.new_text) catch {};
-    }
-    self.cur().history.endGroup();
-    self.curCursor().* = @min(self.curCursor().*, self.cur().pt.len());
-    self.markDirty();
-    self.cur().syntax_revision = std.math.maxInt(u64);
+    applyEditResponse(self, result) catch |e| {
+        if (e == error.AmbiguousDocument or e == error.AmbiguousDocumentUri) self.teardownLsp(false);
+        editErrorMsg(self, e);
+    };
     return true;
 }
 

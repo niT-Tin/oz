@@ -8,8 +8,9 @@
 //!
 //! The design mirrors the approved web demo: layered editor/band/card
 //! surfaces, bold active text and a real SGR underline in `accent_alt`.
-//! Active buffer tabs join the editor surface; navigator/workbox selections
-//! use `bg_sel`. The `>` marker and file icons share the same accent.
+//! Active buffer tabs join the editor surface; navigator selections use
+//! `bg_sel`, while dense Workbox/thread rows use a softer blend of the same
+//! palette. The `>` marker and file icons share the same accent.
 //!
 //! `bg` is passed in by the caller because the same logical style lands on
 //! different panel surfaces; only semantic foreground/background roles live

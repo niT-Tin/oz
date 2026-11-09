@@ -16,6 +16,7 @@
 - 撤销/重做（分组 + 分支语义）、寄存器语义（linewise/charwise yank & put）并与系统剪贴板互通（OSC52 + pbcopy/wl-copy/xclip/xsel，对齐 nvim `clipboard=unnamedplus`）
 - 键盘宏：`q{reg}` 录制（再按 q 停止）、`@{reg}` 回放（支持 `3@a` 次数与 `@@` 重复），可视模式下 `@` 对选区逐行回放（`:'<,'>normal!` 语义），状态栏显示 `recording @x`
 - 分屏（:sp/:vs + Ctrl-w 系列）、buffer 标签栏、相对行号、代码折叠
+- 未保存内容保护：`:q`/`:wq` 关闭当前窗口，退出时检查所有 workspace 的 buffer；`:qa`、`:bd` 和标签 × 拒绝丢弃未保存内容，`:qa!`/`:bd!` 才显式丢弃。
 
 **语法与界面**
 

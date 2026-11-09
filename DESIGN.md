@@ -468,10 +468,12 @@ Client = {
 | `gd` / `gD` | definition / declaration | 跳转；`gr`/`gI`（references/implementation）→ picker 列表 |
 | `gs` | signatureHelp | 浮窗 + 当前参数高亮 |
 | `gl` | publishDiagnostics | 行诊断浮窗 |
-| `<leader>rn` | rename | 输入新名 + 预览确认 |
+| `<leader>rn` | rename | 输入新名后按 URI 更新各目标 buffer，`:w` 保存 |
 | `<leader>lf` | formatting | 全文档格式化 |
 | `<leader>ti` | inlayHint | 开关 |
 | 诊断 | publishDiagnostics | gutter 图标 + 行内 + `]d/[d` 跳转 + `<leader>sd` 列表 |
+
+格式化/重命名请求保存源文件路径、workspace、buffer 索引、history revision 和 edit sequence。切换焦点不改变响应目标；源文件被关闭/替换或请求后有编辑时拒绝过期结果。`WorkspaceEdit.changes` 与 `documentChanges` 的所有文本编辑先按 URI 分派、检查 document version、范围与重叠，再预分配完整替换和 undo group；全部准备成功后才更新各 buffer，保持焦点和磁盘不变。所有修改目标（包括隐藏及新打开文档）同步到 LSP，避免下一次请求使用旧坐标；通知队列只合并相邻同 URI 的全文更新，保留其他 URI 和请求的顺序。文件 URI 编码百分号与保留字符，确保文件名往返一致。资源创建/删除/重命名操作、重复目标、非本地 URI 和其他 workspace 的已打开目标会整组拒绝。
 
 ### 9.4 补全管线（`ui/Completion.zig` + `lsp/Features.zig`）
 
@@ -748,7 +750,7 @@ src/app/ai.zig  会话状态 / 键处理 / 请求生命周期 / 渲染
 
 ### 17.3 取消与上下文
 
-- Ctrl+c：主线程立刻置 `cancelled` 并 `client.requestCancel()`；此后排空到的事件全部丢弃，worker 在下一个 chunk 边界退出。Ctrl+n 清空会话并同样取消。
+- Ctrl+c：主线程立刻置 `cancelled` 并 `client.requestCancel()`；此后排空到的事件全部丢弃。后台 supervisor 取消 `std.Io.concurrent` transport，可中断等待 HTTP headers、SSE body 和 TLS handshake 的 I/O；活 worker 未释放前重试立即返回 Busy，保留输入，不在 UI 线程 join。Ctrl+n 清空会话并同样取消。
 - 上下文：始终 `Current file: <path>`；有 visual 选区时 `Selected lines A-B:` + 选中文本；否则 `Cursor line: N` + `Context (lines A-B):`（光标 ±10 行）。总输出 ≤8 KiB，按 UTF-8 边界截断，追加 `… [truncated]`。
 - 自动滚动：streaming 时跟随底部；Ctrl+j/k 或 PageUp/PageDown 手动滚动后关闭自动跟随，下一次发送重新开启。
 
@@ -1348,13 +1350,13 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 **Apply / undo**
 
 - 单文件：approve 后重新 canonicalize（必要时打开 buffer）、校验 buffer revision、整文件文本与重新执行的 patch；通过后**一次 buffer 替换 = 一个 undo group**（dirty，不写盘），`:w` 仍是用户动作。
-- 多文件：approve 先对每个文件重新校验 canonical path、buffer revision、old text 与 retained hunks；任一失败 → `stale patch: <file>`，保留 review，**不写任何文件**。全部通过后：
+- 多文件：stage 分别保存 buffer 文本和磁盘基线；approve 对每个文件重新校验 canonical path、buffer revision、old text、retained hunks 和独立磁盘基线（已打开文件也必须读盘）；任一失败 → `stale patch: <file>`，保留 review，**不写任何文件**。全部通过后：
   1. 再次 realpath 每个目标（防 symlink 替换）；
   2. 两个阶段写：先把每个 new text 写入同目录 sibling temp（保留原 mode），全部 temp 成功后才逐个 `rename` 覆盖目标；
-  3. phase-1 失败：清理 temp，目标全部未动；phase-2 某个 rename 失败：删除未 rename 的 temp，并用内存中的 old text **回滚已经 rename 的文件**；回滚本身失败会在卡片/状态栏如实报告，绝不声称成功；
+  3. phase-1 失败：清理 temp，目标全部未动；phase-2 某个 rename 失败：删除未 rename 的 temp，并用独立保存的磁盘旧字节**回滚已经 rename 的文件**；回滚本身失败会在卡片/状态栏如实报告，绝不声称成功；
   4. 事务成功后更新所有已打开 buffer（整文件替换、一个 history group、clean、cursor/view 截断），当前 buffer 同步 LSP，其他 buffer 在下次 switch 时 full sync；
   5. 如果 apply 前没有任何目标被打开，则打开第一个目标以便用户看到结果。
-- 多文件 undo：`Session.patch_undo: UndoSet` 保存每个文件的 old/new text、路径、apply 时的 buffer/revision。在多文件 set 的任一 buffer 按 `u`，只有**所有**相关 buffer revision 与磁盘内容仍等于 apply 结果时才执行跨文件 undo：先以同一 two-phase transaction 把 old text 写回所有文件，再对打开过的 buffer 执行历史 undo；`Ctrl+r` 对称 redo。任一项 stale/被编辑/disk 改变 → 拒绝并提示，不部分恢复。
+- 多文件 undo：`Session.patch_undo: UndoSet` 分别保存每个文件的 buffer 旧文本/dirty 状态、磁盘旧字节、新文本、路径和 apply 时的 buffer/revision。在多文件 set 的任一 buffer 按 `u`，只有**所有**相关 buffer revision、文本及磁盘内容仍匹配时才执行跨文件 undo：以同一 two-phase transaction 恢复磁盘旧字节，再恢复 buffer 旧文本及 dirty 状态；`Ctrl+r` 对称 redo。任一项 stale/被编辑/disk 改变 → 拒绝并提示，不部分恢复。
 - metrics：stage 记一次 `approval_required`，approve/reject 记一次 decision；一次 `apply_patch` 调用只算一次 call。自动 follow-up 已经发出 “staged/not applied”，之后本地 approve 不改写模型 transcript（与 M3b1 相同）。
 - 单文件 apply 成功后清空上一组 multi undo unit；新的 multi apply 替换上一组。跨文件 undo 只保留**最近一组**。
 
@@ -1602,4 +1604,4 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 - diff/LCS 仍只在生成或 stage 时计算，普通帧只画缓存行；chart 按 thread/metrics revision/尺寸缓存。Agent-focus 的文件树加载只发生在显式进入时，不在 render 中增加全文件扫描、文件 IO 或 idle redraw。动态标签继续使用 frame arena。
 - 纯模型覆盖 rail 三档宽度、Agent-focus、metrics、UTF-8 wrap；PTY 覆盖 Coding/Agent-focus 往返、图标、hints、流式、审批和鼠标。goldens 包含 `ai-dock-120x30`、`ai-dock-100x30`、`ai-drawer-80x24`、`ai-focus-120x30`，使用稳定 fixture 路径，连续运行不会因 PID 改变而漂移。
 - 请求 telemetry 另有 usage-only chunk、阶段/耗时/上下文纯模型与 DeepSeek-shaped PTY 断言；四张 AI golden 固定 `<1s` 的完成态与估算上下文行，窄屏不截断关键指标。
-- 当前套件：**581 unit / 220 e2e**，最终以 `./tools/verify.sh` 的记录为准。
+- 当前套件：**598 unit / 235 e2e**，最终以 `./tools/verify.sh` 的记录为准。

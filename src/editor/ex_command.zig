@@ -13,8 +13,10 @@ pub const Command = union(enum) {
     quit_force,
     /// :wq — write then quit.
     write_quit,
-    /// :qa / :qa! — quit every window/buffer (exit the editor).
+    /// :qa — quit every window/buffer, refusing unsaved changes.
     quit_all,
+    /// :qa! — explicitly discard every workspace's unsaved changes.
+    quit_all_force,
     /// :vs — vertical split (side-by-side windows).
     vsplit,
     /// :sp — horizontal split (stacked windows).
@@ -26,6 +28,7 @@ pub const Command = union(enum) {
     buffer_prev,
     buffer_list,
     buffer_delete,
+    buffer_delete_force,
     /// :noh — clear search highlight (M0: no-op).
     noh,
     /// :help / :h — open the keymap search overlay.
@@ -100,8 +103,8 @@ pub fn parse(line: []const u8) Command {
         return if (args.len == 0) .quit else .unknown;
     }
     if (std.mem.eql(u8, word, "q!") or std.mem.eql(u8, word, "quit!")) return .quit_force;
-    if (std.mem.eql(u8, word, "qa") or std.mem.eql(u8, word, "qall") or
-        std.mem.eql(u8, word, "qa!") or std.mem.eql(u8, word, "qall!")) return .quit_all;
+    if (std.mem.eql(u8, word, "qa") or std.mem.eql(u8, word, "qall")) return .quit_all;
+    if (std.mem.eql(u8, word, "qa!") or std.mem.eql(u8, word, "qall!")) return .quit_all_force;
     if (std.mem.eql(u8, word, "vs") or std.mem.eql(u8, word, "vsplit") or
         std.mem.eql(u8, word, "vnew")) return .vsplit;
     if (std.mem.eql(u8, word, "sp") or std.mem.eql(u8, word, "split") or
@@ -116,6 +119,7 @@ pub fn parse(line: []const u8) Command {
     if (std.mem.eql(u8, word, "bp") or std.mem.eql(u8, word, "bprev")) return .buffer_prev;
     if (std.mem.eql(u8, word, "ls") or std.mem.eql(u8, word, "buffers")) return .buffer_list;
     if (std.mem.eql(u8, word, "bd") or std.mem.eql(u8, word, "bdelete")) return .buffer_delete;
+    if (std.mem.eql(u8, word, "bd!") or std.mem.eql(u8, word, "bdelete!")) return .buffer_delete_force;
     if (std.mem.eql(u8, word, "noh") or std.mem.eql(u8, word, "nohlsearch")) return .noh;
     if (std.mem.eql(u8, word, "h") or std.mem.eql(u8, word, "help")) {
         return if (args.len == 0) .help else .unknown;
@@ -200,7 +204,8 @@ test "parse: write/quit family" {
     try std.testing.expect(parse("") == .empty);
     try std.testing.expect(parse("   ") == .empty);
     try std.testing.expect(parse("qa") == .quit_all);
-    try std.testing.expect(parse("qall!") == .quit_all);
+    try std.testing.expect(parse("qall!") == .quit_all_force);
+    try std.testing.expect(parse("qa!") == .quit_all_force);
     try std.testing.expect(parse("vs") == .vsplit);
     try std.testing.expect(parse("vsplit") == .vsplit);
     try std.testing.expect(parse("sp") == .split);
@@ -271,6 +276,8 @@ test "parse: buffers, noh, set, unknown" {
     try std.testing.expect(parse("bp") == .buffer_prev);
     try std.testing.expect(parse("ls") == .buffer_list);
     try std.testing.expect(parse("bd") == .buffer_delete);
+    try std.testing.expect(parse("bd!") == .buffer_delete_force);
+    try std.testing.expect(parse("bdelete!") == .buffer_delete_force);
     try std.testing.expect(parse("noh") == .noh);
     try std.testing.expect(parse("help") == .help);
     try std.testing.expect(parse("h") == .help);

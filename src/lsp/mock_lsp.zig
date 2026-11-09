@@ -80,6 +80,13 @@ pub const Script = enum {
     /// items with detail + markdown documentation and a wide label. Used by
     /// the popup-geometry/markdown e2e tests.
     rich,
+    /// Hold formatting until another URI is didOpen'd. Rename returns two
+    /// URI-keyed changes with b.zig first, deliberately unlike request order.
+    edit_safety,
+    /// The same rename fixture in documentChanges form (nullable versions).
+    edit_safety_documents,
+    /// Rename returns real b.zig while hover observes the opened symlink.
+    edit_safety_alias,
 
     pub fn parse(name: []const u8) ?Script {
         if (std.mem.eql(u8, name, "hello")) return .hello;
@@ -89,6 +96,9 @@ pub const Script = enum {
         if (std.mem.eql(u8, name, "inlay_range")) return .inlay_range;
         if (std.mem.eql(u8, name, "inlay_eol")) return .inlay_eol;
         if (std.mem.eql(u8, name, "rich")) return .rich;
+        if (std.mem.eql(u8, name, "edit_safety")) return .edit_safety;
+        if (std.mem.eql(u8, name, "edit_safety_documents")) return .edit_safety_documents;
+        if (std.mem.eql(u8, name, "edit_safety_alias")) return .edit_safety_alias;
         return null;
     }
 };
@@ -111,6 +121,8 @@ pub const State = struct {
     /// Later requests are deliberately left unanswered to model a slow
     /// server (the editor must not rely on a refresh to fix stale hints).
     inlay_answered: bool = false,
+    /// Complete owned response held until didOpen of another document.
+    pending_format: ?struct { body: []u8, uri: []u8 } = null,
 
     pub const ChangeRecord = struct {
         uri: []u8,
@@ -118,6 +130,10 @@ pub const State = struct {
     };
 
     pub fn deinit(self: *State, alloc: std.mem.Allocator) void {
+        if (self.pending_format) |pending| {
+            alloc.free(pending.body);
+            alloc.free(pending.uri);
+        }
         for (self.opened.items) |uri| alloc.free(uri);
         self.opened.deinit(alloc);
         for (self.changed.items) |rec| {
@@ -218,7 +234,11 @@ pub fn handleMessage(
             const prefix = completionPrefix(a, state, uri, line, col);
             try pushResponse(alloc, &out, id, try buildCompletionResult(a, prefix, script));
         } else if (std.mem.eql(u8, method, "textDocument/hover")) {
-            try pushResponse(alloc, &out, id, try buildHoverResult(a, script));
+            const result = if (script == .edit_safety or script == .edit_safety_documents or script == .edit_safety_alias)
+                try buildSafetyHover(a, state, msg.params, if (script == .edit_safety_alias) "linked-b.zig" else "b.zig")
+            else
+                try buildHoverResult(a, script);
+            try pushResponse(alloc, &out, id, result);
         } else if (std.mem.eql(u8, method, "textDocument/definition") or
             std.mem.eql(u8, method, "textDocument/declaration"))
         {
@@ -239,12 +259,27 @@ pub fn handleMessage(
         } else if (std.mem.eql(u8, method, "textDocument/signatureHelp")) {
             try pushResponse(alloc, &out, id, try buildSignatureResult(a));
         } else if (std.mem.eql(u8, method, "textDocument/formatting")) {
-            // Format the whole doc: replace everything with a canonical form
-            try pushResponse(alloc, &out, id, try buildFormatResult(a, state));
+            if (script == .edit_safety or script == .edit_safety_documents or script == .edit_safety_alias) {
+                const uri = requestDocumentUri(msg.params) orelse return error.MissingDocumentUri;
+                const body = try json_rpc.encodeResponse(alloc, id, try buildSafetyEdits(a, "FORMATTED_A"));
+                errdefer alloc.free(body);
+                const owned_uri = try alloc.dupe(u8, uri);
+                errdefer alloc.free(owned_uri);
+                if (state.pending_format) |old| {
+                    alloc.free(old.body);
+                    alloc.free(old.uri);
+                }
+                state.pending_format = .{ .body = body, .uri = owned_uri };
+            } else {
+                // Default fixture is a no-op edit over the whole document.
+                try pushResponse(alloc, &out, id, try buildFormatResult(a, state));
+            }
         } else if (std.mem.eql(u8, method, "textDocument/rename")) {
-            // Rename: replace the symbol at the cursor (line 0) everywhere.
-            // The mock replaces the whole document with a fixed rename edit.
-            try pushResponse(alloc, &out, id, try buildRenameResult(a, state));
+            if (script == .edit_safety or script == .edit_safety_documents or script == .edit_safety_alias) {
+                try pushResponse(alloc, &out, id, try buildSafetyRename(a, msg.params, script == .edit_safety_documents));
+            } else {
+                try pushResponse(alloc, &out, id, try buildRenameResult(a, state));
+            }
         } else if (std.mem.eql(u8, method, "textDocument/inlayHint")) {
             if (script == .inlay_range) {
                 // Echo the recorded text of the REQUESTED uri, one hint per
@@ -275,6 +310,15 @@ pub fn handleMessage(
         state.initialized = true;
     } else if (std.mem.eql(u8, method, "textDocument/didOpen")) {
         try recordDidOpen(alloc, state, msg.params);
+        if (state.pending_format) |pending| {
+            if (requestDocumentUri(msg.params)) |opened_uri| {
+                if (!std.mem.eql(u8, pending.uri, opened_uri)) {
+                    try out.frames.append(alloc, pending.body);
+                    alloc.free(pending.uri);
+                    state.pending_format = null;
+                }
+            }
+        }
         // Push diagnostics for the JUST-opened document (uri matches what the
         // client filters on) — pushing at `initialized` races didOpen and the
         // client would drop the diagnostics as belonging to another file.
@@ -651,6 +695,79 @@ fn buildRenameResult(a: std.mem.Allocator, state: *State) !std.json.Value {
     try changes.put(a, uri, .{ .array = edits });
     var result = try std.json.ObjectMap.init(a, &.{}, &.{});
     try result.put(a, "changes", .{ .object = changes });
+    return .{ .object = result };
+}
+
+fn requestDocumentUri(params: ?std.json.Value) ?[]const u8 {
+    const p = params orelse return null;
+    if (p != .object) return null;
+    const td = p.object.get("textDocument") orelse return null;
+    if (td != .object) return null;
+    const uri = td.object.get("uri") orelse return null;
+    return if (uri == .string) uri.string else null;
+}
+
+/// Both safety fixtures replace exactly the three ASCII characters on line
+/// zero, keeping the newline. The response therefore has a real valid range.
+fn buildSafetyEdits(a: std.mem.Allocator, text: []const u8) !std.json.Value {
+    var start = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try start.put(a, "line", .{ .integer = 0 });
+    try start.put(a, "character", .{ .integer = 0 });
+    var end = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try end.put(a, "line", .{ .integer = 0 });
+    try end.put(a, "character", .{ .integer = 3 });
+    var range = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try range.put(a, "start", .{ .object = start });
+    try range.put(a, "end", .{ .object = end });
+    var edit = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try edit.put(a, "range", .{ .object = range });
+    try edit.put(a, "newText", .{ .string = text });
+    var edits = std.json.Array.init(a);
+    try edits.append(.{ .object = edit });
+    return .{ .array = edits };
+}
+
+fn buildSafetyRename(a: std.mem.Allocator, params: ?std.json.Value, document_changes: bool) !std.json.Value {
+    const uri_a = requestDocumentUri(params) orelse return error.MissingDocumentUri;
+    const slash = std.mem.lastIndexOfScalar(u8, uri_a, '/') orelse return error.MissingDocumentUri;
+    const uri_b = try std.fmt.allocPrint(a, "{s}/b.zig", .{uri_a[0..slash]});
+    var result = try std.json.ObjectMap.init(a, &.{}, &.{});
+    const uris = [_][]const u8{ uri_b, uri_a };
+    const replacements = [_][]const u8{ "RENAMED_B", "RENAMED_A" };
+    if (document_changes) {
+        var documents = std.json.Array.init(a);
+        for (uris, replacements) |uri, replacement| {
+            var td = try std.json.ObjectMap.init(a, &.{}, &.{});
+            try td.put(a, "uri", .{ .string = uri });
+            try td.put(a, "version", .null);
+            var doc = try std.json.ObjectMap.init(a, &.{}, &.{});
+            try doc.put(a, "textDocument", .{ .object = td });
+            try doc.put(a, "edits", try buildSafetyEdits(a, replacement));
+            try documents.append(.{ .object = doc });
+        }
+        try result.put(a, "documentChanges", .{ .array = documents });
+    } else {
+        var changes = try std.json.ObjectMap.init(a, &.{}, &.{});
+        for (uris, replacements) |uri, replacement| try changes.put(a, uri, try buildSafetyEdits(a, replacement));
+        try result.put(a, "changes", .{ .object = changes });
+    }
+    return .{ .object = result };
+}
+
+/// Hover requested from A reports B's last didOpen/didChange text. Rename
+/// responses do not update this copy themselves, so a stale hidden document
+/// is observable without selecting B (which could otherwise repair it).
+fn buildSafetyHover(a: std.mem.Allocator, state: *State, params: ?std.json.Value, peer: []const u8) !std.json.Value {
+    const uri_a = requestDocumentUri(params) orelse return error.MissingDocumentUri;
+    const slash = std.mem.lastIndexOfScalar(u8, uri_a, '/') orelse return error.MissingDocumentUri;
+    const uri_b = try std.fmt.allocPrint(a, "{s}/{s}", .{ uri_a[0..slash], peer });
+    const text = recordedTextOf(state, uri_b) orelse "<not opened>";
+    const label = try std.fmt.allocPrint(a, "server {s}: {s}", .{ peer, std.mem.trimEnd(u8, text, "\r\n") });
+    var contents = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try contents.put(a, "kind", .{ .string = "plaintext" });
+    try contents.put(a, "value", .{ .string = label });
+    var result = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try result.put(a, "contents", .{ .object = contents });
     return .{ .object = result };
 }
 
@@ -1046,6 +1163,10 @@ fn printUsage(io: std.Io) void {
         \\  rich    hover/completion fixture for popup geometry: markdown
         \\           heading + arrow + fenced code + CJK hover; completion
         \\           items with detail/docs and a wide label.
+        \\  edit_safety  formatting waits for another didOpen; rename edits
+        \\           b.zig then the requesting URI through changes.
+        \\  edit_safety_documents  same rename through documentChanges.
+        \\  edit_safety_alias  rename real b.zig, hover its opened symlink URI.
         \\
         \\options:
         \\  --verbose  log received/sent messages to stderr
@@ -1191,6 +1312,9 @@ fn buildSignatureResult(a: std.mem.Allocator) !std.json.Value {
 test "Script.parse" {
     try testing.expect(Script.parse("hello") == .hello);
     try testing.expect(Script.parse("silent") == .silent);
+    try testing.expect(Script.parse("edit_safety") == .edit_safety);
+    try testing.expect(Script.parse("edit_safety_documents") == .edit_safety_documents);
+    try testing.expect(Script.parse("edit_safety_alias") == .edit_safety_alias);
     try testing.expect(Script.parse("bogus") == null);
 }
 
@@ -1578,6 +1702,87 @@ test "format: whole-doc edit is in range and covers the real document" {
     try testing.expectEqual(@as(u32, 0), edits.items[0].start);
     try testing.expectEqual(@as(u32, 26), edits.items[0].end);
     try testing.expectEqualStrings("const a = 1;\nconst b = 2;\n", edits.items[0].new_text);
+}
+
+test "edit safety fixture: formatting responds only after another document opens" {
+    const alloc = testing.allocator;
+    var state = State{};
+    defer state.deinit(alloc);
+    const open_a = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///a.zig\",\"text\":\"aaa\\n\"}}}";
+    var opened = try handleContent(alloc, .edit_safety, &state, open_a);
+    defer opened.deinit(alloc);
+    var requested = try handleContent(alloc, .edit_safety, &state, "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/formatting\",\"params\":{\"textDocument\":{\"uri\":\"file:///a.zig\"}}}");
+    defer requested.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), requested.frames.items.len);
+    try testing.expect(state.pending_format != null);
+    var same = try handleContent(alloc, .edit_safety, &state, open_a);
+    defer same.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), same.frames.items.len);
+    var switched = try handleContent(alloc, .edit_safety, &state, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///b.zig\",\"text\":\"bbb\\n\"}}}");
+    defer switched.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), switched.frames.items.len);
+    try testing.expect(state.pending_format == null);
+    var response = try json_rpc.parseMessage(alloc, switched.frames.items[0]);
+    defer response.deinit(alloc);
+    try testing.expectEqual(@as(?u64, 7), response.id);
+    try testing.expectEqualStrings("FORMATTED_A", response.result.?.array.items[0].object.get("newText").?.string);
+}
+
+test "edit safety fixture: both rename encodings put two URI targets in B A order" {
+    const alloc = testing.allocator;
+    for ([_]Script{ .edit_safety, .edit_safety_documents }) |script| {
+        var state = State{};
+        defer state.deinit(alloc);
+        var out = try handleContent(alloc, script, &state, "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"textDocument/rename\",\"params\":{\"textDocument\":{\"uri\":\"file:///fixture/a.zig\"},\"newName\":\"renamed\"}}");
+        defer out.deinit(alloc);
+        var response = try json_rpc.parseMessage(alloc, out.frames.items[0]);
+        defer response.deinit(alloc);
+        const result = response.result.?.object;
+        const uris = [_][]const u8{ "file:///fixture/b.zig", "file:///fixture/a.zig" };
+        const replacements = [_][]const u8{ "RENAMED_B", "RENAMED_A" };
+        if (script == .edit_safety) {
+            const changes = result.get("changes").?.object;
+            try testing.expectEqual(@as(usize, 2), changes.count());
+            for (uris, replacements, 0..) |uri, replacement, i| {
+                try testing.expectEqualStrings(uri, changes.keys()[i]);
+                try testing.expectEqualStrings(replacement, changes.values()[i].array.items[0].object.get("newText").?.string);
+            }
+        } else {
+            const docs = result.get("documentChanges").?.array.items;
+            try testing.expectEqual(@as(usize, 2), docs.len);
+            for (uris, replacements, docs) |uri, replacement, doc| {
+                const td = doc.object.get("textDocument").?.object;
+                try testing.expectEqualStrings(uri, td.get("uri").?.string);
+                try testing.expect(td.get("version").? == .null);
+                try testing.expectEqualStrings(replacement, doc.object.get("edits").?.array.items[0].object.get("newText").?.string);
+            }
+        }
+    }
+}
+
+test "edit safety fixture: hover from A observes hidden B only after didChange" {
+    const alloc = testing.allocator;
+    var state = State{};
+    defer state.deinit(alloc);
+    var open_a = try handleContent(alloc, .edit_safety, &state, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///fixture/a.zig\",\"text\":\"aaa\\n\"}}}");
+    defer open_a.deinit(alloc);
+    var open_b = try handleContent(alloc, .edit_safety, &state, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///fixture/b.zig\",\"text\":\"bbb\\n\"}}}");
+    defer open_b.deinit(alloc);
+    var rename = try handleContent(alloc, .edit_safety, &state, "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"textDocument/rename\",\"params\":{\"textDocument\":{\"uri\":\"file:///fixture/a.zig\"},\"newName\":\"renamed\"}}");
+    defer rename.deinit(alloc);
+    const hover = "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///fixture/a.zig\"},\"position\":{\"line\":0,\"character\":1}}}";
+    var stale = try handleContent(alloc, .edit_safety, &state, hover);
+    defer stale.deinit(alloc);
+    var stale_response = try json_rpc.parseMessage(alloc, stale.frames.items[0]);
+    defer stale_response.deinit(alloc);
+    try testing.expectEqualStrings("server b.zig: bbb", stale_response.result.?.object.get("contents").?.object.get("value").?.string);
+    var changed = try handleContent(alloc, .edit_safety, &state, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///fixture/b.zig\",\"version\":2},\"contentChanges\":[{\"text\":\"RENAMED_B\\n\"}]}}");
+    defer changed.deinit(alloc);
+    var fresh = try handleContent(alloc, .edit_safety, &state, hover);
+    defer fresh.deinit(alloc);
+    var fresh_response = try json_rpc.parseMessage(alloc, fresh.frames.items[0]);
+    defer fresh_response.deinit(alloc);
+    try testing.expectEqualStrings("server b.zig: RENAMED_B", fresh_response.result.?.object.get("contents").?.object.get("value").?.string);
 }
 
 test "full message cycle through frame functions and handleMessage" {

@@ -319,6 +319,18 @@ fn findBufferByPath(self: *App, path: []const u8) ?usize {
     return null;
 }
 
+fn openInOtherWorkspace(self: *App, path: []const u8) bool {
+    for (self.workspaces.items, 0..) |workspace, wi| {
+        if (wi == self.current_ws) continue;
+        for (workspace.buffers.items) |buf| {
+            if (buf.path) |got| {
+                if (std.mem.eql(u8, got, path)) return true;
+            }
+        }
+    }
+    return false;
+}
+
 fn bufferTextEquals(self: *App, idx: usize, expected: []const u8) bool {
     if (idx >= self.buffers.items.len) return false;
     const pt = &self.buffers.items[idx].pt;
@@ -469,6 +481,9 @@ const TextOutcome = Outcome(LoadedText);
 /// edits) if there is one, otherwise the file on disk. Neither path opens a
 /// buffer or touches the dirty flag.
 fn loadTargetText(self: *App, canonical: []const u8, rel: []const u8) TextOutcome {
+    if (openInOtherWorkspace(self, canonical)) {
+        return failOutcome(LoadedText, self.alloc, "file is open in another workspace: {s}", .{rel});
+    }
     if (findBufferByPath(self, canonical)) |idx| {
         const pt = &self.buffers.items[idx].pt;
         if (pt.len() > model.max_stage_bytes) {
@@ -717,6 +732,12 @@ fn stageMultiPatch(
         for (loaded[0..loaded_count]) |*text| text.deinit(alloc);
         alloc.free(loaded);
     }
+    const disk_texts = alloc.alloc([]u8, n) catch return .oom;
+    var disk_count: usize = 0;
+    defer {
+        for (disk_texts[0..disk_count]) |text| alloc.free(text);
+        alloc.free(disk_texts);
+    }
     var issues: std.ArrayList([]u8) = .empty;
     defer {
         for (issues.items) |issue| alloc.free(issue);
@@ -774,9 +795,20 @@ fn stageMultiPatch(
         };
         loaded[loaded_count] = text;
         loaded_count += 1;
+        const disk = readDiskText(self, target.canonical_path) catch |e| {
+            if (e == error.OutOfMemory) return .oom;
+            issues.append(alloc, std.fmt.allocPrint(
+                alloc,
+                "{s}: cannot capture disk baseline ({s})",
+                .{ target.rel, @errorName(e) },
+            ) catch return .oom) catch return .oom;
+            continue;
+        };
+        disk_texts[disk_count] = disk;
+        disk_count += 1;
     }
 
-    if (issues.items.len > 0 or loaded_count != n or target_count != n) {
+    if (issues.items.len > 0 or loaded_count != n or target_count != n or disk_count != n) {
         return .{ .failed = formatIssueList(alloc, issues.items) catch return .oom };
     }
 
@@ -821,6 +853,7 @@ fn stageMultiPatch(
                     .display_path = targets[i].rel,
                     .old_text = loaded[i].text,
                     .new_text = new_texts[i],
+                    .disk_text = disk_texts[i],
                     .buffer_index = loaded[i].buffer_index,
                     .revision = loaded[i].revision,
                     .patch = &set.files[i],
@@ -902,7 +935,12 @@ fn copyBufferText(self: *App, idx: usize) ?[]u8 {
     return copy;
 }
 
-const FileCurrent = struct { text: []u8, buffer_index: ?usize };
+const FileCurrent = struct {
+    text: []u8,
+    disk_text: []u8,
+    buffer_index: ?usize,
+    dirty: bool = false,
+};
 
 /// Current text for one staged file plus the open buffer (if any). The buffer
 /// history revision is checked when the file was staged from a buffer, and a
@@ -910,22 +948,32 @@ const FileCurrent = struct { text: []u8, buffer_index: ?usize };
 /// replaced by an outside symlink is stale.
 fn currentFileText(self: *App, p: *const model.Pending, index: usize) ?FileCurrent {
     const file = &p.files[index];
+    if (openInOtherWorkspace(self, file.path)) return null;
+    const canonical_now = std.Io.Dir.cwd().realPathFileAlloc(self.io, file.path, self.alloc) catch return null;
+    defer self.alloc.free(canonical_now);
+    if (!std.mem.eql(u8, canonical_now, file.path) or !tool_exec.isWithin(p.root, canonical_now)) return null;
+    const disk = readDiskText(self, file.path) catch return null;
+    var disk_owned = true;
+    defer if (disk_owned) self.alloc.free(disk);
+    if (!p.verifyDiskFile(index, disk)) return null;
     if (findBufferByPath(self, file.path)) |buf_idx| {
         if (file.revision) |rev| {
             if (self.buffers.items[buf_idx].history.revision != rev) return null;
         }
         const text = copyBufferText(self, buf_idx) orelse return null;
-        return .{ .text = text, .buffer_index = buf_idx };
+        disk_owned = false;
+        return .{ .text = text, .disk_text = disk, .buffer_index = buf_idx, .dirty = self.buffers.items[buf_idx].dirty };
     }
-    const canonical_now = std.Io.Dir.cwd().realPathFileAlloc(self.io, file.path, self.alloc) catch return null;
-    defer self.alloc.free(canonical_now);
-    if (!std.mem.eql(u8, canonical_now, file.path) or !tool_exec.isWithin(p.root, canonical_now)) return null;
-    const disk = readDiskText(self, file.path) catch return null;
-    return .{ .text = disk, .buffer_index = null };
+    const text = self.alloc.dupe(u8, disk) catch return null;
+    disk_owned = false;
+    return .{ .text = text, .disk_text = disk, .buffer_index = null };
 }
 
 fn freeCurrent(self: *App, current: []FileCurrent, initialized: usize) void {
-    for (current[0..initialized]) |item| self.alloc.free(item.text);
+    for (current[0..initialized]) |item| {
+        self.alloc.free(item.text);
+        self.alloc.free(item.disk_text);
+    }
 }
 
 /// Replace one open buffer with a verified full text as one history group.
@@ -958,7 +1006,7 @@ fn replaceBufferText(self: *App, idx: usize, text: []const u8) !void {
 /// apply history group) without inventing a fake history entry. Verified
 /// text equality happened before this call; the stale undo/redo stacks are
 /// dropped because their offsets describe a different document lineage.
-fn replaceBufferTextDirect(self: *App, idx: usize, text: []const u8) !void {
+fn replaceBufferTextDirect(self: *App, idx: usize, text: []const u8, dirty: bool) !void {
     if (idx >= self.buffers.items.len) return;
     const buf = &self.buffers.items[idx];
     _ = try buf.pt.replace(0, buf.pt.len(), text);
@@ -968,7 +1016,7 @@ fn replaceBufferTextDirect(self: *App, idx: usize, text: []const u8) !void {
     buf.history.redo_stack.clearRetainingCapacity();
     buf.history.revision +%= 1;
     buf.history.last_record = null;
-    afterBufferHistory(self, idx);
+    afterBufferHistory(self, idx, dirty);
 }
 
 fn updateBufferAfterDisk(self: *App, current: []const FileCurrent, p: *const model.Pending) bool {
@@ -1025,15 +1073,17 @@ fn buildUndoSet(
 ) ?model.UndoSet {
     const entries = self.alloc.alloc(model.UndoEntry, p.files.len) catch return null;
     var initialized: usize = 0;
-    errdefer {
+    var entries_owned = true;
+    defer if (entries_owned) {
         for (entries[0..initialized]) |*entry| entry.deinit(self.alloc);
         self.alloc.free(entries);
-    }
+    };
     for (p.files, 0..) |*file, i| {
         var entry = model.UndoEntry{
             .path = &.{},
             .old_text = &.{},
             .new_text = &.{},
+            .old_dirty = current[i].dirty or !std.mem.eql(u8, file.text, current[i].disk_text),
             .buffer_index = current[i].buffer_index,
             .open_at_apply = current[i].buffer_index != null,
             .revision = if (current[i].buffer_index) |idx|
@@ -1053,16 +1103,18 @@ fn buildUndoSet(
             entry.deinit(self.alloc);
             return null;
         };
+        entry.old_disk_text = self.alloc.dupe(u8, current[i].disk_text) catch {
+            entry.deinit(self.alloc);
+            return null;
+        };
         entries[i] = entry;
         initialized += 1;
     }
+    const root = self.alloc.dupe(u8, p.root) catch return null;
+    entries_owned = false;
     return .{
         .files = entries,
-        .root = self.alloc.dupe(u8, p.root) catch {
-            for (entries[0..initialized]) |*entry| entry.deinit(self.alloc);
-            self.alloc.free(entries);
-            return null;
-        },
+        .root = root,
         .applied = true,
     };
 }
@@ -1162,7 +1214,7 @@ fn approveMulti(self: *App, p: *model.Pending) !void {
         self.alloc.free(tmp_paths);
     }
     for (p.files, 0..) |file, i| {
-        plan[i] = .{ .path = file.path, .old_text = file.text, .new_text = file.new_text };
+        plan[i] = .{ .path = file.path, .old_text = current[i].disk_text, .new_text = file.new_text };
         tmp_paths[i] = std.fmt.allocPrint(
             self.alloc,
             "{s}.ozpatch{d}.{d}",
@@ -1419,10 +1471,10 @@ pub fn agentEditSelectFile(self: *App, index: usize) void {
     self.agent_edit.active_file = index;
 }
 
-fn afterBufferHistory(self: *App, idx: usize) void {
+fn afterBufferHistory(self: *App, idx: usize, dirty: bool) void {
     if (idx >= self.buffers.items.len) return;
     const buf = &self.buffers.items[idx];
-    buf.dirty = false;
+    buf.dirty = dirty;
     buf.folds.clearRetainingCapacity();
     self.clearSpanCache(buf);
     for (self.windows.items) |*window| {
@@ -1494,8 +1546,35 @@ fn patchHistoryStep(self: *App, direction: PatchHistoryDirection) bool {
         return true;
     };
     defer self.alloc.free(use_history);
+    const disk_texts = self.alloc.alloc([]u8, n) catch {
+        agentEditMsg(self, "patch undo: out of memory");
+        return true;
+    };
+    var disk_count: usize = 0;
+    defer {
+        for (disk_texts[0..disk_count]) |text| self.alloc.free(text);
+        self.alloc.free(disk_texts);
+    }
 
     for (set.files, 0..) |file, i| {
+        if (openInOtherWorkspace(self, file.path)) {
+            return patchHistoryUnavailable(self, file.path, "file is open in another workspace");
+        }
+        const canonical_now = std.Io.Dir.cwd().realPathFileAlloc(self.io, file.path, self.alloc) catch {
+            return patchHistoryUnavailable(self, file.path, "path no longer resolves");
+        };
+        defer self.alloc.free(canonical_now);
+        if (!std.mem.eql(u8, canonical_now, file.path) or !tool_exec.isWithin(set.root, canonical_now)) {
+            return patchHistoryUnavailable(self, file.path, "path escapes the workspace");
+        }
+        const disk = readDiskText(self, file.path) catch {
+            return patchHistoryUnavailable(self, file.path, "cannot read the file");
+        };
+        disk_texts[disk_count] = disk;
+        disk_count += 1;
+        if (!std.mem.eql(u8, disk, set.liveDiskText(i))) {
+            return patchHistoryUnavailable(self, file.path, "file changed on disk");
+        }
         if (findBufferByPath(self, file.path)) |idx| {
             if (file.revision) |rev| {
                 if (self.buffers.items[idx].history.revision != rev) {
@@ -1523,24 +1602,12 @@ fn patchHistoryStep(self: *App, direction: PatchHistoryDirection) bool {
             }
         } else {
             use_history[i] = false;
-            const canonical_now = std.Io.Dir.cwd().realPathFileAlloc(self.io, file.path, self.alloc) catch {
-                return patchHistoryUnavailable(self, file.path, "path no longer resolves");
+            const copy = self.alloc.dupe(u8, disk) catch {
+                return patchHistoryUnavailable(self, file.path, "out of memory");
             };
-            defer self.alloc.free(canonical_now);
-            if (!std.mem.eql(u8, canonical_now, file.path) or
-                !tool_exec.isWithin(set.root, canonical_now))
-            {
-                return patchHistoryUnavailable(self, file.path, "path escapes the workspace");
-            }
-            const disk = readDiskText(self, file.path) catch {
-                return patchHistoryUnavailable(self, file.path, "cannot read the file");
-            };
-            texts[i] = disk;
+            texts[i] = copy;
             initialized += 1;
             buffer_indices[i] = null;
-            if (!std.mem.eql(u8, disk, set.liveText(i))) {
-                return patchHistoryUnavailable(self, file.path, "file changed on disk");
-            }
         }
     }
 
@@ -1576,8 +1643,8 @@ fn patchHistoryStep(self: *App, direction: PatchHistoryDirection) bool {
     for (set.files, 0..) |file, i| {
         plan[i] = .{
             .path = file.path,
-            .old_text = set.liveText(i),
-            .new_text = set.targetText(i),
+            .old_text = disk_texts[i],
+            .new_text = set.targetDiskText(i),
         };
         tmp_paths[i] = std.fmt.allocPrint(
             self.alloc,
@@ -1623,10 +1690,10 @@ fn patchHistoryStep(self: *App, direction: PatchHistoryDirection) bool {
                     .undo => _ = hist.undo(&self.buffers.items[idx].pt),
                     .redo => _ = hist.redo(&self.buffers.items[idx].pt),
                 }
-                afterBufferHistory(self, idx);
+                afterBufferHistory(self, idx, direction == .undo and file.old_dirty);
                 file.revision = hist.revision;
             } else {
-                replaceBufferTextDirect(self, idx, set.targetText(i)) catch {
+                replaceBufferTextDirect(self, idx, set.targetText(i), direction == .undo and file.old_dirty) catch {
                     return patchHistoryUnavailable(self, file.path, "buffer refresh failed");
                 };
                 file.revision = self.buffers.items[idx].history.revision;
