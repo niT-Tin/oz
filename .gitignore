@@ -17,3 +17,7 @@ zig-pkg/
 .zig-*.log
 .codegraph/
 .cursor/
+.demo/
+.dsh-vision-toolkit/
+.tmp/
+docs/aegis/
