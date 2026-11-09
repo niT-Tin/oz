@@ -15,3 +15,5 @@ zig-pkg/
 .zig-cache-*/
 .zig-global-cache-*/
 .zig-*.log
+.codegraph/
+.cursor/
