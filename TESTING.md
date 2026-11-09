@@ -37,6 +37,35 @@ replaying a cached successful run.
 
 ## Test layers
 
+The data-integrity regression groups added after the November 2026 review
+exercise actual saved bytes as well as screen state:
+
+- `zig build e2e -Dtest-filter="text regression:"`: CJK/emoji inclusive
+  operators, backward find/Visual Line ranges, and vertical-motion insertion.
+- `zig build e2e -Dtest-filter="safety:"`: hidden buffer/workspace dirty
+  protection, explicit force close, split `:wq`, and asynchronous LSP edit
+  routing (`changes` and `documentChanges`, with the other URI first).
+- `zig build e2e -Dtest-filter="approval: multi-file disk baseline"`:
+  external atomic replacements before approve/undo, plus independent dirty
+  buffer and disk restoration.
+- `zig build test -Dtest-filter="client:"`: real loopback peers that stay
+  silent during HTTP headers, SSE body or TLS handshake; cancel/retry and
+  shutdown must finish without waiting for the peer.
+- `zig build test -Dtest-filter="tool_job"`: a cancelled worker retains its
+  slot until reaped, including completed results not yet drained.
+
+Dirty-tab close expectations now assert E37 and retained unsaved content;
+`:bd!` is used only for explicit cleanup. This replaces the earlier test
+expectation that clicking × silently discarded the buffer.
+LSP notification coalescing now preserves each URI and request ordering:
+only adjacent full-text changes to the same document may replace one
+another. The queue regression retains both sides of a request barrier,
+instead of moving a later document state ahead of that request.
+Shared PTY waits and exit drains use monotonic deadlines even while bytes
+keep arriving, so a redrawing terminal cannot suppress the test timeout.
+Terminal startup probes separate legacy Alt+r from subsequent typing, then
+assert a uniquely formatted shell response instead of assuming a `$` prompt.
+
 | Layer | What it covers | Where |
 |---|---|---|
 | **Model/unit (L1)** | Pure logic: piece table, motions, keymaps, SSE/OpenAI config parsing, AI workspace layout/focus/thread model, navigator tab model, note store (paths/titles/sorting/creation), inline selection mapping/fences/diff/pending policy, M3a agent loop bounds/card formatting/metrics/chart cache key + transcript→request assembly, M3c recent-window p95 (nearest-rank, ring wraparound, empty→null, no revision change), M3b1 staged `edit_file` args/occurrence/span/bounded-preview/pending policy and approval decision metrics; M3b2 multi/single-file unified-diff parse/validate, per-file patch pending, two-phase commit rollback, cross-file undo set, bounded/full hunk preview and `verifyFile`; M3b3 terminal argument validation/timeout bounds/escaped display/output cap/result text, real `/bin/sh` spawn/cancel/timeout/output-cap job wrapper, and one-call terminal execution metrics | `src/**/*.zig` `test` blocks, aggregated by `src/tests.zig` |

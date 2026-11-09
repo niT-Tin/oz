@@ -23,6 +23,7 @@
 //!   mirroring the utf8 module's decode contract.
 const std = @import("std");
 const PieceTable = @import("../buffer/piece_table.zig").PieceTable;
+const edit_range = @import("edit_range.zig");
 
 pub const Motion = enum {
     left,
@@ -285,15 +286,7 @@ fn moveVert(pt: *const PieceTable, pos: u32, dir: i8) u32 {
     if (dir > 0 and line + 1 >= pt.lineCount()) return pos;
     if (dir < 0 and line == 0) return pos;
     const target_line = if (dir > 0) line + 1 else line - 1;
-    const start = pt.lineStart(line);
-    var col = pos - start;
-    const line_len = pt.lineTextLen(line);
-    if (col > line_len) col = line_len; // defensive clamp
-    const t_start = pt.lineStart(target_line);
-    const t_len = pt.lineTextLen(target_line);
-    var t_col = col;
-    if (t_col >= t_len) t_col = if (t_len == 0) 0 else lastCharStart(pt, t_start, t_len) - t_start;
-    return t_start + t_col;
+    return toLineKeepCol(pt, pos, target_line);
 }
 
 /// Move to `target_line` (clamped to the document) preserving the byte
@@ -311,7 +304,9 @@ pub fn toLineKeepCol(pt: *const PieceTable, pos: u32, target_line: u32) u32 {
     const t_len = pt.lineTextLen(tl);
     var t_col = col;
     if (t_col >= t_len) t_col = if (t_len == 0) 0 else lastCharStart(pt, t_start, t_len) - t_start;
-    return t_start + t_col;
+    // Equal byte columns can point inside a wider UTF-8 character on the
+    // destination line. Editing must always begin at its leading byte.
+    return edit_range.charStart(pt, t_start + t_col);
 }
 
 // ------------------------------- word motions -------------------------------
@@ -848,6 +843,29 @@ test "down/up: column preservation and line-length clamping" {
     try check(&pt, .up, args, 9, 2, 1); // 9 -> 6 -> 1
     try check(&pt, .up, args, 9, 3, 1); // clamps at the first line
     try check(&pt, .up, args, 9, 50, 1);
+}
+
+test "down/up: byte columns snap to complete UTF-8 characters" {
+    // ab\n你(3)好(6)\n🙂(10)x(14)\n
+    var pt = try PieceTable.init(testing.allocator, "ab\n你好\n🙂x\n");
+    defer pt.deinit();
+    try check(&pt, .down, .{}, 1, 1, 3); // column 1 lies inside 你
+    try check(&pt, .up, .{}, 14, 1, 6); // column 4 lies inside 好
+    try testing.expectEqual(@as(u32, 3), toLineKeepCol(&pt, 1, 1));
+    try testing.expectEqual(@as(u32, 10), toLineKeepCol(&pt, 1, 2));
+    try testing.expectEqual(@as(u32, 6), toLineKeepCol(&pt, 14, 1));
+
+    // Every byte-column target in a valid mixed-width line remains a lead
+    // byte, including a shortened destination and the artificial EOF line.
+    var mixed = try PieceTable.init(testing.allocator, "0123456789\n你🙂a好\n");
+    defer mixed.deinit();
+    var from: u32 = 0;
+    while (from < 10) : (from += 1) {
+        const pos = toLineKeepCol(&mixed, from, 1);
+        try testing.expect((mixed.byteAt(pos) & 0xC0) != 0x80);
+        try testing.expectEqual(pos, target(&mixed, .down, .{}, from, 1));
+    }
+    try testing.expectEqual(mixed.len(), toLineKeepCol(&mixed, 9, 2));
 }
 
 test "word motions w/e/b/ge: punctuation, underscore, blank lines, cross-line" {

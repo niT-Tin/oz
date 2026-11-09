@@ -695,9 +695,9 @@ pub const App = struct {
     inlay_req_seq: u64 = 0,
     /// edit_seq at the moment the in-flight completion request was sent.
     completion_req_seq: u64 = 0,
-    /// edit_seq at the moment the in-flight formatting/rename request was
-    /// sent (format_slot is shared by both).
-    format_req_seq: u64 = 0,
+    /// Identity and revision of the document that requested formatting or
+    /// rename. Switching focus never changes the response's target.
+    format_request: ?@import("lsp/workspace_edit.zig").Request = null,
 
     /// Per-frame memo for screenCellCol: the same (line, byte_pos) query
     /// recurs several times a frame (status bar, cursor block, completion
@@ -1265,7 +1265,7 @@ pub const App = struct {
     /// editor (all buffers end together). Multi-window :q only closes the
     /// focused window (closeWindow's other branch).
     pub fn closeSingleWindow(self: *App) void {
-        self.quit = true;
+        @import("app/buffers.zig").requestQuit(self, false);
     }
 
     /// Make window `i` the focused one, syncing the current buffer and the
@@ -1556,6 +1556,7 @@ pub const App = struct {
         self.nav_locations.deinit(self.alloc);
         if (self.completion_slot) |*v| json_rpc.freeValue(self.alloc, v);
         if (self.format_slot) |*v| json_rpc.freeValue(self.alloc, v);
+        if (self.format_request) |*r| r.deinit(self.alloc);
         if (self.inlay_slot) |*v| json_rpc.freeValue(self.alloc, v);
         if (self.outline_slot) |*v| json_rpc.freeValue(self.alloc, v);
         for (self.inlay_hints.items) |*h| self.alloc.free(h.label);

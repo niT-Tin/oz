@@ -73,17 +73,18 @@ fn hexVal(c: u8) ?u8 {
     };
 }
 
-/// Convert an absolute path to a file:// URI (allocated). No percent-encoding
-/// beyond spaces (kept minimal for local paths).
+/// Convert an absolute path to a file:// URI. Encode literal percent signs
+/// and reserved characters so decoding the URI always recovers this path.
 pub fn pathToFileUri(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "file://");
     for (path) |c| {
-        if (c == ' ') {
-            try out.appendSlice(allocator, "%20");
-        } else {
+        if (std.ascii.isAlphanumeric(c) or c == '/' or c == '-' or c == '_' or c == '.' or c == '~') {
             try out.append(allocator, c);
+        } else {
+            const hex = "0123456789ABCDEF";
+            try out.appendSlice(allocator, &.{ '%', hex[c >> 4], hex[c & 0x0F] });
         }
     }
     return out.toOwnedSlice(allocator);
@@ -131,6 +132,17 @@ test "types: file URI round-trip" {
     defer alloc.free(u);
     try std.testing.expectEqualStrings("file:///tmp/x%20y.zig", u);
     try std.testing.expectError(error.InvalidUri, fileUriToPath(alloc, "http://x"));
+}
+
+test "types: literal percent and reserved UTF-8 filename bytes round-trip" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/a%20b#?你好.zig";
+    const uri = try pathToFileUri(alloc, path);
+    defer alloc.free(uri);
+    try std.testing.expectEqualStrings("file:///tmp/a%2520b%23%3F%E4%BD%A0%E5%A5%BD.zig", uri);
+    const restored = try fileUriToPath(alloc, uri);
+    defer alloc.free(restored);
+    try std.testing.expectEqualStrings(path, restored);
 }
 
 test "types: positionAt counts UTF-16 code units, not bytes" {

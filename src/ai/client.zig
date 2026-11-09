@@ -5,10 +5,10 @@
 //! client before spawn, and the worker pushes owned `Event` payloads into a
 //! mutex-protected FIFO. `pop` transfers ownership back to the App.
 //!
-//! Cancellation is cooperative: `requestCancel` sets an atomic that the
-//! worker checks between chunks. The App additionally stops applying events
-//! as soon as the user cancels, so a late chunk can never mutate the
-//! transcript.
+//! The transport runs in a cancellable `std.Io` task. A small supervisor
+//! handles cancellation off the UI thread, including a blocked DNS lookup,
+//! connect, TLS handshake, response header or body read. The App additionally
+//! drops events as soon as the user cancels.
 //!
 //! Transport:
 //!   - normal: `std.http.Client` POST {base}/chat/completions, TLS via the
@@ -107,16 +107,11 @@ pub const Client = struct {
     /// Begin one stream. Fails with `error.Busy` while a previous worker is
     /// still alive; the caller must cancel and let it finish first.
     pub fn start(self: *Client, spec: Spec) StartError!void {
-        if (self.running.load(.acquire)) {
-            // A cancelled worker winds down at its next chunk boundary and
-            // is joined here so a retry can reuse the client. A wedged
-            // network read can delay this; the App reports it as a start
-            // error rather than silently sharing the transcript.
-            if (!self.cancel.load(.acquire)) return error.Busy;
-            self.joinThread();
-        } else {
-            self.joinThread();
-        }
+        // Joining a live transport here would block the UI on the provider.
+        // Cancellation is handled by the supervisor; a retry can reuse this
+        // client as soon as it has published `running = false`.
+        if (self.running.load(.acquire)) return error.Busy;
+        self.joinThread();
         // Never let a finished stream's queued bytes leak into the next
         // request's transcript.
         self.clearEvents();
@@ -164,7 +159,8 @@ pub const Client = struct {
         self.events.clearRetainingCapacity();
     }
 
-    /// Request cooperative cancellation. Safe from any thread.
+    /// Request cancellation without waiting on the UI thread. The supervisor
+    /// interrupts the transport's current cancellable I/O operation.
     pub fn requestCancel(self: *Client) void {
         self.cancel.store(true, .release);
     }
@@ -216,13 +212,15 @@ pub const Client = struct {
     }
 
     fn pushError(self: *Client, text: []const u8) void {
+        if (self.cancel.load(.acquire)) return;
         const copy = self.alloc.dupe(u8, text) catch return;
-        self.push(.{ .err = copy }) catch self.alloc.free(copy);
+        self.push(.{ .err = copy }) catch {};
     }
 
     fn pushErrorFmt(self: *Client, comptime fmt: []const u8, args: anytype) void {
+        if (self.cancel.load(.acquire)) return;
         const text = std.fmt.allocPrint(self.alloc, fmt, args) catch return;
-        self.push(.{ .err = text }) catch self.alloc.free(text);
+        self.push(.{ .err = text }) catch {};
     }
 
     fn checkCancel(self: *Client) error{Cancelled}!void {
@@ -231,13 +229,34 @@ pub const Client = struct {
 
     fn workerMain(self: *Client) void {
         defer self.running.store(false, .release);
+        var transport_done = std.atomic.Value(bool).init(false);
+        var task = self.io.concurrent(transportMain, .{ self, &transport_done }) catch |e| {
+            self.pushErrorFmt("transport start failed: {s}", .{@errorName(e)});
+            return;
+        };
+        while (!transport_done.load(.acquire)) {
+            if (self.cancel.load(.acquire)) {
+                // Future.cancel both interrupts blocked std.Io operations
+                // and awaits cleanup. Only this supervisor ever accesses
+                // the Future, so cancellation cannot race task destruction.
+                task.cancel(self.io);
+                return;
+            }
+            std.Io.sleep(self.io, .fromMilliseconds(1), .real) catch {};
+        }
+        task.await(self.io);
+    }
+
+    fn transportMain(self: *Client, done: *std.atomic.Value(bool)) void {
+        defer done.store(true, .release);
+        defer if (self.cancel.load(.acquire)) self.push(.cancelled) catch {};
         const job = &self.job.?;
         const result = if (job.mock_dir) |dir|
             self.runMock(job, dir)
         else
             self.runHttp(job);
         result catch |e| switch (e) {
-            error.Cancelled => self.push(.cancelled) catch {},
+            error.Cancelled, error.Canceled => {},
             else => self.pushErrorFmt("{s}", .{@errorName(e)}),
         };
     }
@@ -457,7 +476,7 @@ pub const Client = struct {
                     };
                     if (delta.content) |content| {
                         const copy = try self.alloc.dupe(u8, content);
-                        self.push(.{ .delta = copy }) catch self.alloc.free(copy);
+                        self.push(.{ .delta = copy }) catch {};
                     }
                     if (delta.finish_reason != null) saw_done.* = true;
                 },
@@ -488,7 +507,6 @@ pub const Client = struct {
             return;
         }
         self.push(.{ .tool_calls = calls }) catch {
-            tools.freeCalls(self.alloc, calls);
             return error.OutOfMemory;
         };
     }
@@ -687,6 +705,115 @@ test "client: cancel stops deltas" {
     std.Io.sleep(io, .fromMilliseconds(60), .real) catch {};
     try std.testing.expect(client.pop() == null);
     try std.testing.expect(!client.isRunning());
+}
+
+/// A real loopback peer that reads the request (or TLS ClientHello), then
+/// deliberately stops sending bytes. The deadline only makes a regression
+/// fail instead of hanging the test runner; a correct client cancels while
+/// the peer is still waiting.
+const StalledPeer = struct {
+    server: std.Io.net.Server,
+    mode: enum { headers, body, tls },
+    ready: std.Io.Event = .unset,
+    release: std.Io.Event = .unset,
+
+    fn run(self: *StalledPeer, io: std.Io) !void {
+        const stream = try self.server.accept(io);
+        defer stream.close(io);
+        var request: [8192]u8 = undefined;
+        var slices: [1][]u8 = .{&request};
+        _ = try stream.readWithControl(io, &slices, &.{});
+        if (self.mode == .body) {
+            var writer = stream.writer(io, &.{});
+            try writer.interface.writeAll(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+                    "33\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n\r\n",
+            );
+            try writer.interface.flush();
+        }
+        self.ready.set(io);
+        self.release.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(3), .clock = .awake } }) catch |e| switch (e) {
+            error.Timeout => {},
+            else => return e,
+        };
+    }
+};
+
+fn waitClientStopped(client: *Client, io: std.Io) !void {
+    const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(1));
+    while (client.isRunning()) {
+        if (std.Io.Clock.awake.now(io).compare(.gte, deadline)) return error.TestUnexpectedResult;
+        try std.Io.sleep(io, .fromMilliseconds(1), .real);
+    }
+}
+
+test "client: cancel interrupts silent HTTP headers, SSE body and TLS handshake" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    inline for (.{ .headers, .body, .tls }) |mode| {
+        const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        var peer: StalledPeer = .{ .server = try address.listen(io, .{ .reuse_address = true }), .mode = mode };
+        defer peer.server.deinit(io);
+        var peer_task = try io.concurrent(StalledPeer.run, .{ &peer, io });
+        defer peer_task.cancel(io) catch {};
+        var url_buf: [128]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "{s}://127.0.0.1:{d}/chat/completions", .{
+            if (mode == .tls) "https" else "http", peer.server.socket.address.ip4.port,
+        });
+        var client = Client.init(alloc, io);
+        defer client.deinit();
+        try client.start(.{ .url = url, .body = "{}" });
+        try peer.ready.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
+        // Make the body case prove a parsed delta preceded the stalled read.
+        if (mode == .body) {
+            var got_delta = false;
+            var waited: u32 = 0;
+            while (!got_delta and waited < 1000) : (waited += 1) {
+                while (client.pop()) |ev| {
+                    if (ev == .delta) got_delta = true;
+                    ev.deinit(alloc);
+                }
+                if (!got_delta) try std.Io.sleep(io, .fromMilliseconds(1), .real);
+            }
+            try std.testing.expect(got_delta);
+        }
+        client.requestCancel();
+        // start must never join a live worker. It can report Busy while the
+        // supervisor interrupts I/O, then the same client must be reusable.
+        const before = std.Io.Timestamp.now(io, .awake).nanoseconds;
+        client.start(.{ .url = "invalid", .body = "{}" }) catch |e| try std.testing.expectEqual(error.Busy, e);
+        const start_ms = @divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds - before, std.time.ns_per_ms);
+        try std.testing.expect(start_ms < 250);
+        client.requestCancel();
+        try waitClientStopped(&client, io);
+        peer.release.set(io);
+        try peer_task.await(io);
+        try client.start(.{ .url = "invalid", .body = "{}" });
+        try waitClientStopped(&client, io);
+    }
+}
+
+test "client: deinit interrupts a peer that never sends HTTP headers" {
+    const io = std.testing.io;
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var peer: StalledPeer = .{ .server = try address.listen(io, .{ .reuse_address = true }), .mode = .headers };
+    defer peer.server.deinit(io);
+    var peer_task = try io.concurrent(StalledPeer.run, .{ &peer, io });
+    defer peer_task.cancel(io) catch {};
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/chat/completions", .{peer.server.socket.address.ip4.port});
+    var client = Client.init(std.testing.allocator, io);
+    var client_live = true;
+    defer if (client_live) client.deinit();
+    try client.start(.{ .url = url, .body = "{}" });
+    try peer.ready.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
+    const before = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    client.deinit();
+    client_live = false;
+    const elapsed_ms = @divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds - before, std.time.ns_per_ms);
+    try std.testing.expect(elapsed_ms < 1000);
+    peer.release.set(io);
+    try peer_task.await(io);
 }
 
 test "client: tool_calls fragments accumulate while text deltas still stream" {

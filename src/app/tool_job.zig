@@ -64,27 +64,59 @@ pub const Job = struct {
         generation: u64,
         delay_ms: u32,
     ) !*Job {
+        errdefer ai.tools.freeCalls(alloc, calls);
+        const root_copy = try alloc.dupe(u8, root);
+        errdefer alloc.free(root_copy);
+        const results = try alloc.alloc(Result, calls.len);
+        errdefer alloc.free(results);
         const self = try alloc.create(Job);
         errdefer alloc.destroy(self);
         self.* = .{
             .alloc = alloc,
             .io = io,
-            .root = try alloc.dupe(u8, root),
+            .root = root_copy,
             .calls = calls,
-            .results = try alloc.alloc(Result, calls.len),
+            .results = results,
             .generation = generation,
             .delay_ms = delay_ms,
         };
-        errdefer {
-            ai.tools.freeCalls(alloc, self.calls);
-            alloc.free(self.results);
-            alloc.free(self.root);
-        }
         for (self.results) |*r| {
             r.* = .{ .status = .cancelled, .executed = false, .content = &.{}, .duration_ms = 0 };
         }
         self.thread = std.Thread.spawn(.{}, workerMain, .{self}) catch return error.ThreadSpawnFailed;
         return self;
+    }
+
+    /// Admit a batch into its sole owning slot. A cancelled worker still
+    /// owns its in-flight read until it finishes; never overwrite that
+    /// pointer. Completed stale workers can be reclaimed without waiting.
+    /// `calls` ownership transfers on every return path, including Busy.
+    pub fn startInSlot(
+        slot: *?*Job,
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        root: []const u8,
+        calls: []ai.tools.ToolCall,
+        generation: u64,
+        delay_ms: u32,
+    ) !*Job {
+        reapFinished(slot);
+        if (slot.* != null) {
+            ai.tools.freeCalls(alloc, calls);
+            return error.Busy;
+        }
+        const job = try start(alloc, io, root, calls, generation, delay_ms);
+        slot.* = job;
+        return job;
+    }
+
+    /// Reclaim only a finished worker; this function never waits for file
+    /// I/O. In particular, cancellation does not relinquish slot ownership.
+    pub fn reapFinished(slot: *?*Job) void {
+        const job = slot.* orelse return;
+        if (!job.isDone()) return;
+        job.deinit();
+        slot.* = null;
     }
 
     pub fn isDone(self: *const Job) bool {
@@ -200,4 +232,51 @@ pub const Job = struct {
 /// loop's clock so duration numbers are comparable with the UI.
 fn nowMs(io: std.Io) i64 {
     return @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds, std.time.ns_per_ms));
+}
+
+fn testCalls(alloc: std.mem.Allocator) ![]ai.tools.ToolCall {
+    const calls = try alloc.alloc(ai.tools.ToolCall, 1);
+    errdefer alloc.free(calls);
+    const id = try alloc.dupe(u8, "call_slot");
+    errdefer alloc.free(id);
+    const name = try alloc.dupe(u8, "list_directory");
+    errdefer alloc.free(name);
+    calls[0] = .{ .id = id, .name = name, .arguments_json = try alloc.dupe(u8, "{\"path\":\".\"}") };
+    return calls;
+}
+
+test "tool_job: cancelled slot retains ownership until reaped, then admits a new generation" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    var slot: ?*Job = null;
+    defer if (slot) |job| job.deinit();
+    const first = try Job.startInSlot(&slot, alloc, io, root, try testCalls(alloc), 1, 150);
+    first.requestCancel();
+    // The worker is deliberately still alive: cancellation alone must not
+    // permit the second batch to lose the only pointer to the first one.
+    Job.reapFinished(&slot);
+    try std.testing.expectEqual(first, slot.?);
+    try std.testing.expectError(error.Busy, Job.startInSlot(&slot, alloc, io, root, try testCalls(alloc), 2, 0));
+    try std.testing.expectEqual(first, slot.?);
+    const deadline = nowMs(io) + 2000;
+    while (!first.isDone()) {
+        if (nowMs(io) >= deadline) return error.TestUnexpectedResult;
+        try std.Io.sleep(io, .fromMilliseconds(1), .real);
+    }
+    // startInSlot must also reclaim a *finished but not yet drained* stale
+    // batch: drainAi runs before drainToolJobs in the real App loop.
+    const second = try Job.startInSlot(&slot, alloc, io, root, try testCalls(alloc), 2, 0);
+    try std.testing.expectEqual(@as(u64, 2), second.generation);
+    while (!second.isDone()) {
+        if (nowMs(io) >= deadline) return error.TestUnexpectedResult;
+        try std.Io.sleep(io, .fromMilliseconds(1), .real);
+    }
+    Job.reapFinished(&slot);
+    try std.testing.expect(slot == null);
+    // std.testing.allocator additionally proves that the refused batch and
+    // both completed/cancelled results/call arrays were freed.
 }

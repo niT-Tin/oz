@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const editor = @import("../editor/root.zig");
+const edit_range = @import("../editor/edit_range.zig");
 
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
@@ -115,7 +116,7 @@ pub fn applyOpRangeEx(self: *App, op: editor.KeyEvent.ActionId, from: u32, to: u
     const start = @min(from, to);
     var end = @max(from, to);
     if (exclusive and end > start) end -= 1;
-    if (sel == .inclusive_cursor and end < self.cur().pt.len()) end += 1;
+    if (sel == .inclusive_cursor) end = edit_range.charEnd(&self.cur().pt, end);
     if (end <= start) {
         if (op == .change) {
             // empty range (e.g. cc on an empty line): enter insert with

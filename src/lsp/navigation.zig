@@ -213,7 +213,7 @@ fn offsetAt(pt: anytype, pos: Pos) ?u32 {
         units += if (seq_len == 4) 2 else 1;
         i += seq_len;
     }
-    if (units < pos.character) return null; // past the line end
+    if (units != pos.character or i > len) return null; // past EOL or inside a surrogate pair
     return start + i;
 }
 

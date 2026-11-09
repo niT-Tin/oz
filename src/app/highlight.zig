@@ -1,6 +1,7 @@
 //! highlight — App method group split out of src/main.zig (physical move).
 
 const std = @import("std");
+const edit_range = @import("../editor/edit_range.zig");
 const editor = @import("../editor/root.zig");
 const syntax = @import("../syntax.zig");
 const term = @import("../term.zig");
@@ -264,8 +265,11 @@ pub fn execOpMotion(self: *App, m: editor.OpMotion) !void {
         if (self.visual_anchor) |anchor| {
             if (self.state.mode == .visual_block) {
                 try self.applyBlockOp(m.op);
+            } else if (self.state.mode == .visual_line) {
+                const range = edit_range.linewise(&self.cur().pt, anchor, self.curCursor().*);
+                try self.applyOpRangeEx(m.op, range.start, range.end, false, .exclusive_cursor, true);
             } else {
-                try self.applyOpRangeEx(m.op, anchor, self.curCursor().*, false, .inclusive_cursor, self.state.mode == .visual_line);
+                try self.applyOpRangeEx(m.op, anchor, self.curCursor().*, false, .inclusive_cursor, false);
             }
         }
         self.exitVisualAfterOp(m.op);
@@ -295,12 +299,11 @@ pub fn execOpMotion(self: *App, m: editor.OpMotion) !void {
     // normal mode: d/c/y over [cursor, target). vim semantics:
     // naturally-exclusive motions (w/b/h/l/t/^) yield a half-open
     // range [cursor, target) as-is; inclusive motions ($/e/f/%)
-    // include the character at the target (add one). We therefore
-    // pass exclusive=false and pre-adjust the target, instead of
-    // the old unconditional end-=1 that broke dl/dh/d$/de/dw.
-    var target_pos = editor.Motion.target(&self.cur().pt, m.motion, m.args, self.curCursor().*, m.count);
-    if (m.inclusive and target_pos < self.cur().pt.len()) target_pos += 1;
-    try self.applyOpRange(m.op, self.curCursor().*, target_pos, false, false);
+    // include the full character at the sorted right endpoint, including
+    // multibyte characters and backward inclusive find motions.
+    const target_pos = editor.Motion.target(&self.cur().pt, m.motion, m.args, self.curCursor().*, m.count);
+    const range = edit_range.characterwise(&self.cur().pt, self.curCursor().*, target_pos, m.inclusive);
+    try self.applyOpRange(m.op, range.start, range.end, false, false);
 }
 
 pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !void {
@@ -518,19 +521,14 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
                         try self.applyBlockOp(action);
                     } else if (self.state.mode == .visual_line) {
                         // V selects whole lines: the range spans from the
-                        // anchor line's start to the cursor line's end
+                        // earlier endpoint's line start to the later line's end
                         // (including the trailing newline when present),
                         // not just anchor..cursor bytes — otherwise the
                         // last selected line survives a d/c.
-                        const pt = &self.cur().pt;
-                        const al = pt.lineOf(anchor);
-                        const cl = pt.lineOf(self.curCursor().*);
-                        const start = pt.lineStart(al);
-                        var end = pt.lineStart(cl) + pt.lineLen(cl);
-                        if (end < pt.len()) end += 1; // include the newline
+                        const range = edit_range.linewise(&self.cur().pt, anchor, self.curCursor().*);
                         // exclusive_cursor: the range already ends exactly
                         // after the last selected line's newline.
-                        try self.applyOpRangeEx(action, start, end, false, .exclusive_cursor, true);
+                        try self.applyOpRangeEx(action, range.start, range.end, false, .exclusive_cursor, true);
                     } else {
                         try self.applyOpRangeEx(action, anchor, self.curCursor().*, false, .inclusive_cursor, false);
                     }

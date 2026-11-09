@@ -459,6 +459,9 @@ pub const PendingFile = struct {
     display_path: []u8,
     /// Full target text at staging time (buffer or disk).
     text: []u8,
+    /// Independent on-disk baseline for a multi-file transaction. A dirty
+    /// buffer's snapshot can differ and must never be used for rollback.
+    disk_text: ?[]u8 = null,
     /// Full staged result for this file.
     new_text: []u8,
     buffer_index: ?usize = null,
@@ -476,6 +479,7 @@ pub const PendingFile = struct {
         if (self.path.len > 0) alloc.free(self.path);
         if (self.display_path.len > 0) alloc.free(self.display_path);
         if (self.text.len > 0) alloc.free(self.text);
+        if (self.disk_text) |text| alloc.free(text);
         if (self.new_text.len > 0) alloc.free(self.new_text);
         if (self.patch) |*patch| patch.deinit(alloc);
         freePreview(alloc, self.diff);
@@ -583,6 +587,15 @@ pub const Pending = struct {
         return std.mem.eql(u8, applied, file.new_text);
     }
 
+    /// Disk writes have a separate baseline even when the target is open.
+    /// Missing transaction metadata refuses a write instead of falling back
+    /// to a potentially dirty buffer snapshot.
+    pub fn verifyDiskFile(self: *const Pending, index: usize, current_disk: []const u8) bool {
+        if (index >= self.files.len) return false;
+        const baseline = self.files[index].disk_text orelse return false;
+        return std.mem.eql(u8, baseline, current_disk);
+    }
+
     /// First file (in patch order) whose current text no longer matches the
     /// staging snapshot, or null when the whole set is still current. The
     /// caller supplies each current text; path/buffer-index checks happen at
@@ -607,6 +620,9 @@ pub const UndoEntry = struct {
     path: []u8,
     old_text: []u8,
     new_text: []u8,
+    /// Disk state before the apply; `old_text` is the buffer state.
+    old_disk_text: ?[]u8 = null,
+    old_dirty: bool = false,
     buffer_index: ?usize = null,
     /// True when the buffer was already open at apply time, so the apply's
     /// one history group exists in that buffer. A file opened later is
@@ -620,6 +636,7 @@ pub const UndoEntry = struct {
         if (self.path.len > 0) alloc.free(self.path);
         if (self.old_text.len > 0) alloc.free(self.old_text);
         if (self.new_text.len > 0) alloc.free(self.new_text);
+        if (self.old_disk_text) |text| alloc.free(text);
         self.* = undefined;
     }
 };
@@ -648,6 +665,16 @@ pub const UndoSet = struct {
     pub fn targetText(self: *const UndoSet, index: usize) []const u8 {
         const file = &self.files[index];
         return if (self.applied) file.old_text else file.new_text;
+    }
+
+    pub fn liveDiskText(self: *const UndoSet, index: usize) []const u8 {
+        const file = &self.files[index];
+        return if (self.applied) file.new_text else file.old_disk_text orelse file.old_text;
+    }
+
+    pub fn targetDiskText(self: *const UndoSet, index: usize) []const u8 {
+        const file = &self.files[index];
+        return if (self.applied) file.old_disk_text orelse file.old_text else file.new_text;
     }
 };
 
@@ -735,6 +762,7 @@ pub const PatchFileMeta = struct {
     display_path: []const u8,
     old_text: []const u8,
     new_text: []const u8,
+    disk_text: ?[]const u8 = null,
     buffer_index: ?usize = null,
     revision: ?u64 = null,
     /// Parsed patch. Ownership moves into the returned `Pending` on success;
@@ -851,11 +879,13 @@ fn initPendingFile(
         if (file.display_path.len > 0) alloc.free(file.display_path);
         if (file.text.len > 0) alloc.free(file.text);
         if (file.new_text.len > 0) alloc.free(file.new_text);
+        if (file.disk_text) |text| alloc.free(text);
     }
     file.path = try alloc.dupe(u8, meta.path);
     file.display_path = try alloc.dupe(u8, meta.display_path);
     file.text = try alloc.dupe(u8, meta.old_text);
     file.new_text = try alloc.dupe(u8, meta.new_text);
+    if (meta.disk_text) |text| file.disk_text = try alloc.dupe(u8, text);
     return file;
 }
 
@@ -1363,6 +1393,7 @@ test "agent_edit: multi-file patch pending keeps per-file snapshots and totals" 
             .display_path = "a.txt",
             .old_text = old_a,
             .new_text = new_a,
+            .disk_text = "disk version a\n",
             .patch = &set.files[0],
         },
         .{
@@ -1388,6 +1419,10 @@ test "agent_edit: multi-file patch pending keeps per-file snapshots and totals" 
     try testing.expectEqual(@as(u32, 2), pending.removed);
     try testing.expectEqual(@as(u32, 2), pending.added);
     try testing.expect(pending.verifyFile(alloc, 0, old_a));
+    try testing.expect(pending.verifyDiskFile(0, "disk version a\n"));
+    try testing.expect(!pending.verifyDiskFile(0, old_a));
+    try testing.expect(!pending.verifyDiskFile(0, "external replacement\n"));
+    try testing.expect(!pending.verifyDiskFile(1, old_b));
     try testing.expect(pending.verifyFile(alloc, 1, old_b));
     try testing.expect(!pending.verifyFile(alloc, 0, "changed\n"));
     try testing.expect(!pending.verify(old_a));
@@ -1407,6 +1442,8 @@ test "agent_edit: undo set swaps every file's live and target text" {
         .path = try alloc.dupe(u8, "/workspace/a.txt"),
         .old_text = try alloc.dupe(u8, "old a\n"),
         .new_text = try alloc.dupe(u8, "new a\n"),
+        .old_disk_text = try alloc.dupe(u8, "disk a\n"),
+        .old_dirty = true,
     };
     entries[1] = .{
         .path = try alloc.dupe(u8, "/workspace/b.txt"),
@@ -1422,11 +1459,16 @@ test "agent_edit: undo set swaps every file's live and target text" {
 
     try testing.expectEqualStrings("new a\n", set.liveText(0));
     try testing.expectEqualStrings("old a\n", set.targetText(0));
+    try testing.expectEqualStrings("new a\n", set.liveDiskText(0));
+    try testing.expectEqualStrings("disk a\n", set.targetDiskText(0));
+    try testing.expect(set.files[0].old_dirty);
     try testing.expectEqualStrings("new b\n", set.liveText(1));
     try testing.expectEqualStrings("old b\n", set.targetText(1));
 
     set.applied = false;
     try testing.expectEqualStrings("old a\n", set.liveText(0));
+    try testing.expectEqualStrings("disk a\n", set.liveDiskText(0));
+    try testing.expectEqualStrings("new a\n", set.targetDiskText(0));
     try testing.expectEqualStrings("new a\n", set.targetText(0));
     try testing.expectEqualStrings("old b\n", set.liveText(1));
     try testing.expectEqualStrings("new b\n", set.targetText(1));

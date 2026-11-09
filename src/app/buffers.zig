@@ -230,6 +230,8 @@ pub fn teardownLsp(self: *App, died: bool) void {
     self.completion_slot = null;
     if (self.format_slot) |*v| json_rpc.freeValue(self.alloc, v);
     self.format_slot = null;
+    if (self.format_request) |*request| request.deinit(self.alloc);
+    self.format_request = null;
     if (self.inlay_slot) |*v| json_rpc.freeValue(self.alloc, v);
     self.inlay_slot = null;
     if (self.outline_slot) |*v| json_rpc.freeValue(self.alloc, v);
@@ -248,7 +250,17 @@ pub fn teardownLsp(self: *App, died: bool) void {
 /// next buffer. The last buffer stays. Used by :bd and the single-window
 /// :q path.
 pub fn closeBufferAt(self: *App, buf_idx: usize) void {
+    closeBufferAtForce(self, buf_idx, false);
+}
+
+pub fn closeBufferAtForce(self: *App, buf_idx: usize, force: bool) void {
+    if (buf_idx >= self.buffers.items.len) return;
     if (self.buffers.items.len <= 1) return;
+    if (!force and self.buffers.items[buf_idx].dirty) {
+        const msg = self.alloc.dupe(u8, "E37: No write since last change (add ! to override)") catch return;
+        self.setMsg(msg) catch self.alloc.free(msg);
+        return;
+    }
     self.cancelLspStart();
     if (self.lsp_client) |c| {
         c.deinit();
@@ -284,10 +296,36 @@ pub fn closeBufferAt(self: *App, buf_idx: usize) void {
 
 /// :bd — close the focused window's buffer; the window shows the next one.
 pub fn closeCurrentBuffer(self: *App) void {
+    closeCurrentBufferForce(self, false);
+}
+
+pub fn closeCurrentBufferForce(self: *App, force: bool) void {
     const buf = self.windows.items[self.current_win].buf;
-    self.closeBufferAt(buf);
+    closeBufferAtForce(self, buf, force);
     self.windows.items[self.current_win].buf = self.current;
     self.windows.items[self.current_win].cursor = @min(self.windows.items[self.current_win].cursor, self.cur().pt.len());
+}
+
+/// Every exit destroys every workspace, including hidden buffers. Keep the
+/// check at the exit boundary so dashboard/window shortcuts share it.
+pub fn requestQuit(self: *App, force: bool) void {
+    if (!force) {
+        var dirty: usize = 0;
+        for (self.buffers.items) |buf| {
+            if (buf.dirty) dirty += 1;
+        }
+        for (self.workspaces.items) |workspace| {
+            for (workspace.buffers.items) |buf| {
+                if (buf.dirty) dirty += 1;
+            }
+        }
+        if (dirty > 0) {
+            const msg = std.fmt.allocPrint(self.alloc, "E37: {d} unsaved buffer(s) (add ! to override)", .{dirty}) catch return;
+            self.setMsg(msg) catch self.alloc.free(msg);
+            return;
+        }
+    }
+    self.quit = true;
 }
 
 /// FNV-1a hash of the current buffer content (for dirty detection).

@@ -847,6 +847,22 @@ pub fn aiSend(self: *App) !void {
         setStatusMsg(self, "resolve the pending terminal command first");
         return;
     }
+    if (idx < self.ai.clients.items.len) {
+        if (self.ai.clients.items[idx]) |client| {
+            if (client.isRunning()) {
+                setStatusMsg(self, "previous AI request is stopping; retry shortly");
+                return;
+            }
+        }
+    }
+    if (idx < self.ai.tool_jobs.items.len) {
+        const slot = &self.ai.tool_jobs.items[idx];
+        tool_job.Job.reapFinished(slot);
+        if (slot.* != null) {
+            setStatusMsg(self, "previous tools are stopping; retry shortly");
+            return;
+        }
+    }
     try aiLoadConfig(self);
     if (self.ai.config == null) {
         aiSetThreadError(self, idx, "config unavailable");
@@ -997,10 +1013,18 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
     const plan = agent.planBatch(st.?.rounds, st.?.calls, .{}, calls.len);
     // Read-only calls are admitted to the background worker; write tools are
     // handled locally. `worker_calls` owns only the read-only subset and is
-    // transferred to `tool_job.Job.start` (which frees it on failure).
+    // transferred to `tool_job.Job.startInSlot` (which frees it on failure).
+    var read_only_count: usize = 0;
+    for (calls[0..plan.execute]) |call| {
+        const kind = ai.tools.classify(call.name) orelse continue;
+        switch (kind) {
+            .read_file, .list_directory, .grep => read_only_count += 1,
+            .edit_file, .apply_patch, .terminal => {},
+        }
+    }
     var worker_calls: []ai.tools.ToolCall = &.{};
-    if (plan.execute > 0) {
-        worker_calls = self.alloc.alloc(ai.tools.ToolCall, plan.execute) catch {
+    if (read_only_count > 0) {
+        worker_calls = self.alloc.alloc(ai.tools.ToolCall, read_only_count) catch {
             ai.tools.freeCalls(self.alloc, calls);
             aiSetThreadErrorFmt(self, idx, "tool call protocol: out of memory", .{});
             return;
@@ -1207,6 +1231,7 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
         return;
     }
     std.debug.assert(worker_count == st.?.pending_card_count);
+    std.debug.assert(worker_count == worker_calls.len);
 
     const root = st.?.root orelse {
         for (worker_calls[0..worker_count]) |call| call.deinit(self.alloc);
@@ -1230,8 +1255,16 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
         setToolNote(self, idx, "tool loop stopped: workspace root unavailable");
         return;
     };
-    const job = tool_job.Job.start(self.alloc, self.io, root, worker_calls, st.?.generation, toolTestDelayMs(self)) catch {
-        // Job.start freed `worker_calls` on failure.
+    if (idx >= self.ai.tool_jobs.items.len) {
+        for (worker_calls) |call| call.deinit(self.alloc);
+        self.alloc.free(worker_calls);
+        st.?.pending_followup = true;
+        st.?.final_only = true;
+        return;
+    }
+    _ = tool_job.Job.startInSlot(&self.ai.tool_jobs.items[idx], self.alloc, self.io, root, worker_calls, st.?.generation, toolTestDelayMs(self)) catch {
+        // startInSlot owns/frees `worker_calls` even when the previous
+        // cancelled batch still owns the slot (Busy).
         for (st.?.pending_cards[0..st.?.pending_card_count]) |msg_index| {
             const name = if (msg_index < t.messages.items.len) (t.messages.items[msg_index].tool_name orelse "?") else "?";
             self.ai.threads.setToolOutcome(
@@ -1251,17 +1284,6 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
         setToolNote(self, idx, "tool loop stopped: worker failed to start");
         return;
     };
-    if (idx >= self.ai.tool_jobs.items.len) {
-        job.requestCancel();
-        // syncAiSidecars keeps this in range; if it ever isn't, surface the
-        // failure instead of leaking a running job.
-        var j = job;
-        j.deinit();
-        st.?.pending_followup = true;
-        st.?.final_only = true;
-        return;
-    }
-    self.ai.tool_jobs.items[idx] = job;
     st.?.active = true;
 }
 
