@@ -1778,11 +1778,11 @@ fn multiVisibleDiffRows(self: *App, p: *const model.Pending) u32 {
     const rows = self.vx.window().height;
     if (rows <= app_mod.status_row_count) return 1;
     const m = ws.metrics(rows - app_mod.status_row_count, .changes);
-    if (m.body_rows < 6) return 1;
+    if (m.body_rows < 7) return 1;
     const budget = inline_ui.multiFileRowBudget(m.body_rows, p.files.len);
     const overflow = p.files.len > budget;
     const file_rows = (if (overflow) @max(budget -| 1, 1) else budget) + @intFromBool(overflow);
-    return m.body_rows -| (1 + file_rows + 2);
+    return m.body_rows -| (2 + file_rows + 2);
 }
 
 fn scrollActiveReview(self: *App, delta: i64) void {
@@ -1823,6 +1823,8 @@ fn drawMultiAgentEdit(
         .paths = paths[0..p.files.len],
         .actions = actions[0..p.files.len],
         .active = active,
+        .first_line = file.first_line,
+        .last_line = file.last_line,
         .total_removed = p.removed,
         .total_added = p.added,
         .stale = p.stale,

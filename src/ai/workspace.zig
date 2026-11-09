@@ -6,6 +6,9 @@
 //! the rendering; it routes through these types so the policies below have
 //! exactly one implementation.
 const std = @import("std");
+const telemetry = @import("telemetry.zig");
+
+pub const RequestTelemetry = telemetry.Request;
 
 // ---------------------------------------------------------------------------
 // Layout
@@ -17,6 +20,7 @@ const std = @import("std");
 pub const wide_cols: u32 = 110;
 pub const mid_cols: u32 = 90;
 pub const rail_wide_width: u32 = 38;
+pub const rail_focus_width: u32 = 52;
 pub const rail_mid_width: u32 = 34;
 /// The drawer never eats more than `cols - 8`, so at 80 cols the editor
 /// still shows 46 usable columns to the left.
@@ -53,8 +57,12 @@ pub fn railWidth(cols: u32) u32 {
 /// The single source of truth for the workspace layout. Every renderer and
 /// input handler that needs the editor/rail split must use this.
 pub fn layout(cols: u32, open: bool) Layout {
+    return layoutMode(cols, open, false);
+}
+
+pub fn layoutMode(cols: u32, open: bool, agent_focus: bool) Layout {
     if (!open) return .{ .mode = .hidden, .editor_width = cols };
-    const rw = railWidth(cols);
+    const rw = if (agent_focus and cols >= wide_cols) rail_focus_width else railWidth(cols);
     const rail_col = cols -| rw;
     const rail_gutter: u32 = 1;
     if (cols >= mid_cols) {
@@ -91,10 +99,12 @@ pub const Metrics = struct {
     divider_row: u32 = 0,
     workbox_header_row: u32 = 0,
     tabs_row: u32 = 0,
-    /// Second horizontal rule: closes the tab strip and opens the body.
+    /// Band transition between the tab strip and body.
     tabs_sep_row: u32 = 0,
     body_top: u32 = 0,
     body_rows: u32 = 0,
+    /// Real editor path/range line above the Chat input.
+    context_row: ?u32 = null,
     prompt_row: ?u32 = null,
 };
 
@@ -132,8 +142,10 @@ pub fn metrics(rail_rows: u32, tab: WorkboxTab) Metrics {
     const tabs_row = workbox_header_row + 1;
     const tabs_sep_row = tabs_row + 1;
     const body_top = tabs_sep_row + 1;
-    const prompt_row: ?u32 = if (tab == .chat and rail_rows > body_top + 1) rail_rows - 1 else null;
-    const body_bottom = if (prompt_row) |p| p - 1 else rail_rows - 1;
+    const has_composer = tab == .chat and rail_rows > body_top + 2;
+    const context_row: ?u32 = if (has_composer) rail_rows - 2 else null;
+    const prompt_row: ?u32 = if (has_composer) rail_rows - 1 else null;
+    const body_bottom = if (context_row) |row| row - 1 else rail_rows - 1;
     const body_rows = if (body_bottom >= body_top) body_bottom - body_top + 1 else 0;
     return .{
         .rail_rows = rail_rows,
@@ -144,6 +156,7 @@ pub fn metrics(rail_rows: u32, tab: WorkboxTab) Metrics {
         .tabs_sep_row = tabs_sep_row,
         .body_top = body_top,
         .body_rows = body_rows,
+        .context_row = context_row,
         .prompt_row = prompt_row,
     };
 }
@@ -276,6 +289,8 @@ pub const Thread = struct {
     input: std.ArrayList(u8) = .empty,
     status: Status = .idle,
     error_text: ?[]u8 = null,
+    /// Last request's transport phase, timing and token/context accounting.
+    request: RequestTelemetry = .{},
     /// Transcript top row (wrapped rows) for manual scrolling.
     scroll: u32 = 0,
     /// Follow the bottom while streaming; a manual scroll disables it until
@@ -645,8 +660,25 @@ test "workspace layout: 120/110/100/90 dock, 89/80 drawer, hidden" {
     try std.testing.expectEqual(@as(u32, 0), hidden.rail_gutter);
 }
 
-test "workspace layout: rail metrics keep a workbox and chat prompt" {
-    // 30-row terminal: the status band owns two rows (rule + status).
+test "workspace layout: Agent-focus widens only wide docks" {
+    const focused = layoutMode(120, true, true);
+    try std.testing.expectEqual(RailMode.docked, focused.mode);
+    try std.testing.expectEqual(rail_focus_width, focused.rail_width);
+    try std.testing.expectEqual(@as(u32, 67), focused.editor_width);
+    try std.testing.expectEqual(@as(u32, 68), focused.rail_col);
+
+    const medium = layoutMode(100, true, true);
+    try std.testing.expectEqual(rail_mid_width, medium.rail_width);
+    try std.testing.expectEqual(layout(100, true).editor_width, medium.editor_width);
+
+    const narrow = layoutMode(80, true, true);
+    try std.testing.expectEqual(RailMode.drawer, narrow.mode);
+    try std.testing.expectEqual(layout(80, true).rail_width, narrow.rail_width);
+    try std.testing.expectEqual(@as(u32, 120), layoutMode(120, false, true).editor_width);
+}
+
+test "workspace layout: rail metrics keep a workbox and two-row composer" {
+    // The caller passes the rows above the one-row global status band.
     const m = metrics(28, .chat);
     try std.testing.expectEqual(@as(u32, 6), m.thread_rows);
     try std.testing.expectEqual(@as(u32, 8), m.divider_row);
@@ -654,17 +686,21 @@ test "workspace layout: rail metrics keep a workbox and chat prompt" {
     try std.testing.expectEqual(@as(u32, 10), m.tabs_row);
     try std.testing.expectEqual(@as(u32, 11), m.tabs_sep_row);
     try std.testing.expectEqual(@as(u32, 12), m.body_top);
+    try std.testing.expectEqual(@as(u32, 26), m.context_row.?);
     try std.testing.expectEqual(@as(u32, 27), m.prompt_row.?);
-    try std.testing.expect(m.body_rows > 8);
+    try std.testing.expectEqual(@as(u32, 14), m.body_rows);
+    try std.testing.expectEqual(m.context_row.? - 1, m.body_top + m.body_rows - 1);
 
-    // 24-row drawer: the body keeps its starting row and row budget.
+    // 24-row drawer: context and input each own exactly one cell row.
     const m24 = metrics(22, .chat);
     try std.testing.expectEqual(@as(u32, 4), m24.thread_rows);
     try std.testing.expectEqual(@as(u32, 10), m24.body_top);
-    try std.testing.expectEqual(@as(u32, 11), m24.body_rows);
+    try std.testing.expectEqual(@as(u32, 10), m24.body_rows);
+    try std.testing.expectEqual(@as(u32, 20), m24.context_row.?);
     try std.testing.expectEqual(@as(u32, 21), m24.prompt_row.?);
 
     const changes = metrics(22, .changes);
+    try std.testing.expect(changes.context_row == null);
     try std.testing.expect(changes.prompt_row == null);
     try std.testing.expectEqual(@as(u32, 12), changes.body_rows);
 }
@@ -929,6 +965,11 @@ test "property: rail metrics stay inside the rail for 0..200 rows" {
                 try std.testing.expect(p >= m.body_top);
                 try std.testing.expectEqual(m.rail_rows - 1, p);
                 try std.testing.expect(tab == .chat);
+                const context = m.context_row.?;
+                try std.testing.expectEqual(p - 1, context);
+                try std.testing.expectEqual(context, m.body_top + m.body_rows);
+            } else {
+                try std.testing.expect(m.context_row == null);
             }
         }
     }

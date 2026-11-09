@@ -915,7 +915,23 @@ pub const Preview = struct {
 fn appendNote(alloc: std.mem.Allocator, list: *std.ArrayList(inline_model.DiffLine), comptime fmt: []const u8, args: anytype) !void {
     const text = try std.fmt.allocPrint(alloc, fmt, args);
     errdefer alloc.free(text);
-    try list.append(alloc, .{ .kind = .context, .text = text });
+    try list.append(alloc, .{ .kind = .note, .text = text });
+}
+
+fn appendHunkHeader(alloc: std.mem.Allocator, list: *std.ArrayList(inline_model.DiffLine), hunk: *const Hunk) !void {
+    const info = inline_model.HunkInfo{
+        .old_start = hunk.old_start,
+        .old_count = hunk.old_count,
+        .new_start = hunk.new_start,
+        .new_count = hunk.new_count,
+    };
+    const text = try std.fmt.allocPrint(
+        alloc,
+        "@@ -{d},{d} +{d},{d} @@",
+        .{ info.old_start, info.old_count, info.new_start, info.new_count },
+    );
+    errdefer alloc.free(text);
+    try list.append(alloc, .{ .kind = .hunk, .text = text, .hunk = info });
 }
 
 /// Build the review diff directly from the parsed hunks: a patch already is a
@@ -960,8 +976,11 @@ pub fn buildPreviewWithLimits(
         }
         if (shown_hunks == 0) preview.first_line = first_line;
         preview.last_line = last_line;
+        try appendHunkHeader(alloc, &out, hunk);
         shown_hunks += 1;
 
+        var old_line = hunk.old_start;
+        var new_line = hunk.new_start;
         for (hunk.lines) |line| {
             if (shown_lines >= line_limit) {
                 preview.partial = true;
@@ -972,14 +991,29 @@ pub fn buildPreviewWithLimits(
                 .remove => .removed,
                 .add => .added,
             };
+            const old_coord: ?u32 = if (line.kind == .add) null else old_line;
+            const new_coord: ?u32 = if (line.kind == .remove) null else new_line;
+            const text = try inline_model.dupeDisplayLine(alloc, line.text);
+            errdefer alloc.free(text);
             try out.append(alloc, .{
                 .kind = kind,
-                .text = try inline_model.dupeDisplayLine(alloc, line.text),
+                .text = text,
+                .old_line = old_coord,
+                .new_line = new_coord,
             });
             switch (line.kind) {
-                .remove => preview.removed += 1,
-                .add => preview.added += 1,
-                .context => {},
+                .remove => {
+                    preview.removed += 1;
+                    old_line += 1;
+                },
+                .add => {
+                    preview.added += 1;
+                    new_line += 1;
+                },
+                .context => {
+                    old_line += 1;
+                    new_line += 1;
+                },
             }
             shown_lines += 1;
         }
@@ -1130,6 +1164,82 @@ test "agent_patch: parses and applies a simple single hunk" {
     const new_text = try apply(alloc, &patch, "alpha\nbeta\ngamma\n");
     defer alloc.free(new_text);
     try testing.expectEqualStrings("alpha\nBETA\ngamma\n", new_text);
+}
+
+test "agent_patch: preview carries hunk and one-based old/new coordinates" {
+    const alloc = testing.allocator;
+    var patch = try parse(alloc,
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -10,2 +10,3 @@
+        \\ keep
+        \\-old
+        \\+new
+        \\+extra
+        \\
+    );
+    defer patch.deinit(alloc);
+    const preview = try buildPreview(alloc, &patch);
+    defer {
+        for (preview.lines) |line| alloc.free(line.text);
+        alloc.free(preview.lines);
+    }
+    try testing.expectEqual(@as(usize, 5), preview.lines.len);
+    try testing.expectEqual(inline_model.DiffKind.hunk, preview.lines[0].kind);
+    try testing.expectEqual(@as(u32, 10), preview.lines[0].hunk.?.old_start);
+    try testing.expectEqual(@as(u32, 2), preview.lines[0].hunk.?.old_count);
+    try testing.expectEqual(@as(u32, 3), preview.lines[0].hunk.?.new_count);
+    try testing.expectEqual(@as(?u32, 10), preview.lines[1].old_line);
+    try testing.expectEqual(@as(?u32, 10), preview.lines[1].new_line);
+    try testing.expectEqual(@as(?u32, 11), preview.lines[2].old_line);
+    try testing.expectEqual(@as(?u32, null), preview.lines[2].new_line);
+    try testing.expectEqual(@as(?u32, null), preview.lines[3].old_line);
+    try testing.expectEqual(@as(?u32, 11), preview.lines[3].new_line);
+    try testing.expectEqual(@as(?u32, null), preview.lines[4].old_line);
+    try testing.expectEqual(@as(?u32, 12), preview.lines[4].new_line);
+}
+
+test "agent_patch: pure insertion and deletion previews leave opposite coordinates empty" {
+    const alloc = testing.allocator;
+    var insertion = try parse(alloc,
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -0,0 +1,2 @@
+        \\+first
+        \\+second
+        \\
+    );
+    defer insertion.deinit(alloc);
+    const added = try buildPreview(alloc, &insertion);
+    defer {
+        for (added.lines) |line| alloc.free(line.text);
+        alloc.free(added.lines);
+    }
+    try testing.expectEqual(@as(u32, 0), added.lines[0].hunk.?.old_count);
+    for (added.lines[1..], 0..) |line, i| {
+        try testing.expectEqual(@as(?u32, null), line.old_line);
+        try testing.expectEqual(@as(?u32, @intCast(i + 1)), line.new_line);
+    }
+
+    var deletion = try parse(alloc,
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1,2 +0,0 @@
+        \\-first
+        \\-second
+        \\
+    );
+    defer deletion.deinit(alloc);
+    const removed = try buildPreview(alloc, &deletion);
+    defer {
+        for (removed.lines) |line| alloc.free(line.text);
+        alloc.free(removed.lines);
+    }
+    try testing.expectEqual(@as(u32, 0), removed.lines[0].hunk.?.new_count);
+    for (removed.lines[1..], 0..) |line, i| {
+        try testing.expectEqual(@as(?u32, @intCast(i + 1)), line.old_line);
+        try testing.expectEqual(@as(?u32, null), line.new_line);
+    }
 }
 
 test "agent_patch: multiple hunks in one file apply in order with drift" {

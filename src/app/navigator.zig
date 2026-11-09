@@ -62,8 +62,12 @@ pub fn panelWidth(mode: Mode) u32 {
 
 /// Absolute column where editor content starts for a navigator state.
 pub fn editorCol(active: bool, cols: u32) u32 {
+    return editorColForMode(active, modeForCols(cols));
+}
+
+pub fn editorColForMode(active: bool, mode: Mode) u32 {
     if (!active) return 0;
-    return panelWidth(modeForCols(cols)) + gutter;
+    return panelWidth(mode) + gutter;
 }
 
 /// Position of `tab` in the strip (0-based).

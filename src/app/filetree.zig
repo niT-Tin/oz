@@ -123,7 +123,7 @@ pub fn toggleFiletree(self: *App) !void {
     // Compact mode has no inline list: the explicit navigator entry opens
     // its peek so the focused pane has visible content. Esc returns to the
     // editor and leaves the icon rail.
-    self.navigator_peek = nav_tabs.modeForCols(self.vx.window().width) == .compact;
+    self.navigator_peek = self.navigatorMode() == .compact;
     // Root the tree at the workspace's project root (or the process cwd
     // when none is set). Rebuild when the stored root differs, so opening a
     // file in a different directory switches <leader>e to that directory.
@@ -253,7 +253,7 @@ pub fn locateInFiletree(self: *App) !void {
     }
     self.navigator_tab = .files;
     self.focus = .navigator;
-    self.navigator_peek = nav_tabs.modeForCols(self.vx.window().width) == .compact;
+    self.navigator_peek = self.navigatorMode() == .compact;
     if (self.cur().path) |p| {
         // Reveal the file's ancestors (expanding any folded dirs on the
         // way) and select the matching row.

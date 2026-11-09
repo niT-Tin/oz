@@ -279,7 +279,7 @@ fn freePreview(alloc: std.mem.Allocator, diff: []inline_model.DiffLine) void {
 fn appendNote(alloc: std.mem.Allocator, list: *std.ArrayList(inline_model.DiffLine), comptime fmt: []const u8, args: anytype) !void {
     const text = try std.fmt.allocPrint(alloc, fmt, args);
     errdefer alloc.free(text);
-    try list.append(alloc, .{ .kind = .context, .text = text });
+    try list.append(alloc, .{ .kind = .note, .text = text });
 }
 
 /// Build the bounded review diff. Each changed line range becomes a hunk
@@ -380,7 +380,7 @@ fn buildPreview(
             try region_new.appendSlice(alloc, text[cursor..end_off]);
         }
 
-        const diff = try inline_model.buildDiff(alloc, region_old, region_new.items);
+        const diff = try inline_model.buildDiffAt(alloc, region_old, region_new.items, @intCast(w.first + 1));
         var moved: usize = 0;
         errdefer {
             var j = moved;
@@ -1054,21 +1054,32 @@ test "agent_edit: unique old_string stages a real diff and span replacement" {
     try testing.expect(pending.verify(text));
     try testing.expect(!pending.verify("alpha one\nbeta TWO\ngamma three\n"));
 
-    // The preview is a line diff with context, not a fabricated unified blob.
+    // The preview is a line diff with context and real source coordinates.
     var saw_removed = false;
     var saw_added = false;
+    var saw_hunk = false;
     for (pending.files[0].diff) |d| switch (d.kind) {
         .removed => {
             saw_removed = true;
             try testing.expectEqualStrings("beta two", d.text);
+            try testing.expectEqual(@as(?u32, 2), d.old_line);
+            try testing.expectEqual(@as(?u32, null), d.new_line);
         },
         .added => {
             saw_added = true;
             try testing.expectEqualStrings("BETA TWO", d.text);
+            try testing.expectEqual(@as(?u32, null), d.old_line);
+            try testing.expectEqual(@as(?u32, 2), d.new_line);
         },
-        .context => {},
+        .hunk => {
+            saw_hunk = true;
+            try testing.expectEqual(@as(u32, 1), d.hunk.?.old_start);
+            try testing.expectEqual(@as(u32, 3), d.hunk.?.old_count);
+            try testing.expectEqual(@as(u32, 3), d.hunk.?.new_count);
+        },
+        .context, .note => {},
     };
-    try testing.expect(saw_removed and saw_added);
+    try testing.expect(saw_removed and saw_added and saw_hunk);
 }
 
 test "agent_edit: missing and ambiguous old_string are real errors" {
@@ -1110,16 +1121,31 @@ test "agent_edit: distant occurrences produce multiple hunks with context" {
     var removed: u32 = 0;
     var added: u32 = 0;
     var separators: usize = 0;
+    var hunks: usize = 0;
     for (pending.files[0].diff) |d| switch (d.kind) {
-        .removed => removed += 1,
-        .added => added += 1,
-        .context => if (std.mem.eql(u8, d.text, "…")) {
+        .removed => {
+            removed += 1;
+            try testing.expectEqual(@as(?u32, if (removed == 1) 1 else 22), d.old_line);
+            try testing.expectEqual(@as(?u32, null), d.new_line);
+        },
+        .added => {
+            added += 1;
+            try testing.expectEqual(@as(?u32, null), d.old_line);
+            try testing.expectEqual(@as(?u32, if (added == 1) 1 else 22), d.new_line);
+        },
+        .hunk => {
+            hunks += 1;
+            if (hunks == 2) try testing.expectEqual(@as(u32, 19), d.hunk.?.old_start);
+        },
+        .note => if (std.mem.eql(u8, d.text, "…")) {
             separators += 1;
         },
+        .context => {},
     };
     try testing.expectEqual(@as(u32, 2), removed);
     try testing.expectEqual(@as(u32, 2), added);
     try testing.expectEqual(@as(usize, 1), separators);
+    try testing.expectEqual(@as(usize, 2), hunks);
     try testing.expect(!pending.preview_partial);
 }
 
@@ -1145,7 +1171,7 @@ test "agent_edit: preview is bounded and summarizes omitted occurrences" {
         if (std.mem.indexOf(u8, d.text, "more occurrence(s) not shown") != null) note_found = true;
     }
     try testing.expect(note_found);
-    try testing.expect(pending.files[0].diff.len <= max_preview_lines + max_preview_hunks + 2);
+    try testing.expect(pending.files[0].diff.len <= max_preview_lines + 2 * max_preview_hunks + 2);
 }
 
 test "agent_edit: pending is thread-scoped and one review at a time" {

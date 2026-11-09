@@ -720,7 +720,8 @@ Client = {
 ```
 src/ai/
   sse.zig      增量 SSE 解析（data: 多行、CRLF/LF、[DONE]、任意字节切分）
-  openai.zig   request JSON 构造、delta 解析、API error body 解析
+  openai.zig   request JSON 构造、delta/usage 解析、API error body 解析
+  telemetry.zig 请求阶段、耗时、usage 与上下文占用的纯模型
   context.zig  有界编辑器上下文（路径 / 选区 / 光标窗口，UTF-8 安全截断）
   config.zig   纯环境变量解析（OZ_AI_*）
   client.zig   单条在飞流：后台线程 + Mutex 队列 + 原子取消
@@ -735,11 +736,15 @@ src/app/ai.zig  会话状态 / 键处理 / 请求生命周期 / 渲染
 ### 17.2 Provider 协议
 
 - `POST {OZ_AI_BASE_URL}/chat/completions`，body：
-  `{"model": ..., "stream": true, "messages":[{"role":"system"|"user"|"assistant","content":...}]}`。
-- SSE：只消费 `data:` 行；`[DONE]` 或 `choices[0].finish_reason` 结束；解析 `choices[0].delta.content`；malformed JSON 忽略（不让一条坏 chunk 终止整条流）。
+  `{"model": ..., "stream": true, "stream_options":{"include_usage":true}, "messages":[{"role":"system"|"user"|"assistant","content":...}]}`。
+- SSE：只消费 `data:` 行；解析 `choices[0].delta.content`；malformed JSON 忽略（不让一条坏 chunk 终止整条流）。`finish_reason` 不再提前截断读取：继续到 `[DONE]` 或 EOF，以保留末尾携带 `usage` 的 chunk（DeepSeek 把 usage 放在最后一条 content/finish chunk；部分网关发送 `choices: []` + `usage`）。usage 解析 `prompt_tokens` / `completion_tokens` / `total_tokens`，缺 total 时由前两项相加。
+- 200 响应内的 `{"error":{"message":...}}` 直接转为终止错误（网关常见做法）；流结束仍无 content 且无 tool_calls 时，按 `finish_reason` 显示 `provider returned an empty response (<reason>)`（含 `insufficient_system_resource` / `aborted` / `content_filter`），不把空白响应当成功。
+- HTTP/1.1 chunked 读取：`std.Io.Reader.readVec` 返回 0 只表示它刚把数据填进内部 buffer，不是 EOF；读取循环必须继续，否则真实的 SSE 流会被误判为空。SSE 请求只声明 `identity`，避免 4 KiB transfer buffer 小于 gzip 的 32 KiB 窗口导致解压读取失败。
+- 请求事件区分 `connecting`（DNS/TLS/发送）、`waiting`（请求已 flush，等待响应/首个有效 SSE）与 `streaming`（收到有效 JSON chunk）。每个 thread 保存最近一次请求的 phase、started/finished monotonic ms、估算输入 token 与真实 usage；完成/失败/取消冻结耗时，follow-up 开启新一笔指标。
+- Chat 在 transcript 末尾绘制请求指标：进行时为阶段 + elapsed，等待 15 秒显示 `no response yet`；完成后为 total/in/out tokens。未收到 usage 时仅显示 `ctx ~N tokens · estimate`（请求字节约 4 B/token，包含 JSON/tool schema）；`OZ_AI_CONTEXT_TOKENS` 提供可选正整数窗口，只有配置后才显示 `ctx N%`，不猜 provider 的窗口大小。
 - 非 2xx：优先解析 `{"error":{"message":...}}`，否则用响应体前 8 KiB，面板显示一行 `HTTP <code>: <message>`。
 - TLS：`std.http.Client` + 标准 CA bundle（`rescan`），**不关闭证书校验**。API key 仅存在于 request 头 / 进程内存，不写日志、不落盘。
-- 每帧由 `App.run` 的 `drainAi()` 排空事件；后台 worker 只把 **owned bytes**（job spec / delta / error）跨线程传递，UI 线程永不阻塞。
+- 每帧由 `App.run` 的 `drainAi()` 排空事件；后台 worker 只把 **owned bytes**（job spec / delta / error）或值类型 phase/usage 跨线程传递，UI 线程永不阻塞。
 
 ### 17.3 取消与上下文
 
@@ -1567,3 +1572,34 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 - **选择/复制**：mouse reporting 会接管默认拖选；依赖终端的 Shift 拖选绕过；无法从应用侧强制。
 - **无拖拽**：不做 tab 拖拽、分隔线 resize、文本拖选、右键菜单、双击选词。
 - **pixel 模式**：强制 cell 坐标，不使用像素级 offset（v1 不需要）。
+
+---
+
+## 22. AI workspace 视觉整合与 Agent-focus
+
+本轮以批准的 `.demo/ai-workspace-redesign/` 为方向整合生产 UI；§18 的里程碑记录保留作历史，本节描述当前行为。
+
+### 22.1 视觉层级与全局 chrome
+
+- `src/app/chrome.zig` 统一 `surface / band / card / diff` 语义样式。普通分隔线只用 `win_sep`，accent 留给焦点、活跃 tab、streaming 与待办工作；不再用整行粗 rule 或大面积 accent 制造层级。
+- buffer strip 仍是 label layers + 一行共享区域，但第二行改为真实的 **editor context**：项目相对路径/绝对 fallback、光标位置和既有 `<leader>i` 入口。active buffer 与 editor 共用 surface，inactive tab 留在 band；文字 underline 标识 active，不再另画一条通栏底线。split 的 label layers 只共享 context，不重复显示各 pane 光标。
+- 全局状态带收敛为一行（`status_row_count = 1`）。保留 workspace、模式、行列、branch、路径和右侧 AI 状态；命令/错误/保存反馈优先于路径，transient 消息出现时让出右侧 AI 状态，长文本按 grapheme 裁剪。
+
+### 22.2 Chat、Composer 与 Changes
+
+- Chat 使用独立 `YOU` / `AI · model` header 和全宽正文；普通 prose 在 UTF-8 cell budget 内优先词边界，长单词/CJK hard-wrap， fenced code 保持硬换行与缩进。工具卡、Tools 和 Terminal 复用 band/card，而不是把整栏当浮窗。
+- Composer 的 context 行来自发送请求所用的同一 editor snapshot，显示真实 path、选区或光标行；流式时显示 `Ctrl+c stop`。输入空间不足时隐藏 `Enter send` 辅助提示，优先完整显示正在编辑的内容。
+- Changes 缓存真实 old/new 行号与 hunk metadata。短行可显示双行号，放不下的行自动退回紧凑符号列，保证审批文本不被行号挤掉；宽 Agent-focus 可完整使用双行号。`edit_file` 的第二个及后续 hunk 从实际窗口首行编号，不再重置为 1。
+
+### 22.3 Agent-focus、图标与键盘流
+
+- `Ctrl-w A` 在 Coding rail 与 **Agent-focus** 间切换，不改变 `<leader>a` / `Ctrl-w a`、线程、client 或审批状态。宽终端 Agent-focus 为 **52-cell AI rail + 7-cell Navigator 图标 rail**；100 列沿用 34-cell dock，80 列沿用 drawer，避免为了视觉侵占正文。
+- 进入时必要时打开 Navigator，退出恢复之前的 full/hidden 状态；compact rail 继续显示 `src/icons.zig` 的 Files/Notes/Agents Nerd Font glyph，文件类型与 buffer 图标不退化成字母。
+- `<leader>j` 的 qutebrowser hints、定长 `asdfghjkl` 标签、前缀/Backspace/Esc、prompt 隔离和 mouse/hint rect 保持同一实现。布局切换只改几何，不新增第二套导航或审批路径。
+
+### 22.4 性能与验证
+
+- diff/LCS 仍只在生成或 stage 时计算，普通帧只画缓存行；chart 按 thread/metrics revision/尺寸缓存。Agent-focus 的文件树加载只发生在显式进入时，不在 render 中增加全文件扫描、文件 IO 或 idle redraw。动态标签继续使用 frame arena。
+- 纯模型覆盖 rail 三档宽度、Agent-focus、metrics、UTF-8 wrap；PTY 覆盖 Coding/Agent-focus 往返、图标、hints、流式、审批和鼠标。goldens 包含 `ai-dock-120x30`、`ai-dock-100x30`、`ai-drawer-80x24`、`ai-focus-120x30`，使用稳定 fixture 路径，连续运行不会因 PID 改变而漂移。
+- 请求 telemetry 另有 usage-only chunk、阶段/耗时/上下文纯模型与 DeepSeek-shaped PTY 断言；四张 AI golden 固定 `<1s` 的完成态与估算上下文行，窄屏不截断关键指标。
+- 当前套件：**581 unit / 220 e2e**，最终以 `./tools/verify.sh` 的记录为准。

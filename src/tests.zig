@@ -62,6 +62,7 @@ pub const chart = @import("chart.zig");
 // M1 AI chat (pure modules; app/ai.zig is exercised by e2e)
 pub const ai_sse = @import("ai/sse.zig");
 pub const ai_openai = @import("ai/openai.zig");
+pub const ai_telemetry = @import("ai/telemetry.zig");
 pub const ai_context = @import("ai/context.zig");
 pub const ai_config = @import("ai/config.zig");
 pub const ai_client = @import("ai/client.zig");

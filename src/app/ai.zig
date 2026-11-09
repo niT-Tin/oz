@@ -98,6 +98,8 @@ pub const Session = struct {
     tool_jobs: std.ArrayList(?*tool_job.Job) = .empty,
     chart_cache: ChartCache = .{},
     rail_open: bool = false,
+    agent_focus: bool = false,
+    focus_restore_filetree: ?bool = null,
     focus: Focus = .editor,
     tab: WorkboxTab = .chat,
     /// Thread-list cursor (may differ from `threads.active` until Enter).
@@ -137,7 +139,7 @@ fn setToolNote(self: *App, idx: usize, text: []const u8) void {
 /// never draws over editor cells (and drawer mode keeps the editor full
 /// width underneath).
 pub fn aiLayout(self: *App) ws.Layout {
-    return ws.layout(self.vx.window().width, self.ai.rail_open);
+    return ws.layoutMode(self.vx.window().width, self.ai.rail_open, self.ai.agent_focus);
 }
 
 pub fn aiEditorWidth(self: *App) u32 {
@@ -167,6 +169,7 @@ fn cancelClient(self: *App, idx: usize) void {
     }
     if (idx < self.ai.threads.items.items.len) {
         self.ai.threads.cancelRunningTools(idx);
+        self.ai.threads.items.items[idx].request.finish(self.nowMs());
     }
 }
 
@@ -229,6 +232,43 @@ fn ensureThreadVisible(self: *App) void {
     }
 }
 
+pub fn clearAgentFocus(self: *App, restore_navigator: bool) void {
+    const hide_auto_navigator = restore_navigator and
+        (self.ai.focus_restore_filetree orelse true) == false;
+    self.ai.agent_focus = false;
+    self.ai.focus_restore_filetree = null;
+    if (hide_auto_navigator) {
+        self.filetree_active = false;
+        self.focus = .buffer;
+        self.navigator_peek = false;
+    }
+}
+
+/// `Ctrl-w A`: switch between the coding rail and Agent-focus. The wide
+/// focus layout pairs a 52-cell rail with the existing Nerd Font icon rail;
+/// entering and leaving never creates a second thread or provider client.
+pub fn toggleAiFocus(self: *App) !void {
+    try ensureAi(self);
+    self.navigator_peek = false;
+    self.pending_window = false;
+    self.pending_replace = null;
+    self.ai.rail_pending_leader = false;
+    if (self.ai.agent_focus) {
+        clearAgentFocus(self, true);
+    } else {
+        self.ai.focus_restore_filetree = self.filetree_active;
+        if (!self.filetree_active) try self.toggleFiletree();
+        self.ai.agent_focus = true;
+        self.focus = .buffer;
+    }
+    self.ai.rail_open = true;
+    self.ai.focus = .prompt;
+    self.ai.tab = .chat;
+    self.ai.thread_cursor = self.ai.threads.active;
+    ensureThreadVisible(self);
+    aiLoadConfig(self) catch {};
+}
+
 /// `<leader>a`: toggle the rail. Opening focuses the prompt; closing returns
 /// focus to the editor. See `ai.workspace.toggleRail` for the policy.
 pub fn toggleAiPanel(self: *App) !void {
@@ -252,6 +292,8 @@ pub fn toggleAiPanel(self: *App) !void {
             self.alloc.free(m);
             self.msg = null;
         }
+    } else {
+        clearAgentFocus(self, true);
     }
 }
 
@@ -277,6 +319,7 @@ fn aiLeaveRail(self: *App) void {
     const state = ws.leaveRail(self.ai.rail_open, self.ai.focus, narrow);
     self.ai.rail_open = state.open;
     self.ai.focus = state.focus;
+    if (!state.open) clearAgentFocus(self, true);
 }
 
 /// Append a new thread, cancel the previously active stream (switching
@@ -707,6 +750,7 @@ fn startThreadRequest(self: *App, idx: usize, plan: *RequestPlan) !void {
         return error.StartFailed;
     };
     self.ai.threads.markStreaming(self.alloc, idx);
+    self.ai.threads.items.items[idx].request.begin(self.nowMs(), plan.body.len);
     if (toolState(self, idx)) |st| {
         st.stream_done = false;
         st.active = false;
@@ -833,6 +877,40 @@ fn stopToolLoop(self: *App, idx: usize, reason: agent.LimitReason) void {
     st.final_only = true;
 }
 
+const EditorContextSnapshot = struct {
+    path: ?[]const u8,
+    cursor: u32,
+    selection: ?ai.context.Selection,
+};
+
+/// Capture the exact editor state used both by the composer label and aiSend.
+fn editorContextSnapshot(self: *App) EditorContextSnapshot {
+    var selection: ?ai.context.Selection = null;
+    if (self.isVisual()) {
+        if (self.visual_anchor) |anchor| {
+            const pt = &self.cur().pt;
+            const cursor = self.curCursor().*;
+            var start = @min(anchor, cursor);
+            var end = @max(anchor, cursor);
+            if (self.state.mode == .visual_line) {
+                const first = pt.lineOf(start);
+                const last = pt.lineOf(end);
+                start = pt.lineStart(first);
+                end = pt.lineStart(last) + pt.lineLen(last);
+                if (end < pt.len()) end += 1;
+            } else {
+                end = @min(end + self.charLenAt(pt, end), pt.len());
+            }
+            selection = .{ .start = start, .end = end };
+        }
+    }
+    return .{
+        .path = self.cur().path,
+        .cursor = self.curCursor().*,
+        .selection = selection,
+    };
+}
+
 pub fn aiSend(self: *App) !void {
     if (self.ai.threads.items.items.len == 0) return;
     const idx = self.ai.threads.active;
@@ -860,32 +938,14 @@ pub fn aiSend(self: *App) !void {
     }
 
     // Editor context: file path + selection or a cursor window (bounded).
+    const snapshot = editorContextSnapshot(self);
     const text = try self.curText();
     defer self.alloc.free(text);
-    var selection: ?ai.context.Selection = null;
-    if (self.isVisual()) {
-        if (self.visual_anchor) |anchor| {
-            const pt = &self.cur().pt;
-            const cursor = self.curCursor().*;
-            var start = @min(anchor, cursor);
-            var end = @max(anchor, cursor);
-            if (self.state.mode == .visual_line) {
-                const first = pt.lineOf(start);
-                const last = pt.lineOf(end);
-                start = pt.lineStart(first);
-                end = pt.lineStart(last) + pt.lineLen(last);
-                if (end < pt.len()) end += 1;
-            } else {
-                end = @min(end + self.charLenAt(pt, end), pt.len());
-            }
-            selection = .{ .start = start, .end = end };
-        }
-    }
     const context = try ai.context.build(self.alloc, .{
-        .path = self.cur().path,
+        .path = snapshot.path,
         .text = text,
-        .cursor = self.curCursor().*,
-        .selection = selection,
+        .cursor = snapshot.cursor,
+        .selection = snapshot.selection,
     }, .{});
     defer self.alloc.free(context);
 
@@ -1380,6 +1440,14 @@ pub fn drainAi(self: *App) !bool {
         while (client.pop()) |ev| {
             changed = true;
             switch (ev) {
+                .phase => |phase| {
+                    if (t.cancel_requested) continue;
+                    t.request.setPhase(phase);
+                },
+                .usage => |usage| {
+                    if (t.cancel_requested) continue;
+                    t.request.usage = usage;
+                },
                 .delta => |text| {
                     defer self.alloc.free(text);
                     if (t.cancel_requested) continue;
@@ -1418,6 +1486,7 @@ pub fn drainAi(self: *App) !bool {
         if (saw_terminal) {
             // The worker pushes its terminal event last; join so a follow-up
             // can reuse the client immediately (no Busy race).
+            t.request.finish(self.nowMs());
             client.joinAfterTerminal();
             const st = toolState(self, idx);
             if (st) |s| s.stream_done = true;
@@ -1443,6 +1512,7 @@ pub fn drainAi(self: *App) !bool {
         const st = toolState(self, idx);
         const waiting_tools = if (st) |s| s.active or s.pending_followup else false;
         if (t.status == .streaming and !waiting_tools and !client.isRunning() and !client.hasEvents()) {
+            t.request.finish(self.nowMs());
             self.ai.threads.fail(self.alloc, idx, "stream ended unexpectedly");
             changed = true;
         }
@@ -1481,6 +1551,7 @@ pub fn aiStatusTextMini(self: *App, a: std.mem.Allocator) !?[]const u8 {
 const Row = struct {
     segs: std.ArrayList(vaxis.Segment) = .empty,
     cells: u32 = 0,
+    bg: ?vaxis.Color = null,
 };
 
 const Styles = struct {
@@ -1496,6 +1567,8 @@ const Styles = struct {
     error_style: vaxis.Style,
     warn: vaxis.Style,
     border: vaxis.Style,
+    card_bg: vaxis.Color,
+    band_bg: vaxis.Color,
     /// Raw palette endpoints for streaming/running pulses. Kept beside the
     /// prebuilt styles so animated elements share the theme mapping (no
     /// second color table that can drift).
@@ -1503,8 +1576,14 @@ const Styles = struct {
     pulse_b: theme.Rgb,
 };
 
-/// Wraps styled segments into fixed-width rows, repeating a continuation
-/// prefix on every wrapped row (so transcript labels stay aligned).
+fn styleOn(style: vaxis.Style, bg: vaxis.Color) vaxis.Style {
+    var out = style;
+    out.bg = bg;
+    return out;
+}
+
+/// Wraps styled segments into fixed-width rows. Prose uses word-aware wraps;
+/// fenced code keeps hard cell wrapping so indentation remains meaningful.
 const Assembler = struct {
     a: std.mem.Allocator,
     rows: *std.ArrayList(Row),
@@ -1540,7 +1619,7 @@ const Assembler = struct {
         self.started = false;
     }
 
-    fn addStyleSeg(self: *Assembler, text: []const u8, style: vaxis.Style) !void {
+    fn addSeg(self: *Assembler, text: []const u8, style: vaxis.Style, word_wrap: bool) !void {
         var rest = text;
         while (rest.len > 0) {
             if (!self.started) try self.beginCont();
@@ -1549,24 +1628,40 @@ const Assembler = struct {
                 try self.flush();
                 continue;
             }
-            var take = buffer.utf8.truncateWidth(rest, avail);
-            if (take.len == 0) {
-                // A wide glyph did not fit in the leftover cells: wrap when
-                // this row has content, otherwise emit it (rail too narrow).
+            const fit = if (word_wrap)
+                buffer.utf8.wrapPrefix(rest, avail)
+            else
+                buffer.utf8.WrapFit{
+                    .take = buffer.utf8.truncateWidth(rest, avail).len,
+                    .consumed = buffer.utf8.truncateWidth(rest, avail).len,
+                    .wrap = buffer.utf8.displayWidth(rest) > avail,
+                };
+            if (fit.take == 0) {
                 if (self.cur.cells > self.cont_cells) {
                     try self.flush();
                     continue;
                 }
+                // A wide glyph cannot fit even on an empty, extremely narrow
+                // row. Drop it rather than spilling into the rail border.
                 const d = buffer.utf8.decodeAt(rest, 0);
-                const n = if (d.len == 0) @min(rest.len, 1) else @min(@as(usize, d.len), rest.len);
-                take = rest[0..n];
+                const n = @min(@as(usize, d.len), rest.len);
+                rest = rest[@max(n, 1)..];
+                continue;
             }
-            if (take.len == 0) break;
+            const take = rest[0..fit.take];
             try self.cur.segs.append(self.a, .{ .text = take, .style = style });
             self.cur.cells += buffer.utf8.displayWidth(take);
-            rest = rest[take.len..];
-            if (rest.len > 0) try self.flush();
+            rest = rest[fit.consumed..];
+            if (fit.wrap) try self.flush();
         }
+    }
+
+    fn addStyleSeg(self: *Assembler, text: []const u8, style: vaxis.Style) !void {
+        return self.addSeg(text, style, true);
+    }
+
+    fn addCodeSeg(self: *Assembler, text: []const u8, style: vaxis.Style) !void {
+        return self.addSeg(text, style, false);
     }
 
     fn newline(self: *Assembler) !void {
@@ -1697,26 +1792,30 @@ fn appendMessageRows(
     st: Styles,
     inner_w: u32,
     role: Role,
+    model: []const u8,
     text: []const u8,
 ) !void {
-    const label: []const u8 = if (role == .user) " you› " else " ai› ";
+    const label = if (role == .user)
+        "YOU"
+    else
+        try std.fmt.allocPrint(a, "AI · {s}", .{model});
     const label_style = if (role == .user) st.label_user else st.label_ai;
-    const label_width: u32 = buffer.utf8.displayWidth(label);
-
-    const first_prefix = try a.alloc(vaxis.Segment, 1);
-    first_prefix[0] = .{ .text = label, .style = label_style };
-    const cont = try spaces(a, label_width);
-    const cont_prefix = try a.alloc(vaxis.Segment, 1);
-    cont_prefix[0] = .{ .text = cont, .style = .{ .bg = st.base.bg } };
+    const label_fit = buffer.utf8.truncateWidth(label, inner_w);
+    var header = Row{};
+    if (label_fit.len > 0) {
+        try header.segs.append(a, .{ .text = label_fit, .style = label_style });
+        header.cells = buffer.utf8.displayWidth(label_fit);
+    }
+    try rows.append(a, header);
 
     var wrap = Assembler{
         .a = a,
         .rows = rows,
         .inner_w = inner_w,
-        .first_prefix = first_prefix,
-        .first_cells = label_width,
-        .cont_prefix = cont_prefix,
-        .cont_cells = label_width,
+        .first_prefix = &[_]vaxis.Segment{},
+        .first_cells = 0,
+        .cont_prefix = &[_]vaxis.Segment{},
+        .cont_cells = 0,
     };
     try wrap.beginFirst();
 
@@ -1732,8 +1831,8 @@ fn appendMessageRows(
         }
         const safe_line = try displaySafe(a, line);
         if (in_fence) {
-            try wrap.addStyleSeg("  ", st.base);
-            try wrap.addStyleSeg(safe_line, st.code);
+            try wrap.addCodeSeg("  ", st.base);
+            try wrap.addCodeSeg(safe_line, st.code);
             try wrap.newline();
         } else {
             var segs = std.ArrayList(vaxis.Segment).empty;
@@ -1756,16 +1855,17 @@ fn appendCardRow(
     a: std.mem.Allocator,
     rows: *std.ArrayList(Row),
     inner_w: u32,
+    bg: vaxis.Color,
     segs: []const vaxis.Segment,
 ) !void {
-    var row = Row{};
+    var row = Row{ .bg = bg };
     var remaining = inner_w;
     for (segs) |seg| {
         if (remaining == 0) break;
         const fit = buffer.utf8.truncateWidth(seg.text, remaining);
         if (fit.len == 0) continue;
         const cells = buffer.utf8.displayWidth(fit);
-        try row.segs.append(a, .{ .text = fit, .style = seg.style });
+        try row.segs.append(a, .{ .text = fit, .style = styleOn(seg.style, bg) });
         row.cells += cells;
         remaining -|= cells;
     }
@@ -1874,7 +1974,7 @@ fn appendToolCardRows(
             }
         }
     }
-    try appendCardRow(a, rows, inner_w, header.items);
+    try appendCardRow(a, rows, inner_w, st.card_bg, header.items);
 
     if (args.len > 0) {
         const args_safe = try displaySafe(a, args);
@@ -1890,10 +1990,10 @@ fn appendToolCardRows(
                 try std.fmt.allocPrint(a, "  {s}…", .{shown})
             else
                 try std.fmt.allocPrint(a, "  {s}", .{args_safe});
-            try appendCardRow(a, rows, inner_w, &.{.{ .text = line, .style = st.dim }});
+            try appendCardRow(a, rows, inner_w, st.card_bg, &.{.{ .text = line, .style = st.dim }});
         } else {
             const line = try std.fmt.allocPrint(a, "  {s}", .{args_safe});
-            try appendCardRow(a, rows, inner_w, &.{.{ .text = line, .style = st.dim }});
+            try appendCardRow(a, rows, inner_w, st.card_bg, &.{.{ .text = line, .style = st.dim }});
         }
     }
 
@@ -1902,45 +2002,45 @@ fn appendToolCardRows(
             if (msg.text.len > 0) {
                 const safe = try displaySafe(a, msg.text);
                 const line = try std.fmt.allocPrint(a, "  {s}", .{safe});
-                try appendCardRow(a, rows, inner_w, &.{.{ .text = line, .style = st.warn }});
+                try appendCardRow(a, rows, inner_w, st.card_bg, &.{.{ .text = line, .style = st.warn }});
             } else {
-                try appendCardRow(a, rows, inner_w, &.{.{ .text = "  staged — review in Changes", .style = st.warn }});
+                try appendCardRow(a, rows, inner_w, st.card_bg, &.{.{ .text = "  staged — review in Changes", .style = st.warn }});
             }
         },
         .approved => {
             if (msg.text.len > 0) {
                 const safe = try displaySafe(a, msg.text);
                 const line = try std.fmt.allocPrint(a, "  {s}", .{safe});
-                try appendCardRow(a, rows, inner_w, &.{.{ .text = line, .style = st.code }});
+                try appendCardRow(a, rows, inner_w, st.card_bg, &.{.{ .text = line, .style = st.code }});
             }
         },
         .rejected => {
             if (msg.text.len > 0) {
                 const safe = try displaySafe(a, msg.text);
                 const line = try std.fmt.allocPrint(a, "  {s}", .{safe});
-                try appendCardRow(a, rows, inner_w, &.{.{ .text = line, .style = st.error_style }});
+                try appendCardRow(a, rows, inner_w, st.card_bg, &.{.{ .text = line, .style = st.error_style }});
             }
         },
         .unsupported => {
             if (msg.text.len > 0) {
                 const safe = try displaySafe(a, msg.text);
                 const line = try std.fmt.allocPrint(a, "  {s}", .{safe});
-                try appendCardRow(a, rows, inner_w, &.{.{ .text = line, .style = st.faint }});
+                try appendCardRow(a, rows, inner_w, st.card_bg, &.{.{ .text = line, .style = st.faint }});
             } else {
-                try appendCardRow(a, rows, inner_w, &.{.{ .text = "  not executed", .style = st.faint }});
+                try appendCardRow(a, rows, inner_w, st.card_bg, &.{.{ .text = "  not executed", .style = st.faint }});
             }
         },
         .cancelled => {
-            try appendCardRow(a, rows, inner_w, &.{.{ .text = "  stopped (no result applied)", .style = st.faint }});
+            try appendCardRow(a, rows, inner_w, st.card_bg, &.{.{ .text = "  stopped (no result applied)", .style = st.faint }});
         },
         .running => {
-            try appendCardRow(a, rows, inner_w, &.{.{ .text = "  ⋯ working", .style = st.faint }});
+            try appendCardRow(a, rows, inner_w, st.card_bg, &.{.{ .text = "  ⋯ working", .style = st.faint }});
         },
         .ok, .err, .none => {
             if (msg.text.len > 0) {
                 const safe = try displaySafe(a, msg.text);
                 const line = try std.fmt.allocPrint(a, "  ↳ {s}", .{safe});
-                try appendCardRow(a, rows, inner_w, &.{.{ .text = line, .style = if (status == .err) st.error_style else st.code }});
+                try appendCardRow(a, rows, inner_w, st.card_bg, &.{.{ .text = line, .style = if (status == .err) st.error_style else st.code }});
             }
         },
     }
@@ -1952,10 +2052,10 @@ fn appendToolCardRows(
         while (i < view.count) : (i += 1) {
             const safe = try displaySafe(a, line_buf[i]);
             const line = try std.fmt.allocPrint(a, "  │ {s}", .{safe});
-            try appendCardRow(a, rows, inner_w, &.{.{ .text = line, .style = st.faint }});
+            try appendCardRow(a, rows, inner_w, st.card_bg, &.{.{ .text = line, .style = st.faint }});
         }
         if (view.more) {
-            try appendCardRow(a, rows, inner_w, &.{.{ .text = "  …", .style = st.faint }});
+            try appendCardRow(a, rows, inner_w, st.card_bg, &.{.{ .text = "  …", .style = st.faint }});
         }
     }
 
@@ -2014,7 +2114,15 @@ fn aiStatusLabelFor(self: *App, idx: usize) []const u8 {
         if (toolState(self, idx)) |st| {
             if (st.active or st.pending_followup) return "tools…";
         }
-        return self.ai.threads.items.items[idx].statusLabel();
+        const t = &self.ai.threads.items.items[idx];
+        if (t.status == .streaming) {
+            return switch (t.request.phase) {
+                .connecting => "connecting…",
+                .waiting => "waiting…",
+                .idle, .streaming => "streaming…",
+            };
+        }
+        return t.statusLabel();
     }
     return "idle";
 }
@@ -2116,7 +2224,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
             });
         }
     }
-    const rail_bg = vaxis.Color{ .rgb = t.bg_float };
+    const rail_bg = vaxis.Color{ .rgb = t.bg };
     const content_w = w -| 3;
     const focused = self.ai.focus != .editor;
     // The left rule is the rail's hard boundary: the theme's active window
@@ -2131,8 +2239,8 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
     self.addMouseScrollTarget(m.thread_top, x, w, m.thread_rows, .ai_threads);
     if (m.body_rows > 0) self.addMouseScrollTarget(m.body_top, x, w, m.body_rows, .ai_workbox);
 
-    // Solid bg first: every rail cell (including the border/padding) is
-    // bg_float, so cell-exactness tests can sample anywhere inside it.
+    // Paint the base once; band/card renderers layer theme-derived surfaces
+    // over it without changing the rail's cell geometry.
     const panel = win.child(.{
         .x_off = @intCast(x),
         .y_off = 0,
@@ -2154,6 +2262,8 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         .error_style = .{ .fg = .{ .rgb = t.diag_error }, .bg = rail_bg },
         .warn = .{ .fg = .{ .rgb = t.diag_warn }, .bg = rail_bg },
         .border = border_style,
+        .card_bg = .{ .rgb = t.bg_alt },
+        .band_bg = .{ .rgb = t.bg_status },
         .pulse_a = t.accent,
         .pulse_b = t.accent_alt,
     };
@@ -2171,11 +2281,9 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
 
     // ---- header band: AGENTS  N  [+] ----
     {
-        // A full-width header band separates the rail from the editor even
-        // when the rail does not own the keyboard; the count is a separate
-        // token so `AGENTS 1` is readable (and no decorative glyph is
-        // required).
-        const header_bg = vaxis.Color{ .rgb = t.bg_status };
+        // The existing Nerd Font agents icon and a quiet count identify the
+        // section; the only action in the band is the real new-thread target.
+        const header_bg = st.band_bg;
         const header_border_style = chrome.panelBorderStyle(t, focused, header_bg);
         const header_label_style = vaxis.Style{
             .fg = .{ .rgb = if (focused) t.accent else t.fg },
@@ -2185,14 +2293,15 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         const header_dim_style = vaxis.Style{ .fg = .{ .rgb = t.fg_dim }, .bg = header_bg };
         const header_base_style = vaxis.Style{ .fg = .{ .rgb = t.fg }, .bg = header_bg };
         var segs = std.ArrayList(vaxis.Segment).empty;
-        try segs.append(a, .{ .text = "AGENTS", .style = header_label_style });
+        const heading = " AGENTS";
+        try segs.append(a, .{ .text = heading, .style = header_label_style });
         try segs.append(a, .{ .text = "  ", .style = header_base_style });
         // vaxis cells reference this slice until vx.render(), after
         // drawAiRail has returned — the frame arena owns it like every
         // other label on the rail.
         const count = try std.fmt.allocPrint(a, "{d}", .{self.ai.threads.items.items.len});
         try segs.append(a, .{ .text = count, .style = header_dim_style });
-        var used: u32 = 6 + 2 + @as(u32, @intCast(count.len));
+        var used: u32 = buffer.utf8.displayWidth(heading) + 2 + @as(u32, @intCast(count.len));
         // right-aligned "+" affordance (n / + also work from the rail).
         if (content_w >= used + 2) {
             try segs.append(a, .{ .text = try spaces(a, content_w - used - 1), .style = .{ .bg = header_bg } });
@@ -2213,17 +2322,9 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
     // ---- workspace group ----
     {
         var segs = std.ArrayList(vaxis.Segment).empty;
-        const ws_name = self.curWsName();
-        const suffix = " / workspace";
-        const suffix_w: u32 = @intCast(autil.cellWidth(win, suffix));
-        const ws_fit = autil.cellFitPrefix(win, ws_name, content_w -| suffix_w);
-        try segs.append(a, .{ .text = ws_fit.slice, .style = st.dim });
-        var used: u32 = @intCast(ws_fit.cells);
-        if (content_w >= used + suffix_w) {
-            try segs.append(a, .{ .text = suffix, .style = st.faint });
-            used += suffix_w;
-        }
-        try drawRailRow(win, a, m.group_row, x, w, "│", border_style, rail_bg, segs.items, used);
+        const ws_fit = autil.cellFitPrefix(win, self.curWsName(), content_w);
+        try segs.append(a, .{ .text = ws_fit.slice, .style = st.faint });
+        try drawRailRow(win, a, m.group_row, x, w, "│", border_style, rail_bg, segs.items, @intCast(ws_fit.cells));
     }
 
     if (self.ai.thread_cursor >= self.ai.threads.items.items.len) {
@@ -2240,6 +2341,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         }
     }
 
+    const muted_sel = chrome.mutedSelectionColor(t);
     var cursor_row: ?u32 = null;
     var vis: u32 = 0;
     while (vis < m.thread_rows) : (vis += 1) {
@@ -2253,7 +2355,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         const selected = ti == self.ai.thread_cursor;
         const attached = ti == active_idx;
         const highlight = (self.ai.focus == .rail and selected) or (self.ai.focus == .prompt and attached);
-        const row_bg: vaxis.Color = if (highlight) .{ .rgb = t.bg_sel } else rail_bg;
+        const row_bg: vaxis.Color = if (highlight) muted_sel else rail_bg;
         const title_style: vaxis.Style = .{
             .fg = .{ .rgb = if (attached) t.fg else t.fg_dim },
             .bg = row_bg,
@@ -2301,23 +2403,17 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         }
     }
 
-    // ---- divider: thread list | workbox ----
-    {
-        var rule = std.ArrayList(u8).empty;
-        var rc: u32 = 0;
-        while (rc < content_w) : (rc += 1) try rule.appendSlice(a, "─");
-        var segs = std.ArrayList(vaxis.Segment).empty;
-        try segs.append(a, .{ .text = rule.items, .style = chrome.separatorStyle(t, .major, rail_bg) });
-        try drawRailRow(win, a, m.divider_row, x, w, "├", border_style, rail_bg, segs.items, content_w);
-    }
+    // ---- band transition: thread list | workbox ----
+    try drawRailRow(win, a, m.divider_row, x, w, "│", border_style, rail_bg, &.{}, 0);
 
     // ---- workbox header: thread · status, model right ----
     {
+        const band_border = chrome.panelBorderStyle(t, focused, st.band_bg);
         var segs = std.ArrayList(vaxis.Segment).empty;
-        try segs.append(a, .{ .text = active.title, .style = st.bold });
-        try segs.append(a, .{ .text = " · ", .style = st.dim });
+        try segs.append(a, .{ .text = active.title, .style = styleOn(st.bold, st.band_bg) });
+        try segs.append(a, .{ .text = " · ", .style = styleOn(st.dim, st.band_bg) });
         const active_status_label = aiStatusLabelFor(self, active_idx);
-        try segs.append(a, .{ .text = active_status_label, .style = railStatusStyle(st, active.status, self.frame_now_ms) });
+        try segs.append(a, .{ .text = active_status_label, .style = styleOn(railStatusStyle(st, active.status, self.frame_now_ms), st.band_bg) });
         var used: u32 = @intCast(autil.cellWidth(win, active.title) + 3 + autil.cellWidth(win, active_status_label));
         const model: []const u8 = if (self.ai.config) |cfg| cfg.model else ai.config.default_model;
         const mw = autil.cellWidth(win, model);
@@ -2326,16 +2422,16 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
             if (fit.cells > 0) {
                 try segs.append(a, .{ .text = try spaces(a, content_w -| used -| @as(u32, @intCast(fit.cells))), .style = .{
                     .fg = .{ .rgb = t.fg_faint },
-                    .bg = rail_bg,
+                    .bg = st.band_bg,
                 } });
-                try segs.append(a, .{ .text = fit.slice, .style = st.faint });
+                try segs.append(a, .{ .text = fit.slice, .style = styleOn(st.faint, st.band_bg) });
                 used += @as(u32, @intCast(fit.cells));
             }
         }
-        try drawRailRow(win, a, m.workbox_header_row, x, w, "│", border_style, rail_bg, segs.items, used);
+        try drawRailRow(win, a, m.workbox_header_row, x, w, "│", band_border, st.band_bg, segs.items, used);
     }
 
-    // ---- tabs: >chat │ changes N │ tools │ terminal ----
+    // ---- tabs: >chat  changes N  tools  terminal ----
     // Observe the real pending count once per frame. A change starts a
     // short, explicitly-deadlined flash on the Changes label; the run loop
     // polls only while `reviewFlashActive` is true, so an idle rail burns
@@ -2355,12 +2451,11 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
     );
 
     // The active tab carries a `>` marker on the soft selection background,
-    // `fg` bold text and an accent_alt underline; the shared chrome helper
-    // keeps it identical to the navigator and buffer tabs. `│`
-    // separators keep the four targets from reading as one label; the
-    // compact labels leave room for the badge at 34-cell rail widths.
+    // `fg` bold text and an accent_alt underline. Plain spacing replaces the
+    // old vertical separators while every target keeps its exact hit cells.
     {
-        const changes_label = try std.fmt.allocPrint(a, "changes {d}", .{self.reviewPendingCount()});
+        const band_border = chrome.panelBorderStyle(t, focused, st.band_bg);
+        const changes_label = try std.fmt.allocPrint(a, "changes {d}", .{pending_now});
         const Tabs = [_]struct { tab: WorkboxTab, label: []const u8 }{
             .{ .tab = .chat, .label = "chat" },
             .{ .tab = .changes, .label = changes_label },
@@ -2369,48 +2464,41 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         };
         var segs = std.ArrayList(vaxis.Segment).empty;
         var used: u32 = 0;
-        // 38-cell rail (content 35): spend the extra cells on separator
-        // breathing room. The first rule keeps its space on the right so the
-        // active `>` marker + all four labels still fit 35 cells; 34-cell
-        // rails (100 dock / 80 drawer) keep the compact 30-cell row.
-        const spaced = content_w >= 35;
+        const gap_cells: u32 = if (content_w >= 33) 2 else 1;
         for (Tabs, 0..) |entry, i| {
             const active_tab = self.ai.tab == entry.tab;
             const label_cells: u32 = @intCast(autil.cellWidth(win, entry.label));
             const marker_cells: u32 = if (active_tab) 1 else 0;
-            const sep_cells: u32 = if (i == 0) 0 else if (spaced) (if (i == 1) 2 else 3) else 1;
+            const sep_cells: u32 = if (i == 0) 0 else gap_cells;
             // Extremely narrow rails omit trailing tabs instead of running
             // past the border; all tabs fit at the supported 34/38 widths.
             if (used + sep_cells + marker_cells + label_cells > content_w) break;
             if (i > 0) {
-                const sep_text = if (spaced) (if (i == 1) "│ " else " │ ") else "│";
-                try segs.append(a, .{ .text = sep_text, .style = chrome.separatorStyle(t, .minor, rail_bg) });
+                try segs.append(a, .{ .text = try spaces(a, sep_cells), .style = .{ .bg = st.band_bg } });
                 used += sep_cells;
             }
+            const sel_bg = chrome.mutedSelectionColor(t);
             var style: vaxis.Style = if (active_tab)
                 chrome.activeTabStyle(t)
             else
-                chrome.inactiveTabStyle(t, rail_bg);
+                chrome.inactiveTabStyle(t, st.band_bg);
+            if (active_tab) style.bg = sel_bg;
             if (entry.tab == .changes and badge_flashing) {
                 style.fg = .{ .rgb = animation.pulseColor(t.accent, t.accent_alt, self.frame_now_ms, 300) };
                 style.bold = true;
             }
             if (entry.tab == .terminal and app_agent_terminal.pendingCount(self) > 0) {
-                // No extra label cells (the 34/38-cell tab row is exactly
-                // full); a warning-tinted label marks the approval instead.
                 style.fg = .{ .rgb = t.diag_warn };
                 style.bold = true;
             }
             const target_col = x + 2 + used;
             if (active_tab) {
-                // The marker shares the tab's soft selection + accent
-                // underline, so marker + label read as one selected tab.
-                try segs.append(a, .{ .text = ">", .style = chrome.activeTabMarkerStyle(t) });
+                var marker_style = chrome.activeTabMarkerStyle(t);
+                marker_style.bg = sel_bg;
+                try segs.append(a, .{ .text = ">", .style = marker_style });
                 used += 1;
             }
             if (self.mouseTargetsCollecting()) {
-                // The active tab's `>` marker belongs to the same target as
-                // its label (the label overlay covers the marker).
                 self.addHintTarget(.{
                     .row = m.tabs_row,
                     .col = target_col,
@@ -2421,18 +2509,11 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
             try segs.append(a, .{ .text = entry.label, .style = style });
             used += label_cells;
         }
-        try drawRailRow(win, a, m.tabs_row, x, w, "│", border_style, rail_bg, segs.items, used);
+        try drawRailRow(win, a, m.tabs_row, x, w, "│", band_border, st.band_bg, segs.items, used);
     }
 
-    // ---- rule: tab strip | body ----
-    {
-        var rule = std.ArrayList(u8).empty;
-        var rc: u32 = 0;
-        while (rc < content_w) : (rc += 1) try rule.appendSlice(a, "─");
-        var segs = std.ArrayList(vaxis.Segment).empty;
-        try segs.append(a, .{ .text = rule.items, .style = chrome.separatorStyle(t, .major, rail_bg) });
-        try drawRailRow(win, a, m.tabs_sep_row, x, w, "├", border_style, rail_bg, segs.items, content_w);
-    }
+    // ---- band transition: tab strip | body ----
+    try drawRailRow(win, a, m.tabs_sep_row, x, w, "│", border_style, rail_bg, &.{}, 0);
 
     // ---- body ----
     if (m.body_rows > 0) {
@@ -2464,19 +2545,66 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         }
     }
 
-    // ---- prompt (chat only) ----
+    // ---- composer: real editor context + input (chat only) ----
     if (m.prompt_row) |prompt_row| {
-        const t2 = active;
+        const composer_border = chrome.panelBorderStyle(t, focused, st.band_bg);
+        if (m.context_row) |context_row| {
+            const snapshot = editorContextSnapshot(self);
+            const pt = &self.cur().pt;
+            var start_line = pt.lineOf(@min(snapshot.cursor, pt.len()));
+            var end_line = start_line;
+            if (snapshot.selection) |selection| {
+                const start_off = @min(@min(selection.start, selection.end), pt.len());
+                const end_off = @min(@max(selection.start, selection.end), pt.len());
+                start_line = pt.lineOf(start_off);
+                end_line = pt.lineOf(if (end_off > start_off) end_off - 1 else start_off);
+            }
+            const location = try ai.context.displayLocation(a, .{
+                .path = snapshot.path,
+                .start_line = start_line,
+                .end_line = end_line,
+                .selection = snapshot.selection != null,
+                .has_content = pt.len() > 0,
+            });
+            const label = "context ";
+            const fit = autil.cellFitSuffix(win, location, content_w -| buffer.utf8.displayWidth(label));
+            var segs = std.ArrayList(vaxis.Segment).empty;
+            try segs.append(a, .{ .text = label, .style = styleOn(st.faint, st.band_bg) });
+            if (fit.cells > 0) try segs.append(a, .{ .text = fit.slice, .style = styleOn(st.dim, st.band_bg) });
+            try drawRailRow(win, a, context_row, x, w, "│", composer_border, st.band_bg, segs.items, buffer.utf8.displayWidth(label) + @as(u32, @intCast(fit.cells)));
+        }
+
         const prefix = "❯ ";
         const prefix_cells: u32 = 2;
-        const cap: usize = content_w -| prefix_cells;
-        const safe_input = try displaySafe(a, t2.input.items);
-        const fit = autil.cellFitSuffix(win, safe_input, cap);
+        const streaming = active.status == .streaming;
+        const hint = if (streaming) "Ctrl+c stop" else "Enter send";
+        var hint_fit = autil.cellFitSuffix(win, hint, content_w -| prefix_cells -| 2);
+        const safe_input = try displaySafe(a, active.input.items);
+        var input_cap = content_w -| prefix_cells -| @as(u32, @intCast(hint_fit.cells)) -| 2;
+        if (safe_input.len > 0 and autil.cellWidth(win, safe_input) > input_cap) {
+            hint_fit = .{ .slice = "", .cells = 0 };
+            input_cap = content_w -| prefix_cells;
+        }
+        const hint_cells: u32 = @intCast(hint_fit.cells);
+        const fit = autil.cellFitSuffix(win, safe_input, input_cap);
+        const placeholder = try std.fmt.allocPrint(a, "Message {s}…", .{active.title});
+        const placeholder_fit = autil.cellFitPrefix(win, placeholder, input_cap);
         var segs = std.ArrayList(vaxis.Segment).empty;
-        try segs.append(a, .{ .text = prefix, .style = st.accent });
-        if (fit.cells > 0) try segs.append(a, .{ .text = fit.slice, .style = st.base });
-        const used: u32 = prefix_cells + @as(u32, @intCast(fit.cells));
-        try drawRailRow(win, a, prompt_row, x, w, "│", border_style, rail_bg, segs.items, used);
+        try segs.append(a, .{ .text = prefix, .style = styleOn(st.accent, st.band_bg) });
+        var used: u32 = prefix_cells;
+        if (fit.cells > 0) {
+            try segs.append(a, .{ .text = fit.slice, .style = styleOn(st.base, st.band_bg) });
+            used += @intCast(fit.cells);
+        } else if (placeholder_fit.cells > 0) {
+            try segs.append(a, .{ .text = placeholder_fit.slice, .style = styleOn(st.faint, st.band_bg) });
+            used += @intCast(placeholder_fit.cells);
+        }
+        if (hint_cells > 0 and used + 2 + hint_cells <= content_w) {
+            try segs.append(a, .{ .text = try spaces(a, content_w - used - hint_cells), .style = .{ .bg = st.band_bg } });
+            try segs.append(a, .{ .text = hint_fit.slice, .style = styleOn(if (streaming) st.warn else st.faint, st.band_bg) });
+            used = content_w;
+        }
+        try drawRailRow(win, a, prompt_row, x, w, "│", composer_border, st.band_bg, segs.items, used);
         if (self.mouseTargetsCollecting()) {
             self.addHintTarget(.{
                 .row = prompt_row,
@@ -2661,7 +2789,7 @@ fn drawToolsTab(
         break :blk try std.fmt.allocPrint(a, "avg {d}ms", .{value});
     } else try std.fmt.allocPrint(a, "tools · {d} calls · no durations", .{calls});
     if (m.body_rows > 0) {
-        try drawRailTextRow(self, win, a, m.body_top, x, w, border_style, rail_bg, summary, st.bold);
+        try drawRailTextRow(self, win, a, m.body_top, x, w, border_style, st.band_bg, summary, styleOn(st.bold, st.band_bg));
     }
 
     const remaining = m.body_rows -| 1;
@@ -2678,21 +2806,20 @@ fn drawToolsTab(
     var i: u32 = 0;
     while (i < visible and y + 3 <= body_end) : (i += 1) {
         const stats = mm.atConst(i) orelse break;
-        // row 1: name + call count (right-aligned count). Clip the name to
-        // the rail width before handing it to vaxis: unknown tool names can
-        // be long and must never spill past the border.
+        // Three quiet surface rows per real metric; no fabricated sparkline
+        // or status is added when the corresponding samples are absent.
         const head = buffer.utf8.truncateWidth(stats.name, content_w);
         var head_segs = std.ArrayList(vaxis.Segment).empty;
         defer head_segs.deinit(a);
-        try head_segs.append(a, .{ .text = head, .style = st.bold });
+        try head_segs.append(a, .{ .text = head, .style = styleOn(st.bold, st.card_bg) });
         const count_text = try std.fmt.allocPrint(a, "calls {d}", .{stats.calls});
         const head_cells: u32 = @intCast(autil.cellWidth(win, head));
         const count_cells: u32 = @intCast(autil.cellWidth(win, count_text));
         if (head_cells +| count_cells < content_w) {
-            try head_segs.append(a, .{ .text = try spaces(a, content_w - head_cells - count_cells), .style = .{ .bg = rail_bg } });
-            try head_segs.append(a, .{ .text = count_text, .style = st.dim });
+            try head_segs.append(a, .{ .text = try spaces(a, content_w - head_cells - count_cells), .style = .{ .bg = st.card_bg } });
+            try head_segs.append(a, .{ .text = count_text, .style = styleOn(st.dim, st.card_bg) });
         }
-        try drawRailRow(win, a, y, x, w, "│", border_style, rail_bg, head_segs.items, @min(content_w, head_cells +| count_cells));
+        try drawRailRow(win, a, y, x, w, "│", border_style, st.card_bg, head_segs.items, @min(content_w, head_cells +| count_cells));
         y += 1;
 
         var counts = try std.fmt.allocPrint(a, "ok {d} · err {d}", .{ stats.ok, stats.errors });
@@ -2705,7 +2832,7 @@ fn drawToolsTab(
         if (stats.unsupported > 0) {
             counts = try std.fmt.allocPrint(a, "{s} · unsup {d}", .{ counts, stats.unsupported });
         }
-        try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, counts, st.dim);
+        try drawRailTextRow(self, win, a, y, x, w, border_style, st.card_bg, counts, styleOn(st.dim, st.card_bg));
         y += 1;
 
         // p95 is the tool's own recent window (≤32 real samples); avg/max
@@ -2722,7 +2849,7 @@ fn drawToolsTab(
             if (autil.cellWidth(win, plain) <= width_cells) break :blk plain;
             break :blk try std.fmt.allocPrint(a, "avg {d}ms", .{avg_ms});
         } else "no latency samples";
-        try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, latency, st.dim);
+        try drawRailTextRow(self, win, a, y, x, w, border_style, st.card_bg, latency, styleOn(st.dim, st.card_bg));
         y += 1;
     }
 
@@ -2766,38 +2893,41 @@ fn drawTerminalTab(
     var lines: std.ArrayList([]const u8) = .empty;
     defer lines.deinit(a);
     var scrollable = false;
+    var lines_bg = rail_bg;
 
     const pending = app_agent_terminal.visiblePending(self);
     const last = app_agent_terminal.lastCard(self, self.ai.threads.active);
 
     if (pending) |p| {
         const running = self.agent_terminal.job != null;
+        lines_bg = st.card_bg;
         if (y < bottom) {
-            const head = if (running) "terminal · running" else "terminal · approval required";
-            try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, head, if (running) st.accent else st.warn);
+            const icon = if (running) animation.spinnerGlyph(self.frame_now_ms) else "!";
+            const head = try std.fmt.allocPrint(a, "{s} terminal · {s}", .{ icon, if (running) "running" else "approval required" });
+            try drawRailTextRow(self, win, a, y, x, w, border_style, st.card_bg, head, styleOn(if (running) st.accent else st.warn, st.card_bg));
             y += 1;
         }
         if (y < bottom) {
-            try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, "your permissions · not sandboxed", st.warn);
+            try drawRailTextRow(self, win, a, y, x, w, border_style, st.card_bg, "your permissions · not sandboxed", styleOn(st.warn, st.card_bg));
             y += 1;
         }
         if (y < bottom) {
             const tail = autil.cellFitSuffix(win, p.root, content_w -| 5);
             const cwd = try std.fmt.allocPrint(a, "cwd: {s}", .{tail.slice});
-            try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, cwd, st.dim);
+            try drawRailTextRow(self, win, a, y, x, w, border_style, st.card_bg, cwd, styleOn(st.dim, st.card_bg));
             y += 1;
         }
         if (y < bottom) {
             if (running) {
-                try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, "running… · Ctrl+c stops", st.accent);
+                try drawRailTextRow(self, win, a, y, x, w, border_style, st.card_bg, "running… · Ctrl+c stops", styleOn(st.accent, st.card_bg));
             } else {
                 const full = "[a] allow  [r] deny";
                 if (content_w >= autil.cellWidth(win, full)) {
                     var segs = std.ArrayList(vaxis.Segment).empty;
-                    try segs.append(a, .{ .text = "[a] allow", .style = st.accent });
-                    try segs.append(a, .{ .text = "  ", .style = .{ .bg = rail_bg } });
-                    try segs.append(a, .{ .text = "[r] deny", .style = st.error_style });
-                    try drawRailRow(win, a, y, x, w, "│", border_style, rail_bg, segs.items, @intCast(autil.cellWidth(win, full)));
+                    try segs.append(a, .{ .text = "[a] allow", .style = styleOn(st.accent, st.card_bg) });
+                    try segs.append(a, .{ .text = "  ", .style = .{ .bg = st.card_bg } });
+                    try segs.append(a, .{ .text = "[r] deny", .style = styleOn(st.error_style, st.card_bg) });
+                    try drawRailRow(win, a, y, x, w, "│", border_style, st.card_bg, segs.items, @intCast(autil.cellWidth(win, full)));
                     if (self.mouseTargetsCollecting()) {
                         self.addHintTarget(.{
                             .row = y,
@@ -2813,7 +2943,7 @@ fn drawTerminalTab(
                         }, .agent_terminal_deny);
                     }
                 } else {
-                    try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, full, st.warn);
+                    try drawRailTextRow(self, win, a, y, x, w, border_style, st.card_bg, full, styleOn(st.warn, st.card_bg));
                 }
             }
             y += 1;
@@ -2824,11 +2954,11 @@ fn drawTerminalTab(
                 "timeout {d}ms · max {d}ms",
                 .{ p.timeout_ms, terminal_tool.max_timeout_ms },
             );
-            try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, timeout, st.dim);
+            try drawRailTextRow(self, win, a, y, x, w, border_style, st.card_bg, timeout, styleOn(st.dim, st.card_bg));
             y += 1;
         }
         if (y < bottom) {
-            try drawRailRow(win, a, y, x, w, "│", border_style, rail_bg, &.{}, 0);
+            try drawRailRow(win, a, y, x, w, "│", border_style, st.card_bg, &.{}, 0);
             y += 1;
         }
         const clipped = try appendWrappedTerminalLines(self, a, win, &lines, p.display, content_w, 512);
@@ -2844,24 +2974,25 @@ fn drawTerminalTab(
                 .cancelled => st.faint,
                 else => st.dim,
             };
-            const head = try std.fmt.allocPrint(a, "terminal · {s}", .{status_label});
-            try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, head, style);
+            const icon = if (msg.tool_status == .running) animation.spinnerGlyph(self.frame_now_ms) else cardIcon(msg.tool_status);
+            const head = try std.fmt.allocPrint(a, "{s} terminal · {s}", .{ icon, status_label });
+            try drawRailTextRow(self, win, a, y, x, w, border_style, st.card_bg, head, styleOn(style, st.card_bg));
             y += 1;
         }
         if (y < bottom) {
-            try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, "not sandboxed · runs as you", st.warn);
+            try drawRailTextRow(self, win, a, y, x, w, border_style, st.card_bg, "not sandboxed · runs as you", styleOn(st.warn, st.card_bg));
             y += 1;
         }
         if (y < bottom and msg.text.len > 0) {
-            try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, msg.text, st.bold);
+            try drawRailTextRow(self, win, a, y, x, w, border_style, st.card_bg, msg.text, styleOn(st.bold, st.card_bg));
             y += 1;
         }
         if (y < bottom) {
-            try drawRailTextRow(self, win, a, y, x, w, border_style, rail_bg, "j/k scroll output · r tab", st.faint);
+            try drawRailTextRow(self, win, a, y, x, w, border_style, st.card_bg, "j/k scroll output · r tab", styleOn(st.faint, st.card_bg));
             y += 1;
         }
         if (y < bottom) {
-            try drawRailRow(win, a, y, x, w, "│", border_style, rail_bg, &.{}, 0);
+            try drawRailRow(win, a, y, x, w, "│", border_style, st.card_bg, &.{}, 0);
             y += 1;
         }
         const body = terminalResultBody(msg.api_text);
@@ -2895,7 +3026,7 @@ fn drawTerminalTab(
         const top = @min(self.agent_terminal.scroll, max_top);
         var i: u32 = 0;
         while (i < visible and top + i < line_count) : (i += 1) {
-            try drawRailTextRow(self, win, a, y + i, x, w, border_style, rail_bg, lines.items[top + i], st.base);
+            try drawRailTextRow(self, win, a, y + i, x, w, border_style, lines_bg, lines.items[top + i], styleOn(st.base, lines_bg));
         }
         y += i;
     }
@@ -2972,6 +3103,87 @@ fn terminalResultBody(content: []const u8) []const u8 {
     return content;
 }
 
+fn elapsedLabel(a: std.mem.Allocator, elapsed_ms: u64) ![]const u8 {
+    if (elapsed_ms < 1000) return std.fmt.allocPrint(a, "<1s", .{});
+    if (elapsed_ms < 10_000) return std.fmt.allocPrint(a, "{d}.{d}s", .{ elapsed_ms / 1000, (elapsed_ms % 1000) / 100 });
+    if (elapsed_ms < 60_000) return std.fmt.allocPrint(a, "{d}s", .{elapsed_ms / 1000});
+    return std.fmt.allocPrint(a, "{d}m{d:0>2}s", .{ elapsed_ms / 60_000, (elapsed_ms % 60_000) / 1000 });
+}
+
+fn appendRequestTelemetryRows(
+    self: *App,
+    a: std.mem.Allocator,
+    rows: *std.ArrayList(Row),
+    content_w: u32,
+    st: Styles,
+    active: *const AgentThread,
+) !void {
+    const req = &active.request;
+    if (req.started_ms == null) return;
+    const elapsed = try elapsedLabel(a, req.elapsedMs(self.frame_now_ms));
+    const live = active.status == .streaming and req.finished_ms == null;
+    const first = if (live) blk: {
+        const label = switch (req.phase) {
+            .idle => "waiting for tools",
+            .connecting => "connecting to provider",
+            .waiting => if (req.elapsedMs(self.frame_now_ms) >= 15_000) "waiting · no response yet" else "waiting for response",
+            .streaming => "receiving response",
+        };
+        break :blk try std.fmt.allocPrint(a, "{s} · {s}", .{ label, elapsed });
+    } else if (req.usage) |usage|
+        try std.fmt.allocPrint(a, "{s} · {s} · {d} tokens", .{
+            switch (active.status) {
+                .idle, .streaming => "complete",
+                .cancelled => "cancelled",
+                .err => "failed",
+            },
+            elapsed,
+            usage.total_tokens,
+        })
+    else
+        try std.fmt.allocPrint(a, "{s} · {s} · no usage", .{
+            switch (active.status) {
+                .idle, .streaming => "complete",
+                .cancelled => "cancelled",
+                .err => "failed",
+            },
+            elapsed,
+        });
+    const first_style = if (live and req.phase == .waiting and req.elapsedMs(self.frame_now_ms) >= 15_000)
+        st.warn
+    else if (live)
+        st.accent
+    else
+        st.faint;
+    try appendWrappedPlain(a, rows, content_w, first, first_style);
+
+    if (req.usage) |usage| {
+        const second = if (self.ai.config) |cfg| blk: {
+            if (cfg.context_tokens) |limit| {
+                const percent = (@as(u128, usage.total_tokens) * 100) / limit;
+                break :blk try std.fmt.allocPrint(a, "ctx {d}% · in {d} · out {d}", .{
+                    percent,
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                });
+            }
+            break :blk try std.fmt.allocPrint(a, "ctx {d} · in {d} · out {d}", .{
+                usage.total_tokens,
+                usage.prompt_tokens,
+                usage.completion_tokens,
+            });
+        } else try std.fmt.allocPrint(a, "ctx {d} · in {d} · out {d}", .{
+            usage.total_tokens,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+        });
+        try appendWrappedPlain(a, rows, content_w, second, st.faint);
+    } else {
+        const second = try std.fmt.allocPrint(a, "ctx ~{d} tokens · estimate", .{req.estimated_prompt_tokens});
+        try appendWrappedPlain(a, rows, content_w, second, st.faint);
+    }
+}
+
 fn drawChatBody(
     self: *App,
     a: std.mem.Allocator,
@@ -2993,6 +3205,7 @@ fn drawChatBody(
     }
     var card_rows: std.ArrayList(CardRow) = .empty;
     defer card_rows.deinit(self.alloc);
+    const model: []const u8 = if (self.ai.config) |cfg| cfg.model else ai.config.default_model;
 
     for (active.messages.items, 0..) |msg, mi| {
         if (msg.role == .tool) {
@@ -3000,12 +3213,13 @@ fn drawChatBody(
             try appendToolCardRows(self, a, &rows, st, content_w, &msg);
             try card_rows.append(self.alloc, .{ .msg = mi, .row = at });
         } else {
-            // A tool-call assistant turn with no text is represented by its
-            // cards; an empty in-flight bubble renders nothing (M1 behavior).
+            // A tool-call-only assistant turn is represented by its cards;
+            // an ordinary empty in-flight turn still shows its stable AI header.
             if (msg.role == .assistant and msg.tool_calls_json != null and msg.text.len == 0) continue;
-            try appendMessageRows(a, &rows, st, content_w, msg.role, msg.text);
+            try appendMessageRows(a, &rows, st, content_w, msg.role, model, msg.text);
         }
     }
+    try appendRequestTelemetryRows(self, a, &rows, content_w, st, active);
     if (active.error_text) |err| {
         const prefix = try std.fmt.allocPrint(a, "error: {s}", .{std.mem.trim(u8, err, " \t\r\n")});
         try appendWrappedPlain(a, &rows, content_w, prefix, st.error_style);
@@ -3042,7 +3256,7 @@ fn drawChatBody(
             continue;
         }
         const row = rows.items[ri];
-        try drawRailRow(win, a, y, x, w, "│", border_style, rail_bg, row.segs.items, row.cells);
+        try drawRailRow(win, a, y, x, w, "│", border_style, row.bg orelse rail_bg, row.segs.items, row.cells);
     }
 
     // Tool cards are interactive through the existing hint API: activating

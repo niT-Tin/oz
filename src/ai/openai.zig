@@ -1,10 +1,13 @@
 //! OpenAI-compatible chat-completions wire format (M1 AI chat).
 //!
-//! Request: POST {base_url}/chat/completions with `stream: true`.
+//! Request: POST {base_url}/chat/completions with streaming usage enabled.
 //! Response: Server-Sent Events whose `data:` payloads are JSON chunks with
-//! `choices[0].delta.content` and (on the final chunk) `finish_reason`.
+//! `choices[0].delta.content`, `finish_reason`, and optional token `usage`.
 //! Errors: a non-2xx response usually carries `{"error":{"message":...}}`.
 const std = @import("std");
+const telemetry = @import("telemetry.zig");
+
+pub const Usage = telemetry.Usage;
 
 pub const Message = struct {
     role: []const u8,
@@ -37,6 +40,11 @@ pub fn buildRequestBody(
     s.write(model) catch return error.OutOfMemory;
     s.objectField("stream") catch return error.OutOfMemory;
     s.write(true) catch return error.OutOfMemory;
+    s.objectField("stream_options") catch return error.OutOfMemory;
+    s.beginObject() catch return error.OutOfMemory;
+    s.objectField("include_usage") catch return error.OutOfMemory;
+    s.write(true) catch return error.OutOfMemory;
+    s.endObject() catch return error.OutOfMemory;
     s.objectField("messages") catch return error.OutOfMemory;
     s.beginArray() catch return error.OutOfMemory;
     if (system) |sys| {
@@ -76,22 +84,56 @@ fn writeMessage(s: *std.json.Stringify, message: Message) RequestError!void {
 }
 
 /// One streamed chunk's useful fields. Both strings are owned (null when the
-/// field is absent or null).
+/// field is absent or null); usage is a value copied from the JSON tree.
 pub const Delta = struct {
     content: ?[]u8 = null,
     finish_reason: ?[]u8 = null,
+    usage: ?Usage = null,
+    /// Provider error carried inside a 200 SSE stream (`{"error":{...}}`).
+    /// Some OpenAI-compatible gateways report failures this way instead of a
+    /// non-2xx HTTP response.
+    error_message: ?[]u8 = null,
 
     pub fn deinit(self: *Delta, alloc: std.mem.Allocator) void {
         if (self.content) |c| alloc.free(c);
         if (self.finish_reason) |f| alloc.free(f);
+        if (self.error_message) |e| alloc.free(e);
         self.* = .{};
     }
 };
 
 pub const DeltaError = error{ OutOfMemory, InvalidJson };
 
+fn dupTrimmed(alloc: std.mem.Allocator, text: []const u8) !?[]u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return try alloc.dupe(u8, trimmed);
+}
+
+fn tokenField(value: std.json.Value, name: []const u8) ?u64 {
+    if (value != .object) return null;
+    const field = value.object.get(name) orelse return null;
+    if (field != .integer or field.integer < 0) return null;
+    return @intCast(field.integer);
+}
+
+fn parseUsage(value: std.json.Value) ?Usage {
+    const prompt = tokenField(value, "prompt_tokens");
+    const completion = tokenField(value, "completion_tokens");
+    const total = tokenField(value, "total_tokens");
+    if (prompt == null and completion == null and total == null) return null;
+    const input = prompt orelse 0;
+    const output = completion orelse 0;
+    return .{
+        .prompt_tokens = input,
+        .completion_tokens = output,
+        .total_tokens = total orelse input +| output,
+    };
+}
+
 /// Parse one `data:` JSON chunk. A syntactically valid chunk without
 /// `choices[0]` returns an empty Delta (some gateways send metadata chunks).
+/// DeepSeek's final usage-only chunk has `choices: []` and is handled here.
 /// Malformed JSON is an explicit error; the client ignores such events.
 pub fn parseDelta(alloc: std.mem.Allocator, json: []const u8) DeltaError!Delta {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{ .allocate = .alloc_always }) catch |e| switch (e) {
@@ -102,8 +144,21 @@ pub fn parseDelta(alloc: std.mem.Allocator, json: []const u8) DeltaError!Delta {
     var d: Delta = .{};
     errdefer d.deinit(alloc);
     if (parsed.value != .object) return d;
+    const root = parsed.value.object;
+    if (root.get("usage")) |usage| d.usage = parseUsage(usage);
+    if (root.get("error")) |err_value| {
+        if (err_value == .object) {
+            if (err_value.object.get("message")) |m| {
+                if (m == .string) d.error_message = try dupTrimmed(alloc, m.string);
+            }
+        }
+    } else if (root.get("message")) |m| {
+        // Bare `{"message":"..."}` errors from smaller gateways.
+        if (m == .string) d.error_message = try dupTrimmed(alloc, m.string);
+    }
+    if (d.error_message != null) return d;
 
-    const choices = parsed.value.object.get("choices") orelse return d;
+    const choices = root.get("choices") orelse return d;
     if (choices != .array or choices.array.items.len == 0) return d;
     const choice = choices.array.items[0];
     if (choice != .object) return d;
@@ -162,6 +217,7 @@ test "openai: request body has model, stream and messages" {
     defer alloc.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"qwen2.5-coder:7b\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"stream_options\":{\"include_usage\":true}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":\"hi \\\"there\\\"\"") != null);
     // no system prompt when null
@@ -187,6 +243,34 @@ test "openai: delta content and finish_reason" {
     defer f.deinit(alloc);
     try std.testing.expect(f.content == null);
     try std.testing.expectEqualStrings("stop", f.finish_reason.?);
+}
+
+test "openai: DeepSeek usage-only chunk survives empty choices" {
+    const alloc = std.testing.allocator;
+    var d = try parseDelta(
+        alloc,
+        "{\"id\":\"chatcmpl-1\",\"choices\":[],\"usage\":{\"prompt_tokens\":1200,\"completion_tokens\":42,\"total_tokens\":1242,\"prompt_cache_hit_tokens\":640}}",
+    );
+    defer d.deinit(alloc);
+    try std.testing.expect(d.content == null);
+    try std.testing.expectEqual(@as(u64, 1200), d.usage.?.prompt_tokens);
+    try std.testing.expectEqual(@as(u64, 42), d.usage.?.completion_tokens);
+    try std.testing.expectEqual(@as(u64, 1242), d.usage.?.total_tokens);
+}
+
+test "openai: error payload in a 200 SSE chunk is surfaced" {
+    const alloc = std.testing.allocator;
+    var d = try parseDelta(
+        alloc,
+        "{\"error\":{\"message\":\"Insufficient Balance\",\"type\":\"unknown_error\"}}",
+    );
+    defer d.deinit(alloc);
+    try std.testing.expect(d.content == null);
+    try std.testing.expectEqualStrings("Insufficient Balance", d.error_message.?);
+
+    var bare = try parseDelta(alloc, "{\"message\":\"bad gateway\"}");
+    defer bare.deinit(alloc);
+    try std.testing.expectEqualStrings("bad gateway", bare.error_message.?);
 }
 
 test "openai: delta with missing fields is empty, malformed is an error" {

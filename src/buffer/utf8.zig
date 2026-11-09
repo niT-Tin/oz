@@ -434,6 +434,39 @@ pub fn truncateWidth(bytes: []const u8, max_cells: u32) []const u8 {
     return bytes[0..i];
 }
 
+pub const WrapFit = struct {
+    take: usize,
+    consumed: usize,
+    wrap: bool,
+};
+
+/// Prefer the last ASCII word boundary that fits, then hard-wrap long words
+/// and CJK on a UTF-8 boundary within the terminal-cell budget.
+pub fn wrapPrefix(text: []const u8, avail: u32) WrapFit {
+    if (text.len == 0) return .{ .take = 0, .consumed = 0, .wrap = false };
+    if (displayWidth(text) <= avail) {
+        return .{ .take = text.len, .consumed = text.len, .wrap = false };
+    }
+    const hard = truncateWidth(text, avail);
+    if (hard.len == 0) return .{ .take = 0, .consumed = 0, .wrap = true };
+
+    var last_space: ?usize = null;
+    var i: usize = 0;
+    while (i < hard.len) {
+        if (hard[i] == ' ') last_space = i;
+        const next = nextBoundary(hard, i);
+        i = next;
+    }
+    if (last_space) |space| {
+        if (space > 0) {
+            var consumed = space + 1;
+            while (consumed < text.len and text[consumed] == ' ') consumed += 1;
+            return .{ .take = space, .consumed = consumed, .wrap = true };
+        }
+    }
+    return .{ .take = hard.len, .consumed = hard.len, .wrap = hard.len < text.len };
+}
+
 /// Start offset of the character containing byte position `p` (0 <= p < len).
 /// Robust for invalid bytes: a run of continuation bytes that is not consumed
 /// by a valid leading byte is treated as one character.
@@ -762,4 +795,54 @@ test "utf8 truncateWidth never splits a glyph" {
     try std.testing.expectEqualStrings("abc", truncateWidth("abc", 99));
     // Invalid bytes decode to width 1, so they are never silently dropped.
     try std.testing.expectEqualStrings("\xFF", truncateWidth("\xFF", 1));
+}
+
+test "utf8 wrapPrefix prefers words and hard-wraps long words" {
+    const word = wrapPrefix("alpha beta gamma", 9);
+    try std.testing.expectEqualStrings("alpha", "alpha beta gamma"[0..word.take]);
+    try std.testing.expectEqualStrings("beta gamma", "alpha beta gamma"[word.consumed..]);
+    try std.testing.expect(word.wrap);
+
+    const long = wrapPrefix("abcdefghij", 4);
+    try std.testing.expectEqualStrings("abcd", "abcdefghij"[0..long.take]);
+    try std.testing.expectEqual(@as(usize, 4), long.consumed);
+    try std.testing.expect(long.wrap);
+
+    const whole = wrapPrefix("short text", 20);
+    try std.testing.expectEqual(@as(usize, "short text".len), whole.take);
+    try std.testing.expect(!whole.wrap);
+}
+
+test "utf8 wrapPrefix keeps CJK in bounds" {
+    const text = "甲乙丙";
+    const fit = wrapPrefix(text, 5);
+    try std.testing.expectEqualStrings("甲乙", text[0..fit.take]);
+    try std.testing.expectEqualStrings("丙", text[fit.consumed..]);
+    try std.testing.expect(displayWidth(text[0..fit.take]) <= 5);
+    try std.testing.expect(isBoundary(text, fit.take));
+    try std.testing.expect(fit.wrap);
+
+    const too_narrow = wrapPrefix(text, 1);
+    try std.testing.expectEqual(@as(usize, 0), too_narrow.take);
+    try std.testing.expect(too_narrow.wrap);
+}
+
+test "utf8 wrapPrefix obeys every cell budget" {
+    const samples = [_][]const u8{
+        "one two three four",
+        "supercalifragilistic",
+        "中文 混合 wrapping 测试",
+        "  leading and  multiple  spaces",
+    };
+    for (samples) |text| {
+        var width: u32 = 1;
+        while (width <= 32) : (width += 1) {
+            const fit = wrapPrefix(text, width);
+            try std.testing.expect(fit.take <= fit.consumed);
+            try std.testing.expect(fit.consumed <= text.len);
+            try std.testing.expect(displayWidth(text[0..fit.take]) <= width);
+            try std.testing.expect(isBoundary(text, fit.take));
+            try std.testing.expect(isBoundary(text, fit.consumed));
+        }
+    }
 }

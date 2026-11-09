@@ -9,6 +9,7 @@ A terminal text editor written in Zig.
 **Editing (vim-style)**
 
 - Six modes: Normal / Insert / Visual / Visual Line / Visual Block / Command
+- Help: `F1` or `:help` opens the searchable keymap reference
 - Full motions with counts: hjkl, w/W/e/E/b/B/ge/gE, ^/0/$, gg/G, {/}, %, f/F/t/T, Ctrl-u/d/f/b
 - Unicode motions: `w/e/b/ge` treat each CJK/emoji codepoint as one word; `W/E/B/gE` are whitespace-delimited WORDs; `f/F/t/T` accept Chinese/emoji targets
 - Text objects, surround, comments, alignment, EasyMotion (s / `<leader>f`), multi-cursor (Ctrl+n)
@@ -79,8 +80,8 @@ A terminal text editor written in Zig.
 
 **AI workspace (M2a)**
 
-- `<leader>a` opens the right-hand **Agent Rail + Workbox** and focuses its prompt; from the editor or thread list it closes the rail and returns focus to the editor. A docked rail is non-modal: editing continues beside it.
-- Width behavior: **≥110 cols** reserves a 38-cell docked rail; **90–109** reserves 34; **<90** uses an overlay drawer (`min(34, width-8)`) while the editor keeps its full width underneath. The rail stops above the status bar and never draws over the editor's reserved area. In drawer mode Esc closes the drawer; there is no fake scrim, diff or telemetry.
+- `<leader>a` opens the right-hand **Agent Rail + Workbox** and focuses its prompt; from the editor or thread list it closes the rail and returns focus to the editor. A docked rail is non-modal: editing continues beside it. `Ctrl-w a` re-enters the rail at the thread list; **`Ctrl-w A`** toggles **Agent-focus**, which keeps the same session but uses a 52-cell rail plus the 7-cell Nerd Font Navigator rail on wide terminals. Leaving Agent-focus restores the previous coding rail and Navigator layout.
+- Width behavior: **≥110 cols** reserves a 38-cell docked rail (52 in Agent-focus); **90–109** reserves 34; **<90** uses an overlay drawer (`min(34, width-8)`) while the editor keeps its full width underneath. The rail stops above the single-row status band and never draws over the editor's reserved area. In drawer mode Esc closes the drawer; there is no fake scrim, diff or telemetry.
 - **Threads** are session-level and listed under the current workspace. `j`/`k` select, Enter attaches, `n` (or `+`) creates a new thread and focuses its prompt, Tab from the prompt returns to the thread list. One stream runs at a time: switching away from a streaming thread cancels it (status `cancelled`, transcript frozen); switching back shows that frozen transcript. Each thread has its own request history and client, so deltas can never land in another thread. Threads survive rail close and workspace switches, but are not persisted to disk.
 - **Workbox tabs**: Chat (the M1 transcript, streaming, cancellation, errors, Markdown, tool cards and prompt), Changes (inline-edit **and staged agent-edit** review: a real unified-style diff with explicit Approve/Reject; multi-file patches add a selectable per-file list/window on top of the active diff; `no pending changes` when empty), Tools (real per-tool call/decision metrics, avg/max plus a nearest-rank p95 of the last ≤32 real samples, and a latency chart; `no tool calls yet` when empty), Terminal (the **approved agent terminal tool**: staged command, explicit Allow/Deny, real bounded output; the existing editor terminal is still `Alt+r` and stays separate). Empty states are real — no fabricated diffs, counts or charts.
 - **Inline assistant (`<leader>i`)**: select lines in visual/visual-line mode, press `<leader>i`, type an instruction in the compact `inline edit` float, and press Enter. The request streams through its **own** OpenAI-compatible client (it never appends to a chat thread); on completion the rail opens on **Changes**, the badge becomes `changes 1`, and the diff shows the removed selection lines and the streamed replacement. Nothing is written until you approve:
@@ -100,6 +101,7 @@ A terminal text editor written in Zig.
 - **Mouse (`feat/mouse`)**: vaxis cell-coordinate mouse reporting is enabled at startup and reset on exit (including error paths). Left-click focuses split panes and places the cursor from the clicked line/column (relative-number gutter, `view_top`, soft wrap and inlay hints considered), and clicks buffer tabs and their `×`, navigator tabs/rows (files/notes/agents), AI thread rows, workbox tabs, the prompt and `+`, tool cards, and the Changes/Terminal Approve·Allow/Reject·Deny buttons. Clicks run the **same** App methods as the keyboard/hints, so approval/stale/dirty safety is unchanged; the last buffer's `×` is never registered, empty areas are no-ops, and a click finalizes an active insert session first (text kept). Wheel scrolls the editor (3 lines/notch, cursor column preserved), filetree/notes/agents selection and the Chat/Changes transcript/diff — always clamped; over the focused embedded terminal the wheel is left alone (clicking the terminal focuses it, clicking elsewhere returns to the editor). Plain drag belongs to mouse reporting — hold **Shift** while dragging to select/copy text in your terminal (terminal-dependent). v1 has no drag/resize, middle/right button, or terminal mouse forwarding; heavily wrapped lines and grapheme clusters map approximately (DESIGN §21).
 
 - Streaming OpenAI-compatible completions (`POST {base_url}/chat/completions`, SSE); Markdown + fenced code rendering, auto-scroll
+- **Request state and tokens**: thread status distinguishes `connecting…` / `waiting…` / `streaming…`, while Chat shows the current phase and elapsed time. After 15 seconds without a first response it says `no response yet`; Ctrl+c remains available in the composer. Requests include `stream_options.include_usage`, and completed requests show provider-reported total/input/output tokens, including DeepSeek's usage-only chunk after `finish_reason`. Before usage arrives the display is explicitly `ctx ~N tokens · estimate` (roughly 4 request bytes/token), never a fake exact count. Configure the model's context window to see real `ctx N%`; agent loops show the latest HTTP request's metrics.
 - Editor context is attached automatically: current file path, visual selection with its 1-based line range, otherwise the cursor line ± a small window (capped at 8 KB)
 - Configuration via env (read when the rail opens):
 
@@ -109,6 +111,7 @@ A terminal text editor written in Zig.
   | `OZ_AI_MODEL` | `qwen2.5-coder:7b` | Model name |
   | `OZ_AI_API_KEY` | unset | Optional `Authorization: Bearer …`; never logged or persisted |
   | `OZ_AI_SYSTEM` | built-in | Optional system-prompt override |
+  | `OZ_AI_CONTEXT_TOKENS` | unset | Optional positive context-window size used for `ctx N%`; without it only token counts are shown, never a guessed limit |
 
   Example: `OZ_AI_BASE_URL=https://api.deepseek.com/v1 OZ_AI_MODEL=deepseek-chat OZ_AI_API_KEY=sk-… oz`.
 

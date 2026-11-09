@@ -48,6 +48,7 @@ pub const normal: KeyMap = &.{
     act(.{ .codepoint = 'O' }, .insert_line_before),
     act(.{ .codepoint = 'v' }, .visual_char),
     act(.{ .codepoint = 'V' }, .visual_line),
+    act(.{ .codepoint = vaxis.Key.f1 }, .picker_keymaps),
     act(.{ .codepoint = 's' }, .easymotion),
     act(.{ .codepoint = ' ' }, .leader),
     act(.{ .codepoint = ':' }, .enter_command_mode),
@@ -145,6 +146,7 @@ test "normal keymap covers the M0 key set" {
     try std.testing.expectEqual(.find_char_back, L(normal, .{ .codepoint = 'F' }));
     try std.testing.expectEqual(.till_char, L(normal, .{ .codepoint = 't' }));
     try std.testing.expectEqual(.till_char_back, L(normal, .{ .codepoint = 'T' }));
+    try std.testing.expectEqual(.picker_keymaps, L(normal, .{ .codepoint = vaxis.Key.f1 }));
     try std.testing.expectEqual(.repeat_find, L(normal, .{ .codepoint = ';' }));
     try std.testing.expectEqual(.repeat_find_back, L(normal, .{ .codepoint = ',' }));
     try std.testing.expectEqual(.undo, L(normal, .{ .codepoint = 'u' }));

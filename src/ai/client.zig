@@ -19,12 +19,17 @@
 const std = @import("std");
 const sse = @import("sse.zig");
 const openai = @import("openai.zig");
+const telemetry = @import("telemetry.zig");
 const tools = @import("tools.zig");
 
 pub const Event = union(enum) {
+    /// Transport progressed without changing the transcript.
+    phase: telemetry.Phase,
+    /// Provider-reported token accounting (DeepSeek sends a final usage-only chunk).
+    usage: telemetry.Usage,
     /// A content delta (owned).
     delta: []u8,
-    /// The stream completed (finish_reason or [DONE]).
+    /// The stream completed ([DONE] or EOF after any usage-only chunk).
     done,
     /// A human-readable failure (owned).
     err: []u8,
@@ -39,7 +44,7 @@ pub const Event = union(enum) {
             .delta => |d| alloc.free(d),
             .err => |e| alloc.free(e),
             .tool_calls => |calls| tools.freeCalls(alloc, calls),
-            .done, .cancelled => {},
+            .phase, .usage, .done, .cancelled => {},
         }
     }
 };
@@ -246,6 +251,7 @@ pub const Client = struct {
 
     fn runMock(self: *Client, job: *const Job, dir: []const u8) !void {
         try self.checkCancel();
+        try self.push(.{ .phase = .waiting });
         const seq_name = try std.fmt.allocPrint(self.alloc, "request-{d}.json", .{job.seq});
         defer self.alloc.free(seq_name);
         try writeRequestFile(self.alloc, self.io, dir, "request.json", job.body);
@@ -306,8 +312,7 @@ pub const Client = struct {
             try self.drainSse(&parser, &saw_done, &acc, &protocol_failed);
         }
         if (protocol_failed) return;
-        try self.finalizeToolTurn(&acc);
-        if (protocol_failed) return;
+        if (try self.finishStream(&acc)) return;
         self.push(.done) catch {};
     }
 
@@ -315,6 +320,7 @@ pub const Client = struct {
 
     fn runHttp(self: *Client, job: *const Job) !void {
         try self.checkCancel();
+        try self.push(.{ .phase = .connecting });
         const uri = std.Uri.parse(job.url) catch {
             self.pushError("invalid OZ_AI_BASE_URL");
             return;
@@ -344,6 +350,12 @@ pub const Client = struct {
             return;
         };
         defer req.deinit();
+        // SSE must stay uncompressed: `Response.reader(&transfer)` passes the
+        // 4 KiB transfer buffer as the decompression window, which is smaller
+        // than gzip's 32 KiB window. A gzip SSE body then reads as immediate
+        // EOF, producing a silent empty completion. Only request identity.
+        req.accept_encoding = @splat(false);
+        req.accept_encoding[@intFromEnum(std.http.ContentEncoding.identity)] = true;
         req.transfer_encoding = .{ .content_length = job.body.len };
         var body = req.sendBodyUnflushed(&.{}) catch |e| {
             self.pushErrorFmt("send failed: {s}", .{@errorName(e)});
@@ -361,6 +373,7 @@ pub const Client = struct {
             self.pushErrorFmt("send failed: {s}", .{@errorName(e)});
             return;
         };
+        try self.push(.{ .phase = .waiting });
 
         var response = req.receiveHead(&.{}) catch |e| {
             self.pushErrorFmt("response failed: {s}", .{@errorName(e)});
@@ -374,7 +387,7 @@ pub const Client = struct {
             while (err_len < err_buf.len) {
                 var slices = [_][]u8{err_buf[err_len..]};
                 const n = rdr.readVec(&slices) catch break;
-                if (n == 0) break;
+                if (n == 0) continue;
                 err_len += n;
             }
             const body_text = err_buf[0..err_len];
@@ -404,7 +417,9 @@ pub const Client = struct {
                     return;
                 },
             };
-            if (n == 0) break;
+            // `readVec` can return 0 after filling the reader's internal
+            // buffer; it is not EOF. The next call drains that buffer.
+            if (n == 0) continue;
             parser.feed(buf[0..n]) catch {
                 self.pushError("stream parse failed");
                 return;
@@ -417,8 +432,7 @@ pub const Client = struct {
             try self.drainSse(&parser, &saw_done, &acc, &protocol_failed);
         }
         if (protocol_failed) return;
-        try self.finalizeToolTurn(&acc);
-        if (protocol_failed) return;
+        if (try self.finishStream(&acc)) return;
         self.push(.done) catch {};
     }
 
@@ -447,6 +461,16 @@ pub const Client = struct {
                         error.OutOfMemory => return error.OutOfMemory,
                     };
                     defer delta.deinit(self.alloc);
+                    if (delta.error_message) |message| {
+                        // A 200 response can still carry an error object
+                        // inside the SSE stream. Treat it as terminal; a
+                        // silent "complete" with no transcript is worse.
+                        self.pushErrorFmt("provider error: {s}", .{message});
+                        protocol_failed.* = true;
+                        return;
+                    }
+                    try self.push(.{ .phase = .streaming });
+                    if (delta.usage) |usage| try self.push(.{ .usage = usage });
                     acc.feedChunk(json) catch |e| switch (e) {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => {
@@ -459,10 +483,32 @@ pub const Client = struct {
                         const copy = try self.alloc.dupe(u8, content);
                         self.push(.{ .delta = copy }) catch self.alloc.free(copy);
                     }
-                    if (delta.finish_reason != null) saw_done.* = true;
+                    // A finish_reason may be followed by DeepSeek's usage-only
+                    // chunk. Stop on [DONE] or EOF, not before that accounting.
                 },
             }
         }
+    }
+
+    /// Convert a completed stream into exactly one terminal event. A reply
+    /// with neither text nor tool calls is a provider/proxy failure, not a
+    /// successful blank answer: returning `true` means an error was queued
+    /// and the caller must not emit `.done`.
+    fn finishStream(self: *Client, acc: *tools.Accumulator) !bool {
+        if (!acc.sawText() and !acc.hasToolCalls()) {
+            if (acc.finishReason()) |reason| {
+                if (reason == .tool_calls) {
+                    self.pushError("tool call protocol: tool_calls finish without calls");
+                } else {
+                    self.pushErrorFmt("provider returned an empty response ({s})", .{@tagName(reason)});
+                }
+            } else {
+                self.pushError("provider returned an empty response");
+            }
+            return true;
+        }
+        try self.finalizeToolTurn(acc);
+        return false;
     }
 
     /// Finalize accumulated calls and queue exactly one `.tool_calls` event.
@@ -545,7 +591,7 @@ fn readOptionalFile(
 // Tests
 // ---------------------------------------------------------------------------
 
-test "client: mock stream emits deltas then done and writes request.json" {
+test "client: mock stream emits phases, deltas, DeepSeek usage and done" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -554,7 +600,9 @@ test "client: mock stream emits deltas then done and writes request.json" {
     const stream =
         "data: {\"choices\":[{\"delta\":{\"content\":\"mock \"}}]}\n\n" ++
         "data: {\"choices\":[{\"delta\":{\"content\":\"reply\"}}]}\n\n" ++
-        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1200,\"completion_tokens\":42,\"total_tokens\":1242}}\n\n" ++
+        "data: [DONE]\n\n";
     try tmp.dir.writeFile(io, .{ .sub_path = "stream.sse", .data = stream });
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -573,12 +621,21 @@ test "client: mock stream emits deltas then done and writes request.json" {
 
     var got = std.ArrayList(u8).empty;
     defer got.deinit(alloc);
+    var saw_waiting = false;
+    var saw_streaming = false;
+    var got_usage: ?telemetry.Usage = null;
     var done = false;
     var waited_ms: u32 = 0;
     while (!done and waited_ms < 3000) : (waited_ms += 5) {
         if (client.pop()) |ev| {
             defer ev.deinit(alloc);
             switch (ev) {
+                .phase => |phase| switch (phase) {
+                    .waiting => saw_waiting = true,
+                    .streaming => saw_streaming = true,
+                    else => {},
+                },
+                .usage => |usage| got_usage = usage,
                 .delta => |d| try got.appendSlice(alloc, d),
                 .done => done = true,
                 .err => |e| {
@@ -596,11 +653,100 @@ test "client: mock stream emits deltas then done and writes request.json" {
         }
     }
     try std.testing.expect(done);
+    try std.testing.expect(saw_waiting);
+    try std.testing.expect(saw_streaming);
     try std.testing.expectEqualStrings("mock reply", got.items);
+    try std.testing.expectEqual(@as(u64, 1242), got_usage.?.total_tokens);
+    try std.testing.expectEqual(@as(u64, 1200), got_usage.?.prompt_tokens);
+    try std.testing.expectEqual(@as(u64, 42), got_usage.?.completion_tokens);
 
     const req = try tmp.dir.readFileAlloc(io, "request.json", alloc, .limited(4096));
     defer alloc.free(req);
     try std.testing.expectEqualStrings("{\"model\":\"mock-model\"}", req);
+}
+
+test "client: SSE error payload becomes a terminal error" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "stream.sse",
+        .data = "data: {\"error\":{\"message\":\"Insufficient Balance\"}}\n\n",
+    });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    var client = Client.init(alloc, io);
+    defer client.deinit();
+    try client.start(.{
+        .url = "http://127.0.0.1:1/v1/chat/completions",
+        .body = "{}",
+        .mock_dir = path_buf[0..n],
+        .chunk_delay_ms = 0,
+    });
+
+    var saw_error = false;
+    var waited_ms: u32 = 0;
+    while (!saw_error and waited_ms < 3000) : (waited_ms += 5) {
+        if (client.pop()) |ev| {
+            defer ev.deinit(alloc);
+            switch (ev) {
+                .err => |e| {
+                    try std.testing.expect(std.mem.indexOf(u8, e, "Insufficient Balance") != null);
+                    saw_error = true;
+                },
+                .done => return error.TestUnexpectedResult,
+                else => {},
+            }
+        } else {
+            std.Io.sleep(io, .fromMilliseconds(5), .real) catch {};
+        }
+    }
+    try std.testing.expect(saw_error);
+}
+
+test "client: stream with no text or tool calls reports an empty response" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "stream.sse",
+        .data = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"insufficient_system_resource\"}]}\n\n" ++
+            "data: [DONE]\n\n",
+    });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    var client = Client.init(alloc, io);
+    defer client.deinit();
+    try client.start(.{
+        .url = "http://127.0.0.1:1/v1/chat/completions",
+        .body = "{}",
+        .mock_dir = path_buf[0..n],
+        .chunk_delay_ms = 0,
+    });
+
+    var saw_error = false;
+    var waited_ms: u32 = 0;
+    while (!saw_error and waited_ms < 3000) : (waited_ms += 5) {
+        if (client.pop()) |ev| {
+            defer ev.deinit(alloc);
+            switch (ev) {
+                .err => |e| {
+                    try std.testing.expect(std.mem.indexOf(u8, e, "empty response") != null);
+                    try std.testing.expect(std.mem.indexOf(u8, e, "insufficient_system_resource") != null);
+                    saw_error = true;
+                },
+                .done => return error.TestUnexpectedResult,
+                else => {},
+            }
+        } else {
+            std.Io.sleep(io, .fromMilliseconds(5), .real) catch {};
+        }
+    }
+    try std.testing.expect(saw_error);
 }
 
 test "client: mock error.txt becomes an error event" {
@@ -628,7 +774,7 @@ test "client: mock error.txt becomes an error event" {
         if (client.pop()) |ev| {
             switch (ev) {
                 .err => |e| saw_err = e,
-                .delta, .done, .cancelled => ev.deinit(alloc),
+                .phase, .usage, .delta, .done, .cancelled => ev.deinit(alloc),
                 .tool_calls => |calls| {
                     tools.freeCalls(alloc, calls);
                     return error.TestUnexpectedResult;
@@ -734,6 +880,7 @@ test "client: tool_calls fragments accumulate while text deltas still stream" {
                     alloc.free(e);
                     return error.TestUnexpectedResult;
                 },
+                .phase, .usage => {},
                 .cancelled => return error.TestUnexpectedResult,
             }
         } else {
@@ -855,6 +1002,7 @@ test "client: per-request mock fixtures and request-<n>.json for follow-ups" {
                     alloc.free(e);
                     return error.TestUnexpectedResult;
                 },
+                .phase, .usage => {},
                 .cancelled, .tool_calls => return error.TestUnexpectedResult,
             }
         } else std.Io.sleep(io, .fromMilliseconds(5), .real) catch {};

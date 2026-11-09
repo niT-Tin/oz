@@ -81,10 +81,9 @@ pub fn tabLayerCount(self: *App, a: std.mem.Allocator) u32 {
 }
 
 /// Rows owned by the buffer strip: one label layer per pane-column layer
-/// plus ONE shared bottom rule/underline row. Content starts below both, so
-/// the active tab can carry the demo's accent inset line without making the
-/// label text cramped. The bar never consumes the content or status band:
-/// at a pathologically short height it clamps to the rows that exist.
+/// plus ONE shared editor context row. Content starts below both. The bar
+/// never consumes the content or status band: at a pathologically short
+/// height it clamps to the rows that exist.
 pub fn tabBarRows(self: *App, a: std.mem.Allocator) u32 {
     const height: u32 = self.vx.window().height;
     if (height <= status_row_count) return 1;
@@ -109,11 +108,14 @@ pub fn contentTop(self: *App, a: std.mem.Allocator) u32 {
     return self.tabBarRows(a);
 }
 
+pub fn navigatorMode(self: *App) nav_tabs.Mode {
+    if (self.ai.agent_focus) return .compact;
+    return nav_tabs.modeForCols(self.vx.window().width);
+}
+
 pub fn contentCol(self: *App) u32 {
-    // Full mode keeps the 30-cell panel; compact mode reserves only the
-    // 7-cell icon rail. In both, one blank column separates the navigator's
-    // right border from editor text.
-    return nav_tabs.editorCol(self.filetree_active, self.vx.window().width);
+    // Agent-focus deliberately keeps the 7-cell icon rail at every width.
+    return nav_tabs.editorColForMode(self.filetree_active, self.navigatorMode());
 }
 
 /// Width of the editor's usable area after the navigator takes its column
@@ -133,7 +135,7 @@ pub fn navigatorBodyTop(self: *App, a: std.mem.Allocator) u32 {
 /// True when the compact icon rail's peek drawer should be drawn/owned.
 pub fn navigatorPeekActive(self: *App) bool {
     return self.filetree_active and self.navigator_peek and
-        nav_tabs.modeForCols(self.vx.window().width) == .compact;
+        self.navigatorMode() == .compact;
 }
 
 /// Width of the relative-line-number gutter in cells: digits of the
@@ -1846,7 +1848,7 @@ pub fn hoverLineSegs(self: *App, a: std.mem.Allocator, line: []const u8, cols: u
 /// existing caches — never from a per-frame filesystem scan.
 pub fn renderNavigator(self: *App, a: std.mem.Allocator, win: vaxis.Window, height: u32) !void {
     if (height <= status_row_count) return;
-    const mode = nav_tabs.modeForCols(win.width);
+    const mode = self.navigatorMode();
     if (mode == .compact) {
         // Keyboard focus leaving the navigator closes the peek, so a user
         // can never type into the editor under an open overlay.
@@ -2721,32 +2723,18 @@ pub fn drawRichPopup(
     }
 }
 
-/// Bottom chrome: a solid status band with a horizontal rule on its first
-/// row. Reserving two rows (`App.status_row_count`) keeps every editor and
-/// rail cell above the band; the rule gives the status text a hard boundary
-/// from the document instead of blending into it.
+/// Bottom chrome: one quiet status band. The background change supplies the
+/// boundary without spending another row on a full-width rule.
 pub fn drawStatusChrome(self: *App, win: vaxis.Window) void {
     const rows: u32 = win.height;
     if (rows <= status_row_count) return;
-    const rule_row = rows - status_row_count;
-    const bg = vaxis.Color{ .rgb = self.theme.bg_status };
     const band = win.child(.{
         .x_off = 0,
-        .y_off = @intCast(rule_row),
+        .y_off = @intCast(rows - status_row_count),
         .width = @intCast(win.width),
         .height = @intCast(status_row_count),
     });
-    band.fill(.{ .style = .{ .bg = bg } });
-    // The top rule is the strongest horizontal chrome boundary above the
-    // status text: full secondary accent, not the old fixed gray.
-    const rule_style = chrome.separatorStyle(self.theme, .major, bg);
-    var col: u32 = 0;
-    while (col < win.width) : (col += 1) {
-        win.writeCell(@intCast(col), @intCast(rule_row), .{
-            .char = .{ .grapheme = "─", .width = 1 },
-            .style = rule_style,
-        });
-    }
+    band.fill(.{ .style = chrome.bandStyle(self.theme) });
 }
 
 /// Fill one strip row span with the strip's flat background. The buffer
@@ -2777,29 +2765,22 @@ fn bufferTabKind(self: *App, buf: *const Buffer) BufferTabKind {
     return .plain;
 }
 
-/// Draw one planned tab strip (a single-window strip or one pane's tabs on
-/// its split layer) and the active-tab underline segment on the shared rule
-/// row. `origin` is the screen column of plan x=0; `buf_map` maps a plan
-/// slot's spec index back to a buffer index. All geometry comes from the
-/// pure `tabstrip.plan`, so the close target and underline cannot drift from
-/// the drawn label.
+/// Draw one planned tab strip on a single-window row or a split pane layer.
+/// `origin` is the screen column of plan x=0; `buf_map` maps plan slots back
+/// to buffers. Active emphasis stays in the label row so the shared context
+/// row below remains readable for every split arrangement.
 pub fn drawBufferTabPlan(
     self: *App,
     a: std.mem.Allocator,
     win: vaxis.Window,
     label_row: u32,
-    rule_row: u32,
     origin: u32,
     p: tabstrip.Plan,
     buf_map: []const usize,
 ) !void {
     const t = self.theme;
-    const strip_bg = vaxis.Color{ .rgb = t.bg_status };
-    const active_underline = vaxis.Style{
-        .fg = .{ .rgb = t.accent_alt },
-        .bg = strip_bg,
-        .bold = true,
-    };
+    const strip_bg = chrome.bandStyle(t).bg;
+    const editor_bg = chrome.surfaceStyle(t).bg;
     const dashboard = self.isDashboard();
     var i: usize = 0;
     while (i < p.count) : (i += 1) {
@@ -2808,10 +2789,7 @@ pub fn drawBufferTabPlan(
         if (buf_idx >= self.buffers.items.len) continue;
         const buf = &self.buffers.items[buf_idx];
         const tab_x = origin + slot.x;
-        const body_bg: vaxis.Color = if (slot.active)
-            .{ .rgb = t.bg_sel }
-        else
-            strip_bg;
+        const body_bg: vaxis.Color = if (slot.active) editor_bg else strip_bg;
         fillStripRow(win, label_row, tab_x, slot.width, body_bg);
         if (!slot.first_visible and slot.x > 0) {
             win.writeCell(@intCast(tab_x - 1), @intCast(label_row), .{
@@ -2821,7 +2799,7 @@ pub fn drawBufferTabPlan(
         }
         const icon = icons.forPath(if (buf.path) |path| path else "", false);
         const icon_style: vaxis.Style = if (slot.active)
-            chrome.activeTabMarkerStyle(t)
+            chrome.activeSurfaceTabMarkerStyle(t)
         else
             .{
                 .fg = .{ .rgb = icons.rgbOf(t, icon.color) },
@@ -2841,7 +2819,7 @@ pub fn drawBufferTabPlan(
             .note => kind_fg = t.type,
         }
         const name_style: vaxis.Style = if (slot.active)
-            chrome.activeTabStyle(t)
+            chrome.activeSurfaceTabStyle(t)
         else
             .{ .fg = .{ .rgb = kind_fg }, .bg = strip_bg };
         if (slot.name_alloc > 0) {
@@ -2907,17 +2885,54 @@ pub fn drawBufferTabPlan(
                 }, .{ .buffer_close = buf_idx });
             }
         }
-        if (slot.active and rule_row < self.vx.window().height) {
-            // Demo `inset 0 1px 0 blue`: a bright accent segment on the
-            // shared bottom rule, spanning the full active tab width.
-            var x: u32 = 0;
-            while (x < slot.width) : (x += 1) {
-                win.writeCell(@intCast(tab_x + x), @intCast(rule_row), .{
-                    .char = .{ .grapheme = "─", .width = 1 },
-                    .style = active_underline,
-                });
-            }
+    }
+}
+
+/// Shared editor context row. It describes only the focused pane, which keeps
+/// horizontal and vertical splits on one predictable row without duplicating
+/// cursors or inventing per-pane request context.
+fn drawEditorContext(
+    self: *App,
+    a: std.mem.Allocator,
+    win: vaxis.Window,
+    row: u32,
+    col: u32,
+    width: u32,
+    cursor_line: u32,
+    cursor_col: u32,
+) !void {
+    if (width == 0) return;
+    const base = chrome.surfaceStyle(self.theme);
+    fillStripRow(win, row, col, width, base.bg);
+
+    const path = tabstrip.contextPath(self.cur().path, self.project_root);
+    const cursor = try std.fmt.allocPrint(a, "L{d}:C{d}", .{ cursor_line + 1, cursor_col });
+    const right = try std.fmt.allocPrint(a, "{s}  {s}", .{ cursor, tabstrip.ask_agent_hint });
+    const right_cells: u32 = @intCast(autil.cellWidth(win, right));
+    const dim: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = base.bg };
+
+    if (right_cells + 2 < width) {
+        const path_budget = width - right_cells - 2;
+        var shown = path;
+        if (autil.cellWidth(win, path) > path_budget) {
+            const fit = autil.cellFitPrefix(win, path, path_budget -| 1);
+            shown = if (path_budget > 1)
+                try std.fmt.allocPrint(a, "{s}{s}", .{ fit.slice, tabstrip.ellipsis })
+            else
+                fit.slice;
         }
+        const path_seg = [_]vaxis.Segment{.{ .text = shown, .style = dim }};
+        _ = win.print(&path_seg, .{ .row_offset = @intCast(row), .col_offset = @intCast(col), .wrap = .none });
+        const right_seg = [_]vaxis.Segment{.{ .text = right, .style = base }};
+        _ = win.print(&right_seg, .{
+            .row_offset = @intCast(row),
+            .col_offset = @intCast(col + width - right_cells),
+            .wrap = .none,
+        });
+    } else {
+        const shown = autil.cellFitPrefix(win, right, width);
+        const seg = [_]vaxis.Segment{.{ .text = shown.slice, .style = base }};
+        _ = win.print(&seg, .{ .row_offset = @intCast(row), .col_offset = @intCast(col), .wrap = .none });
     }
 }
 
@@ -2954,7 +2969,7 @@ pub fn render(self: *App) !void {
     // M2.6a hints: clear this frame's target list. One boolean test per
     // frame outside hint mode; normal frames never touch the fixed array.
     self.hints.beginFrame(height, win.width);
-    // Content area rows: below the two-row buffer strip, above the status
+    // Content area rows: below the buffer labels/context, above the status
     // band. The strip's rows are real layout rows, so the cursor/viewport
     // math below can never paint into them.
     const bar_rows = self.tabBarRows(a);
@@ -2972,39 +2987,26 @@ pub fn render(self: *App) !void {
 
     const cursor_line = self.cur().pt.lineOf(self.curCursor().*);
     const line_count = self.cur().pt.lineCount();
+    const status_col = self.screenCellCol(win, cursor_line, self.curCursor().*);
     // relative-number gutter: computed once per frame, reused by the
     // cursor offset, mc highlight and easymotion labels
     const gutter = self.gutterWidth(line_count);
 
-    // ---- two-row buffer strip (DESIGN §18.11) ----
-    // Row 0..layers-1: labels (one row per pane-column layer). The last row
-    // is a shared full-width rule with the active tab's accent inset
-    // segment. Panes whose column spans overlap keep their own layer; a
-    // vertical split shares one label row, so the strip does not waste rows.
+    // Label layers followed by one focused-editor context row. Vertical
+    // splits share a label row; overlapping pane spans keep separate layers.
     const strip_col = self.contentCol();
     const strip_right = self.aiEditorWidth();
     const strip_w = strip_right -| strip_col;
-    const strip_bg = vaxis.Color{ .rgb = self.theme.bg_status };
-    const label_rows = bar_rows - 1; // shared rule row = last strip row
-    const rule_row = bar_rows - 1;
+    const strip_bg = chrome.bandStyle(self.theme).bg;
+    const label_rows = bar_rows - 1;
+    const context_row = bar_rows - 1;
     if (strip_w > 0) {
         var label_r: u32 = 0;
         while (label_r < label_rows and label_r < height) : (label_r += 1) {
             fillStripRow(win, label_r, strip_col, strip_w, strip_bg);
         }
-        if (rule_row < height) {
-            fillStripRow(win, rule_row, strip_col, strip_w, strip_bg);
-            var rc: u32 = 0;
-            while (rc < strip_w) : (rc += 1) {
-                win.writeCell(@intCast(strip_col + rc), @intCast(rule_row), .{
-                    .char = .{ .grapheme = "─", .width = 1 },
-                    .style = .{
-                        .fg = .{ .rgb = self.theme.win_sep },
-                        .bg = strip_bg,
-                        .dim = true,
-                    },
-                });
-            }
+        if (context_row < height) {
+            try drawEditorContext(self, a, win, context_row, strip_col, strip_w, cursor_line, status_col);
         }
         // Scratch maps reused by every pane; the spec array is frame-arena
         // storage (the vaxis cells reference the printed labels until render).
@@ -3024,7 +3026,7 @@ pub fn render(self: *App) !void {
                 n += 1;
             }
             const p = tabstrip.plan(tab_specs[0..n], strip_w);
-            try self.drawBufferTabPlan(a, win, 0, rule_row, strip_col, p, tab_bufs[0..n]);
+            try self.drawBufferTabPlan(a, win, 0, strip_col, p, tab_bufs[0..n]);
         } else if (self.layoutWindows(a, content_top, content_rows, strip_col, strip_w)) |tab_layout| {
             // Each buffer's tab appears EXACTLY ONCE, owned by the pane that
             // displays it (the focused pane wins when several panes show the
@@ -3098,7 +3100,7 @@ pub fn render(self: *App) !void {
                     }
                     const avail = right -| pos;
                     const p = tabstrip.plan(tab_specs[0..n], avail);
-                    try self.drawBufferTabPlan(a, win, lli, rule_row, pos, p, tab_bufs[0..n]);
+                    try self.drawBufferTabPlan(a, win, lli, pos, p, tab_bufs[0..n]);
                     pos += p.used;
                 }
             }
@@ -3225,8 +3227,7 @@ pub fn render(self: *App) !void {
         // M2b2 inline prompt floats above the rail; hint labels remain the
         // topmost overlay below.
         if (self.inlinePromptOpen()) try self.drawInlinePrompt(a, win);
-        // The dashboard has no status text, but the same bottom rule keeps
-        // its content from running into the terminal edge.
+        // The dashboard has no status text, but keeps the same bottom band.
         self.drawStatusChrome(win);
         // M2.6a: labels + status indicator are the topmost layer, and must be
         // drawn after rail/filetree/dashboard before the frame is flushed.
@@ -3415,6 +3416,9 @@ pub fn render(self: *App) !void {
             max_w = @min(max_w, 60);
         }
         var inner_w: u32 = @intCast(@max(max_w, 12));
+        // Keymap descriptions are long; a slightly wider card gives the
+        // reference room to breathe instead of reading as a cramped list.
+        if (self.picker_mode == .keymaps) inner_w = @max(inner_w, 48);
         var box_w: u32 = undefined;
         if (self.picker_mode == .grep) {
             // fixed-size panel: width is independent of the result count
@@ -3692,6 +3696,45 @@ pub fn render(self: *App) !void {
         };
         self.vx.screen.cursor_vis = true;
         self.vx.screen.cursor_shape = .block;
+        // A picker is modal, but the mode must stay visible. Draw a compact
+        // status band before the early return (the normal status code below
+        // would otherwise be skipped for every picker).
+        self.drawStatusChrome(win);
+        const picker_mode = switch (self.state.mode) {
+            .normal => "NORMAL",
+            .insert => "INSERT",
+            .visual_char, .visual_line, .visual_block => "VISUAL",
+            .command => "COMMAND",
+        };
+        const picker_badge_style: vaxis.Style = .{
+            .fg = .{ .rgb = self.theme.accent },
+            .bg = .{ .rgb = self.theme.bg_status },
+            .bold = true,
+        };
+        _ = win.print(&.{.{ .text = "[", .style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_status } } }}, .{
+            .row_offset = @intCast(height - 1),
+            .col_offset = 0,
+            .wrap = .none,
+        });
+        _ = win.print(&.{.{ .text = picker_mode, .style = picker_badge_style }}, .{
+            .row_offset = @intCast(height - 1),
+            .col_offset = 1,
+            .wrap = .none,
+        });
+        _ = win.print(&.{.{ .text = "]", .style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_status } } }}, .{
+            .row_offset = @intCast(height - 1),
+            .col_offset = @intCast(1 + picker_mode.len),
+            .wrap = .none,
+        });
+        const picker_hint = " Esc close ";
+        const picker_hint_w: u32 = @intCast(autil.cellWidth(win, picker_hint));
+        if (picker_hint_w < win.width) {
+            _ = win.print(&.{.{ .text = picker_hint, .style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg_status } } }}, .{
+                .row_offset = @intCast(height - 1),
+                .col_offset = @intCast(win.width - picker_hint_w),
+                .wrap = .none,
+            });
+        }
         try self.vx.render(self.tty.writer());
         return;
     }
@@ -4190,9 +4233,9 @@ pub fn render(self: *App) !void {
         }
     }
 
-    // The status band is painted after every document overlay so its rule is
-    // the visible boundary above the status text (pickers that return early
-    // have their own modal chrome).
+    // Paint one status row after document overlays. Agent state reserves its
+    // right-hand slot first; left sections clip to the remainder instead of
+    // overwriting it. Hint mode keeps ownership of that slot.
     self.drawStatusChrome(win);
     const mode_name = switch (self.state.mode) {
         .normal => "NORMAL",
@@ -4200,130 +4243,138 @@ pub fn render(self: *App) !void {
         .visual_char, .visual_line, .visual_block => "VISUAL",
         .command => "COMMAND",
     };
-    var mode_buf: [16]u8 = undefined;
-    const mode_badge = std.fmt.bufPrint(&mode_buf, "[{s}]", .{mode_name}) catch mode_name;
-    const status_col = self.screenCellCol(win, cursor_line, self.curCursor().*);
     const ws_name = self.curWsName();
     var ws_buf: [256]u8 = undefined;
     const ws_label = std.fmt.bufPrint(&ws_buf, "[{s}]", .{ws_name}) catch ws_name;
+    const status_path = if (self.cur().path != null)
+        tabstrip.contextPath(self.cur().path, self.project_root)
+    else
+        ws_label;
     var cursor_buf: [96]u8 = undefined;
     const cursor_text = std.fmt.bufPrint(
         &cursor_buf,
         "line {d}/{d} col {d}",
         .{ cursor_line + 1, line_count, status_col },
     ) catch "line ?";
-    // vim-style macro recording indicator: "recording @x" while q is live
-    // (the transient message set at q{reg} vanishes on the next keystroke;
-    // this one persists for the whole recording).
     const rec: []const u8 = if (self.macro_rec) |r|
         try std.fmt.allocPrint(a, "  recording @{c}", .{@as(u8, @intCast('a' + r))})
     else
         "";
-    // a completion request is in flight (zls can take many seconds on
-    // build.zig while its build_runner analyses the project) — show "…"
-    // so a slow response isn't mistaken for a dead completion that
-    // silently turns the next Enter into a newline.
     const completion_marker: []const u8 = if (self.completion_slot != null) "  …" else "";
 
-    const status_bg = vaxis.Color{ .rgb = self.theme.bg_status };
+    const status_band = chrome.bandStyle(self.theme);
+    const status_bg = status_band.bg;
     const status_fg: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = status_bg };
     const status_dim: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = status_bg };
-    const status_sep = chrome.separatorStyle(self.theme, .minor, status_bg);
-    const status_accent: vaxis.Style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = status_bg };
+    const status_sep: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = status_bg };
+    // Quiet mode badge: accent text on the band, not a solid accent block.
     const status_badge: vaxis.Style = .{
-        .fg = .{ .rgb = self.theme.bg },
-        .bg = .{ .rgb = self.theme.accent },
+        .fg = .{ .rgb = self.theme.accent },
+        .bg = status_bg,
         .bold = true,
     };
     const status_row: u32 = height - 1;
+
+    var ai_text: ?[]const u8 = null;
+    var ai_cells: u32 = 0;
+    if (!self.hints.active and self.msg == null) {
+        const ai_budget = @min(win.width / 3, 48);
+        if (ai_budget > 0) {
+            if (try self.aiStatusText(a)) |full| {
+                ai_text = full;
+                ai_cells = @intCast(autil.cellWidth(win, full));
+                if (ai_cells > ai_budget) {
+                    if (try self.aiStatusTextCompact(a)) |compact| {
+                        ai_text = compact;
+                        ai_cells = @intCast(autil.cellWidth(win, compact));
+                    }
+                }
+                if (ai_cells > ai_budget) {
+                    if (try self.aiStatusTextMini(a)) |mini| {
+                        ai_text = mini;
+                        ai_cells = @intCast(autil.cellWidth(win, mini));
+                    }
+                }
+                if (ai_cells > ai_budget) {
+                    const fit = autil.cellFitSuffix(win, ai_text.?, ai_budget -| 1);
+                    ai_text = try std.fmt.allocPrint(a, "{s}{s}", .{ tabstrip.ellipsis, fit.slice });
+                    ai_cells = ai_budget;
+                }
+            }
+        }
+    }
+    const ai_reserved = if (ai_text != null and ai_cells > 0) ai_cells + 2 else 0;
+    const left_limit = win.width -| ai_reserved;
     var used_cells: u32 = 0;
     const printStatus = struct {
-        fn one(win_: vaxis.Window, text: []const u8, style: vaxis.Style, row: u32, col: *u32) void {
-            const seg = [_]vaxis.Segment{.{ .text = text, .style = style }};
+        fn one(win_: vaxis.Window, text: []const u8, style: vaxis.Style, row: u32, col: *u32, limit: u32) void {
+            if (col.* >= limit) return;
+            const fit = autil.cellFitPrefix(win_, text, limit - col.*);
+            if (fit.slice.len == 0) return;
+            const seg = [_]vaxis.Segment{.{ .text = fit.slice, .style = style }};
             _ = win_.print(&seg, .{ .row_offset = @intCast(row), .col_offset = @intCast(col.*), .wrap = .none });
-            col.* += @intCast(autil.cellWidth(win_, text));
+            col.* += @intCast(fit.cells);
         }
     }.one;
-    // Sections: workspace │ mode badge │ file/cursor │ git branch. `│`
-    // separators are drawn in every state so the row reads as a status line,
-    // not as the document's last line.
-    printStatus(win, ws_label, status_fg, status_row, &used_cells);
-    printStatus(win, " │ ", status_sep, status_row, &used_cells);
-    printStatus(win, mode_badge, status_badge, status_row, &used_cells);
-    printStatus(win, " │ ", status_sep, status_row, &used_cells);
-    printStatus(win, cursor_text, status_fg, status_row, &used_cells);
-    if (completion_marker.len > 0) printStatus(win, completion_marker, status_fg, status_row, &used_cells);
-    if (self.msg) |m| {
-        printStatus(win, "  ", status_fg, status_row, &used_cells);
-        printStatus(win, m, status_fg, status_row, &used_cells);
-    }
-    if (rec.len > 0) printStatus(win, rec, status_fg, status_row, &used_cells);
-    // git branch (M3a): the design's StatusLine git section, after a
-    // separator so it never merges with a long status message.
-    if (self.git_branch) |b| {
-        printStatus(win, " │ ", status_sep, status_row, &used_cells);
-        printStatus(win, "⎇ ", status_accent, status_row, &used_cells);
-        printStatus(win, std.mem.trim(u8, b, " \t\r\n"), status_accent, status_row, &used_cells);
-    }
 
-    // AI workspace status (M2a): active thread · model · status, flush right
-    // on the status bar, followed by an explicit dock/drawer layout cell.
-    // Hint mode owns that slot (HINTS · N targets · Esc cancel) and
-    // suppresses both so the indicators never share cells.
-    if (!self.hints.active) {
-        const layout_text: ?[]const u8 = if (self.ai.rail_open)
-            (if (self.aiLayout().mode == .docked) "dock" else "drawer")
-        else
-            null;
-        const layout_cells: u32 = if (layout_text) |text| @intCast(autil.cellWidth(win, text)) else 0;
-        const layout_reserved: u32 = if (layout_text != null) layout_cells + 3 else 0;
-        const avail = win.width -| used_cells -| 2 -| layout_reserved;
-        const ai_status_text: ?[]const u8 = try self.aiStatusText(a);
-        if (ai_status_text) |full_ai_text| {
-            var ai_text = full_ai_text;
-            var ai_cells: u32 = @intCast(autil.cellWidth(win, ai_text));
-            if (ai_cells > avail) {
-                if (try self.aiStatusTextCompact(a)) |compact| {
-                    ai_text = compact;
-                    ai_cells = @intCast(autil.cellWidth(win, ai_text));
+    // Dim brackets keep the mode readable without the "solid badge" look.
+    printStatus(win, "[", status_sep, status_row, &used_cells, left_limit);
+    printStatus(win, mode_name, status_badge, status_row, &used_cells, left_limit);
+    printStatus(win, "]", status_sep, status_row, &used_cells, left_limit);
+    printStatus(win, " │ ", status_sep, status_row, &used_cells, left_limit);
+    printStatus(win, ws_label, status_dim, status_row, &used_cells, left_limit);
+    printStatus(win, " │ ", status_sep, status_row, &used_cells, left_limit);
+    printStatus(win, cursor_text, status_fg, status_row, &used_cells, left_limit);
+    if (self.git_branch) |b| {
+        printStatus(win, " │ ", status_sep, status_row, &used_cells, left_limit);
+        printStatus(win, "⎇ ", status_band, status_row, &used_cells, left_limit);
+        printStatus(win, std.mem.trim(u8, b, " \t\r\n"), status_band, status_row, &used_cells, left_limit);
+    }
+    if (completion_marker.len > 0) printStatus(win, completion_marker, status_fg, status_row, &used_cells, left_limit);
+    if (self.msg) |m| {
+        printStatus(win, " │ ", status_sep, status_row, &used_cells, left_limit);
+        printStatus(win, m, status_fg, status_row, &used_cells, left_limit);
+    }
+    if (rec.len > 0) printStatus(win, rec, status_fg, status_row, &used_cells, left_limit);
+    // Responsive priority: the buffer strip's context row already shows the
+    // full path. On medium/narrow terminals show a suffix (basename) or drop
+    // the duplicate instead of truncating the path to a useless prefix.
+    if (win.width >= 90) {
+        printStatus(win, " │ ", status_sep, status_row, &used_cells, left_limit);
+        const path_budget = left_limit -| used_cells;
+        if (path_budget > 0) {
+            if (autil.cellWidth(win, status_path) <= path_budget) {
+                printStatus(win, status_path, status_dim, status_row, &used_cells, left_limit);
+            } else {
+                const base = std.fs.path.basename(status_path);
+                const short = try std.fmt.allocPrint(a, "{s}/{s}", .{ tabstrip.ellipsis, base });
+                if (autil.cellWidth(win, short) <= path_budget) {
+                    printStatus(win, short, status_dim, status_row, &used_cells, left_limit);
+                } else {
+                    const fit = autil.cellFitSuffix(win, status_path, path_budget);
+                    printStatus(win, fit.slice, status_dim, status_row, &used_cells, left_limit);
                 }
-            }
-            if (ai_cells > avail) {
-                if (try self.aiStatusTextMini(a)) |mini| {
-                    ai_text = mini;
-                    ai_cells = @intCast(autil.cellWidth(win, ai_text));
-                }
-            }
-            if (ai_cells <= avail) {
-                const ai_status = self.ai.threads.activeStatus();
-                const ai_style: vaxis.Style = .{
-                    .fg = .{ .rgb = if (ai_status == .streaming) self.theme.accent else self.theme.fg_dim },
-                    .bg = status_bg,
-                };
-                const ai_seg = [_]vaxis.Segment{.{ .text = ai_text, .style = ai_style }};
-                _ = win.print(&ai_seg, .{
-                    .row_offset = @intCast(status_row),
-                    .col_offset = @intCast(win.width - layout_reserved - ai_cells),
-                    .wrap = .none,
-                });
             }
         }
-        if (layout_text) |text| {
-            if (win.width >= layout_cells + 3) {
-                const sep_col = win.width - layout_cells - 3;
-                const sep_seg = [_]vaxis.Segment{.{ .text = " │ ", .style = status_sep }};
-                _ = win.print(&sep_seg, .{
-                    .row_offset = @intCast(status_row),
-                    .col_offset = @intCast(sep_col),
-                    .wrap = .none,
-                });
-                const layout_seg = [_]vaxis.Segment{.{ .text = text, .style = status_dim }};
-                _ = win.print(&layout_seg, .{
-                    .row_offset = @intCast(status_row),
-                    .col_offset = @intCast(win.width - layout_cells),
-                    .wrap = .none,
-                });
-            }
+    }
+
+    if (ai_text) |text| {
+        if (ai_cells > 0 and ai_cells <= win.width) {
+            const ai_status = self.ai.threads.activeStatus();
+            const ai_style: vaxis.Style = .{
+                .fg = .{ .rgb = switch (ai_status) {
+                    .streaming => self.theme.accent,
+                    .err => self.theme.diag_error,
+                    else => self.theme.fg_dim,
+                } },
+                .bg = status_bg,
+            };
+            const ai_seg = [_]vaxis.Segment{.{ .text = text, .style = ai_style }};
+            _ = win.print(&ai_seg, .{
+                .row_offset = @intCast(status_row),
+                .col_offset = @intCast(win.width - ai_cells),
+                .wrap = .none,
+            });
         }
     }
 

@@ -321,7 +321,7 @@ fn isJsonWhitespace(c: u8) bool {
 // Streaming tool-call accumulation
 // ---------------------------------------------------------------------------
 
-pub const FinishReason = enum { stop, length, tool_calls, content_filter, function_call, unknown };
+pub const FinishReason = enum { stop, length, tool_calls, content_filter, function_call, insufficient_system_resource, aborted, unknown };
 
 pub const ToolCall = struct {
     /// Owned; free with `deinit` (or `freeCalls`).
@@ -651,6 +651,8 @@ fn parseFinishReason(raw: []const u8) FinishReason {
     if (std.mem.eql(u8, raw, "tool_calls")) return .tool_calls;
     if (std.mem.eql(u8, raw, "content_filter")) return .content_filter;
     if (std.mem.eql(u8, raw, "function_call")) return .function_call;
+    if (std.mem.eql(u8, raw, "insufficient_system_resource")) return .insufficient_system_resource;
+    if (std.mem.eql(u8, raw, "aborted")) return .aborted;
     return .unknown;
 }
 

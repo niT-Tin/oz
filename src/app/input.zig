@@ -175,8 +175,10 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
                 }
             },
             // Agent Rail (M2a): open/focus the thread list. Keep the
-            // editor's Ctrl-w hjkl contract untouched.
+            // editor's Ctrl-w hjkl contract untouched. Uppercase A switches
+            // the wider Agent-focus layout without replacing either binding.
             'a' => try self.focusAiRail(),
+            'A' => try self.toggleAiFocus(),
             else => {},
         }
         return;

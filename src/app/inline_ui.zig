@@ -385,9 +385,9 @@ pub fn drainInline(self: *App) !bool {
             .cancelled => {
                 if (s.request_active) setInlineError(self, "stream cancelled");
             },
-            // The inline request never advertises tools; a tool-call event
-            // is a protocol surprise. `defer ev.deinit` already freed it.
-            .tool_calls => {},
+            // Inline has no harness of its own yet; transport phases and usage
+            // do not alter the replacement text. Tool calls are not advertised.
+            .phase, .usage, .tool_calls => {},
         }
     }
     if (s.request_active and s.status == .streaming and !c.isRunning() and !c.hasEvents()) {
@@ -805,6 +805,240 @@ pub const ReviewView = struct {
     reject_action: hints.Action,
 };
 
+fn tintBackground(base: vaxis.Color, accent: [3]u8, amount: u8) vaxis.Color {
+    return switch (base) {
+        .rgb => |rgb| .{ .rgb = .{
+            @intCast((@as(u16, rgb[0]) * (255 - @as(u16, amount)) + @as(u16, accent[0]) * amount) / 255),
+            @intCast((@as(u16, rgb[1]) * (255 - @as(u16, amount)) + @as(u16, accent[1]) * amount) / 255),
+            @intCast((@as(u16, rgb[2]) * (255 - @as(u16, amount)) + @as(u16, accent[2]) * amount) / 255),
+        } },
+        else => base,
+    };
+}
+
+fn drawReviewTitle(
+    self: *App,
+    a: std.mem.Allocator,
+    win: vaxis.Window,
+    row: u32,
+    x: u32,
+    w: u32,
+    border_style: vaxis.Style,
+    rail_bg: vaxis.Color,
+    title: []const u8,
+    removed: u32,
+    added: u32,
+    stale: bool,
+) !void {
+    const t = self.theme;
+    const title_style: vaxis.Style = .{
+        .fg = .{ .rgb = if (stale) t.git_del else t.accent },
+        .bg = rail_bg,
+        .bold = true,
+    };
+    const removed_text = try std.fmt.allocPrint(a, "-{d}", .{removed});
+    const added_text = try std.fmt.allocPrint(a, "+{d}", .{added});
+    const stats_cells: u32 = @intCast(autil.cellWidth(win, removed_text) + autil.cellWidth(win, added_text) + 1);
+    const content_w = w -| 3;
+    const fit = autil.cellFitPrefix(win, title, content_w -| stats_cells -| 2);
+    var segs = std.ArrayList(vaxis.Segment).empty;
+    try segs.append(a, .{ .text = fit.slice, .style = title_style });
+    var used: u32 = @intCast(fit.cells);
+    if (content_w >= used + stats_cells + 2) {
+        const padding = content_w - used - stats_cells;
+        const spaces = try a.alloc(u8, padding);
+        @memset(spaces, ' ');
+        try segs.append(a, .{ .text = spaces, .style = .{ .bg = rail_bg } });
+        try segs.append(a, .{ .text = removed_text, .style = .{ .fg = .{ .rgb = t.git_del }, .bg = rail_bg } });
+        try segs.append(a, .{ .text = " ", .style = .{ .bg = rail_bg } });
+        try segs.append(a, .{ .text = added_text, .style = .{ .fg = .{ .rgb = t.git_add }, .bg = rail_bg } });
+        used = content_w;
+    }
+    try drawRow(win, a, row, x, w, "│", border_style, rail_bg, segs.items, used);
+}
+
+fn drawReviewPath(
+    self: *App,
+    a: std.mem.Allocator,
+    win: vaxis.Window,
+    row: u32,
+    x: u32,
+    w: u32,
+    border_style: vaxis.Style,
+    rail_bg: vaxis.Color,
+    path: []const u8,
+    meta: []const u8,
+) !void {
+    const t = self.theme;
+    const content_w = w -| 3;
+    const meta_cells: u32 = @intCast(autil.cellWidth(win, meta));
+    const fit = autil.cellFitPrefix(win, path, content_w -| meta_cells -| 2);
+    var segs = std.ArrayList(vaxis.Segment).empty;
+    try segs.append(a, .{ .text = fit.slice, .style = .{ .fg = .{ .rgb = t.fg }, .bg = rail_bg, .bold = true } });
+    var used: u32 = @intCast(fit.cells);
+    if (meta.len > 0 and content_w >= used + meta_cells + 2) {
+        const padding = content_w - used - meta_cells;
+        const spaces = try a.alloc(u8, padding);
+        @memset(spaces, ' ');
+        try segs.append(a, .{ .text = spaces, .style = .{ .bg = rail_bg } });
+        try segs.append(a, .{ .text = meta, .style = .{ .fg = .{ .rgb = t.fg_dim }, .bg = rail_bg } });
+        used = content_w;
+    }
+    try drawRow(win, a, row, x, w, "│", border_style, rail_bg, segs.items, used);
+}
+
+fn drawReviewActions(
+    self: *App,
+    a: std.mem.Allocator,
+    win: vaxis.Window,
+    row: u32,
+    x: u32,
+    w: u32,
+    border_style: vaxis.Style,
+    rail_bg: vaxis.Color,
+    approve_action: hints.Action,
+    reject_action: hints.Action,
+) !void {
+    const t = self.theme;
+    const accent: vaxis.Style = .{ .fg = .{ .rgb = t.accent_alt }, .bg = rail_bg, .bold = true };
+    const reject: vaxis.Style = .{ .fg = .{ .rgb = t.git_del }, .bg = rail_bg };
+    const content_w = w -| 3;
+    const full = "[a] approve  [r] reject";
+    if (content_w >= autil.cellWidth(win, full)) {
+        const segs = [_]vaxis.Segment{
+            .{ .text = "[a] approve", .style = accent },
+            .{ .text = "  ", .style = .{ .bg = rail_bg } },
+            .{ .text = "[r] reject", .style = reject },
+        };
+        try drawRow(win, a, row, x, w, "│", border_style, rail_bg, &segs, @intCast(autil.cellWidth(win, full)));
+        if (self.mouseTargetsCollecting()) {
+            self.addHintTarget(.{
+                .row = row,
+                .col = x + 2,
+                .width = @intCast("[a] approve".len),
+                .height = 1,
+            }, approve_action);
+            self.addHintTarget(.{
+                .row = row,
+                .col = x + 2 + @as(u32, @intCast("[a] approve  ".len)),
+                .width = @intCast("[r] reject".len),
+                .height = 1,
+            }, reject_action);
+        }
+    } else {
+        try drawTextRow(self, win, a, row, x, w, border_style, rail_bg, full, accent);
+    }
+}
+
+fn decimalDigits(value: u32) u32 {
+    var n = value;
+    var digits: u32 = 1;
+    while (n >= 10) : (digits += 1) n /= 10;
+    return digits;
+}
+
+fn diffNumberWidth(first_line: u32, last_line: u32, diff_len: usize) u32 {
+    const extra: u32 = @intCast(@min(diff_len, std.math.maxInt(u32)));
+    return decimalDigits(@max(first_line, last_line) +| extra);
+}
+
+fn formatNumberRail(a: std.mem.Allocator, old_line: ?u32, new_line: ?u32, width: u32) ![]u8 {
+    const out = try a.alloc(u8, width * 2 + 1);
+    @memset(out, ' ');
+    if (old_line) |n| {
+        const text = try std.fmt.allocPrint(a, "{d}", .{n});
+        if (text.len <= width) @memcpy(out[width - text.len .. width], text);
+    }
+    if (new_line) |n| {
+        const text = try std.fmt.allocPrint(a, "{d}", .{n});
+        if (text.len <= width) @memcpy(out[width * 2 + 1 - text.len .. width * 2 + 1], text);
+    }
+    return out;
+}
+
+fn drawCachedDiffRows(
+    self: *App,
+    a: std.mem.Allocator,
+    win: vaxis.Window,
+    x: u32,
+    w: u32,
+    row: u32,
+    diff_rows: u32,
+    border_style: vaxis.Style,
+    rail_bg: vaxis.Color,
+    first_line: u32,
+    last_line: u32,
+    diff: []const inline_model.DiffLine,
+    scroll: *u32,
+) !void {
+    if (diff_rows == 0) return;
+    const t = self.theme;
+    const bottom = row + diff_rows;
+    const max_top = diff.len -| diff_rows;
+    if (scroll.* > max_top) scroll.* = @intCast(max_top);
+    const top = scroll.*;
+    const content_w = w -| 3;
+    const number_width = diffNumberWidth(first_line, last_line, diff.len);
+    const dual_numbers = content_w >= 30 and content_w >= number_width * 2 + 11;
+    var drawn: u32 = 0;
+    while (drawn < diff_rows) : (drawn += 1) {
+        const idx = top + drawn;
+        if (idx >= diff.len) break;
+        const d = diff[idx];
+        if (d.kind == .hunk) {
+            const bg = tintBackground(rail_bg, t.accent_alt, 15);
+            const fit = autil.cellFitPrefix(win, d.text, content_w);
+            try drawRow(win, a, row + drawn, x, w, "│", border_style, bg, &.{.{ .text = fit.slice, .style = .{
+                .fg = .{ .rgb = t.accent_alt },
+                .bg = bg,
+            } }}, @intCast(fit.cells));
+            continue;
+        }
+        if (d.kind == .note) {
+            const fit = autil.cellFitPrefix(win, d.text, content_w);
+            try drawRow(win, a, row + drawn, x, w, "│", border_style, rail_bg, &.{.{ .text = fit.slice, .style = .{
+                .fg = .{ .rgb = t.fg_faint },
+                .bg = rail_bg,
+                .italic = true,
+            } }}, @intCast(fit.cells));
+            continue;
+        }
+
+        const bg = switch (d.kind) {
+            .removed => tintBackground(rail_bg, t.git_del, 24),
+            .added => tintBackground(rail_bg, t.git_add, 24),
+            else => rail_bg,
+        };
+        const style: vaxis.Style = switch (d.kind) {
+            .removed => .{ .fg = .{ .rgb = t.git_del }, .bg = bg },
+            .added => .{ .fg = .{ .rgb = t.git_add }, .bg = bg },
+            else => .{ .fg = .{ .rgb = t.fg_dim }, .bg = bg },
+        };
+        const number_style: vaxis.Style = .{ .fg = .{ .rgb = t.fg_faint }, .bg = bg };
+        const sign: []const u8 = switch (d.kind) {
+            .removed => "- ",
+            .added => "+ ",
+            else => "  ",
+        };
+        const numbered_cells = number_width * 2 + 1 + sign.len;
+        const show_numbers = dual_numbers and
+            autil.cellWidth(win, d.text) + numbered_cells <= content_w;
+        const numbers = if (show_numbers) try formatNumberRail(a, d.old_line, d.new_line, number_width) else "";
+        const prefix_cells: u32 = @intCast(numbers.len + sign.len);
+        const fit = autil.cellFitPrefix(win, d.text, content_w -| prefix_cells);
+        const segs = [_]vaxis.Segment{
+            .{ .text = numbers, .style = number_style },
+            .{ .text = sign, .style = style },
+            .{ .text = fit.slice, .style = style },
+        };
+        try drawRow(win, a, row + drawn, x, w, "│", border_style, bg, &segs, prefix_cells + @as(u32, @intCast(fit.cells)));
+    }
+    var y = row + drawn;
+    while (y < bottom) : (y += 1) {
+        try drawRow(win, a, y, x, w, "│", border_style, rail_bg, &.{}, 0);
+    }
+}
+
 pub fn drawDiffReview(
     self: *App,
     a: std.mem.Allocator,
@@ -818,107 +1052,27 @@ pub fn drawDiffReview(
     view: ReviewView,
 ) !void {
     if (body_rows == 0) return;
-    const t = self.theme;
-    const dim: vaxis.Style = .{ .fg = .{ .rgb = t.fg_dim }, .bg = rail_bg };
-    const base: vaxis.Style = .{ .fg = .{ .rgb = t.fg }, .bg = rail_bg };
-    const err_style: vaxis.Style = .{ .fg = .{ .rgb = t.diag_error }, .bg = rail_bg, .bold = true };
-    const add_style: vaxis.Style = .{ .fg = .{ .rgb = t.string }, .bg = rail_bg };
-    const accent: vaxis.Style = .{ .fg = .{ .rgb = t.accent }, .bg = rail_bg, .bold = true };
     const bottom = body_top + body_rows;
     var row = body_top;
-
-    // header: path · lines A-B
-    {
-        const text = try std.fmt.allocPrint(a, "{s} · lines {d}-{d}", .{ view.path, view.first_line, view.last_line });
-        try drawTextRow(self, win, a, row, x, w, border_style, rail_bg, text, base);
-        row += 1;
-    }
+    const title = if (view.stale)
+        view.stale_label
+    else if (view.partial)
+        try std.fmt.allocPrint(a, "APPROVAL REQUIRED · {s}", .{view.partial_label})
+    else
+        "APPROVAL REQUIRED";
+    try drawReviewTitle(self, a, win, row, x, w, border_style, rail_bg, title, view.removed, view.added, view.stale);
+    row += 1;
     if (row >= bottom) return;
-    // stats + stale/partial markers
-    {
-        var text = try std.fmt.allocPrint(a, "-{d} +{d}", .{ view.removed, view.added });
-        if (view.partial) text = try std.fmt.allocPrint(a, "{s}  {s}", .{ text, view.partial_label });
-        if (view.stale) text = try std.fmt.allocPrint(a, "{s}  {s}", .{ text, view.stale_label });
-        try drawTextRow(self, win, a, row, x, w, border_style, rail_bg, text, if (view.stale) err_style else dim);
-        row += 1;
-    }
+    const meta = try std.fmt.allocPrint(a, "lines {d}-{d}", .{ view.first_line, view.last_line });
+    try drawReviewPath(self, a, win, row, x, w, border_style, rail_bg, view.path, meta);
+    row += 1;
     if (row >= bottom) return;
-    // buttons (hint targets: Approve / Reject)
-    {
-        const content_w = w -| 3;
-        const full = "[a] approve  [r] reject";
-        if (content_w >= autil.cellWidth(win, full)) {
-            var segs = std.ArrayList(vaxis.Segment).empty;
-            try segs.append(a, .{ .text = "[a] approve", .style = accent });
-            try segs.append(a, .{ .text = "  ", .style = .{ .bg = rail_bg } });
-            try segs.append(a, .{ .text = "[r] reject", .style = err_style });
-            const used: u32 = @intCast(autil.cellWidth(win, full));
-            try drawRow(win, a, row, x, w, "│", border_style, rail_bg, segs.items, used);
-            if (self.mouseTargetsCollecting()) {
-                // Target the WHOLE drawn button label, not just the 3-cell
-                // hint prefix: pointer users click the word ("approve"),
-                // while `<leader>j` still paints its label at the same
-                // top-left cell. Hint behavior/tests are unchanged.
-                self.addHintTarget(.{
-                    .row = row,
-                    .col = x + 2,
-                    .width = @intCast("[a] approve".len),
-                    .height = 1,
-                }, view.approve_action);
-                self.addHintTarget(.{
-                    .row = row,
-                    .col = x + 2 + @as(u32, @intCast("[a] approve  ".len)),
-                    .width = @intCast("[r] reject".len),
-                    .height = 1,
-                }, view.reject_action);
-            }
-        } else {
-            try drawTextRow(self, win, a, row, x, w, border_style, rail_bg, "[a] approve  [r] reject", accent);
-        }
-        row += 1;
-    }
+    try drawReviewActions(self, a, win, row, x, w, border_style, rail_bg, view.approve_action, view.reject_action);
+    row += 1;
     if (row >= bottom) return;
-    // breathing row
     try drawRow(win, a, row, x, w, "│", border_style, rail_bg, &.{}, 0);
     row += 1;
-    const diff_rows = bottom -| row;
-    if (diff_rows == 0) return;
-    const max_top = view.diff.len -| diff_rows;
-    if (view.scroll.* > max_top) view.scroll.* = @intCast(max_top);
-    const top = view.scroll.*;
-    var k: u32 = 0;
-    while (k < diff_rows) : (k += 1) {
-        const idx = top + k;
-        if (idx >= view.diff.len) break;
-        const d = view.diff[idx];
-        const prefix: []const u8 = switch (d.kind) {
-            .context => "  ",
-            .removed => "- ",
-            .added => "+ ",
-        };
-        const style: vaxis.Style = switch (d.kind) {
-            .context => base,
-            .removed => err_style,
-            .added => add_style,
-        };
-        // Cached diff text + a two-cell prefix drawn as segments: no
-        // per-frame diff string construction/allocation.
-        const content_w = w -| 3;
-        const fit = autil.cellFitPrefix(win, d.text, content_w -| 2);
-        const segs = [_]vaxis.Segment{
-            .{ .text = prefix, .style = style },
-            .{ .text = fit.slice, .style = style },
-        };
-        const used: u32 = 2 + @as(u32, @intCast(fit.cells));
-        try drawRow(win, a, row + k, x, w, "│", border_style, rail_bg, &segs, used);
-    }
-    // Fill every remaining body row with the rail border: the Changes body
-    // must stay a closed panel even when the diff is shorter than the body
-    // (scenario/golden checks sample the bottom-left cell).
-    var y = row + @min(@as(u32, @intCast(view.diff.len -| top)), diff_rows);
-    while (y < bottom) : (y += 1) {
-        try drawRow(win, a, y, x, w, "│", border_style, rail_bg, &.{}, 0);
-    }
+    try drawCachedDiffRows(self, a, win, x, w, row, bottom -| row, border_style, rail_bg, view.first_line, view.last_line, view.diff, view.scroll);
 }
 
 /// Multi-file staged patch review. One row per file (bounded window around
@@ -930,6 +1084,8 @@ pub const MultiReviewView = struct {
     paths: []const []const u8,
     actions: []const hints.Action,
     active: usize,
+    first_line: u32,
+    last_line: u32,
     total_removed: u32,
     total_added: u32,
     stale: bool = false,
@@ -942,9 +1098,9 @@ pub const MultiReviewView = struct {
 };
 
 /// Number of file-list rows the multi review may use at `body_rows`, leaving
-/// a title, buttons, one breathing row and at least two diff rows.
+/// the shared title/path/actions headers, one breathing row and two diff rows.
 pub fn multiFileRowBudget(body_rows: u32, file_count: usize) u32 {
-    const budget = body_rows -| 5;
+    const budget = body_rows -| 6;
     return @min(file_count, @max(budget, 1));
 }
 
@@ -964,54 +1120,52 @@ pub fn drawMultiDiffReview(
     const t = self.theme;
     const dim: vaxis.Style = .{ .fg = .{ .rgb = t.fg_dim }, .bg = rail_bg };
     const base: vaxis.Style = .{ .fg = .{ .rgb = t.fg }, .bg = rail_bg };
-    const err_style: vaxis.Style = .{ .fg = .{ .rgb = t.diag_error }, .bg = rail_bg, .bold = true };
-    const add_style: vaxis.Style = .{ .fg = .{ .rgb = t.string }, .bg = rail_bg };
-    const accent: vaxis.Style = .{ .fg = .{ .rgb = t.accent }, .bg = rail_bg, .bold = true };
+    const accent: vaxis.Style = .{ .fg = .{ .rgb = t.accent_alt }, .bg = rail_bg, .bold = true };
     const bottom = body_top + body_rows;
+    const active = @min(view.active, view.paths.len - 1);
     var row = body_top;
 
-    // total stats header (the Chat card carries the same totals)
-    {
-        var text = try std.fmt.allocPrint(a, "{d} files · -{d} +{d}", .{
-            view.paths.len,
-            view.total_removed,
-            view.total_added,
-        });
-        if (view.stale) {
-            const suffix = if (view.stale_file) |f|
-                try std.fmt.allocPrint(a, "  {s}: {s}", .{ view.stale_label, f })
-            else
-                try std.fmt.allocPrint(a, "  {s}", .{view.stale_label});
-            text = try std.fmt.allocPrint(a, "{s}{s}", .{ text, suffix });
-        }
-        try drawTextRow(self, win, a, row, x, w, border_style, rail_bg, text, if (view.stale) err_style else dim);
-        row += 1;
-    }
+    const title = if (view.stale)
+        if (view.stale_file) |file|
+            try std.fmt.allocPrint(a, "{s} · {s}", .{ view.stale_label, file })
+        else
+            view.stale_label
+    else
+        "APPROVAL REQUIRED";
+    try drawReviewTitle(self, a, win, row, x, w, border_style, rail_bg, title, view.total_removed, view.total_added, view.stale);
+    row += 1;
+    if (row >= bottom) return;
+    const meta = try std.fmt.allocPrint(a, "file {d}/{d} · lines {d}-{d}", .{
+        active + 1,
+        view.paths.len,
+        view.first_line,
+        view.last_line,
+    });
+    try drawReviewPath(self, a, win, row, x, w, border_style, rail_bg, view.paths[active], meta);
+    row += 1;
     if (row >= bottom) return;
 
-    // file list (bounded window around the active file, explicit overflow)
     const budget = multiFileRowBudget(body_rows, view.paths.len);
     const overflow = view.paths.len > budget;
     const shown = if (overflow) @max(budget -| 1, 1) else budget;
     const max_start = view.paths.len - shown;
     var start: usize = 0;
-    if (view.active >= shown) start = @min(view.active - shown + 1, max_start);
-    if (view.active < start) start = view.active;
+    if (active >= shown) start = @min(active - shown + 1, max_start);
+    if (active < start) start = active;
     const content_w = w -| 3;
     var fi: usize = 0;
     while (fi < shown and row < bottom) : (fi += 1) {
         const idx = start + fi;
         if (idx >= view.paths.len) break;
-        const active = idx == view.active;
-        const marker: []const u8 = if (active) "> " else "  ";
-        const max_cells: usize = content_w -| 2;
-        const fit = autil.cellFitPrefix(win, view.paths[idx], max_cells);
+        const is_active = idx == active;
+        const marker: []const u8 = if (is_active) "> " else "  ";
+        const fit = autil.cellFitPrefix(win, view.paths[idx], content_w -| 2);
         const clipped = fit.slice.len < view.paths[idx].len;
         const text = if (clipped)
             try std.fmt.allocPrint(a, "{s}{s}…", .{ marker, fit.slice })
         else
             try std.fmt.allocPrint(a, "{s}{s}", .{ marker, fit.slice });
-        try drawTextRow(self, win, a, row, x, w, border_style, rail_bg, text, if (active) accent else base);
+        try drawTextRow(self, win, a, row, x, w, border_style, rail_bg, text, if (is_active) accent else base);
         if (self.mouseTargetsCollecting()) {
             self.addHintTarget(.{
                 .row = row,
@@ -1026,79 +1180,17 @@ pub fn drawMultiDiffReview(
         row += 1;
     }
     if (overflow and row < bottom) {
-        const text = try std.fmt.allocPrint(
-            a,
-            "… file {d}/{d} · j/k select",
-            .{ view.active + 1, view.paths.len },
-        );
+        const text = try std.fmt.allocPrint(a, "… file {d}/{d} · j/k select", .{ active + 1, view.paths.len });
         try drawTextRow(self, win, a, row, x, w, border_style, rail_bg, text, dim);
         row += 1;
     }
     if (row >= bottom) return;
-
-    // buttons
-    {
-        const full = "[a] approve  [r] reject";
-        if (content_w >= autil.cellWidth(win, full)) {
-            var segs = std.ArrayList(vaxis.Segment).empty;
-            try segs.append(a, .{ .text = "[a] approve", .style = accent });
-            try segs.append(a, .{ .text = "  ", .style = .{ .bg = rail_bg } });
-            try segs.append(a, .{ .text = "[r] reject", .style = err_style });
-            const used: u32 = @intCast(autil.cellWidth(win, full));
-            try drawRow(win, a, row, x, w, "│", border_style, rail_bg, segs.items, used);
-            if (self.mouseTargetsCollecting()) {
-                self.addHintTarget(.{
-                    .row = row,
-                    .col = x + 2,
-                    .width = @intCast("[a] approve".len),
-                    .height = 1,
-                }, view.approve_action);
-                self.addHintTarget(.{
-                    .row = row,
-                    .col = x + 2 + @as(u32, @intCast("[a] approve  ".len)),
-                    .width = @intCast("[r] reject".len),
-                    .height = 1,
-                }, view.reject_action);
-            }
-        } else {
-            try drawTextRow(self, win, a, row, x, w, border_style, rail_bg, "[a] approve  [r] reject", accent);
-        }
-        row += 1;
-    }
+    try drawReviewActions(self, a, win, row, x, w, border_style, rail_bg, view.approve_action, view.reject_action);
+    row += 1;
     if (row >= bottom) return;
     try drawRow(win, a, row, x, w, "│", border_style, rail_bg, &.{}, 0);
     row += 1;
-    const diff_rows = bottom -| row;
-    if (diff_rows == 0) return;
-    const max_top = view.diff.len -| diff_rows;
-    if (view.scroll.* > max_top) view.scroll.* = @intCast(max_top);
-    const top = view.scroll.*;
-    var k: u32 = 0;
-    while (k < diff_rows) : (k += 1) {
-        const idx = top + k;
-        if (idx >= view.diff.len) break;
-        const d = view.diff[idx];
-        const prefix: []const u8 = switch (d.kind) {
-            .context => "  ",
-            .removed => "- ",
-            .added => "+ ",
-        };
-        const style: vaxis.Style = switch (d.kind) {
-            .context => base,
-            .removed => err_style,
-            .added => add_style,
-        };
-        const fit = autil.cellFitPrefix(win, d.text, content_w -| 2);
-        const segs = [_]vaxis.Segment{
-            .{ .text = prefix, .style = style },
-            .{ .text = fit.slice, .style = style },
-        };
-        try drawRow(win, a, row + k, x, w, "│", border_style, rail_bg, &segs, 2 + @as(u32, @intCast(fit.cells)));
-    }
-    var y = row + @min(@as(u32, @intCast(view.diff.len -| top)), diff_rows);
-    while (y < bottom) : (y += 1) {
-        try drawRow(win, a, y, x, w, "│", border_style, rail_bg, &.{}, 0);
-    }
+    try drawCachedDiffRows(self, a, win, x, w, row, bottom -| row, border_style, rail_bg, view.first_line, view.last_line, view.diff, view.scroll);
 }
 
 /// Workbox Changes body for the pending inline edit.

@@ -28,6 +28,8 @@ pub const Command = union(enum) {
     buffer_delete,
     /// :noh — clear search highlight (M0: no-op).
     noh,
+    /// :help / :h — open the keymap search overlay.
+    help,
     /// :set <option> — M0: accepted, applied if recognized, else ignored.
     set: []const u8,
     /// :theme [name] — switch color theme (no arg lists available themes).
@@ -115,6 +117,9 @@ pub fn parse(line: []const u8) Command {
     if (std.mem.eql(u8, word, "ls") or std.mem.eql(u8, word, "buffers")) return .buffer_list;
     if (std.mem.eql(u8, word, "bd") or std.mem.eql(u8, word, "bdelete")) return .buffer_delete;
     if (std.mem.eql(u8, word, "noh") or std.mem.eql(u8, word, "nohlsearch")) return .noh;
+    if (std.mem.eql(u8, word, "h") or std.mem.eql(u8, word, "help")) {
+        return if (args.len == 0) .help else .unknown;
+    }
     if (std.mem.eql(u8, word, "set")) return .{ .set = args };
     if (std.mem.eql(u8, word, "theme") or std.mem.eql(u8, word, "colorscheme")) return .{ .theme = args };
 
@@ -267,6 +272,9 @@ test "parse: buffers, noh, set, unknown" {
     try std.testing.expect(parse("ls") == .buffer_list);
     try std.testing.expect(parse("bd") == .buffer_delete);
     try std.testing.expect(parse("noh") == .noh);
+    try std.testing.expect(parse("help") == .help);
+    try std.testing.expect(parse("h") == .help);
+    try std.testing.expect(parse("help foo") == .unknown);
     const c = parse("set tabstop=2");
     try std.testing.expect(c == .set);
     try std.testing.expectEqualStrings("tabstop=2", c.set);

@@ -169,9 +169,9 @@ pub fn createNote(self: *App) void {
     };
 }
 
-/// True when the terminal is in the compact (<90-col) navigator mode.
+/// True for the narrow layout or Agent-focus's deliberate icon rail.
 pub fn navigatorCompact(self: *App) bool {
-    return nav.modeForCols(self.vx.window().width) == .compact;
+    return self.navigatorMode() == .compact;
 }
 
 /// Focus the navigator from the keyboard. Full mode just takes focus;
@@ -183,6 +183,7 @@ pub fn navigatorEnter(self: *App) void {
         if (self.ai.rail_open and self.aiLayout().mode == .drawer) {
             self.ai.rail_open = false;
             self.ai.focus = .editor;
+            self.clearAgentFocus(false);
         }
     }
     self.focus = .navigator;
@@ -232,6 +233,7 @@ pub fn navigatorSetTab(self: *App, tab: nav.Tab) !void {
         if (self.ai.rail_open and self.aiLayout().mode == .drawer) {
             self.ai.rail_open = false;
             self.ai.focus = .editor;
+            self.clearAgentFocus(false);
         }
     } else {
         self.navigator_peek = false;

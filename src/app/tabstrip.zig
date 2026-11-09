@@ -1,43 +1,21 @@
-//! Pure two-row buffer-strip geometry (DESIGN.md §18.11).
+//! Pure buffer-strip geometry and editor-context path semantics.
 //!
-//! The buffer tab strip is bigger and demo-shaped: every tab has two cells of
-//! inner padding on the outside, a devicon, a filename, a reserved dirty
-//! marker cell, a close `×`, and a one-cell `│` separator between adjacent
-//! tabs. Tabs are at least `min_body` cells wide so a filename is readable
-//! without hover, and at most `max_body` so one long path cannot crowd out
-//! every other buffer.
+//! Every tab has two cells of outer padding, a devicon, a filename, a
+//! reserved dirty marker, a close `×`, and a one-cell separator. The final
+//! strip row is an editor context bar; it is not part of the tab hit geometry.
 //!
-//! This module owns the arithmetic only (no vaxis, no App): callers measure
-//! each filename in screen cells and pass `Spec`s in buffer order. `plan`
-//! returns the visible window, per-tab positions and the close-target cell.
-//! When the strip does not fit, the window is scrolled so the ACTIVE tab is
-//! always fully visible: neighbours fill to its right first, then to its
-//! left. The renderer draws the label row from this plan and the shared rule
-//! row below it.
-//!
-//! ## Geometry (strip-relative cells)
-//!
-//! ```text
-//! │  <icon> <name…> · ×  │ <icon> <name>   × │
-//! ^^                    ^^
-//! pad=2               pad=2
-//! ```
-//!
-//! Body = `fixed_cells` (2 pad + icon + gap + dirty + gap + close + 2 pad)
-//! plus the allocated name region. The dirty marker column is reserved even
-//! while clean, so typing never shifts a neighbour; `×` sits at a fixed
-//! offset from the body's right edge.
+//! This module owns arithmetic only (no vaxis, no App): callers measure each
+//! filename in screen cells and pass `Spec`s in buffer order. `plan` returns
+//! the visible window, per-tab positions and the close-target cell. When the
+//! strip does not fit, the ACTIVE tab is always fully visible.
 //!
 //! Complexity: O(number of tabs) time, O(visible tabs) storage (fixed
-//! `max_slots`), no allocation. `plan` is deterministic and total — a
-//! foreground render must never fail on unusual buffer counts.
+//! `max_slots`), no allocation. `plan` is deterministic and total.
 
 const std = @import("std");
 
-/// Smallest body width: 9 cells of fixed chrome + 11 name cells (fits
-/// "noname.txt" and a 9-cell truncated name with room to breathe).
+/// Smallest body width: fixed chrome plus a readable filename region.
 pub const min_body: u32 = 20;
-/// Largest body width: 9 cells of fixed chrome + 17 name cells.
 pub const max_body: u32 = 26;
 pub const pad_left: u32 = 2;
 pub const pad_right: u32 = 2;
@@ -45,15 +23,25 @@ pub const icon_cells: u32 = 1;
 pub const gap_cells: u32 = 1;
 pub const dirty_cells: u32 = 1;
 pub const close_cells: u32 = 1;
-/// Cells of a tab body that do not belong to the filename.
 pub const fixed_cells: u32 =
     pad_left + icon_cells + gap_cells + dirty_cells + gap_cells + close_cells + pad_right;
-/// Name region of a minimum-width tab (the narrowest filename presentation).
 pub const min_name_cells: u32 = min_body - fixed_cells;
-/// Largest name region before the width cap truncates.
 pub const max_name_cells: u32 = max_body - fixed_cells;
-/// One-cell ellipsis inserted into a truncated filename.
 pub const ellipsis = "…";
+
+/// Existing inline-assistant entry; the context bar only advertises it.
+pub const ask_agent_hint = "Ask agent  <leader>i";
+
+/// Project-relative paths keep the context useful without a filesystem walk.
+/// Paths outside the root stay absolute, and a shared string prefix is not
+/// mistaken for a path-component boundary.
+pub fn contextPath(path: ?[]const u8, project_root: ?[]const u8) []const u8 {
+    const p = path orelse return "[No Name]";
+    const root = project_root orelse return p;
+    if (root.len == 0 or p.len <= root.len or !std.mem.startsWith(u8, p, root)) return p;
+    if (p[root.len] != '/' and p[root.len] != '\\') return p;
+    return p[root.len + 1 ..];
+}
 
 /// Split of a truncated filename's name region: keep a readable prefix and a
 /// recognizable extension/suffix, separated by one ellipsis cell. Middle
@@ -274,7 +262,7 @@ test "tabstrip: a fitting strip lays tabs left to right with separators" {
 }
 
 test "tabstrip: geometry pins icon/name/dirty/close columns" {
-    const specs = [_]Spec{ .{ .name_cells = 6, .dirty = true, .active = true } };
+    const specs = [_]Spec{.{ .name_cells = 6, .dirty = true, .active = true }};
     const p = plan(&specs, 80);
     const s = p.slots[0];
     try std.testing.expectEqual(@as(u32, 0), s.x);
@@ -392,4 +380,14 @@ test "tabstrip: middle truncation keeps an extension-sized suffix" {
     try std.testing.expect(tiny.prefix >= 1);
     const none = nameSplit(0);
     try std.testing.expectEqual(@as(u32, 0), none.prefix + none.suffix);
+}
+
+test "tabstrip: editor context uses real paths without false root matches" {
+    try std.testing.expectEqualStrings("src/app.zig", contextPath("/work/oz/src/app.zig", "/work/oz"));
+    try std.testing.expectEqualStrings("src/app.zig", contextPath("src/app.zig", null));
+    try std.testing.expectEqualStrings("[No Name]", contextPath(null, "/work/oz"));
+    try std.testing.expectEqualStrings("/work/oz-old/app.zig", contextPath("/work/oz-old/app.zig", "/work/oz"));
+    try std.testing.expectEqualStrings("/work/oz", contextPath("/work/oz", "/work/oz"));
+    try std.testing.expectEqualStrings("src\\app.zig", contextPath("C:\\work\\oz\\src\\app.zig", "C:\\work\\oz"));
+    try std.testing.expect(std.mem.indexOf(u8, ask_agent_hint, "<leader>i") != null);
 }

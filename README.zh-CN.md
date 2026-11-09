@@ -9,6 +9,7 @@
 **编辑（vim 系）**
 
 - Normal / Insert / Visual / Visual Line / Visual Block / Command 六种模式
+- 帮助：`F1` 或 `:help` 打开可搜索的键位参考
 - 完整移动与 count：hjkl、w/W/e/E/b/B/ge/gE、^/0/$、gg/G、{/}、%、f/F/t/T、Ctrl-u/d/f/b
 - Unicode 移动：`w/e/b/ge` 把每个中文字/emoji 当作一个词，逐字跳；`W/E/B/gE` 按空白分 WORD；`f/F/t/T` 支持中文/emoji 目标
 - 文本对象、surround、注释、对齐、EasyMotion（s / `<leader>f`）、多光标（Ctrl+n）
@@ -79,8 +80,8 @@
 
 **AI Workspace（M2a）**
 
-- `<leader>a` 打开右侧 **Agent Rail + Workbox** 并聚焦输入框；在 editor 或线程列表中再按一次会关闭 rail 并把焦点还给 editor。dock 模式下 rail 不是模态的，可以一边编辑一边使用。
-- 宽度行为：**≥110 列**保留 38 列的右侧 dock；**90–109** 列保留 34；**<90** 列改为右侧 overlay drawer（`min(34, width-8)`），editor 在下方保持全宽。rail 只画到状态栏上方，绝不占用 editor 的保留区域；drawer 模式按 Esc 关闭，没有假遮罩、假 diff 或假遥测。
+- `<leader>a` 打开右侧 **Agent Rail + Workbox** 并聚焦输入框；在 editor 或线程列表中再按一次会关闭 rail 并把焦点还给 editor。dock 模式下 rail 不是模态的，可以一边编辑一边使用。`Ctrl-w a` 从 editor 回到线程列表；**`Ctrl-w A`** 切换 **Agent-focus**：宽终端使用 52 列 AI rail + 7 列 Nerd Font Navigator 图标栏，沿用同一会话，退出后恢复原来的 Coding rail 与 Navigator 布局。
+- 宽度行为：**≥110 列**保留 38 列的右侧 dock（Agent-focus 为 52 列）；**90–109** 列保留 34；**<90** 列改为右侧 overlay drawer（`min(34, width-8)`），editor 在下方保持全宽。rail 只画到单行状态栏上方，绝不占用 editor 的保留区域；drawer 模式按 Esc 关闭，没有假遮罩、假 diff 或假遥测。
 - **线程**是会话级的，按当前 workspace 分组显示。`j`/`k` 选择，Enter attach，`n`（或 `+`）新建线程并聚焦其输入框，输入框内 Tab 回到线程列表。同一时间只允许一个流：切换到别的线程会取消正在流式的线程（状态 `cancelled`，transcript 冻结）；切回来看到冻结的 transcript。每个线程有自己的请求历史和 client，delta 不会串到其他线程。线程在 rail 关闭和 workspace 切换后仍保留，但不落盘。
 - **Workbox tabs**：Chat（沿用 M1 的 transcript、流式、取消、错误、Markdown、tool cards 与输入框）、Changes（inline edit **与 staged agent edit** 审核：真实 unified 风格 diff + 显式 Approve/Reject；多文件 patch 在 active diff 上方提供可选择的逐文件列表/窗口；没有待审内容时显示 `no pending changes`）、Tools（真实工具调用/决策统计、avg/max 加最近 ≤32 个真实样本的 nearest-rank p95、延迟图；没有数据时显示 `no tool calls yet`）、Terminal（**带人工批准的 agent terminal tool**：staged 命令、显式 Allow/Deny、真实有界输出；编辑器自己的终端仍是 `Alt+r`，两者独立）。空状态是真实的，不伪造 diff、计数或图表。
 - **Inline assistant（`<leader>i`）**：在 visual/visual-line 中选行后按 `<leader>i`，在紧凑的 `inline edit` 浮窗里输入指令并 Enter。请求使用**独立**的 OpenAI 兼容 client 流式返回（绝不追加到 chat thread）；完成后自动打开 rail 并切到 **Changes**，badge 变 `changes 1`，diff 展示被删除的选区行和流式 replacement。未经批准不会写入：
@@ -100,6 +101,7 @@
 - **鼠标（`feat/mouse`）**：启动时开启 vaxis cell 坐标鼠标上报，退出（含错误路径）复位。左键点击 split pane 会聚焦并按点击行列定位光标（考虑相对行号 gutter、`view_top`、soft wrap 与 inlay hints），也可点击 buffer tab 及其 `×`、navigator tab/行（files/notes/agents）、AI 线程行、Workbox tab、prompt 与 `+`、tool card，以及 Changes/Terminal 的 Approve·Allow/Reject·Deny 按钮。点击调用与键盘/hint **完全相同**的 App 方法，审批/stale/dirty 安全语义不变；最后一个 buffer 不注册 `×`，空白区域 no-op，点击前会先结束插入会话（保留文本）。滚轮滚动编辑器（每格 3 行，保持光标列）、文件树/笔记/agents 选择以及 Chat/Changes 的 transcript/diff，均做 clamp；内嵌终端聚焦时滚轮不会抢走事件（点击终端聚焦，点击其他区域回到编辑器）。普通拖拽由 mouse reporting 接管，按住 **Shift** 拖拽可用终端自身的选择/复制（取决于终端）。v1 不做拖拽/resize、中键/右键、终端鼠标转发；重度折行与 grapheme cluster 的定位是近似值（见 DESIGN §21）。
 
 - 流式 OpenAI 兼容补全（`POST {base_url}/chat/completions`，SSE）；支持 Markdown 与 fenced 代码块渲染、自动滚动
+- **请求状态与 token**：线程状态区分 `connecting…` / `waiting…` / `streaming…`，Chat 底部显示请求阶段和耗时；等待首包超过 15 秒会明确显示 `no response yet`，输入行仍可用 Ctrl+c 取消。请求携带 `stream_options.include_usage`，完成后显示 provider 返回的 total/input/output tokens；DeepSeek 在 `finish_reason` 后发送的 usage-only chunk 也会保留。usage 尚未返回时只显示 `ctx ~N tokens · estimate`（按请求字节约 4 B/token 估算），不伪装精确值。设置上下文窗口后显示真实 `ctx N%`；多轮工具请求展示最近一次 HTTP 请求的指标。
 - 自动附带编辑器上下文：当前文件路径；有可视选区时附带选中文本与 1-based 行号范围；否则附带光标行 ± 少量上下文（总上限 8 KB）
 - 通过环境变量配置（打开 rail 时读取）：
 
@@ -109,6 +111,7 @@
   | `OZ_AI_MODEL` | `qwen2.5-coder:7b` | 模型名 |
   | `OZ_AI_API_KEY` | 未设置 | 可选 `Authorization: Bearer …`，不会记录或持久化 |
   | `OZ_AI_SYSTEM` | 内置 | 可选 system prompt 覆盖 |
+  | `OZ_AI_CONTEXT_TOKENS` | 未设置 | 可选模型上下文窗口 token 数（正整数），用于 `ctx N%`；未设置时显示 token 数而不猜窗口 |
 
   示例：`OZ_AI_BASE_URL=https://api.deepseek.com/v1 OZ_AI_MODEL=deepseek-chat OZ_AI_API_KEY=sk-… oz`。
 

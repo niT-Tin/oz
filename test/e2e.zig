@@ -1457,7 +1457,7 @@ test "mouse: AI thread row attach, workbox tabs, prompt focus, transcript wheel"
     try frame.expectNoHorizontalOverflow(&grid, 120);
 
     // Wheel over the transcript (3 rows/notch): scroll up to the first line.
-    for (0..6) |_| try mouseWheelAt(&sess, rail_col + 5, aiTabsSepRow(30) + 1, -1);
+    for (0..7) |_| try mouseWheelAt(&sess, rail_col + 5, aiTabsSepRow(30) + 1, -1);
     try gridWaitFor(&sess, &grid, "L00 reply", 5000);
     try std.testing.expect(grid.contains("NORMAL"));
 
@@ -7861,7 +7861,7 @@ test "gutter: relative line numbers never overlap content on deep files" {
     // 5-digit number "15000 ".
     try sess.send("G");
     waited = 0;
-    while (!std.mem.eql(u8, grid.rowText(21)[0..6], "15000 ")) {
+    while (!std.mem.eql(u8, grid.rowText(22)[0..6], "15000 ")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -7871,17 +7871,17 @@ test "gutter: relative line numbers never overlap content on deep files" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    if (!std.mem.eql(u8, grid.rowText(21)[0..6], "15000 ")) {
+    if (!std.mem.eql(u8, grid.rowText(22)[0..6], "15000 ")) {
         std.debug.print("gutter at the bottom:\n", .{});
         grid.dump();
     }
-    try std.testing.expect(std.mem.eql(u8, grid.rowText(21)[0..6], "15000 "));
+    try std.testing.expect(std.mem.eql(u8, grid.rowText(22)[0..6], "15000 "));
 
     // every visible content row: the first content cell is at the dynamic
     // gutter width (column 6, preceded by the trailing space) — line
     // numbers never run into the text
     var r: usize = 2;
-    while (r < 22) : (r += 1) {
+    while (r < 23) : (r += 1) {
         try std.testing.expect(grid.buf[(r * 80 + 6) * 4] == 'x');
         try std.testing.expect(grid.buf[(r * 80 + 5) * 4] == ' ');
     }
@@ -9459,14 +9459,11 @@ test "windows: :sp splits stacked; each window scrolls independently" {
     }
     try std.testing.expect(grid.contains("NORMAL"));
 
-    // :sp — horizontal split: the buffer strip gains a second label row for
-    // the stacked pane, then the shared strip rule; the top window shows
-    // "topline" on row 3; the "─" pane separator consumes row 12 (vim
-    // statusline style), and the bottom window's own first line sits
-    // underneath it, so its first visible line ("second") starts at row 13
+    // :sp — two label layers and one context row; each pane gets ten rows,
+    // so the separator is row 13 and bottom content starts at row 14.
     try sess.send(":sp\r");
     waited = 0;
-    while (!(grid.contains("topline") and grid.contains("second") and rowContains(&grid, 12, "─"))) {
+    while (!(grid.contains("topline") and grid.contains("second") and rowContains(&grid, 13, "─"))) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -9478,15 +9475,14 @@ test "windows: :sp splits stacked; each window scrolls independently" {
     }
     try gridSettle(&sess, &grid, 120, 3000);
     const top_here = rowContains(&grid, 3, "topline");
-    const bottom_here = rowContains(&grid, 13, "second");
+    const bottom_here = rowContains(&grid, 14, "second");
     if (!top_here or !bottom_here) {
         std.debug.print("after :sp:\n", .{});
         grid.dump();
     }
     try std.testing.expect(top_here);
     try std.testing.expect(bottom_here);
-    // the pane boundary reads as a real separator row of "─" (row 12)
-    try std.testing.expect(rowContains(&grid, 12, "─"));
+    try std.testing.expect(rowContains(&grid, 13, "─"));
 
     // both windows keep independent viewports: bottom window (focused) scrolls
     // down with G, top window stays on line 1
@@ -9605,6 +9601,10 @@ test "TMP: tab-bar fuzz — every open buffer's tab appears exactly once" {
             var rr: usize = 0;
             while (rr + 1 < grid.rows) : (rr += 1) {
                 const row = grid.rowText(rr);
+                // The context/status rows repeat the focused path; only tab
+                // label layers participate in this ownership invariant.
+                if (std.mem.indexOf(u8, row, "Ask agent") != null or
+                    std.mem.indexOf(u8, row, "[NORMAL]") != null) continue;
                 var pos: usize = 0;
                 while (std.mem.indexOfPos(u8, row, pos, nm)) |p| {
                     cnt += 1;
@@ -12873,6 +12873,8 @@ test "keymap picker: <leader>sk filters, token colors, Esc closes" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(grid.contains(" Keymaps "));
+    // A modal picker still shows the current mode.
+    try std.testing.expect(grid.contains("[NORMAL]"));
 
     // "hover" → the K entry is the only match; its "K" token renders with
     // the keyword color (kanagawa oniViolet), not the title's accent
@@ -12934,6 +12936,60 @@ test "keymap picker: <leader>sk filters, token colors, Esc closes" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(!grid.contains(" Keymaps "));
+
+    // :help opens the same keymap search overlay.
+    try sess.send(":help\r");
+    waited = 0;
+    while (!grid.contains(" Keymaps ")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains(" Keymaps "));
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains(" Keymaps ")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+
+    // F1 is the same help entry point.
+    try sess.send("\x1bOP");
+    waited = 0;
+    while (!grid.contains(" Keymaps ")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(grid.contains(" Keymaps "));
+    try sess.send("\x1b");
+    waited = 0;
+    while (grid.contains(" Keymaps ")) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) {
+            waited += 200;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     if (exit_code != 0) {
@@ -13194,9 +13250,8 @@ test "nonexistent CLI file opens as an empty named buffer; :w creates it" {
 }
 
 test "H/M/L move in the viewport; zz/zt/zb scroll around the cursor" {
-    // 24-row pty: content area = 24 - 2 (bottom chrome) - 2 (buffer strip) =
-    // 20 rows, grid rows 2..21. File: "line 001".."line 100" (plus a
-    // trailing empty line 101 from the final newline).
+    // 24-row pty: 21 content rows (one status row, two strip rows), grid
+    // rows 2..22. File: "line 001".."line 100" plus a trailing empty line.
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
@@ -13258,16 +13313,16 @@ test "H/M/L move in the viewport; zz/zt/zb scroll around the cursor" {
     try std.testing.expect(try Wait.until(&sess, &grid, "line 061", 2));
     try std.testing.expect(grid.contains("line 61/101"));
 
-    // zb: cursor line at the bottom → view_top = 60 - 19 = 41 → "line 042"
+    // zb: cursor line at the bottom → view_top = 60 - 20 = 40 → "line 041"
     try sess.send("zb");
-    try std.testing.expect(try Wait.until(&sess, &grid, "line 042", 2));
+    try std.testing.expect(try Wait.until(&sess, &grid, "line 041", 2));
     try std.testing.expect(grid.contains("line 61/101"));
 
-    // H: first visible line (view_top 41) → line 42
+    // H: first visible line (view_top 40) → line 41
     try sess.send("H");
-    try std.testing.expect(try Wait.until(&sess, &grid, "line 42/101", -1));
+    try std.testing.expect(try Wait.until(&sess, &grid, "line 41/101", -1));
 
-    // M: middle visible line = 41 + (20-1)/2 = 50 → line 51
+    // M: middle visible line = 40 + (21-1)/2 = 50 → line 51
     try sess.send("M");
     try std.testing.expect(try Wait.until(&sess, &grid, "line 51/101", -1));
 
@@ -14020,10 +14075,9 @@ test "git: marks stay glued to their lines while typing (instant shift, no refre
     try sess.send("ggi");
     try std.testing.expect(try Wait.until(&sess, &grid, "INSERT"));
     try sess.send("A\rB\rC");
-    // wait for the last typed char to render — the refresh cannot have
-    // fired yet (still inside the typing hold)
+    // Wait for the typed C on its new content row, not the context row's C0.
     var waited: i32 = 0;
-    while (!grid.contains("C")) {
+    while (!rowContains(&grid, 4, "C")) {
         const nn = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
         if (nn == 0) {
             waited += 50;
@@ -15280,6 +15334,10 @@ fn navSelectedBg() u32 {
     return packRgb(0x2D, 0x4F, 0x67); // kanagawa-wave bg_sel
 }
 
+fn aiMutedSelBg() u32 {
+    return packRgb(0x28, 0x41, 0x59); // bg_float/bg_sel blend used by the AI rail
+}
+
 fn navEditorBg() u32 {
     return packRgb(0x1F, 0x1F, 0x28); // kanagawa-wave bg
 }
@@ -15368,7 +15426,7 @@ fn aiFindCellFrom(grid: *Grid, needle: []const u8, min_col: usize) ?struct { row
 }
 
 fn aiRailBg() u32 {
-    return packRgb(0x22, 0x32, 0x49); // kanagawa-wave bg_float
+    return packRgb(0x1F, 0x1F, 0x28); // editor surface; bands/cards layer above it
 }
 
 fn aiEditorBg() u32 {
@@ -15383,9 +15441,8 @@ fn aiStatusBg() u32 {
 /// active thread (the thread rail above it also lists names, so tests that
 /// assert attachment must look at THIS row).
 fn aiWorkboxHeaderRow(rows: usize) usize {
-    // Mirrors app/ai/workspace.zig metrics: two bottom chrome rows, and one
-    // thread-list row is reclaimed for the tab-strip closing rule.
-    const rail_rows = rows - 2;
+    // One global status row; the remaining rail rows follow ws.metrics.
+    const rail_rows = rows - 1;
     var thread_rows = (rail_rows -| 5) / 3;
     thread_rows = @min(@max(thread_rows, 3), 8) - 1;
     thread_rows = @max(thread_rows, 3);
@@ -15398,8 +15455,7 @@ fn aiTabsContentCol(rail_col: usize) usize {
     return rail_col + 2;
 }
 
-/// 38-cell rails spend two cells after `chat` (the `│ ` separator); 34-cell
-/// rails stay compact (`│`).
+/// Wide rails use two blank cells between tab labels; medium rails use one.
 fn aiTabsSpaced(cols: usize) bool {
     return aiRailWidth(cols) >= 38;
 }
@@ -15422,16 +15478,13 @@ fn aiCellBlank(grid: *Grid, row: usize, col: usize) bool {
     return text.len == 0 or std.mem.eql(u8, text, " ");
 }
 
-/// Count cells holding `ch` in the rail, excluding the bottom chrome (rule
-/// + status). Used to prove a transcript's reply text disappears when
-/// another thread is active and never appears in the wrong thread.
+/// Count cells holding `ch` in the rail, excluding role headers and status.
 fn aiCountRailChar(grid: *Grid, ch: u8) usize {
     const rail_col = aiRailCol(grid.cols);
     var n: usize = 0;
-    // Start below the `AGENTS` header/workspace group so their static "A"
-    // is not counted as transcript text.
     var r: usize = 2;
-    while (r + 2 < grid.rows) : (r += 1) {
+    while (r + 1 < grid.rows) : (r += 1) {
+        if (std.mem.indexOf(u8, grid.rowText(r), "AI ·") != null) continue;
         var c = rail_col;
         while (c < grid.cols) : (c += 1) {
             const txt = aiCellText(grid, r, c);
@@ -15501,11 +15554,13 @@ test "ai workspace: 120-col docked rail keeps editor+filetree, streams, focus re
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
     try aiWriteFile(io, dir, "stream.sse", "data: {\"choices\":[{\"delta\":{\"content\":\"mock \"}}]}\n\n" ++
         "data: {\"choices\":[{\"delta\":{\"content\":\"reply\"}}]}\n\n" ++
-        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1200,\"completion_tokens\":42,\"total_tokens\":1242}}\n\n" ++
+        "data: [DONE]\n\n");
 
     const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
     defer alloc.free(mock_env);
-    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120);
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, &.{ mock_env, "OZ_AI_MODEL=mock-model", "OZ_AI_CONTEXT_TOKENS=128000" }, 30, 120);
     defer sess.close();
     defer killPid(sess.pid);
 
@@ -15551,6 +15606,8 @@ test "ai workspace: 120-col docked rail keeps editor+filetree, streams, focus re
     try sess.send("\r");
     try gridWaitFor(&sess, &grid, "mock reply", 8000);
     try gridWaitFor(&sess, &grid, "idle", 4000);
+    try gridWaitFor(&sess, &grid, "1242 tokens", 4000);
+    try gridWaitFor(&sess, &grid, "ctx 0% · in 1200 · out 42", 4000);
     try std.testing.expect(aiRowContains(&grid, 29, "thread 1"));
     try std.testing.expect(aiRowContains(&grid, 29, "mock-model"));
     try std.testing.expect(aiRowContains(&grid, 29, "idle"));
@@ -15560,6 +15617,7 @@ test "ai workspace: 120-col docked rail keeps editor+filetree, streams, focus re
     defer alloc.free(req);
     try std.testing.expect(std.mem.indexOf(u8, req, "\"model\":\"mock-model\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req, "\"stream\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"stream_options\":{\"include_usage\":true}") != null);
     try std.testing.expect(std.mem.indexOf(u8, req, "hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, req, name) != null);
 
@@ -15736,7 +15794,7 @@ test "ui chrome: 120x30 rail header, rules, tabs and status boundary" {
     try std.testing.expectEqual(aiStatusBg(), aiCellBg(&grid, 0, 119));
     try std.testing.expect(aiRowContains(&grid, 0, "AGENTS  1"));
     try std.testing.expect(aiRowContains(&grid, 2, "> thread 1"));
-    try std.testing.expect(aiRowContains(&grid, 1, "main / workspace"));
+    try std.testing.expect(aiRowContains(&grid, 1, "main"));
     // Blank gutters: one column between the navigator box and editor text,
     // one between the editor's last text cell and the rail border.
     try std.testing.expect(aiCellBlank(&grid, 1, 30));
@@ -15745,53 +15803,42 @@ test "ui chrome: 120x30 rail header, rules, tabs and status boundary" {
     try std.testing.expect(aiCellBlank(&grid, 1, 81));
     try std.testing.expectEqualStrings("│", aiCellText(&grid, 1, 82));
 
-    // Divider between the thread list and workbox header; second divider
-    // between the tab strip and body.
+    // Quiet band transitions preserve the border without full-width rules.
     const divider_row = aiWorkboxHeaderRow(30) - 1;
-    try std.testing.expectEqualStrings("├", aiCellText(&grid, divider_row, rail_col));
-    try std.testing.expectEqualStrings("─", aiCellText(&grid, divider_row, rail_col + 2));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, divider_row, rail_col));
     const tabs_row = aiTabsRow(30);
-    try std.testing.expect(aiRowContains(&grid, tabs_row, ">chat│ changes 0 │ tools │ terminal"));
+    try std.testing.expect(aiRowContains(&grid, tabs_row, ">chat  changes 0  tools  terminal"));
     const content_col = aiTabsContentCol(rail_col);
-    try std.testing.expectEqualStrings("│", aiCellText(&grid, tabs_row, content_col + 5));
-    try std.testing.expectEqualStrings("│", aiCellText(&grid, tabs_row, content_col + 17));
-    // Active chat tab: bold `fg` text on bg_sel with an accent_alt
-    // underline and accent marker; the inactive badge stays on the rail
-    // background.
-    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, tabs_row, content_col + 1));
+    // Active chat tab: bold `fg` text on the muted selection surface with
+    // an accent_alt underline and accent marker; inactive tabs stay on the band.
+    try std.testing.expectEqual(aiMutedSelBg(), aiCellBg(&grid, tabs_row, content_col + 1));
     try std.testing.expectEqual(packRgb(0xDC, 0xD7, 0xBA), grid.fg_buf[tabs_row * grid.cols + content_col + 1]);
     try frame.expectCellUl(&grid, tabs_row, content_col + 1, packRgb(0x7E, 0x9C, 0xD8));
     try std.testing.expectEqual(packRgb(0x7E, 0x9C, 0xD8), grid.fg_buf[tabs_row * grid.cols + content_col]);
-    try std.testing.expectEqual(aiRailBg(), aiCellBg(&grid, tabs_row, content_col + 7));
-    try std.testing.expectEqualStrings("├", aiCellText(&grid, aiTabsSepRow(30), rail_col));
-    try std.testing.expectEqualStrings("─", aiCellText(&grid, aiTabsSepRow(30), rail_col + 2));
+    try std.testing.expectEqual(aiStatusBg(), aiCellBg(&grid, tabs_row, content_col + 7));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, aiTabsSepRow(30), rail_col));
 
-    // Switching tabs moves the marker and selection to the new label while
-    // every tab keeps its cell position.
+    // Switching tabs moves the marker and selection without moving labels.
     try sess.send("\t");
     try sess.send("d");
     try gridWaitFor(&sess, &grid, "no pending changes", 4000);
-    try std.testing.expect(aiRowContains(&grid, tabs_row, "chat│ >changes 0 │ tools │ terminal"));
-    // Tab separators use the dim secondary accent, the `>` marker sits on
-    // the selection background, and the new label/underline follow it.
-    try std.testing.expectEqual(packRgb(0x7E, 0x9C, 0xD8), grid.fg_buf[tabs_row * grid.cols + content_col + 5]);
-    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, tabs_row, content_col + 6));
+    try std.testing.expect(aiRowContains(&grid, tabs_row, "chat  >changes 0  tools  terminal"));
+    try std.testing.expect(aiCellBlank(&grid, tabs_row, content_col + 5));
+    try std.testing.expectEqual(aiMutedSelBg(), aiCellBg(&grid, tabs_row, content_col + 6));
     try std.testing.expectEqual(packRgb(0x7E, 0x9C, 0xD8), grid.fg_buf[tabs_row * grid.cols + content_col + 6]);
     try frame.expectCellUl(&grid, tabs_row, content_col + 6, packRgb(0x7E, 0x9C, 0xD8));
-    try std.testing.expectEqual(navSelectedBg(), aiCellBg(&grid, tabs_row, content_col + 7));
+    try std.testing.expectEqual(aiMutedSelBg(), aiCellBg(&grid, tabs_row, content_col + 7));
     try std.testing.expectEqual(packRgb(0xDC, 0xD7, 0xBA), grid.fg_buf[tabs_row * grid.cols + content_col + 7]);
     try frame.expectCellUl(&grid, tabs_row, content_col + 7, packRgb(0x7E, 0x9C, 0xD8));
     try sess.send("c");
-    try gridWaitFor(&sess, &grid, ">chat│ changes 0", 4000);
+    try gridWaitFor(&sess, &grid, ">chat  changes 0", 4000);
 
-    // Status: rule row + section separators + mode badge + layout section.
-    try std.testing.expectEqualStrings("─", aiCellText(&grid, 28, 0));
-    try std.testing.expectEqualStrings("─", aiCellText(&grid, 28, 119));
-    try std.testing.expectEqual(aiStatusBg(), aiCellBg(&grid, 28, 0));
-    try std.testing.expect(aiRowContains(&grid, 29, "│ [NORMAL] │"));
+    // One status band, with workspace/mode/cursor and the right AI status.
+    try std.testing.expect(aiRowContains(&grid, 29, "[NORMAL]"));
+    try std.testing.expect(aiRowContains(&grid, 29, "[main]"));
     try std.testing.expect(aiRowContains(&grid, 29, "line 1/"));
-    try std.testing.expect(aiRowContains(&grid, 29, "dock"));
-    try std.testing.expectEqual(aiStatusBg(), aiCellBg(&grid, 29, 0));
+    try std.testing.expect(aiRowContains(&grid, 29, "thread 1"));
+    try std.testing.expectEqual(aiStatusBg(), aiCellBg(&grid, 29, 119));
     try frame.expectNoHorizontalOverflow(&grid, grid.cols);
 
     // No tofu-prone glyphs in the new AI/nav chrome.
@@ -15837,20 +15884,17 @@ test "ui chrome: 80x24 drawer header, tabs and status boundary" {
     try std.testing.expectEqualStrings("│", aiCellText(&grid, 0, rail_col));
     try std.testing.expectEqual(aiStatusBg(), aiCellBg(&grid, 0, rail_col));
     try std.testing.expect(aiRowContains(&grid, 0, "AGENTS  1"));
-    // Drawer gutter: the editor keeps its full layout width but its last
-    // visible cell before the rail is blanked, so text never touches `│`.
-    try std.testing.expect(!aiCellBlank(&grid, 1, 44));
+    // Drawer gutter leaves one blank column before the rail border.
     try std.testing.expect(aiCellBlank(&grid, 1, 45));
     try std.testing.expectEqualStrings("│", aiCellText(&grid, 1, 46));
     const tabs_row = aiTabsRow(24);
-    try std.testing.expect(aiRowContains(&grid, tabs_row, ">chat│changes 0│tools│terminal"));
-    try std.testing.expectEqualStrings("├", aiCellText(&grid, aiTabsSepRow(24), rail_col));
-    try std.testing.expectEqualStrings("├", aiCellText(&grid, aiWorkboxHeaderRow(24) - 1, rail_col));
-    // Bottom chrome: full-width rule + one status row, drawer layout cell.
-    try std.testing.expectEqualStrings("─", aiCellText(&grid, 22, 0));
-    try std.testing.expectEqual(aiStatusBg(), aiCellBg(&grid, 22, 79));
-    try std.testing.expect(aiRowContains(&grid, 23, "│ [NORMAL] │"));
-    try std.testing.expect(aiRowContains(&grid, 23, "drawer"));
+    try std.testing.expect(aiRowContains(&grid, tabs_row, ">chat changes 0 tools terminal"));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, aiTabsSepRow(24), rail_col));
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, aiWorkboxHeaderRow(24) - 1, rail_col));
+    // One status row; the prompt owns the row immediately above it.
+    try std.testing.expectEqual(aiStatusBg(), aiCellBg(&grid, 23, 79));
+    try std.testing.expect(aiRowContains(&grid, 23, "[NORMAL]"));
+    try std.testing.expect(aiRowContains(&grid, 23, "thread 1"));
     try frame.expectNoHorizontalOverflow(&grid, grid.cols);
     try std.testing.expect(!grid.contains("▥"));
     try expectNoForbiddenGlyphs(&grid, .{ .top = 0, .left = rail_col, .right = 79, .bottom = 21 });
@@ -16014,8 +16058,7 @@ test "ui chrome: theme matrix colors active tabs, separators and focused borders
         try std.testing.expectEqual(tc.fg, sample.nav_tab_fg);
         try std.testing.expectEqual(tc.accent_alt, sample.nav_tab_ul);
         try std.testing.expect(frame.cellUnderlined(&grid, nav_row, files_col));
-        try std.testing.expectEqual(tc.accent_alt, sample.nav_sep_fg);
-        try std.testing.expect(sample.nav_sep_fg != tc.fg_faint);
+        try std.testing.expectEqual(tc.win_sep, sample.nav_sep_fg);
         try std.testing.expectEqual(tc.win_sep_active, sample.nav_border_fg);
 
         try sess.send(" a");
@@ -16030,23 +16073,22 @@ test "ui chrome: theme matrix colors active tabs, separators and focused borders
         sample.workbox_tab_bg = aiCellBg(&grid, tabs_row, content_col + 1);
         sample.workbox_tab_fg = grid.fg_buf[tabs_row * grid.cols + content_col + 1];
         sample.workbox_tab_ul = frame.cellUl(&grid, tabs_row, content_col + 1);
-        // The first tab separator sits right after "chat".
-        sample.workbox_sep_fg = grid.fg_buf[tabs_row * grid.cols + content_col + 5];
-        sample.workbox_rule_fg = grid.fg_buf[aiTabsSepRow(30) * grid.cols + rail_col + 2];
+        // Quiet borders replace the old accent tab/rule separators.
+        sample.workbox_sep_fg = grid.fg_buf[tabs_row * grid.cols + rail_col];
+        sample.workbox_rule_fg = grid.fg_buf[aiTabsSepRow(30) * grid.cols + rail_col];
         // Attached thread row (the rail header is row 0, the workspace
         // group row 1, thread rows start at row 2). Prompt focus puts the
         // active row on bg_sel and its `>` marker on accent_alt.
         sample.thread_marker_fg = grid.fg_buf[2 * grid.cols + rail_col + 2];
         sample.thread_marker_bg = grid.bg_buf[2 * grid.cols + rail_col + 2];
-        sample.status_rule_fg = grid.fg_buf[28 * grid.cols + 0];
+        sample.status_rule_fg = grid.fg_buf[29 * grid.cols + 9];
 
-        // The buffer tab bar lives at row 0 from contentCol (31 with the
-        // navigator open). Find the active tab's accent underline.
+        // The active buffer tab is continuous with the editor surface.
         sample.buffer_tab_fg = 0;
         sample.buffer_tab_ul = 0;
         var bc: usize = 31;
         while (bc < 70) : (bc += 1) {
-            if (grid.bg_buf[bc] == tc.bg_sel and
+            if (grid.bg_buf[bc] == tc.bg and
                 grid.fg_buf[bc] == tc.fg and
                 frame.cellUl(&grid, 0, bc) == tc.accent_alt and
                 frame.cellUnderlined(&grid, 0, bc))
@@ -16057,18 +16099,16 @@ test "ui chrome: theme matrix colors active tabs, separators and focused borders
             }
         }
 
-        // The active workbox tab and buffer tab use the shared style; rules
-        // and separators use the theme's secondary accent, never the old
-        // fixed gray.
+        // Selection accents mark activity; ordinary rules use win_sep.
         try std.testing.expectEqual(tc.bg_sel, sample.workbox_tab_bg);
         try std.testing.expectEqual(tc.fg, sample.workbox_tab_fg);
         try std.testing.expectEqual(tc.accent_alt, sample.workbox_tab_ul);
         try std.testing.expect(frame.cellUnderlined(&grid, tabs_row, content_col + 1));
-        try std.testing.expectEqual(tc.accent_alt, sample.workbox_sep_fg);
-        try std.testing.expectEqual(tc.accent_alt, sample.workbox_rule_fg);
+        try std.testing.expectEqual(tc.win_sep_active, sample.workbox_sep_fg);
+        try std.testing.expectEqual(tc.win_sep_active, sample.workbox_rule_fg);
         try std.testing.expectEqual(tc.accent_alt, sample.thread_marker_fg);
         try std.testing.expectEqual(tc.bg_sel, sample.thread_marker_bg);
-        try std.testing.expectEqual(tc.accent_alt, sample.status_rule_fg);
+        try std.testing.expectEqual(tc.win_sep, sample.status_rule_fg);
         try std.testing.expectEqual(tc.win_sep, sample.nav_border_fg);
         try std.testing.expectEqual(tc.win_sep_active, sample.rail_border_fg);
         try std.testing.expectEqual(tc.fg, sample.buffer_tab_fg);
@@ -16427,6 +16467,46 @@ test "ai workspace: error surfaces in the thread and leaves the editor usable" {
     try aiQuit(&sess);
 }
 
+test "ai workspace: empty provider stream surfaces a failure, not a blank reply" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}aie2.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "empty test\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try aiWriteFile(io, dir, "stream.sse", "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"insufficient_system_resource\"}]}\n\n" ++
+        "data: [DONE]\n\n");
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, &.{mock_env}, 24, 80);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("hi\r");
+    try gridWaitFor(&sess, &grid, "empty response", 6000);
+    try std.testing.expect(grid.contains("insufficient_system_resource"));
+    try std.testing.expect(grid.contains("error"));
+
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "changes 0", 4000);
+    try aiQuit(&sess);
+}
+
 // ---------------------------------------------------------------------------
 // M2.6a keyboard hints (DESIGN.md §19)
 // ---------------------------------------------------------------------------
@@ -16484,7 +16564,7 @@ fn aiTabsRow(rows: usize) usize {
 
 /// Chat prompt row: the last rail row, above the bottom chrome.
 fn aiPromptRow(rows: usize) usize {
-    return rows - 3;
+    return rows - 2;
 }
 
 /// Rule between the workbox tab strip and the body.
@@ -16750,7 +16830,7 @@ test "hints: 80x24 drawer target works, Esc cancels without side effects" {
     try std.testing.expectEqualStrings("│", aiCellText(&grid, 5, rail_col));
     try frame.expectNoHorizontalOverflow(&grid, grid.cols);
     const status_rect = frame.Rect{ .top = 23, .left = 0, .right = 79, .bottom = 23 };
-    try std.testing.expect(std.mem.startsWith(u8, grid.rowText(23), "[main]"));
+    try std.testing.expect(std.mem.startsWith(u8, grid.rowText(23), "[NORMAL]"));
     try std.testing.expect(std.mem.indexOf(u8, grid.rowText(23), "NORMAL") != null);
 
     // Activate the changes workbox tab through its drawn label.
@@ -17005,7 +17085,7 @@ test "navigator: notes create, edit, save and reopen from the list" {
     try sess.send("Go");
     try sess.send("NOTE_MARKER_1");
     try sess.send("\x1b");
-    try gridWaitFor(&sess, &grid, "NORMAL", 4000);
+    try gridWaitGone(&sess, &grid, "INSERT", 4000);
     try sess.send(":w\r");
     try gridWaitFor(&sess, &grid, "written:", 5000);
     {
@@ -17305,7 +17385,7 @@ test "navigator: 80x24 compact rail + notes peek scroll" {
     try std.testing.expectEqualStrings("│", aiCellText(&grid, navBodyRow(), 29));
     try frame.expectNoHorizontalOverflow(&grid, grid.cols);
 
-    // Files -> Notes through the peek; 12 notes, 7 fit in the peek's 15
+    // Files -> Notes through the peek; 12 notes, 8 fit in the peek's 16
     // content rows (2 rows each). A page of j scrolls three notes off.
     try sess.send("\t");
     try gridWaitFor(&sess, &grid, "Note 12", 5000);
@@ -17315,7 +17395,7 @@ test "navigator: 80x24 compact rail + notes peek scroll" {
 
     try sess.send("jjjjjjjjj");
     try gridWaitGone(&sess, &grid, "Note 12", 5000);
-    try std.testing.expect(aiRowContains(&grid, navBodyRow(), "Note 09"));
+    try std.testing.expect(aiRowContains(&grid, navBodyRow(), "Note 10"));
     try std.testing.expect(grid.contains("Note 03"));
     try frame.expectNoHorizontalOverflow(&grid, grid.cols);
 
@@ -19724,7 +19804,7 @@ test "approval: multi-file apply_patch writes both files, updates both buffers, 
     try sess.send("patch both files");
     try sess.send("\r");
     try gridWaitFor(&sess, &grid, "changes 1", 10000);
-    try gridWaitFor(&sess, &grid, "2 files", 5000);
+    try gridWaitFor(&sess, &grid, "file 1/2", 5000);
     try gridWaitFor(&sess, &grid, "-2 +2", 5000);
     try gridWaitFor(&sess, &grid, "> a.txt", 5000);
     try gridWaitFor(&sess, &grid, "- beta two", 5000);
@@ -19872,7 +19952,7 @@ test "approval: multi-file apply_patch deny via mouse writes nothing" {
     try sess.send("stage multi and deny");
     try sess.send("\r");
     try gridWaitFor(&sess, &grid, "changes 1", 10000);
-    try gridWaitFor(&sess, &grid, "2 files", 5000);
+    try gridWaitFor(&sess, &grid, "file 1/2", 5000);
     try gridWaitFor(&sess, &grid, "[r] reject", 5000);
     try gridWaitFor(&sess, &grid, "idle", 10000);
     try expectNoDirtyMarker(&grid);
@@ -19976,7 +20056,7 @@ test "approval: one stale multi-file target rejects the whole set with the file 
     try sess.send("stage both then edit one");
     try sess.send("\r");
     try gridWaitFor(&sess, &grid, "changes 1", 10000);
-    try gridWaitFor(&sess, &grid, "2 files", 5000);
+    try gridWaitFor(&sess, &grid, "file 1/2", 5000);
     try gridWaitFor(&sess, &grid, "idle", 10000);
 
     try sess.send("\x1b");
@@ -20074,7 +20154,7 @@ test "approval: 80x24 multi-file review fits and its approve hint writes both" {
     try sess.send("stage multi at 80");
     try sess.send("\r");
     try gridWaitFor(&sess, &grid, "changes 1", 10000);
-    try gridWaitFor(&sess, &grid, "2 files", 5000);
+    try gridWaitFor(&sess, &grid, "file 1/2", 5000);
     try gridWaitFor(&sess, &grid, "> a.txt", 5000);
     try gridWaitFor(&sess, &grid, "[a] approve", 5000);
     try gridWaitFor(&sess, &grid, "idle", 10000);
@@ -20311,9 +20391,8 @@ test "approval: malformed or missing-target apply_patch calls never stage" {
     try sess.send("try malformed patches");
     try sess.send("\r");
 
-    // Compact cards clip the message; the full text is asserted on the
-    // follow-up request body below.
-    try gridWaitFor(&sess, &grid, "error: patch contains the same", 10000);
+    // Compact cards clip messages and request metrics scroll the oldest card
+    // out of view; every complete error is asserted in the follow-up below.
     try gridWaitFor(&sess, &grid, "patch context does not", 8000);
     try gridWaitFor(&sess, &grid, "not found: missing.txt", 8000);
     try gridWaitFor(&sess, &grid, "BAD_PATCH_DONE follow-up", 10000);
@@ -21426,7 +21505,7 @@ const scenario_matrix = [_]Scenario{
             .{ .keys = "a", .wait_for = "changes 0" },
             // Approve returns focus to the editor; re-enter the rail before
             // switching to the Chat card.
-            .{ .keys = "\x17a", .wait_for = "tools │ terminal" },
+            .{ .keys = "\x17a", .wait_for = "tools  terminal" },
             .{ .keys = "c", .wait_for = "approved" },
         },
         .expect_text = &.{ "approved", "changes 0", "APPROVAL_SCENARIO_NEW", "GOLDEN_EDITOR_MARKER" },
@@ -21451,7 +21530,7 @@ const scenario_matrix = [_]Scenario{
             .{ .keys = "c", .wait_for = "approval required" },
             .{ .keys = "d", .wait_for = "[a] approve" },
             .{ .keys = "a", .wait_for = "changes 0" },
-            .{ .keys = "\x17a", .wait_for = "tools │ terminal" },
+            .{ .keys = "\x17a", .wait_for = "tools  terminal" },
             .{ .keys = "c", .wait_for = "approved" },
             // The approved card shows the real shown-hunk counts, not a
             // fabricated success summary.
@@ -21480,7 +21559,7 @@ const scenario_matrix = [_]Scenario{
             .{ .keys = "\x17a", .wait_for = "thread 1" },
             .{ .keys = "\r", .wait_for = "❯ " },
             .{ .keys = "patch both scenario files\r", .wait_for = "changes 1" },
-            .{ .keys = "", .wait_for = "2 files · -2 +2" },
+            .{ .keys = "", .wait_for = "file 1/2" },
             .{ .keys = "", .wait_for = "second line PATCH_MULTI_SCENARIO_" },
             .{ .keys = "j", .wait_for = "B line PATCH_MULTI_SC" },
             .{ .keys = "", .wait_for = "idle" },
@@ -21693,20 +21772,7 @@ fn assertScenario(sc: Scenario, grid: *Grid) !void {
             try frame.expectTextInRegion(grid, rr, if (sc.inline_prompt != null) "changes 1" else "changes 0");
         }
         try frame.expectCellBg(grid, @as(usize, rows) - 1, @as(usize, cols) - 1, aiStatusBg());
-        // The rail stops above the status bar and never shares a cell with
-        // it; the editor keeps its reserved width to the left.
-        // A full-width rule separates the last content/rail row from the
-        // status band; no pane may paint it.
-        const rule_row = @as(usize, rows) - 2;
-        try frame.expectCellBg(grid, rule_row, 0, aiStatusBg());
-        try frame.expectCellBg(grid, rule_row, @as(usize, cols) - 1, aiStatusBg());
-        try std.testing.expectEqualStrings("─", frame.cellText(grid, rule_row, 0));
-        try frame.expectNoOverlap(rr, frame.Rect{
-            .top = rule_row,
-            .left = 0,
-            .right = @as(usize, cols) - 1,
-            .bottom = rule_row,
-        });
+        // The rail ends immediately above the one-row status band.
         try frame.expectNoOverlap(rr, status_rect);
         try expectNoForbiddenGlyphs(grid, rr);
         try frame.expectNoHorizontalOverflow(grid, @as(usize, cols));
@@ -21770,7 +21836,7 @@ fn assertScenario(sc: Scenario, grid: *Grid) !void {
                 .top = 2,
                 .left = 0,
                 .right = rail_w - 1,
-                .bottom = rows - 3,
+                .bottom = rows - 2,
             }, status_rect);
         } else {
             const ft = findNavigatorBox(grid) orelse {
@@ -22069,6 +22135,66 @@ test "scenario matrix: every required tag is covered" {
     }
 }
 
+test "ai workspace: Ctrl-w A switches Agent-focus and restores navigator layouts" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}focus.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "AGENT_FOCUS_MARKER\n");
+    }
+
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, null, 30, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "AGENT_FOCUS_MARKER", 5000);
+
+    try sess.send("\x17A");
+    try gridWaitFor(&sess, &grid, "AGENTS", 5000);
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 5, 68));
+    try std.testing.expectEqualStrings("\u{f07b}", aiCellText(&grid, navCompactTabRow(0), 2));
+    try std.testing.expectEqualStrings("\u{f0219}", aiCellText(&grid, navCompactTabRow(1), 2));
+    try std.testing.expectEqualStrings("\u{f0c0}", aiCellText(&grid, navCompactTabRow(2), 2));
+    try std.testing.expect(aiFindCell(&grid, "AGENT_FOCUS_MARKER").?.col < 68);
+    try frame.expectNoHorizontalOverflow(&grid, 120);
+
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, 68, false, 3000);
+    try sess.send("\x17A");
+    try gridSettle(&sess, &grid, 250, 5000);
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 5, 82));
+    try std.testing.expect(!navCompactRailVisible(&grid));
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, 82, false, 3000);
+    try sess.send(" a");
+    try gridWaitGone(&sess, &grid, "AGENTS", 4000);
+
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "Files", 5000);
+    try gridSettle(&sess, &grid, 250, 5000);
+    try std.testing.expect(findNavigatorBox(&grid) != null);
+    try sess.send("\x17A");
+    try gridWaitFor(&sess, &grid, "AGENTS", 5000);
+    try std.testing.expect(navCompactRailVisible(&grid));
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, 68, false, 3000);
+    try sess.send("\x17A");
+    try gridSettle(&sess, &grid, 250, 5000);
+    try std.testing.expectEqualStrings("│", aiCellText(&grid, 5, 82));
+    try std.testing.expect(findNavigatorBox(&grid) != null);
+
+    try sess.send("\x1b");
+    try aiWaitRailFocus(&sess, &grid, 82, false, 3000);
+    try aiQuit(&sess);
+}
+
 // ---------------------------------------------------------------------------
 // Golden frames (M2.5)
 // ---------------------------------------------------------------------------
@@ -22078,14 +22204,14 @@ const golden = @import("golden.zig");
 /// plain-text file in a fixed non-git cwd, a fixed theme/HOME, the mock
 /// stream, and the same key sequence. Volatile inputs (paths, branch, time)
 /// are absent by construction; the frame is stable across runs.
-fn runAiGolden(name: []const u8, rows: u16, cols: u16, golden_rel_path: []const u8) !void {
+fn runAiGolden(name: []const u8, rows: u16, cols: u16, golden_rel_path: []const u8, agent_focus: bool) !void {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
     var root_buf: [128]u8 = undefined;
-    const root = try bufPrintZ(&root_buf, "/tmp/oz_golden_{d}_{d}", .{ linux.getpid(), tmp_counter });
-    tmp_counter += 1;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_golden_{s}", .{name});
     defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().deleteTree(io, root);
     try std.Io.Dir.createDirAbsolute(io, root, .default_dir);
 
     var fixture_buf: [192]u8 = undefined;
@@ -22122,7 +22248,7 @@ fn runAiGolden(name: []const u8, rows: u16, cols: u16, golden_rel_path: []const 
     // The text-file LSP probe settles to this deterministic label; waiting
     // for it keeps the status bar identical between fresh and warm runs.
     try gridWaitFor(&sess, &grid, "NoLspServer", 5000);
-    try sess.send(" a");
+    try sess.send(if (agent_focus) "\x17A" else " a");
     try gridWaitFor(&sess, &grid, "AGENTS", 5000);
     try gridWaitFor(&sess, &grid, "thread 1", 4000);
     try gridWaitFor(&sess, &grid, "❯ ", 4000);
@@ -22137,11 +22263,66 @@ fn runAiGolden(name: []const u8, rows: u16, cols: u16, golden_rel_path: []const 
 }
 
 test "golden: 120x30 docked AI workspace" {
-    try runAiGolden("ai-dock-120x30", 30, 120, "test/golden/ai-dock-120x30.txt");
+    try runAiGolden("ai-dock-120x30", 30, 120, "test/golden/ai-dock-120x30.txt", false);
+}
+
+test "golden: 100x30 docked AI workspace" {
+    try runAiGolden("ai-dock-100x30", 30, 100, "test/golden/ai-dock-100x30.txt", false);
 }
 
 test "golden: 80x24 narrow AI drawer" {
-    try runAiGolden("ai-drawer-80x24", 24, 80, "test/golden/ai-drawer-80x24.txt");
+    try runAiGolden("ai-drawer-80x24", 24, 80, "test/golden/ai-drawer-80x24.txt", false);
+}
+
+test "golden: 120x30 Agent-focus workspace" {
+    try runAiGolden("ai-focus-120x30", 30, 120, "test/golden/ai-focus-120x30.txt", true);
+}
+
+/// A modal picker still owns a compact status band. This frame locks the
+/// help overlay's layout and the `[NORMAL]` / `Esc close` status row.
+fn runHelpGolden(name: []const u8, rows: u16, cols: u16, golden_rel_path: []const u8) !void {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [128]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_golden_{s}", .{name});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().deleteTree(io, root);
+    try std.Io.Dir.createDirAbsolute(io, root, .default_dir);
+
+    var fixture_buf: [192]u8 = undefined;
+    const fixture = try std.fmt.bufPrint(&fixture_buf, "{s}/fixture.txt", .{root});
+    {
+        const f = try std.Io.Dir.createFileAbsolute(io, fixture, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "alpha line one\nbeta line two\ngamma line three\n");
+    }
+    var home_buf: [192]u8 = undefined;
+    const home = try std.fmt.bufPrint(&home_buf, "{s}/home", .{root});
+    try std.Io.Dir.createDirAbsolute(io, home, .default_dir);
+    const home_env = try std.fmt.allocPrint(alloc, "HOME={s}", .{home});
+    defer alloc.free(home_env);
+    const env_extra = [_][]const u8{home_env};
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "fixture.txt" }, &env_extra, rows, cols, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, rows, cols);
+    defer grid.deinit(alloc);
+
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "alpha line one", 5000);
+    try gridWaitFor(&sess, &grid, "NoLspServer", 5000);
+    try sess.send(":help\r");
+    try gridWaitFor(&sess, &grid, " Keymaps ", 5000);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+    try gridSettle(&sess, &grid, 300, 4000);
+
+    try golden.check(io, alloc, &grid, name, golden_rel_path);
+}
+
+test "golden: 120x30 help picker overlay" {
+    try runHelpGolden("help-120x30", 30, 120, "test/golden/help-120x30.txt");
 }
 
 // ---------------------------------------------------------------------------
@@ -22196,20 +22377,12 @@ fn uiCellBg(grid: *Grid, row: usize, col: usize) u32 {
     return grid.bg_buf[row * grid.cols + col];
 }
 
-fn uiExpectRuleRow(grid: *Grid, row: usize, bg: u32) !void {
+fn uiExpectContextRow(grid: *Grid, row: usize, bg: u32) !void {
+    try std.testing.expect(aiRowContains(grid, row, "Ask agent"));
     var c: usize = 0;
     while (c < grid.cols) : (c += 1) {
-        try std.testing.expectEqualStrings("─", aiCellText(grid, row, c));
         try std.testing.expectEqual(bg, uiCellBg(grid, row, c));
     }
-    // The rule is the neutral strip border, not the accent underline; both
-    // must appear so the active-tab segment reads as a distinct inset.
-    var saw_rule = false;
-    var c2: usize = 0;
-    while (c2 < grid.cols) : (c2 += 1) {
-        if (grid.fg_buf[row * grid.cols + c2] == packRgb(0x54, 0x54, 0x6D)) saw_rule = true;
-    }
-    try std.testing.expect(saw_rule);
 }
 
 /// One 120/100/80 buffer-strip scenario: five real files (short, long,
@@ -22257,55 +22430,56 @@ fn bufferStripCase(io: Io, alloc: std.mem.Allocator, cols: u16) !void {
     }
     try gridSettle(&sess, &grid, 120, 3000);
 
-    // Two-row strip: label row 0 + shared rule row 1; content starts at 2.
+    // Label row + editor context row; content starts at 2.
     const marker = aiFindCell(&grid, "STRIP_MARKER") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 2), marker.row);
-    try uiExpectRuleRow(&grid, 1, aiStatusBg());
-    // Every visible active tab has a full-body accent inset on the rule row
-    // and the same span has bg_sel on the label row.
-    const active_underline = uiFgRun(&grid, 1, packRgb(0x7E, 0x9C, 0xD8)) orelse {
+    try uiExpectContextRow(&grid, 1, aiEditorBg());
+    // Active emphasis lives inside the label row on the editor surface.
+    const active_underline = uiFgRun(&grid, 0, packRgb(0x7E, 0x9C, 0xD8)) orelse {
         std.debug.print("no active underline at {d}x{d}\n", .{ rows, cols });
         grid.dump();
         return error.TestUnexpectedResult;
     };
-    const underline_w = active_underline.end - active_underline.start + 1;
-    try std.testing.expect(underline_w >= tabstrip_min_body);
     try std.testing.expect(active_underline.end < cols);
-    try std.testing.expectEqual(aiStatusBg(), uiCellBg(&grid, 1, active_underline.start - 1));
+    try std.testing.expectEqual(aiEditorBg(), uiCellBg(&grid, 1, active_underline.start - 1));
 
-    // Scan the label row's bg_sel run (the whole tab body, including padding
-    // and close) and require the underline to span exactly it.
+    // The editor-colored body includes padding and close; text underlines
+    // stay inside it rather than replacing the whole context row.
     var bg_start: ?usize = null;
     var bg_end: usize = 0;
     for (0..grid.cols) |c| {
-        if (uiCellBg(&grid, 0, c) == navSelectedBg()) {
+        if (uiCellBg(&grid, 0, c) == aiEditorBg()) {
             if (bg_start == null) bg_start = c;
             bg_end = c;
         }
     }
     try std.testing.expect(bg_start != null);
-    try std.testing.expectEqual(active_underline.start, bg_start.?);
-    try std.testing.expectEqual(active_underline.end, bg_end);
-    // The `×` is the close target, three cells before the body's right edge
-    // (two-cell right padding + the glyph itself).
+    try std.testing.expect(bg_end - bg_start.? + 1 >= tabstrip_min_body);
+    try std.testing.expect(active_underline.start >= bg_start.? and active_underline.end <= bg_end);
     const close_col = bg_end - 2;
     try std.testing.expectEqualStrings("×", aiCellText(&grid, 0, close_col));
-    // Inactive tab body uses the strip surface, separators are accent-dim.
     const sep_count = uiCountText(&grid, 0, "│");
     try std.testing.expect(sep_count >= 1);
     try std.testing.expectEqual(@as(usize, 0), uiCountText(&grid, 2, "│"));
-    // The number of close affordances equals the number of visible tabs.
     const visible_tabs = sep_count + 1;
     try std.testing.expectEqual(visible_tabs, uiCountText(&grid, 0, "×"));
 
-    // Switching to the previous buffer moves the active tab; the underline
-    // follows it and remains complete at every width.
+    // Switching to the previous buffer moves the active body and its text.
     try sess.send("gT");
     try gridSettle(&sess, &grid, 100, 3000);
-    const moved = uiFgRun(&grid, 1, packRgb(0x7E, 0x9C, 0xD8)) orelse return error.TestUnexpectedResult;
+    const moved = uiFgRun(&grid, 0, packRgb(0x7E, 0x9C, 0xD8)) orelse return error.TestUnexpectedResult;
     try std.testing.expect(moved.start != active_underline.start or moved.end != active_underline.end);
     try std.testing.expect(moved.end < cols);
-    try std.testing.expect(moved.end - moved.start + 1 >= tabstrip_min_body);
+    var moved_bg_start: ?usize = null;
+    var moved_bg_end: usize = 0;
+    for (0..grid.cols) |c| {
+        if (uiCellBg(&grid, 0, c) == aiEditorBg()) {
+            if (moved_bg_start == null) moved_bg_start = c;
+            moved_bg_end = c;
+        }
+    }
+    try std.testing.expect(moved_bg_start != null);
+    try std.testing.expect(moved_bg_end - moved_bg_start.? + 1 >= tabstrip_min_body);
 
     // Hint mode: both the tab body and its close cell are targets. Read the
     // close label from the drawn frame and activate it; the buffer count
@@ -22315,12 +22489,12 @@ fn bufferStripCase(io: Io, alloc: std.mem.Allocator, cols: u16) !void {
     try gridWaitFor(&sess, &grid, "HINTS ·", 4000);
     const want = hintLabelLenFor(hintTargetCount(&grid) orelse return error.TestUnexpectedResult);
     var tab_buf: [3]u8 = undefined;
-    const tab_label = hintLabelAt(&grid, &tab_buf, 0, moved.start + 2, want);
+    const tab_label = hintLabelAt(&grid, &tab_buf, 0, moved_bg_start.? + 2, want);
     try std.testing.expectEqual(want, tab_label.len);
     var close_buf: [3]u8 = undefined;
-    const close_label = hintLabelAt(&grid, &close_buf, 0, moved.end - 2, want);
+    const close_label = hintLabelAt(&grid, &close_buf, 0, moved_bg_end - 2, want);
     if (close_label.len != want) {
-        std.debug.print("close hint missing at ({d},{d}) at {d}x{d}\n", .{ 0, moved.end - 2, rows, cols });
+        std.debug.print("close hint missing at ({d},{d}) at {d}x{d}\n", .{ 0, moved_bg_end - 2, rows, cols });
         grid.dump();
         return error.TestUnexpectedResult;
     }
@@ -22389,21 +22563,20 @@ test "ui buffer strip: split layers share one rule row" {
     try gridWaitFor(&sess, &grid, "split_alpha", 5000);
     try gridSettle(&sess, &grid, 150, 3000);
 
-    // Stacked panes: one label layer each, then ONE shared rule row.
+    // Stacked panes: two label layers, then one editor context row.
     try std.testing.expect(aiCellIndexOf(&grid, 0, "split_") != null);
     try std.testing.expect(aiCellIndexOf(&grid, 1, "split_") != null);
-    try uiExpectRuleRow(&grid, 2, aiStatusBg());
-    // The focused (bottom) pane's own buffer carries the selection; the
-    // hidden sibling's tab on the upper layer stays inactive, so exactly one
-    // label layer is selected here.
-    try std.testing.expectEqual(navSelectedBg(), uiCellBg(&grid, 1, 2));
+    try uiExpectContextRow(&grid, 2, aiEditorBg());
+    // Active emphasis is on the focused pane's label layer; the other stays
+    // on the persistent band surface.
+    try std.testing.expectEqual(aiEditorBg(), uiCellBg(&grid, 1, 2));
     try std.testing.expectEqual(aiStatusBg(), uiCellBg(&grid, 0, 2));
-    const underline = uiFgRun(&grid, 2, packRgb(0x7E, 0x9C, 0xD8));
+    const underline = uiFgRun(&grid, 1, packRgb(0x7E, 0x9C, 0xD8));
     try std.testing.expect(underline != null);
-    // Content starts below both layers and the shared rule.
+    // Content starts below both layers and the context row.
     const marker = aiFindCell(&grid, "SPLIT_MARKER") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 3), marker.row);
-    try std.testing.expectEqual(@as(usize, 0), uiCountText(&grid, 2, " "));
+    try std.testing.expectEqual(@as(usize, 0), uiCountText(&grid, 2, "─"));
     try frame.expectNoHorizontalOverflow(&grid, grid.cols);
 
     _ = try sess.commandAndWaitExit(":qa!\r");

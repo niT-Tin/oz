@@ -11,6 +11,7 @@
 //!   - tools.zig   M3 tool definitions/streaming wire format + permission policy
 pub const sse = @import("sse.zig");
 pub const openai = @import("openai.zig");
+pub const telemetry = @import("telemetry.zig");
 pub const context = @import("context.zig");
 pub const config = @import("config.zig");
 pub const client = @import("client.zig");

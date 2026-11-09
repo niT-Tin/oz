@@ -200,11 +200,23 @@ fn isOpeningFence(trimmed: []const u8) bool {
 // Diff
 // ---------------------------------------------------------------------------
 
-pub const DiffKind = enum { context, removed, added };
+pub const DiffKind = enum { context, removed, added, hunk, note };
+
+pub const HunkInfo = struct {
+    old_start: u32,
+    old_count: u32,
+    new_start: u32,
+    new_count: u32,
+};
 
 pub const DiffLine = struct {
     kind: DiffKind,
     text: []u8,
+    /// One-based source coordinates. Added lines have no old coordinate and
+    /// removed lines have no new coordinate; separators have neither.
+    old_line: ?u32 = null,
+    new_line: ?u32 = null,
+    hunk: ?HunkInfo = null,
 };
 
 pub const DiffStats = struct { removed: u32 = 0, added: u32 = 0 };
@@ -250,10 +262,93 @@ pub fn dupeDisplayLine(alloc: std.mem.Allocator, line: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
+fn appendDiffLine(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(DiffLine),
+    kind: DiffKind,
+    line: []const u8,
+    old_line: ?u32,
+    new_line: ?u32,
+) !void {
+    try out.append(alloc, .{
+        .kind = kind,
+        .text = try dupeDisplayLine(alloc, line),
+        .old_line = old_line,
+        .new_line = new_line,
+    });
+}
+
+fn appendHunk(alloc: std.mem.Allocator, out: *std.ArrayList(DiffLine), lines: []const DiffLine) !void {
+    if (lines.len == 0) return;
+    var first_old: ?u32 = null;
+    var last_old: ?u32 = null;
+    var first_new: ?u32 = null;
+    var last_new: ?u32 = null;
+    for (lines) |line| {
+        if (line.old_line) |n| {
+            if (first_old == null) first_old = n;
+            last_old = n;
+        }
+        if (line.new_line) |n| {
+            if (first_new == null) first_new = n;
+            last_new = n;
+        }
+    }
+    const info = HunkInfo{
+        .old_start = first_old orelse if (first_new) |n| n -| 1 else 0,
+        .old_count = if (first_old != null) last_old.? - first_old.? + 1 else 0,
+        .new_start = first_new orelse if (first_old) |n| n -| 1 else 0,
+        .new_count = if (first_new != null) last_new.? - first_new.? + 1 else 0,
+    };
+    const text = try std.fmt.allocPrint(
+        alloc,
+        "@@ -{d},{d} +{d},{d} @@",
+        .{ info.old_start, info.old_count, info.new_start, info.new_count },
+    );
+    errdefer alloc.free(text);
+    try out.append(alloc, .{ .kind = .hunk, .text = text, .hunk = info });
+}
+
+/// Insert real hunk records without dropping any of the existing inline
+/// context. Distant edits start a new hunk after three trailing context lines.
+fn decorateHunks(alloc: std.mem.Allocator, raw: []const DiffLine) ![]DiffLine {
+    var out: std.ArrayList(DiffLine) = .empty;
+    errdefer {
+        for (out.items) |line| {
+            if (line.kind == .hunk) alloc.free(line.text);
+        }
+        out.deinit(alloc);
+    }
+    var group_start: usize = 0;
+    var last_change: ?usize = null;
+    for (raw, 0..) |line, i| {
+        if (line.kind != .removed and line.kind != .added) continue;
+        if (last_change) |previous| {
+            if (i - previous > 7) {
+                const split = previous + 4;
+                try appendHunk(alloc, &out, raw[group_start..split]);
+                try out.appendSlice(alloc, raw[group_start..split]);
+                group_start = split;
+            }
+        }
+        last_change = i;
+    }
+    try appendHunk(alloc, &out, raw[group_start..]);
+    try out.appendSlice(alloc, raw[group_start..]);
+    return out.toOwnedSlice(alloc);
+}
+
 /// Truthful line diff: an LCS over display lines when both sides are small
 /// enough, otherwise every original line removed followed by every
-/// replacement line added. Never invents equal lines. Caller owns the result.
+/// replacement line added. Never invents equal lines or coordinates. The
+/// returned display lines and hunk metadata are computed once by the caller.
 pub fn buildDiff(alloc: std.mem.Allocator, original: []const u8, replacement: []const u8) ![]DiffLine {
+    return buildDiffAt(alloc, original, replacement, 1);
+}
+
+/// `buildDiff` for a preview window whose first source line is `first_line`.
+/// Both sides start at that real file coordinate, never again at line 1.
+pub fn buildDiffAt(alloc: std.mem.Allocator, original: []const u8, replacement: []const u8, first_line: u32) ![]DiffLine {
     const orig = try splitLines(alloc, original);
     defer alloc.free(orig);
     const repl = try splitLines(alloc, replacement);
@@ -266,9 +361,15 @@ pub fn buildDiff(alloc: std.mem.Allocator, original: []const u8, replacement: []
     }
 
     if (orig.len > max_diff_lines or repl.len > max_diff_lines) {
-        for (orig) |line| try out.append(alloc, .{ .kind = .removed, .text = try dupeDisplayLine(alloc, line) });
-        for (repl) |line| try out.append(alloc, .{ .kind = .added, .text = try dupeDisplayLine(alloc, line) });
-        return out.toOwnedSlice(alloc);
+        for (orig, 0..) |line, i| {
+            try appendDiffLine(alloc, &out, .removed, line, first_line + @as(u32, @intCast(i)), null);
+        }
+        for (repl, 0..) |line, i| {
+            try appendDiffLine(alloc, &out, .added, line, null, first_line + @as(u32, @intCast(i)));
+        }
+        const decorated = try decorateHunks(alloc, out.items);
+        out.deinit(alloc);
+        return decorated;
     }
 
     const n = orig.len;
@@ -293,20 +394,26 @@ pub fn buildDiff(alloc: std.mem.Allocator, original: []const u8, replacement: []
     var j: usize = 0;
     while (i < n and j < m) {
         if (std.mem.eql(u8, orig[i], repl[j])) {
-            try out.append(alloc, .{ .kind = .context, .text = try dupeDisplayLine(alloc, orig[i]) });
+            try appendDiffLine(alloc, &out, .context, orig[i], first_line + @as(u32, @intCast(i)), first_line + @as(u32, @intCast(j)));
             i += 1;
             j += 1;
         } else if (dp[(i + 1) * width + j] >= dp[i * width + (j + 1)]) {
-            try out.append(alloc, .{ .kind = .removed, .text = try dupeDisplayLine(alloc, orig[i]) });
+            try appendDiffLine(alloc, &out, .removed, orig[i], first_line + @as(u32, @intCast(i)), null);
             i += 1;
         } else {
-            try out.append(alloc, .{ .kind = .added, .text = try dupeDisplayLine(alloc, repl[j]) });
+            try appendDiffLine(alloc, &out, .added, repl[j], null, first_line + @as(u32, @intCast(j)));
             j += 1;
         }
     }
-    while (i < n) : (i += 1) try out.append(alloc, .{ .kind = .removed, .text = try dupeDisplayLine(alloc, orig[i]) });
-    while (j < m) : (j += 1) try out.append(alloc, .{ .kind = .added, .text = try dupeDisplayLine(alloc, repl[j]) });
-    return out.toOwnedSlice(alloc);
+    while (i < n) : (i += 1) {
+        try appendDiffLine(alloc, &out, .removed, orig[i], first_line + @as(u32, @intCast(i)), null);
+    }
+    while (j < m) : (j += 1) {
+        try appendDiffLine(alloc, &out, .added, repl[j], null, first_line + @as(u32, @intCast(j)));
+    }
+    const decorated = try decorateHunks(alloc, out.items);
+    out.deinit(alloc);
+    return decorated;
 }
 
 pub fn diffStats(diff: []const DiffLine) DiffStats {
@@ -314,7 +421,7 @@ pub fn diffStats(diff: []const DiffLine) DiffStats {
     for (diff) |d| switch (d.kind) {
         .removed => s.removed += 1,
         .added => s.added += 1,
-        .context => {},
+        .context, .hunk, .note => {},
     };
     return s;
 }
@@ -538,51 +645,111 @@ test "inline: stripFences removes only a clearly fenced replacement" {
     try testing.expectEqualStrings("hello\n", plain);
 }
 
-test "inline: diff is a real LCS with context lines" {
+test "inline: diff is a real LCS with context lines and coordinates" {
     const alloc = testing.allocator;
     const diff = try buildDiff(alloc, "a\nb\nc\n", "a\nB\nc\n");
     defer freeDiff(alloc, diff);
-    try testing.expectEqual(@as(usize, 4), diff.len);
-    try testing.expectEqual(DiffKind.context, diff[0].kind);
-    try testing.expectEqualStrings("a", diff[0].text);
-    try testing.expectEqual(DiffKind.removed, diff[1].kind);
-    try testing.expectEqualStrings("b", diff[1].text);
-    try testing.expectEqual(DiffKind.added, diff[2].kind);
-    try testing.expectEqualStrings("B", diff[2].text);
-    try testing.expectEqual(DiffKind.context, diff[3].kind);
+    try testing.expectEqual(@as(usize, 5), diff.len);
+    try testing.expectEqual(DiffKind.hunk, diff[0].kind);
+    try testing.expectEqual(@as(u32, 1), diff[0].hunk.?.old_start);
+    try testing.expectEqual(@as(u32, 3), diff[0].hunk.?.old_count);
+    try testing.expectEqual(@as(u32, 1), diff[0].hunk.?.new_start);
+    try testing.expectEqual(@as(u32, 3), diff[0].hunk.?.new_count);
+    try testing.expectEqual(DiffKind.context, diff[1].kind);
+    try testing.expectEqualStrings("a", diff[1].text);
+    try testing.expectEqual(@as(?u32, 1), diff[1].old_line);
+    try testing.expectEqual(@as(?u32, 1), diff[1].new_line);
+    try testing.expectEqual(DiffKind.removed, diff[2].kind);
+    try testing.expectEqualStrings("b", diff[2].text);
+    try testing.expectEqual(@as(?u32, 2), diff[2].old_line);
+    try testing.expectEqual(@as(?u32, null), diff[2].new_line);
+    try testing.expectEqual(DiffKind.added, diff[3].kind);
+    try testing.expectEqualStrings("B", diff[3].text);
+    try testing.expectEqual(@as(?u32, null), diff[3].old_line);
+    try testing.expectEqual(@as(?u32, 2), diff[3].new_line);
+    try testing.expectEqual(DiffKind.context, diff[4].kind);
+    try testing.expectEqual(@as(?u32, 3), diff[4].old_line);
+    try testing.expectEqual(@as(?u32, 3), diff[4].new_line);
     const stats = diffStats(diff);
     try testing.expectEqual(@as(u32, 1), stats.removed);
     try testing.expectEqual(@as(u32, 1), stats.added);
 }
 
-test "inline: diff handles empty and trailing-newline text" {
+test "inline: diff handles empty and trailing-newline text without fake coordinates" {
     const alloc = testing.allocator;
     const add = try buildDiff(alloc, "", "x\n");
     defer freeDiff(alloc, add);
-    try testing.expectEqual(@as(usize, 1), add.len);
-    try testing.expectEqual(DiffKind.added, add[0].kind);
-    try testing.expectEqualStrings("x", add[0].text);
+    try testing.expectEqual(@as(usize, 2), add.len);
+    try testing.expectEqual(DiffKind.added, add[1].kind);
+    try testing.expectEqualStrings("x", add[1].text);
+    try testing.expectEqual(@as(?u32, null), add[1].old_line);
+    try testing.expectEqual(@as(?u32, 1), add[1].new_line);
+    try testing.expectEqual(@as(u32, 0), add[0].hunk.?.old_count);
 
     const del = try buildDiff(alloc, "x\n", "");
     defer freeDiff(alloc, del);
-    try testing.expectEqual(@as(usize, 1), del.len);
-    try testing.expectEqual(DiffKind.removed, del[0].kind);
+    try testing.expectEqual(@as(usize, 2), del.len);
+    try testing.expectEqual(DiffKind.removed, del[1].kind);
+    try testing.expectEqual(@as(?u32, 1), del[1].old_line);
+    try testing.expectEqual(@as(?u32, null), del[1].new_line);
+    try testing.expectEqual(@as(u32, 0), del[0].hunk.?.new_count);
 
     const blank = try buildDiff(alloc, "a\n\n", "a\n");
     defer freeDiff(alloc, blank);
-    try testing.expectEqual(@as(usize, 2), blank.len);
-    try testing.expectEqual(DiffKind.removed, blank[1].kind);
-    try testing.expectEqualStrings("", blank[1].text);
+    try testing.expectEqual(@as(usize, 3), blank.len);
+    try testing.expectEqual(DiffKind.removed, blank[2].kind);
+    try testing.expectEqualStrings("", blank[2].text);
+    try testing.expectEqual(@as(?u32, 2), blank[2].old_line);
+    try testing.expectEqual(@as(?u32, null), blank[2].new_line);
 }
 
 test "inline: diff display lines expand tabs and drop CR" {
     const alloc = testing.allocator;
     const diff = try buildDiff(alloc, "a\tb\r\nold\n", "a\tb\r\nnew\n");
     defer freeDiff(alloc, diff);
-    try testing.expectEqual(@as(usize, 3), diff.len);
-    try testing.expectEqualStrings("a    b", diff[0].text);
-    try testing.expectEqualStrings("old", diff[1].text);
-    try testing.expectEqualStrings("new", diff[2].text);
+    try testing.expectEqual(@as(usize, 4), diff.len);
+    try testing.expectEqualStrings("a    b", diff[1].text);
+    try testing.expectEqualStrings("old", diff[2].text);
+    try testing.expectEqualStrings("new", diff[3].text);
+}
+
+test "inline: oversized LCS fallback keeps independent old and new numbering" {
+    const alloc = testing.allocator;
+    var original: std.ArrayList(u8) = .empty;
+    defer original.deinit(alloc);
+    var i: usize = 0;
+    while (i <= max_diff_lines) : (i += 1) try original.print(alloc, "old {d}\n", .{i});
+    const diff = try buildDiff(alloc, original.items, "new\n");
+    defer freeDiff(alloc, diff);
+    try testing.expectEqual(@as(usize, max_diff_lines + 3), diff.len);
+    try testing.expectEqual(@as(u32, max_diff_lines + 1), diff[0].hunk.?.old_count);
+    try testing.expectEqual(@as(u32, 1), diff[0].hunk.?.new_count);
+    for (diff[1 .. max_diff_lines + 2], 0..) |line, n| {
+        try testing.expectEqual(DiffKind.removed, line.kind);
+        try testing.expectEqual(@as(?u32, @intCast(n + 1)), line.old_line);
+        try testing.expectEqual(@as(?u32, null), line.new_line);
+    }
+    const added = diff[max_diff_lines + 2];
+    try testing.expectEqual(DiffKind.added, added.kind);
+    try testing.expectEqual(@as(?u32, null), added.old_line);
+    try testing.expectEqual(@as(?u32, 1), added.new_line);
+}
+
+test "inline: distant changes receive separate truthful hunk headers" {
+    const alloc = testing.allocator;
+    const original = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no\np\nq\nr\ns\nt\n";
+    const replacement = "A\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no\np\nq\nr\ns\nT\n";
+    const diff = try buildDiff(alloc, original, replacement);
+    defer freeDiff(alloc, diff);
+    var hunks: usize = 0;
+    for (diff) |line| {
+        if (line.kind == .hunk) hunks += 1;
+        if (std.mem.eql(u8, line.text, "e")) {
+            try testing.expectEqual(@as(?u32, 5), line.old_line);
+            try testing.expectEqual(@as(?u32, 5), line.new_line);
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), hunks);
 }
 
 test "inline: pending owns its snapshot and detects revision changes" {

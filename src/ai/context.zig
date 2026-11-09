@@ -33,6 +33,29 @@ pub const Options = struct {
     window_lines: u32 = 10,
 };
 
+pub const DisplayLocation = struct {
+    path: ?[]const u8,
+    start_line: u32,
+    end_line: u32,
+    selection: bool,
+    has_content: bool,
+};
+
+/// Compact label for the composer. The App derives this location from the
+/// same editor snapshot used to build the provider request.
+pub fn displayLocation(alloc: std.mem.Allocator, location: DisplayLocation) ![]u8 {
+    if (location.path == null and !location.has_content) return alloc.dupe(u8, "no file open");
+    const path = location.path orelse "unsaved buffer";
+    if (location.selection) {
+        return std.fmt.allocPrint(alloc, "{s}:L{d}-{d}", .{
+            path,
+            location.start_line + 1,
+            location.end_line + 1,
+        });
+    }
+    return std.fmt.allocPrint(alloc, "{s}:L{d}", .{ path, location.start_line + 1 });
+}
+
 /// Build the context block. Caller owns the result.
 pub fn build(alloc: std.mem.Allocator, input: Input, options: Options) ![]u8 {
     const max_bytes = @max(options.max_bytes, 32);
@@ -251,4 +274,37 @@ test "context: reversed selection is normalized" {
     defer alloc.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "Selected lines 2-3") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "bbb") != null);
+}
+
+test "context: composer location mirrors path, cursor and selection" {
+    const alloc = std.testing.allocator;
+    const cursor = try displayLocation(alloc, .{
+        .path = "src/中文.zig",
+        .start_line = 41,
+        .end_line = 41,
+        .selection = false,
+        .has_content = true,
+    });
+    defer alloc.free(cursor);
+    try std.testing.expectEqualStrings("src/中文.zig:L42", cursor);
+
+    const selection = try displayLocation(alloc, .{
+        .path = null,
+        .start_line = 35,
+        .end_line = 42,
+        .selection = true,
+        .has_content = true,
+    });
+    defer alloc.free(selection);
+    try std.testing.expectEqualStrings("unsaved buffer:L36-43", selection);
+
+    const empty = try displayLocation(alloc, .{
+        .path = null,
+        .start_line = 0,
+        .end_line = 0,
+        .selection = false,
+        .has_content = false,
+    });
+    defer alloc.free(empty);
+    try std.testing.expectEqualStrings("no file open", empty);
 }

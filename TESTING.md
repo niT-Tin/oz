@@ -17,10 +17,10 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-Current counts on `feat/patch-multi` (based on `5d57e73`):
-**556 unit tests** and **213 e2e tests**. `tools/verify.sh` PASSes all three
-commands in this worktree (diff check, 556/556 unit, 213/213 e2e; the
-`terminal:` and multi-file `approval:` suites included). `tools/verify.sh`
+Current counts for the AI workspace visual redesign and request telemetry:
+**581 unit tests** and **220 e2e tests**. `tools/verify.sh` covers diff check,
+all unit tests and all e2e tests (including Agent-focus, `terminal:` and
+multi-file `approval:`). `tools/verify.sh`
 writes `.verify/unit.log`, `.verify/e2e.log`, and
 `.verify/verify.json` (schema version 1, git commit/dirty flag, exact command
 strings, timestamps, exit codes, log SHA-256s, parsed pass/fail counts). It
@@ -40,7 +40,7 @@ replaying a cached successful run.
 | Layer | What it covers | Where |
 |---|---|---|
 | **Model/unit (L1)** | Pure logic: piece table, motions, keymaps, SSE/OpenAI config parsing, AI workspace layout/focus/thread model, navigator tab model, note store (paths/titles/sorting/creation), inline selection mapping/fences/diff/pending policy, M3a agent loop bounds/card formatting/metrics/chart cache key + transcript→request assembly, M3c recent-window p95 (nearest-rank, ring wraparound, empty→null, no revision change), M3b1 staged `edit_file` args/occurrence/span/bounded-preview/pending policy and approval decision metrics; M3b2 multi/single-file unified-diff parse/validate, per-file patch pending, two-phase commit rollback, cross-file undo set, bounded/full hunk preview and `verifyFile`; M3b3 terminal argument validation/timeout bounds/escaped display/output cap/result text, real `/bin/sh` spawn/cancel/timeout/output-cap job wrapper, and one-call terminal execution metrics | `src/**/*.zig` `test` blocks, aggregated by `src/tests.zig` |
-| **Protocol fixtures** | SSE chunking, request JSON (incl. assistant tool-call turns and `role:"tool"` results), streamed `tool_calls` fragments/parallel calls/malformed protocol, config env parsing, AI client cancellation/error paths; mock LSP JSON-RPC | `src/ai/sse.zig`, `src/ai/openai.zig`, `src/ai/tools.zig`, `src/ai/client.zig`, `src/ai/config.zig`, mock LSP tests |
+| **Protocol fixtures** | SSE chunking, request JSON (incl. `stream_options.include_usage`, assistant tool-call turns and `role:"tool"` results), DeepSeek usage-only chunks after `finish_reason`, request phase/elapsed/context telemetry, streamed `tool_calls` fragments/parallel calls/malformed protocol, config env parsing incl. `OZ_AI_CONTEXT_TOKENS`, AI client cancellation/error paths; mock LSP JSON-RPC | `src/ai/sse.zig`, `src/ai/openai.zig`, `src/ai/telemetry.zig`, `src/ai/tools.zig`, `src/ai/client.zig`, `src/ai/config.zig`, mock LSP tests |
 | **Semantic frames (L3)** | Real `oz` binary in a pty; ANSI stream reconstructed into a cell grid; assertions on regions, borders, text, overlap, overflow | `test/e2e.zig` + `test/frame.zig` |
 | **Scenario matrix** | Data-driven pairwise matrix over terminal widths, filetree, and AI rail states; fresh pty per scenario; tags enforced | `test/e2e.zig` (`scenario_matrix`) |
 | **Goldens** | Cell-exact text + fg/bg frames for representative AI workspace sizes | `test/golden/`, `test/golden.zig` |
@@ -102,17 +102,23 @@ least one scenario.
 
 ### Goldens
 
-Two focused frames are stored under `test/golden/`:
+Five focused frames are stored under `test/golden/`:
 
-- `ai-dock-120x30.txt` — docked rail + editor
+- `ai-dock-120x30.txt` — 38-cell Coding rail + editor
+- `ai-dock-100x30.txt` — 34-cell medium dock + editor
 - `ai-drawer-80x24.txt` — narrow overlay drawer
+- `ai-focus-120x30.txt` — 52-cell Agent-focus rail + 7-cell icon Navigator
+- `help-120x30.txt` — `:help` keymap picker with the modal `[NORMAL]` / `Esc close` status band
 
 Format is plain text: header/size, one text row per screen row, then
 run-length-encoded packed-RGB `bg` and `fg` rows covering every cell
 (`-` means the default/unpainted color). It is diffable in code review and
 needs no image codec/OCR. The frame setup uses a fixed non-git temp cwd, a
 fixed fixture file, a fresh `HOME`, a fixed theme, and the mock stream; there
-are no timestamps or volatile paths in the frame.
+are no timestamps or volatile paths in the frame. Sub-second request telemetry
+is rendered as `<1s`, so the added `complete … no usage` and estimated-context
+rows stay deterministic. A separate DeepSeek-shaped pty fixture asserts real
+`1242 tokens` and `ctx 0% · in 1200 · out 42` after a usage-only final chunk.
 
 Normal runs compare and fail with `error.GoldenMismatch`, printing the first
 differing lines and writing:
@@ -134,60 +140,42 @@ an automatic create.
 
 ### UI chrome assertions
 
-The chrome changes are covered by two focused pty tests (`ui chrome:` filter)
-at 120x30 dock and 80x24 drawer plus the scenario matrix:
+The current chrome is covered by three focused pty tests (`ui chrome:` filter)
+at 120x30 dock and 80x24 drawer plus the scenario matrix and Agent-focus test:
 
-- the rail header band (`AGENTS  1`), the two `├──` rules (thread list/workbox
-  header, tab strip/body), the `│`-separated workbox tabs (spaced at 38 cells,
-  compact at 34/80) and the active tab's `>` marker + `bg_sel`/accent style
-  (switching to Changes moves the marker);
-- the navigator: the branded `╭─ OZ ─────╮` border, the real
-  `workspace / branch` line, the `Files / Notes / Agents` icon tabs with
-  separators and active `bg_sel`/underline, the 4-row header + `├──┤` rule, and
-  the one-cell blank gutter between the 30-cell box and editor text (full
-  mode); at <90 columns the 7-cell `OZ` + icon rail and its 30-cell peek,
-  with the editor starting at column 8 after the peek is closed;
-- the one-cell blank rail gutter in dock and drawer modes (text never touches
-  the rail's `│`, and drawer cursors under the panel are hidden);
-- the bottom status band: full-width rule row, `[MODE]` badge with accent
-  background, `│` section separators, and the `dock`/`drawer` layout cell;
+- the rail header band (`AGENTS  1`), quiet band transitions, space-separated
+  workbox tabs and the active tab's `>` marker + `bg_sel`/accent style;
+- the Navigator's branded border, real `workspace / branch`, Nerd Font
+  Files/Notes/Agents icons, active underline, and the full 30-cell or compact
+  7-cell geometry; Agent-focus uses that compact rail at 120 columns;
+- the one-cell blank rail gutter in dock and drawer modes, and the single-row
+  status band with workspace/mode/cursor/path and right-aligned AI status;
 - the theme matrix (`ui chrome: theme matrix ...`): three real starts with a
   fresh `HOME` and a written `~/.cache/oz/theme` (kanagawa-wave,
-  catppuccin-mocha, flexoki-light), asserting the navigator/buffer/workbox
-  active tabs' fg/bg/underline, the `>` markers, the minor/major separator
-  colors, the status top rule, and focused vs inactive panel borders — plus a
-  cross-theme check that those rendered samples are pairwise different;
-- a scan for tofu-prone chrome glyphs (`▥ ● ○ ◌ ✖ ▸ ▾`) in the rail and
-  navigator regions; and
-- a real-git blame test at 120 dock and 80 drawer: the ghost is truncated one
-  cell before the rail, the gap cell stays blank, the rail's own text is not
-  overwritten, and the commit summary never appears in the rail.
+  catppuccin-mocha, flexoki-light), asserting active fg/bg/underline, quiet
+  `win_sep` borders, focused accent borders and the editor-surface buffer tab;
+- a scan for tofu-prone chrome glyphs (`▥ ● ○ ◌ ✖ ▸ ▾`), and a real-git blame
+  test proving text stops before the rail without overwriting it.
 
-The goldens changed only because the chrome moved rows/styles: header band,
-active markers, the two rules, the status band, and the 38-cell tab separator
-spacing in the final gutter pass. The theme-chrome pass changed style runs
-only: active buffer tab `bg_sel`, workbox marker/label underline and marker
-background, `accent_alt` rules/tab separators, status top rule and section
-separators, and the active thread marker. Row text is unchanged. They were
-regenerated with `OZ_UPDATE_GOLDEN=1` and reviewed cell-by-cell.
+The goldens were regenerated explicitly with `OZ_UPDATE_GOLDEN=1` and reviewed
+cell-by-cell. Fixture roots are stable per golden name, so repeated runs do
+not embed a different PID or temporary path.
 
 ### Buffer strip and motion assertions
 
-The `feat/ui-polish` strip is covered by the `ui buffer strip:` tests at
-120x30, 100x30 and 80x24 plus one split test:
+The current strip is covered by the `ui buffer strip:` tests at 120x30,
+100x30 and 80x24 plus one split test:
 
-- row 0 is the label row and row 1 is the editor-wide rule row; the first
-  content line is row 2 (single window) or row 3 (two stacked label layers);
-- five real files (short, long/truncated, plain, note, diff) prove the 20–26
-  cell tab width, the `×` close cell, `│` separators, middle-ellipsis, and
-  that `gT` moves a complete `accent_alt` underline span together with the
-  `bg_sel` body (the rule row itself is the neutral `win_sep` hairline);
-- hint mode read from the drawn frame: the tab select label sits at the icon,
-  the close label at the close cell, and activating the close label removes
-  the real buffer through the existing `closeBufferAt` path;
-- the split test asserts two label rows, one shared rule row, one active
-  underline on the focused pane, content starting below all three rows, and
-  no horizontal overflow.
+- row 0 is the label row and row 1 is the editor context row (real path,
+  cursor and `<leader>i` hint); the first content line is row 2 (single
+  window) or row 3 (two stacked label layers);
+- five real files prove the 20–26 cell tab width, `×` close cell,
+  middle-ellipsis, and that `gT` moves the editor-surface active body and its
+  text underline without depending on a full-width accent rule;
+- hint mode reads labels from the drawn frame and activates the close label
+  through the existing `closeBufferAt` path;
+- the split test asserts two label rows, one shared context row, active
+  emphasis on the focused pane, content below all three rows, and no overflow.
 
 Motion is covered by pure unit tests (`src/app/animation.zig`) and two pty
 tests:
@@ -568,13 +556,14 @@ may coexist.
 |---|---|
 | Editor modes/motions/undo/registers/splits | L1 + existing L3 tests |
 | File tree, picker, dashboard, popups | L3 `assertPopupBox` + semantic frame helpers |
-| AI layout widths (80/100/120), rail/drawer, filetree combinations | scenario matrix |
+| AI layout widths (80/100/120), rail/drawer, filetree combinations | scenario matrix + Agent-focus layout unit tests |
+| Coding/Agent-focus round trips, 52-cell rail, 7-cell icon Navigator, layout restoration | L3 `ai workspace: Ctrl-w A switches Agent-focus...` + `ai-focus-120x30` golden |
 | AI chat send/stream at 120 (dock) and 80 (drawer) | scenario matrix + goldens |
 | AI thread isolation/cancel/error, selection context | existing deep L3 tests |
 | Layout arithmetic / focus state | property sweeps |
 | AI/frame cell colors and borders | goldens + semantic assertions |
-| UI chrome (rail header/rules/tabs, nav/rail blank gutters, navigator tab separators, status band, blame clipping, tofu-glyph scan) | L3 `ui chrome:` tests + `git: blame ghost clips before the agent rail` + scenario matrix + goldens |
-| Two-row buffer strip (20–26 cell tabs, middle-ellipsis, active underline, close hint, split layers) | L1 `src/app/tabstrip.zig` + L3 `ui buffer strip:` tests + goldens |
+| UI chrome (rail header/bands/tabs, nav/rail blank gutters, status band, blame clipping, tofu-glyph scan) | L3 `ui chrome:` tests + `git: blame ghost clips before the agent rail` + scenario matrix + goldens |
+| Buffer labels + editor context row (20–26 cell tabs, middle-ellipsis, active underline, close hint, split layers) | L1 `src/app/tabstrip.zig` + L3 `ui buffer strip:` tests + goldens |
 | Motion (streaming pulse, running tool spinner, badge flash deadline, idle no-churn) | L1 `src/app/animation.zig` + L3 `animation:` tests + goldens |
 | Keyboard hints (labels, status, target actions, Esc) | L1 pure model (`src/app/hints.zig`) + L3 `hints:` tests + `@hints` matrix scenarios |
 | Mouse click/wheel (hit priority, scroll clamp, cell→byte mapping, lifecycle, panes/tabs/rows/buttons, terminal focus, drawer overlay, Shift selection escape hatch) | L1 `src/app/mouse.zig` + L3 `mouse:` pty tests (SGR 1006 press/release/wheel) + `@mouse` scenarios |
@@ -595,7 +584,7 @@ Known gaps / deliberate limitations:
   but not by systematic fault injection.
 - The browser does not apply: oz is a terminal application.
 - Cursor position observability is not available (see above).
-- Goldens cover two AI workspace frames by design, not every screen/theme.
+- Goldens cover four AI workspace frames by design, not every screen/theme.
 - There is intentionally no hint-overlay golden: labels cover the target text and
   the target count depends on the repository-root filetree entries, so a full-frame
   golden would be dominated by volatile rows. The dedicated `hints:` e2e tests

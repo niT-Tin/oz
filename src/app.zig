@@ -44,10 +44,9 @@ const gitPreviewLineCount = git_job.gitPreviewLineCount;
 /// positions the cursor/ghost/menu must use the same value or columns drift.
 pub const tab_width: u32 = 4;
 
-/// Bottom chrome rows: one separator rule + the status line. Every layout
-/// (editor rows, rail rows, floats) reserves both so no content paints over
-/// the status boundary.
-pub const status_row_count: u32 = 2;
+/// Bottom chrome rows: one global status line. Every layout (editor rows,
+/// rail rows, floats) reserves the same row so no content paints over it.
+pub const status_row_count: u32 = 1;
 
 /// Current-line blame CursorHold delay (ms) — nvim updatetime-style; the
 /// ghost appears this long after the cursor settles (<leader>tb).
@@ -1889,6 +1888,8 @@ pub const App = struct {
     pub const replaceCharsAtCursor = @import("app/highlight.zig").replaceCharsAtCursor;
     // ---- AI workspace → src/app/ai.zig ----
     pub const toggleAiPanel = app_ai.toggleAiPanel;
+    pub const toggleAiFocus = app_ai.toggleAiFocus;
+    pub const clearAgentFocus = app_ai.clearAgentFocus;
     pub const focusAiRail = app_ai.focusAiRail;
     pub const aiNewThread = app_ai.aiNewThread;
     pub const aiSelectThread = app_ai.aiSelectThread;
@@ -1966,6 +1967,7 @@ pub const App = struct {
     pub const tabBarRows = @import("app/render.zig").tabBarRows;
     pub const tabLayerCount = @import("app/render.zig").tabLayerCount;
     pub const contentTop = @import("app/render.zig").contentTop;
+    pub const navigatorMode = @import("app/render.zig").navigatorMode;
     pub const contentCol = @import("app/render.zig").contentCol;
     pub const editorAreaWidth = @import("app/render.zig").editorAreaWidth;
     pub const navigatorBodyTop = @import("app/render.zig").navigatorBodyTop;
