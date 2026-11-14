@@ -448,3 +448,32 @@ test "mouse: previous codepoint start walks back over continuation bytes" {
     // "a你": bytes a=1, 你=3; pos 4 → 你 start at 1.
     try testing.expectEqual(@as(usize, 1), prevCodepointStart("a你", 4));
 }
+
+/// Inverse of soft-wrap layout, including gaps before wide graphemes.
+pub fn wrappedCellToByte(line: []const u8, row: u32, col: u32, width: u32, tab: u32, method: vaxis.gwidth.Method, hint_at: []const u32, hint_width: []const u32) u32 {
+    var layout = @import("wrap.zig").Layout{ .width = width };
+    const target = @as(u64, row) * width + col;
+    var hint_index: usize = 0;
+    var iter = vaxis.unicode.graphemeIterator(line);
+    while (iter.next()) |g| {
+        while (hint_index < hint_at.len and hint_at[hint_index] <= g.start) : (hint_index += 1) {
+            for (0..hint_width[hint_index]) |_| layout.add(1);
+            const end = layout.cursor();
+            if (target < @as(u64, end.row) * width + end.col) return @intCast(g.start);
+        }
+        const bytes = g.bytes(line);
+        if (std.mem.eql(u8, bytes, "\t")) {
+            for (0..tab) |_| layout.add(1);
+        } else layout.add(vaxis.gwidth.gwidth(bytes, method));
+        const end = layout.cursor();
+        if (target < @as(u64, end.row) * width + end.col) return @intCast(g.start);
+    }
+    return @intCast(line.len);
+}
+
+test "mouse: wrapped CJK gaps, combining clusters and tab continuation" {
+    const t = std.testing;
+    try t.expectEqual(@as(u32, 7), wrappedCellToByte("aaaa界b", 1, 2, 5, 4, .wcwidth, &.{}, &.{}));
+    try t.expectEqual(@as(u32, 0), wrappedCellToByte("e\u{0301}b", 0, 0, 5, 4, .wcwidth, &.{}, &.{}));
+    try t.expectEqual(@as(u32, 4), wrappedCellToByte("aaaa\tb", 1, 1, 5, 4, .wcwidth, &.{}, &.{}));
+}

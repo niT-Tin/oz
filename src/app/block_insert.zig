@@ -64,6 +64,31 @@ pub fn blockRect(self: *App) ?BlockRect {
 pub fn applyBlockOp(self: *App, op: editor.KeyEvent.ActionId) !void {
     const rect = self.blockRect() orelse return;
     const pt = &self.cur().pt;
+    // Capture every row before d/c mutates the document, just as y does.
+    if (op == .delete or op == .change or op == .yank) {
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(self.alloc);
+        var width: u32 = 0;
+        var line = rect.top;
+        while (line <= rect.bottom) : (line += 1) {
+            const ls = pt.lineStart(line);
+            const le = ls + pt.lineLen(line);
+            const start = self.charBoundaryForward(pt, @min(ls + rect.left, le), le);
+            const end = self.charBoundaryForward(pt, @min(ls + rect.right + 1, le), le);
+            const slice = try self.alloc.alloc(u8, end - start);
+            defer self.alloc.free(slice);
+            pt.copyRange(start, slice);
+            width = @max(width, self.textWidth(self.vx.window(), slice));
+            try bytes.appendSlice(self.alloc, slice);
+            if (line < rect.bottom) try bytes.append(self.alloc, '\n');
+        }
+        const owned = try bytes.toOwnedSlice(self.alloc);
+        if (self.yank_buffer) |old| self.alloc.free(old);
+        self.yank_buffer = owned;
+        self.yank_linewise = false;
+        self.yank_block_width = @max(width, 1);
+        self.pushSystemClipboard(owned);
+    }
     switch (op) {
         .delete, .change => {
             self.cur().history.beginGroup();
@@ -93,30 +118,7 @@ pub fn applyBlockOp(self: *App, op: editor.KeyEvent.ActionId) !void {
             }
         },
         .yank => {
-            var buf = std.ArrayList(u8).empty;
-            defer buf.deinit(self.alloc);
-            var line = rect.top;
-            while (line <= rect.bottom) : (line += 1) {
-                const ls = pt.lineStart(line);
-                const len = pt.lineLen(line);
-                if (rect.left < len) {
-                    const line_end = ls + len;
-                    const start = self.charBoundaryForward(pt, ls + rect.left, line_end);
-                    const end = @min(self.charBoundaryForward(pt, ls + rect.right + 1, line_end), line_end);
-                    if (end <= start) continue;
-                    const seg = try self.alloc.alloc(u8, end - start);
-                    defer self.alloc.free(seg);
-                    pt.copyRange(start, seg);
-                    try buf.appendSlice(self.alloc, seg);
-                }
-                if (line < rect.bottom) try buf.append(self.alloc, '\n');
-            }
-            if (self.yank_buffer) |b| self.alloc.free(b);
-            self.yank_buffer = try buf.toOwnedSlice(self.alloc);
-            self.yank_linewise = false; // blockwise yank pastes inline (no blockwise put yet)
-            // clipboard=unnamedplus: block yanks reach the system
-            // clipboard too (same as setRegister)
-            self.pushSystemClipboard(self.yank_buffer.?);
+            self.curCursor().* = pt.lineStart(rect.top) + @min(rect.left, pt.lineLen(rect.top));
             try self.setMsg(try std.fmt.allocPrint(self.alloc, "yanked block {d} bytes", .{self.yank_buffer.?.len}));
         },
         else => {},

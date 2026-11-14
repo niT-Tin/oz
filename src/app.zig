@@ -215,6 +215,8 @@ pub const App = struct {
         buf: usize = 0,
         cursor: u32 = 0,
         view_top: u32 = 0,
+        /// Wrapped rows skipped within the first visible buffer line.
+        view_wrap: u32 = 0,
         /// Set by zz/zt/zb (explicit scrolls): the render loop's
         /// "don't scroll past EOF leaving blank rows" pull-up is skipped
         /// while pinned, so zz near EOF still centers the cursor line
@@ -373,6 +375,8 @@ pub const App = struct {
     /// cursor line; charwise yanks (yw, vey, …) paste inline after/at the
     /// cursor. nvim's unnamed register behaves exactly this way.
     yank_linewise: bool = false,
+    /// Display-cell width of a rectangular register; null for char/linewise.
+    yank_block_width: ?u32 = null,
     /// Native clipboard tool probed once at startup (detectClipboardTool):
     /// macOS pbcopy/pbpaste; Linux wl-clipboard → xclip → xsel. .none on
     /// headless/SSH — yanks then reach the system clipboard only through

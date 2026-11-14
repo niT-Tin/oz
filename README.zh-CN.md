@@ -13,7 +13,7 @@
 - 完整移动与 count：hjkl、w/W/e/E/b/B/ge/gE、^/0/$、gg/G、{/}、%、f/F/t/T、Ctrl-u/d/f/b
 - Unicode 移动：`w/e/b/ge` 把每个中文字/emoji 当作一个词，逐字跳；`W/E/B/gE` 按空白分 WORD；`f/F/t/T` 支持中文/emoji 目标
 - 文本对象、surround、注释、对齐、EasyMotion（s / `<leader>f`）、多光标（Ctrl+n）
-- 撤销/重做（分组 + 分支语义）、寄存器语义（linewise/charwise yank & put）并与系统剪贴板互通（OSC52 + pbcopy/wl-copy/xclip/xsel，对齐 nvim `clipboard=unnamedplus`）
+- 撤销/重做（分组 + 分支语义）、寄存器语义（linewise/charwise/blockwise yank & put）并与系统剪贴板互通（OSC52 + pbcopy/wl-copy/xclip/xsel，对齐 nvim `clipboard=unnamedplus`）
 - 键盘宏：`q{reg}` 录制（再按 q 停止）、`@{reg}` 回放（支持 `3@a` 次数与 `@@` 重复），可视模式下 `@` 对选区逐行回放（`:'<,'>normal!` 语义），状态栏显示 `recording @x`
 - 分屏（:sp/:vs + Ctrl-w 系列）、buffer 标签栏、相对行号、代码折叠
 - 文件安全：载入独立内容快照，外部原地写入/截断不会改动 buffer；保存保留符号链接并写入真实目标。磁盘内容已变或新文件被外部创建时，`:w`/`:wq` 拒绝覆盖并保留未保存内容；显式 `:w!`/`:wq!` 才覆盖内容冲突，链接被重定向时仍拒绝。

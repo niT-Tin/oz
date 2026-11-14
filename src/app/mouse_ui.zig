@@ -441,7 +441,7 @@ fn panePositionAt(self: *App, win_idx: usize, rect: mouse.Rect, col: u32, row: u
     const dr = row - rect.row;
 
     var line = @min(w.view_top, line_count - 1);
-    var rem = dr;
+    var rem = dr + w.view_wrap;
     var target_line: u32 = line;
     var chunk: u32 = 0;
     var found = false;
@@ -466,8 +466,6 @@ fn panePositionAt(self: *App, win_idx: usize, rect: mouse.Rect, col: u32, row: u
     // the cursor at the line start (vim's "click margin" behavior).
     if (clicked_cell < gutter) return line_start;
     const text_col = clicked_cell - gutter;
-    const target_cell: i64 = @as(i64, @intCast(chunk)) * @as(i64, @intCast(content_width)) +
-        @as(i64, @intCast(text_col));
 
     // Bounded line copy for the cell/byte walk. A >256 KiB line maps within
     // its first 256 KiB (explicit limitation, DESIGN §21); typical code
@@ -493,9 +491,11 @@ fn panePositionAt(self: *App, win_idx: usize, rect: mouse.Rect, col: u32, row: u
         }
     }
 
-    var byte = mouse.cellToByteWithHints(
+    var byte = mouse.wrappedCellToByte(
         text,
-        target_cell,
+        chunk,
+        text_col,
+        content_width,
         app_mod.tab_width,
         self.vx.caps.widthMethod(),
         hint_at.items,

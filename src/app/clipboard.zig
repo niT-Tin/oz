@@ -96,8 +96,8 @@ pub fn pushSystemClipboard(self: *App, text: []const u8) void {
 pub fn readSystemClipboard(self: *App) ?[]u8 {
     const argv: []const []const u8 = switch (self.clip_tool) {
         .pbcopy => &.{"pbpaste"},
-        // NOT --no-newline: the trailing '\n' decides linewise vs charwise
-        .wl => &.{"wl-paste"},
+        // Suppress wl-paste's synthetic newline; preserve actual clipboard bytes.
+        .wl => &.{ "wl-paste", "--no-newline" },
         .xclip => &.{ "xclip", "-selection", "clipboard", "-o" },
         .xsel => &.{ "xsel", "--clipboard", "--output" },
         .none => return null,

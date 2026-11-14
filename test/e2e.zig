@@ -23668,3 +23668,201 @@ test "ACP editor: external writes preserve dirty buffers" {
 test "ACP editor: unchanged disk does not conflict with local edits" {
     try acpEditorScenario("normal", true, false);
 }
+
+test "regression wrap: inserted tail and cursor stay together past row and viewport boundaries" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "wrap.txt", "\n");
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/wrap.txt", .{root});
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{}, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try sess.send("i");
+    try gridWaitFor(&sess, &grid, "INSERT", 5000);
+    const first_row = grid.row;
+    const gutter = grid.col;
+    const cw = grid.cols - gutter;
+    const prefix = try a.alloc(u8, cw);
+    defer a.free(prefix);
+    @memset(prefix, 'x');
+    try sess.send(prefix);
+    try gridWaitFor(&sess, &grid, "col 78", 5000);
+    try std.testing.expectEqual(first_row + 1, grid.row);
+    try std.testing.expectEqual(gutter, grid.col);
+    try sess.send("TAIL");
+    try gridWaitRowContains(&sess, &grid, first_row + 1, "TAIL", 5000);
+    try std.testing.expectEqual(gutter + 4, grid.col);
+    const huge = try a.alloc(u8, 80 * 35);
+    defer a.free(huge);
+    @memset(huge, 'z');
+    try sess.send("\x1b[200~");
+    try sess.send(huge);
+    try sess.send("\x1b[201~");
+    try sess.send("END");
+    try gridWaitFor(&sess, &grid, "END", 8000);
+    try std.testing.expect(grid.row < grid.rows - 1);
+    try std.testing.expect(rowContains(&grid, grid.row, "END"));
+    try sess.send("\x1b");
+    std.Io.sleep(io, .fromMilliseconds(100), .real) catch {};
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try absFileText(io, a, path);
+    defer a.free(saved);
+    const expected = try std.fmt.allocPrint(a, "{s}TAIL{s}END\n", .{ prefix, huge });
+    defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, saved);
+}
+
+test "regression block: delete then P restores a rectangle instead of a stale register" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const original = "aa11zz\nbb22yy\ncc33xx\n";
+    try aiWriteFile(io, root, "block.txt", original);
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/block.txt", .{root});
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{}, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try sess.send("yyll\x16ljjd");
+    try gridWaitFor(&sess, &grid, "aazz", 5000);
+    try sess.send("P");
+    try gridWaitFor(&sess, &grid, "bb22yy", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try absFileText(io, a, path);
+    defer a.free(saved);
+    try std.testing.expectEqualStrings(original, saved);
+}
+
+test "regression wrap: CJK edge gaps and combining graphemes use the same cursor layout" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "unicode.txt", "\n");
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/unicode.txt", .{root});
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{}, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try sess.send("i");
+    try gridWaitFor(&sess, &grid, "INSERT", 5000);
+    const row = grid.row;
+    const gutter = grid.col;
+    const prefix = try a.alloc(u8, grid.cols - gutter - 1);
+    defer a.free(prefix);
+    @memset(prefix, 'a');
+    try sess.send("\x1b[200~");
+    try sess.send(prefix);
+    try sess.send("界e\u{0301}\x1b[201~");
+    try sess.send("Q");
+    try gridWaitRowContains(&sess, &grid, row + 1, "Q", 5000);
+    try std.testing.expectEqual(row + 1, grid.row);
+    try std.testing.expectEqual(gutter + 4, grid.col);
+    try sess.send("\x1b");
+    std.Io.sleep(io, .fromMilliseconds(100), .real) catch {};
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try absFileText(io, a, path);
+    defer a.free(saved);
+    const expected = try std.fmt.allocPrint(a, "{s}界e\u{0301}Q\n", .{prefix});
+    defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, saved);
+}
+
+test "regression block: Wayland clipboard preserves block type and count put pads short lines" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "wl-copy", "#!/bin/sh\n/bin/cat > \"$OZ_TEST_CLIPBOARD\"\n");
+    try aiWriteFile(io, root, "wl-paste", "#!/bin/sh\n/bin/cat \"$OZ_TEST_CLIPBOARD\"\nif [ \"$1\" != '--no-newline' ]; then printf '\\n'; fi\n");
+    for ([_][]const u8{ "wl-copy", "wl-paste" }) |name| {
+        const p = try std.fs.path.join(a, &.{ root, name });
+        defer a.free(p);
+        const f = try std.Io.Dir.cwd().openFile(io, p, .{});
+        defer f.close(io);
+        try f.setPermissions(io, std.Io.File.Permissions.fromMode(0o755));
+    }
+    try aiWriteFile(io, root, "clipboard", "STALE_SYSTEM_TEXT");
+    try aiWriteFile(io, root, "block.txt", "aa11zz\nbb22yy\ncc33xx\nA\n\n");
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/block.txt", .{root});
+    const path_env = try std.fmt.allocPrint(a, "PATH={s}:/usr/bin:/bin", .{root});
+    defer a.free(path_env);
+    const clip_env = try std.fmt.allocPrint(a, "OZ_TEST_CLIPBOARD={s}/clipboard", .{root});
+    defer a.free(clip_env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{ path_env, clip_env, "WAYLAND_DISPLAY=oz-fixture" }, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try sess.send("ll\x16ljjd");
+    try gridWaitFor(&sess, &grid, "aazz", 5000);
+    try sess.send("P");
+    try gridWaitFor(&sess, &grid, "bb22yy", 5000);
+    const clip = try aiReadFile(io, a, root, "clipboard");
+    defer a.free(clip);
+    try std.testing.expectEqualStrings("11\n22\n33", clip);
+    // Block yank must also retain its type. Put twice after column 0 of
+    // the short fourth line; later rows must be padded/created, not joined.
+    try sess.send("gg0ll\x16ljjy3j02p");
+    try gridWaitFor(&sess, &grid, "A1111", 5000);
+    try sess.send("u");
+    try gridWaitGone(&sess, &grid, "A1111", 5000);
+    try sess.send("\x12");
+    try gridWaitFor(&sess, &grid, "A1111", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try absFileText(io, a, path);
+    defer a.free(saved);
+    try std.testing.expectEqualStrings("aa11zz\nbb22yy\ncc33xx\nA1111\n 2222\n 3333", saved);
+}
+
+test "regression wrap: syntax style changes at a full row do not hide the next character" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "edge.zig", "\n");
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/edge.zig", .{root});
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{"OZ_LSP_CMD=/bin/false"}, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try sess.send("i");
+    try gridWaitFor(&sess, &grid, "INSERT", 5000);
+    const first_row = grid.row;
+    const gutter = grid.col;
+    const digits = try a.alloc(u8, grid.cols - gutter - 10);
+    defer a.free(digits);
+    @memset(digits, '1');
+    try sess.send("\x1b[200~const a = ");
+    try sess.send(digits);
+    try sess.send(";\x1b[201~");
+    try gridWaitRowContains(&sess, &grid, first_row + 1, ";", 5000);
+    try std.testing.expectEqual(first_row + 1, grid.row);
+    try std.testing.expectEqual(gutter + 1, grid.col);
+    try sess.send("\x1b");
+    std.Io.sleep(io, .fromMilliseconds(100), .real) catch {};
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+}

@@ -22,6 +22,7 @@ const tabstrip = @import("tabstrip.zig");
 const animation = @import("animation.zig");
 const git_job = @import("git_job.zig");
 const markdown = @import("markdown.zig");
+const wrap = @import("wrap.zig");
 
 const tab_width = app_mod.tab_width;
 const status_row_count = app_mod.status_row_count;
@@ -158,39 +159,12 @@ pub fn gutterWidth(self: *const App, line_count: u32) u32 {
 /// inserted text before/after CJK characters).
 pub fn lineCellCol(self: *App, win: vaxis.Window, line: u32, byte_pos: u32) u32 {
     const pt = &self.cur().pt;
-    const line_start = pt.lineStart(line);
-    var p = line_start;
+    const start = pt.lineStart(line);
+    var iter = LineGraphemes{ .pt = pt, .pos = start, .end = start + pt.lineTextLen(line) };
     var col: u32 = 0;
-    // Scan a chunked COPY of the line: per-byte byteAt is O(pieces), so
-    // walking long lines byte by byte costs O(line_len × pieces) per
-    // call, several times per frame.
-    var chunk: [4096]u8 = undefined;
-    var chunk_start: u32 = 0;
-    var chunk_len: usize = 0;
-    while (p < byte_pos) {
-        if (p < chunk_start or p >= chunk_start + chunk_len) {
-            chunk_start = p;
-            chunk_len = @min(@as(usize, @intCast(byte_pos - p)), chunk.len);
-            pt.copyRange(p, chunk[0..chunk_len]);
-        }
-        const b = chunk[p - chunk_start];
-        // A tab occupies `tab_width` cells (the renderer expands it), not
-        // the 0 vaxis reports — otherwise cursor/ghost/menu columns would
-        // disagree with the drawn line on files containing tabs.
-        if (b == '\t') {
-            col += tab_width;
-            p += 1;
-            continue;
-        }
-        const seq_len: usize = if (b < 0x80)
-            1
-        else
-            (std.unicode.utf8ByteSequenceLength(b) catch 1);
-        const avail = @min(seq_len, @as(usize, @intCast(byte_pos - p)));
-        var ch_buf: [4]u8 = undefined;
-        pt.copyRange(p, ch_buf[0..avail]);
-        col += win.gwidth(ch_buf[0..avail]);
-        p += @intCast(avail);
+    while (iter.next()) |g| {
+        if (g.start + g.bytes.len > byte_pos) break;
+        col += if (std.mem.eql(u8, g.bytes, "\t")) tab_width else win.gwidth(g.bytes);
     }
     return col;
 }
@@ -202,18 +176,10 @@ pub fn lineCellCol(self: *App, win: vaxis.Window, line: u32, byte_pos: u32) u32 
 pub fn textWidth(self: *App, win: vaxis.Window, text: []const u8) u32 {
     _ = self;
     var col: u32 = 0;
-    var p: usize = 0;
-    while (p < text.len) {
-        const b = text[p];
-        if (b == '\t') {
-            col += tab_width;
-            p += 1;
-            continue;
-        }
-        const seq_len: usize = if (b < 0x80) 1 else (std.unicode.utf8ByteSequenceLength(b) catch 1);
-        const avail = @min(seq_len, text.len - p);
-        col += win.gwidth(text[p .. p + avail]);
-        p += avail;
+    var iter = vaxis.unicode.graphemeIterator(text);
+    while (iter.next()) |g| {
+        const bytes = g.bytes(text);
+        col += if (std.mem.eql(u8, bytes, "\t")) tab_width else win.gwidth(bytes);
     }
     return col;
 }
@@ -361,55 +327,84 @@ pub fn blankContextLevels(self: *App, buf: *Buffer, line: u32, line_count: u32) 
     return ctx_levels;
 }
 
-/// Screen rows `line` occupies in a pane `content_width` cells wide with
-/// soft wrap (always ≥ 1): the line text's display cells (grapheme widths,
-/// tab = tab_width — matching the text the renderer emits after tab
-/// expansion) plus the inlay hints spliced into the line and a closed
-/// fold's " … N lines" marker, ceiling-divided by the width. Markdown
-/// conceal is NOT subtracted: it only shrinks rows, so the estimate never
-/// scrolls the cursor off — at worst it scrolls one row early.
-pub fn lineDisplayRows(self: *App, win: vaxis.Window, buf: *Buffer, buf_index: usize, line: u32, content_width: u32) u32 {
-    const cw = @max(content_width, 1);
+/// Soft-wrap measurement and painting share grapheme widths, tab expansion
+/// and edge-gap rules. Insertion after an exactly full line reserves a row.
+// Iterate whole graphemes from a bounded piece-table cache. Refill before
+// consuming a grapheme at a chunk boundary so combining marks/ZWJ stay joined.
+const LineGraphemes = struct {
+    pt: *const buffer.PieceTable,
+    pos: u32,
+    end: u32,
+    begin: u32 = 0,
+    len: u32 = 0,
+    cache: [4096]u8 = undefined,
+    fn refill(it: *@This()) void {
+        it.begin = it.pos;
+        it.len = @min(it.end - it.pos, it.cache.len);
+        it.pt.copyRange(it.pos, it.cache[0..it.len]);
+    }
+    fn next(it: *@This()) ?struct { start: u32, bytes: []const u8 } {
+        if (it.pos >= it.end) return null;
+        if (it.pos < it.begin or it.pos >= it.begin + it.len) it.refill();
+        var rest = it.cache[it.pos - it.begin .. it.len];
+        var iter = vaxis.unicode.graphemeIterator(rest);
+        var g = iter.next() orelse return null;
+        if (g.len + 4 >= rest.len and it.begin + it.len < it.end and it.pos > it.begin) {
+            it.refill();
+            rest = it.cache[0..it.len];
+            iter = vaxis.unicode.graphemeIterator(rest);
+            g = iter.next() orelse return null;
+        }
+        const start = it.pos;
+        it.pos += @intCast(g.len);
+        return .{ .start = start, .bytes = g.bytes(rest) };
+    }
+};
+fn addWrappedText(layout: *wrap.Layout, win: vaxis.Window, text: []const u8) void {
+    var iter = vaxis.unicode.graphemeIterator(text);
+    while (iter.next()) |g| {
+        const bytes = g.bytes(text);
+        if (std.mem.eql(u8, bytes, "\t")) {
+            for (0..tab_width) |_| layout.add(1);
+        } else layout.add(win.gwidth(bytes));
+    }
+}
+const LineWrap = struct { cursor: wrap.Pos, rows: u32 };
+fn lineWrap(self: *App, win: vaxis.Window, buf: *Buffer, buf_index: usize, line: u32, width: u32, target: ?u32) LineWrap {
     const ls = buf.pt.lineStart(line);
-    const ll = buf.pt.lineTextLen(line);
-    var cells: u32 = 0;
-    // chunked copyRange scan (per-byte byteAt is O(pieces) — see lineCellCol)
-    var chunk: [4096]u8 = undefined;
-    var off: u32 = 0;
-    while (off < ll) {
-        const cn: u32 = @min(ll - off, chunk.len);
-        buf.pt.copyRange(ls + off, chunk[0..cn]);
-        var p: u32 = 0;
-        while (p < cn) {
-            const b = chunk[p];
-            if (b == '\t') {
-                cells += tab_width;
-                p += 1;
-                continue;
-            }
-            const seq_len: u32 = if (b < 0x80) 1 else (std.unicode.utf8ByteSequenceLength(b) catch 1);
-            // a multi-byte sequence split by the chunk edge: re-read from
-            // its start instead of feeding gwidth a truncated sequence
-            if (p + seq_len > cn and off + cn < ll) break;
-            const avail: usize = @intCast(@min(seq_len, cn - p));
-            cells += win.gwidth(chunk[p..][0..avail]);
-            p += @intCast(avail);
-        }
-        off += p;
+    const end = ls + buf.pt.lineTextLen(line);
+    var layout = wrap.Layout{ .width = @max(width, 1) };
+    var result: ?wrap.Pos = null;
+    var hint_i: usize = 0;
+    const hints = if (!self.inlay_stale and self.inlay_buf == buf_index) self.inlay_hints.items else &.{};
+    while (hint_i < hints.len and hints[hint_i].line < line) hint_i += 1;
+    var it = LineGraphemes{ .pt = &buf.pt, .pos = ls, .end = end };
+    while (it.next()) |g| {
+        while (hint_i < hints.len and hints[hint_i].line == line and hints[hint_i].character <= g.start - ls) : (hint_i += 1)
+            addWrappedText(&layout, win, hints[hint_i].label);
+        const is_tab = std.mem.eql(u8, g.bytes, "\t");
+        const cells: u32 = if (is_tab) 1 else win.gwidth(g.bytes);
+        _ = layout.place(cells);
+        if (target) |pos| if (result == null and pos < g.start + g.bytes.len) {
+            result = layout.cursor();
+        };
+        if (is_tab) {
+            for (0..tab_width) |_| layout.add(1);
+        } else layout.add(cells);
     }
-    // inlay hints occupy screen cells without buffer bytes
-    if (!self.inlay_stale and self.inlay_buf == buf_index) {
-        for (self.inlay_hints.items) |hint| {
-            if (hint.line == line) cells += self.textWidth(win, hint.label);
-        }
-    }
-    // a closed fold's header row also carries the " … N lines" marker
+    while (hint_i < hints.len and hints[hint_i].line == line) : (hint_i += 1) addWrappedText(&layout, win, hints[hint_i].label);
+    if (result == null) result = layout.cursor();
     if (foldAt(buf, line)) |f| {
         var mbuf: [24]u8 = undefined;
-        const marker = std.fmt.bufPrint(&mbuf, " … {d} lines", .{f.hiddenCount()}) catch "";
-        cells += self.textWidth(win, marker);
+        addWrappedText(&layout, win, std.fmt.bufPrint(&mbuf, " … {d} lines", .{f.hiddenCount()}) catch "");
     }
-    return @max(1, (cells + cw - 1) / cw);
+    var rows = layout.pos.row + 1;
+    if (self.state.mode == .insert and buf_index == self.current and buf.pt.lineOf(self.curCursor().*) == line and self.curCursor().* == end)
+        rows = @max(rows, result.?.row + 1);
+    return .{ .cursor = result.?, .rows = rows };
+}
+pub fn lineDisplayRows(self: *App, win: vaxis.Window, buf: *Buffer, buf_index: usize, line: u32, content_width: u32) u32 {
+    return lineWrap(self, win, buf, buf_index, line, content_width, null).rows;
 }
 
 fn markdownVirtualRows(win: vaxis.Window, layout: ?*const markdown.Layout, line: u32, content_width: u32, before: bool, after: bool) u32 {
@@ -583,12 +578,11 @@ pub fn focusedScreenPos(self: *App, win: vaxis.Window, rect: LeafRect, line: u32
         row += displayRowsWithMarkdown(self, win, buf, self.current, l, cw, md_layout);
     }
     row += markdownVirtualRows(win, md_layout, line, cw, true, false);
-    const col_cells = self.screenCellCol(win, line, pos);
-    const rows = self.lineDisplayRows(win, buf, self.current, line, cw);
-    const wrap_row = @min(col_cells / cw, rows - 1);
+    const wrapped = lineWrap(self, win, buf, self.current, line, cw, pos);
+    const skipped = self.windows.items[self.current_win].view_wrap;
     return .{
-        .row = row + wrap_row,
-        .col = @min(col_cells -| wrap_row * cw, cw - 1),
+        .row = (row + wrapped.cursor.row) -| skipped,
+        .col = @min(wrapped.cursor.col, cw - 1),
     };
 }
 
@@ -614,7 +608,7 @@ fn printMarkdownVirtual(
             var iter = vaxis.unicode.graphemeIterator(text[offset..]);
             while (iter.next()) |g| {
                 const gw: u32 = win.gwidth(g.bytes(text[offset..]));
-                if (used + gw > content_width and take > 0) break;
+                if (used + gw > content_width and used > 0) break;
                 used += gw;
                 take = g.start + g.len;
             }
@@ -685,13 +679,10 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
     }
     // the cursor's cell column decides which wrap chunk of its line it
     // sits on — that chunk must be visible, not just the line's first row
-    const cursor_col_cells: u32 = if (w.buf == self.current)
-        self.screenCellCol(win, cursor_line, w.cursor)
-    else
-        self.lineCellCol(win, cursor_line, w.cursor);
+    const cursor_layout = lineWrap(self, win, buf, w.buf, cursor_line, content_width, w.cursor);
     const cur_line_rows = displayRowsWithMarkdown(self, win, buf, w.buf, cursor_line, content_width, active_md);
     const cursor_before_rows = markdownVirtualRows(win, active_md, cursor_line, content_width, true, false);
-    const cursor_wrap_row: u32 = @min(cursor_before_rows + cursor_col_cells / content_width, cur_line_rows - 1);
+    const cursor_wrap_row: u32 = cursor_before_rows + cursor_layout.cursor.row;
     // Rows between view_top and the cursor's row (view_top row counts as
     // row 0). Single forward pass with a ring of per-line row counts: as
     // the walk advances, view_top follows so the window never spans more
@@ -719,6 +710,11 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         }
         rows_to_cursor = sum + cursor_wrap_row;
     }
+    w.view_wrap = if (w.view_top == cursor_line and cursor_wrap_row >= rect.height)
+        cursor_wrap_row - rect.height + 1
+    else
+        0;
+    rows_to_cursor -|= w.view_wrap;
     // The cursor (or a fold snap) forced the view to scroll: an explicit
     // zz/zt/zb pin no longer applies and normal scroll rules resume.
     // Moving the cursor INSIDE the viewport never reaches this — the pin
@@ -749,6 +745,7 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
             // its row would scroll off the bottom
             if (rows_to_cursor + r >= rect.height) break;
             w.view_top = prev;
+            w.view_wrap = 0;
             below += r;
             rows_to_cursor += r;
         }
@@ -1058,36 +1055,14 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         // math — the text segment builder expands them to spaces).
         var n: u32 = line_len;
         {
-            const max_cells: u32 = content_width * (rect.row + rect.height - row);
+            const max_cells: u32 = content_width * (rect.row + rect.height - row + (if (line == w.view_top) w.view_wrap else 0));
             var cells: u32 = 0;
-            var chunk: [4096]u8 = undefined;
-            var off: u32 = 0;
-            var done = false;
-            while (off < n and !done) {
-                const cn: u32 = @min(n - off, chunk.len);
-                buf.pt.copyRange(line_start + off, chunk[0..cn]);
-                var p: u32 = 0;
-                while (p < cn) {
-                    const b = chunk[p];
-                    if (b == '\t') {
-                        cells += tab_width;
-                        p += 1;
-                    } else {
-                        const seq_len: u32 = if (b < 0x80) 1 else (std.unicode.utf8ByteSequenceLength(b) catch 1);
-                        // re-read a multi-byte sequence split by the chunk edge
-                        if (p + seq_len > cn and off + cn < n) break;
-                        const avail: usize = @intCast(@min(seq_len, cn - p));
-                        cells += win.gwidth(chunk[p..][0..avail]);
-                        p += @intCast(avail);
-                    }
-                    if (cells >= max_cells) {
-                        done = true;
-                        break;
-                    }
-                }
-                off += p;
+            var iter = LineGraphemes{ .pt = &buf.pt, .pos = line_start, .end = line_start + line_len };
+            while (iter.next()) |g| {
+                cells += if (std.mem.eql(u8, g.bytes, "\t")) tab_width else win.gwidth(g.bytes);
+                if (cells >= max_cells) break;
             }
-            n = off; // whole graphemes only — never a split UTF-8 sequence
+            n = iter.pos - line_start;
         }
         // line text lives in a per-line arena slice (valid until vx.render,
         // like every other segment slice)
@@ -1539,15 +1514,18 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         // and blanks on continuation rows (vim 'wrap' + 'number').
         const line_row = row; // first chunk row: number + diag/git marks
         if (is_focused and line == cursor_line) {
-            self.rendered_cursor_row = line_row + (cursor_wrap_row - cursor_before_rows);
+            self.rendered_cursor_row = line_row + (cursor_wrap_row - cursor_before_rows) -| (if (line == w.view_top) w.view_wrap else 0);
         }
         var seg_i: usize = 2; // skip the two gutter segments
         var seg_off: usize = 0; // grapheme-aligned byte offset into seg.text
+        var wrap_row: u32 = 0;
+        const skip_rows = if (line == w.view_top) w.view_wrap else 0;
         while (row < rect.row + rect.height) {
-            if (row == line_row) {
+            const visible = wrap_row >= skip_rows;
+            if (visible and wrap_row == 0) {
                 const gseg = [_]vaxis.Segment{.{ .text = num_str, .style = cursorline_style }};
                 _ = win.print(&gseg, .{ .row_offset = @intCast(row), .col_offset = @intCast(rect.col), .wrap = .none });
-            } else {
+            } else if (visible) {
                 const blank = num_buf[(row - rect.row) * gutter ..][0..gutter];
                 @memset(blank, ' ');
                 const gseg = [_]vaxis.Segment{.{ .text = blank, .style = cursorline_style }};
@@ -1566,7 +1544,7 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
                     // a wide grapheme that would straddle the edge goes to
                     // the next row whole — but always take at least one per
                     // row or the loop never advances (narrow pane)
-                    if (used + gw > content_width and take > 0) break;
+                    if (used + gw > content_width and used > 0) break;
                     used += gw;
                     take = g.start + g.len;
                 }
@@ -1580,15 +1558,21 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
                 seg_i += 1;
                 seg_off = 0;
             }
-            if (chunk_segs.items.len > 0) {
+            if (visible and chunk_segs.items.len > 0) {
                 _ = win.print(chunk_segs.items, .{
                     .row_offset = @intCast(row),
                     .col_offset = @intCast(rect.col + gutter),
                     .wrap = .none,
                 });
             }
-            row += 1;
-            if (consumed) break;
+            if (visible) row += 1;
+            wrap_row += 1;
+            if (consumed) {
+                // The insertion point after an exactly full line owns an
+                // empty continuation row; don't paint the next line there.
+                if (line == cursor_line and cursor_layout.cursor.row == wrap_row and self.state.mode == .insert and row < rect.row + rect.height) row += 1;
+                break;
+            }
         }
         // diagnostic mark: writeCell AFTER the line print so the glyph is
         // not overwritten by the gutter segment (on the line's FIRST row)

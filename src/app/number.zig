@@ -229,7 +229,9 @@ pub fn pasteBuffer(self: *App, before: bool, count: u32) !void {
         try self.setMsg(try self.alloc.dupe(u8, "E353: Nothing in register"));
         return;
     };
-    try self.putRegister(buf, self.yank_linewise, before, count);
+    if (self.yank_block_width) |width| {
+        try putBlock(self, buf, width, before, count);
+    } else try self.putRegister(buf, self.yank_linewise, before, count);
 }
 
 /// The put itself: paste `buf` with register type `linewise`. Split out
@@ -326,5 +328,49 @@ pub fn putRegister(self: *App, buf: []const u8, linewise: bool, before: bool, co
     // markDirty is the single entry point for dirty flag / edit_seq /
     // LSP didChange / inlay invalidation — paste must go through it or
     // the server keeps an outdated document and hints stay stale.
+    self.markDirty();
+}
+
+/// Put each rectangular register row at the same display column. One undo
+/// group includes padding and new lines, including puts past the last line.
+fn putBlock(self: *App, bytes: []const u8, width: u32, before: bool, count: u32) !void {
+    const pt = &self.cur().pt;
+    const top = pt.lineOf(self.curCursor().*);
+    const win = self.vx.window();
+    var anchor = self.curCursor().*;
+    const end = pt.lineStart(top) + pt.lineLen(top);
+    if (!before and anchor < end) anchor += self.charLenAt(pt, anchor);
+    const column = self.lineCellCol(win, top, anchor);
+    self.cur().history.beginGroup();
+    defer self.cur().history.endGroup();
+    var rows = std.mem.splitScalar(u8, bytes, '\n');
+    var row: u32 = top;
+    var first: ?u32 = null;
+    while (rows.next()) |text| : (row += 1) {
+        while (row >= pt.lineCount()) try self.cur().history.record(pt, pt.len(), 0, "\n");
+        const ls = pt.lineStart(row);
+        const le = ls + pt.lineLen(row);
+        var pos = ls;
+        var cells: u32 = 0;
+        while (pos < le and cells < column) {
+            const n = self.charLenAt(pt, pos);
+            var ch: [4]u8 = undefined;
+            pt.copyRange(pos, ch[0..n]);
+            cells += self.textWidth(win, ch[0..n]);
+            pos += n;
+        }
+        var insert: std.ArrayList(u8) = .empty;
+        defer insert.deinit(self.alloc);
+        if (cells < column) try insert.appendNTimes(self.alloc, ' ', column - cells);
+        const start = pos + @as(u32, @intCast(insert.items.len));
+        const text_cells = self.textWidth(win, text);
+        for (0..@max(count, 1)) |_| {
+            try insert.appendSlice(self.alloc, text);
+            if (text_cells < width) try insert.appendNTimes(self.alloc, ' ', width - text_cells);
+        }
+        try self.cur().history.record(pt, pos, 0, insert.items);
+        if (first == null) first = start;
+    }
+    self.curCursor().* = first orelse anchor;
     self.markDirty();
 }

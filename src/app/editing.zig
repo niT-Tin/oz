@@ -100,6 +100,7 @@ pub fn setRegister(self: *App, start: u32, end: u32, linewise: bool) !void {
     self.cur().pt.copyRange(start, buf);
     self.yank_buffer = buf;
     self.yank_linewise = linewise;
+    self.yank_block_width = null;
     // clipboard=unnamedplus: every register write also lands on the
     // system clipboard (OSC52 + probed native tool, both best-effort)
     self.pushSystemClipboard(buf);

@@ -91,3 +91,5 @@ test {
 }
 
 pub const ai_acp = @import("ai/acp.zig");
+
+pub const app_wrap = @import("app/wrap.zig");

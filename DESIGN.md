@@ -1557,7 +1557,7 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
   - gutter 宽度（相对行号 digits+1）；点击 gutter 落在行首；
   - 从 `view_top` 起按 `lineDisplayRows`（fold 折叠 + soft wrap + inlay hint 宽度）累加，得到目标 line 与 wrap chunk；
   - 文本 cell → byte：按 UTF-8 codepoint 逐个累加 `vaxis.gwidth`，tab = `tab_width`，并插入排序后的 inlay hint 宽度；宽字符第二格映射回该字符起点；行尾之后映射到行尾（Normal 模式再回退到最后一个 codepoint 起点，类似 `$`）。
-- **安全限制**：单行只拷贝/映射前 256 KiB；soft wrap 的 chunk 起点按 `chunk * content_width` 近似（渲染在宽字符处可能提前换行）；grapheme cluster/emoji ZWJ 按 codepoint 近似。非折行 ASCII/CJK 的常见情况精确，单元测试覆盖。
+- **安全限制**：单行只拷贝/映射前 256 KiB；文字使用与绘制一致的 grapheme/宽字符换行规则；首行内部滚动由 per-window `view_wrap` 记录。inlay hint 的点击映射仍使用总 cell 宽度，因此 hint 内宽字符在边界处的空隙是近似值。单元测试覆盖宽字符间隙与组合字符。
 - 点击 pane 不触发编辑、不改变文本；随后 `switchWindowTo` 执行既有 buffer/LSP/inlay/diag/hover 失效策略。
 
 ### 21.6 滚轮

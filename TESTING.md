@@ -703,3 +703,12 @@ python3 test/deepseek_smoke.py /home/leoz/sources/deepseek-harness
 ```
 
 Prepare that checkout with its locked pnpm dependencies, `pnpm run build:native-system`, and `pnpm exec tsx scripts/generate-typert.ts`. The smoke creates an isolated DSH home, persistence directory and local deterministic provider. It checks real profile initialization/session creation/close and stdout purity, then drives the built oz through a PTY for two turns and checks editor context delivery. It exercises the actual `deepseek` preset, including `pnpm --silent` (plain pnpm may write runner/install messages to the JSON-RPC stream). No remote model calls or user credentials are needed; this smoke is separate from the deterministic Zig suite because it requires another repository and its build prerequisites.
+
+
+Long-input and rectangular-register regressions: `zig build e2e -Dtest-filter='regression '`.
+The PTY tests cover exact-width insertion, a line taller than the viewport,
+CJK edge gaps, combining characters, syntax-style boundaries, block delete/P,
+block yank/count put, short/empty destination lines and grouped undo/redo.
+A local wl-copy/wl-paste fixture starts with stale clipboard bytes and models
+wl-paste's default appended newline; no desktop clipboard is needed.
+`app/wrap.zig` and `app/mouse.zig` additionally check cell layout and its inverse.
