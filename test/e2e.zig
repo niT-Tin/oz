@@ -24282,7 +24282,12 @@ test "diagnostic UI: real ZLS matches source, fixes and line movement" {
     const parameter = aiFindCellFrom(&grid, "aaa: usize", 0).?;
     try std.testing.expectEqual(@as(u8, 0), frame.cellUnderlineStyle(&grid, parameter.row, parameter.col + 3));
     const function = aiFindCellFrom(&grid, "peek", 0).?;
-    try std.testing.expectEqual(@as(u8, 0), frame.cellUnderlineStyle(&grid, function.row, function.col));
+    // The real diagnostic belongs to aaa. The focused function header has
+    // its own quiet, straight scope rule; it must never borrow the error's
+    // red curly style. Check both roles explicitly instead of requiring
+    // every non-diagnostic cell to have no underline at all.
+    try std.testing.expectEqual(@as(u8, 1), frame.cellUnderlineStyle(&grid, function.row, function.col));
+    try std.testing.expectEqual(scope_ul, frame.cellUl(&grid, function.row, function.col));
     try sess.send("gl");
     try gridWaitFor(&sess, &grid, "Diagnostics (1)", 5000);
     try gridWaitFor(&sess, &grid, "Error: unused function parameter", 5000);
