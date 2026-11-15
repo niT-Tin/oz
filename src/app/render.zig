@@ -4537,25 +4537,26 @@ pub fn render(self: *App) !void {
                 const icon = if (item.kind != 0) kindGlyph(item.kind) else " ";
                 max_icon = @max(max_icon, @as(u32, @intCast(autil.cellWidth(win, icon))));
             }
-            const budget: u32 = pane_width -| 4;
+            var doc_rows_list = try buildCompletionDocRows(self, a, win, &self.completion_words.items[self.completion_sel], @min(@as(u32, 64), pane_width -| 4));
+            const menu_budget = completion_layout.menuWidthBudget(pane_width, doc_rows_list.len > 0, 24);
+            const budget: u32 = menu_budget -| 4;
             // Keep the label identifiable before spending cells on detail
             // and description. The cap is a cell budget, not a byte count.
             var label_w = @min(max_label, @min(@as(u32, 46), budget -| 4));
             var detail_w = @min(max_detail, @min(@as(u32, 34), budget -| (max_icon + 1 + label_w + 2)));
             var desc_w = @min(max_desc, @min(@as(u32, 20), budget -| (max_icon + 1 + label_w + detail_w + 2)));
             while (max_icon + 1 + label_w + (if (detail_w > 0) 1 + detail_w else 0) +
-                (if (desc_w > 0) 1 + desc_w else 0) + 2 > pane_width and label_w > 8)
+                (if (desc_w > 0) 1 + desc_w else 0) + 2 > menu_budget and label_w > 8)
             {
                 if (detail_w > 0) detail_w -= 1 else if (desc_w > 0) desc_w -= 1 else label_w -= 1;
             }
             const inner_cells: u32 = max_icon + 1 + label_w +
                 (if (detail_w > 0) 1 + detail_w else 0) +
                 (if (desc_w > 0) 1 + desc_w else 0);
-            const box_w = @min(inner_cells + 2, pane_width);
+            const box_w = @min(inner_cells + 2, menu_budget);
             // Joint menu/docs placement inside the focused pane. Doc rows
             // are wrapped at a provisional width, then rebuilt at the width
             // the planner actually granted (narrow pane/split/Agent rail).
-            var doc_rows_list = try buildCompletionDocRows(self, a, win, &self.completion_words.items[self.completion_sel], @min(@as(u32, 64), pane_width -| 4));
             var lp = completion_layout.plan(.{
                 .pane = .{ .row = cur_rect.row, .col = cur_rect.col, .width = cur_rect.width, .height = cur_rect.height },
                 .cursor_row = cur_rect.row + c_sp.row,

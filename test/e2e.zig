@@ -26631,18 +26631,20 @@ test "completion layout: bottom edge and resize round-trip keep both boxes insid
     try gridWaitFor(&fx.sess, &grid, "ArrayList", 8000);
     try gridSettle(&fx.sess, &grid, 100, 3000);
     try frame.expectNoHorizontalOverflow(&grid, 80);
-    // At 20 rows the menu flips above the bottom-edge cursor; the docs pane
-    // has no admissible rectangle and is omitted instead of overlapping.
-    try std.testing.expect(!grid.contains("A contiguous"));
+    // At 80 columns the joint budget now reserves a right-hand explanation
+    // even above a bottom-edge caret; both boxes stop before the caret row.
+    try gridWaitFor(&fx.sess, &grid, "A contiguous", 5000);
+    try expectAdjacentCompletionPanels(&grid);
     try std.testing.expect(glyphCol(&grid, 0, "╭", 0) == null);
     const boxes = try countPopupBoxes(&grid);
     try std.testing.expect(boxes >= 1);
 
     // Grow: menu/docs re-plan side-by-side; no old border or out-of-pane
-    // cell may survive. Shrink again: docs disappear cleanly, menu remains.
+    // cell may survive. At 40 columns docs disappear; returning to 80 restores them.
     for ([_]struct { rows: u16, cols: u16, docs: bool }{
         .{ .rows = 30, .cols = 120, .docs = true },
-        .{ .rows = 20, .cols = 80, .docs = false },
+        .{ .rows = 20, .cols = 40, .docs = false },
+        .{ .rows = 20, .cols = 80, .docs = true },
     }) |shape| {
         const size = Winsize{ .ws_row = shape.rows, .ws_col = shape.cols, .ws_xpixel = shape.cols * 10, .ws_ypixel = shape.rows * 20 };
         _ = linux.ioctl(fx.sess.pty.master, TIOCSWINSZ, @intFromPtr(&size));
@@ -29689,4 +29691,68 @@ test "path completion: delayed semantic resolve cannot revive over a path menu o
     const bytes = try readDiskFile(io, a, fx.path);
     defer a.free(bytes);
     try std.testing.expectEqualStrings("./fixture_file.txt", bytes);
+}
+
+fn expectAdjacentCompletionPanels(grid: *Grid) !void {
+    for (0..grid.rows) |row| {
+        const left = glyphCol(grid, row, "╭", 0) orelse continue;
+        const menu_right = glyphCol(grid, row, "╮", left + 1) orelse continue;
+        const doc_left = glyphCol(grid, row, "╭", menu_right + 1) orelse continue;
+        const doc_right = glyphCol(grid, row, "╮", doc_left + 1) orelse continue;
+        try std.testing.expectEqual(menu_right + 1, doc_left);
+        _ = try assertPopupBoxAt(grid, row, left, menu_right);
+        _ = assertPopupBoxAt(grid, row, doc_left, doc_right) catch |err| {
+            grid.dump();
+            return err;
+        };
+        try std.testing.expect(doc_right < grid.cols);
+        return;
+    }
+    grid.dump();
+    return error.TestUnexpectedResult;
+}
+
+test "completion adjacent: explanation remains right and touching across right-edge cursor and resize" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 96);
+    defer a.free(padding);
+    @memset(padding, ' ');
+    const source = try std.fmt.allocPrint(a, "{s}std", .{padding});
+    defer a.free(source);
+    var fx = try startCompletionMock(io, a, "completion_rich", source, 30, 120);
+    defer fx.deinit(io, a);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send("A.");
+    try gridWaitFor(&fx.sess, &grid, "A contiguous", 8000);
+    try gridSettle(&fx.sess, &grid, 100, 3000);
+    try expectAdjacentCompletionPanels(&grid);
+    try fx.sess.send("\x0e");
+    try gridWaitFor(&fx.sess, &grid, "Duplicates ArrayList", 5000);
+    try gridSettle(&fx.sess, &grid, 100, 3000);
+    try expectAdjacentCompletionPanels(&grid);
+    try fx.sess.send("\x10");
+    try gridWaitFor(&fx.sess, &grid, "A contiguous", 5000);
+    for ([_]u16{ 80, 40, 120 }) |cols| {
+        const size = Winsize{ .ws_row = 30, .ws_col = cols, .ws_xpixel = cols * 10, .ws_ypixel = 600 };
+        _ = linux.ioctl(fx.sess.pty.master, TIOCSWINSZ, @intFromPtr(&size));
+        grid.deinit(a);
+        grid = try Grid.initSizedCols(a, 30, cols);
+        try gridWaitFor(&fx.sess, &grid, "ArrayList", 8000);
+        try gridSettle(&fx.sess, &grid, 100, 3000);
+        if (cols >= 64) {
+            try gridWaitFor(&fx.sess, &grid, "A contiguous", 5000);
+            try gridSettle(&fx.sess, &grid, 100, 3000);
+            try expectAdjacentCompletionPanels(&grid);
+        } else {
+            try gridWaitGone(&fx.sess, &grid, "A contiguous", 3000);
+            try std.testing.expectEqual(@as(usize, 1), try countPopupBoxes(&grid));
+        }
+        try frame.expectNoHorizontalOverflow(&grid, cols);
+    }
+    try fx.sess.send("\x1b");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
 }
