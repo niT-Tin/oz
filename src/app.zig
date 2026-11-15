@@ -482,6 +482,8 @@ pub const App = struct {
     // file tree (<leader>e)
     filetree_active: bool = false,
     filetree_sel: usize = 0,
+    /// Files owns its gg prefix; it never enters the editor motion state.
+    filetree_pending_g: bool = false,
     /// Scroll-window top for the sidebar: the selection moves freely inside
     /// the window; the window scrolls only when it crosses an edge.
     filetree_top: usize = 0,

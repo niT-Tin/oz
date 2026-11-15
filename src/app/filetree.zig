@@ -108,6 +108,7 @@ pub fn setProjectRoot(self: *App, file_path: []const u8) void {
 }
 
 pub fn toggleFiletree(self: *App) !void {
+    self.filetree_pending_g = false;
     if (self.filetree_active) {
         self.filetree_active = false;
         self.navigator_peek = false;
@@ -337,7 +338,25 @@ pub fn moveFiletreeCursor(self: *App, delta: i32) void {
 }
 
 pub fn filetreeKey(self: *App, key: vaxis.Key) !bool {
+    const was_g = self.filetree_pending_g;
+    self.filetree_pending_g = false;
+    // Ctrl-w is handled by the shared focus router before reaching Files.
+    // Only explicit global surfaces may pass through; editor motions and
+    // mutations must never run behind a focused navigator.
+    if (key.mods.alt) return !(key.codepoint == 'r' or key.codepoint == 'w' or key.codepoint == 'e');
+    if (key.mods.ctrl or key.mods.super) return true;
     switch (key.codepoint) {
+        'g' => {
+            if (was_g) {
+                self.filetree_sel = 0;
+                self.filetree_top = 0;
+            } else self.filetree_pending_g = true;
+            return true;
+        },
+        'G' => {
+            self.filetree_sel = self.filetree_rows.items.len -| 1;
+            return true;
+        },
         'j', vaxis.Key.down => {
             moveFiletreeCursor(self, 1);
             return true;
@@ -376,7 +395,10 @@ pub fn filetreeKey(self: *App, key: vaxis.Key) !bool {
             self.closeNavigator();
             return true;
         },
-        else => return false,
+        // Keep command/leader entry and keymap help available; everything
+        // else belongs to Files, including unbound editing keys.
+        ' ', ':', vaxis.Key.f1 => return false,
+        else => return true,
     }
 }
 

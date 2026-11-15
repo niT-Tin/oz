@@ -17,6 +17,7 @@ const isWordByte = App.isWordByte;
 // ---- input ----
 
 pub fn handleKey(self: *App, key: vaxis.Key) !void {
+    if (key.codepoint != 'g') self.filetree_pending_g = false;
     // Observe the completion context BEFORE dispatch. Any key that changes
     // it (movement, Esc/re-enter, typing) bumps the epoch so a response
     // requested for the old state is rejected even if the cursor later

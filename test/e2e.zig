@@ -27320,3 +27320,43 @@ test "editing reliability: manually selected completion survives a refresh" {
     defer alloc.free(saved);
     try std.testing.expectEqualStrings("lines_insert", saved);
 }
+
+test "file tree safety: G gg and editing keys stay in the navigator" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var root_buf: [160]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/oz_navroute_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDir(io, root, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const original = "SOURCE_A\nSOURCE_B\nSOURCE_C\n";
+    try writeTestFile(io, root, "edit.txt", original);
+    var name_buf: [24]u8 = undefined;
+    for (0..40) |n| try writeTestFile(io, root, try std.fmt.bufPrint(&name_buf, "z{d:0>2}.txt", .{n}), "");
+    const path = try std.fmt.allocPrint(alloc, "{s}/edit.txt", .{root});
+    defer alloc.free(path);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, null, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "SOURCE_A", 8000);
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "z00.txt", 8000);
+    try sess.send("G");
+    try gridWaitFor(&sess, &grid, "z39.txt", 8000);
+    try std.testing.expect(grid.contains("L1:C0"));
+    try sess.send("gg");
+    try gridWaitFor(&sess, &grid, "z00.txt", 8000);
+    try std.testing.expect(!grid.contains("z39.txt"));
+    try sess.send("xux\x12");
+    try sess.send("\x17l");
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+    const f = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer f.close(io);
+    var saved: [128]u8 = undefined;
+    const count = try f.readPositionalAll(io, &saved, 0);
+    try std.testing.expectEqualStrings(original, saved[0..count]);
+}
