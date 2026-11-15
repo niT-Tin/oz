@@ -627,3 +627,45 @@ test "terminal screen scrollback: bounded ring, viewport and styles" {
     try scr.copyViewportTo(alloc, &front, 4);
     try testing.expectEqualStrings("L14", std.mem.trimEnd(u8, screenRowString(&front, 0, &row_buf), " "));
 }
+
+test "terminal scrollback adversarial: deleting a live row is not history" {
+    var scr = try vaxis.widgets.Terminal.Screen.initWithHistory(testing.allocator, 12, 4, 5);
+    defer scr.deinit(testing.allocator);
+    for ([_][]const u8{ "KEEP_TOP", "DELETE_ME", "KEEP_MID", "KEEP_LAST" }, 0..) |line, row| {
+        scr.cursor.row = @intCast(row);
+        scr.cursor.col = 0;
+        try screenPrintText(&scr, line);
+    }
+    scr.cursor.row = 1;
+    scr.cursor.col = 0;
+    try scr.deleteLine(1);
+    // DL is an in-place edit, not output scrolling off the viewport.
+    try testing.expectEqual(@as(usize, 0), scr.historyCount());
+    var buf: [80]u8 = undefined;
+    try testing.expectEqualStrings("KEEP_TOP", std.mem.trimEnd(u8, screenRowString(&scr, 0, &buf), " "));
+    try testing.expectEqualStrings("KEEP_MID", std.mem.trimEnd(u8, screenRowString(&scr, 1, &buf), " "));
+    try testing.expectEqualStrings("KEEP_LAST", std.mem.trimEnd(u8, screenRowString(&scr, 2, &buf), " "));
+}
+
+test "terminal scrollback adversarial: only full-screen scrolling retains rows" {
+    var scr = try vaxis.widgets.Terminal.Screen.initWithHistory(testing.allocator, 12, 4, 5);
+    defer scr.deinit(testing.allocator);
+    for ([_][]const u8{ "ROW_ZERO", "ROW_ONE", "ROW_TWO", "ROW_THREE" }, 0..) |line, row| {
+        scr.cursor.row = @intCast(row);
+        scr.cursor.col = 0;
+        try screenPrintText(&scr, line);
+    }
+    scr.cursor.row = 2;
+    scr.cursor.col = 3;
+    try scr.scrollUp(2);
+    try testing.expectEqual(@as(usize, 2), scr.historyCount());
+    try testing.expectEqual(@as(u16, 2), scr.cursor.row);
+    try testing.expectEqual(@as(u16, 3), scr.cursor.col);
+    var buf: [80]u8 = undefined;
+    try testing.expectEqualStrings("ROW_TWO", std.mem.trimEnd(u8, screenRowString(&scr, 0, &buf), " "));
+    scr.scrolling_region = .{ .top = 1, .bottom = 3, .left = 0, .right = 11 };
+    scr.cursor.row = 3;
+    try scr.index();
+    // A subregion must not add the application's interior rows to history.
+    try testing.expectEqual(@as(usize, 2), scr.historyCount());
+}

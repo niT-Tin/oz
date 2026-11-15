@@ -14627,7 +14627,7 @@ fn termRowIs(grid: *Grid, row: usize, before: []const u8) bool {
 /// (Without this the scrollback fixture can be cleared before the test looks
 /// at it; the shell also records its final size in $FLOAT.)
 fn termAwaitFloatLayout(sess: *Session, grid: *Grid) !void {
-    try sess.send("while [ \"$(stty size)\" = '24 80' ]; do sleep 0.05; done; FLOAT=$(stty size); printf 'TERM_READY\\n'\r");
+    try sess.send("while [ \"$(stty size)\" = '24 80' ]; do sleep 0.05; done; FLOAT=$(stty size); printf 'TERM_%s\\n' READY\r");
     try gridWaitFor(sess, grid, "TERM_READY", 10000);
 }
 

@@ -549,9 +549,7 @@ fn _run(self: *Terminal) !void {
                             self.back_screen.cursor.col = cur_col;
                             self.back_screen.cursor.pending_wrap = wrap;
                         }
-                        self.back_screen.cursor.col = self.back_screen.scrolling_region.left;
-                        self.back_screen.cursor.row = self.back_screen.scrolling_region.top;
-                        try self.back_screen.deleteLine(n);
+                        try self.back_screen.scrollUp(n);
                     },
                     // Scroll Down
                     'T' => {
@@ -735,7 +733,7 @@ fn _run(self: *Terminal) !void {
                                 ' ' => {
                                     var iter = seq.iterator(u8);
                                     const shape = iter.next() orelse 0;
-                                    self.back_screen.cursor.shape = @enumFromInt(shape);
+                                    self.back_screen.cursor.shape = @fromBackingInt(@intCast(shape));
                                 },
                                 else => {},
                             }
@@ -845,7 +843,7 @@ inline fn handleC0(self: *Terminal, b: ansi.C0) !void {
         .CR => self.carriageReturn(),
         .SO => {}, // TODO: Charset shift out
         .SI => {}, // TODO: Charset shift in
-        else => log.warn("unhandled C0: 0x{x}", .{@intFromEnum(b)}),
+        else => log.warn("unhandled C0: 0x{x}", .{@backingInt(b)}),
     }
 }
 

@@ -387,8 +387,7 @@ pub fn index(self: *Screen) !void {
     if (self.cursor.row == self.scrolling_region.bottom) {
         // Inside scrolling region *and* at bottom of screen, we scroll contents up and insert a
         // blank line
-        // TODO: scrollback if scrolling region is entire visible screen
-        try self.deleteLine(1);
+        try self.scrollUp(1);
         return;
     }
     self.cursor.row += 1;
@@ -409,7 +408,7 @@ pub fn sgr(self: *Screen, seq: ansi.CSI) void {
             3 => self.cursor.style.italic = true,
             4 => {
                 const kind: vaxis.Style.Underline = if (iter.next_is_sub)
-                    @enumFromInt(iter.next() orelse 1)
+                    @fromBackingInt(@intCast(iter.next() orelse 1))
                 else
                     .single;
                 self.cursor.style.ul_style = kind;
@@ -565,8 +564,22 @@ pub fn eraseLine(self: *Screen) void {
     }
 }
 
-/// delete n lines from the bottom of the scrolling region
+/// Delete live rows starting at the cursor (DL). Deletion edits the screen;
+/// only an actual scroll at the top of the viewport contributes history.
 pub fn deleteLine(self: *Screen, n: usize) !void {
+    try self.deleteLineImpl(n, false);
+}
+
+/// Scroll the region upward (IND at the bottom / SU), preserving the cursor.
+pub fn scrollUp(self: *Screen, n: usize) !void {
+    const saved = self.cursor;
+    defer self.cursor = saved;
+    self.cursor.row = self.scrolling_region.top;
+    self.cursor.col = self.scrolling_region.left;
+    try self.deleteLineImpl(n, true);
+}
+
+fn deleteLineImpl(self: *Screen, n: usize, retain: bool) !void {
     if (n == 0) return;
 
     // Don't delete if outside scroll region
@@ -581,7 +594,7 @@ pub fn deleteLine(self: *Screen, n: usize) !void {
     // Local scrollback: before the shift overwrites them, move the rows that
     // leave the top of a FULL-SCREEN scrolling region into the bounded
     // primary-screen history. Alt screens / partial regions have capacity 0.
-    if (self.history.capacity() > 0 and
+    if (retain and self.history.capacity() > 0 and
         self.scrolling_region.top == 0 and
         self.scrolling_region.bottom == self.height - 1 and
         self.scrolling_region.left == 0 and
@@ -593,7 +606,7 @@ pub fn deleteLine(self: *Screen, n: usize) !void {
         }
     }
 
-    var row: usize = self.scrolling_region.top;
+    var row: usize = self.cursor.row;
     while (row <= self.scrolling_region.bottom) : (row += 1) {
         var col: usize = self.scrolling_region.left;
         while (col <= self.scrolling_region.right) : (col += 1) {
