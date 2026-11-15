@@ -5,6 +5,88 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const utf8 = @import("../buffer/utf8.zig");
+
+pub const ByteRange = struct { start: u32, end: u32, severity: types.Severity };
+
+fn byteAtUtf16(text: []const u8, column: u32) u32 {
+    var byte: usize = 0;
+    var units: u32 = 0;
+    while (byte < text.len and units < column) {
+        const cp = utf8.decodeAt(text, byte);
+        units += if (cp.cp > 0xFFFF) 2 else 1;
+        byte += cp.len;
+    }
+    return @intCast(byte);
+}
+
+/// Source-byte interval for this line, clipped to the supplied visible text.
+/// LSP columns are UTF-16 and ranges exclude their end. A point marks the
+/// next codepoint if one exists; an EOL/empty-line point has no source glyph.
+pub fn byteRangeOnLine(d: types.Diagnostic, line: u32, text: []const u8) ?ByteRange {
+    const s = d.range.start;
+    const e = d.range.end;
+    if (e.line < s.line or (e.line == s.line and e.character < s.character)) return null;
+    if (!coversLine(d, line)) return null;
+    const start = if (line == s.line) byteAtUtf16(text, s.character) else 0;
+    var end = if (line == e.line) byteAtUtf16(text, e.character) else @as(u32, @intCast(text.len));
+    if (s.line == e.line and s.character == e.character and start < text.len)
+        end = start + utf8.decodeAt(text, start).len;
+    if (end <= start) return null;
+    return .{ .start = start, .end = end, .severity = d.severity };
+}
+
+/// Resolve overlaps by severity and stop at the next source-byte boundary.
+pub fn rangeRun(ranges: []const ByteRange, byte: u32, limit: u32) struct { end: u32, severity: ?types.Severity } {
+    var end = limit;
+    var severity: ?types.Severity = null;
+    for (ranges) |r| {
+        if (r.start > byte) end = @min(end, r.start);
+        if (r.end > byte) end = @min(end, r.end);
+        if (r.start <= byte and byte < r.end) {
+            if (severity == null or @backingInt(r.severity) < @backingInt(severity.?)) severity = r.severity;
+        }
+    }
+    return .{ .end = end, .severity = severity };
+}
+
+test "diagnostic ranges: UTF-16 columns, multiline exclusive ends and point diagnostics" {
+    const t = std.testing;
+    var d = types.Diagnostic{ .range = .{ .start = .{ .line = 2, .character = 4 }, .end = .{ .line = 2, .character = 5 } }, .message = @constCast("test") };
+    const text = "中😀_x";
+    const r = byteRangeOnLine(d, 2, text).?;
+    try t.expectEqualStrings("x", text[r.start..r.end]);
+    d.range.start.character = 1;
+    d.range.end.character = 3;
+    const emoji = byteRangeOnLine(d, 2, text).?;
+    try t.expectEqualStrings("😀", text[emoji.start..emoji.end]);
+    d.range.end = .{ .line = 4, .character = 0 };
+    try t.expectEqual(@as(u32, 0), byteRangeOnLine(d, 3, text).?.start);
+    try t.expect(byteRangeOnLine(d, 4, text) == null);
+    d.range.end = d.range.start;
+    try t.expectEqual(@as(u32, 7), byteRangeOnLine(d, 2, text).?.end);
+    d.range.start.character = 99;
+    d.range.end = d.range.start;
+    try t.expect(byteRangeOnLine(d, 2, text) == null);
+    try t.expect(byteRangeOnLine(d, 2, "") == null);
+    d.range.end.character = 0;
+    try t.expect(byteRangeOnLine(d, 2, text) == null);
+}
+
+test "diagnostic ranges: higher severity wins only on the overlapping interval" {
+    const rs = [_]ByteRange{
+        .{ .start = 2, .end = 10, .severity = .info },
+        .{ .start = 4, .end = 7, .severity = .err },
+        .{ .start = 6, .end = 12, .severity = .warning },
+    };
+    try std.testing.expectEqual(@as(?types.Severity, null), rangeRun(&rs, 1, 20).severity);
+    try std.testing.expectEqual(@as(u32, 2), rangeRun(&rs, 1, 20).end);
+    try std.testing.expectEqual(types.Severity.info, rangeRun(&rs, 2, 20).severity.?);
+    try std.testing.expectEqual(types.Severity.err, rangeRun(&rs, 6, 20).severity.?);
+    try std.testing.expectEqual(@as(u32, 7), rangeRun(&rs, 6, 20).end);
+    try std.testing.expectEqual(types.Severity.warning, rangeRun(&rs, 7, 20).severity.?);
+    try std.testing.expect(rangeRun(&rs, 12, 20).severity == null);
+}
 
 /// A versioned publication must describe the text we last sent. Missing/null
 /// versions remain valid: servers such as ZLS publish unversioned diagnostics.

@@ -50,6 +50,7 @@ pub const Script = enum {
     clear_on_change,
     /// Mixed-severity, multiline/CJK diagnostics plus an unrelated URI push.
     diagnostic_ui,
+    diagnostic_underlines,
     /// First edit gets no reply; later edits publish current then stale data.
     diagnostic_versions,
     /// Phantom-'j' detector: after EVERY didChange, inspect the latest
@@ -114,6 +115,7 @@ pub const Script = enum {
         if (std.mem.eql(u8, name, "silent")) return .silent;
         if (std.mem.eql(u8, name, "clear_on_change")) return .clear_on_change;
         if (std.mem.eql(u8, name, "diagnostic_ui")) return .diagnostic_ui;
+        if (std.mem.eql(u8, name, "diagnostic_underlines")) return .diagnostic_underlines;
         if (std.mem.eql(u8, name, "diagnostic_versions")) return .diagnostic_versions;
         if (std.mem.eql(u8, name, "jk_sync")) return .jk_sync;
         if (std.mem.eql(u8, name, "inlay_range")) return .inlay_range;
@@ -415,12 +417,12 @@ pub fn handleMessage(
         // Push diagnostics for the JUST-opened document (uri matches what the
         // client filters on) — pushing at `initialized` races didOpen and the
         // client would drop the diagnostics as belonging to another file.
-        if (script == .hello or script == .clear_on_change or script == .diagnostic_ui or script == .diagnostic_versions) {
+        if (script == .hello or script == .clear_on_change or script == .diagnostic_ui or script == .diagnostic_underlines or script == .diagnostic_versions) {
             const uri = if (state.opened.items.len > 0) state.opened.items[state.opened.items.len - 1] else default_uri;
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
             const a = arena.allocator();
-            var params = if (script == .diagnostic_ui) try buildDetailedDiagnostics(a, uri) else try buildDiagnosticsParams(a, uri, "mock error");
+            var params = if (script == .diagnostic_underlines) try buildUnderlineDiagnostics(a, uri) else if (script == .diagnostic_ui) try buildDetailedDiagnostics(a, uri) else try buildDiagnosticsParams(a, uri, "mock error");
             if (script == .diagnostic_versions) try params.object.put(a, "version", msg.params.?.object.get("textDocument").?.object.get("version").?);
             const body = try json_rpc.encodeNotification(alloc, "textDocument/publishDiagnostics", params);
             errdefer alloc.free(body);
@@ -466,7 +468,7 @@ pub fn handleMessage(
         // clear_on_change: the edit fixed the document — push an empty
         // diagnostics list so the client must clear the gutter mark (and
         // repaint without waiting for another keypress).
-        if ((script == .clear_on_change or script == .diagnostic_ui) and !state.clear_pushed) {
+        if ((script == .clear_on_change or script == .diagnostic_ui or script == .diagnostic_underlines) and !state.clear_pushed) {
             state.clear_pushed = true;
             const uri = if (state.opened.items.len > 0) state.opened.items[state.opened.items.len - 1] else default_uri;
             var arena = std.heap.ArenaAllocator.init(alloc);
@@ -1180,6 +1182,37 @@ fn buildDiagnosticsParams(a: std.mem.Allocator, uri: []const u8, message: []cons
     try params.put(a, "uri", .{ .string = uri });
     try params.put(a, "diagnostics", .{ .array = diags });
     return .{ .object = params };
+}
+
+fn buildUnderlineDiagnostics(a: std.mem.Allocator, uri: []const u8) !std.json.Value {
+    var params = try buildEmptyDiagnosticsParams(a, uri);
+    const ds = &params.object.getPtr("diagnostics").?.array;
+    const ranges = [_]struct { sl: i64, sc: i64, el: i64, ec: i64, severity: i64, message: []const u8 }{
+        .{ .sl = 0, .sc = 6, .el = 0, .ec = 7, .severity = 2, .message = "CJK_WARNING" },
+        .{ .sl = 0, .sc = 28, .el = 0, .ec = 35, .severity = 1, .message = "RANGE_ERROR" },
+        .{ .sl = 1, .sc = 10, .el = 1, .ec = 17, .severity = 2, .message = "RANGE_WARNING" },
+        .{ .sl = 2, .sc = 16, .el = 2, .ec = 17, .severity = 3, .message = "COMBINING_INFO" },
+        .{ .sl = 2, .sc = 0, .el = 2, .ec = 1, .severity = 2, .message = "TAB_WARNING" },
+        .{ .sl = 3, .sc = 10, .el = 5, .ec = 0, .severity = 3, .message = "MULTILINE_INFO" },
+        .{ .sl = 3, .sc = 10, .el = 3, .ec = 14, .severity = 4, .message = "RANGE_HINT" },
+        .{ .sl = 3, .sc = 17, .el = 3, .ec = 17, .severity = 1, .message = "POINT_ERROR" },
+        .{ .sl = 6, .sc = 20, .el = 6, .ec = 110, .severity = 2, .message = "WRAPPED_WARNING" },
+        .{ .sl = 7, .sc = 10, .el = 7, .ec = 14, .severity = 4, .message = "ISOLATED_HINT" },
+    };
+    for (ranges) |r| {
+        const wrapper = try buildDiagnosticsParams(a, uri, r.message);
+        var d = wrapper.object.get("diagnostics").?.array.items[0];
+        try d.object.put(a, "severity", .{ .integer = r.severity });
+        const range = d.object.getPtr("range").?;
+        const start = &range.object.getPtr("start").?.object;
+        const end = &range.object.getPtr("end").?.object;
+        try start.put(a, "line", .{ .integer = r.sl });
+        try start.put(a, "character", .{ .integer = r.sc });
+        try end.put(a, "line", .{ .integer = r.el });
+        try end.put(a, "character", .{ .integer = r.ec });
+        try ds.append(d);
+    }
+    return params;
 }
 
 fn buildDetailedDiagnostics(a: std.mem.Allocator, uri: []const u8) !std.json.Value {

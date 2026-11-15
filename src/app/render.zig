@@ -7,6 +7,8 @@ const util = @import("../util/root.zig");
 const syntax = @import("../syntax.zig");
 const lsp_types = @import("../lsp/types.zig");
 const lsp_nav = @import("../lsp/navigation.zig");
+const lsp_diag = @import("../lsp/diagnostics.zig");
+const diagnostic_ui = @import("diagnostics.zig");
 const theme = @import("../theme.zig");
 const icons = @import("../icons.zig");
 const keymap_list = @import("../editor/keymap_list.zig");
@@ -1077,6 +1079,10 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         // like every other segment slice)
         const text = try a.alloc(u8, n);
         buf.pt.copyRange(line_start, text);
+        const diagnostic_ranges: []const lsp_diag.ByteRange = if (w.buf == self.current)
+            try diagnostic_ui.lineRanges(self, a, line, text)
+        else
+            &.{};
 
         // markdown decorations (M4): advance the row pointer and derive
         // this row's band prop (heading/fence). Conceal per row: never on
@@ -1232,6 +1238,8 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
                     var gstyle: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg } };
                     if (is_cur_line) gstyle.bg = .{ .rgb = self.theme.bg_curline };
                     if (ib >= sel_s and ib < sel_e) gstyle.bg = .{ .rgb = self.theme.bg_sel };
+                    if (lsp_diag.rangeRun(diagnostic_ranges, ib, n).severity) |severity|
+                        diagnostic_ui.underline(self, &gstyle, severity);
                     if (is_guide) {
                         // Only the scope's OWN guide column (its starting
                         // line's indent, snacks: `i > indent` rows) is
@@ -1446,6 +1454,9 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
             // on the scope's first line read as a stray rule across the
             // reading surface and leaked into later virtual text on terminals
             // that only repaint changed cells; it is deliberately gone.
+            const diagnostic_run = lsp_diag.rangeRun(diagnostic_ranges, col, n);
+            next = @min(next, diagnostic_run.end);
+            if (diagnostic_run.severity) |severity| diagnostic_ui.underline(self, &style, severity);
             const seg_text = text[col..next];
             if (std.mem.indexOfScalar(u8, seg_text, '\t') != null) {
                 // Expand tabs to `tab_width` spaces so they render (vaxis

@@ -447,6 +447,7 @@ const Grid = struct {
     /// instead of inheriting the label fg.
     ul_buf: []u32 = &.{},
     ul_on_buf: []bool = &.{},
+    ul_style_buf: []u8 = &.{}, // SGR 4 subparameter: 1 single, 3 curly, 4 dotted, 5 dashed
     /// Per-cell SGR 1/2/3 attributes. Recorded so tests can prove italic
     /// comments, bold active tabs and the removal of hint double-dim.
     bold_buf: []bool = &.{},
@@ -457,7 +458,8 @@ const Grid = struct {
     fg: u32 = 0, // current fg color (packed RGB, 0 = default)
     bg: u32 = 0, // current bg color (packed RGB, 0 = default)
     ul: u32 = 0, // current underline color (packed RGB, 0 = default)
-    ul_on: bool = false, // SGR 4 single underline active
+    ul_on: bool = false,
+    ul_style: u8 = 0,
     bold: bool = false, // SGR 1
     dim: bool = false, // SGR 2
     italic: bool = false, // SGR 3
@@ -498,6 +500,8 @@ const Grid = struct {
         @memset(ul_buf, 0);
         const ul_on_buf = try alloc.alloc(bool, rows * cols);
         @memset(ul_on_buf, false);
+        const ul_style_buf = try alloc.alloc(u8, rows * cols);
+        @memset(ul_style_buf, 0);
         const bold_buf = try alloc.alloc(bool, rows * cols);
         @memset(bold_buf, false);
         const dim_buf = try alloc.alloc(bool, rows * cols);
@@ -512,6 +516,7 @@ const Grid = struct {
             .bg_buf = bg_buf,
             .ul_buf = ul_buf,
             .ul_on_buf = ul_on_buf,
+            .ul_style_buf = ul_style_buf,
             .bold_buf = bold_buf,
             .dim_buf = dim_buf,
             .italic_buf = italic_buf,
@@ -525,6 +530,7 @@ const Grid = struct {
         alloc.free(self.bg_buf);
         alloc.free(self.ul_buf);
         alloc.free(self.ul_on_buf);
+        alloc.free(self.ul_style_buf);
         alloc.free(self.bold_buf);
         alloc.free(self.dim_buf);
         alloc.free(self.italic_buf);
@@ -573,6 +579,8 @@ const Grid = struct {
                     // CSI: params up to final byte 0x40-0x7e
                     var j = i + 2;
                     var params: [16]i64 = @splat(0);
+                    var subparams: [16]bool = @splat(false);
+                    var is_subparam = false;
                     var np: usize = 0;
                     var cur: i64 = -1; // -1 = no digit seen yet
                     while (j < bytes.len) {
@@ -582,17 +590,24 @@ const Grid = struct {
                             cur = cur * 10 + (c - '0');
                         } else if (c == ';' or c == ':') {
                             if (cur >= 0) {
-                                if (np < 16) params[np] = cur;
-                                np += 1;
+                                if (np < params.len) {
+                                    params[np] = cur;
+                                    subparams[np] = is_subparam;
+                                    np += 1;
+                                }
                             }
                             cur = -1;
+                            is_subparam = c == ':';
                         } else if (c >= 0x40 and c <= 0x7e) {
                             // final byte
                             if (cur >= 0) {
-                                if (np < 16) params[np] = cur;
-                                np += 1;
+                                if (np < params.len) {
+                                    params[np] = cur;
+                                    subparams[np] = is_subparam;
+                                    np += 1;
+                                }
                             }
-                            self.handleCsi(c, &params, np);
+                            self.handleCsi(c, &params, &subparams, np);
                             i = j + 1;
                             break;
                         } else {
@@ -713,6 +728,7 @@ const Grid = struct {
                         self.bg_buf[self.row * self.cols + self.col] = self.bg;
                         self.ul_buf[self.row * self.cols + self.col] = self.ul;
                         self.ul_on_buf[self.row * self.cols + self.col] = self.ul_on;
+                        self.ul_style_buf[self.row * self.cols + self.col] = self.ul_style;
                         self.bold_buf[self.row * self.cols + self.col] = self.bold;
                         self.dim_buf[self.row * self.cols + self.col] = self.dim;
                         self.italic_buf[self.row * self.cols + self.col] = self.italic;
@@ -723,6 +739,7 @@ const Grid = struct {
                             self.bg_buf[self.row * self.cols + self.col + extra] = self.bg;
                             self.ul_buf[self.row * self.cols + self.col + extra] = self.ul;
                             self.ul_on_buf[self.row * self.cols + self.col + extra] = self.ul_on;
+                            self.ul_style_buf[self.row * self.cols + self.col + extra] = self.ul_style;
                             self.bold_buf[self.row * self.cols + self.col + extra] = self.bold;
                             self.dim_buf[self.row * self.cols + self.col + extra] = self.dim;
                             self.italic_buf[self.row * self.cols + self.col + extra] = self.italic;
@@ -735,7 +752,7 @@ const Grid = struct {
         }
     }
 
-    fn handleCsi(self: *Grid, final: u8, params: *const [16]i64, np: usize) void {
+    fn handleCsi(self: *Grid, final: u8, params: *const [16]i64, subparams: *const [16]bool, np: usize) void {
         const p0: usize = if (np > 0 and params[0] > 0) @intCast(params[0]) else 1;
         const p1: usize = if (np > 1 and params[1] > 0) @intCast(params[1]) else 1;
         switch (final) {
@@ -756,6 +773,7 @@ const Grid = struct {
                         self.bg = 0;
                         self.ul = 0;
                         self.ul_on = false;
+                        self.ul_style = 0;
                         self.bold = false;
                         self.dim = false;
                         self.italic = false;
@@ -777,9 +795,17 @@ const Grid = struct {
                     } else if (p == 59) {
                         self.ul = 0;
                     } else if (p == 4) {
+                        if (k + 1 < np and subparams[k + 1]) {
+                            self.ul_style = @intCast(std.math.clamp(params[k + 1], 0, 5));
+                            self.ul_on = self.ul_style != 0;
+                            k += 2;
+                            continue;
+                        }
+                        self.ul_style = 1;
                         self.ul_on = true;
                     } else if (p == 24) {
                         self.ul_on = false;
+                        self.ul_style = 0;
                     } else if (p == 58 and k + 4 < np and params[k + 1] == 2) {
                         self.ul = packRgb(
                             @intCast(params[k + 2]),
@@ -820,6 +846,7 @@ const Grid = struct {
                     self.bg_buf[self.row * self.cols + c] = 0;
                     self.ul_buf[self.row * self.cols + c] = 0;
                     self.ul_on_buf[self.row * self.cols + c] = false;
+                    self.ul_style_buf[self.row * self.cols + c] = 0;
                     self.bold_buf[self.row * self.cols + c] = false;
                     self.dim_buf[self.row * self.cols + c] = false;
                     self.italic_buf[self.row * self.cols + c] = false;
@@ -24016,7 +24043,8 @@ test "diagnostic UI: inline priority, full float scrolling, cursor movement and 
     // each), not a fabricated zero and not a guessed total.
     try gridWaitFor(&sess, &grid, "E1 W1 I1", 5000);
     try std.testing.expect(!grid.contains("FOREIGN_DIAG"));
-    try std.testing.expect(rowContains(&grid, 2, "+1 [gl]"));
+    try std.testing.expect(rowContains(&grid, 2, "+1"));
+    try std.testing.expect(!grid.contains("[gl]"));
     try gridWaitFor(&sess, &grid, ": i32", 5000);
     const row = grid.row;
     const col = grid.col;
@@ -24203,6 +24231,11 @@ test "diagnostic UI: real ZLS matches source, fixes and line movement" {
     // The actual server diagnoses the unused parameter, not the function.
     try sess.send("ggj");
     try gridWaitRowContains(&sess, &grid, 3, "unused function parameter", 30000);
+    try expectDiagnosticUnderline(&grid, "aaa", 3, packRgb(0xE8, 0x24, 0x24));
+    const parameter = aiFindCellFrom(&grid, "aaa: usize", 0).?;
+    try std.testing.expectEqual(@as(u8, 0), frame.cellUnderlineStyle(&grid, parameter.row, parameter.col + 3));
+    const function = aiFindCellFrom(&grid, "peek", 0).?;
+    try std.testing.expectEqual(@as(u8, 0), frame.cellUnderlineStyle(&grid, function.row, function.col));
     try sess.send("gl");
     try gridWaitFor(&sess, &grid, "Diagnostics (1)", 5000);
     try gridWaitFor(&sess, &grid, "Error: unused function parameter", 5000);
@@ -24215,6 +24248,8 @@ test "diagnostic UI: real ZLS matches source, fixes and line movement" {
     try gridDrain(&sess, &grid, 1000);
     try std.testing.expect(rowContains(&grid, 3, "_: usize"));
     try std.testing.expect(!grid.contains("unused function parameter"));
+    const ignored_parameter = aiFindCellFrom(&grid, "_: usize", 0).?;
+    try std.testing.expectEqual(@as(u8, 0), frame.cellUnderlineStyle(&grid, ignored_parameter.row, ignored_parameter.col));
     try sess.send("gl");
     try gridWaitFor(&sess, &grid, "no diagnostics on this line", 5000);
     // Restore the real error, then insert a line above it. The server must
@@ -24231,6 +24266,7 @@ test "diagnostic UI: real ZLS matches source, fixes and line movement" {
     try sess.send("j");
     try gridWaitRowContains(&sess, &grid, 4, "aaa: usize", 5000);
     try gridWaitRowContains(&sess, &grid, 4, "unused function parameter", 10000);
+    try expectDiagnosticUnderline(&grid, "aaa", 3, packRgb(0xE8, 0x24, 0x24));
     try sess.send("gl");
     try gridWaitFor(&sess, &grid, "Error: unused function parameter", 5000);
     try sess.send("\x1b");
@@ -25822,4 +25858,126 @@ test "signature lifecycle: click and immediate typing preserve the new focus req
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
     }
+}
+
+test "observer: underline styles keep colon subparameters separate from italic" {
+    var grid = try Grid.initSizedCols(std.testing.allocator, 1, 12);
+    defer grid.deinit(std.testing.allocator);
+    grid.feed("\x1b[58:2:232:36:36m\x1b[4:");
+    grid.feed("3mE\x1b[4:4mI\x1b[4:5mH\x1b[4:0mN\x1b[4;3mS\x1b[24;23mX");
+    for ([_]u8{ 3, 4, 5, 0, 1, 0 }, 0..) |style, col| {
+        try std.testing.expectEqual(style, frame.cellUnderlineStyle(&grid, 0, col));
+        try frame.expectCellItalic(&grid, 0, col, col == 4);
+    }
+    try std.testing.expectEqual(packRgb(232, 36, 36), frame.cellUl(&grid, 0, 0));
+}
+
+fn expectDiagnosticUnderline(grid: *Grid, word: []const u8, style: u8, tint: u32) !void {
+    const pos = aiFindCellFrom(grid, word, 0) orelse return error.TestUnexpectedResult;
+    for (0..word.len) |i| {
+        try std.testing.expectEqual(style, frame.cellUnderlineStyle(grid, pos.row, pos.col + i));
+        try std.testing.expectEqual(tint, frame.cellUl(grid, pos.row, pos.col + i));
+    }
+}
+
+test "diagnostic UI: colored range underlines follow UTF-16, hints, wraps and pane bounds" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const source = "const 中 = \"😀\"; const bad = missing;\n" ++
+        "    const warning = thing;\n\tconst note = \"e\u{301}\";\n" ++
+        "    const hint = value;\nconst tail = 0;\nconst clean = 1;\n" ++
+        "    const wrapped = " ++ "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" ++
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" ++ "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" ++ ";\n    const hint = value;\n";
+    try aiWriteFile(io, root, "diag.zig", source);
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/diag.zig", .{root});
+    const mock = try std.Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/mock_lsp", a);
+    defer a.free(mock);
+    const env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{mock});
+    defer a.free(env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{ env, "OZ_MOCK_SCRIPT=diagnostic_underlines" }, 24, 100, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 100);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "RANGE_ERROR", 8000);
+    try gridWaitFor(&sess, &grid, ": i32", 5000);
+    const red = packRgb(0xE8, 0x24, 0x24);
+    const yellow = packRgb(0xFF, 0x9E, 0x3B);
+    const blue = packRgb(0x65, 0x85, 0x94);
+    try expectDiagnosticUnderline(&grid, "missing", 3, red);
+    try expectDiagnosticUnderline(&grid, "warning", 3, yellow);
+    try expectDiagnosticUnderline(&grid, "tail", 4, blue);
+    const clean = aiFindCellFrom(&grid, "clean", 0).?;
+    try std.testing.expectEqual(@as(u8, 0), frame.cellUnderlineStyle(&grid, clean.row, clean.col));
+    const missing = aiFindCellFrom(&grid, "missing", 0).?;
+    try std.testing.expectEqual(@as(u8, 0), frame.cellUnderlineStyle(&grid, missing.row, missing.col + 7)); // exclusive end
+    try std.testing.expect(frame.cellFg(&grid, missing.row, missing.col) != red); // retain syntax fg
+    const cjk = aiFindCellFrom(&grid, "中", 0).?;
+    for (0..2) |i| {
+        try std.testing.expectEqual(@as(u8, 3), frame.cellUnderlineStyle(&grid, cjk.row, cjk.col + i));
+        try std.testing.expectEqual(yellow, frame.cellUl(&grid, cjk.row, cjk.col + i));
+    }
+    const hint = aiFindCellFrom(&grid, ": i32", 0).?;
+    for (0..5) |i| try std.testing.expectEqual(@as(u8, 0), frame.cellUnderlineStyle(&grid, hint.row, hint.col + i));
+    const note = aiFindCellFrom(&grid, "note", 0).?;
+    try std.testing.expectEqual(@as(u8, 4), frame.cellUnderlineStyle(&grid, note.row, note.col + 8)); // whole combining grapheme
+    for (0..4) |i| { // the source tab's four display cells, including its indent guide
+        try std.testing.expectEqual(@as(u8, 3), frame.cellUnderlineStyle(&grid, note.row, note.col - 10 + i));
+        try std.testing.expectEqual(yellow, frame.cellUl(&grid, note.row, note.col - 10 + i));
+    }
+    var hint_count: usize = 0;
+    for (0..grid.rows) |r| {
+        if (aiCellIndexOf(&grid, r, "hint")) |c| {
+            hint_count += 1;
+            try std.testing.expectEqual(@as(u8, if (hint_count == 1) 4 else 5), frame.cellUnderlineStyle(&grid, r, c));
+            if (hint_count == 1) {
+                try std.testing.expectEqual(@as(u8, 3), frame.cellUnderlineStyle(&grid, r, c + 7)); // point beats info
+                try std.testing.expectEqual(red, frame.cellUl(&grid, r, c + 7));
+                try std.testing.expectEqual(@as(u8, 4), frame.cellUnderlineStyle(&grid, r, c + 8));
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), hint_count);
+    try std.testing.expect(!grid.contains("[gl]"));
+    // Same source in two narrower panes: each z must stay decorated even
+    // across wraps, without leaking underline into gutters or separators.
+    try sess.send(":vs\r");
+    try gridDrain(&sess, &grid, 400);
+    var decorated_z: usize = 0;
+    for (2..grid.rows - 1) |r| {
+        for (0..grid.cols) |c| {
+            if (std.mem.eql(u8, frame.cellText(&grid, r, c), "z")) {
+                decorated_z += 1;
+                try std.testing.expectEqual(@as(u8, 3), frame.cellUnderlineStyle(&grid, r, c));
+                try std.testing.expectEqual(yellow, frame.cellUl(&grid, r, c));
+            }
+        }
+        try std.testing.expectEqual(@as(u8, 0), frame.cellUnderlineStyle(&grid, r, 0));
+        try std.testing.expectEqual(@as(u8, 0), frame.cellUnderlineStyle(&grid, r, 50));
+    }
+    try std.testing.expectEqual(@as(usize, 180), decorated_z);
+    try sess.send("ix");
+    // Inlay text may be inserted between x and const. The document column
+    // proves the edit was handled without assuming virtual-text contents.
+    try gridWaitFor(&sess, &grid, "L1:C1", 5000);
+    try gridDrain(&sess, &grid, 300);
+    // The edit can wrap "missing" across rows. Check the previously
+    // decorated source cells directly rather than assuming an intact word.
+    var cleared_z: usize = 0;
+    for (2..grid.rows - 1) |r| {
+        for (0..grid.cols) |c| {
+            if (std.mem.eql(u8, frame.cellText(&grid, r, c), "z")) {
+                cleared_z += 1;
+                try std.testing.expectEqual(@as(u8, 0), frame.cellUnderlineStyle(&grid, r, c));
+            }
+        }
+    }
+    try std.testing.expect(cleared_z >= 90);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
 }

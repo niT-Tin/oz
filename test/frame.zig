@@ -69,10 +69,15 @@ pub fn cellUl(grid: anytype, row: usize, col: usize) u32 {
     return grid.ul_buf[row * grid.cols + col];
 }
 
-/// True when the cell has an SGR 4 single underline.
+/// True when the cell has any SGR 4 underline style.
 pub fn cellUnderlined(grid: anytype, row: usize, col: usize) bool {
     if (row >= grid.rows or col >= grid.cols) return false;
     return grid.ul_on_buf[row * grid.cols + col];
+}
+
+pub fn cellUnderlineStyle(grid: anytype, row: usize, col: usize) u8 {
+    if (row >= grid.rows or col >= grid.cols) return 0;
+    return grid.ul_style_buf[row * grid.cols + col];
 }
 
 fn widthOfGlyph(text: []const u8) usize {

@@ -769,3 +769,14 @@ zig build e2e -Dtest-filter='real ZLS' -Dreal-zls=/absolute/path/to/zls
 
 Both are opt-in and are skipped in the default deterministic suite when no
 server path is supplied.
+
+Diagnostic range underlines use the server's UTF-16, end-exclusive ranges:
+errors/warnings are colored curls, information dotted and hints dashed. The
+`diagnostic_underlines` fixture covers CJK/astral offsets, a combining-mark-only
+range, tabs, overlapping severities, point diagnostics, multiline exclusive
+ends, soft wrapping, split-pane boundaries and clearing after edits. Inlay
+labels keep their own style. The real ZLS test checks that only the unused
+parameter name is marked, fixes remove its underline and inserted lines move
+the range. `gl` still opens full details; its key hint is omitted from the
+default inline message. The PTY observer records SGR 4 subparameters and SGR 58
+colors separately, including resets and sequences split across reads.

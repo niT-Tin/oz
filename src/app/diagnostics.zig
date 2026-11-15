@@ -109,6 +109,34 @@ fn color(self: *App, severity: types.Severity) [3]u8 {
         .info, .hint => self.theme.diag_info,
     };
 }
+
+/// Decorate source text only; syntax, search and selection colors survive.
+pub fn underline(self: *App, style: *vaxis.Style, severity: types.Severity) void {
+    style.ul = .{ .rgb = color(self, severity) };
+    style.ul_style = switch (severity) {
+        .err, .warning => .curly,
+        .info => .dotted,
+        .hint => .dashed,
+    };
+}
+
+pub fn lineRanges(self: *App, a: std.mem.Allocator, line: u32, text: []const u8) ![]const lsp_diag.ByteRange {
+    var ranges: std.ArrayList(lsp_diag.ByteRange) = .empty;
+    for (self.lsp_diagnostics.items) |d| {
+        if (d.range.start.line > line) break; // publications are sorted
+        var r = lsp_diag.byteRangeOnLine(d, line, text) orelse continue;
+        // Terminals underline whole grapheme clusters. Expand a range that
+        // selects a combining mark/base, without splitting the printed glyph.
+        var iter = vaxis.unicode.graphemeIterator(text);
+        while (iter.next()) |g| {
+            if (g.start >= r.end) break;
+            if (r.start > g.start and r.start < g.start + g.len) r.start = @intCast(g.start);
+            if (r.end > g.start and r.end < g.start + g.len) r.end = @intCast(g.start + g.len);
+        }
+        try ranges.append(a, r);
+    }
+    return ranges.items;
+}
 fn safeText(a: std.mem.Allocator, text: []const u8, multiline: bool) ![]const u8 {
     const out = try a.dupe(u8, text);
     for (out) |*byte| if ((byte.* < 32 and !(multiline and byte.* == '\n')) or byte.* == 127) {
@@ -239,7 +267,7 @@ pub fn draw(self: *App, a: std.mem.Allocator, win: vaxis.Window, rect: App.LeafR
     const available = pane_end -| x;
     if (available < 12) return true;
     const safe = try safeText(a, diagnostic.message, false);
-    const suffix = if (summary.count > 1) try std.fmt.allocPrint(a, " +{d} [gl]", .{summary.count - 1}) else " [gl]";
+    const suffix = if (summary.count > 1) try std.fmt.allocPrint(a, " +{d}", .{summary.count - 1}) else "";
     const label = try std.fmt.allocPrint(a, "← {s} {s}", .{ lsp_diag.severityMark(diagnostic.severity), safe });
     const budget = available -| @as(u32, @intCast(autil.cellWidth(win, suffix)));
     if (budget < 5) return true;
