@@ -62,6 +62,8 @@ pub const app_completion_layout = @import("app/completion_layout.zig");
 pub const app_completion_context = @import("app/completion_context.zig");
 // undo/redo inlay-anchor transforms (pure; app/highlight.zig wires them)
 pub const app_inlay_history = @import("app/inlay_history.zig");
+// per-(window, buffer) cursor/viewport save/restore + document clamping
+pub const app_view_state = @import("app/view_state.zig");
 // M2b1 navigator tabs + note store (pure; app/notes.zig is e2e-tested)
 pub const app_navigator = @import("app/navigator.zig");
 pub const app_note_store = @import("app/note_store.zig");

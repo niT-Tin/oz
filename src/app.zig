@@ -21,6 +21,7 @@ const git = @import("git.zig");
 const term = @import("term.zig");
 
 const autil = @import("app/util.zig");
+const app_view = @import("app/view_state.zig");
 const git_job = @import("app/git_job.zig");
 const app_ai = @import("app/ai.zig");
 const app_hints = @import("app/hints.zig");
@@ -233,6 +234,10 @@ pub const App = struct {
         /// (markDirty) — line numbers drift after edits, and re-folding is
         /// cheap; vim-style fold carryover across edits is out of scope.
         folds: std.ArrayList(editor.fold.Range) = .empty,
+        /// Saved cursor/viewport per window that has shown this buffer (see
+        /// app/view_state.zig). Owned here so it travels with the buffer
+        /// across closes/workspace swaps and is freed with the document.
+        views: app_view.Store = .{},
         /// Cached syntax spans for this buffer's last-rendered visible byte
         /// range (owned; see SpanRangeCache). null until the first render.
         span_cache: ?SpanRangeCache = null,
@@ -254,6 +259,9 @@ pub const App = struct {
 
     /// One split window: which buffer it shows plus its own cursor/viewport.
     pub const Window = struct {
+        /// Stable identity for per-(window, buffer) saved views. List
+        /// indices shift on close, so they must never be used as keys.
+        id: u64 = 0,
         buf: usize = 0,
         cursor: u32 = 0,
         view_top: u32 = 0,
@@ -356,6 +364,8 @@ pub const App = struct {
     windows: std.ArrayList(Window) = .empty,
     win_root: ?*WinNode = null,
     current_win: usize = 0,
+    /// Monotonic identity source for split windows (see Window.id).
+    next_win_id: u64 = 1,
     markdown_frame: ?*const markdown.Layout = null,
     markdown_frame_buf: usize = std.math.maxInt(usize),
     markdown_images: std.StringHashMap(union(enum) { loaded: vaxis.Image, failed: void }),
@@ -886,6 +896,44 @@ pub const App = struct {
         return &self.windows.items[self.current_win].view_top;
     }
 
+    /// Allocate the stable identity of a new split window.
+    pub fn newWindowId(self: *App) u64 {
+        const id = self.next_win_id;
+        self.next_win_id +%= 1;
+        if (self.next_win_id == 0) self.next_win_id = 1; // skip a wrapped id
+        return id;
+    }
+
+    /// Remember `w`'s cursor/viewport for the buffer it currently shows.
+    /// Best-effort: losing a saved position is not worth failing a switch.
+    pub fn saveWindowView(self: *App, w: *Window) void {
+        const buf = &self.buffers.items[w.buf];
+        buf.views.save(self.alloc, w.id, .{
+            .cursor = w.cursor,
+            .view_top = w.view_top,
+            .view_wrap = w.view_wrap,
+            .view_pinned = w.view_pinned,
+        }) catch {};
+    }
+
+    /// Install `w`'s saved position for the buffer it now shows, validated
+    /// against the current document. A window that has never shown this
+    /// buffer starts at the top — never at the previous buffer's cursor
+    /// clamped to the new document length.
+    pub fn restoreWindowView(self: *App, w: *Window) void {
+        const buf = &self.buffers.items[w.buf];
+        const snap = if (buf.views.get(w.id)) |s| app_view.clamp(&buf.pt, s) else app_view.Snapshot{};
+        w.cursor = snap.cursor;
+        w.view_top = snap.view_top;
+        w.view_wrap = snap.view_wrap;
+        w.view_pinned = snap.view_pinned;
+        // Fold state is per buffer and may have changed (or been dropped)
+        // while another document was shown: a hidden body is not a legal
+        // cursor/viewport line.
+        w.cursor = foldSnapPos(buf, w.cursor);
+        if (foldCovering(buf, w.view_top)) |f| w.view_top = f.start;
+    }
+
     /// Height (in text rows) of the focused window's leaf rect. Runs the same
     /// layout math as render() so H/M/L and zz/zt/zb agree with what's on
     /// screen, including splits.
@@ -1174,10 +1222,14 @@ pub const App = struct {
     /// (vim: the split command focuses the new window).
     pub fn splitWindow(self: *App, dir: SplitDir) !void {
         const cur_win = self.current_win;
+        const src = self.windows.items[cur_win];
         try self.windows.append(self.alloc, .{
-            .buf = self.windows.items[cur_win].buf,
-            .cursor = self.windows.items[cur_win].cursor,
-            .view_top = self.windows.items[cur_win].view_top,
+            .id = self.newWindowId(),
+            .buf = src.buf,
+            .cursor = src.cursor,
+            .view_top = src.view_top,
+            .view_wrap = src.view_wrap,
+            .view_pinned = src.view_pinned,
         });
         const new_idx: usize = self.windows.items.len - 1;
         // the new pane (which takes focus) is the last to SHOW the shared
@@ -1363,6 +1415,9 @@ pub const App = struct {
         }
         const cur_win = self.current_win;
         const root = self.win_root orelse return;
+        // The removed window is gone for good; its saved positions in every
+        // buffer are unreachable state (ids are never reused).
+        for (self.buffers.items) |*buf| buf.views.removeWindow(self.windows.items[cur_win].id);
         const new_root = self.removeWindow(root, cur_win) orelse unreachable; // ≥2 windows: never the root itself
         self.win_root = new_root;
         _ = self.windows.orderedRemove(cur_win);
@@ -1558,7 +1613,7 @@ pub const App = struct {
             .history = buffer.History.init(init.gpa),
         });
         // one window showing buffer 0 (the initial empty buffer)
-        try self.windows.append(init.gpa, .{ .buf = 0 });
+        try self.windows.append(init.gpa, .{ .buf = 0, .id = self.newWindowId() });
         const leaf = try init.gpa.create(WinNode);
         leaf.* = .{ .leaf = 0 };
         self.win_root = leaf;
