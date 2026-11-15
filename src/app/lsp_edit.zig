@@ -661,7 +661,7 @@ pub fn collectCompletionWords(self: *App, keep_sel: bool) !void {
     var k: usize = 0;
     while (k < limit) : (k += 1) {
         const w = try self.alloc.dupe(u8, pairs.items[k].word);
-        try self.completion_words.append(self.alloc, .{ .label = w, .kind = 0 });
+        try self.completion_words.append(self.alloc, .{ .source = .buffer, .label = w, .kind = 0 });
     }
     self.completion_sel = 0;
     if (selected) |label| {
@@ -714,7 +714,9 @@ pub fn acceptCompletion(self: *App) !void {
         self.closeCompletion();
         return;
     }
-    const word = self.completion_words.items[self.completion_sel].insertText();
+    const chosen = &self.completion_words.items[self.completion_sel];
+    const word = chosen.insertText();
+    const continue_path = chosen.source == .path and std.mem.endsWith(u8, word, "/");
     const pt = &self.cur().pt;
     const cursor = self.curCursor().*;
     const pos = @min(self.completion_pos, cursor);
@@ -729,6 +731,7 @@ pub fn acceptCompletion(self: *App) !void {
     self.curCursor().* = pos + @as(u32, @intCast(word.len));
     self.markDirtyRange(start_pos, end_pos, word);
     self.closeCompletion();
+    if (continue_path) try self.maybeAutoComplete("/");
 }
 
 /// Drop the completion menu and free its candidate words (the list keeps
@@ -743,6 +746,8 @@ pub fn closeCompletion(self: *App) void {
     for (self.completion_words.items) |*it| it.deinit(self.alloc);
     self.completion_words.clearRetainingCapacity();
     self.completion_active = false;
+    self.completion_path = false;
+    self.completion_path_cache.deinit(self.alloc);
     self.completion_sel = 0;
     self.completion_user_navigated = false;
     self.completion_pos = 0;

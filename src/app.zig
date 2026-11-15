@@ -671,6 +671,8 @@ pub const App = struct {
 
     // insert-mode completion (Ctrl+n and auto-suggest on word chars)
     completion_active: bool = false,
+    completion_path: bool = false,
+    completion_path_cache: @import("editor/path_completion.zig").Cache = .{},
     /// Owned candidate items (text + LSP kind for the menu icon).
     completion_words: std.ArrayList(lsp_nav.CompletionItem) = .empty,
     completion_sel: usize = 0,
@@ -1694,6 +1696,7 @@ pub const App = struct {
         self.inlay_hints.deinit(self.alloc);
         for (self.completion_words.items) |*it| it.deinit(self.alloc);
         self.completion_words.deinit(self.alloc);
+        self.completion_path_cache.deinit(self.alloc);
         // M3a git state
         if (self.git_job) |job| {
             if (job.thread) |t| t.join(); // let the worker finish, then free

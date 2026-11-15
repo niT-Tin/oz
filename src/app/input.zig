@@ -402,7 +402,7 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
             // Esc exit and text entry behave as usual.
             const is_comp_input = key.text != null and key.text.?.len > 0 and
                 !key.mods.ctrl and !key.mods.alt and !key.mods.super and
-                (isWordByte(key.text.?[0]) or self.isCompletionTriggerText(key.text.?));
+                (isWordByte(key.text.?[0]) or self.isCompletionTriggerText(key.text.?) or self.completion_path or key.text.?[0] == '/' or key.text.?[0] == '~');
             if (!is_comp_input) self.closeCompletion();
         }
         // Arrow keys move the cursor without leaving insert mode (up/down
@@ -561,8 +561,8 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
             // jk is the insert-exit shortcut, and asking the server on
             // the 'j' alone makes the menu flash between 'j' and 'k'.
             if (!key.mods.ctrl and !key.mods.alt and !key.mods.super and
-                key.codepoint != 'j' and
-                (isWordByte(text[0]) or self.isCompletionTriggerText(text)))
+                (key.codepoint != 'j' or self.completion_path) and
+                (isWordByte(text[0]) or self.isCompletionTriggerText(text) or self.completion_path or text[0] == '/' or text[0] == '~'))
             {
                 try self.maybeAutoComplete(text);
             }

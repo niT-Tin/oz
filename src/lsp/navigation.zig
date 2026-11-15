@@ -332,6 +332,7 @@ pub const ResolveState = enum { none, loading, ready, empty, failed };
 /// such as ZLS return `labelDetails` and a `filterText` that must not leak
 /// into the inserted bytes or into a label-only match.
 pub const CompletionItem = struct {
+    source: enum { lsp, buffer, path } = .lsp,
     /// CompletionItem.label (owned): what the menu shows.
     label: []u8,
     /// Insertion text (owned, optional). null means "same as label".

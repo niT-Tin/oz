@@ -5,6 +5,7 @@ const lsp_types = @import("../lsp/types.zig");
 const lsp_nav = @import("../lsp/navigation.zig");
 const json_rpc = @import("../util/json_rpc.zig");
 const theme = @import("../theme.zig");
+const paths = @import("../editor/path_completion.zig");
 
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
@@ -137,6 +138,7 @@ pub fn kindColor(t: theme.Theme, kind: u8) theme.Rgb {
 /// a word prefix the key is swallowed (no candidates, no side effect).
 pub fn startCompletion(self: *App) !void {
     if (self.completion_active) return;
+    if (try maybePathCompletion(self)) return;
     if (self.curCursor().* == 0) return;
     if (!isWordByte(self.cur().pt.byteAt(self.curCursor().* - 1))) return;
     // LSP completion first: ask the language server for candidates at the
@@ -207,7 +209,9 @@ pub fn isCompletionTriggerText(self: *App, text: []const u8) bool {
 /// only for word prefixes on small documents — a full-buffer scan per
 /// keystroke on a huge file would jitter.
 pub fn maybeAutoComplete(self: *App, text: []const u8) !void {
-    if (self.curCursor().* == 0) return;
+    if (try maybePathCompletion(self)) return;
+    if (self.completion_path) self.closeCompletion();
+    if (self.curCursor().* == 0 or text.len == 0) return;
     self.completion_manual = false; // auto-suggest: silent on empty
     const trigger = !isWordByte(text[0]) and self.isCompletionTriggerText(text);
     if (self.lsp_client) |c| {
@@ -229,6 +233,65 @@ pub fn maybeAutoComplete(self: *App, text: []const u8) !void {
         self.invalidatePassiveHints();
         self.completion_active = true;
     }
+}
+
+/// Filesystem paths take priority over semantic LSP completion. Directory
+/// results are local and use the same request/session invalidation as menus;
+/// an already queued LSP response cannot overwrite this newer provider.
+fn maybePathCompletion(self: *App) !bool {
+    const pt = &self.cur().pt;
+    const cursor = self.curCursor().*;
+    const line_start = pt.lineStart(pt.lineOf(cursor));
+    const prefix_start = @max(line_start, cursor -| std.fs.max_path_bytes);
+    var storage: [std.fs.max_path_bytes]u8 = undefined;
+    const len = cursor - prefix_start;
+    pt.copyRange(prefix_start, storage[0..len]);
+    const ctx = paths.context(storage[0..len]) orelse return false;
+    // Relative paths are relative to the current file, or the workspace for
+    // unnamed buffers/Notes. HOME is expanded only for directory lookup.
+    const base = if (self.cur().path) |path|
+        try self.alloc.dupe(u8, std.fs.path.dirname(path) orelse "/")
+    else
+        try self.currentRootDir();
+    defer self.alloc.free(base);
+    const directory = (try paths.directoryPath(self.alloc, ctx, self.env_map.get("HOME"), base)) orelse {
+        self.closeCompletion();
+        return true;
+    };
+    defer self.alloc.free(directory);
+    const previous = if (self.completion_path and self.completion_user_navigated and self.completion_sel < self.completion_words.items.len)
+        try self.alloc.dupe(u8, self.completion_words.items[self.completion_sel].label)
+    else
+        null;
+    defer if (previous) |label| self.alloc.free(label);
+    self.invalidateCompletionContext();
+    self.completion_session +%= 1;
+    self.completion_generation +%= 1;
+    self.completion_waiting_enter = false;
+    self.completion_doc_scroll = 0;
+    for (self.completion_words.items) |*item| item.deinit(self.alloc);
+    self.completion_words.clearRetainingCapacity();
+    self.completion_path = true;
+    self.completion_active = false;
+    self.completion_sel = 0;
+    self.completion_pos = prefix_start + @as(u32, @intCast(ctx.component_start));
+    self.completion_path_cache.load(self.alloc, self.io, directory) catch return true;
+    for (self.completion_path_cache.entries.items) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, ctx.prefix)) continue;
+        if (entry.name[0] == '.' and (ctx.prefix.len == 0 or ctx.prefix[0] != '.')) continue;
+        if (self.completion_words.items.len >= paths.Cache.max_candidates) break;
+        const label = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ entry.name, if (entry.is_dir) "/" else "" });
+        errdefer self.alloc.free(label);
+        const insert = if (ctx.bare_home) try std.fmt.allocPrint(self.alloc, "/{s}", .{label}) else null;
+        errdefer if (insert) |text| self.alloc.free(text);
+        try self.completion_words.append(self.alloc, .{ .source = .path, .label = label, .insert_text = insert, .kind = if (entry.is_dir) 19 else 17 });
+        if (previous) |old| if (std.mem.eql(u8, old, label)) {
+            self.completion_sel = self.completion_words.items.len - 1;
+        };
+    }
+    self.completion_active = self.completion_words.items.len > 0;
+    if (self.completion_active) self.invalidatePassiveHints();
+    return true;
 }
 
 /// Consume a completed LSP completion response (called after drain each
@@ -366,6 +429,7 @@ pub fn maybeResolveCompletion(self: *App) void {
     const c = self.lsp_client orelse return;
     if (!c.caps_completion_resolve) return;
     var item = &self.completion_words.items[self.completion_sel];
+    if (item.source != .lsp) return;
     if (!needsResolve(item) or item.resolve_requested) return;
 
     var arena = std.heap.ArenaAllocator.init(self.alloc);
