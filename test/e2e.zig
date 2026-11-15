@@ -27360,3 +27360,39 @@ test "file tree safety: G gg and editing keys stay in the navigator" {
     const count = try f.readPositionalAll(io, &saved, 0);
     try std.testing.expectEqualStrings(original, saved[0..count]);
 }
+
+test "file tree safety: Backspace changes only browsing root and persists" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var root_buf: [160]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/oz_navparent_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const project = try std.fmt.allocPrint(alloc, "{s}/project", .{root});
+    defer alloc.free(project);
+    try std.Io.Dir.cwd().createDirPath(io, project);
+    try writeTestFile(io, root, "PARENT_ONLY.txt", "outside\n");
+    try writeTestFile(io, project, "inside.txt", "UNCHANGED_BODY\n");
+    const path = try std.fmt.allocPrint(alloc, "{s}/inside.txt", .{project});
+    defer alloc.free(path);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, null, 30, 120, project);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "UNCHANGED_BODY", 8000);
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "Files", 8000);
+    try std.testing.expect(!grid.contains("PARENT_ONLY"));
+    try sess.send("\x7f");
+    try gridWaitFor(&sess, &grid, "PARENT_ONLY", 8000);
+    // Closing/reopening retains the browsing directory, not project cwd.
+    try sess.send(" e");
+    try gridWaitGone(&sess, &grid, "PARENT_ONLY", 8000);
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "PARENT_ONLY", 8000);
+    try std.testing.expect(grid.contains("L1:C0"));
+    try std.testing.expect(grid.contains("NORMAL"));
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}

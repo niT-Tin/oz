@@ -125,32 +125,59 @@ pub fn toggleFiletree(self: *App) !void {
     // its peek so the focused pane has visible content. Esc returns to the
     // editor and leaves the icon rail.
     self.navigator_peek = self.navigatorMode() == .compact;
-    // Root the tree at the workspace's project root (or the process cwd
-    // when none is set). Rebuild when the stored root differs, so opening a
-    // file in a different directory switches <leader>e to that directory.
-    const root_dir = try self.currentRootDir();
-    if (self.filetree_root == null or !std.mem.eql(u8, self.filetree_root.?.path, root_dir)) {
-        if (self.filetree_root) |old| self.freeFiletreeNode(old);
-        self.filetree_root = null; // never leave a dangling pointer on failure
-        const root = try self.alloc.create(TreeNode);
-        root.* = .{
-            .name = try self.alloc.dupe(u8, ""),
-            .path = root_dir, // owned by the node from here on
-            .is_dir = true,
-            .expanded = true, // the root's own children are visible
-            .children = .empty,
-            .parent = null,
-        };
-        var dir = try std.Io.Dir.cwd().openDir(self.io, root_dir, .{ .iterate = true });
-        defer dir.close(self.io);
-        try self.walkTreeLevel(dir, root);
-        self.sortTreeChildren(root);
-        self.filetree_root = root;
-    } else {
-        self.alloc.free(root_dir); // already rooted here — drop the duplicate
+    // A built tree owns its browsing root independently from project/LSP
+    // root. Closing and reopening Files must keep a Backspace navigation.
+    if (self.filetree_root == null) {
+        const root_dir = try self.currentRootDir();
+        defer self.alloc.free(root_dir);
+        self.filetree_root = try makeFiletreeRoot(self, root_dir);
     }
     try self.rebuildFiletreeRows();
     self.filetree_active = true;
+}
+
+/// Build a replacement off to the side: permission/read failures leave the
+/// currently displayed tree alive and its node pointers valid.
+fn makeFiletreeRoot(self: *App, path: []const u8) !*TreeNode {
+    const root = try self.alloc.create(TreeNode);
+    errdefer self.alloc.destroy(root);
+    const owned_name = try self.alloc.dupe(u8, "");
+    errdefer self.alloc.free(owned_name);
+    const owned_path = try self.alloc.dupe(u8, path);
+    errdefer self.alloc.free(owned_path);
+    root.* = .{ .name = owned_name, .path = owned_path, .is_dir = true, .expanded = true, .children = .empty, .parent = null };
+    errdefer {
+        for (root.children.items) |child| self.freeFiletreeNode(child);
+        root.children.deinit(self.alloc);
+    }
+    var dir = try std.Io.Dir.cwd().openDir(self.io, path, .{ .iterate = true });
+    defer dir.close(self.io);
+    try self.walkTreeLevel(dir, root);
+    self.sortTreeChildren(root);
+    return root;
+}
+
+fn filetreeParent(self: *App) !void {
+    const old = self.filetree_root orelse return;
+    const path = std.fs.path.dirname(old.path) orelse return;
+    if (std.mem.eql(u8, path, old.path)) return;
+    const replacement = makeFiletreeRoot(self, path) catch |err| {
+        try self.setMsg(try std.fmt.allocPrint(self.alloc, "Files: {s}", .{@errorName(err)}));
+        return;
+    };
+    var selected: usize = 0;
+    for (replacement.children.items, 0..) |child, i| {
+        if (std.mem.eql(u8, child.path, old.path)) {
+            selected = i;
+            break;
+        }
+    }
+    self.freeFiletreeNode(old);
+    self.filetree_root = replacement;
+    self.filetree_sel = selected;
+    self.filetree_top = 0;
+    try self.rebuildFiletreeRows();
+    // project_root, process cwd, picker/LSP/agent root remain unchanged.
 }
 
 /// Walk one directory level into `node.children` (lazy expansion). Child
@@ -164,7 +191,7 @@ pub fn walkTreeLevel(self: *App, dir: std.Io.Dir, node: *TreeNode) !void {
         if (name.len == 0 or name[0] == '.') continue;
         if (std.mem.eql(u8, name, "zig-out") or std.mem.eql(u8, name, "zig-pkg") or std.mem.eql(u8, name, "node_modules")) continue;
         const is_dir = (entry.kind == .directory);
-        const child_path = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ node.path, name });
+        const child_path = try std.fs.path.join(self.alloc, &.{ node.path, name });
         errdefer self.alloc.free(child_path);
         const child_name = try self.alloc.dupe(u8, name);
         errdefer self.alloc.free(child_name);
@@ -346,6 +373,10 @@ pub fn filetreeKey(self: *App, key: vaxis.Key) !bool {
     if (key.mods.alt) return !(key.codepoint == 'r' or key.codepoint == 'w' or key.codepoint == 'e');
     if (key.mods.ctrl or key.mods.super) return true;
     switch (key.codepoint) {
+        vaxis.Key.backspace => {
+            try filetreeParent(self);
+            return true;
+        },
         'g' => {
             if (was_g) {
                 self.filetree_sel = 0;
