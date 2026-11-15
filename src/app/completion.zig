@@ -247,6 +247,17 @@ fn maybePathCompletion(self: *App) !bool {
     const len = cursor - prefix_start;
     pt.copyRange(prefix_start, storage[0..len]);
     const ctx = paths.context(storage[0..len]) orelse return false;
+    const line_end = line_start + pt.lineTextLen(pt.lineOf(cursor));
+    const suffix_len = @min(line_end -| cursor, storage.len);
+    var suffix_storage: [std.fs.max_path_bytes]u8 = undefined;
+    pt.copyRange(cursor, suffix_storage[0..suffix_len]);
+    const component_suffix = paths.componentSuffixLen(suffix_storage[0..suffix_len], ctx.quote);
+    // A malformed overlong component has no bounded replacement end. Do not
+    // offer an insertion that could replace only part of that old basename.
+    if (component_suffix == suffix_len and suffix_len < line_end -| cursor) {
+        self.closeCompletion();
+        return true;
+    }
     // Relative paths are relative to the current file, or the workspace for
     // unnamed buffers/Notes. HOME is expanded only for directory lookup.
     const base = if (self.cur().path) |path|
@@ -275,6 +286,7 @@ fn maybePathCompletion(self: *App) !bool {
     self.completion_active = false;
     self.completion_sel = 0;
     self.completion_pos = prefix_start + @as(u32, @intCast(ctx.component_start));
+    self.completion_path_end = cursor + @as(u32, @intCast(component_suffix));
     self.completion_path_cache.load(self.alloc, self.io, directory) catch return true;
     for (self.completion_path_cache.entries.items) |entry| {
         if (!std.mem.startsWith(u8, entry.name, ctx.prefix)) continue;

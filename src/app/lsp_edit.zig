@@ -704,8 +704,8 @@ pub fn countCompletionWord(self: *App, counts: *std.StringHashMap(u32), word: []
     }
 }
 
-/// Enter while the menu is open: replace the typed prefix
-/// [completion_pos, cursor) with the selected word — one edit inside the
+/// Enter while the menu is open: replace the typed semantic prefix (or the
+/// full existing path basename) with the selected word — one edit inside the
 /// open insert-session undo group — then close the menu (insert stays
 /// active, the session continues). Matches the user's nvim (blink.cmp):
 /// Enter is the only accept key; Tab always inserts literal spaces.
@@ -720,14 +720,21 @@ pub fn acceptCompletion(self: *App) !void {
     const pt = &self.cur().pt;
     const cursor = self.curCursor().*;
     const pos = @min(self.completion_pos, cursor);
+    var replace_end = cursor;
+    if (chosen.source == .path) {
+        replace_end = @min(pt.len(), @max(cursor, self.completion_path_end));
+        // Directory candidates already end in '/'. Consume an existing
+        // separator once, retaining the following component byte-for-byte.
+        if (continue_path and replace_end < pt.len() and pt.byteAt(replace_end) == '/') replace_end += 1;
+    }
     if (!self.in_insert) {
         self.cur().history.beginGroup();
         self.in_insert = true;
     }
-    // LSP range in the PRE-EDIT document: [pos, cursor) → word.
+    // LSP range in the PRE-EDIT document: [pos, replace_end) → word.
     const start_pos = self.lspPositionAt(pt, pos);
-    const end_pos = self.lspPositionAt(pt, cursor);
-    try self.cur().history.record(pt, pos, cursor - pos, word);
+    const end_pos = self.lspPositionAt(pt, replace_end);
+    try self.cur().history.record(pt, pos, replace_end - pos, word);
     self.curCursor().* = pos + @as(u32, @intCast(word.len));
     self.markDirtyRange(start_pos, end_pos, word);
     self.closeCompletion();
@@ -747,6 +754,7 @@ pub fn closeCompletion(self: *App) void {
     self.completion_words.clearRetainingCapacity();
     self.completion_active = false;
     self.completion_path = false;
+    self.completion_path_end = 0;
     self.completion_path_cache.deinit(self.alloc);
     self.completion_sel = 0;
     self.completion_user_navigated = false;

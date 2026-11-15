@@ -672,6 +672,8 @@ pub const App = struct {
     // insert-mode completion (Ctrl+n and auto-suggest on word chars)
     completion_active: bool = false,
     completion_path: bool = false,
+    /// End of the existing basename for a path menu opened mid-component.
+    completion_path_end: u32 = 0,
     completion_path_cache: @import("editor/path_completion.zig").Cache = .{},
     /// Owned candidate items (text + LSP kind for the menu icon).
     completion_words: std.ArrayList(lsp_nav.CompletionItem) = .empty,

@@ -27502,3 +27502,113 @@ test "path completion: local paths beat a genuinely late LSP response and surviv
     defer a.free(bytes);
     try std.testing.expectEqualStrings("./fixture_file.txt", bytes);
 }
+
+test "path completion: accepting mid-component replaces its suffix and preserves the tail" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const cases = [_]struct { text: []const u8, keys: []const u8, want: []const u8 }{
+        .{ .text = "./longname.txt", .keys = "4li\x0e", .want = "./longname.txt" },
+        .{ .text = "\"./long file.txt\"; AFTER", .keys = "5li\x0e", .want = "\"./long file.txt\"; AFTER" },
+        .{ .text = "./subold/child.txt", .keys = "4li\x0e", .want = "./subnew/child.txt" },
+    };
+    for (cases) |c| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const target = if (c.text[0] == '"') "long file.txt" else "longname.txt";
+        try tmp.dir.writeFile(io, .{ .sub_path = target, .data = "target" });
+        try tmp.dir.createDir(io, "subnew", .default_dir);
+        try tmp.dir.writeFile(io, .{ .sub_path = "subnew/child.txt", .data = "target" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "editor.txt", .data = c.text });
+        var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &root_buf);
+        const root = root_buf[0..root_len];
+        const file = try std.fs.path.join(a, &.{ root, "editor.txt" });
+        defer a.free(file);
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, file }, &.{}, 30, 120, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 30, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try sess.send(c.keys);
+        try gridWaitFor(&sess, &grid, "[INSERT]", 3000);
+        // Enter follows the synchronous local-provider request in FIFO order.
+        try sess.send("\r\x03");
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+        const bytes = try readDiskFile(io, a, file);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings(c.want, bytes);
+    }
+}
+
+test "path completion: relative CLI files resolve dot and dotdot against their own directory" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const cases = [_]struct { text: []const u8, candidate: []const u8, want: []const u8 }{
+        .{ .text = "./si", .candidate = "sibling.txt", .want = "./sibling.txt" },
+        .{ .text = "../pa", .candidate = "parent.txt", .want = "../parent.txt" },
+    };
+    for (cases) |c| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDir(io, "src", .default_dir);
+        try tmp.dir.writeFile(io, .{ .sub_path = "src/sibling.txt", .data = "target" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "parent.txt", .data = "target" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "src/editor.txt", .data = c.text });
+        var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &root_buf);
+        const root = root_buf[0..root_len];
+        const file = try std.fs.path.join(a, &.{ root, "src/editor.txt" });
+        defer a.free(file);
+        // Deliberately use a relative CLI argument, with a distinct process cwd.
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "src/editor.txt" }, &.{}, 30, 120, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 30, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try sess.send("A\x0e");
+        try gridWaitFor(&sess, &grid, c.candidate, 3000);
+        try sess.send("\r\x03");
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+        const bytes = try readDiskFile(io, a, file);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings(c.want, bytes);
+    }
+}
+
+test "path completion: delayed semantic resolve cannot revive over a path menu or reentry" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var fx = try startCompletionMock(io, a, "edge:duplicate", "du", 30, 120);
+    defer fx.deinit(io, a);
+    try aiWriteFile(io, fx.root, "fixture_file.txt", "target");
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send("A\x0e");
+    try gridWaitFor(&fx.sess, &grid, "fn duplicate() void", 5000);
+    try fx.sess.send("\x17./");
+    try gridWaitFor(&fx.sess, &grid, "fixture_file.txt", 5000);
+    // Delivery is gated until the newer filesystem provider is visible.
+    try aiWriteFile(io, fx.root, "release-resolve", "go");
+    try waitBarrierMarker(io, a, fx.root, "resolve-delivered", 5000);
+    try gridDrain(&fx.sess, &grid, 400);
+    try std.testing.expect(grid.contains("fixture_file.txt"));
+    try std.testing.expect(!grid.contains("A_LATE_DOC"));
+    try fx.sess.send("\x1b[D");
+    try gridWaitGone(&fx.sess, &grid, "fixture_file.txt", 3000);
+    try fx.sess.send("\x03");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+    try fx.sess.send("Af");
+    try gridWaitFor(&fx.sess, &grid, "fixture_file.txt", 5000);
+    try std.testing.expect(!grid.contains("A_LATE_DOC"));
+    try fx.sess.send("\r\x03");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":wq\r"));
+    const bytes = try readDiskFile(io, a, fx.path);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("./fixture_file.txt", bytes);
+}

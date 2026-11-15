@@ -9,6 +9,7 @@ pub const Context = struct {
     prefix: []const u8,
     home: bool,
     bare_home: bool,
+    quote: ?u8 = null,
 };
 
 /// The caller supplies source text up to the insertion point, on one line.
@@ -45,6 +46,7 @@ pub fn context(prefix: []const u8) ?Context {
         .prefix = "",
         .home = true,
         .bare_home = true,
+        .quote = quote,
     };
     if (!(token[0] == '/' or std.mem.startsWith(u8, token, "~/") or
         std.mem.startsWith(u8, token, "./") or std.mem.startsWith(u8, token, "../"))) return null;
@@ -56,7 +58,26 @@ pub fn context(prefix: []const u8) ?Context {
         .prefix = token[slash + 1 ..],
         .home = home,
         .bare_home = false,
+        .quote = quote,
     };
+}
+
+/// Bytes after the insertion point belonging to the same basename.
+/// Keep later path components and language delimiters outside replacement.
+/// Spaces/punctuation belong to a quoted filename until its closing quote.
+pub fn componentSuffixLen(suffix: []const u8, quote: ?u8) usize {
+    var p: usize = 0;
+    while (p < suffix.len) : (p += 1) {
+        const byte = suffix[p];
+        if (byte == '/') break;
+        if (quote) |q| {
+            if (byte == q) break;
+            if (byte == '\\' and p + 1 < suffix.len and
+                (suffix[p + 1] == q or suffix[p + 1] == '\\')) p += 1;
+        } else if (std.ascii.isWhitespace(byte) or
+            std.mem.indexOfScalar(u8, "\"'`=,;(){}[]<>", byte) != null) break;
+    }
+    return p;
 }
 
 pub fn directoryPath(a: std.mem.Allocator, ctx: Context, home: ?[]const u8, base: []const u8) !?[]u8 {
@@ -178,4 +199,14 @@ test "path completion: cache is owned, sorted, reused until close and fails clea
     try std.testing.expectError(error.FileNotFound, cache.load(a, io, missing));
     try std.testing.expect(cache.directory == null);
     try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
+}
+
+test "path completion: replacement ends at basename, not next component or delimiter" {
+    const t = std.testing;
+    try t.expectEqual(@as(usize, 10), componentSuffixLen("ngname.txt/child", null));
+    try t.expectEqual(@as(usize, 11), componentSuffixLen("ng file.txt\"; other", '"'));
+    try t.expectEqual(@as(usize, 10), componentSuffixLen("ngname.txt other", null));
+    try t.expectEqual(@as(usize, 0), componentSuffixLen("/child", null));
+    try t.expectEqual(@as(usize, 2), componentSuffixLen("o\\/child", '"'));
+    try t.expectEqual(@as(?u8, '"'), context("\"./lo").?.quote);
 }
