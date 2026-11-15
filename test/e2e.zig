@@ -27360,3 +27360,59 @@ test "editing performance: large fenced docs render without per-line parser stal
     try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
 }
+
+test "editing performance: fenced docs preserve CRLF Unicode and unclosed block offsets" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    for ([_]u16{ 80, 120 }) |cols| {
+        var name_buf: [192:0]u8 = undefined;
+        const source = "const unchanged = 1;\n";
+        const name = try erFixture(io, &name_buf, ".zig", source);
+        defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+        const oz = try erAbs(io, alloc, oz_exe_path);
+        defer alloc.free(oz);
+        const mock = try erAbs(io, alloc, "zig-out/bin/mock_lsp");
+        defer alloc.free(mock);
+        const env = try std.fmt.allocPrint(alloc, "OZ_LSP_CMD={s}", .{mock});
+        defer alloc.free(env);
+        var sess = try Session.spawnEnvSize(io, &.{ oz, name }, &.{ env, "OZ_MOCK_SCRIPT=completion_fenced_edges" }, 32, cols);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(alloc, 32, cols);
+        defer grid.deinit(alloc);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try sess.send("i");
+        try gridWaitFor(&sess, &grid, "[INSERT]", 4000);
+        try sess.send("s");
+        try gridWaitFor(&sess, &grid, "FENCE_EDGE_START", 8000);
+        var first = false;
+        var second = false;
+        var last = false;
+        var unicode = false;
+        var syntax_colored = false;
+        for (0..6) |_| {
+            first = first or grid.contains("AFTER_FIRST");
+            second = second or grid.contains("AFTER_SECOND");
+            last = last or grid.contains("EDGE_UNCLOSED_LAST");
+            unicode = unicode or grid.contains("中😀");
+            for (0..grid.rows) |row| {
+                syntax_colored = syntax_colored or rowContainsFg(&grid, row, "const first", packRgb(0x95, 0x7F, 0xB8));
+            }
+            if (first and second and last and unicode and syntax_colored) break;
+            try sess.send("\x06");
+            try gridDrain(&sess, &grid, 250);
+        }
+        try std.testing.expect(first and second and last and unicode and syntax_colored);
+        // Rebuilding the frame while scrolling must not reuse/fill freed
+        // arena-owned block text with later row allocations.
+        try sess.send("\x02\x02\x02\x02");
+        try gridWaitFor(&sess, &grid, "FENCE_EDGE_START", 4000);
+        try std.testing.expect(grid.contains("std_fenced"));
+        try sess.send("\x03");
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+        const saved = try erRead(io, alloc, name);
+        defer alloc.free(saved);
+        try std.testing.expectEqualStrings(source, saved);
+    }
+}

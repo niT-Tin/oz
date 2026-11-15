@@ -112,6 +112,7 @@ pub const Script = enum {
     /// 160-line zig fenced block. Used to profile/document the per-frame
     /// documentation layout cost while the completion menu is open.
     completion_bulk_docs,
+    completion_fenced_edges,
     /// Rich completion-only fixture: labelDetails (detail + description),
     /// display label != insertText, markdown/plaintext docs, a long
     /// scrollable body, duplicate labels and detail-only/no-docs items.
@@ -153,6 +154,7 @@ pub const Script = enum {
         if (std.mem.eql(u8, name, "inlay_param")) return .inlay_param;
         if (std.mem.eql(u8, name, "completion_progressive")) return .completion_progressive;
         if (std.mem.eql(u8, name, "completion_bulk_docs")) return .completion_bulk_docs;
+        if (std.mem.eql(u8, name, "completion_fenced_edges")) return .completion_fenced_edges;
         if (std.mem.eql(u8, name, "completion_rich")) return .completion_rich;
         if (std.mem.eql(u8, name, "completion_resolve")) return .completion_resolve;
         if (std.mem.eql(u8, name, "completion_resolve_hold")) return .completion_resolve_hold;
@@ -314,7 +316,9 @@ pub fn handleMessage(
                 }
             }
             const prefix = completionPrefix(a, state, uri, line, col);
-            const result = if (script == .completion_bulk_docs)
+            const result = if (script == .completion_fenced_edges)
+                try buildFencedEdgeCompletionResult(a)
+            else if (script == .completion_bulk_docs)
                 try buildBulkDocsCompletionResult(a)
             else if (script == .completion_order)
                 try buildOrderCompletionResult(a)
@@ -885,6 +889,24 @@ fn buildBulkDocsCompletionResult(a: std.mem.Allocator) !std.json.Value {
     try doc.put(a, "kind", .{ .string = "markdown" });
     try doc.put(a, "value", .{ .string = doc_text.items });
     try it.put(a, "documentation", .{ .object = doc });
+    try items.append(.{ .object = it });
+    var result = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try result.put(a, "items", .{ .array = items });
+    return .{ .object = result };
+}
+
+/// Adversarial block slicing: CRLF, multiple blocks, UTF-8 and an unclosed
+/// final fence must retain their own source offsets after batch highlighting.
+fn buildFencedEdgeCompletionResult(a: std.mem.Allocator) !std.json.Value {
+    var it = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try it.put(a, "label", .{ .string = "std_fenced" });
+    try it.put(a, "kind", .{ .integer = 3 });
+    try it.put(a, "detail", .{ .string = "fn std_fenced() void" });
+    var doc = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try doc.put(a, "kind", .{ .string = "markdown" });
+    try doc.put(a, "value", .{ .string = "FENCE_EDGE_START\r\n```zig\r\nconst first = \"中😀\";\r\n```\r\nAFTER_FIRST\r\n```zig\r\nconst second = 2;\r\n```\r\nAFTER_SECOND\r\n```zig\r\nconst last = \"EDGE_UNCLOSED_LAST\";" });
+    try it.put(a, "documentation", .{ .object = doc });
+    var items = std.json.Array.init(a);
     try items.append(.{ .object = it });
     var result = try std.json.ObjectMap.init(a, &.{}, &.{});
     try result.put(a, "items", .{ .array = items });
