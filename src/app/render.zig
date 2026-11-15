@@ -5021,7 +5021,7 @@ pub fn render(self: *App) !void {
     }
     // cursor position — drawAiRail already placed the prompt/thread cursor
     // when the rail or prompt owns focus; otherwise the editor cursor wins.
-    var editor_cursor_hidden = cur_rect.width == 0 or cur_rect.height == 0;
+    var editor_cursor_hidden = false;
     if (self.inlinePromptOpen()) {
         // cursor was placed by drawInlinePrompt
     } else if (self.ai.rail_open and self.ai.focus != .editor) {
@@ -5043,6 +5043,7 @@ pub fn render(self: *App) !void {
             .col = @intCast(self.nav_float_col + 1),
         };
     } else {
+        editor_cursor_hidden = cur_rect.width == 0 or cur_rect.height == 0;
         // The row is recorded while painting the cursorline itself, so
         // markdown virtual rows can never make the terminal cursor and the
         // highlighted source row disagree. Columns still use byte-to-cell
