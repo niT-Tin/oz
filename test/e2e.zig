@@ -27320,3 +27320,458 @@ test "editing reliability: manually selected completion survives a refresh" {
     defer alloc.free(saved);
     try std.testing.expectEqualStrings("lines_insert", saved);
 }
+
+// ===========================================================================
+// Issue #10 design demo: opt-in unified editor+tabs focus frame.
+//
+// The frame is a DEMO behind `OZ_DEMO_FOCUS_FRAME=1` (default off). These tests
+// pin the two contracts the demo must keep: flag-off output is a no-op, and
+// flag-on spends only reserved border cells (never source, hints or mouse
+// targets). Adoption is a separate, user-approved decision.
+// ===========================================================================
+
+/// Write `lines` numbered text lines ("L1 LINE"…) so frames are deterministic
+/// without tree-sitter (no scope animation, no syntax background).
+fn focusFrameWriteLines(io: Io, root: []const u8, name: []const u8, lines: usize) !void {
+    var buf: [8192]u8 = undefined;
+    var n: usize = 0;
+    for (0..lines) |i| {
+        const line = try std.fmt.bufPrint(buf[n..], "L{d} LINE{s}", .{ i + 1, if (i + 1 < lines) "\n" else "" });
+        n += line.len;
+    }
+    try aiWriteFile(io, root, name, buf[0..n]);
+}
+
+/// Whole-screen equality: text, fg/bg and every underline attribute. Used to
+/// prove the demo flag is a no-op when unset/0.
+fn expectSameFrame(a: *Grid, b: *Grid) !void {
+    try std.testing.expectEqual(a.rows, b.rows);
+    try std.testing.expectEqual(a.cols, b.cols);
+    var r: usize = 0;
+    while (r < a.rows) : (r += 1) {
+        try std.testing.expectEqualStrings(a.rowText(r), b.rowText(r));
+    }
+    const cells = a.rows * a.cols;
+    var i: usize = 0;
+    while (i < cells) : (i += 1) {
+        try std.testing.expectEqual(a.fg_buf[i], b.fg_buf[i]);
+        try std.testing.expectEqual(a.bg_buf[i], b.bg_buf[i]);
+        try std.testing.expectEqual(a.ul_buf[i], b.ul_buf[i]);
+        try std.testing.expectEqual(a.ul_on_buf[i], b.ul_on_buf[i]);
+        try std.testing.expectEqual(a.ul_style_buf[i], b.ul_style_buf[i]);
+    }
+}
+
+/// Assert the demo's outer ring around the editor surface: corners, vertical
+/// sides and the two horizontal rules. `left` is the frame's left border
+/// column (0 with the navigator closed; the navigator's editor column when
+/// the full panel is open). `fg` is the focused/idle theme role.
+fn expectFocusFrameRing(grid: *Grid, rows: usize, cols: usize, left: usize, fg: u32) !void {
+    const rect = frame.Rect{ .top = 0, .left = left, .right = cols - 1, .bottom = rows - 2 };
+    try frame.expectBorderBox(grid, rect, fg);
+    var c: usize = left + 1;
+    while (c < cols - 1) : (c += 1) {
+        if (!std.mem.startsWith(u8, frame.cellText(grid, 0, c), "─")) {
+            std.debug.print("missing top rule at (0,{d}): \"{s}\"\n", .{ c, frame.cellText(grid, 0, c) });
+            grid.dump();
+            return error.TestUnexpectedResult;
+        }
+        if (!std.mem.startsWith(u8, frame.cellText(grid, rows - 2, c), "─")) {
+            std.debug.print("missing bottom rule at ({d},{d}): \"{s}\"\n", .{ rows - 2, c, frame.cellText(grid, rows - 2, c) });
+            grid.dump();
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "focus frame demo: flag off is byte-identical and paints no border" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try focusFrameWriteLines(io, root, "plain.txt", 12);
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/plain.txt", .{root});
+
+    var plain = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, null, 30, 90, root);
+    defer plain.close();
+    defer killPid(plain.pid);
+    var explicit_off = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{"OZ_DEMO_FOCUS_FRAME=0"}, 30, 90, root);
+    defer explicit_off.close();
+    defer killPid(explicit_off.pid);
+    var g_plain = try Grid.initSizedCols(a, 30, 90);
+    defer g_plain.deinit(a);
+    var g_off = try Grid.initSizedCols(a, 30, 90);
+    defer g_off.deinit(a);
+    try gridWaitFor(&plain, &g_plain, "[NORMAL]", 8000);
+    try gridWaitFor(&plain, &g_plain, "L1 LINE", 5000);
+    try gridWaitFor(&explicit_off, &g_off, "[NORMAL]", 8000);
+    try gridWaitFor(&explicit_off, &g_off, "L1 LINE", 5000);
+    try gridSettle(&plain, &g_plain, 200, 3000);
+    try gridSettle(&explicit_off, &g_off, 200, 3000);
+
+    // Neither session draws any frame glyph: the feature is strictly opt-in.
+    inline for (.{ "╭", "╮", "╰", "╯" }) |glyph| {
+        try std.testing.expect(!g_plain.contains(glyph));
+        try std.testing.expect(!g_off.contains(glyph));
+    }
+    try expectSameFrame(&g_plain, &g_off);
+    // Content origins are identical too: the default 12-line gutter is 3
+    // cells, the tab strip is row 0, and the first source row is row 2.
+    const plain_origin = aiCellIndexOf(&g_plain, 2, "L1 LINE") orelse return error.TestUnexpectedResult;
+    const off_origin = aiCellIndexOf(&g_off, 2, "L1 LINE") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 3), plain_origin);
+    try std.testing.expectEqual(plain_origin, off_origin);
+
+    // A deterministic cursor move must emit the same bytes on both sessions:
+    // the flag cannot perturb the default render path or layout geometry.
+    try gridSettle(&plain, &g_plain, 150, 2000);
+    try gridSettle(&explicit_off, &g_off, 150, 2000);
+    const mark_plain = plain.used;
+    const mark_off = explicit_off.used;
+    try plain.send("j");
+    try explicit_off.send("j");
+    try gridSettle(&plain, &g_plain, 200, 3000);
+    try gridSettle(&explicit_off, &g_off, 200, 3000);
+    const bytes_plain = plain.out[mark_plain..plain.used];
+    const bytes_off = explicit_off.out[mark_off..explicit_off.used];
+    if (!std.mem.eql(u8, bytes_plain, bytes_off)) {
+        std.debug.print("flag-off bytes differ: plain {d} bytes, explicit-off {d} bytes\n", .{ bytes_plain.len, bytes_off.len });
+        return error.TestUnexpectedResult;
+    }
+    try expectSameFrame(&g_plain, &g_off);
+    try std.testing.expectEqual(@as(u32, 0), try plain.commandAndWaitExit(":qa!\r"));
+    try std.testing.expectEqual(@as(u32, 0), try explicit_off.commandAndWaitExit(":qa!\r"));
+}
+
+test "focus frame demo: one outer frame at 90/120/160 keeps content inside" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try focusFrameWriteLines(io, root, "plain.txt", 60);
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/plain.txt", .{root});
+    const accent = packRgb(0xE6, 0xC3, 0x84); // kanagawa win_sep_active
+    const gutter: usize = 3; // digits(60) + separating space
+
+    inline for ([_]u16{ 90, 120, 160 }) |cols| {
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{"OZ_DEMO_FOCUS_FRAME=1"}, 30, cols, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 30, cols);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try gridWaitFor(&sess, &grid, "L1 LINE", 5000);
+        try gridSettle(&sess, &grid, 200, 3000);
+        try expectFocusFrameRing(&grid, 30, cols, 0, accent);
+
+        // The tab label row and the context row live INSIDE the frame; the
+        // source begins one row below them, one cell in from the border.
+        try std.testing.expect(rowContains(&grid, 1, "plain.txt"));
+        try std.testing.expect(rowContains(&grid, 2, "Ask agent"));
+        const l1_col = aiCellIndexOf(&grid, 3, "L1 LINE") orelse {
+            std.debug.print("source missing at {d} cols\n", .{cols});
+            grid.dump();
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expectEqual(@as(usize, 1 + gutter), l1_col);
+        // The frame never covers the status band.
+        try std.testing.expect(rowContains(&grid, 29, "[NORMAL]"));
+        // The reading surface ends above the bottom rule: the last content
+        // row (27 here) is still source, row 28 is the rule.
+        try std.testing.expect(rowContains(&grid, 27, "L25 LINE"));
+        try std.testing.expect(!rowContains(&grid, 28, "LINE"));
+
+        // Cursor geometry inside the inset surface: j moves to source line
+        // 2, whose cursorline bg is exactly the next content row.
+        try sess.send("j");
+        try gridWaitFor(&sess, &grid, "line 2/60", 3000);
+        try gridSettle(&sess, &grid, 150, 2000);
+        try expectFocusFrameRing(&grid, 30, cols, 0, accent);
+        try std.testing.expect(grid.rowHasBg(4, packRgb(42, 42, 55)));
+
+        // A vertical split is still ONE outer frame; the pane separator is
+        // an internal boundary, and both panes keep source inside the ring.
+        try sess.send(":vs\r");
+        try gridSettle(&sess, &grid, 400, 4000);
+        try expectFocusFrameRing(&grid, 30, cols, 0, accent);
+        const pane_hits = std.mem.count(u8, grid.rowText(3), "L1 LINE");
+        try std.testing.expectEqual(@as(usize, 2), pane_hits);
+        try sess.send("j");
+        try gridWaitFor(&sess, &grid, "line 3/60", 3000);
+        try gridSettle(&sess, &grid, 150, 2000);
+        try expectFocusFrameRing(&grid, 30, cols, 0, accent);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+    }
+
+    // Horizontal split stacks the tab layers. The content origin moves below
+    // BOTH label rows plus the context row, still inside the same ring.
+    {
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{"OZ_DEMO_FOCUS_FRAME=1"}, 30, 120, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 30, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try gridWaitFor(&sess, &grid, "L1 LINE", 5000);
+        try sess.send(":sp\r");
+        try gridSettle(&sess, &grid, 400, 4000);
+        try expectFocusFrameRing(&grid, 30, 120, 0, accent);
+        // Both tab layers are painted (band bg), but the same buffer is
+        // shown by both panes, so its tab appears EXACTLY once (focused
+        // pane wins) on one of the two label rows.
+        try std.testing.expect(grid.rowHasBg(1, packRgb(42, 42, 55)));
+        try std.testing.expect(grid.rowHasBg(2, packRgb(42, 42, 55)));
+        if (!rowContains(&grid, 1, "plain.txt")) {
+            try std.testing.expect(rowContains(&grid, 2, "plain.txt"));
+        }
+        try std.testing.expect(rowContains(&grid, 3, "Ask agent"));
+        try std.testing.expectEqual(@as(usize, 1 + gutter), aiCellIndexOf(&grid, 4, "L1 LINE").?);
+        // Content still reaches the row above the bottom rule in the lower
+        // pane; the rule itself is not source.
+        try std.testing.expect(rowContains(&grid, 27, "LINE"));
+        try std.testing.expect(!rowContains(&grid, 28, "LINE"));
+        try sess.send("j");
+        try gridWaitFor(&sess, &grid, "line 2/60", 3000);
+        try gridSettle(&sess, &grid, 150, 2000);
+        try expectFocusFrameRing(&grid, 30, 120, 0, accent);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+    }
+
+    // 40 columns is the compact-navigator fallback: the demo is disabled
+    // there (no reserved cells, historical content origins) instead of
+    // squeezing an already narrow reading surface.
+    {
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{"OZ_DEMO_FOCUS_FRAME=1"}, 12, 40, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 12, 40);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try gridWaitFor(&sess, &grid, "L1 LINE", 5000);
+        try gridSettle(&sess, &grid, 150, 2000);
+        inline for (.{ "╭", "╮", "╰", "╯" }) |glyph| try std.testing.expect(!grid.contains(glyph));
+        // Historical default geometry: label row 0, context row 1, source
+        // row 2 at the gutter, status row 11.
+        try std.testing.expect(rowContains(&grid, 0, "plain.txt"));
+        try std.testing.expect(rowContains(&grid, 1, "Ask agent"));
+        try std.testing.expectEqual(@as(usize, gutter), aiCellIndexOf(&grid, 2, "L1 LINE").?);
+        try std.testing.expect(rowContains(&grid, 11, "[NORMAL]"));
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+    }
+}
+
+test "focus frame demo: hints, mouse targets and focus transitions use inset cells" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try focusFrameWriteLines(io, root, "a.txt", 20);
+    try focusFrameWriteLines(io, root, "b.txt", 3);
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/a.txt", .{root});
+    const accent = packRgb(0xE6, 0xC3, 0x84);
+    const idle = packRgb(0x54, 0x54, 0x6D); // kanagawa win_sep
+    const nav_left: usize = nav_model.editorCol(true, 120);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{"OZ_DEMO_FOCUS_FRAME=1"}, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try gridWaitFor(&sess, &grid, "L1 LINE", 5000);
+    try gridSettle(&sess, &grid, 200, 3000);
+    try expectFocusFrameRing(&grid, 30, 120, 0, accent);
+
+    // Open a second buffer, then click the first tab at its DEMO row (label
+    // row 1, not the historical row 0). The click must switch buffers.
+    try sess.send(":e b.txt\r");
+    try gridWaitFor(&sess, &grid, "line 1/3", 5000);
+    try gridSettle(&sess, &grid, 150, 2000);
+    const tab_col = aiCellIndexOf(&grid, 1, "a.txt") orelse {
+        std.debug.print("a.txt tab missing from the demo label row\n", .{});
+        grid.dump();
+        return error.TestUnexpectedResult;
+    };
+    try mouseClickAt(&sess, tab_col, 1);
+    try gridWaitFor(&sess, &grid, "line 1/20", 5000);
+    try gridSettle(&sess, &grid, 150, 2000);
+    try expectFocusFrameRing(&grid, 30, 120, 0, accent);
+
+    // A click well inside the pane must hit the SAME inset leaf rect the
+    // renderer uses: content row 3 is source line 1, so row 12 is line 10.
+    try mouseClickAt(&sess, 6, 12);
+    try gridWaitFor(&sess, &grid, "line 10/20", 4000);
+    try gridSettle(&sess, &grid, 150, 2000);
+    try expectFocusFrameRing(&grid, 30, 120, 0, accent);
+    try std.testing.expect(grid.rowHasBg(12, packRgb(42, 42, 55)));
+
+    // Hint mode: labels ride the shifted targets and never overwrite the
+    // reserved ring cells.
+    try sess.send(" j");
+    try gridWaitFor(&sess, &grid, "HINTS ·", 4000);
+    try gridSettle(&sess, &grid, 150, 2000);
+    try expectFocusFrameRing(&grid, 30, 120, 0, accent);
+    try std.testing.expect(!grid.ul_on_buf[0]); // top-left corner untouched
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+
+    // Focus transition: the navigator takes the keyboard. The frame keeps
+    // its geometry (now starting at the navigator's editor column) but drops
+    // to the idle separator role; the navigator itself is NOT enclosed.
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "Files", 5000);
+    var waited: i32 = 0;
+    while (frame.cellFg(&grid, 0, nav_left) != idle and waited < 3000) : (waited += 50) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
+        if (n > 0) {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+    }
+    // The fg flips early in the byte stream; finish the frame (bottom rule)
+    // before asserting the whole ring.
+    try gridSettle(&sess, &grid, 150, 2000);
+    try expectFocusFrameRing(&grid, 30, 120, nav_left, idle);
+    // The navigator columns are outside the ring: no frame glyph starts at
+    // column 0 or in the gutter between navigator and editor.
+    try std.testing.expect(!std.mem.startsWith(u8, frame.cellText(&grid, 0, 0), "─"));
+    try std.testing.expect(!std.mem.startsWith(u8, frame.cellText(&grid, 0, 0), "╭"));
+    try std.testing.expect(!std.mem.startsWith(u8, frame.cellText(&grid, 0, nav_left - 1), "─"));
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "Files", 4000);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+    try gridSettle(&sess, &grid, 150, 2000);
+    try expectFocusFrameRing(&grid, 30, 120, 0, accent);
+
+    // A single outer frame also encloses split panes (the internal separator
+    // is a pane boundary, not a second frame); the idle transition applies
+    // to the split layout too.
+    try sess.send(":vs\r");
+    try gridSettle(&sess, &grid, 400, 4000);
+    try expectFocusFrameRing(&grid, 30, 120, 0, accent);
+    try std.testing.expect(grid.contains("L10 LINE"));
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "Files", 5000);
+    waited = 0;
+    while (frame.cellFg(&grid, 0, nav_left) != idle and waited < 3000) : (waited += 50) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
+        if (n > 0) {
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+    }
+    try gridSettle(&sess, &grid, 150, 2000);
+    try expectFocusFrameRing(&grid, 30, 120, nav_left, idle);
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "Files", 4000);
+    try gridSettle(&sess, &grid, 150, 2000);
+    try expectFocusFrameRing(&grid, 30, 120, 0, accent);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "focus frame demo: floating AI drawer covers the frame without moving content" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try focusFrameWriteLines(io, root, "plain.txt", 60);
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/plain.txt", .{root});
+    const accent = packRgb(0xE6, 0xC3, 0x84);
+    const gutter: usize = 3;
+    const cols: usize = 80;
+    const rail_col: usize = aiRailCol(cols);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{ "OZ_DEMO_FOCUS_FRAME=1", "OZ_AI_MODEL=mock-model" }, 30, cols, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, cols);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try gridWaitFor(&sess, &grid, "L1 LINE", 5000);
+    try gridSettle(&sess, &grid, 200, 3000);
+    try expectFocusFrameRing(&grid, 30, cols, 0, accent);
+    try std.testing.expectEqual(@as(usize, 1 + gutter), aiCellIndexOf(&grid, 3, "L1 LINE").?);
+
+    // At 80 columns the rail is a drawer floating over the editor: it is
+    // drawn AFTER the frame, so it covers the right rule/corners instead of
+    // being wrapped by them.
+    try aiEnterRail(&sess, &grid);
+    try std.testing.expectEqualStrings("│", frame.cellText(&grid, 0, rail_col));
+    try std.testing.expectEqual(accent, frame.cellFg(&grid, 0, rail_col));
+    try std.testing.expect(std.mem.startsWith(u8, frame.cellText(&grid, 0, 10), "─"));
+    try std.testing.expect(std.mem.startsWith(u8, frame.cellText(&grid, 5, 0), "│"));
+    try std.testing.expect(!std.mem.startsWith(u8, frame.cellText(&grid, 0, cols - 1), "╮"));
+    try std.testing.expect(!std.mem.startsWith(u8, frame.cellText(&grid, 0, cols - 1), "─"));
+    // Drawer mode does not narrow the editor underneath, so the reading
+    // origin is byte-identical to the pre-drawer frame.
+    try std.testing.expectEqual(@as(usize, 1 + gutter), aiCellIndexOf(&grid, 3, "L1 LINE").?);
+
+    // Esc closes the narrow drawer and returns the keyboard to the editor:
+    // the complete ring is back and content still starts at the same cell.
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "AGENTS", 5000);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+    try gridSettle(&sess, &grid, 200, 3000);
+    try expectFocusFrameRing(&grid, 30, cols, 0, accent);
+    try std.testing.expectEqual(@as(usize, 1 + gutter), aiCellIndexOf(&grid, 3, "L1 LINE").?);
+    try sess.send("j");
+    try gridWaitFor(&sess, &grid, "line 2/60", 3000);
+    try gridSettle(&sess, &grid, 150, 2000);
+    try expectFocusFrameRing(&grid, 30, cols, 0, accent);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "focus frame demo: LSP inlay hints stay inside and do not shift cursor columns" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var content: [512]u8 = undefined;
+    var n: usize = 0;
+    for (0..8) |i| {
+        const line = try std.fmt.bufPrint(content[n..], "const v{d} = {d};{s}", .{ i, i, if (i + 1 < 8) "\n" else "" });
+        n += line.len;
+    }
+    try aiWriteFile(io, root, "inlay.zig", content[0..n]);
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/inlay.zig", .{root});
+    const accent = packRgb(0xE6, 0xC3, 0x84);
+    const gutter: usize = 2; // digits(8) + separating space
+
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, path }, &.{
+        "OZ_DEMO_FOCUS_FRAME=1",
+        "OZ_LSP_CMD=zig-out/bin/mock_lsp",
+        "OZ_MOCK_SCRIPT=inlay_range",
+    }, 30, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try gridWaitFor(&sess, &grid, ": v0 = 0;const", 12000);
+    try gridSettle(&sess, &grid, 200, 3000);
+    try expectFocusFrameRing(&grid, 30, 120, 0, accent);
+    // The hint label is spliced at source character 0, i.e. immediately
+    // after the gutter inside the frame — never on the left rule.
+    try std.testing.expectEqual(@as(usize, 1 + gutter), aiCellIndexOf(&grid, 3, ": v0").?);
+    try std.testing.expect(std.mem.startsWith(u8, frame.cellText(&grid, 3, 119), "│"));
+
+    // Inlay cells must not perturb logical cursor columns.
+    try std.testing.expect(rowContains(&grid, 29, "line 1/8 col 0"));
+    try sess.send("l");
+    try gridWaitFor(&sess, &grid, "line 1/8 col 1", 3000);
+    try sess.send("$");
+    try gridWaitFor(&sess, &grid, "line 1/8 col 12", 3000);
+    try gridSettle(&sess, &grid, 150, 2000);
+    try expectFocusFrameRing(&grid, 30, 120, 0, accent);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}

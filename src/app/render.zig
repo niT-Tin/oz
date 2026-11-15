@@ -62,8 +62,9 @@ pub const filetree_gutter: u32 = nav_tabs.gutter;
 pub fn tabLayerCount(self: *App, a: std.mem.Allocator) u32 {
     if (self.windows.items.len <= 1) return 1;
     const height: u32 = self.vx.window().height;
-    if (height <= status_row_count) return 1;
-    const layout = self.layoutWindows(a, 1, height - status_row_count - 1, self.contentCol(), self.editorAreaWidth()) catch return 1;
+    const fixed = status_row_count + self.frameTopInset() + self.frameBottomInset();
+    if (height <= fixed + 1) return 1;
+    const layout = self.layoutWindows(a, 1, height - fixed - 1, self.contentCol(), self.editorAreaWidth()) catch return 1;
     const leaves = layout.leaves;
     // greedy interval coloring: assign each pane to the lowest layer
     // whose rightmost pane ends at or before this pane's column start
@@ -94,8 +95,9 @@ pub fn tabLayerCount(self: *App, a: std.mem.Allocator) u32 {
 /// height it clamps to the rows that exist.
 pub fn tabBarRows(self: *App, a: std.mem.Allocator) u32 {
     const height: u32 = self.vx.window().height;
-    if (height <= status_row_count) return 1;
-    const max_bar = height - status_row_count;
+    const fixed = status_row_count + self.frameTopInset() + self.frameBottomInset();
+    if (height <= fixed) return 1;
+    const max_bar = height - fixed;
     return @min(self.tabLayerCount(a) + 1, max_bar);
 }
 
@@ -111,9 +113,20 @@ pub const TabSort = struct {
     }
 };
 
-/// Row where the editor content starts (below the tab bar).
+/// Row where the editor content starts (below the tab bar and, in the #10
+/// demo, below the frame's top border).
 pub fn contentTop(self: *App, a: std.mem.Allocator) u32 {
-    return self.tabBarRows(a);
+    return self.tabBarRows(a) + self.frameTopInset();
+}
+
+/// Rows the editor panes may use: everything above the status band minus the
+/// buffer strip and the demo frame's bottom border. The one definition every
+/// layout/layout-dependent motion (H/M/L, zz/zt/zb, mouse pane targets) uses.
+pub fn editorContentRows(self: *App, a: std.mem.Allocator) u32 {
+    const height: u32 = self.vx.window().height;
+    const reserve = status_row_count + self.frameBottomInset();
+    if (height <= reserve) return 0;
+    return height - reserve -| self.contentTop(a);
 }
 
 pub fn navigatorMode(self: *App) nav_tabs.Mode {
@@ -123,7 +136,7 @@ pub fn navigatorMode(self: *App) nav_tabs.Mode {
 
 pub fn contentCol(self: *App) u32 {
     // Agent-focus deliberately keeps the 7-cell icon rail at every width.
-    return nav_tabs.editorColForMode(self.filetree_active, self.navigatorMode());
+    return nav_tabs.editorColForMode(self.filetree_active, self.navigatorMode()) + self.frameSideInset();
 }
 
 /// Width of the editor's usable area after the navigator takes its column
@@ -131,7 +144,7 @@ pub fn contentCol(self: *App) u32 {
 /// which is the full span from column 0 to the rail) or a navigator-open
 /// pane would wrap text underneath the navigator/rail.
 pub fn editorAreaWidth(self: *App) u32 {
-    return self.aiEditorWidth() -| self.contentCol();
+    return self.aiEditorWidth() -| self.contentCol() -| self.frameSideInset();
 }
 
 /// First row of the navigator's real content (below brand, workspace, tabs
@@ -2640,11 +2653,11 @@ pub fn drawRichPopup(
                     try kinds.append(a, 1);
                     in_fence = flang;
                     block_start = lines.items.len;
-                    } else {
-                        try kinds.append(a, 0);
-                    } else {
-                        try kinds.append(a, 0);
-                    }
+                } else {
+                    try kinds.append(a, 0);
+                } else {
+                    try kinds.append(a, 0);
+                }
             } else {
                 if (autil.isFenceLine(remaining[0..line_len]) != null) {
                     try kinds.append(a, 1);
@@ -2803,6 +2816,74 @@ fn fillStripRow(win: vaxis.Window, row: u32, col: u32, width: u32, bg: vaxis.Col
         .height = 1,
     });
     child.fill(.{ .style = .{ .bg = bg } });
+}
+
+/// Issue #10 demo: the single-cell outer frame around the editor surface —
+/// the buffer strip/context rows plus every pane — never the navigator, the
+/// global status band, or an independent floating window. The four insets
+/// were reserved by `focusFrameActive` before layout (contentTop /
+/// editorContentRows / contentCol / editorAreaWidth), so source, gutter,
+/// cursor, inlay hints and mouse pane targets cannot land on these cells.
+///
+/// Call this BEFORE every overlay (navigator peek/drawer, terminal, AI rail,
+/// completion/hover/picker) so a floating surface covers the frame instead
+/// of being enclosed by it. `win_sep_active` marks the editor owning the
+/// keyboard; `win_sep` marks idle (navigator / AI prompt / terminal focused).
+pub fn drawEditorFocusFrame(self: *App, win: vaxis.Window) void {
+    if (!self.focusFrameActive()) return;
+    const height: u32 = win.height;
+    if (height <= status_row_count) return;
+    const top: u32 = 0;
+    // Status band is the last row; the frame's bottom rule sits directly
+    // above it. With the demo inset this is the first cell the content gave
+    // up, not an overlay on top of a source row.
+    const bottom: u32 = height - status_row_count - self.frameBottomInset();
+    const left: u32 = self.contentCol() -| self.frameSideInset();
+    // The reading surface is [contentCol, contentCol+editorAreaWidth); the
+    // right rule takes the first cell after it. With the demo side inset that
+    // column equals aiEditorWidth - 1, exactly the one column content gave up.
+    const right: u32 = self.contentCol() + self.editorAreaWidth();
+    if (right < left + 2 or right >= win.width or bottom < top + 2) return;
+    const style = chrome.panelBorderStyle(self.theme, self.editorOwnsKeys(), .{ .rgb = self.theme.bg });
+
+    win.writeCell(@intCast(left), @intCast(top), .{
+        .char = .{ .grapheme = "╭", .width = 1 },
+        .style = style,
+    });
+    win.writeCell(@intCast(right), @intCast(top), .{
+        .char = .{ .grapheme = "╮", .width = 1 },
+        .style = style,
+    });
+    win.writeCell(@intCast(left), @intCast(bottom), .{
+        .char = .{ .grapheme = "╰", .width = 1 },
+        .style = style,
+    });
+    win.writeCell(@intCast(right), @intCast(bottom), .{
+        .char = .{ .grapheme = "╯", .width = 1 },
+        .style = style,
+    });
+    var c: u32 = left + 1;
+    while (c < right) : (c += 1) {
+        win.writeCell(@intCast(c), @intCast(top), .{
+            .char = .{ .grapheme = "─", .width = 1 },
+            .style = style,
+        });
+        win.writeCell(@intCast(c), @intCast(bottom), .{
+            .char = .{ .grapheme = "─", .width = 1 },
+            .style = style,
+        });
+    }
+    var r: u32 = top + 1;
+    while (r < bottom) : (r += 1) {
+        win.writeCell(@intCast(left), @intCast(r), .{
+            .char = .{ .grapheme = "│", .width = 1 },
+            .style = style,
+        });
+        win.writeCell(@intCast(right), @intCast(r), .{
+            .char = .{ .grapheme = "│", .width = 1 },
+            .style = style,
+        });
+    }
 }
 
 const BufferTabKind = enum { plain, diff, note };
@@ -3392,8 +3473,8 @@ pub fn render(self: *App) !void {
     // band. The strip's rows are real layout rows, so the cursor/viewport
     // math below can never paint into them.
     const bar_rows = self.tabBarRows(a);
-    const content_top = bar_rows;
-    const content_rows = height - status_row_count - bar_rows;
+    const content_top = self.contentTop(a);
+    const content_rows = self.editorContentRows(a);
 
     // Clamp the focused window's cursor/viewport BEFORE any lineOf /
     // column math below: switching windows or buffers can leave a stale
@@ -3417,8 +3498,11 @@ pub fn render(self: *App) !void {
 
     // Label layers followed by one focused-editor context row. Vertical
     // splits share a label row; overlapping pane spans keep separate layers.
+    // Inside the #10 demo frame the strip is inset like the editor: the
+    // border owns the outermost row/columns, tabs and context stay inside.
+    const strip_top = self.frameTopInset();
     const strip_col = self.contentCol();
-    const strip_right = self.aiEditorWidth();
+    const strip_right = self.aiEditorWidth() -| self.frameSideInset();
     const strip_w = strip_right -| strip_col;
     const strip_bg = chrome.bandStyle(self.theme).bg;
     const label_rows = bar_rows - 1;
@@ -3426,10 +3510,10 @@ pub fn render(self: *App) !void {
     if (strip_w > 0) {
         var label_r: u32 = 0;
         while (label_r < label_rows and label_r < height) : (label_r += 1) {
-            fillStripRow(win, label_r, strip_col, strip_w, strip_bg);
+            fillStripRow(win, strip_top + label_r, strip_col, strip_w, strip_bg);
         }
-        if (context_row < height) {
-            try drawEditorContext(self, a, win, context_row, strip_col, strip_w, cursor_line, status_col);
+        if (strip_top + context_row < height) {
+            try drawEditorContext(self, a, win, strip_top + context_row, strip_col, strip_w, cursor_line, status_col);
         }
         // Scratch maps reused by every pane; the spec array is frame-arena
         // storage (the vaxis cells reference the printed labels until render).
@@ -3449,7 +3533,7 @@ pub fn render(self: *App) !void {
                 n += 1;
             }
             const p = tabstrip.plan(tab_specs[0..n], strip_w);
-            try self.drawBufferTabPlan(a, win, 0, strip_col, p, tab_bufs[0..n]);
+            try self.drawBufferTabPlan(a, win, strip_top, strip_col, p, tab_bufs[0..n]);
         } else if (self.layoutWindows(a, content_top, content_rows, strip_col, strip_w)) |tab_layout| {
             // Each buffer's tab appears EXACTLY ONCE, owned by the pane that
             // displays it (the focused pane wins when several panes show the
@@ -3480,7 +3564,7 @@ pub fn render(self: *App) !void {
             const draw_layers = @min(layers, label_rows);
             var lli: u32 = 0;
             while (lli < draw_layers) : (lli += 1) {
-                fillStripRow(win, lli, strip_col, strip_w, strip_bg);
+                fillStripRow(win, strip_top + lli, strip_col, strip_w, strip_bg);
                 // right edge of the layer's widest span: tabs clip here
                 var right: u32 = 0;
                 for (order.items) |oi| {
@@ -3523,7 +3607,7 @@ pub fn render(self: *App) !void {
                     }
                     const avail = right -| pos;
                     const p = tabstrip.plan(tab_specs[0..n], avail);
-                    try self.drawBufferTabPlan(a, win, lli, pos, p, tab_bufs[0..n]);
+                    try self.drawBufferTabPlan(a, win, strip_top + lli, pos, p, tab_bufs[0..n]);
                     pos += p.used;
                 }
             }
@@ -3538,9 +3622,9 @@ pub fn render(self: *App) !void {
         const logo_style: vaxis.Style = .{ .fg = .{ .rgb = t.accent }, .bold = true };
         const key_style: vaxis.Style = .{ .fg = .{ .rgb = t.accent }, .bold = true };
         const label_style: vaxis.Style = .{ .fg = .{ .rgb = t.fg } };
-        // content area between the sidebar and the right edge
+        // content area between the sidebar/rail and the frame
         const area_col: u32 = self.contentCol();
-        const area_w: u32 = self.aiEditorWidth() -| area_col;
+        const area_w: u32 = self.editorAreaWidth();
         // horizontal centering helper: the column that centers a `width`-cell
         // block inside the content area (never negative)
         const centerCol = struct {
@@ -3638,6 +3722,10 @@ pub fn render(self: *App) !void {
         };
         self.vx.screen.cursor_vis = true;
         self.vx.screen.cursor_shape = .block;
+        // Issue #10 demo: the editor+tabs frame is drawn before the
+        // filetree/terminal/rail overlays so they may cover it (the frame
+        // deliberately does not wrap floating surfaces).
+        self.drawEditorFocusFrame(win);
         // the dashboard returns before the window loop, so the file tree
         // (rendered after that loop) would never draw over it — draw it
         // here too, or <leader>e on the dashboard shows a stale screen
@@ -3713,6 +3801,12 @@ pub fn render(self: *App) !void {
             }
         }
     }
+
+    // Issue #10 demo: one outer frame around the buffer strip + every editor
+    // pane. Drawn before the navigator/terminal/rail/picker overlays so a
+    // floating surface (compact nav peek, drawer, completion/hover, terminal)
+    // covers it instead of being enclosed by it.
+    self.drawEditorFocusFrame(win);
 
     // file tree sidebar (nvim neo-tree style: the panel shares the
     // EDITOR background — Normal bg, not a float — so sidebar and text
