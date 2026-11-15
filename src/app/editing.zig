@@ -3,6 +3,7 @@
 const std = @import("std");
 const editor = @import("../editor/root.zig");
 const edit_range = @import("../editor/edit_range.zig");
+const auto_pair = @import("../editor/auto_pair.zig");
 
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
@@ -27,8 +28,8 @@ pub fn pairCloser(ch: u8) ?u8 {
 /// cursor — multi-cursor edits go through handleMcInsertKey and stay
 /// literal). Returns true when the key was handled here:
 /// - opener: insert the pair, cursor ends up between the two
-/// - quote: same, but not right after a word char ("don't"), and typing
-///   the quote again over an identical quote skips over it
+/// - quote: open a pair, close an existing quote literally, or skip an
+///   identical next quote; word-ending apostrophes remain prose ("don't")
 /// - closer: when the cursor sits on that same closer, skip over it
 ///   instead of inserting a duplicate
 pub fn autoPairInsert(self: *App, text: []const u8) !bool {
@@ -43,11 +44,11 @@ pub fn autoPairInsert(self: *App, text: []const u8) !bool {
             return true;
         },
         '"', '\'', '`' => {
-            if (pos < len and self.cur().pt.byteAt(pos) == ch) {
+            if (!auto_pair.escaped(&self.cur().pt, pos) and pos < len and self.cur().pt.byteAt(pos) == ch) {
                 self.curCursor().* = pos + 1; // skip over
                 return true;
             }
-            if (pos > 0 and isWordByte(self.cur().pt.byteAt(pos - 1))) return false;
+            if (!auto_pair.quoteShouldPair(&self.cur().pt, pos, ch)) return false;
             try self.insertText(&[_]u8{ ch, ch });
             self.curCursor().* = pos + 1;
             return true;

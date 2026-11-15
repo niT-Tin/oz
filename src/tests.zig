@@ -22,6 +22,7 @@ pub const edit_range = @import("editor/edit_range.zig");
 pub const line_open = @import("editor/line_open.zig");
 // language-aware Enter/paste indentation (pure; app/lsp_edit.zig + paste glue)
 pub const indent = @import("editor/indent.zig");
+pub const auto_pair = @import("editor/auto_pair.zig");
 pub const ex_command = @import("editor/ex_command.zig");
 pub const text_object = @import("editor/text_object.zig");
 pub const surround = @import("editor/surround.zig");

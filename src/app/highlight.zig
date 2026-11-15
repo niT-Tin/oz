@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const edit_range = @import("../editor/edit_range.zig");
+const indent_mod = @import("../editor/indent.zig");
 const editor = @import("../editor/root.zig");
 const syntax = @import("../syntax.zig");
 const term = @import("../term.zig");
@@ -569,41 +570,45 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             self.state.mode = .insert;
         },
         .insert_line_after => {
-            // o: new line below, cursor on it. One record (line ending +
-            // auto-indent) joins the insert-session undo group opened here,
-            // so a single undo reverts the whole o+typing session.
             const pt = &self.cur().pt;
             const line = pt.lineOf(self.curCursor().*);
             const ls = pt.lineStart(line);
             const text_len = pt.lineTextLen(line);
-            const indent = try self.leadingIndent(line);
-            defer self.alloc.free(indent);
-            const ending = editor.line_open.preferredEnding(pt, line);
-            const open = try editor.line_open.plan(self.alloc, ending, indent, false);
-            defer open.deinit(self.alloc);
-            // Opening a line is a fresh edit context: drop any completion
-            // menu / pending manual request left by the previous session
-            // (beginInsertSession does this, before the group opens).
+            const leading = try self.leadingIndent(line);
+            defer self.alloc.free(leading);
+            var insert_pos = ls + text_len;
+            var plan: indent_mod.NewlinePlan = undefined;
+            if (pt.len() <= indent_mod.max_insert_bytes) {
+                const doc = try self.curText();
+                defer self.alloc.free(doc);
+                const open = try indent_mod.planOpenBelow(self.alloc, doc, self.curCursor().*, autil.filetypeOf(self.cur().path), .{
+                    .indent_width = @intCast(app_mod.tab_width),
+                    .use_tabs = std.mem.indexOfScalar(u8, leading, '\t') != null,
+                });
+                insert_pos = open.pos;
+                plan = open.newline;
+            } else {
+                const ending = editor.line_open.preferredEnding(pt, line);
+                const open = try editor.line_open.plan(self.alloc, ending, leading, false);
+                plan = .{ .text = open.text, .cursor_after = open.cursor_off };
+            }
+            defer self.alloc.free(plan.text);
+            const at = self.lspPositionAt(pt, insert_pos);
             self.beginInsertSession();
             self.cur().history.beginGroup();
-            try self.recordEdit(ls + text_len, 0, open.text);
-            self.curCursor().* = ls + text_len + open.cursor_off;
+            try self.recordEdit(insert_pos, 0, plan.text);
+            self.curCursor().* = insert_pos + plan.cursor_after;
             self.in_insert = true;
             self.state.mode = .insert;
-            // Re-anchor hints by LINE only: no text was inserted inside the
-            // edited line, so an end-of-line hint belongs to it — moving it
-            // to character 0 of the new row made the insert cursor ride
-            // after stale virtual text. Hints below shift down one line.
-            self.adjustInlayHintsLineOpen(line, false);
-            // keep the git gutter marks glued to their lines (o splits the
-            // line at its end: content below shifts down one)
-            self.gitShiftInsertAt(line, text_len, 1);
-            // structural edit (newline): force a full reparse next frame —
-            // incremental parsing of a newline is where highlight drift
-            // shows up ("o then type then jk leaves gray chars")
+            if (insert_pos == ls + text_len and std.mem.count(u8, plan.text, "\n") == 1) {
+                // End-of-line hints stay attached to their original source;
+                // only rows below an ordinary open-below move down.
+                self.adjustInlayHintsLineOpen(line, false);
+            } else {
+                self.adjustInlayHintsInsert(line, insert_pos - ls, plan.text);
+            }
             self.cur().syntax_revision = std.math.maxInt(u64);
-            // Notify LSP (the new line + indent changed the document).
-            self.markDirty();
+            self.markDirtyRange(at, at, plan.text);
         },
         .insert_line_before => {
             // O: new line above, cursor on it (same open-group semantics).
