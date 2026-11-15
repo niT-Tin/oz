@@ -27320,3 +27320,43 @@ test "editing reliability: manually selected completion survives a refresh" {
     defer alloc.free(saved);
     try std.testing.expectEqualStrings("lines_insert", saved);
 }
+
+test "editing performance: large fenced docs render without per-line parser stall" {
+    // Issue #11: a completion item with 160 fenced code lines used to create
+    // one tree-sitter Highlighter per line on every docs layout (~15.5 s
+    // stall in Debug). The block is now highlighted once; this test fails on
+    // the old per-line path because the menu does not appear within 5 s.
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var name_buf: [192:0]u8 = undefined;
+    const name = try erFixture(io, &name_buf, ".zig", "const a = 1;\n");
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    const oz = try erAbs(io, alloc, oz_exe_path);
+    defer alloc.free(oz);
+    const mock = try erAbs(io, alloc, "zig-out/bin/mock_lsp");
+    defer alloc.free(mock);
+    const lsp_env = try std.fmt.allocPrint(alloc, "OZ_LSP_CMD={s}", .{mock});
+    defer alloc.free(lsp_env);
+    var sess = try Session.spawnEnvSize(io, &.{ oz, name }, &.{ lsp_env, "OZ_MOCK_SCRIPT=completion_bulk_docs" }, 32, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 32, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("i");
+    try gridWaitFor(&sess, &grid, "[INSERT]", 4000);
+    const start_ns = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    try sess.send("s");
+    // 5 s is already the red threshold (old path took ~15 s); the explicit
+    // elapsed assertion keeps a slow runner from passing vacuously.
+    try gridWaitFor(&sess, &grid, "BULK_DOC_START", 5000);
+    const elapsed_ms: u64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds - start_ns, std.time.ns_per_ms));
+    if (elapsed_ms >= 5000) std.debug.print("bulk docs render took {d} ms\n", .{elapsed_ms});
+    try std.testing.expect(elapsed_ms < 5000);
+    // The docs pane is scrollable (footer only appears when rows overflow).
+    try sess.send("\x06");
+    try gridWaitFor(&sess, &grid, "^F/^B", 6000);
+    try sess.send("\x03");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
