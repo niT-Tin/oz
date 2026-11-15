@@ -14602,6 +14602,408 @@ test "terminal: shell-integration OSC sequences never print vaxis logs" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+// ---- issue #18: persistent terminal sessions + framed PTY ----
+
+/// Parse `<key><digits>` from the current reconstructed frame. A typed shell
+/// command echoes its `printf` format (`<key>%s`) too, so the digit guard is
+/// what distinguishes the real output from the echo.
+fn termGridPid(grid: *Grid, key: []const u8) ?i64 {
+    var r: usize = 0;
+    while (r < grid.rows) : (r += 1) {
+        const text = grid.rowText(r);
+        const at = std.mem.indexOf(u8, text, key) orelse continue;
+        var i = at + key.len;
+        const start = i;
+        while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {}
+        if (i == start) continue;
+        return std.fmt.parseInt(i64, text[start..i], 10) catch null;
+    }
+    return null;
+}
+
+fn termWaitPid(sess: *Session, grid: *Grid, key: []const u8, timeout_ms: i32) !i64 {
+    const deadline = std.Io.Timestamp.now(sess.io, .awake).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    while (std.Io.Timestamp.now(sess.io, .awake).nanoseconds < deadline) {
+        if (termGridPid(grid, key)) |pid| return pid;
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) continue;
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    std.debug.print("missing terminal pid '{s}':\n", .{key});
+    grid.dump();
+    return error.TestUnexpectedResult;
+}
+
+fn termGridHasValue(grid: *Grid, key: []const u8, value: []const u8) bool {
+    var r: usize = 0;
+    while (r < grid.rows) : (r += 1) {
+        const text = grid.rowText(r);
+        const at = std.mem.indexOf(u8, text, key) orelse continue;
+        const rest = text[at + key.len ..];
+        if (!std.mem.startsWith(u8, rest, value)) continue;
+        if (rest.len == value.len or rest[value.len] == ' ') return true;
+    }
+    return false;
+}
+
+fn termWaitValue(sess: *Session, grid: *Grid, key: []const u8, value: []const u8, timeout_ms: i32) !void {
+    const deadline = std.Io.Timestamp.now(sess.io, .awake).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    while (std.Io.Timestamp.now(sess.io, .awake).nanoseconds < deadline) {
+        if (termGridHasValue(grid, key, value)) return;
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) continue;
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    std.debug.print("missing terminal value '{s}{s}':\n", .{ key, value });
+    grid.dump();
+    return error.TestUnexpectedResult;
+}
+
+const TermSize = struct { rows: u32, cols: u32 };
+
+/// `<key><rows> <cols>`: the `stty size` answer printed by the child. The
+/// echoed command line carries `<key>%s` and is rejected by the digit guard.
+fn termParseSize(grid: *Grid, key: []const u8) ?TermSize {
+    var r: usize = 0;
+    while (r < grid.rows) : (r += 1) {
+        const text = grid.rowText(r);
+        const at = std.mem.indexOf(u8, text, key) orelse continue;
+        var i = at + key.len;
+        const rows_start = i;
+        while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {}
+        if (i == rows_start) continue;
+        const rows = std.fmt.parseInt(u32, text[rows_start..i], 10) catch continue;
+        if (i >= text.len or text[i] != ' ') continue;
+        while (i < text.len and text[i] == ' ') : (i += 1) {}
+        const cols_start = i;
+        while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {}
+        if (i == cols_start) continue;
+        const cols = std.fmt.parseInt(u32, text[cols_start..i], 10) catch continue;
+        if (rows == 0 or cols == 0) continue;
+        return .{ .rows = rows, .cols = cols };
+    }
+    return null;
+}
+
+fn termWaitSize(sess: *Session, grid: *Grid, key: []const u8, timeout_ms: i32) !TermSize {
+    const deadline = std.Io.Timestamp.now(sess.io, .awake).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    while (std.Io.Timestamp.now(sess.io, .awake).nanoseconds < deadline) {
+        if (termParseSize(grid, key)) |size| return size;
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) continue;
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    std.debug.print("missing terminal size '{s}':\n", .{key});
+    grid.dump();
+    return error.TestUnexpectedResult;
+}
+
+fn termWaitBox(sess: *Session, grid: *Grid, timeout_ms: i32) !frame.Rect {
+    const deadline = std.Io.Timestamp.now(sess.io, .awake).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    while (std.Io.Timestamp.now(sess.io, .awake).nanoseconds < deadline) {
+        if (frame.findBoxByTitle(grid, "oz terminal")) |box| return box;
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) continue;
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    std.debug.print("missing terminal frame 'oz terminal':\n", .{});
+    grid.dump();
+    return error.TestUnexpectedResult;
+}
+
+const TermBoxKind = enum { floating, bottom, right };
+
+/// True when the drawn frame has the geometry of `kind` for this grid. Used
+/// to wait for a layout switch's redraw BEFORE typing into the child: a
+/// command executed in the old-size PTY would be erased by the resize's
+/// screen reset.
+fn termBoxIsKind(box: frame.Rect, kind: TermBoxKind, grid: *Grid) bool {
+    switch (kind) {
+        .floating => return box.width() < grid.cols and box.left > 0 and
+            box.top > 2 and box.bottom + 2 < grid.rows,
+        .bottom => return box.width() == grid.cols and box.bottom == grid.rows - 2,
+        .right => return box.width() < grid.cols and box.left > 0 and
+            box.left * 2 > grid.cols and box.bottom == grid.rows - 2,
+    }
+}
+
+fn termWaitLayout(sess: *Session, grid: *Grid, kind: TermBoxKind, timeout_ms: i32) !frame.Rect {
+    const deadline = std.Io.Timestamp.now(sess.io, .awake).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    while (std.Io.Timestamp.now(sess.io, .awake).nanoseconds < deadline) {
+        if (frame.findBoxByTitle(grid, "oz terminal")) |box| {
+            if (termBoxIsKind(box, kind, grid)) return box;
+        }
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) continue;
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    std.debug.print("missing '{s}' terminal frame:\n", .{@tagName(kind)});
+    grid.dump();
+    return error.TestUnexpectedResult;
+}
+
+fn termWaitBoxInner(sess: *Session, grid: *Grid, want_w: usize, want_h: usize, timeout_ms: i32) !frame.Rect {
+    const deadline = std.Io.Timestamp.now(sess.io, .awake).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    while (std.Io.Timestamp.now(sess.io, .awake).nanoseconds < deadline) {
+        if (frame.findBoxByTitle(grid, "oz terminal")) |box| {
+            if (box.width() - 2 == want_w and box.height() - 2 == want_h) return box;
+        }
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) continue;
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    std.debug.print("missing {d}x{d}-inner terminal frame:\n", .{ want_w, want_h });
+    grid.dump();
+    return error.TestUnexpectedResult;
+}
+
+/// Focus is rendered as the border color: accent while the child owns the
+/// keys, quiet `win_sep` after Esc. Waiting on the FRAME (not a sleep) also
+/// separates a lone Esc from the next key, which the input parser would
+/// otherwise coalesce with the following ESC as Alt+Esc.
+fn termBorderIsFocused(grid: *Grid, box: frame.Rect, accent: u32) bool {
+    return grid.fg_buf[box.top * grid.cols + box.left] == accent;
+}
+
+fn termWaitFocus(sess: *Session, grid: *Grid, box: frame.Rect, accent: u32, want: bool, timeout_ms: i32) !void {
+    const deadline = std.Io.Timestamp.now(sess.io, .awake).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    while (std.Io.Timestamp.now(sess.io, .awake).nanoseconds < deadline) {
+        if (termBorderIsFocused(grid, box, accent) == want) return;
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) continue;
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    std.debug.print("terminal frame focus never became {}\n", .{want});
+    grid.dump();
+    return error.TestUnexpectedResult;
+}
+
+/// First cell (row, col) where `needle` starts in the reconstructed frame.
+fn termFindText(grid: *Grid, needle: []const u8) ?struct { row: usize, col: usize } {
+    var r: usize = 0;
+    while (r < grid.rows) : (r += 1) {
+        const text = grid.rowText(r);
+        if (std.mem.indexOf(u8, text, needle)) |byte_at| {
+            // Convert the byte offset to a cell column; rows may contain
+            // multi-byte box glyphs, so byte and cell offsets differ.
+            var byte: usize = 0;
+            var c: usize = 0;
+            while (c < grid.cols and byte < byte_at) : (c += 1) {
+                const slot = grid.buf[(r * grid.cols + c) * 4 ..][0..4];
+                var k: usize = 0;
+                while (k < 4 and slot[k] != 0) : (k += 1) {}
+                byte += k;
+            }
+            return .{ .row = r, .col = c };
+        }
+    }
+    return null;
+}
+
+test "terminal: Alt+R hide/show reuses the shell session; layouts keep it; exit replaces it" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var dir_buf: [160]u8 = undefined;
+    const root = try std.fmt.bufPrint(&dir_buf, "/tmp/oz_term18_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDir(io, root, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "reuse.txt", "terminal session fixture\n");
+    const path = try std.fmt.allocPrint(alloc, "{s}/reuse.txt", .{root});
+    defer alloc.free(path);
+
+    var mark_buf: [64]u8 = undefined;
+    const mark = try std.fmt.bufPrint(&mark_buf, "ozmark18_{d}", .{linux.getpid()});
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, null, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+    const accent = packRgb(0xE6, 0xC3, 0x84); // focused kanagawa-wave border
+
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "terminal session fixture", 5000);
+
+    // First session: identity (PID), exported environment and cwd.
+    try sess.send("\x1br");
+    _ = try termWaitLayout(&sess, &grid, .floating, 15000);
+    var export_buf: [96]u8 = undefined;
+    try sess.send(try std.fmt.bufPrint(&export_buf, "export OZ_TERM_MARK={s}\r", .{mark}));
+    try sess.send("printf 'OZPID1=%s\\n' \"$$\"\r");
+    const pid1 = try termWaitPid(&sess, &grid, "OZPID1=", 15000);
+    try sess.send("printf 'OZMARK1=%s\\n' \"$OZ_TERM_MARK\"\r");
+    try termWaitValue(&sess, &grid, "OZMARK1=", mark, 8000);
+    try sess.send("printf 'OZCWD1=%s\\n' \"$PWD\"\r");
+    try termWaitValue(&sess, &grid, "OZCWD1=", root, 8000);
+
+    // Alt+R hides the pane instead of destroying the session: the child must
+    // keep running and its rendered cells disappear from the frame.
+    try sess.send("\x1br");
+    try gridWaitGone(&sess, &grid, "OZPID1=", 8000);
+
+    // Showing it again reuses the SAME shell: PID, exported env and cwd all
+    // survive, which a destroy+respawn cannot fake.
+    try sess.send("\x1br");
+    _ = try termWaitLayout(&sess, &grid, .floating, 15000);
+    try sess.send("printf 'OZPID2=%s\\n' \"$$\"\r");
+    const pid2 = try termWaitPid(&sess, &grid, "OZPID2=", 15000);
+    try std.testing.expectEqual(pid1, pid2);
+    try sess.send("printf 'OZMARK2=%s\\n' \"$OZ_TERM_MARK\"\r");
+    try termWaitValue(&sess, &grid, "OZMARK2=", mark, 8000);
+    try sess.send("printf 'OZCWD2=%s\\n' \"$PWD\"\r");
+    try termWaitValue(&sess, &grid, "OZCWD2=", root, 8000);
+
+    // Layout switches only move the same session (bottom -> right -> float).
+    // Wait for the switched frame before typing: input sent into the OLD
+    // PTY size would be wiped by the resize's screen reset.
+    try sess.send("\x1bw");
+    _ = try termWaitLayout(&sess, &grid, .bottom, 15000);
+    try sess.send("printf 'OZPID3=%s\\n' \"$$\"\r");
+    try std.testing.expectEqual(pid1, try termWaitPid(&sess, &grid, "OZPID3=", 15000));
+    try sess.send("\x1be");
+    _ = try termWaitLayout(&sess, &grid, .right, 15000);
+    try sess.send("printf 'OZPID4=%s\\n' \"$$\"\r");
+    try std.testing.expectEqual(pid1, try termWaitPid(&sess, &grid, "OZPID4=", 15000));
+    try sess.send("\x1br");
+    const box5 = try termWaitLayout(&sess, &grid, .floating, 15000);
+    try sess.send("printf 'OZPID5=%s\\n' \"$$\"\r");
+    try std.testing.expectEqual(pid1, try termWaitPid(&sess, &grid, "OZPID5=", 15000));
+
+    // Visible but unfocused + Alt+R focuses the session (does not hide or
+    // recreate it); the next Alt+R hides it. Esc is acknowledged by the frame
+    // turning to the quiet border color before the next key is sent.
+    try sess.send("\x1b");
+    try termWaitFocus(&sess, &grid, box5, accent, false, 8000);
+    try sess.send("\x1br");
+    try termWaitFocus(&sess, &grid, box5, accent, true, 8000);
+    try sess.send("printf 'OZPID6=%s\\n' \"$$\"\r");
+    try std.testing.expectEqual(pid1, try termWaitPid(&sess, &grid, "OZPID6=", 15000));
+    try sess.send("\x1br");
+    try gridWaitGone(&sess, &grid, "OZPID6=", 8000);
+    try sess.send("\x1br");
+    _ = try termWaitLayout(&sess, &grid, .floating, 15000);
+    try sess.send("printf 'OZPID7=%s\\n' \"$$\"\r");
+    try std.testing.expectEqual(pid1, try termWaitPid(&sess, &grid, "OZPID7=", 15000));
+
+    // Only an explicit child exit destroys the session; the next Alt+R starts
+    // a genuinely new shell (different PID, marker no longer exported).
+    try sess.send("exit\r");
+    try gridWaitFor(&sess, &grid, "terminal exited", 15000);
+    try sess.send("\x1br");
+    _ = try termWaitLayout(&sess, &grid, .floating, 15000);
+    try sess.send("printf 'OZPID8=%s\\n' \"$$\"\r");
+    const pid8 = try termWaitPid(&sess, &grid, "OZPID8=", 15000);
+    try std.testing.expect(pid8 != pid1);
+    try sess.send("printf 'OZMARK8=%s\\n' \"${OZ_TERM_MARK:-unset}\"\r");
+    try termWaitValue(&sess, &grid, "OZMARK8=", "unset", 8000);
+
+    // A hidden session must not block app shutdown.
+    try sess.send("\x1br");
+    try gridWaitGone(&sess, &grid, "OZPID8=", 8000);
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "terminal: frame bounds the inner PTY across layouts at 80 and 40 columns" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var dir_buf: [160]u8 = undefined;
+    const root = try std.fmt.bufPrint(&dir_buf, "/tmp/oz_termframe_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDir(io, root, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "frame.txt", "terminal frame fixture\n");
+    const path = try std.fmt.allocPrint(alloc, "{s}/frame.txt", .{root});
+    defer alloc.free(path);
+
+    const accent = packRgb(0xE6, 0xC3, 0x84); // kanagawa-wave win_sep_active
+
+    const Case = struct { cols: usize, key: []const u8, layout: []const u8, want_inner_w: usize, want_inner_h: usize };
+    const cases = [_]Case{
+        .{ .cols = 80, .key = "OZ_SIZE_1=", .layout = "\x1br", .want_inner_w = 62, .want_inner_h = 10 },
+        .{ .cols = 80, .key = "OZ_SIZE_2=", .layout = "\x1bw", .want_inner_w = 78, .want_inner_h = 6 },
+        .{ .cols = 80, .key = "OZ_SIZE_3=", .layout = "\x1be", .want_inner_w = 30, .want_inner_h = 19 },
+        .{ .cols = 40, .key = "OZ_SIZE_4=", .layout = "\x1br", .want_inner_w = 38, .want_inner_h = 10 },
+        .{ .cols = 40, .key = "OZ_SIZE_5=", .layout = "\x1bw", .want_inner_w = 38, .want_inner_h = 6 },
+        .{ .cols = 40, .key = "OZ_SIZE_6=", .layout = "\x1be", .want_inner_w = 28, .want_inner_h = 19 },
+    };
+
+    var by_cols = [_]?Session{ null, null };
+    var grids = [_]?Grid{ null, null };
+    defer {
+        for (&by_cols) |*s| {
+            if (s.*) |*ss| {
+                ss.close();
+                killPid(ss.pid);
+            }
+        }
+    }
+    defer {
+        for (&grids) |*g| {
+            if (g.*) |*gg| gg.deinit(alloc);
+        }
+    }
+
+    for (cases) |case| {
+        const slot: usize = if (case.cols == 80) 0 else 1;
+        if (by_cols[slot] == null) {
+            by_cols[slot] = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, null, 24, @intCast(case.cols), root);
+            grids[slot] = try Grid.initSizedCols(alloc, 24, case.cols);
+        }
+        const sess = &by_cols[slot].?;
+        const grid = &grids[slot].?;
+        if (!grid.contains("NORMAL")) try gridWaitFor(sess, grid, "NORMAL", 8000);
+        try sess.send(case.layout);
+        // Wait for the switched frame BEFORE typing: the resize resets the
+        // terminal screens, so output produced at the old size would vanish.
+        _ = try termWaitBoxInner(sess, grid, case.want_inner_w, case.want_inner_h, 15000);
+        // `printf 'OZ_SIZE_N=%s\n' "$(stty size)"` — the echoed literal keeps
+        // the percent placeholder, so termParseSize only accepts real output.
+        var cmd_buf: [96]u8 = undefined;
+        const cmd = try std.fmt.bufPrint(&cmd_buf, "printf '{s}%s\\n' \"$(stty size)\"\r", .{case.key});
+        try sess.send(cmd);
+        const size = try termWaitSize(sess, grid, case.key, 15000);
+        const box = try termWaitBoxInner(sess, grid, case.want_inner_w, case.want_inner_h, 15000);
+
+        // The drawn frame is the authority: its border must be themed and
+        // its interior must be exactly the PTY size (the border never covers
+        // child content, and the PTY was resized to the inner rect).
+        try frame.expectBorderBox(grid, box, accent);
+        const inner_w = box.width() - 2;
+        const inner_h = box.height() - 2;
+        try std.testing.expectEqual(@as(usize, case.want_inner_w), inner_w);
+        try std.testing.expectEqual(@as(usize, case.want_inner_h), inner_h);
+        try std.testing.expectEqual(inner_h, @as(usize, size.rows));
+        try std.testing.expectEqual(inner_w, @as(usize, size.cols));
+
+        // The reported size text must itself sit strictly inside the border.
+        const at = termFindText(grid, case.key) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(at.row > box.top and at.row < box.bottom);
+        try std.testing.expect(at.col > box.left and at.col < box.right);
+    }
+
+    // Hide each pane with its CURRENT layout key (both ended on the right
+    // strip); Alt+R would move them back to the float, not hide.
+    try by_cols[0].?.send("\x1be");
+    try gridWaitGone(&by_cols[0].?, &grids[0].?, "OZ_SIZE_3=", 8000);
+    try by_cols[1].?.send("\x1be");
+    try gridWaitGone(&by_cols[1].?, &grids[1].?, "OZ_SIZE_6=", 8000);
+    const exit80 = try by_cols[0].?.commandAndWaitExit(":q!\r");
+    const exit40 = try by_cols[1].?.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit80);
+    try std.testing.expectEqual(@as(u32, 0), exit40);
+}
+
 // ================= workspace e2e (M5) =================
 //
 // Shared feed-loop helpers for the workspace tests below (same shape as the
