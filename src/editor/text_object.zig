@@ -243,12 +243,26 @@ fn enclosingPair(pt: *const PieceTable, open: u8, close: u8, pos: u32) ?Pair {
             if (forwardMatch(pt, pos, open, close)) |c| return .{ .open = pos, .close = c };
         }
     }
+    // Discard pairs already closed to the left in one backwards pass.
+    // Re-running forwardMatch for every unmatched opener makes an incomplete
+    // buffer of N opening brackets quadratic while the user is still typing.
+    var depth: u32 = 0;
     var p = pos;
     while (p > 0) {
         p -= 1;
-        if (pt.byteAt(p) != open) continue;
-        const c = forwardMatch(pt, p, open, close) orelse continue;
-        if (c > pos) return .{ .open = p, .close = c };
+        const b = pt.byteAt(p);
+        if (b == close) {
+            depth += 1;
+        } else if (b == open) {
+            if (depth > 0) {
+                depth -= 1;
+            } else {
+                // This is the nearest opener not already closed before the
+                // cursor. If it cannot close, no outer opener can close either.
+                const c = forwardMatch(pt, p, open, close) orelse return null;
+                return .{ .open = p, .close = c };
+            }
+        }
     }
     return null;
 }
@@ -906,4 +920,19 @@ test "count: 2i( acts on the second nesting level; count past nesting clamps" {
     r = range(&pt, .around_paren, 12, 2);
     try testing.expectEqual(@as(u32, 5), r.start);
     try testing.expectEqual(@as(u32, 15), r.end);
+}
+
+test "brackets: unmatched opening brackets stay bounded" {
+    const a = std.testing.allocator;
+    const n = 40000;
+    const input = try a.alloc(u8, n + 1);
+    defer a.free(input);
+    @memset(input[0..n], '(');
+    input[n] = 'x';
+    var pt = try PieceTable.init(a, input);
+    defer pt.deinit();
+    const deadline = std.Io.Clock.awake.now(testing.io).addDuration(.fromSeconds(2));
+    const selected = range(&pt, .inner_paren, n, 1);
+    try testing.expect(std.Io.Clock.awake.now(testing.io).compare(.lt, deadline));
+    try testing.expectEqual(Range{ .start = n, .end = n }, selected);
 }
