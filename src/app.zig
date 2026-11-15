@@ -341,6 +341,12 @@ pub const App = struct {
     /// OZ_NO_ITALIC=1 keeps the palette but strips italic glyphs (fonts or
     /// terminals without a real italic variant still get a usable editor).
     italics_enabled: bool = true,
+    /// Issue #10 DEMO seam: `OZ_DEMO_FOCUS_FRAME=1` draws one outer focus
+    /// frame around the buffer strip and every editor pane. Default off and
+    /// not adopted — this is evidence for the design decision, not a UI
+    /// change. When off every geometry helper below returns its historical
+    /// value, so the default frame stays byte-for-byte unchanged.
+    demo_focus_frame: bool = false,
     /// Theme when the theme picker opened — Esc restores it (no allocation;
     /// value copy, nothing to free in deinit).
     theme_saved: ?theme.Theme = null,
@@ -881,6 +887,46 @@ pub const App = struct {
         return &self.windows.items[self.current_win].cursor;
     }
 
+    /// Issue #10 demo: is the opt-in unified focus frame active? Off by
+    /// default; also silently off on terminals too small to pay for the
+    /// 1-row/2-column border without squeezing the reading surface.
+    ///
+    /// The 40-column boundary is EXCLUSIVE on purpose: 40 columns is the
+    /// existing compact-navigator fallback, and the demo must not make the
+    /// already-narrowest supported layout narrower. The same guard backs all
+    /// four insets, so layout, rendering and mouse targets switch together.
+    pub fn focusFrameActive(self: *App) bool {
+        if (!self.demo_focus_frame) return false;
+        const win = self.vx.window();
+        return win.width > 40 and win.height >= 10;
+    }
+
+    /// Reserved cells around the editor+tabs surface. All three are 0 unless
+    /// the demo is active; layout code adds them instead of branching.
+    pub fn frameTopInset(self: *App) u32 {
+        return if (self.focusFrameActive()) 1 else 0;
+    }
+
+    pub fn frameSideInset(self: *App) u32 {
+        return if (self.focusFrameActive()) 1 else 0;
+    }
+
+    pub fn frameBottomInset(self: *App) u32 {
+        return if (self.focusFrameActive()) 1 else 0;
+    }
+
+    /// True while the editor buffer owns the keyboard: the navigator, the AI
+    /// rail's prompt/thread list and a focused embedded terminal all take
+    /// precedence. Mirrors input.zig's dispatch order so the #10 demo frame
+    /// never claims focus while another surface would receive the next key;
+    /// input routing itself is unchanged.
+    pub fn editorOwnsKeys(self: *App) bool {
+        if (self.focus != .buffer) return false;
+        if (self.ai.rail_open and self.ai.focus != .editor) return false;
+        if (term.supported) if (self.term_pane) |pane| if (pane.focused) return false;
+        return true;
+    }
+
     /// The focused window's viewport top (first visible line).
     pub fn curViewTop(self: *App) *u32 {
         return &self.windows.items[self.current_win].view_top;
@@ -895,8 +941,9 @@ pub const App = struct {
         const win = self.vx.window();
         const height: u32 = win.height;
         if (height <= status_row_count) return 1;
-        const content_rows = height - status_row_count - self.tabBarRows(arena.allocator());
-        const layout = self.layoutWindows(arena.allocator(), self.contentTop(arena.allocator()), content_rows, self.contentCol(), self.editorAreaWidth()) catch return content_rows;
+        const a = arena.allocator();
+        const content_rows = self.editorContentRows(a);
+        const layout = self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), self.editorAreaWidth()) catch return content_rows;
         for (layout.leaves) |leaf| {
             if (leaf.win == self.current_win) return leaf.height;
         }
@@ -914,8 +961,9 @@ pub const App = struct {
         const win = self.vx.window();
         const height: u32 = win.height;
         if (height <= status_row_count) return @max(win.width -| gutter, 1);
-        const content_rows = height - status_row_count - self.tabBarRows(arena.allocator());
-        const layout = self.layoutWindows(arena.allocator(), self.contentTop(arena.allocator()), content_rows, self.contentCol(), self.editorAreaWidth()) catch return @max(self.editorAreaWidth() -| gutter, 1);
+        const a = arena.allocator();
+        const content_rows = self.editorContentRows(a);
+        const layout = self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), self.editorAreaWidth()) catch return @max(self.editorAreaWidth() -| gutter, 1);
         for (layout.leaves) |leaf| {
             if (leaf.win == self.current_win) return @max(leaf.width -| gutter, 1);
         }
@@ -1442,7 +1490,7 @@ pub const App = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const content_rows = height - status_row_count - self.tabBarRows(a);
+        const content_rows = self.editorContentRows(a);
         const layout = self.layoutWindows(a, self.contentTop(a), content_rows, self.contentCol(), self.editorAreaWidth()) catch return null;
         const leaves = layout.leaves;
         var cur_rect: ?LeafRect = null;
@@ -1539,6 +1587,7 @@ pub const App = struct {
             .env_map = init.environ_map,
             .theme = theme.withItalics(theme.default, !std.mem.eql(u8, init.environ_map.get("OZ_NO_ITALIC") orelse "", "1")),
             .italics_enabled = !std.mem.eql(u8, init.environ_map.get("OZ_NO_ITALIC") orelse "", "1"),
+            .demo_focus_frame = std.mem.eql(u8, init.environ_map.get("OZ_DEMO_FOCUS_FRAME") orelse "", "1"),
             .vx = vx,
             .tty = tty,
             .tty_buffer = tty_buffer,
@@ -2119,6 +2168,8 @@ pub const App = struct {
     pub const AgentTerminalSession = app_agent_terminal.Session;
     // ---- render → src/app/render.zig ----
     pub const tabBarRows = @import("app/render.zig").tabBarRows;
+    pub const editorContentRows = @import("app/render.zig").editorContentRows;
+    pub const drawEditorFocusFrame = @import("app/render.zig").drawEditorFocusFrame;
     pub const tabLayerCount = @import("app/render.zig").tabLayerCount;
     pub const contentTop = @import("app/render.zig").contentTop;
     pub const navigatorMode = @import("app/render.zig").navigatorMode;
