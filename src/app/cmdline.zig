@@ -12,6 +12,7 @@ const autil = @import("util.zig");
 // ---- command line (':') ----
 
 pub fn handleCommandKey(self: *App, key: vaxis.Key) !void {
+    if (self.pending_filetree_create != null) return @import("filetree.zig").filetreeCreateKey(self, key);
     // cancel
     if (key.codepoint == vaxis.Key.escape or (key.codepoint == 'c' and key.mods.ctrl)) {
         self.state.mode = .normal;

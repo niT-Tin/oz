@@ -27396,3 +27396,104 @@ test "file tree safety: Backspace changes only browsing root and persists" {
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
+
+test "file tree safety: a creates files and directories in a modal without overwriting" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var root_buf: [160]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/oz_navcreate_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const folder = try std.fs.path.join(alloc, &.{ root, "folder" });
+    defer alloc.free(folder);
+    try std.Io.Dir.cwd().createDirPath(io, folder);
+    try writeTestFile(io, root, "edit.txt", "KEEP_DOCUMENT\n");
+    const path = try std.fs.path.join(alloc, &.{ root, "edit.txt" });
+    defer alloc.free(path);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, null, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "KEEP_DOCUMENT", 8000);
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "folder", 8000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    // Bracketed paste belongs to the filename prompt, not the background.
+    try sess.send("\x1b[200~child.txt\x1b[201~\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    try gridWaitFor(&sess, &grid, "child.txt", 8000);
+    const child = try std.fs.path.join(alloc, &.{ folder, "child.txt" });
+    defer alloc.free(child);
+    _ = try std.Io.Dir.cwd().statFile(io, child, .{});
+    try writeTestFile(io, folder, "child.txt", "PRESERVE_EXISTING\n");
+    // The newly selected file creates siblings in its parent directory.
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    try sess.send("child.txt\r");
+    try gridWaitFor(&sess, &grid, "PathAlreadyExists", 8000);
+    try std.testing.expect(grid.contains("New file / directory"));
+    try sess.send("\x15../escape.txt\r");
+    try gridWaitFor(&sess, &grid, "InvalidName", 8000);
+    try mouseClickAt(&sess, 100, 3);
+    try std.testing.expect(grid.contains("New file / directory"));
+    // Error recovery keeps the input usable and allows UTF-8 + spaces.
+    try sess.send("\x15子 目录/\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    const made_dir = try std.fs.path.join(alloc, &.{ folder, "子 目录" });
+    defer alloc.free(made_dir);
+    var directory = try std.Io.Dir.cwd().openDir(io, made_dir, .{});
+    directory.close(io);
+    try gridWaitFor(&sess, &grid, "子 目录", 8000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    try sess.send("cancelled.txt\x1b");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    const cancelled = try std.fs.path.join(alloc, &.{ made_dir, "cancelled.txt" });
+    defer alloc.free(cancelled);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, cancelled, .{}));
+    try std.testing.expect(grid.contains("L1:C0"));
+    try std.testing.expect(grid.contains("NORMAL"));
+    const code = try sess.commandAndWaitExit(":wq\r");
+    try std.testing.expectEqual(@as(u32, 0), code);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1024));
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings("KEEP_DOCUMENT\n", bytes);
+    const kept = try std.Io.Dir.cwd().readFileAlloc(io, child, alloc, .limited(1024));
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("PRESERVE_EXISTING\n", kept);
+}
+
+test "file tree safety: creation works in an empty compact dashboard" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var root_buf: [160]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/oz_navempty_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var sess = try Session.spawnEnvSizeCwd(io, &.{oz_exe_path}, null, 24, 40, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 40);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "oz", 8000);
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "Files", 8000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    // Empty confirmation cancels without making a filesystem entry.
+    try sess.send("\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    try sess.send("文\x7fempty.txt\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    try gridWaitFor(&sess, &grid, "empty.txt", 8000);
+    const created = try std.fs.path.join(alloc, &.{ root, "empty.txt" });
+    defer alloc.free(created);
+    _ = try std.Io.Dir.cwd().statFile(io, created, .{});
+    const code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), code);
+}

@@ -377,6 +377,10 @@ pub fn filetreeKey(self: *App, key: vaxis.Key) !bool {
             try filetreeParent(self);
             return true;
         },
+        'a' => {
+            try beginFiletreeCreate(self);
+            return true;
+        },
         'g' => {
             if (was_g) {
                 self.filetree_sel = 0;
@@ -440,4 +444,159 @@ pub fn freeFiletreeNode(self: *App, node: *TreeNode) void {
     self.alloc.free(node.name);
     self.alloc.free(node.path);
     self.alloc.destroy(node);
+}
+
+// Filename collection uses command-mode input ownership, but has its own
+// float and filesystem action; it never enters buffer Insert or executes Ex.
+fn beginFiletreeCreate(self: *App) !void {
+    const root = self.filetree_root orelse return;
+    const node = self.filetreeNodeAt(self.filetree_sel) orelse root;
+    const parent = if (node.is_dir) node else node.parent orelse root;
+    const captured = try self.alloc.dupe(u8, parent.path);
+    if (self.pending_filetree_create) |old| self.alloc.free(old);
+    self.pending_filetree_create = captured;
+    self.filetree_pending_g = false;
+    self.cmdline.clearRetainingCapacity();
+    self.clearCmdCompleteNames();
+    self.cmd_hist_idx = null;
+    self.cmdline_kind = .ex;
+    self.state.mode = .command;
+}
+
+fn endFiletreeCreate(self: *App) void {
+    if (self.pending_filetree_create) |path| self.alloc.free(path);
+    self.pending_filetree_create = null;
+    self.cmdline.clearRetainingCapacity();
+    self.state.mode = .normal;
+}
+
+fn nodeWithPath(node: *TreeNode, path: []const u8) ?*TreeNode {
+    if (std.mem.eql(u8, node.path, path)) return node;
+    for (node.children.items) |child| if (nodeWithPath(child, path)) |found| return found;
+    return null;
+}
+
+/// Reload only the affected directory, preserving every unrelated subtree.
+fn refreshCreatedDirectory(self: *App, path: []const u8, leaf: []const u8) !void {
+    const root = self.filetree_root orelse return;
+    const node = nodeWithPath(root, path) orelse return;
+    var replacement = node.*;
+    replacement.children = .empty;
+    var transferred = false;
+    errdefer if (!transferred) {
+        for (replacement.children.items) |child| self.freeFiletreeNode(child);
+        replacement.children.deinit(self.alloc);
+    };
+    var dir = try std.Io.Dir.cwd().openDir(self.io, path, .{ .iterate = true });
+    defer dir.close(self.io);
+    try self.walkTreeLevel(dir, &replacement);
+    self.sortTreeChildren(&replacement);
+    for (node.children.items) |child| self.freeFiletreeNode(child);
+    node.children.deinit(self.alloc);
+    node.children = replacement.children;
+    transferred = true;
+    node.expanded = true;
+    for (node.children.items) |child| child.parent = node;
+    try self.rebuildFiletreeRows();
+    for (node.children.items) |child| {
+        if (std.mem.eql(u8, child.name, leaf)) {
+            if (self.rowIndexOf(child)) |index| self.filetree_sel = index;
+            break;
+        }
+    }
+}
+
+pub fn filetreeCreatePaste(self: *App, text: []const u8) !void {
+    if (!std.unicode.utf8ValidateSlice(text) or self.cmdline.items.len + text.len > 4096) {
+        try self.setMsg(try self.alloc.dupe(u8, "InvalidName"));
+        return;
+    }
+    for (text) |b| if (b < 0x20 or b == 0x7f) {
+        try self.setMsg(try self.alloc.dupe(u8, "InvalidName"));
+        return;
+    };
+    try self.cmdline.appendSlice(self.alloc, text);
+}
+
+pub fn filetreeCreateKey(self: *App, key: vaxis.Key) !void {
+    if (self.msg) |message| self.alloc.free(message);
+    self.msg = null;
+    if (key.codepoint == vaxis.Key.escape or (key.mods.ctrl and key.codepoint == 'c')) {
+        endFiletreeCreate(self);
+        return;
+    }
+    if (key.mods.ctrl and key.codepoint == 'u') {
+        self.cmdline.clearRetainingCapacity();
+        return;
+    }
+    if (key.codepoint == vaxis.Key.enter) {
+        if (self.cmdline.items.len == 0) {
+            endFiletreeCreate(self);
+            return;
+        }
+        const policy = @import("filetree_create.zig");
+        const path = self.pending_filetree_create orelse return;
+        policy.create(self.io, path, self.cmdline.items) catch |err| {
+            try self.setMsg(try std.fmt.allocPrint(self.alloc, "{s} · enter one name, / for directory", .{@errorName(err)}));
+            return;
+        };
+        const name = try policy.parseName(self.cmdline.items);
+        refreshCreatedDirectory(self, path, name.leaf) catch |err| {
+            endFiletreeCreate(self);
+            try self.setMsg(try std.fmt.allocPrint(self.alloc, "Created; Files refresh: {s}", .{@errorName(err)}));
+            return;
+        };
+        endFiletreeCreate(self);
+        return;
+    }
+    if (key.codepoint == vaxis.Key.backspace) {
+        if (self.cmdline.items.len > 0) {
+            var last = self.cmdline.items.len - 1;
+            while (last > 0 and (self.cmdline.items[last] & 0xC0) == 0x80) last -= 1;
+            self.cmdline.shrinkRetainingCapacity(last);
+        }
+        return;
+    }
+    if (key.mods.ctrl or key.mods.alt or key.mods.super) return;
+    if (key.text) |text| try filetreeCreatePaste(self, text);
+}
+
+pub fn drawFiletreeCreate(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
+    const path = self.pending_filetree_create orelse return;
+    const width: u16 = @min(win.width -| 2, 64);
+    const height: u16 = 5;
+    if (width < 6 or win.height < height) return;
+    const x = (win.width - width) / 2;
+    const y = (win.height - height) / 2;
+    const inner = width - 4;
+    const bg: vaxis.Color = .{ .rgb = self.theme.bg_float };
+    const outer = win.child(.{ .x_off = @intCast(x), .y_off = @intCast(y), .width = width, .height = height });
+    outer.fill(.{ .style = .{ .bg = bg } });
+    const border = @import("chrome.zig").panelBorderStyle(self.theme, true, bg);
+    var col: u16 = 0;
+    while (col < width) : (col += 1) {
+        outer.writeCell(col, 0, .{ .char = .{ .grapheme = if (col == 0) "╭" else if (col == width - 1) "╮" else "─", .width = 1 }, .style = border });
+        outer.writeCell(col, height - 1, .{ .char = .{ .grapheme = if (col == 0) "╰" else if (col == width - 1) "╯" else "─", .width = 1 }, .style = border });
+    }
+    var row: u16 = 1;
+    while (row + 1 < height) : (row += 1) {
+        outer.writeCell(0, row, .{ .char = .{ .grapheme = "│", .width = 1 }, .style = border });
+        outer.writeCell(width - 1, row, .{ .char = .{ .grapheme = "│", .width = 1 }, .style = border });
+    }
+    const autil = @import("util.zig");
+    const title = autil.cellFitPrefix(win, " New file / directory ", width - 2).slice;
+    _ = outer.print(&.{.{ .text = title, .style = border }}, .{ .row_offset = 0, .col_offset = 1, .wrap = .none });
+    const context = try std.fmt.allocPrint(a, "In: {s}", .{path});
+    _ = outer.print(&.{.{ .text = autil.cellFitPrefix(win, context, inner).slice, .style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = bg } }}, .{ .row_offset = 1, .col_offset = 2, .wrap = .none });
+    var start: usize = 0;
+    while (start < self.cmdline.items.len and self.textWidth(win, self.cmdline.items[start..]) >= inner) {
+        start += std.unicode.utf8ByteSequenceLength(self.cmdline.items[start]) catch 1;
+    }
+    const input = self.cmdline.items[start..];
+    _ = outer.print(&.{.{ .text = input, .style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = bg } }}, .{ .row_offset = 2, .col_offset = 2, .wrap = .none });
+    const hint = self.msg orelse "Enter create · / directory · Esc cancel";
+    _ = outer.print(&.{.{ .text = autil.cellFitPrefix(win, hint, inner).slice, .style = .{ .fg = .{ .rgb = if (self.msg != null) self.theme.diag_error else self.theme.fg_dim }, .bg = bg } }}, .{ .row_offset = 3, .col_offset = 2, .wrap = .none });
+    self.vx.screen.cursor = .{ .row = y + 2, .col = @intCast(x + 2 + self.textWidth(win, input)) };
+    self.vx.screen.cursor_vis = true;
+    self.vx.screen.cursor_shape = .beam;
 }
