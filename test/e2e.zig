@@ -11203,37 +11203,25 @@ test "lsp: navigation — K hover, gd jump, gr list, gs signature" {
     }
     try std.testing.expect(grid.contains("second line"));
     try std.testing.expect(grid.contains("third line"));
-    // The panel must be a solid theme-colored block: the row holding
-    // "second line" (short text, 11 chars) has its padding cells past the
-    // text filled with bg_float (0x223249), not the editor background —
-    // the "edge not covered by the theme" bug. Check the region between the
-    // two │ borders of that hover row.
+    // The hover fits its actual contents instead of reserving a fixed 60
+    // columns. Inspect the real cell borders and every background cell,
+    // retaining a short-row padding assertion rather than weakening to text.
+    try gridSettle(&sess, &grid, 100, 3000);
     {
-        var r: usize = 0;
-        var found_row: ?usize = null;
-        while (r < grid.rows) : (r += 1) {
-            if (std.mem.indexOf(u8, grid.rowText(r), "second line") != null) {
-                found_row = r;
-                break;
-            }
-        }
-        if (found_row) |fr| {
-            // The hover row is "│" + 60 content cells + "│". Locate the left
-            // border: rowText is ASCII up to it (gutter digits), so its byte
-            // offset is the box's first cell.
-            const row_text = grid.rowText(fr);
-            const left = std.mem.indexOf(u8, row_text, "│") orelse {
-                std.debug.print("hover row has no left border:\n", .{});
-                grid.dump();
-                return error.TestUnexpectedResult;
-            };
-            // Every cell of the box (borders + text + padding after a short
-            // line) must be bg_float — no editor-background gap at the edge.
-            const hline_fg: u32 = packRgb(0x22, 0x32, 0x49);
-            var c: usize = left;
-            while (c < left + 62) : (c += 1) {
-                if (grid.bg_buf[fr * grid.cols + c] != hline_fg) {
-                    std.debug.print("hover row cell {d} not bg_float (bg={x})\n", .{ c, grid.bg_buf[fr * grid.cols + c] });
+        const row = findRow(&grid, "second line") orelse return error.TestUnexpectedResult;
+        const left = glyphCol(&grid, row, "│", 0) orelse return error.TestUnexpectedResult;
+        const right = glyphCol(&grid, row, "│", left + 1) orelse return error.TestUnexpectedResult;
+        const text_col = aiCellIndexOf(&grid, row, "second line") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(text_col > left and text_col + "second line".len < right);
+        var top = row;
+        while (top > 0 and !(cellStartsWith(&grid, top, left, "╭") and cellStartsWith(&grid, top, right, "╮"))) top -= 1;
+        const bottom = try assertPopupBoxAt(&grid, top, left, right);
+        try std.testing.expect(top < row and row < bottom);
+        const float_bg = packRgb(0x22, 0x32, 0x49);
+        for (top..bottom + 1) |r| {
+            for (left..right + 1) |c| {
+                if (grid.bg_buf[r * grid.cols + c] != float_bg) {
+                    std.debug.print("hover box cell ({d},{d}) not bg_float (bg={x})\n", .{ r, c, grid.bg_buf[r * grid.cols + c] });
                     grid.dump();
                     return error.TestUnexpectedResult;
                 }
@@ -26535,7 +26523,7 @@ test "style observation: scope emphasis is opt-out and never paints virtual text
         defer f.close(io);
         try f.writeStreamingAll(io, "fn f() void {\n    if (x) {\n        y();\n    }\n}\n");
     }
-    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{ "OZ_NO_SCOPE_UNDERLINE=1" });
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{"OZ_NO_SCOPE_UNDERLINE=1"});
     defer sess.close();
     defer killPid(sess.pid);
     var grid = try Grid.initSizedCols(a, 24, 80);
@@ -29498,7 +29486,6 @@ test "file tree safety: creation works in an empty compact dashboard" {
     try std.testing.expectEqual(@as(u32, 0), code);
 }
 
-
 test "integration repair: Normal o and undo preserve closed folds and inlay anchors" {
     const io = std.testing.io;
     const a = std.testing.allocator;
@@ -30205,4 +30192,310 @@ test "file tree safety: explicitly created hidden entries stay visible across re
     const after = try std.fs.path.join(a, &.{ root, ".config", "after.txt" });
     defer a.free(after);
     _ = try std.Io.Dir.cwd().statFile(io, after, .{});
+}
+
+test "hover documentation: body after a long signature and paging preserve cursor" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var fx = try startCompletionMock(io, a, "hover_long", "const document_anchor = 1;\n", 30, 120);
+    defer fx.deinit(io, a);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send("K");
+    try gridWaitFor(&fx.sess, &grid, "Opens a file.", 5000);
+    try gridWaitFor(&fx.sess, &grid, "Go to OpenFlags", 3000);
+    try gridWaitFor(&fx.sess, &grid, "^F/^B", 3000);
+    try gridSettle(&fx.sess, &grid, 100, 3000);
+    const cursor_row = grid.row;
+    const cursor_col = grid.col;
+    var pages: usize = 0;
+    while (!grid.contains("HOVER_LAST_DOC") and pages < 40) : (pages += 1) {
+        try fx.sess.send("\x06");
+        try gridSettle(&fx.sess, &grid, 50, 1000);
+    }
+    try std.testing.expect(grid.contains("HOVER_LAST_DOC"));
+    try std.testing.expect(!grid.contains("HOVER_FIRST_DOC"));
+    try std.testing.expect(grid.contains("nested_doc_value"));
+    var keys: [60]u8 = undefined;
+    @memset(&keys, 0x06);
+    try fx.sess.send(&keys);
+    try gridSettle(&fx.sess, &grid, 100, 3000);
+    try std.testing.expect(grid.contains("HOVER_LAST_DOC"));
+    try std.testing.expectEqual(cursor_row, grid.row);
+    try std.testing.expectEqual(cursor_col, grid.col);
+    @memset(&keys, 0x02);
+    try fx.sess.send(&keys);
+    try gridWaitFor(&fx.sess, &grid, "HOVER_FIRST_DOC", 5000);
+    try std.testing.expectEqual(cursor_row, grid.row);
+    try std.testing.expectEqual(cursor_col, grid.col);
+    try fx.sess.send("l");
+    try gridWaitGone(&fx.sess, &grid, "HOVER_FIRST_DOC", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+}
+fn hoverDocPageToLast(sess: *Session, grid: *Grid) !void {
+    var pages: usize = 0;
+    while (!grid.contains("HOVER_LAST_DOC") and pages < 40) : (pages += 1) {
+        try sess.send("\x06");
+        try gridSettle(sess, grid, 50, 1000);
+    }
+    try std.testing.expect(grid.contains("HOVER_LAST_DOC"));
+}
+
+fn expectHoverInside(grid: *Grid, minimum_col: usize, maximum_col: usize) !void {
+    for (0..grid.rows) |row| {
+        const left = glyphCol(grid, row, "╭", 0) orelse continue;
+        const right = glyphCol(grid, row, "╮", left + 1) orelse continue;
+        if (!(left >= minimum_col and right < maximum_col)) {
+            std.debug.print("hover bounds left={d} right={d} expected=[{d},{d}) last_grid_col={d}\n", .{ left, right, minimum_col, maximum_col, grid.col });
+            grid.dump();
+            return error.TestUnexpectedResult;
+        }
+        const bottom = try assertPopupBoxAt(grid, row, left, right);
+        try std.testing.expect(bottom < grid.rows - 1);
+        return;
+    }
+    grid.dump();
+    return error.TestUnexpectedResult;
+}
+
+test "hover documentation: narrow split and resize keep Unicode and all borders inside the owner" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var fx = try startCompletionMock(io, a, "hover_long", "const narrow_anchor = 1;\n", 30, 120);
+    defer fx.deinit(io, a);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send(":vs\r\x17l");
+    try gridSettle(&fx.sess, &grid, 100, 3000);
+    const split = glyphCol(&grid, 2, "│", 0) orelse return error.TestUnexpectedResult;
+    try fx.sess.send("K");
+    try gridWaitFor(&fx.sess, &grid, "Opens a file.", 5000);
+    try gridWaitFor(&fx.sess, &grid, "中文", 5000);
+    try gridSettle(&fx.sess, &grid, 100, 3000);
+    // Vertical separator is painted at the right leaf's own first gutter
+    // column; LeafRect.col includes that cell (the float may use its pane).
+    try expectHoverInside(&grid, split, 120);
+    try hoverDocPageToLast(&fx.sess, &grid);
+    for ([_]u16{ 80, 120 }) |cols| {
+        const size = Winsize{ .ws_row = 30, .ws_col = cols, .ws_xpixel = cols * 10, .ws_ypixel = 600 };
+        _ = linux.ioctl(fx.sess.pty.master, TIOCSWINSZ, @intFromPtr(&size));
+        grid.deinit(a);
+        grid = try Grid.initSizedCols(a, 30, cols);
+        try gridWaitFor(&fx.sess, &grid, "^F/^B", 5000);
+        try gridSettle(&fx.sess, &grid, 100, 3000);
+        const divider = glyphCol(&grid, 2, "│", 0) orelse return error.TestUnexpectedResult;
+        try expectHoverInside(&grid, divider, cols);
+        try frame.expectNoHorizontalOverflow(&grid, cols);
+        try hoverDocPageToLast(&fx.sess, &grid);
+    }
+    // The source cursor is at BOL; h would be a no-op and correctly keep
+    // the docs alive. Prove a real source-column change before dismissal.
+    try fx.sess.send("l");
+    try gridWaitFor(&fx.sess, &grid, "line 1/2 col 1", 3000);
+    try gridWaitGone(&fx.sess, &grid, "HOVER_LAST_DOC", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "hover documentation: long plaintext remains literal and scrollable" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "plain.zig", "const plain_anchor = 1;\n");
+    const path = try std.fmt.allocPrint(a, "{s}/plain.zig", .{root});
+    defer a.free(path);
+    const mock = try erAbs(io, a, "zig-out/bin/mock_lsp");
+    defer a.free(mock);
+    const env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{mock});
+    defer a.free(env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{ env, "OZ_MOCK_SCRIPT=hover_long", "OZ_HOVER_FORCE_PLAINTEXT=1" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("K");
+    try gridWaitFor(&sess, &grid, "HOVER_FIRST_DOC", 5000);
+    try std.testing.expect(grid.contains("```zig"));
+    const row = findRow(&grid, "pub fn openFile") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!rowContainsFg(&grid, row, "pub", packRgb(0x95, 0x7F, 0xB8)));
+    try hoverDocPageToLast(&sess, &grid);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "hover documentation: an unclosed fenced block reports the actual row cap" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var fx = try startCompletionMock(io, a, "hover_unclosed_cap", "const capped_anchor = 1;\n", 30, 120);
+    defer fx.deinit(io, a);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send("K");
+    try gridWaitFor(&fx.sess, &grid, "cap_0", 10000);
+    var pages: [200]u8 = undefined;
+    @memset(&pages, 0x06);
+    try fx.sess.send(&pages);
+    try gridWaitFor(&fx.sess, &grid, "documentation truncated", 10000);
+    try std.testing.expect(!grid.contains("UNREACHABLE_AFTER_CAP"));
+    try gridSettle(&fx.sess, &grid, 100, 3000);
+    try expectHoverInside(&grid, 0, 120);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+}
+
+const hoverLatePeer =
+    \\#!/usr/bin/env python3
+    \\import json
+    \\import os
+    \\from pathlib import Path
+    \\import select
+    \\buf = bytearray()
+    \\held = []
+    \\count = 0
+    \\
+    \\def reply(rid, value):
+    \\    body = json.dumps({'jsonrpc': '2.0', 'id': rid, 'result': value}).encode()
+    \\    data = ('Content-Length: %d\r\n\r\n' % len(body)).encode() + body
+    \\    while data:
+    \\        data = data[os.write(1, data):]
+    \\
+    \\while True:
+    \\    if held and Path('release-hover').exists():
+    \\        for rid in held:
+    \\            reply(rid, {'contents': {'kind': 'markdown', 'value': '```zig\nconst late_a = 1;\n```\nLATE_HOVER_A'}})
+    \\        held.clear()
+    \\        Path('hover-delivered-A').write_text('done')
+    \\    if not select.select([0], [], [], 0.02)[0]:
+    \\        continue
+    \\    chunk = os.read(0, 65536)
+    \\    if not chunk:
+    \\        break
+    \\    buf.extend(chunk)
+    \\    while True:
+    \\        split = buf.find(b'\r\n\r\n')
+    \\        if split < 0:
+    \\            break
+    \\        size = int(bytes(buf[:split]).split(b':', 1)[1])
+    \\        if len(buf) < split + 4 + size:
+    \\            break
+    \\        msg = json.loads(buf[split+4:split+4+size])
+    \\        del buf[:split+4+size]
+    \\        rid = msg.get('id')
+    \\        method = msg.get('method')
+    \\        if method == 'initialize':
+    \\            reply(rid, {'capabilities': {'textDocumentSync': 2, 'hoverProvider': True}})
+    \\        elif method == 'textDocument/hover':
+    \\            count += 1
+    \\            if count == 1:
+    \\                held.append(rid)
+    \\                Path('hover-received-A').write_text('done')
+    \\            else:
+    \\                reply(rid, {'contents': {'kind': 'markdown', 'value': '```zig\nconst current_b = 2;\n```\nCURRENT_HOVER_B'}})
+    \\        elif method == 'exit':
+    \\            raise SystemExit
+    \\        elif rid is not None:
+    \\            reply(rid, None)
+;
+
+test "hover documentation: late A cannot replace B or revive after movement and Insert reentry" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const original = "const anchor_a = 1;\nconst anchor_b = 2;\n";
+    try aiWriteFile(io, root, "hover.zig", original);
+    try aiWriteFile(io, root, "hover_peer.py", hoverLatePeer);
+    const path = try std.fmt.allocPrint(a, "{s}/hover.zig", .{root});
+    defer a.free(path);
+    const peer = try std.fmt.allocPrint(a, "{s}/hover_peer.py", .{root});
+    defer a.free(peer);
+    {
+        const file = try std.Io.Dir.cwd().openFile(io, peer, .{});
+        defer file.close(io);
+        try file.setPermissions(io, std.Io.File.Permissions.fromMode(0o755));
+    }
+    const env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{peer});
+    defer a.free(env);
+    const oz = try erAbs(io, a, oz_exe_path);
+    defer a.free(oz);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz, path }, &.{env}, 30, 100, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 100);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("K");
+    try waitBarrierMarker(io, a, root, "hover-received-A", 5000);
+    try sess.send("lK");
+    try gridWaitFor(&sess, &grid, "CURRENT_HOVER_B", 5000);
+    try aiWriteFile(io, root, "release-hover", "go");
+    try waitBarrierMarker(io, a, root, "hover-delivered-A", 5000);
+    try gridSettle(&sess, &grid, 100, 3000);
+    try std.testing.expect(grid.contains("CURRENT_HOVER_B"));
+    try std.testing.expect(!grid.contains("LATE_HOVER_A"));
+    try sess.send("j");
+    try gridWaitGone(&sess, &grid, "CURRENT_HOVER_B", 3000);
+    try sess.send("K");
+    try gridWaitFor(&sess, &grid, "CURRENT_HOVER_B", 5000);
+    try sess.send("i");
+    try gridWaitFor(&sess, &grid, "[INSERT]", 3000);
+    try gridWaitGone(&sess, &grid, "CURRENT_HOVER_B", 3000);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+    try sess.send("K");
+    try gridWaitFor(&sess, &grid, "CURRENT_HOVER_B", 5000);
+    try std.testing.expect(!grid.contains("LATE_HOVER_A"));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const bytes = try erRead(io, a, path);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings(original, bytes);
+}
+
+test "hover documentation: real ZLS includes declaration comments and reaches the final paragraph" {
+    const zls_path = @import("e2e_options").real_zls orelse return error.SkipZigTest;
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var source = std.ArrayList(u8).empty;
+    defer source.deinit(a);
+    try source.appendSlice(a, "/// Opens a file. REAL_HOVER_DOC_OPEN\n");
+    for (0..32) |i| {
+        const line = try std.fmt.allocPrint(a, "/// Documentation paragraph {d} retains the complete description.\n", .{i});
+        defer a.free(line);
+        try source.appendSlice(a, line);
+    }
+    try source.appendSlice(a, "/// REAL_HOVER_DOC_LAST\npub fn documentedOpenFile(path: []const u8) void { _ = path; }\n");
+    for (0..80) |_| try source.appendSlice(a, "// keep declaration comments outside the source viewport\n");
+    try source.appendSlice(a, "pub fn main() void { documentedOpenFile(\"hello\"); }\n");
+    try aiWriteFile(io, root, "real_hover.zig", source.items);
+    const path = try std.fmt.allocPrint(a, "{s}/real_hover.zig", .{root});
+    defer a.free(path);
+    const env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{zls_path});
+    defer a.free(env);
+    const oz = try erAbs(io, a, oz_exe_path);
+    defer a.free(oz);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz, path }, &.{env}, 30, 100, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 100);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 10000);
+    try sess.send("G");
+    try gridWaitFor(&sess, &grid, "pub fn main", 5000);
+    try std.testing.expect(!grid.contains("REAL_HOVER_DOC_OPEN"));
+    try sess.send("0/documentedOpenFile\rK");
+    try gridWaitFor(&sess, &grid, "REAL_HOVER_DOC_OPEN", 12000);
+    var pages: usize = 0;
+    while (!grid.contains("REAL_HOVER_DOC_LAST") and pages < 20) : (pages += 1) {
+        try sess.send("\x06");
+        try gridSettle(&sess, &grid, 50, 1000);
+    }
+    try std.testing.expect(grid.contains("REAL_HOVER_DOC_LAST"));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
 }

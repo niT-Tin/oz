@@ -587,6 +587,13 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
         return;
     }
 
+    // Explicit K documentation owns page scrolling while it is visible.
+    // Signature hints and ordinary editor scrolling keep their usual keys.
+    if (key.mods.ctrl and !key.mods.alt and !key.mods.super and
+        (key.codepoint == 'f' or key.codepoint == 'b'))
+    {
+        if (self.scrollHover(if (key.codepoint == 'f') 1 else -1)) return;
+    }
     const keymap: editor.KeyEvent.KeyMap = switch (self.state.mode) {
         .normal => editor.Keymaps.normal,
         .insert => editor.Keymaps.insert,

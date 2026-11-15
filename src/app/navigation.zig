@@ -80,6 +80,10 @@ pub fn invalidatePassiveHints(self: *App) void {
     if (self.nav_hover_text) |t| self.alloc.free(t);
     self.nav_hover_text = null;
     self.nav_hover_markdown = false;
+    self.nav_hover_action = .none;
+    self.nav_hover_scroll = 0;
+    self.nav_hover_visible_rows = 0;
+    self.nav_hover_scroll_max = 0;
 }
 
 /// Renderer-side final defence: the displayed text is tied to the context
@@ -88,6 +92,19 @@ pub fn invalidatePassiveHints(self: *App) void {
 pub fn navHoverAlive(self: *App) bool {
     const ctx = self.nav_hover_ctx orelse return false;
     return ctx.matches(self.passiveContext());
+}
+
+/// Page only the visible explicit K documentation. Returning true also at
+/// an endpoint prevents Ctrl-f/Ctrl-b from unexpectedly moving the editor.
+pub fn scrollHover(self: *App, direction: i32) bool {
+    if (self.state.mode != .normal or self.nav_hover_action != .hover or
+        self.nav_hover_text == null or !self.navHoverAlive() or self.nav_hover_visible_rows == 0) return false;
+    const page = @max(self.nav_hover_visible_rows -| 1, 1);
+    self.nav_hover_scroll = if (direction > 0)
+        @min(self.nav_hover_scroll +| page, self.nav_hover_scroll_max)
+    else
+        self.nav_hover_scroll -| page;
+    return true;
 }
 
 /// Send a textDocument request for the cursor position. Hover/signature use
@@ -153,6 +170,10 @@ pub fn processPassiveNav(self: *App) bool {
     }
     const captured = ctx orelse return true;
     if (!captured.matches(self.passiveContext())) return true;
+    self.nav_hover_action = action;
+    self.nav_hover_scroll = 0;
+    self.nav_hover_visible_rows = 0;
+    self.nav_hover_scroll_max = 0;
     switch (action) {
         .hover => {
             // Hover keeps the server's markup kind: Markdown (fenced code,
