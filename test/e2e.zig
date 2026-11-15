@@ -4394,6 +4394,126 @@ test "multi-buffer: :e opens a tab, gt/:bn switch, :bd closes" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+test "buffers: switching restores each window's cursor and viewport" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var dir_buf: [128:0]u8 = undefined;
+    const dir = try bufPrintZ(&dir_buf, "/tmp/oz_e2e_{d}_{d}view", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().createDir(io, dir, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var a_buf: [160:0]u8 = undefined;
+    const a = try bufPrintZ(&a_buf, "{s}/long.txt", .{dir});
+    var b_buf: [160:0]u8 = undefined;
+    const b = try bufPrintZ(&b_buf, "{s}/short.txt", .{dir});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, a, .{ .truncate = true });
+        defer f.close(io);
+        var text: [512]u8 = undefined;
+        var used: usize = 0;
+        var i: usize = 1;
+        while (i <= 60) : (i += 1) {
+            used += (try std.fmt.bufPrint(text[used..], "L{d:0>2}\n", .{i})).len;
+        }
+        try f.writeStreamingAll(io, text[0..used]);
+    }
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, b, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "BBB\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, a });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "L01", 5000);
+
+    // Line 20 with the view pinned to it: cursor and viewport are now both
+    // distinguishable from the startup top-of-file position.
+    try sess.send("19jzt");
+    try gridWaitFor(&sess, &grid, "line 20/61", 5000);
+    try gridWaitGone(&sess, &grid, "L01", 5000);
+    try std.testing.expect(rowContains(&grid, 2, "L20"));
+
+    // :e opens the short buffer; :bp returns and must restore BOTH the
+    // cursor line and the viewport top (L01 stays out of sight).
+    var cmd_buf: [320]u8 = undefined;
+    const open_b = try std.fmt.bufPrint(&cmd_buf, ":e {s}\r", .{b});
+    try sess.send(open_b);
+    try gridWaitFor(&sess, &grid, "line 1/2", 5000);
+    try gridWaitFor(&sess, &grid, "BBB", 5000);
+    try sess.send(":bp\r");
+    try gridWaitFor(&sess, &grid, "line 20/61", 5000);
+    try std.testing.expect(!grid.contains("L01"));
+    try std.testing.expect(rowContains(&grid, 2, "L20"));
+
+    // :bn / :bp round-trip: the short buffer's own position is remembered
+    // too (no stale cursor from the long buffer leaking in).
+    try sess.send(":bn\r");
+    try gridWaitFor(&sess, &grid, "line 1/2", 5000);
+    try sess.send(":bp\r");
+    try gridWaitFor(&sess, &grid, "line 20/61", 5000);
+    try std.testing.expect(rowContains(&grid, 2, "L20"));
+
+    // gt cycles through the buffer list and shares the same switch path.
+    try sess.send("gt");
+    try gridWaitFor(&sess, &grid, "BBB", 5000);
+    try sess.send("gt");
+    try gridWaitFor(&sess, &grid, "line 20/61", 5000);
+    try std.testing.expect(!grid.contains("L01"));
+    try std.testing.expect(rowContains(&grid, 2, "L20"));
+
+    // Two splits on the same buffer keep independent positions: the right
+    // window moves to line 40, the left changes buffer and comes back.
+    try sess.send(":vs\r");
+    var waited: i32 = 0;
+    while (true) {
+        const row = grid.rowText(2);
+        const first = std.mem.indexOf(u8, row, "L20");
+        const second = if (first) |f| std.mem.indexOfPos(u8, row, f + 1, "L20") else null;
+        if (first != null and second != null) break;
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) {
+            waited += 100;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(2), "L20") != null);
+    // focused right window (copied at line 20) moves to line 40 and pins it
+    // to the top
+    try sess.send("20jzt");
+    try gridWaitFor(&sess, &grid, "line 40/61", 5000);
+    try std.testing.expect(rowContains(&grid, 2, "L40"));
+    // left window (line 20) switches away and back; the right window's
+    // position must not be disturbed
+    try sess.send("\x17h");
+    try gridWaitFor(&sess, &grid, "line 20/61", 5000);
+    try sess.send(open_b);
+    try gridWaitFor(&sess, &grid, "line 1/2", 5000);
+    try sess.send(":bp\r");
+    try gridWaitFor(&sess, &grid, "line 20/61", 5000);
+    try std.testing.expect(rowContains(&grid, 2, "L20"));
+    try std.testing.expect(rowContains(&grid, 2, "L40"));
+    // back to the right window: still line 40 with L40 at the top
+    try sess.send("\x17l");
+    try gridWaitFor(&sess, &grid, "line 40/61", 5000);
+    try std.testing.expect(rowContains(&grid, 2, "L40"));
+
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    if (exit_code != 0) std.debug.print("view-state e2e exit {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
 test "buffer picker: <leader>sb lists open buffers, Enter switches" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
