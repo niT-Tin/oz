@@ -25424,6 +25424,19 @@ fn waitBarrierMarker(io: Io, a: std.mem.Allocator, root: []const u8, name: []con
     return error.TestUnexpectedResult;
 }
 
+/// Barrier for the held-signature subcases below: the LSP barrier fires as
+/// soon as the app sends the request, which can be before the app has
+/// rendered the Insert frame for the "A(" that triggered it. Without this
+/// wait the grid can still show the stale `[NORMAL]` from before "A(", so
+/// the post-Escape `gridWaitFor("[NORMAL]")` returns immediately. The
+/// following `:` then arrives while Escape is still unconsumed and vaxis
+/// parses the pair as Alt+`:` -- the app stays in Insert and the command is
+/// typed into the buffer (the CI failure typed `:e other.zig` into the
+/// document). Seeing the Insert frame first makes the Normal wait meaningful.
+fn awaitInsertFrame(sess: *Session, grid: *Grid) !void {
+    try gridWaitFor(sess, grid, "[INSERT]", 3000);
+}
+
 test "signature lifecycle: stale signature is gone before the new completion" {
     const io = std.testing.io;
     const a = std.testing.allocator;
@@ -25531,6 +25544,7 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("x");
         try releaseSignatureA(io, fx.root);
         try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
@@ -25549,6 +25563,7 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("\x1b");
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try releaseSignatureA(io, fx.root);
@@ -25567,6 +25582,7 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("\x1b");
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try fx.sess.send(":e other.zig\r");
@@ -25586,6 +25602,7 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try sendMouseButton(&fx.sess, 8, 4, 0, false);
         try sendMouseButton(&fx.sess, 8, 4, 0, true);
         try gridDrain(&fx.sess, &grid, 200);
@@ -25593,7 +25610,11 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
         try gridDrain(&fx.sess, &grid, 300);
         try std.testing.expect(!grid.contains("SIG_A"));
-        try fx.sess.send("\x1b");
+        // The click itself finalizes the Insert session
+        // (prepareMouseAction exits insert), so the visible [NORMAL] frame is
+        // the click's barrier. Sending a redundant Escape here would race the
+        // following ':' and pair with it as Alt+':' if the app has not
+        // consumed it yet, leaving the quit command untyped.
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
     }
@@ -25606,6 +25627,7 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("\x1b");
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try fx.sess.send(":vs\r");
@@ -25878,6 +25900,7 @@ test "signature lifecycle: delayed response released in the same Insert context"
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("\x1b");
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try fx.sess.send("i");
