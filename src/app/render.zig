@@ -5435,7 +5435,10 @@ pub fn run(self: *App) !void {
                     // Left press = click, wheel = scroll. Motion/drag/
                     // release/unbound buttons return false, so moving the
                     // mouse cannot cause renders or steal terminal selection.
-                    if (try self.handleMouse(m)) handled = true;
+                    if (try self.handleMouse(m)) {
+                        self.prev_insert_key = null;
+                        handled = true;
+                    }
                 },
                 .key_press => |key| {
                     handled = true;
@@ -5456,6 +5459,7 @@ pub fn run(self: *App) !void {
                 },
                 .paste_start => {
                     handled = true;
+                    self.prev_insert_key = null;
                     self.pasting = true;
                     self.paste_buf.clearRetainingCapacity();
                 },

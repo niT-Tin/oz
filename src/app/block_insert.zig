@@ -175,6 +175,8 @@ pub fn placeBlockCursors(self: *App, rect: BlockRect, append: bool) !void {
 /// cursor (one history.record per cursor, right-to-left so the earlier
 /// positions stay valid) and the whole session lives in one undo group.
 pub fn handleMcInsertKey(self: *App, key: vaxis.Key) !void {
+    const prev_insert_key = self.prev_insert_key;
+    self.prev_insert_key = null;
     // Arrow keys move the main cursor without leaving insert.
     if (key.codepoint == vaxis.Key.left or key.codepoint == vaxis.Key.right or
         key.codepoint == vaxis.Key.up or key.codepoint == vaxis.Key.down)
@@ -196,10 +198,8 @@ pub fn handleMcInsertKey(self: *App, key: vaxis.Key) !void {
         return;
     }
     // jk → drop the just-typed 'j' at every cursor, then exit
-    if (self.prev_insert_key) |p| {
-        if (p.codepoint == 'j' and key.codepoint == 'k' and
-            !key.mods.ctrl and !key.mods.alt and !key.mods.super)
-        {
+    if (prev_insert_key) |p| {
+        if (p.codepoint == 'j' and @import("input.zig").isInsertChordChar(key, 'k')) {
             var deleted_any = false;
             var i = self.mc.cursors.items.len;
             while (i > 0) {
@@ -236,9 +236,9 @@ pub fn handleMcInsertKey(self: *App, key: vaxis.Key) !void {
         try self.mcDeleteWordBefore();
         return;
     }
-    self.prev_insert_key = key;
     if (key.text) |text| {
         try self.mcInsertText(text);
+        if (@import("input.zig").isInsertChordChar(key, 'j')) self.prev_insert_key = .{ .codepoint = 'j' };
     }
 }
 
@@ -332,6 +332,8 @@ pub fn exitMcInsert(self: *App) void {
     self.insert_session +%= 1;
     self.invalidatePassiveHints();
     self.mcSyncCursor();
+    // Same insertion-point -> Normal-character conversion as exitInsert.
+    editor.Motion.apply(&self.cur().pt, .left, .{}, self.curCursor(), 1);
     self.mc.clear();
     self.mc_active = false;
     self.state.mode = .normal;

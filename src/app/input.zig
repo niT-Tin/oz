@@ -16,7 +16,20 @@ const isWordByte = App.isWordByte;
 
 // ---- input ----
 
+/// Chords follow the text actually typed. Kitty may report raw 'k' with
+/// shifted/CapsLock text "K"; keybinding matching also ignores lock flags.
+/// Read text only for the current event, never from a saved borrowed Key.
+pub fn isInsertChordChar(key: vaxis.Key, ch: u8) bool {
+    const text = key.text orelse return false;
+    return text.len == 1 and text[0] == ch and
+        !key.mods.ctrl and !key.mods.alt and !key.mods.super and
+        !key.mods.hyper and !key.mods.meta;
+}
+
 pub fn handleKey(self: *App, key: vaxis.Key) !void {
+    // Modal UI routes below may consume keys before Insert dispatch. They
+    // also interrupt the chord, even when focus later returns to the editor.
+    if (!isInsertChordChar(key, 'k')) self.prev_insert_key = null;
     if (key.codepoint != 'g') self.filetree_pending_g = false;
     // Observe the completion context BEFORE dispatch. Any key that changes
     // it (movement, Esc/re-enter, typing) bumps the epoch so a response
@@ -339,6 +352,11 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
             try self.handleMcInsertKey(key);
             return;
         }
+        // Only consecutive text keys form the jk chord. A cursor move,
+        // deletion, completion command, etc. must not leave an old j armed:
+        // otherwise k can erase an unrelated existing j at the new cursor.
+        const prev_insert_key = self.prev_insert_key;
+        self.prev_insert_key = null;
         // ---- insert-mode completion (Ctrl+n and auto-suggest) ----
         // Esc always leaves insert, closing an open menu as part of the
         // same keypress (vim/blink default: Esc is the insert-exit key, not
@@ -411,8 +429,7 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
         // Insert-mode arrows are insertion-point moves: right reaches the
         // line-text END insertion point and up/down land on a short line's
         // text end, unlike Normal `apply` which clamps to the last character
-        // (the "abcd, Left, Right, X -> abcXd" bug). prev_insert_key is left
-        // untouched so a jk exit still works after arrow movement.
+        // (the "abcd, Left, Right, X -> abcXd" bug).
         if (key.codepoint == vaxis.Key.left or key.codepoint == vaxis.Key.right or
             key.codepoint == vaxis.Key.up or key.codepoint == vaxis.Key.down)
         {
@@ -454,10 +471,8 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
             return;
         }
         // jk → drop the 'j' we just inserted, then exit (no chars left)
-        if (self.prev_insert_key) |p| {
-            if (p.codepoint == 'j' and key.codepoint == 'k' and
-                !key.mods.ctrl and !key.mods.alt and !key.mods.super)
-            {
+        if (prev_insert_key) |p| {
+            if (p.codepoint == 'j' and isInsertChordChar(key, 'k')) {
                 if (self.curCursor().* > 0 and self.cur().pt.byteAt(self.curCursor().* - 1) == 'j') {
                     const pos = self.curCursor().* - 1;
                     // LSP range in the PRE-EDIT document: [pos, pos+1).
@@ -521,13 +536,11 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
         // misalignment bug). vim default without expandtab is a tab, but
         // spaces are predictable here (M1).
         if (key.codepoint == vaxis.Key.tab) {
-            self.prev_insert_key = key;
             try self.insertText("    ");
             return;
         }
         // Alt+b / Alt+f: emacs word motion. Pure cursor movement — no
-        // text change, and prev_insert_key stays untouched (the jk exit
-        // and backspace paths must not see these). vaxis parses ESC+b/f
+        // text change. vaxis parses ESC+b/f
         // as codepoint 'b'/'f' with mods.alt.
         if (key.mods.alt and !key.mods.ctrl and !key.mods.super) {
             if (key.codepoint == 'b') {
@@ -541,13 +554,15 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
                 return;
             }
         }
-        self.prev_insert_key = key;
         if (key.text) |text| {
             // auto-pairs: openers/quotes close themselves (cursor lands
             // between), closers skip over an identical closer. The
             // signature-help / auto-suggest triggers below still apply.
             const paired = try self.autoPairInsert(text);
             if (!paired) try self.insertText(text);
+            // Store only a static sentinel after successful insertion;
+            // key.text belongs to this input event and must not be retained.
+            if (isInsertChordChar(key, 'j')) self.prev_insert_key = .{ .codepoint = 'j' };
             // Signature help: typing '(' asks the language server for
             // the callee's signature and shows it in the floating window
             // (LSP signatureHelp; the response arrives via the wake
@@ -662,6 +677,10 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
 }
 
 pub fn exitInsert(self: *App) void {
+    // Insert stores a gap between characters; Normal stores the preceding
+    // character. Do this ONCE after jk removes its temporary j, just as for
+    // Esc/Ctrl-c. Motion.left respects UTF-8 boundaries and never crosses BOL.
+    editor.Motion.apply(&self.cur().pt, .left, .{}, self.curCursor(), 1);
     self.insert_session +%= 1;
     self.insert_goal_col = null;
     self.invalidatePassiveHints();

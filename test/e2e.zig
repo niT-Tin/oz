@@ -5942,7 +5942,9 @@ test "visual block: multi-cursor backspace, ctrl-w and jk stay in sync" {
 
     // --- backspace: I + "ab" then BS (0x7f) deletes the just-typed 'b' at
     // --- every cursor → aaaa / abbb / accc, then Esc.
-    try sess.send("\x16jjIab\x7f");
+    // jk now correctly leaves Normal on the inserted X, so explicitly
+    // move to the original first character before starting the next block.
+    try sess.send("0l\x16jjIab\x7f");
     waited = 0;
     while (!grid.contains("aaaa") or grid.contains("aabaa")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
@@ -24440,10 +24442,16 @@ test "file safety: saving a relative symlink preserves the link, target and mode
     try gridWaitFor(&sess, &grid, "EDIT_LINK_ORIGINAL", 5000);
     try sess.send("\x1b");
     try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+    // Esc leaves Insert on the final inserted character (the underscore).
+    // Assert that position before appending the second edit after it.
+    try gridWaitFor(&sess, &grid, "L1:C4", 5000);
     try sess.send(":w\r");
     try gridWaitFor(&sess, &grid, "written:", 5000);
-    // A second save must use the newly committed baseline as well.
-    try sess.send("iAGAIN_");
+    try expectLspDisk(io, alloc, path, "EDIT_LINK_ORIGINAL\n");
+    try expectLspDisk(io, alloc, link, "EDIT_LINK_ORIGINAL\n");
+    // A second save must use the newly committed baseline as well. `a`
+    // appends after the underscore instead of inserting before it.
+    try sess.send("aAGAIN_");
     try gridWaitFor(&sess, &grid, "AGAIN_", 5000);
     try sess.send("\x1b");
     try gridWaitFor(&sess, &grid, "NORMAL", 5000);
@@ -24452,6 +24460,7 @@ test "file safety: saving a relative symlink preserves the link, target and mode
     try std.testing.expectEqual(mode_before, (try std.Io.Dir.cwd().statFile(io, path, .{})).permissions);
     const saved = try absFileText(io, alloc, path);
     defer alloc.free(saved);
+    try std.testing.expectEqualStrings("EDIT_AGAIN_LINK_ORIGINAL\n", saved);
     try std.testing.expect(std.mem.indexOf(u8, saved, "EDIT_") != null);
     try std.testing.expect(std.mem.indexOf(u8, saved, "AGAIN_") != null);
     try expectLspDisk(io, alloc, link, saved);
@@ -26931,6 +26940,14 @@ fn awaitInsertFrame(sess: *Session, grid: *Grid) !void {
     try gridWaitFor(sess, grid, "[INSERT]", 3000);
 }
 
+/// Check the real terminal caret against the source row, independently of
+/// the status-line column. These fixtures use an ASCII source spelling.
+fn expectSignatureSourceCaret(grid: *Grid, source: []const u8, offset: usize) !void {
+    const cell = aiFindCellFrom(grid, source, 2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(cell.row, grid.row);
+    try std.testing.expectEqual(cell.col + offset, grid.col);
+}
+
 test "signature lifecycle: stale signature is gone before the new completion" {
     const io = std.testing.io;
     const a = std.testing.allocator;
@@ -26941,13 +26958,18 @@ test "signature lifecycle: stale signature is gone before the new completion" {
     try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
     try fx.sess.send("A(");
     try gridWaitFor(&fx.sess, &grid, "SIG_A", 8000);
+    try expectSignatureSourceCaret(&grid, "stdin()", 6);
     try fx.sess.send("\x1b");
     try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
-    try fx.sess.send("a.");
+    // Escape converts the gap before ')' to the preceding '(' character.
+    // Append at EOL explicitly: `a.` here would type inside the empty call.
+    try expectSignatureSourceCaret(&grid, "stdin()", 5);
+    try fx.sess.send("A.");
     try gridWaitFor(&fx.sess, &grid, "stat", 8000);
     try gridWaitFor(&fx.sess, &grid, "STAT_DOC", 5000);
     try gridWaitGone(&fx.sess, &grid, "SIG_A", 3000);
     try gridWaitFor(&fx.sess, &grid, "[INSERT]", 3000);
+    try expectSignatureSourceCaret(&grid, "stdin()", 8);
     // The menu's own border and the first selected explanation are visible,
     // not covered by the old signature float.
     try std.testing.expect(grid.contains("fn stat() void"));
@@ -27370,10 +27392,13 @@ test "signature lifecycle: delayed response released in the same Insert context"
         // Prove both cursor moves were processed before releasing A: the
         // status column must move and return to the original byte.
         try gridWaitFor(&fx.sess, &grid, "line 1/3 col 6", 3000);
+        try expectSignatureSourceCaret(&grid, "stdin()", 6);
         try fx.sess.send("\x1b[D");
         try gridWaitFor(&fx.sess, &grid, "line 1/3 col 5", 3000);
+        try expectSignatureSourceCaret(&grid, "stdin()", 5);
         try fx.sess.send("\x1b[C");
         try gridWaitFor(&fx.sess, &grid, "line 1/3 col 6", 3000);
+        try expectSignatureSourceCaret(&grid, "stdin()", 6);
         try std.testing.expect(grid.contains("[INSERT]"));
         try releaseSignatureA(io, fx.root);
         try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
@@ -27382,7 +27407,10 @@ test "signature lifecycle: delayed response released in the same Insert context"
         try std.testing.expect(grid.contains("[INSERT]"));
         try fx.sess.send("\x1b");
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
-        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":wq\r"));
+        const saved = try std.Io.Dir.cwd().readFileAlloc(io, fx.path, a, .limited(4096));
+        defer a.free(saved);
+        try std.testing.expectEqualStrings("stdin()\nsecond\n", saved);
     }
     // Escape, re-enter Insert at the same position, then release while still
     // in the new Insert session (no extra Esc/formatting).
@@ -27397,9 +27425,13 @@ test "signature lifecycle: delayed response released in the same Insert context"
         try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("\x1b");
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
-        try fx.sess.send("i");
+        try expectSignatureSourceCaret(&grid, "stdin()", 5);
+        // Normal is on '(' after Escape. `a` re-enters the original gap
+        // before ')'; `i` would test another byte and miss the same-context race.
+        try fx.sess.send("a");
         try gridWaitFor(&fx.sess, &grid, "[INSERT]", 3000);
         try gridWaitFor(&fx.sess, &grid, "line 1/3 col 6", 3000);
+        try expectSignatureSourceCaret(&grid, "stdin()", 6);
         try releaseSignatureA(io, fx.root);
         try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
         try gridDrain(&fx.sess, &grid, 300);
@@ -27407,7 +27439,10 @@ test "signature lifecycle: delayed response released in the same Insert context"
         try std.testing.expect(grid.contains("[INSERT]"));
         try fx.sess.send("\x1b");
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
-        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":wq\r"));
+        const saved = try std.Io.Dir.cwd().readFileAlloc(io, fx.path, a, .limited(4096));
+        defer a.free(saved);
+        try std.testing.expectEqualStrings("stdin()\nsecond\n", saved);
     }
 }
 
@@ -27673,6 +27708,88 @@ fn erEditorFileCase(io: Io, alloc: std.mem.Allocator, label: []const u8, suffix:
         std.debug.print("expected: {s}\nactual:   {s}\n", .{ expected, saved });
     }
     try std.testing.expectEqualStrings(expected, saved);
+}
+
+test "insert exit: jk Escape and Ctrl-c land on exactly the previous character" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { initial: []const u8, enter: []const u8, target: []const u8, saved_after_x: []const u8 }{
+        .{ .initial = "abcdef\n", .enter = "lli", .target = "bcdef", .saved_after_x = "acdef\n" },
+        .{ .initial = "abcdef\n", .enter = "lliX", .target = "Xcdef", .saved_after_x = "abcdef\n" },
+        .{ .initial = "a中bc\n", .enter = "lli", .target = "中bc", .saved_after_x = "abc\n" },
+        .{ .initial = "abcdef\n", .enter = "i", .target = "abcdef", .saved_after_x = "bcdef\n" },
+        .{ .initial = "first\nsecond\n", .enter = "ji", .target = "second", .saved_after_x = "first\necond\n" },
+        .{ .initial = "abc\n", .enter = "A", .target = "c", .saved_after_x = "ab\n" },
+        .{ .initial = "abc\r\n", .enter = "A", .target = "c", .saved_after_x = "ab\r\n" },
+        .{ .initial = "abc", .enter = "A", .target = "c", .saved_after_x = "ab" },
+        .{ .initial = "abcdef\nabcdef\n", .enter = "ll\x16jI", .target = "bcdef", .saved_after_x = "acdef\nabcdef\n" },
+        .{ .initial = "abcdef\nabcdef\n", .enter = "ll\x16jIX", .target = "Xcdef", .saved_after_x = "abcdef\nabXcdef\n" },
+    };
+    for ([_][]const u8{ "jk", "\x1b", "\x03" }) |exit| {
+        for (cases) |case| {
+            var name_buf: [192:0]u8 = undefined;
+            const name = try erFixture(io, &name_buf, ".txt", case.initial);
+            defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+            var sess = try erStart(io, alloc, name, 24, 100);
+            defer sess.close();
+            defer killPid(sess.pid);
+            var grid = try Grid.initSizedCols(alloc, 24, 100);
+            defer grid.deinit(alloc);
+            try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+            try sess.send(case.enter);
+            try gridWaitFor(&sess, &grid, "[INSERT]", 5000);
+            try sess.send(exit);
+            try gridWaitGone(&sess, &grid, "[INSERT]", 5000);
+            try std.testing.expect(grid.contains("[NORMAL]"));
+            const target = aiFindCellFrom(&grid, case.target, 2) orelse return error.TestUnexpectedResult;
+            // Assert the actual terminal caret, then use Normal x as an
+            // independent saved-byte oracle for the logical cursor.
+            try std.testing.expectEqual(target.row, grid.row);
+            try std.testing.expectEqual(target.col, grid.col);
+            try sess.send("x");
+            try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+            const saved = try erRead(io, alloc, name);
+            defer alloc.free(saved);
+            try std.testing.expectEqualStrings(case.saved_after_x, saved);
+        }
+    }
+    try erEditorFileCase(io, alloc, "reenter-jk", ".txt", "abcdef\n", "llijkijkrX", "Xbcdef\n");
+    try erEditorFileCase(io, alloc, "empty-jk", ".txt", "\n", "ijk", "\n");
+    try erEditorFileCase(io, alloc, "empty-eof-jk", ".txt", "", "ijk", "");
+    try erEditorFileCase(io, alloc, "empty-line-no-wrap", ".txt", "first\n\nlast\n", "jijkiX", "first\nX\nlast\n");
+    try erEditorFileCase(io, alloc, "new-line-no-wrap", ".txt", "abc\n", "A\rjkiX", "abc\nX\n");
+}
+
+test "insert exit: movement and deletion break the pending jk chord" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { keys: []const u8, expected: []const u8 }{
+        .{ .keys = "Aj\x1b[Dk", .expected = "ajjkj\n" },
+        .{ .keys = "Aj\x7fk", .expected = "ajjk\n" },
+        .{ .keys = "Aj\x17k", .expected = "k\n" },
+        .{ .keys = "Aj\rk", .expected = "ajjj\nk\n" },
+        .{ .keys = "ij\x1b[200~Xj\x1b[201~k", .expected = "jXjkajj\n" },
+    };
+    for (cases) |case| try erEditorFileCase(io, alloc, "broken-jk", ".txt", "ajj\n", case.keys, case.expected);
+    try erEditorFileCase(io, alloc, "block-backspace-breaks-jk", ".txt", "ajj\najj\n", "ll\x16jIj\x7fk", "ajkj\najkj\n");
+    try erEditorFileCase(io, alloc, "block-paste-breaks-jk", ".txt", "ajj\najj\n", "\x16jIj\x1b[200~jj\x1b[201~k", "jjjkajj\njjjkajj\n");
+    try erEditorFileCase(io, alloc, "wheel-breaks-jk", ".txt", "abc\nrow1\nrow2\nzzzjQ\nlast\n", "Aj\x1b[<65;10;3Mk", "abcj\nrow1\nrow2\nzzzjkQ\nlast\n");
+}
+
+test "insert exit: Kitty capital J and K stay literal in single and block insert" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { keys: []const u8, expected: []const u8 }{
+        .{ .keys = "ij\x1b[107:75;2;75u", .expected = "jKajj\najj\n" },
+        .{ .keys = "i\x1b[106:74;2;74uk", .expected = "Jkajj\najj\n" },
+        .{ .keys = "ij\x1b[107;65;75u", .expected = "jKajj\najj\n" },
+        .{ .keys = "\x16jIj\x1b[107:75;2;75u", .expected = "jKajj\njKajj\n" },
+        .{ .keys = "\x16jI\x1b[106:74;2;74uk", .expected = "Jkajj\nJkajj\n" },
+        .{ .keys = "\x16jIj\x1b[107;65;75u", .expected = "jKajj\njKajj\n" },
+        .{ .keys = "i\x1b[106;1;106u\x1b[107;1;107u", .expected = "ajj\najj\n" },
+        .{ .keys = "\x16jI\x1b[106;1;106u\x1b[107;1;107u", .expected = "ajj\najj\n" },
+    };
+    for (cases) |case| try erEditorFileCase(io, alloc, "kitty-jk", ".txt", "ajj\najj\n", case.keys, case.expected);
 }
 
 test "editing reliability: insert arrows keep the EOL insertion point" {
