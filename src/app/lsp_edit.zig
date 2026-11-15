@@ -723,6 +723,7 @@ pub fn closeCompletion(self: *App) void {
     self.completion_words.clearRetainingCapacity();
     self.completion_active = false;
     self.completion_sel = 0;
+    self.completion_user_navigated = false;
     self.completion_pos = 0;
     self.completion_manual = false;
     self.completion_waiting_enter = false;

@@ -722,6 +722,11 @@ pub const App = struct {
     completion_epoch: u64 = 0,
     /// Last context observed by the per-key guard (see syncCompletionContext).
     completion_ctx_seen: ?CompletionContext = null,
+    /// True once the user explicitly moved the completion selection
+    /// (Ctrl+n/Ctrl+p/Up/Down) in this menu session. While false, a refresh
+    /// follows the best-ranked candidate (index 0); while true, the selected
+    /// semantic identity is preserved instead of jumping back to "best".
+    completion_user_navigated: bool = false,
     /// First visible display line of the documentation pane (wrapped rows).
     completion_doc_scroll: u32 = 0,
     /// LSP textDocument/formatting response slot (TextEdit[]).

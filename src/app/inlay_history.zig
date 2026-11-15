@@ -6,9 +6,13 @@
 //! `inserted` bytes. This module maps an anchor through one such step:
 //!
 //! - an anchor inside the removed span is dead (null: drop the hint),
-//! - an anchor at a pure deletion point stays put (its following text moved
-//!   left, so the boundary itself is still the same logical spot),
-//! - an anchor at/after an insertion point shifts with the inserted text.
+//! - an anchor at the START of a deletion/replacement stays at the
+//!   replacement start (start-affine): it must never subtract `removed`
+//!   bytes, which is both wrong and an unsigned-underflow panic when the
+//!   removed span is longer than the offset,
+//! - an anchor at/after a PURE insertion point shifts with the inserted
+//!   text (the following text moved right),
+//! - an anchor at/after the removed span shifts by `inserted - removed`.
 //!
 //! Pure (no App/vaxis) so the ordering/boundary rules are unit-tested.
 const std = @import("std");
@@ -27,16 +31,18 @@ pub const Span = struct {
 pub fn transformOffset(offset: u32, span: Span) ?u32 {
     if (offset < span.pos) return offset;
     const end = span.pos + span.removed;
+    // Inside the replaced text (strictly between start and end): the hint
+    // annotated text that no longer exists.
     if (span.removed > 0 and offset > span.pos and offset < end) return null;
-    if (span.inserted > 0) {
-        // Insertion (pure insert, restore, or replacement): anything at or
-        // after the insertion point shifts to the end of the inserted text.
-        return offset - span.removed + span.inserted;
+    if (offset == span.pos) {
+        // Start-affine boundary. A pure insertion pushes the following text
+        // right, so the anchor follows it; a deletion/replacement keeps the
+        // anchor at the replacement start. Never subtract `removed` here:
+        // that underflows when the replaced span is longer than the offset.
+        return if (span.removed == 0) span.pos + span.inserted else span.pos;
     }
-    // Pure deletion: the anchor at the deletion point keeps its logical
-    // position; later anchors move left with the surviving text.
-    if (offset == span.pos) return span.pos;
-    return offset - span.removed;
+    // offset >= end: the surviving tail shifts by inserted - removed.
+    return offset - span.removed + span.inserted;
 }
 
 /// Apply a sequence of spans in application order to every anchor. `offset`
@@ -109,13 +115,57 @@ test "inlay transform: redo deletion keeps boundary and drops interior" {
     try std.testing.expectEqual(@as(?u32, 6), transformOffset(10, span));
 }
 
-test "inlay transform: replacement maps boundary and kills interior" {
+test "inlay transform: replacement keeps its start and kills interior" {
     const span = Span{ .pos = 4, .removed = 2, .inserted = 5 };
     try std.testing.expectEqual(@as(?u32, 3), transformOffset(3, span));
-    try std.testing.expectEqual(@as(?u32, 7), transformOffset(4, span));
+    // Start-affine: the anchor at the replacement start stays there (the old
+    // formula subtracted `removed` and moved it before the replacement).
+    try std.testing.expectEqual(@as(?u32, 4), transformOffset(4, span));
     try std.testing.expectEqual(@as(?u32, null), transformOffset(5, span));
     try std.testing.expectEqual(@as(?u32, 9), transformOffset(6, span)); // end boundary moves to replacement end
     try std.testing.expectEqual(@as(?u32, 12), transformOffset(9, span));
+}
+
+test "inlay transform: replacement start never underflows (P1 regression)" {
+    // Reviewer repro: transformOffset(2, .{pos=2, removed=20, inserted=1})
+    // used to compute 2 - 20 + 1 and panic with integer overflow.
+    try std.testing.expectEqual(@as(?u32, 2), transformOffset(2, .{
+        .pos = 2,
+        .removed = 20,
+        .inserted = 1,
+    }));
+    // start = 0, start < removed, start >= removed, and large starts.
+    try std.testing.expectEqual(@as(?u32, 0), transformOffset(0, .{
+        .pos = 0,
+        .removed = 20,
+        .inserted = 1,
+    }));
+    try std.testing.expectEqual(@as(?u32, 2), transformOffset(2, .{
+        .pos = 2,
+        .removed = 1,
+        .inserted = 5,
+    }));
+    try std.testing.expectEqual(@as(?u32, 3), transformOffset(5, .{
+        .pos = 2,
+        .removed = 3,
+        .inserted = 1,
+    })); // end -> pos + inserted
+    try std.testing.expectEqual(@as(?u32, 6), transformOffset(8, .{
+        .pos = 2,
+        .removed = 3,
+        .inserted = 1,
+    }));
+    // A pure insertion still shifts the start anchor (existing contract).
+    try std.testing.expectEqual(@as(?u32, 12), transformOffset(10, .{
+        .pos = 10,
+        .removed = 0,
+        .inserted = 2,
+    }));
+    try std.testing.expectEqual(@as(?u32, 5), transformOffset(5, .{
+        .pos = 5,
+        .removed = 0,
+        .inserted = 0,
+    }));
 }
 
 test "inlay transform: sequence order matters and dead anchors stay dead" {

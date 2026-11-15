@@ -881,6 +881,46 @@ fn reindentRelativeLf(
     }
 }
 
+/// True when the normalized insertion at `at` will really be structurally
+/// reindented. Used BOTH by reindentInsertion and by planPaste before it
+/// decides to replace a whitespace-only line prefix: deleting that prefix in
+/// a verbatim/literal fallback would change content (e.g. the spaces inside a
+/// Python triple-quoted string).
+fn canReindentNormalized(
+    doc_before: []const u8,
+    at_u32: u32,
+    norm: []const u8,
+    ft: []const u8,
+    linewise: bool,
+) bool {
+    const lang = languageForFiletype(ft);
+    if (norm.len == 0) return false;
+    if (lang == .plain or lang == .markdown) return false;
+    // A charwise single-line insert is not structurally reindented; only
+    // multi-line charwise pastes and whole-line (linewise) puts are.
+    if (!linewise and std.mem.indexOfScalar(u8, norm, '\n') == null) return false;
+    if (norm.len > max_insert_bytes) return false;
+    var line_count: usize = 1;
+    for (norm) |c| {
+        if (c == '\n') line_count += 1;
+    }
+    if (line_count > max_insert_lines) return false;
+    const at = @min(@as(usize, at_u32), doc_before.len);
+    const line_start = lineStartOf(doc_before, at);
+    const line_end = lineContentEndOf(doc_before, line_start);
+    // Never restructure inside a literal/comment, or inside a Zig multiline
+    // line string: leading whitespace there is content.
+    if (scanState(doc_before, at, lang, .{}).kind != .code) return false;
+    if (lang == .brace and isZigFiletype(ft) and lineStartsWithZigString(doc_before, line_start, line_end)) {
+        return false;
+    }
+    if (lang == .yaml) {
+        if (yamlInBlockScalar(doc_before, at)) return false;
+        if (yamlInsertHasBlockScalar(norm)) return false;
+    }
+    return true;
+}
+
 pub fn reindentInsertion(
     alloc: std.mem.Allocator,
     doc_before: []const u8,
@@ -893,38 +933,16 @@ pub fn reindentInsertion(
     const norm = try normalizeLf(alloc, inserted);
     defer alloc.free(norm);
     const ending = dominantEnding(doc_before);
-    const lang = languageForFiletype(ft);
-    if (norm.len == 0) return withEnding(alloc, norm, ending);
-    if (lang == .plain or lang == .markdown) return withEnding(alloc, norm, ending);
-    // A charwise single-line insert is not structurally reindented; only
-    // multi-line charwise pastes and whole-line (linewise) puts are.
-    if (!linewise and std.mem.indexOfScalar(u8, norm, '\n') == null) {
+    const at = @min(@as(usize, at_u32), doc_before.len);
+    if (!canReindentNormalized(doc_before, at_u32, norm, ft, linewise)) {
         return withEnding(alloc, norm, ending);
     }
-    if (norm.len > max_insert_bytes) return withEnding(alloc, norm, ending);
-    var line_count: usize = 1;
-    for (norm) |c| {
-        if (c == '\n') line_count += 1;
-    }
-    if (line_count > max_insert_lines) return withEnding(alloc, norm, ending);
-
-    const at = @min(@as(usize, at_u32), doc_before.len);
+    const lang = languageForFiletype(ft);
     const line_start = lineStartOf(doc_before, at);
     const line_end = lineContentEndOf(doc_before, line_start);
     const prefix = doc_before[line_start..@min(at, line_end)];
     const line_is_blank = isBlank(doc_before[line_start..line_end]);
     const at_line_start = linewise or at == line_start or (isBlank(prefix) and line_is_blank);
-
-    // Never restructure inside a literal/comment, or inside a Zig multiline
-    // line string: leading whitespace there is content.
-    if (scanState(doc_before, at, lang, .{}).kind != .code) return withEnding(alloc, norm, ending);
-    if (lang == .brace and isZigFiletype(ft) and lineStartsWithZigString(doc_before, line_start, line_end)) {
-        return withEnding(alloc, norm, ending);
-    }
-    if (lang == .yaml) {
-        if (yamlInBlockScalar(doc_before, at)) return withEnding(alloc, norm, ending);
-        if (yamlInsertHasBlockScalar(norm)) return withEnding(alloc, norm, ending);
-    }
 
     const anchor = anchorFor(doc_before, at, at_line_start, lang);
     var out = std.ArrayList(u8).empty;
@@ -967,14 +985,22 @@ pub fn planPaste(
     const at = @min(@as(usize, at_u32), doc_before.len);
     const line_start = lineStartOf(doc_before, at);
     const line_end = lineContentEndOf(doc_before, line_start);
+    // Decide BEFORE changing the insertion point/delete range whether this
+    // paste is structurally reindented at all. plaintext/Markdown/literal
+    // contexts return the inserted bytes verbatim; deleting the line's blank
+    // prefix for them would silently change the document (e.g. spaces inside
+    // a Python triple-quoted string) and could also eat whitespace after the
+    // cursor. Verbatim fallbacks keep at=original and delete_len=0.
+    const norm_for_decision = try normalizeLf(alloc, inserted);
+    defer alloc.free(norm_for_decision);
+    const multi_line = std.mem.indexOfScalar(u8, norm_for_decision, '\n') != null;
+    const structurally = canReindentNormalized(doc_before, at_u32, norm_for_decision, ft, linewise);
     var replace_len: u32 = 0;
     var insert_at = at;
     // Only a MULTI-LINE charwise paste into a whitespace-only line replaces
     // that line's indent prefix. A single-line paste is not reindented at all
     // (it must keep the indentation already before the cursor).
-    const multi_line = std.mem.indexOfScalar(u8, inserted, '\n') != null or
-        std.mem.indexOfScalar(u8, inserted, '\r') != null;
-    if (!linewise and multi_line and at >= line_start and at <= line_end and
+    if (structurally and !linewise and multi_line and at >= line_start and at <= line_end and
         isBlank(doc_before[line_start..line_end]))
     {
         replace_len = @intCast(line_end - line_start);
@@ -1395,4 +1421,70 @@ test "indent: Markdown and unknown filetypes keep pasted content" {
     const plain = try reindentInsertion(alloc, doc, at, "if (x) {\n  y\n}\n", "txt", .{}, false);
     defer alloc.free(plain);
     try testing.expectEqualSlices(u8, "if (x) {\n  y\n}\n", plain);
+}
+
+/// Apply a PastePlan to build the bytes a caller would save. Used to assert
+/// the ASSEMBLED result (not only the reindented string), because deleting a
+/// blank prefix is part of the plan.
+fn applyPastePlan(alloc: std.mem.Allocator, doc: []const u8, plan: PastePlan) ![]u8 {
+    std.debug.assert(plan.at + plan.delete_len <= doc.len);
+    const out = try alloc.alloc(u8, doc.len - plan.delete_len + plan.text.len);
+    const at: usize = plan.at;
+    const del: usize = plan.delete_len;
+    @memcpy(out[0..at], doc[0..at]);
+    @memcpy(out[at .. at + plan.text.len], plan.text);
+    @memcpy(out[at + plan.text.len ..], doc[at + del ..]);
+    return out;
+}
+
+test "indent paste plan: literal contexts keep the blank prefix (P1 regression)" {
+    const alloc = testing.allocator;
+
+    // Python triple-quoted body: the four spaces are CONTENT. A verbatim
+    // fallback must not delete them (pre-fix save lost all four).
+    {
+        const doc = "s = \"\"\"\n    \n\"\"\"\n";
+        const at: u32 = 12; // after four spaces on the middle line
+        const plan = try planPaste(alloc, doc, at, "a\nb", "py", .{}, false);
+        defer alloc.free(plan.text);
+        try testing.expectEqual(@as(u32, 12), plan.at);
+        try testing.expectEqual(@as(u32, 0), plan.delete_len);
+        try testing.expectEqualStrings("a\nb", plan.text);
+        const saved = try applyPastePlan(alloc, doc, plan);
+        defer alloc.free(saved);
+        try testing.expectEqualStrings("s = \"\"\"\n    a\nb\n\"\"\"\n", saved);
+    }
+    // Markdown: no structural reindent, no prefix deletion.
+    {
+        const doc = "text\n\n";
+        const plan = try planPaste(alloc, doc, 5, "a\nb", "md", .{}, false);
+        defer alloc.free(plan.text);
+        try testing.expectEqual(@as(u32, 5), plan.at);
+        try testing.expectEqual(@as(u32, 0), plan.delete_len);
+        try testing.expectEqualStrings("a\nb", plan.text);
+    }
+    // Unknown filetype: same safe fallback.
+    {
+        const doc = "note\n\n";
+        const plan = try planPaste(alloc, doc, 5, "  a\n  b", "txt", .{}, false);
+        defer alloc.free(plan.text);
+        try testing.expectEqual(@as(u32, 5), plan.at);
+        try testing.expectEqual(@as(u32, 0), plan.delete_len);
+        try testing.expectEqualStrings("  a\n  b", plan.text);
+    }
+}
+
+test "indent paste plan: structural blank line replaces only its indent prefix" {
+    const alloc = testing.allocator;
+    const doc = "fn f() {\n    \n}\n";
+    const line2_start: u32 = 9;
+    const at: u32 = line2_start + 2; // cursor in the MIDDLE of the 4-space prefix
+    const plan = try planPaste(alloc, doc, at, "if (ok) {\ncall();\n}", "zig", .{}, false);
+    defer alloc.free(plan.text);
+    try testing.expectEqual(line2_start, plan.at);
+    try testing.expectEqual(@as(u32, 4), plan.delete_len);
+    try testing.expectEqualStrings("    if (ok) {\n        call();\n    }", plan.text);
+    const saved = try applyPastePlan(alloc, doc, plan);
+    defer alloc.free(saved);
+    try testing.expectEqualStrings("fn f() {\n    if (ok) {\n        call();\n    }\n}\n", saved);
 }

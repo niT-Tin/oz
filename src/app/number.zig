@@ -339,16 +339,33 @@ pub fn putRegister(self: *App, buf: []const u8, linewise: bool, before: bool, co
             @memcpy(repeated[rlen..][0..buf.len], buf);
             rlen += buf.len;
         }
-        const final_text = try reindentPut(self, doc_opt, repeated, pos, ft);
-        defer self.alloc.free(final_text);
+        // Charwise p/P uses the SAME placement plan as bracketed paste: a
+        // multi-line charwise put into a whitespace-only line must replace
+        // that line's blank prefix instead of inserting after it (otherwise
+        // the reindented first line's indent is added on top: 4+4=8 spaces).
+        // `plan.at`/`delete_len` are one edit in one undo group.
+        const plan: ?indent.PastePlan = if (doc_opt) |doc|
+            try search.planPasteAt(self, doc, pos, repeated[0..rlen], ft, false)
+        else
+            null;
+        defer if (plan) |p| self.alloc.free(p.text);
+        var owned_fallback: ?[]u8 = null;
+        defer if (owned_fallback) |t| self.alloc.free(t);
+        const final_text: []const u8 = if (plan) |p| p.text else blk: {
+            const t = try reindentPut(self, doc_opt, repeated, pos, ft);
+            owned_fallback = t;
+            break :blk t;
+        };
+        const edit_at: u32 = if (plan) |p| p.at else pos;
+        const delete_len: u32 = if (plan) |p| p.delete_len else 0;
         self.cur().history.beginGroup();
         defer self.cur().history.endGroup();
-        try search.recordPasteEditNoCursor(self, pos, 0, final_text);
+        try search.recordPasteEditNoCursor(self, edit_at, delete_len, final_text);
         // nvim: the cursor lands ON the last pasted character (not past
-        // it) — back up over UTF-8 continuation bytes
-        const pos_after = pos + @as(u32, @intCast(final_text.len));
+        // it) — back up over UTF-8 continuation bytes.
+        const pos_after = edit_at + @as(u32, @intCast(final_text.len));
         var c = pos_after - 1;
-        const paste_begin = pos;
+        const paste_begin = edit_at;
         while (c > paste_begin and (pt.byteAt(c) & 0xC0) == 0x80) c -= 1;
         self.curCursor().* = c;
     }

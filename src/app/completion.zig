@@ -311,10 +311,16 @@ pub fn processCompletion(self: *App) bool {
         self.completion_active = true;
         var next_sel: usize = 0;
         var same_selection = false;
-        if (prev_id) |want| {
-            if (lsp_nav.completionSelection(self.completion_words.items, want, prev_key.?)) |i| {
-                next_sel = i;
-                same_selection = true;
+        // A refresh with no explicit user navigation follows the new best
+        // match (index 0). Only after Ctrl+n/Ctrl+p/arrow selection do we
+        // preserve the previously selected semantic identity across a
+        // re-ranked refresh.
+        if (self.completion_user_navigated) {
+            if (prev_id) |want| {
+                if (lsp_nav.completionSelection(self.completion_words.items, want, prev_key.?)) |i| {
+                    next_sel = i;
+                    same_selection = true;
+                }
             }
         }
         const selection_changed = !same_selection;
@@ -333,6 +339,7 @@ pub fn processCompletion(self: *App) bool {
         // semicolon" confusion).
         self.completion_active = false;
         self.completion_sel = 0;
+        self.completion_user_navigated = false;
         if (self.completion_manual) {
             self.setMsg(self.alloc.dupe(u8, "no candidates") catch return true) catch {};
         }
@@ -501,6 +508,9 @@ pub fn completionDocsVisible(self: *App) bool {
 pub fn moveCompletion(self: *App, delta: isize) void {
     const n = self.completion_words.items.len;
     if (n == 0) return;
+    // Explicit navigation: from now on refreshes preserve this semantic
+    // candidate instead of following the newly-best match.
+    self.completion_user_navigated = true;
     const cur: isize = @intCast(self.completion_sel);
     self.completion_sel = @intCast(@mod(cur + delta, @as(isize, @intCast(n))));
     self.completion_doc_scroll = 0;

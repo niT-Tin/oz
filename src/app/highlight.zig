@@ -337,23 +337,30 @@ fn clampHistoryCursor(self: *App, pos: u32) u32 {
     return p;
 }
 
-/// Map the displayed hint anchors through the edit group that is about to be
-/// undone/redone. Killed anchors are freed; survivors are re-anchored to the
-/// post-operation line/byte column. On allocation failure the safe fallback
-/// is the old invalidate-everything path (never leave wrong hints).
-fn transformInlayAnchorsForHistory(self: *App, edits: []const history_mod.Edit, kind: history_mod.UndoKind) void {
-    if (self.inlay_hints.items.len == 0) return;
-    if (self.inlay_buf != self.current) return;
-    if (edits.len == 0) return;
+/// Capture the displayed hint anchors as absolute byte offsets in the
+/// CURRENT (pre-operation) document and transform them through the edit
+/// group. The conversion back to line/column MUST happen after the history
+/// transaction, against the new piece table: an undo that inserts/deletes
+/// lines changes line starts and length, so converting before the operation
+/// re-anchors to stale coordinates. Returns null when there is nothing to
+/// transform (or on allocation failure, after the safe invalidate fallback).
+fn captureInlayOffsetsForHistory(
+    self: *App,
+    edits: []const history_mod.Edit,
+    kind: history_mod.UndoKind,
+) ?[]?u32 {
+    if (self.inlay_hints.items.len == 0) return null;
+    if (self.inlay_buf != self.current) return null;
+    if (edits.len == 0) return null;
     const pt = &self.cur().pt;
     const spans = self.alloc.alloc(inlay_history.Span, edits.len) catch {
         self.invalidateInlayHints();
-        return;
+        return null;
     };
     defer self.alloc.free(spans);
     const lens = self.alloc.alloc(inlay_history.EditLen, edits.len) catch {
         self.invalidateInlayHints();
-        return;
+        return null;
     };
     defer self.alloc.free(lens);
     for (edits, lens) |e, *l| {
@@ -369,15 +376,24 @@ fn transformInlayAnchorsForHistory(self: *App, edits: []const history_mod.Edit, 
     }
     const offsets = self.alloc.alloc(?u32, self.inlay_hints.items.len) catch {
         self.invalidateInlayHints();
-        return;
+        return null;
     };
-    defer self.alloc.free(offsets);
     for (self.inlay_hints.items, offsets) |h, *off| {
         const ls = pt.lineStart(h.line);
         const abs = ls + h.character;
         off.* = if (abs <= pt.len()) abs else null;
     }
     inlay_history.transformOffsets(offsets, spans);
+    return offsets;
+}
+
+/// Re-anchor transformed absolute offsets in the POST-operation document:
+/// validate UTF-8/line bounds, drop dead hints (freeing only their labels),
+/// then compute the new line/byte column. `offsets` maps 1:1 to the hint list
+/// captured before the operation.
+fn applyInlayOffsetsAfterHistory(self: *App, offsets: []const ?u32) void {
+    if (self.inlay_hints.items.len != offsets.len) return;
+    const pt = &self.cur().pt;
     var write: usize = 0;
     for (self.inlay_hints.items, offsets) |h, off_opt| {
         const off = off_opt orelse {
@@ -436,7 +452,10 @@ pub fn performHistoryStep(self: *App, kind: history_mod.UndoKind) HistoryOutcome
         .undo => self.cur().history.topUndoGroup(),
         .redo => self.cur().history.topRedoGroup(),
     } orelse return .{ .applied = false, .kind = kind, .before_cursor = before_cursor, .after_cursor = before_cursor, .revision = self.cur().history.revision };
-    transformInlayAnchorsForHistory(self, group.edits.items, kind);
+    // Transform offsets in the pre-edit document, apply the history
+    // transaction, then convert to line/column in the NEW document.
+    const inlay_offsets = captureInlayOffsetsForHistory(self, group.edits.items, kind);
+    defer if (inlay_offsets) |o| self.alloc.free(o);
     const res = switch (kind) {
         .undo => self.cur().history.undoResult(&self.cur().pt),
         .redo => self.cur().history.redoResult(&self.cur().pt),
@@ -444,6 +463,7 @@ pub fn performHistoryStep(self: *App, kind: history_mod.UndoKind) HistoryOutcome
     if (!res.changed) {
         return .{ .applied = false, .kind = kind, .before_cursor = before_cursor, .after_cursor = before_cursor, .revision = res.revision };
     }
+    if (inlay_offsets) |o| applyInlayOffsetsAfterHistory(self, o);
     // A secondary insert cursor is a per-session position; an undo is a
     // single deterministic transaction, so collapse to the main cursor.
     if (self.mc_active or self.mc.cursors.items.len > 0) {

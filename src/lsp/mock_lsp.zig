@@ -96,6 +96,18 @@ pub const Script = enum {
     /// insertText so the accepted bytes prove insertText was used and the
     /// label/filterText were not. The client must rank exact `line` first.
     completion_order,
+    /// Inlay/undo fixture: one hint anchored at line 0, character 2 (the
+    /// start of the identifier) plus a completion item that replaces the
+    /// 20-character identifier with another 20-character insertText. Used by
+    /// the undo replacement-start regression (the old transform underflowed
+    /// when removed > offset).
+    inlay_param,
+    /// Progressive completion fixture: `lines` (sortText "a") and `line`
+    /// (sortText "b"), docs tagged with the response generation. Typing "l"
+    /// ranks lines first; typing the full "line" makes exact line best. Used
+    /// to separate default-best selection from an explicit Ctrl+n selection
+    /// across refreshes.
+    completion_progressive,
     /// Rich completion-only fixture: labelDetails (detail + description),
     /// display label != insertText, markdown/plaintext docs, a long
     /// scrollable body, duplicate labels and detail-only/no-docs items.
@@ -134,6 +146,8 @@ pub const Script = enum {
         if (std.mem.eql(u8, name, "rich")) return .rich;
         if (std.mem.eql(u8, name, "hover_cap")) return .hover_cap;
         if (std.mem.eql(u8, name, "completion_order")) return .completion_order;
+        if (std.mem.eql(u8, name, "inlay_param")) return .inlay_param;
+        if (std.mem.eql(u8, name, "completion_progressive")) return .completion_progressive;
         if (std.mem.eql(u8, name, "completion_rich")) return .completion_rich;
         if (std.mem.eql(u8, name, "completion_resolve")) return .completion_resolve;
         if (std.mem.eql(u8, name, "completion_resolve_hold")) return .completion_resolve_hold;
@@ -181,6 +195,10 @@ pub const State = struct {
     /// when the client advertises markdown. The renderer must then keep
     /// literal backticks/fences as prose. Set by OZ_HOVER_FORCE_PLAINTEXT=1.
     hover_force_plaintext: bool = false,
+    /// completion_progressive: number of completion responses sent. Docs carry
+    /// this generation so a test can prove it is reading a REFRESHED frame
+    /// rather than a stale one.
+    progressive_requests: u32 = 0,
 
     pub const ChangeRecord = struct {
         uri: []u8,
@@ -293,7 +311,12 @@ pub fn handleMessage(
             const prefix = completionPrefix(a, state, uri, line, col);
             const result = if (script == .completion_order)
                 try buildOrderCompletionResult(a)
-            else if (script == .completion_rich)
+            else if (script == .inlay_param)
+                try buildInlayParamCompletionResult(a)
+            else if (script == .completion_progressive) blk: {
+                state.progressive_requests += 1;
+                break :blk try buildProgressiveCompletionResult(a, state.progressive_requests);
+            } else if (script == .completion_rich)
                 try buildRichCompletionResult(a, prefix)
             else if (script == .signature_lifecycle)
                 try buildLifecycleCompletionResult(a)
@@ -412,6 +435,8 @@ pub fn handleMessage(
                     state.inlay_answered = true;
                     try pushResponse(alloc, &out, id, try buildEolInlayResult(a, state, msg.params));
                 }
+            } else if (script == .inlay_param) {
+                try pushResponse(alloc, &out, id, try buildInlayParamHintResult(a));
             } else {
                 try pushResponse(alloc, &out, id, try buildInlayResult(a));
             }
@@ -761,6 +786,71 @@ fn richCompletionItem(
         }
     }
     return .{ .object = item };
+}
+
+/// inlay_param: one 20-char item whose label/filterText matches the typed
+/// lowercase identifier while insertText is a distinct 20-char uppercase run.
+fn buildInlayParamCompletionResult(a: std.mem.Allocator) !std.json.Value {
+    var items = std.json.Array.init(a);
+    var it = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try it.put(a, "label", .{ .string = "abcdefghijklmnopqrstXYZ" });
+    try it.put(a, "filterText", .{ .string = "abcdefghijklmnopqrstXYZ" });
+    try it.put(a, "insertText", .{ .string = "ABCDEFGHIJKLMNOPQRST" });
+    try it.put(a, "kind", .{ .integer = 6 });
+    try it.put(a, "documentation", .{ .object = blk: {
+        var doc = try std.json.ObjectMap.init(a, &.{}, &.{});
+        try doc.put(a, "kind", .{ .string = "plaintext" });
+        try doc.put(a, "value", .{ .string = "INLAY_PARAM_DOC" });
+        break :blk doc;
+    } });
+    try items.append(.{ .object = it });
+    var result = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try result.put(a, "items", .{ .array = items });
+    return .{ .object = result };
+}
+
+/// inlay_param: hint exactly at the replacement start (line 0, char 2).
+fn buildInlayParamHintResult(a: std.mem.Allocator) !std.json.Value {
+    var pos = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try pos.put(a, "line", .{ .integer = 0 });
+    try pos.put(a, "character", .{ .integer = 2 });
+    var hint = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try hint.put(a, "position", .{ .object = pos });
+    try hint.put(a, "label", .{ .string = ": usize" });
+    var items = std.json.Array.init(a);
+    try items.append(.{ .object = hint });
+    return .{ .array = items };
+}
+
+/// completion_progressive: two prefix-related items where the best match
+/// changes with the typed prefix, while both identities stay selectable.
+/// Initial order (typed "l") is `lines` (sortText a) then `line` (b); typing
+/// "line" makes exact `line` best. Docs carry the response generation so a
+/// test can prove it observed a refreshed frame.
+fn buildProgressiveCompletionResult(a: std.mem.Allocator, generation: u32) !std.json.Value {
+    const Spec = struct { label: []const u8, insert: []const u8, doc: []const u8, sort: []const u8 };
+    const specs = [_]Spec{
+        .{ .label = "lines", .insert = "lines_insert", .doc = "LINES", .sort = "a" },
+        .{ .label = "line", .insert = "line_insert", .doc = "LINE", .sort = "b" },
+    };
+    var items = std.json.Array.init(a);
+    for (specs) |spec| {
+        var it = try std.json.ObjectMap.init(a, &.{}, &.{});
+        try it.put(a, "label", .{ .string = spec.label });
+        try it.put(a, "filterText", .{ .string = spec.label });
+        try it.put(a, "insertText", .{ .string = spec.insert });
+        try it.put(a, "sortText", .{ .string = spec.sort });
+        try it.put(a, "kind", .{ .integer = 6 });
+        const doc_value = try std.fmt.allocPrint(a, "{s}_DOC_{d}", .{ spec.doc, generation });
+        var doc = try std.json.ObjectMap.init(a, &.{}, &.{});
+        try doc.put(a, "kind", .{ .string = "plaintext" });
+        try doc.put(a, "value", .{ .string = doc_value });
+        try it.put(a, "documentation", .{ .object = doc });
+        try items.append(.{ .object = it });
+    }
+    var result = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try result.put(a, "items", .{ .array = items });
+    return .{ .object = result };
 }
 
 /// Completion ordering fixture: the exact server order from the report, each

@@ -18,7 +18,7 @@ zig build e2e -Dtest-filter="golden"
 ```
 
 Current counts after the 2026-11-15 editing-reliability fixes:
-**735 unit tests** and **309 e2e tests** in the default filters (the three
+**738 unit tests** and **316 e2e tests** in the default filters (the three
 opt-in real-ZLS tests skip unless `-Dreal-zls` is supplied). `tools/verify.sh` covers diff check,
 all unit tests and all e2e tests (including Agent-focus, `terminal:` and
 multi-file `approval:`). `tools/verify.sh`
@@ -788,10 +788,13 @@ current frame/mode/cursor plus exact saved bytes):
 - Enter is language-aware: `{|}`, `{` at EOL, an already-expanded closer,
   nested one-liners, string/comment braces (no fake indent), CRLF and one
   undo group. `src/editor/indent.zig` is pure and also drives paste reindent.
-- Paste reindents bracketed/system-clipboard/internal linewise puts by the
-  current language (Zig/CRLF/tabs; Python/YAML/Markdown/literal bodies stay
-  literal; unknown filetypes verbatim) as one pre-edit transaction/undo
-  group. Block-register rectangular paste remains covered by the
+- Paste reindents bracketed/system-clipboard/internal puts by the current
+  language (Zig/CRLF/tabs; Python/YAML/Markdown/literal bodies stay literal;
+  unknown filetypes verbatim) as one pre-edit transaction/undo group.
+  Charwise `p`/`P` share the same placement plan (at/delete_len/text), so a
+  multi-line put into a whitespace-only line replaces its blank prefix once
+  instead of stacking a second indent; literal/unknown contexts keep the
+  original spaces. Block-register rectangular paste remains covered by the
   `regression ` group.
 - Insert Ctrl+W deletes a vim word: dotted names, consecutive punctuation,
   snake_case/digits, paths, CJK/emoji, invalid UTF-8; the multi-cursor
@@ -804,11 +807,17 @@ current frame/mode/cursor plus exact saved bytes):
 - Undo/redo returns the cursor to the actual change; a gated inlay peer
   (`test/fixtures/inlay_gate.py`) proves the three frames: before undo, undo
   applied with the replacement still held (transformed hints stay visible),
-  and after the new response (atomic replacement). Empty stacks do not mark
-  the buffer dirty, and undo emits no full-screen clear.
+  and after the new response (atomic replacement). Hint offsets are
+  transformed in the pre-edit document but re-anchored to line/column only
+  after the history transaction, so line inserts/deletes keep the hint on the
+  target row. Replacement starts are start-affine (a 20-byte replacement
+  starting at offset 2 no longer underflows). Empty stacks do not mark the
+  buffer dirty, and undo emits no full-screen clear.
 - Completion ranking puts exact `line` before count_lines/read_lines/inline,
   then sortText/stable server order; the accepted bytes come from insertText,
-  not label/filterText. A 5000-reversed-sortText case pins O(n log n).
+  not label/filterText. A 5000-reversed-sortText case pins O(n log n). An
+  untouched menu follows the newly-best match on every refresh; only after an
+  explicit Ctrl+n/Ctrl+p/arrow move is the selected semantic identity kept.
 - Completion request lifecycle uses `test/fixtures/completion_gate.py` with
   `received-N`/`release-*`/`delivered-*` file barriers: a late response after
   arrow movement or Esc→re-entering Insert cannot reopen the menu (Ctrl+n

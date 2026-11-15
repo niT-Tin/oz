@@ -15,9 +15,11 @@ import select
 
 barrier = Path(os.environ["OZ_INLAY_BARRIER_DIR"])
 barrier.mkdir(parents=True, exist_ok=True)
+anchor = os.environ.get("OZ_INLAY_ANCHOR", "")
 buffer = bytearray()
 held = []
 count = 0
+document = ""
 
 
 def reply(request_id, value):
@@ -28,8 +30,19 @@ def reply(request_id, value):
 
 
 def hint(count_value):
+    line = 0
+    character = 0
+    if anchor == "target" and "target" in document:
+        # Anchor after the `target` token on its current line. The peer sees
+        # didChange, so this survives the test's insert/undo/redo sequence.
+        for index, text in enumerate(document.split("\n")):
+            pos = text.find("target")
+            if pos >= 0:
+                line = index
+                character = pos + len("target")
+                break
     return {
-        "position": {"line": 0, "character": 0},
+        "position": {"line": line, "character": character},
         "label": ": eol" if count_value == 1 else ": fresh-%d" % count_value,
     }
 
@@ -62,6 +75,12 @@ while True:
         request_id = message.get("id")
         if method == "initialize":
             reply(request_id, {"capabilities": {"textDocumentSync": 2, "inlayHintProvider": True}})
+        elif method == "textDocument/didOpen":
+            document = message["params"]["textDocument"].get("text", "")
+        elif method == "textDocument/didChange":
+            changes = message["params"].get("contentChanges", [])
+            if changes:
+                document = changes[0].get("text", document)
         elif method == "textDocument/inlayHint":
             count += 1
             (barrier / ("request-%d" % count)).write_text("done")
