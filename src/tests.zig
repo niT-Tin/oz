@@ -20,6 +20,8 @@ pub const mode = @import("editor/mode.zig");
 pub const motion = @import("editor/motion.zig");
 pub const edit_range = @import("editor/edit_range.zig");
 pub const line_open = @import("editor/line_open.zig");
+// language-aware Enter/paste indentation (pure; app/lsp_edit.zig + paste glue)
+pub const indent = @import("editor/indent.zig");
 pub const ex_command = @import("editor/ex_command.zig");
 pub const text_object = @import("editor/text_object.zig");
 pub const surround = @import("editor/surround.zig");
@@ -56,6 +58,10 @@ pub const app_animation = @import("app/animation.zig");
 // Status-line model/planner (pure; render.zig owns drawing)
 pub const app_statusline = @import("app/statusline.zig");
 pub const app_completion_layout = @import("app/completion_layout.zig");
+// insert-mode completion request identity (pure context matching rules)
+pub const app_completion_context = @import("app/completion_context.zig");
+// undo/redo inlay-anchor transforms (pure; app/highlight.zig wires them)
+pub const app_inlay_history = @import("app/inlay_history.zig");
 // M2b1 navigator tabs + note store (pure; app/notes.zig is e2e-tested)
 pub const app_navigator = @import("app/navigator.zig");
 pub const app_note_store = @import("app/note_store.zig");

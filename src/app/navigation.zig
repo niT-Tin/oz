@@ -58,6 +58,9 @@ pub fn syncPassiveFocus(self: *App) void {
             prev.agent_focus != now.agent_focus or prev.terminal_focus != now.terminal_focus)
         {
             self.invalidatePassiveHints();
+            // A completion list requested under the old focus must never
+            // reopen after a mouse/keyboard focus switch.
+            self.invalidateCompletionContext();
         }
     }
     self.passive_focus_seen = now;
@@ -76,6 +79,7 @@ pub fn invalidatePassiveHints(self: *App) void {
     self.passive_slot = null;
     if (self.nav_hover_text) |t| self.alloc.free(t);
     self.nav_hover_text = null;
+    self.nav_hover_markdown = false;
 }
 
 /// Renderer-side final defence: the displayed text is tied to the context
@@ -150,13 +154,26 @@ pub fn processPassiveNav(self: *App) bool {
     const captured = ctx orelse return true;
     if (!captured.matches(self.passiveContext())) return true;
     switch (action) {
-        .hover, .signature => {
-            const text = if (action == .hover)
-                lsp_nav.parseHoverText(self.alloc, result) catch null
-            else
-                lsp_nav.parseSignature(self.alloc, result) catch null;
+        .hover => {
+            // Hover keeps the server's markup kind: Markdown (fenced code,
+            // headings) takes the rich popup renderer, plaintext stays
+            // literal — never the other way round.
+            const hover: ?lsp_nav.HoverContent = lsp_nav.parseHover(self.alloc, result) catch null;
+            if (self.nav_hover_text) |t| self.alloc.free(t);
+            self.nav_hover_text = null;
+            self.nav_hover_markdown = false;
+            if (hover) |h| {
+                self.nav_hover_text = h.text;
+                self.nav_hover_markdown = h.kind == .markdown;
+            }
+            const text = self.nav_hover_text;
+            self.nav_hover_ctx = if (text != null and text.?.len > 0) captured else null;
+        },
+        .signature => {
+            const text = lsp_nav.parseSignature(self.alloc, result) catch null;
             if (self.nav_hover_text) |t| self.alloc.free(t);
             self.nav_hover_text = text;
+            self.nav_hover_markdown = false;
             self.nav_hover_ctx = if (text != null and text.?.len > 0) captured else null;
         },
         else => {},

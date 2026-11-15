@@ -10,6 +10,8 @@ const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const autil = @import("util.zig");
 const markdown = @import("markdown.zig");
+const inlay_history = @import("inlay_history.zig");
+const history_mod = @import("../buffer/history.zig");
 
 const Buffer = App.Buffer;
 
@@ -306,6 +308,183 @@ pub fn execOpMotion(self: *App, m: editor.OpMotion) !void {
     try self.applyOpRange(m.op, range.start, range.end, false, false);
 }
 
+/// Public transaction result for `u` / Ctrl-r. The handler is the only
+/// caller today; this explicit shape keeps cursor/range/revision in one
+/// place so e2e and future callers do not re-derive them.
+pub const HistoryOutcome = struct {
+    applied: bool = false,
+    kind: history_mod.UndoKind = .undo,
+    before_cursor: u32 = 0,
+    after_cursor: u32 = 0,
+    change_start: u32 = 0,
+    change_end: u32 = 0,
+    revision: u64 = 0,
+};
+
+/// Clamp a post-undo/redo anchor to a real Insert/Normal position: inside
+/// the document, on a UTF-8 scalar boundary, and never between the \r and \n
+/// of a CRLF terminator.
+fn clampHistoryCursor(self: *App, pos: u32) u32 {
+    const pt = &self.cur().pt;
+    var p: u32 = @min(pos, pt.len());
+    if (p > 0 and p < pt.len()) {
+        while (p > 0 and (pt.byteAt(p) & 0xC0) == 0x80) p -= 1;
+    }
+    const line = pt.lineOf(p);
+    const line_start = pt.lineStart(line);
+    const text_end = line_start + pt.lineTextLen(line);
+    if (p > text_end) p = text_end;
+    return p;
+}
+
+/// Capture the displayed hint anchors as absolute byte offsets in the
+/// CURRENT (pre-operation) document and transform them through the edit
+/// group. The conversion back to line/column MUST happen after the history
+/// transaction, against the new piece table: an undo that inserts/deletes
+/// lines changes line starts and length, so converting before the operation
+/// re-anchors to stale coordinates. Returns null when there is nothing to
+/// transform (or on allocation failure, after the safe invalidate fallback).
+fn captureInlayOffsetsForHistory(
+    self: *App,
+    edits: []const history_mod.Edit,
+    kind: history_mod.UndoKind,
+) ?[]?u32 {
+    if (self.inlay_hints.items.len == 0) return null;
+    if (self.inlay_buf != self.current) return null;
+    if (edits.len == 0) return null;
+    const pt = &self.cur().pt;
+    const spans = self.alloc.alloc(inlay_history.Span, edits.len) catch {
+        self.invalidateInlayHints();
+        return null;
+    };
+    defer self.alloc.free(spans);
+    const lens = self.alloc.alloc(inlay_history.EditLen, edits.len) catch {
+        self.invalidateInlayHints();
+        return null;
+    };
+    defer self.alloc.free(lens);
+    for (edits, lens) |e, *l| {
+        l.* = .{
+            .pos = e.pos,
+            .before_len = @intCast(e.before.len),
+            .after_len = @intCast(e.after.len),
+        };
+    }
+    switch (kind) {
+        .undo => inlay_history.undoSpans(spans, lens),
+        .redo => inlay_history.redoSpans(spans, lens),
+    }
+    const offsets = self.alloc.alloc(?u32, self.inlay_hints.items.len) catch {
+        self.invalidateInlayHints();
+        return null;
+    };
+    for (self.inlay_hints.items, offsets) |h, *off| {
+        const ls = pt.lineStart(h.line);
+        const abs = ls + h.character;
+        off.* = if (abs <= pt.len()) abs else null;
+    }
+    inlay_history.transformOffsets(offsets, spans);
+    return offsets;
+}
+
+/// Re-anchor transformed absolute offsets in the POST-operation document:
+/// validate UTF-8/line bounds, drop dead hints (freeing only their labels),
+/// then compute the new line/byte column. `offsets` maps 1:1 to the hint list
+/// captured before the operation.
+fn applyInlayOffsetsAfterHistory(self: *App, offsets: []const ?u32) void {
+    if (self.inlay_hints.items.len != offsets.len) return;
+    const pt = &self.cur().pt;
+    var write: usize = 0;
+    for (self.inlay_hints.items, offsets) |h, off_opt| {
+        const off = off_opt orelse {
+            self.alloc.free(h.label);
+            continue;
+        };
+        if (off > pt.len()) {
+            self.alloc.free(h.label);
+            continue;
+        }
+        // A transformed anchor must still be a UTF-8 boundary and inside the
+        // line's text (not the CRLF terminator). Otherwise it no longer
+        // describes a drawable position; drop it rather than paint garbage.
+        if (off < pt.len() and (pt.byteAt(off) & 0xC0) == 0x80) {
+            self.alloc.free(h.label);
+            continue;
+        }
+        const line = pt.lineOf(off);
+        const ls = pt.lineStart(line);
+        const character = off -| ls;
+        if (character > pt.lineTextLen(line)) {
+            self.alloc.free(h.label);
+            continue;
+        }
+        self.inlay_hints.items[write] = .{ .line = line, .character = character, .label = h.label };
+        write += 1;
+    }
+    self.inlay_hints.shrinkRetainingCapacity(write);
+}
+
+/// One `u` / Ctrl-r transaction. Empty stacks and refused Agent-set undos do
+/// not touch the dirty flag, LSP sync, inlay hints or cursor.
+pub fn performHistoryStep(self: *App, kind: history_mod.UndoKind) HistoryOutcome {
+    const before_cursor = self.curCursor().*;
+    if (self.in_insert) {
+        self.cur().history.endGroup();
+        self.in_insert = false;
+    }
+    // M3b2 multi-file apply: one cross-file undo unit. `u` in any buffer of
+    // the set restores every file (buffers + disk) instead of undoing just
+    // the current buffer. From an unrelated buffer this returns false.
+    const agent_consumed = switch (kind) {
+        .undo => self.agentPatchUndo(),
+        .redo => self.agentPatchRedo(),
+    };
+    if (agent_consumed) {
+        return .{
+            .applied = true,
+            .kind = kind,
+            .before_cursor = before_cursor,
+            .after_cursor = self.curCursor().*,
+            .revision = self.cur().history.revision,
+        };
+    }
+    const group = switch (kind) {
+        .undo => self.cur().history.topUndoGroup(),
+        .redo => self.cur().history.topRedoGroup(),
+    } orelse return .{ .applied = false, .kind = kind, .before_cursor = before_cursor, .after_cursor = before_cursor, .revision = self.cur().history.revision };
+    // Transform offsets in the pre-edit document, apply the history
+    // transaction, then convert to line/column in the NEW document.
+    const inlay_offsets = captureInlayOffsetsForHistory(self, group.edits.items, kind);
+    defer if (inlay_offsets) |o| self.alloc.free(o);
+    const res = switch (kind) {
+        .undo => self.cur().history.undoResult(&self.cur().pt),
+        .redo => self.cur().history.redoResult(&self.cur().pt),
+    };
+    if (!res.changed) {
+        return .{ .applied = false, .kind = kind, .before_cursor = before_cursor, .after_cursor = before_cursor, .revision = res.revision };
+    }
+    if (inlay_offsets) |o| applyInlayOffsetsAfterHistory(self, o);
+    // A secondary insert cursor is a per-session position; an undo is a
+    // single deterministic transaction, so collapse to the main cursor.
+    if (self.mc_active or self.mc.cursors.items.len > 0) {
+        self.mc.clear();
+        self.mc_active = false;
+    }
+    self.curCursor().* = clampHistoryCursor(self, res.anchor);
+    // Keep the transformed inlay hints rendered; the run loop re-requests
+    // the post-undo band and processInlay atomically replaces the list.
+    self.markDirtyHistory();
+    return .{
+        .applied = true,
+        .kind = kind,
+        .before_cursor = before_cursor,
+        .after_cursor = self.curCursor().*,
+        .change_start = res.change_start,
+        .change_end = res.change_end,
+        .revision = res.revision,
+    };
+}
+
 pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !void {
     switch (action) {
         .repeat_last => {
@@ -320,27 +499,10 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             }
         },
         .undo => {
-            if (self.in_insert) {
-                self.cur().history.endGroup();
-                self.in_insert = false;
-            }
-            // M3b2 multi-file apply: one cross-file undo unit. `u` in any
-            // buffer of the set restores every file (buffers + disk) instead
-            // of undoing just the current buffer. From an unrelated buffer
-            // this returns false and normal per-buffer undo runs.
-            if (self.agentPatchUndo()) return;
-            _ = self.cur().history.undo(&self.cur().pt);
-            self.curCursor().* = @min(self.curCursor().*, self.cur().pt.len());
-            // the document changed: keep LSP/inlay in sync (markDirty
-            // also touches the dirty flag — acceptable for undo, vim
-            // marks the buffer modified after an undo too)
-            self.markDirty();
+            _ = self.performHistoryStep(.undo);
         },
         .redo => {
-            if (self.agentPatchRedo()) return;
-            _ = self.cur().history.redo(&self.cur().pt);
-            self.curCursor().* = @min(self.curCursor().*, self.cur().pt.len());
-            self.markDirty();
+            _ = self.performHistoryStep(.redo);
         },
         .insert_mode => {
             // open the undo group immediately so the whole insert session

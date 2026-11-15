@@ -1743,6 +1743,18 @@ pub fn hoverCodeLineSegs(self: *App, a: std.mem.Allocator, block: []const u8, li
 /// rowAllBg on hover rows). The text slices reference the caller's owned
 /// hover buffer, and the padding is allocator-owned — both outlive the
 /// render call.
+/// Literal one-segment renderer for plaintext hover content. Unlike
+/// hoverLineSegs it never hides Markdown markers or starts fences: a server
+/// that negotiated plaintext (or an unknown contentFormat) must be shown
+/// exactly as sent.
+pub fn hoverPlainLineSegs(self: *App, a: std.mem.Allocator, line: []const u8, cols: u32) ![]vaxis.Segment {
+    const base: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } };
+    const shown = buffer.utf8.truncateWidth(line, cols);
+    const segs = try a.alloc(vaxis.Segment, 1);
+    segs[0] = .{ .text = shown, .style = base };
+    return segs;
+}
+
 pub fn hoverLineSegs(self: *App, a: std.mem.Allocator, line: []const u8, cols: u32) ![]vaxis.Segment {
     var segs = std.ArrayList(vaxis.Segment).empty;
     const base: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } };
@@ -2562,6 +2574,7 @@ pub fn drawRichPopup(
     col0: u32,
     max_rows: u32,
     cols: u32,
+    as_markdown: bool,
 ) !void {
     // Height = number of source lines, capped: a huge hover never covers
     // the buffer and a small one does not leave blank rows.
@@ -2623,13 +2636,15 @@ pub fn drawRichPopup(
             const line_len = if (nl) |i| i else remaining.len;
             try lines.append(a, remaining[0..line_len]);
             if (in_fence == null) {
-                if (autil.isFenceLine(remaining[0..line_len])) |flang| {
+                if (as_markdown) if (autil.isFenceLine(remaining[0..line_len])) |flang| {
                     try kinds.append(a, 1);
                     in_fence = flang;
                     block_start = lines.items.len;
-                } else {
-                    try kinds.append(a, 0);
-                }
+                    } else {
+                        try kinds.append(a, 0);
+                    } else {
+                        try kinds.append(a, 0);
+                    }
             } else {
                 if (autil.isFenceLine(remaining[0..line_len]) != null) {
                     try kinds.append(a, 1);
@@ -2718,7 +2733,10 @@ pub fn drawRichPopup(
                     inner = try self.hoverLineSegs(a, line, cols);
                 }
             },
-            else => inner = try self.hoverLineSegs(a, line, cols),
+            else => inner = if (as_markdown)
+                try self.hoverLineSegs(a, line, cols)
+            else
+                try self.hoverPlainLineSegs(a, line, cols),
         }
         var segs = std.ArrayList(vaxis.Segment).empty;
         try segs.append(a, .{ .text = border, .style = border_style });
@@ -4737,7 +4755,7 @@ pub fn render(self: *App) !void {
                 start_row = (cur_rect.row + h_sp.row) -| hrows;
             }
             const col0 = cur_rect.col + gutter + 1;
-            try self.drawRichPopup(a, win, htext, start_row, col0, 6, 60);
+            try self.drawRichPopup(a, win, htext, start_row, col0, 6, 60, self.nav_hover_markdown);
         }
     }
 

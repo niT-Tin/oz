@@ -17,8 +17,9 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-Current counts after merging the editor-integrity fixes with the AI workspace:
-**604 unit tests** and **241 e2e tests**. `tools/verify.sh` covers diff check,
+Current counts after the 2026-11-15 editing-reliability fixes:
+**738 unit tests** and **316 e2e tests** in the default filters (the three
+opt-in real-ZLS tests skip unless `-Dreal-zls` is supplied). `tools/verify.sh` covers diff check,
 all unit tests and all e2e tests (including Agent-focus, `terminal:` and
 multi-file `approval:`). `tools/verify.sh`
 writes `.verify/unit.log`, `.verify/e2e.log`, and
@@ -692,6 +693,10 @@ Known gaps / deliberate limitations:
   summary line was not parseable (inspect the log).
 - A golden mismatch is not "flaky" unless two runs produce different actual
   frames; compare `.verify/golden/*.actual.txt` across runs before updating.
+- The pty harness pins `PATH=/usr/bin:/bin:/usr/local/bin`. The two `grep
+  picker:` tests discover the user's real `rg` from the test runner's PATH
+  (`grepPathEnv`) because ripgrep is commonly installed under `~/.cargo/bin`;
+  without `rg` they fail with their normal "no matches" diagnostic.
 - Scenario failures print the scenario name and tags, then dump the grid.
 
 ACP regressions use `test/fixtures/acp_agent.py` (Python 3; no network, credentials or model usage). `zig build test` covers argv configuration, fragmented UTF-8, two turns on one session, foreign-session filtering, string permission IDs, allow/reject, malformed JSON, disconnects, version negotiation, remote errors, frame limits and cancellation. `zig build e2e -Dtest-filter='ACP editor'` covers the real Agent panel, permission decisions, cancellation, clean-buffer refresh and dirty-buffer preservation. These fixtures do not replace authenticated compatibility testing against installed Kimi/Codex/DeepSeek versions.
@@ -769,6 +774,68 @@ zig build e2e -Dtest-filter='real ZLS' -Dreal-zls=/absolute/path/to/zls
 
 Both are opt-in and are skipped in the default deterministic suite when no
 server path is supplied.
+
+Editing reliability regressions (2026-11-15 audit):
+`zig build e2e -Dtest-filter='editing reliability:'` (all use the absolute
+freshly built `zig-out/bin/oz`, send CSI arrows as one packet, and assert
+current frame/mode/cursor plus exact saved bytes):
+
+- Insert arrows reach the line-text END insertion point (ASCII, UTF-8, short
+  lines, empty last line) and preserve a vim-style goal column across
+  Up/Down; accepting a completion then walking all four arrows still inserts
+  the sentinel at the accepted end. The full combination
+  accept→arrows→Enter→bracketed paste→Esc→undo/Ctrl-r is byte-exact.
+- Enter is language-aware: `{|}`, `{` at EOL, an already-expanded closer,
+  nested one-liners, string/comment braces (no fake indent), CRLF and one
+  undo group. `src/editor/indent.zig` is pure and also drives paste reindent.
+- Paste reindents bracketed/system-clipboard/internal puts by the current
+  language (Zig/CRLF/tabs; Python/YAML/Markdown/literal bodies stay literal;
+  unknown filetypes verbatim) as one pre-edit transaction/undo group.
+  Charwise `p`/`P` share the same placement plan (at/delete_len/text), so a
+  multi-line put into a whitespace-only line replaces its blank prefix once
+  instead of stacking a second indent; literal/unknown contexts keep the
+  original spaces. Block-register rectangular paste remains covered by the
+  `regression ` group.
+- Insert Ctrl+W deletes a vim word: dotted names, consecutive punctuation,
+  snake_case/digits, paths, CJK/emoji, invalid UTF-8; the multi-cursor
+  `Ctrl-v` path shares the helper and one undo group.
+- Visual `gc` is two keys in v/V/Ctrl-v (never change), comments/uncomments
+  inclusive ranges, keeps blank/CRLF/EOF bytes correct, preserves the
+  unnamed register, exits Visual, and round-trips through undo/redo. Normal
+  `gcc` is unchanged; a filetype without a comment style shows E505 with no
+  edit.
+- Undo/redo returns the cursor to the actual change; a gated inlay peer
+  (`test/fixtures/inlay_gate.py`) proves the three frames: before undo, undo
+  applied with the replacement still held (transformed hints stay visible),
+  and after the new response (atomic replacement). Hint offsets are
+  transformed in the pre-edit document but re-anchored to line/column only
+  after the history transaction, so line inserts/deletes keep the hint on the
+  target row. Replacement starts are start-affine (a 20-byte replacement
+  starting at offset 2 no longer underflows). Empty stacks do not mark the
+  buffer dirty, and undo emits no full-screen clear.
+- Completion ranking puts exact `line` before count_lines/read_lines/inline,
+  then sortText/stable server order; the accepted bytes come from insertText,
+  not label/filterText. A 5000-reversed-sortText case pins O(n log n). An
+  untouched menu follows the newly-best match on every refresh; only after an
+  explicit Ctrl+n/Ctrl+p/arrow move is the selected semantic identity kept.
+- Completion request lifecycle uses `test/fixtures/completion_gate.py` with
+  `received-N`/`release-*`/`delivered-*` file barriers: a late response after
+  arrow movement or Esc→re-entering Insert cannot reopen the menu (Ctrl+n
+  sends request 3 only when the menu is truly closed, a client-visible
+  consumption barrier); a B list/detail stays installed when an older A
+  arrives last; buffer and split-window switches reject a pending request.
+- Hover negotiates `textDocument.hover.contentFormat` (separate from
+  completion `documentationFormat`), preserves MarkupContent kind and legacy
+  MarkedString language fences, renders plaintext literally, and highlights
+  fenced code with real tree-sitter colors. The mock `hover_cap` only returns
+  Markdown when the client advertised it; `real ZLS K hover` asserts actual
+  keyword/type/number cell colors from the real server and movement
+  lifecycle.
+
+Pure L1 groups behind those paths: `insert motion:`, `completion ranking:`,
+`completion context:`, `hover content:`, `initParams: hover`, `indent:`,
+`visual gc:`, `comment:`, `undoResult:`, `inlay transform:`,
+`wordStartBefore`/`bigWordStartBefore`.
 
 Diagnostic range underlines use the server's UTF-16, end-exclusive ranges:
 errors/warnings are colored curls, information dotted and hints dashed. The

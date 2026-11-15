@@ -293,8 +293,10 @@ pub fn mcBackspace(self: *App) !void {
     self.markDirty();
 }
 
-/// Ctrl-w at every visual-block cursor: delete the word before each
-/// cursor (right-to-left); cursors shift like backspace.
+/// Ctrl-w at every visual-block cursor: delete the vim word before each
+/// cursor (right-to-left) using the SAME helper as the single-cursor
+/// insert path (buffer/ops.wordStartBefore: word run vs punctuation run vs
+/// whitespace, UTF-8 safe); cursors shift like backspace.
 pub fn mcDeleteWordBefore(self: *App) !void {
     // safety net: the deletion must join the insert-session group
     if (!self.in_insert) {

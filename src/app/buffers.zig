@@ -43,6 +43,7 @@ pub fn switchTo(self: *App, i: usize) void {
     // command-line exitVisual fallback)
     self.visual_anchor = null;
     self.in_insert = false;
+    self.insert_goal_col = null;
     self.curCursor().* = @min(self.curCursor().*, self.cur().pt.len());
     // per-buffer state from the previous buffer must not leak onto the
     // new one: stale inlay hints would render at wrong positions, stale
@@ -189,6 +190,7 @@ pub fn openInBuffer(self: *App, path: []const u8) !void {
         self.state.mode = .normal;
         self.visual_anchor = null;
         self.in_insert = false;
+        self.insert_goal_col = null;
         self.curCursor().* = 0;
         self.curViewTop().* = 0;
         self.invalidateInlayHints();

@@ -8,6 +8,8 @@ const json_rpc = @import("../util/json_rpc.zig");
 const buffer = @import("../buffer/root.zig");
 const workspace_edit = @import("../lsp/workspace_edit.zig");
 const edit_range = @import("../editor/edit_range.zig");
+const indent = @import("../editor/indent.zig");
+const autil = @import("util.zig");
 
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
@@ -714,10 +716,14 @@ pub fn acceptCompletion(self: *App) !void {
 /// the next one (notably `completion_waiting_enter`, which used to swallow
 /// the first Enter after re-entering insert).
 pub fn closeCompletion(self: *App) void {
+    // End the request identity FIRST: a response that already landed in the
+    // slot is freed by processCompletion and can never reopen this menu.
+    self.invalidateCompletionContext();
     for (self.completion_words.items) |*it| it.deinit(self.alloc);
     self.completion_words.clearRetainingCapacity();
     self.completion_active = false;
     self.completion_sel = 0;
+    self.completion_user_navigated = false;
     self.completion_pos = 0;
     self.completion_manual = false;
     self.completion_waiting_enter = false;
@@ -731,12 +737,13 @@ pub fn closeCompletion(self: *App) void {
     self.completion_doc_scroll = 0;
 }
 
-/// Enter in insert mode (vim semantics): split the current line at the
-/// cursor and carry the original line's leading indentation (the run of
-/// spaces/tabs before the cursor) over to the new line. The cursor lands
-/// right after the carried indentation (insertText advances it). Done as
-/// one edit so it is a single undo step. The split uses the line's own
-/// ending (`\n` / `\r\n`), so a CRLF buffer never acquires a bare LF line.
+/// Enter in insert mode: language-aware structural indentation via the pure
+/// `editor.indent.planEnter` planner (Zig/C-like blocks, Python/YAML colon
+/// rules, copy-indent fallback for unknown/plain text and literals). The
+/// plan is applied as ONE `history.record` inside the insert-session group
+/// (one undo step) with a single pre-edit LSP range [cursor, cursor). A
+/// CRLF buffer keeps its own terminator; the cursor's `cursor_after` may be
+/// before the plan's tail (e.g. the existing aligned `}` closer).
 pub fn insertNewline(self: *App) !void {
     // safety net: the newline insertion must join the insert-session group
     if (!self.in_insert) {
@@ -750,20 +757,62 @@ pub fn insertNewline(self: *App) !void {
     // and \n (stale motions, old files) would otherwise emit "\r\r\n".
     const text_end = line_start + pt.lineTextLen(line);
     if (self.curCursor().* > text_end) self.curCursor().* = text_end;
-    const col = self.curCursor().* - line_start;
-    // leading indentation of the original line, capped at the cursor
-    var indent_end: u32 = 0;
-    while (indent_end < col) : (indent_end += 1) {
-        const b = pt.byteAt(line_start + indent_end);
-        if (b != ' ' and b != '\t') break;
+    const pos = self.curCursor().*;
+    const col = pos - line_start;
+    const ft = autil.filetypeOf(self.cur().path);
+
+    var plan: indent.NewlinePlan = undefined;
+    if (pt.len() <= indent.max_insert_bytes) {
+        const doc = try self.alloc.alloc(u8, pt.len());
+        defer self.alloc.free(doc);
+        if (doc.len > 0) pt.copyRange(0, doc);
+        // Preserve the buffer's indentation style at the edit line (or the
+        // nearest non-blank line above it, so Enter on an empty line inside
+        // a tab-indented block keeps tabs).
+        var cfg = indent.Config{ .indent_width = @intCast(app_mod.tab_width), .use_tabs = false };
+        var style_line = line;
+        var tries: u32 = 0;
+        while (tries < 8) : (tries += 1) {
+            const ls = pt.lineStart(style_line);
+            const len = pt.lineLen(style_line);
+            var i = ls;
+            var non_blank = false;
+            var tab = false;
+            while (i < ls + len) : (i += 1) {
+                const c = doc[i];
+                if (c == '\t') {
+                    tab = true;
+                    break;
+                }
+                if (c != ' ') {
+                    non_blank = true;
+                    break;
+                }
+            }
+            if (tab) {
+                cfg.use_tabs = true;
+                break;
+            }
+            if (non_blank or style_line == 0) break;
+            style_line -= 1;
+        }
+        plan = try indent.planEnter(self.alloc, doc, pos, ft, cfg);
+    } else {
+        // Oversized buffer: bounded fallback to the old copy-indent plan.
+        const ind = try self.leadingIndent(line);
+        defer self.alloc.free(ind);
+        const ending = editor.line_open.preferredEnding(pt, line);
+        const open = try editor.line_open.plan(self.alloc, ending, ind, false);
+        defer open.deinit(self.alloc);
+        plan = .{ .text = try self.alloc.dupe(u8, open.text), .cursor_after = open.cursor_off };
     }
-    const indent = try self.alloc.alloc(u8, @intCast(indent_end));
-    defer self.alloc.free(indent);
-    pt.copyRange(line_start, indent);
-    const ending = editor.line_open.preferredEnding(pt, line);
-    const open = try editor.line_open.plan(self.alloc, ending, indent, false);
-    defer open.deinit(self.alloc);
-    try self.insertText(open.text);
+    defer self.alloc.free(plan.text);
+    // LSP range in the PRE-EDIT document: a pure insert at [pos, pos).
+    const at = self.lspPositionAt(pt, pos);
+    try self.cur().history.record(pt, pos, 0, plan.text);
+    self.curCursor().* = pos + plan.cursor_after;
+    self.adjustInlayHintsInsert(line, col, plan.text);
+    self.markDirtyRange(at, at, plan.text);
 }
 
 /// Ctrl+k in insert mode (emacs kill-line): delete from the cursor to the

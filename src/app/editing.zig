@@ -276,6 +276,13 @@ pub fn isVisual(self: *const App) bool {
 
 /// gcc: comment/uncomment the current line (vim semantics: fully commented
 /// lines get uncommented, otherwise everything is commented).
+///
+/// Visual `gc` (v/V/Ctrl-v) reaches this same function: it toggles every
+/// selected line. On success the selection is consumed (Normal mode, anchor
+/// cleared) and NO yank/delete register is written — the toggle edits through
+/// History only. On an unknown filetype nothing is edited and Visual stays
+/// active with the selection intact (E505 is shown; the `g` prefix was
+/// already consumed by the state machine, so a retry is a fresh `gc`).
 pub fn toggleCommentLine(self: *App) !void {
     const ft = autil.filetypeOf(self.cur().path);
     const style = editor.comment.styleForFiletype(ft) orelse {
@@ -294,10 +301,15 @@ pub fn toggleCommentLine(self: *App) !void {
         from_line;
     const toggle = try editor.comment.toggleLines(self.alloc, &self.cur().pt, from_line, to_line, style);
     defer self.alloc.free(toggle.text);
+    const visual = self.isVisual();
     const start = self.cur().pt.lineStart(from_line);
     const end = self.cur().pt.lineStart(to_line) + self.cur().pt.lineLen(to_line); // toggleLines text excludes the trailing '\n'
     try self.applyEdit(start, end, toggle.text);
     self.curCursor().* = start;
+    // Visual gc consumes the selection: leave Visual, clear the anchor and
+    // any pending prefix state (already reset by Mode when it emitted the
+    // action). Normal-mode gcc has no Visual state and is unchanged.
+    if (visual) self.exitVisual();
 }
 
 pub fn exitVisual(self: *App) void {

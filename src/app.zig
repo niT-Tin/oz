@@ -78,6 +78,11 @@ pub const NavAction = enum { none, hover, definition, declaration, references, i
 /// change even if some future call site forgot to bump the epoch.
 pub const PassiveFocus = struct { focus: u8, ai_focus: u8, agent_focus: bool, terminal_focus: bool };
 
+/// Identity of one insert-mode completion request (pure module: see
+/// app/completion_context.zig). App aliases it so completion.zig can build
+/// contexts without importing app.zig recursively through this file.
+pub const CompletionContext = @import("app/completion_context.zig").Context;
+
 pub const PassiveNavContext = struct {
     epoch: u64,
     buffer_hash: u64,
@@ -578,8 +583,18 @@ pub const App = struct {
     passive_focus_seen: ?PassiveFocus = null,
     /// Insert-session generation (incremented by beginInsertSession).
     insert_session: u64 = 0,
+    /// Vim's `curswant` for Insert-mode Up/Down: the byte column the user
+    /// aimed at. Short target lines clamp the cursor, but the next vertical
+    /// move restores this goal so Up-then-Down returns to the same insertion
+    /// point instead of drifting left by the clamp. Cleared by any other key,
+    /// insert exit and buffer/window switches.
+    insert_goal_col: ?u32 = null,
     /// Owned hover/signature text shown in a floating window (or null).
     nav_hover_text: ?[]u8 = null,
+    /// True when `nav_hover_text` is Markdown (MarkupContent kind or legacy
+    /// MarkedString language content). False means literal plaintext: the
+    /// popup must not interpret fences/backticks/bold markers.
+    nav_hover_markdown: bool = false,
     /// Owned location list for gr/gI (uri strings owned per item).
     nav_locations: std.ArrayList(lsp_nav.NavLocation) = .empty,
     nav_list_active: bool = false,
@@ -695,6 +710,23 @@ pub const App = struct {
     /// Buffer index at request time (belt-and-braces against cross-buffer
     /// responses if a close path is missed).
     completion_req_buf: usize = 0,
+    /// Full identity captured after the in-flight list request was sent.
+    /// processCompletion installs the response only while this still matches
+    /// the current context (buffer/window/cursor/edit_seq/insert session/
+    /// epoch/focus). Null while no list request is pending.
+    completion_req_ctx: ?CompletionContext = null,
+    /// Event-boundary generation for completion contexts. Bumped whenever a
+    /// key observes a context change and whenever a non-key path switches
+    /// buffer/window/focus or closes the menu. A request captured before the
+    /// bump can never revive the menu, even after moving away and back.
+    completion_epoch: u64 = 0,
+    /// Last context observed by the per-key guard (see syncCompletionContext).
+    completion_ctx_seen: ?CompletionContext = null,
+    /// True once the user explicitly moved the completion selection
+    /// (Ctrl+n/Ctrl+p/Up/Down) in this menu session. While false, a refresh
+    /// follows the best-ranked candidate (index 0); while true, the selected
+    /// semantic identity is preserved instead of jumping back to "best".
+    completion_user_navigated: bool = false,
     /// First visible display line of the documentation pane (wrapped rows).
     completion_doc_scroll: u32 = 0,
     /// LSP textDocument/formatting response slot (TextEdit[]).
@@ -1734,6 +1766,10 @@ pub const App = struct {
     pub const processPassiveNav = @import("app/navigation.zig").processPassiveNav;
     pub const passiveContext = @import("app/navigation.zig").passiveContext;
     pub const invalidatePassiveHints = @import("app/navigation.zig").invalidatePassiveHints;
+    // ---- completion request context (insert-mode list lifecycle) ----
+    pub const completionContext = @import("app/completion.zig").completionContext;
+    pub const syncCompletionContext = @import("app/completion.zig").syncCompletionContext;
+    pub const invalidateCompletionContext = @import("app/completion.zig").invalidateCompletionContext;
     pub const navHoverAlive = @import("app/navigation.zig").navHoverAlive;
     pub const syncPassiveFocus = @import("app/navigation.zig").syncPassiveFocus;
     pub const clearNavOverlays = @import("app/navigation.zig").clearNavOverlays;
@@ -1960,6 +1996,7 @@ pub const App = struct {
     pub const lspHandler = @import("app/lsp.zig").lspHandler;
     pub const markDirtyBase = @import("app/lsp.zig").markDirtyBase;
     pub const markDirty = @import("app/lsp.zig").markDirty;
+    pub const markDirtyHistory = @import("app/lsp.zig").markDirtyHistory;
     pub const markDirtyRange = @import("app/lsp.zig").markDirtyRange;
     pub const syncLspFull = @import("app/lsp.zig").syncLspFull;
     // ---- picker → src/app/picker.zig ----
@@ -1998,6 +2035,8 @@ pub const App = struct {
     pub const saveRecent = @import("app/highlight.zig").saveRecent;
     pub const execOpMotion = @import("app/highlight.zig").execOpMotion;
     pub const execAction = @import("app/highlight.zig").execAction;
+    pub const performHistoryStep = @import("app/highlight.zig").performHistoryStep;
+    pub const HistoryOutcome = @import("app/highlight.zig").HistoryOutcome;
     pub const replaceCharsAtCursor = @import("app/highlight.zig").replaceCharsAtCursor;
     // ---- AI workspace → src/app/ai.zig ----
     pub const toggleAiPanel = app_ai.toggleAiPanel;
@@ -2104,6 +2143,7 @@ pub const App = struct {
     pub const hoverBlankSegs = @import("app/render.zig").hoverBlankSegs;
     pub const hoverCodeLineSegs = @import("app/render.zig").hoverCodeLineSegs;
     pub const hoverLineSegs = @import("app/render.zig").hoverLineSegs;
+    pub const hoverPlainLineSegs = @import("app/render.zig").hoverPlainLineSegs;
     pub const drawRichPopup = @import("app/render.zig").drawRichPopup;
     pub const drawStatusChrome = @import("app/render.zig").drawStatusChrome;
     pub const drawBufferTabPlan = @import("app/render.zig").drawBufferTabPlan;

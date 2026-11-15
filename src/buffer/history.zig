@@ -23,6 +23,58 @@ pub const Group = struct {
     }
 };
 
+pub const UndoKind = enum { undo, redo };
+
+/// Result of one undo/redo transaction. All positions are byte offsets in the
+/// document AFTER the operation (so they can be installed directly), except
+/// `revision`, which is the history revision after the operation.
+///
+///   anchor        suggested cursor: change start for undo, change end for
+///                 redo. Callers clamp to a UTF-8 boundary / line end.
+///   change_start  union start of every restored/removed span
+///   change_end    union end (exclusive)
+///
+/// Empty stacks return `changed = false` with `revision` unchanged: callers
+/// must not mark the buffer dirty or invalidate LSP state in that case.
+pub const UndoResult = struct {
+    changed: bool = false,
+    kind: UndoKind = .undo,
+    anchor: u32 = 0,
+    change_start: u32 = 0,
+    change_end: u32 = 0,
+    revision: u64 = 0,
+};
+
+/// Transform one coordinate through a replace transaction that removes
+/// `old_len` bytes at `pos` and inserts `new_len` bytes. Coordinates inside
+/// the removed span collapse to its start; `is_end` selects the collapse
+/// point for a range end (start of the replacement for a start anchor, end
+/// of the replacement for an end anchor).
+fn transformPos(pos: u32, old_len: u32, new_len: u32, at: u32, is_end: bool) u32 {
+    const old_end = pos + old_len;
+    const delta = @as(i64, new_len) - @as(i64, old_len);
+    if (at >= old_end) {
+        const moved = @as(i64, at) + delta;
+        return if (moved < 0) 0 else @intCast(moved);
+    }
+    if (at >= pos) return if (is_end) pos + new_len else pos;
+    return at;
+}
+
+/// Merge the changed span of one applied edit into the running union.
+fn unionSpan(start: *u32, end: *u32, has: *bool, pos: u32, old_len: u32, new_len: u32) void {
+    const new_start = transformPos(pos, old_len, new_len, start.*, false);
+    const new_end = transformPos(pos, old_len, new_len, end.*, true);
+    if (!has.*) {
+        start.* = pos;
+        end.* = pos + new_len;
+        has.* = true;
+        return;
+    }
+    start.* = @min(new_start, pos);
+    end.* = @max(new_end, pos + new_len);
+}
+
 pub const History = struct {
     allocator: std.mem.Allocator,
     undo_stack: std.ArrayList(Group),
@@ -134,38 +186,87 @@ pub const History = struct {
         self.redo_stack.clearRetainingCapacity();
     }
 
-    /// Undo the top group; applies inverse edits in reverse order.
-    /// Returns false when the undo stack is empty.
-    pub fn undo(self: *History, pt: *PieceTable) bool {
-        const g = self.undo_stack.pop() orelse return false;
-        // Apply the inverse of each edit (replace back the `before` bytes),
-        // in reverse recording order.
+    /// Undo the top group and report the transaction span/cursor anchor.
+    /// Applies inverse edits in reverse order. An empty stack returns
+    /// `changed = false` and leaves the revision untouched.
+    pub fn undoResult(self: *History, pt: *PieceTable) UndoResult {
+        const g = self.undo_stack.pop() orelse return .{
+            .changed = false,
+            .kind = .undo,
+            .revision = self.revision,
+        };
+        var start: u32 = 0;
+        var end: u32 = 0;
+        var has = false;
         var i = g.edits.items.len;
         while (i > 0) {
             i -= 1;
             const e = g.edits.items[i];
-            // The API has no error channel and the doc must stay consistent;
-            // a failing replace mid-group is unrecoverable — OOM is fatal in
-            // this codebase (see piece_table.zig's `catch unreachable`).
+            // This step removes `after` and restores `before` at e.pos.
+            unionSpan(&start, &end, &has, e.pos, @intCast(e.after.len), @intCast(e.before.len));
             _ = pt.replace(e.pos, @intCast(e.after.len), e.before) catch unreachable;
         }
         self.redo_stack.append(self.allocator, g) catch unreachable;
         self.revision += 1;
         self.last_record = null; // undo has no single-edit description
-        return true;
+        if (!has) {
+            start = 0;
+            end = 0;
+        }
+        return .{
+            .changed = true,
+            .kind = .undo,
+            .anchor = start,
+            .change_start = start,
+            .change_end = end,
+            .revision = self.revision,
+        };
     }
 
-    /// Redo the top redo group. Returns false when empty.
-    pub fn redo(self: *History, pt: *PieceTable) bool {
-        const g = self.redo_stack.pop() orelse return false;
-        // Replay the edits in forward order (replace back the `after` bytes).
+    /// Undo the top group; applies inverse edits in reverse order.
+    /// Returns false when the undo stack is empty.
+    pub fn undo(self: *History, pt: *PieceTable) bool {
+        return self.undoResult(pt).changed;
+    }
+
+    /// Redo the top redo group and report the transaction span/cursor anchor.
+    /// An empty stack returns `changed = false` and leaves the revision
+    /// untouched.
+    pub fn redoResult(self: *History, pt: *PieceTable) UndoResult {
+        const g = self.redo_stack.pop() orelse return .{
+            .changed = false,
+            .kind = .redo,
+            .revision = self.revision,
+        };
+        var start: u32 = 0;
+        var end: u32 = 0;
+        var has = false;
         for (g.edits.items) |e| {
+            // This step removes `before` and re-inserts `after` at e.pos.
+            unionSpan(&start, &end, &has, e.pos, @intCast(e.before.len), @intCast(e.after.len));
             _ = pt.replace(e.pos, @intCast(e.before.len), e.after) catch unreachable;
         }
         self.undo_stack.append(self.allocator, g) catch unreachable;
         self.revision += 1;
         self.last_record = null;
-        return true;
+        if (!has) {
+            start = 0;
+            end = 0;
+        }
+        return .{
+            .changed = true,
+            .kind = .redo,
+            // Redo lands after the re-inserted text, like vim's Ctrl-R.
+            .anchor = end,
+            .change_start = start,
+            .change_end = end,
+            .revision = self.revision,
+        };
+    }
+
+    /// Redo the top redo group. Returns false when empty.
+    pub fn redo(self: *History, pt: *PieceTable) bool {
+        return self.redoResult(pt).changed;
     }
 
     pub fn canUndo(self: *const History) bool {
@@ -174,6 +275,20 @@ pub const History = struct {
 
     pub fn canRedo(self: *const History) bool {
         return self.redo_stack.items.len > 0;
+    }
+
+    /// Borrow the group that `undoResult` would apply. Used by the inlay-hint
+    /// transform, which must map anchors through the SAME edits before the
+    /// document changes. Valid until the next History mutation.
+    pub fn topUndoGroup(self: *const History) ?*const Group {
+        const n = self.undo_stack.items.len;
+        return if (n == 0) null else &self.undo_stack.items[n - 1];
+    }
+
+    /// Borrow the group that `redoResult` would replay.
+    pub fn topRedoGroup(self: *const History) ?*const Group {
+        const n = self.redo_stack.items.len;
+        return if (n == 0) null else &self.redo_stack.items[n - 1];
     }
 };
 
@@ -557,4 +672,123 @@ test "random ops: mirror-consistent undo/redo (fixed seed)" {
     defer alloc.free(final_check);
     pt.copyRange(0, final_check);
     try std.testing.expectEqualSlices(u8, final_doc, final_check);
+}
+
+// ---- UndoResult transaction contract (issue 7) ----------------------------
+
+test "undoResult: single insert reports changed span and start anchor" {
+    var pt = try PieceTable.init(std.testing.allocator, "hello world");
+    defer pt.deinit();
+    var hist = History.init(std.testing.allocator);
+    defer hist.deinit();
+
+    const rev_before = hist.revision;
+    try hist.record(&pt, 5, 0, " cruel");
+    const res = hist.undoResult(&pt);
+    try std.testing.expect(res.changed);
+    try std.testing.expectEqual(UndoKind.undo, res.kind);
+    try std.testing.expectEqual(@as(u32, 5), res.anchor);
+    try std.testing.expectEqual(@as(u32, 5), res.change_start);
+    try std.testing.expectEqual(@as(u32, 5), res.change_end);
+    try std.testing.expectEqual(rev_before + 2, res.revision);
+    try std.testing.expectEqual(rev_before + 2, hist.revision);
+    try expectDoc(&pt, std.testing.allocator, "hello world");
+
+    const redo = hist.redoResult(&pt);
+    try std.testing.expect(redo.changed);
+    try std.testing.expectEqual(UndoKind.redo, redo.kind);
+    try std.testing.expectEqual(@as(u32, 11), redo.anchor);
+    try std.testing.expectEqual(@as(u32, 5), redo.change_start);
+    try std.testing.expectEqual(@as(u32, 11), redo.change_end);
+    try expectDoc(&pt, std.testing.allocator, "hello cruel world");
+}
+
+test "undoResult: empty stacks do not change the revision and keep the anchor" {
+    var pt = try PieceTable.init(std.testing.allocator, "abc");
+    defer pt.deinit();
+    var hist = History.init(std.testing.allocator);
+    defer hist.deinit();
+
+    const u = hist.undoResult(&pt);
+    try std.testing.expect(!u.changed);
+    try std.testing.expectEqual(@as(u64, 0), u.revision);
+    try std.testing.expectEqual(@as(u32, 0), u.anchor);
+    const r = hist.redoResult(&pt);
+    try std.testing.expect(!r.changed);
+    try std.testing.expectEqual(@as(u64, 0), r.revision);
+    try expectDoc(&pt, std.testing.allocator, "abc");
+}
+
+test "undoResult: multi-edit group reports the union in the post-op document" {
+    var pt = try PieceTable.init(std.testing.allocator, "abcd");
+    defer pt.deinit();
+    var hist = History.init(std.testing.allocator);
+    defer hist.deinit();
+
+    hist.beginGroup();
+    try hist.record(&pt, 1, 0, "X"); // aXbcd
+    try hist.record(&pt, 3, 0, "Y"); // aXbYcd
+    hist.endGroup();
+    try expectDoc(&pt, std.testing.allocator, "aXbYcd");
+
+    const res = hist.undoResult(&pt);
+    try std.testing.expect(res.changed);
+    try expectDoc(&pt, std.testing.allocator, "abcd");
+    // Touched region spans from the first restore point through the shifted
+    // second one; both endpoints lie on the final document.
+    try std.testing.expectEqual(@as(u32, 1), res.anchor);
+    try std.testing.expectEqual(@as(u32, 1), res.change_start);
+    try std.testing.expectEqual(@as(u32, 2), res.change_end);
+    try std.testing.expect(res.change_start <= res.change_end);
+    try std.testing.expect(res.change_end <= pt.len());
+
+    const redo = hist.redoResult(&pt);
+    try std.testing.expect(redo.changed);
+    try expectDoc(&pt, std.testing.allocator, "aXbYcd");
+    try std.testing.expectEqual(@as(u32, 4), redo.anchor);
+    try std.testing.expectEqual(@as(u32, 1), redo.change_start);
+    try std.testing.expectEqual(@as(u32, 4), redo.change_end);
+    try std.testing.expect(redo.change_end <= pt.len());
+}
+
+test "undoResult: deletion undo anchor is the restore start; redo anchor its end" {
+    var pt = try PieceTable.init(std.testing.allocator, "one two three");
+    defer pt.deinit();
+    var hist = History.init(std.testing.allocator);
+    defer hist.deinit();
+
+    try hist.record(&pt, 4, 3, ""); // delete "two" -> "one  three"
+    try expectDoc(&pt, std.testing.allocator, "one  three");
+
+    const undo = hist.undoResult(&pt);
+    try std.testing.expect(undo.changed);
+    try std.testing.expectEqual(@as(u32, 4), undo.anchor);
+    try std.testing.expectEqual(@as(u32, 4), undo.change_start);
+    try std.testing.expectEqual(@as(u32, 7), undo.change_end);
+    try expectDoc(&pt, std.testing.allocator, "one two three");
+
+    const redo = hist.redoResult(&pt);
+    try std.testing.expect(redo.changed);
+    try std.testing.expectEqual(@as(u32, 4), redo.anchor);
+    try std.testing.expectEqual(@as(u32, 4), redo.change_start);
+    try std.testing.expectEqual(@as(u32, 4), redo.change_end);
+    try expectDoc(&pt, std.testing.allocator, "one  three");
+}
+
+test "undoResult: UTF-8 bytes stay whole and anchors are byte offsets" {
+    var pt = try PieceTable.init(std.testing.allocator, "a中b");
+    defer pt.deinit();
+    var hist = History.init(std.testing.allocator);
+    defer hist.deinit();
+
+    // Insert an emoji (4 bytes) after 中: "a中🙂b".
+    try hist.record(&pt, 4, 0, "🙂");
+    const undo = hist.undoResult(&pt);
+    try std.testing.expectEqual(@as(u32, 4), undo.anchor);
+    try std.testing.expectEqual(@as(u32, 4), undo.change_end);
+    try expectDoc(&pt, std.testing.allocator, "a中b");
+    const redo = hist.redoResult(&pt);
+    try std.testing.expectEqual(@as(u32, 8), redo.anchor);
+    try std.testing.expectEqual(@as(u32, 8), redo.change_end);
+    try expectDoc(&pt, std.testing.allocator, "a中🙂b");
 }

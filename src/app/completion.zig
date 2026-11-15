@@ -8,6 +8,58 @@ const theme = @import("../theme.zig");
 
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
+const term = @import("../term.zig");
+
+// ---- completion request context (insert-mode list lifecycle) ----
+
+/// Current identity of the insert-completion context. `epoch` is bumped by
+/// every observed transition (see syncCompletionContext) so moving away and
+/// back to the same byte cannot revive an old response.
+pub fn completionContext(self: *App) app_mod.CompletionContext {
+    return .{
+        .epoch = self.completion_epoch,
+        .buffer = self.current,
+        .window = self.current_win,
+        .cursor = self.curCursor().*,
+        .edit_seq = self.edit_seq,
+        .insert_session = self.insert_session,
+        .mode = @backingInt(self.state.mode),
+        .focus = @backingInt(self.focus),
+        .ai_focus = @backingInt(self.ai.focus),
+        .agent_focus = self.ai.agent_focus,
+        .terminal_focus = if (term.supported)
+            (self.term_pane != null and self.term_pane.?.focused)
+        else
+            false,
+    };
+}
+
+/// Called at the start of every key event (before dispatch). If the context
+/// changed since the previous event, bump the epoch: a pending completion
+/// response was requested for a state the user has already left. An
+/// unchanged context keeps the epoch (typing refreshes capture the NEW
+/// context after the request, so their own edit does not invalidate them).
+pub fn syncCompletionContext(self: *App) void {
+    const now = self.completionContext();
+    if (self.completion_ctx_seen) |prev| {
+        if (!prev.sameWithoutEpoch(now)) {
+            self.completion_epoch +%= 1;
+            self.completion_ctx_seen = self.completionContext();
+            return;
+        }
+    }
+    self.completion_ctx_seen = self.completionContext();
+}
+
+/// End the current completion request context: close/accept, insert exit,
+/// buffer/window switch or focus change. The in-flight raw slot is owned by
+/// the client drain path; processCompletion frees it and drops the result
+/// because completion_req_ctx is null.
+pub fn invalidateCompletionContext(self: *App) void {
+    self.completion_epoch +%= 1;
+    self.completion_ctx_seen = null;
+    self.completion_req_ctx = null;
+}
 
 // ---- insert-mode keyword completion (Ctrl+n) ----
 
@@ -129,6 +181,9 @@ pub fn requestLspCompletion(self: *App, c: anytype, no_prefix: bool) !void {
     defer lsp_nav.freeTextDocPositionParams(self.alloc, &params);
     c.request("textDocument/completion", params, &self.completion_slot) catch return;
     self.completion_req_seq = self.edit_seq;
+    // Capture the FINAL identity after the request was queued. Any later
+    // movement/close/exit/focus change invalidates it (epoch or fields).
+    self.completion_req_ctx = self.completionContext();
 }
 
 /// True when the just-typed `text` is one of the server's completion
@@ -185,13 +240,17 @@ pub fn processCompletion(self: *App) bool {
         json_rpc.freeValue(self.alloc, &result);
         self.completion_slot = null;
     }
-    // Stale: the text changed after the request (fast typing) or the
-    // user left insert mode (e.g. Esc before the response landed). Keep
-    // the current items — the next keystroke sends a fresh request.
+    // Stale: the context the request was issued for is no longer current
+    // (movement, close/accept, insert exit, buffer/window/focus switch), or
+    // the text changed after the request (fast typing). Keep the current
+    // items — the next keystroke sends a fresh request.
     // The manual request's response is still consumed, so Enter must be
     // unblocked (otherwise it would stay stuck on "completion pending…"
     // forever with no menu to open).
-    if (self.edit_seq != self.completion_req_seq or self.state.mode != .insert or
+    const captured = self.completion_req_ctx;
+    self.completion_req_ctx = null;
+    if (captured == null or !captured.?.matches(self.completionContext()) or
+        self.edit_seq != self.completion_req_seq or self.state.mode != .insert or
         self.completion_req_buf != self.current)
     {
         self.completion_waiting_enter = false;
@@ -211,38 +270,57 @@ pub fn processCompletion(self: *App) bool {
     self.completion_words.clearRetainingCapacity();
     self.completion_generation +%= 1;
     lsp_nav.parseCompletionItems(self.alloc, result, &self.completion_words) catch {};
-    // Client-side filter: servers like zls return the FULL candidate set
-    // and leave matching to the client (blink/nvim do the same via
-    // filterText/label). Substring match, case-insensitive — loose like
-    // fuzzy matching; without this the menu would show the same
-    // unfiltered list no matter what you type.
-    if (self.completion_words.items.len > 0 and self.completion_pos < self.curCursor().*) {
+    // Client-side filtering AND ranking: servers like zls return the FULL
+    // candidate set and leave matching to the client (blink/nvim do the same
+    // via filterText/label). Matching uses filterText (never the display
+    // label); non-matches are dropped first, then the survivors are
+    // stable-sorted by match quality (exact > case-insensitive exact >
+    // prefix > word-boundary substring > substring), server sortText
+    // (present before absent, ascending) and finally original server order.
+    // This happens BEFORE installing the list and before the selection /
+    // truncation decision, so index 0 is the best candidate and a refresh
+    // keeps the user's selected identity instead of jumping back to "best".
+    // An empty typed prefix (trigger completion, e.g. after "b.") is neutral:
+    // only sortText and the stable server order decide. Local buffer-word
+    // completion (collectCompletionWords) keeps its explicit frequency
+    // ordering — it is a caller-sorted list and the stable sort preserves it.
+    var typed_buf: [256]u8 = undefined;
+    var typed: []const u8 = "";
+    if (self.completion_pos < self.curCursor().*) {
         const typed_len = self.curCursor().* - self.completion_pos;
-        var typed_buf: [256]u8 = undefined;
-        if (typed_len <= 256) {
+        if (typed_len <= typed_buf.len) {
             self.cur().pt.copyRange(self.completion_pos, typed_buf[0..typed_len]);
-            const typed = typed_buf[0..typed_len];
-            var write: usize = 0;
-            for (self.completion_words.items) |*it| {
-                if (containsIgnoreCase(it.filterText(), typed)) {
-                    self.completion_words.items[write] = it.*;
-                    write += 1;
-                } else {
-                    it.deinit(self.alloc);
-                }
-            }
-            self.completion_words.shrinkRetainingCapacity(write);
+            typed = typed_buf[0..typed_len];
         }
     }
+    if (typed.len > 0 and self.completion_words.items.len > 0) {
+        var write: usize = 0;
+        for (self.completion_words.items) |*it| {
+            if (lsp_nav.completionMatchScore(typed, it) > 0) {
+                self.completion_words.items[write] = it.*;
+                write += 1;
+            } else {
+                it.deinit(self.alloc);
+            }
+        }
+        self.completion_words.shrinkRetainingCapacity(write);
+    }
+    lsp_nav.sortCompletionItems(self.alloc, self.completion_words.items, typed);
     if (self.completion_words.items.len > 0) {
         self.invalidatePassiveHints();
         self.completion_active = true;
         var next_sel: usize = 0;
         var same_selection = false;
-        if (prev_id) |want| {
-            if (lsp_nav.completionSelection(self.completion_words.items, want, prev_key.?)) |i| {
-                next_sel = i;
-                same_selection = true;
+        // A refresh with no explicit user navigation follows the new best
+        // match (index 0). Only after Ctrl+n/Ctrl+p/arrow selection do we
+        // preserve the previously selected semantic identity across a
+        // re-ranked refresh.
+        if (self.completion_user_navigated) {
+            if (prev_id) |want| {
+                if (lsp_nav.completionSelection(self.completion_words.items, want, prev_key.?)) |i| {
+                    next_sel = i;
+                    same_selection = true;
+                }
             }
         }
         const selection_changed = !same_selection;
@@ -261,6 +339,7 @@ pub fn processCompletion(self: *App) bool {
         // semicolon" confusion).
         self.completion_active = false;
         self.completion_sel = 0;
+        self.completion_user_navigated = false;
         if (self.completion_manual) {
             self.setMsg(self.alloc.dupe(u8, "no candidates") catch return true) catch {};
         }
@@ -429,6 +508,9 @@ pub fn completionDocsVisible(self: *App) bool {
 pub fn moveCompletion(self: *App, delta: isize) void {
     const n = self.completion_words.items.len;
     if (n == 0) return;
+    // Explicit navigation: from now on refreshes preserve this semantic
+    // candidate instead of following the newly-best match.
+    self.completion_user_navigated = true;
     const cur: isize = @intCast(self.completion_sel);
     self.completion_sel = @intCast(@mod(cur + delta, @as(isize, @intCast(n))));
     self.completion_doc_scroll = 0;
