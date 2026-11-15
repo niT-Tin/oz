@@ -3,8 +3,8 @@
 //! Inputs are measured in terminal cells by the renderer; this module only
 //! decides rectangles inside the focused pane. Rules:
 //!   * the menu stays next to the cursor and flips above near the bottom;
-//!   * documentation prefers the right of the menu, then the left, then below
-//!     or above (never on top of the menu);
+//!   * documentation sits immediately to the right of the menu; the pair
+//!     shifts together to fit, and narrow panes degrade to menu-only;
 //!   * every rectangle is clamped to the pane (Agent rail / splits are not
 //!     available space);
 //!   * the visible row count and maximum scroll are derived from the chosen
@@ -32,7 +32,7 @@ pub const Rect = struct {
     }
 };
 
-pub const Side = enum { right, left, below, above, none };
+pub const Side = enum { right, none };
 
 pub const Options = struct {
     /// Focused editor pane (screen cells; border-exclusive is fine).
@@ -83,13 +83,21 @@ pub fn visibleMenuRows(pane_rect: Rect, cursor: u32, requested: u32) u32 {
     return if (slot.height >= 3) slot.height - 2 else 0;
 }
 
+/// Leave a readable right-hand documentation column on normal-width panes.
+/// The renderer uses the same budget when fitting its label/detail columns,
+/// so shortening the rectangle never draws unshortened rows over its border.
+pub fn menuWidthBudget(width: u32, has_docs: bool, min_doc_width: u32) u32 {
+    if (!has_docs or width < 64 or width < min_doc_width + 22) return width;
+    return @min(width - min_doc_width - 2, width * 3 / 5);
+}
+
 pub fn plan(o: Options) Plan {
     var out = Plan{ .menu = undefined };
     if (o.pane.width == 0 or o.pane.height == 0 or o.menu_width == 0 or o.menu_rows == 0) {
         out.menu = .{ .row = o.pane.row, .col = o.pane.col, .width = 0, .height = 0 };
         return out;
     }
-    const menu_w = @min(o.menu_width, o.pane.width);
+    const menu_w = @min(o.menu_width, menuWidthBudget(o.pane.width, o.doc_total_rows > 0, o.min_doc_width));
     const slot = menuSlot(o.pane, o.cursor_row, o.menu_rows);
     if (menu_w < 3 or slot.height < 3) {
         out.menu = .{ .row = o.pane.row, .col = o.pane.col, .width = 0, .height = 0 };
@@ -108,57 +116,25 @@ pub fn plan(o: Options) Plan {
     const max_w = o.pane.width -| 2;
     const want_w = @min(o.doc_width, max_w);
 
-    // Right of the menu, aligned with its top.
-    const right_space = o.pane.right() -| (out.menu.right() + 2);
-    if (right_space >= o.min_doc_width + 2) {
-        const w = @min(want_w, right_space - 2);
-        const avail_rows = o.pane.bottom() -| (menu_row + 1);
-        if (avail_rows >= 4) {
-            const rows = @min(doc_rows, avail_rows - 2);
-            out.doc = .{ .row = menu_row, .col = out.menu.right() + 2, .width = w + 2, .height = rows + 2 };
-            out.side = .right;
-            out.doc_visible_rows = rows;
-            out.scroll_max = o.doc_total_rows - rows;
-            return out;
-        }
-    }
-
-    // Left of the menu.
-    const left_space = out.menu.col -| (o.pane.col + 2);
-    if (left_space >= o.min_doc_width + 2) {
-        const w = @min(want_w, left_space - 2);
-        const avail_rows = o.pane.bottom() -| (menu_row + 1);
-        if (avail_rows >= 4) {
-            const rows = @min(doc_rows, avail_rows - 2);
-            out.doc = .{ .row = menu_row, .col = out.menu.col - (w + 4), .width = w + 2, .height = rows + 2 };
-            out.side = .left;
-            out.doc_visible_rows = rows;
-            out.scroll_max = o.doc_total_rows - rows;
-            return out;
-        }
-    }
-
-    // Below / above the menu, full pane width.
-    const full_w = @min(want_w, max_w);
-    const full_col = o.pane.col + (o.pane.width - (full_w + 2)) / 2;
-    const below_rows = o.pane.bottom() -| (out.menu.bottom() + 1);
-    if (below_rows >= 4) {
-        const rows = @min(doc_rows, below_rows - 2);
-        out.doc = .{ .row = out.menu.bottom() + 1, .col = full_col, .width = full_w + 2, .height = rows + 2 };
-        out.side = .below;
-        out.doc_visible_rows = rows;
-        out.scroll_max = o.doc_total_rows - rows;
-        return out;
-    }
-    const above_rows = out.menu.row -| (o.pane.row + 1);
-    if (above_rows >= 4) {
-        const rows = @min(doc_rows, above_rows - 2);
-        out.doc = .{ .row = out.menu.row - (rows + 3), .col = full_col, .width = full_w + 2, .height = rows + 2 };
-        out.side = .above;
-        out.doc_visible_rows = rows;
-        out.scroll_max = o.doc_total_rows - rows;
-        return out;
-    }
+    // Treat both panels as one contiguous horizontal pair. Planning only the
+    // menu first made an otherwise wide pane choose a left/below fallback;
+    // reserving and clamping the pair keeps explanation on the right at any
+    // cursor column. Adjacent border cells have no intervening blank column.
+    const available = o.pane.width -| menu_w;
+    if (available < o.min_doc_width + 2) return out;
+    const doc_w = @min(want_w + 2, available);
+    const pair_w = menu_w + doc_w;
+    out.menu.col = std.math.clamp(o.cursor_col, o.pane.col, o.pane.right() - pair_w);
+    var avail_rows = o.pane.bottom() -| menu_row;
+    // When a bottom-edge menu flips above the caret, a tall right panel must
+    // not extend back down over the caret after the pair shifts left.
+    if (menu_row < o.cursor_row) avail_rows = @min(avail_rows, o.cursor_row - menu_row);
+    if (avail_rows < 3) return out;
+    const rows = @min(doc_rows, avail_rows - 2);
+    out.doc = .{ .row = menu_row, .col = out.menu.right(), .width = doc_w, .height = rows + 2 };
+    out.side = .right;
+    out.doc_visible_rows = rows;
+    out.scroll_max = o.doc_total_rows - rows;
     return out;
 }
 
@@ -181,7 +157,7 @@ test "completion layout: doc prefers the right and stays inside the pane" {
         .doc_total_rows = 10,
     });
     try t.expectEqual(Side.right, p.side);
-    try t.expect(p.doc.col >= p.menu.right());
+    try t.expectEqual(p.menu.right(), p.doc.col);
     try t.expect(p.doc.right() <= pane().right());
     try t.expect(p.doc.bottom() <= pane().bottom());
     try t.expect(!Rect.overlaps(p.menu, p.doc));
@@ -204,10 +180,9 @@ test "completion layout: long docs scroll within the visible rectangle" {
     try t.expect(p.doc.bottom() <= pane().bottom());
 }
 
-test "completion layout: narrow right side falls back to left or below, never overlap" {
+test "completion layout: pair shifts left and trims the menu to keep docs on the right" {
     const t = std.testing;
-    // Menu is wide and near the right edge: no room on either side, so the
-    // docs go below.
+    // A wide menu and a right-edge caret still leave a readable right column.
     const p = plan(.{
         .pane = .{ .row = 0, .col = 0, .width = 80, .height = 24 },
         .cursor_row = 4,
@@ -217,7 +192,8 @@ test "completion layout: narrow right side falls back to left or below, never ov
         .doc_width = 60,
         .doc_total_rows = 12,
     });
-    try t.expectEqual(Side.below, p.side);
+    try t.expectEqual(Side.right, p.side);
+    try t.expectEqual(p.menu.right(), p.doc.col);
     try t.expect(!Rect.overlaps(p.menu, p.doc));
     try t.expect(p.doc.right() <= 80);
     try t.expect(p.doc.bottom() <= 24);
@@ -254,13 +230,12 @@ test "completion layout: no documentation space degrades to menu only" {
     try t.expect(p.menu.bottom() <= 12);
 }
 
-test "completion layout: stacked docs include both borders in a 50-cell pane" {
+test "completion layout: 50-cell panes degrade to menu-only instead of detached docs" {
     const r = Rect{ .row = 2, .col = 30, .width = 50, .height = 26 };
     const p = plan(.{ .pane = r, .cursor_row = 2, .cursor_col = 30, .menu_width = 46, .menu_rows = 8, .doc_total_rows = 20 });
-    try std.testing.expectEqual(Side.below, p.side);
-    try std.testing.expectEqual(r.col, p.doc.col);
-    try std.testing.expectEqual(r.width, p.doc.width);
-    try std.testing.expectEqual(r.right(), p.doc.right());
+    try std.testing.expectEqual(Side.none, p.side);
+    try std.testing.expectEqual(@as(u32, 0), p.doc.width);
+    try std.testing.expectEqual(@as(u32, 46), p.menu.width);
 }
 
 test "completion layout: tiny and split panes keep every border and the caret in bounds" {
@@ -280,6 +255,9 @@ test "completion layout: tiny and split panes keep every border and the caret in
                         try std.testing.expect(p.doc.col >= r.col and p.doc.right() <= r.right());
                         try std.testing.expect(p.doc.row >= r.row and p.doc.bottom() <= r.bottom());
                         try std.testing.expect(!Rect.overlaps(p.menu, p.doc));
+                        try std.testing.expectEqual(Side.right, p.side);
+                        try std.testing.expectEqual(p.menu.right(), p.doc.col);
+                        try std.testing.expect(caret < p.doc.row or caret >= p.doc.bottom() or column < p.doc.col or column >= p.doc.right());
                         try std.testing.expectEqual(p.doc.height - 2, p.doc_visible_rows);
                     }
                 }
