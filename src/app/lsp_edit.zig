@@ -9,6 +9,7 @@ const buffer = @import("../buffer/root.zig");
 const workspace_edit = @import("../lsp/workspace_edit.zig");
 const edit_range = @import("../editor/edit_range.zig");
 const indent = @import("../editor/indent.zig");
+const inlay_edit = @import("highlight.zig");
 const autil = @import("util.zig");
 
 const app_mod = @import("../app.zig");
@@ -734,8 +735,11 @@ pub fn acceptCompletion(self: *App) !void {
     // LSP range in the PRE-EDIT document: [pos, replace_end) → word.
     const start_pos = self.lspPositionAt(pt, pos);
     const end_pos = self.lspPositionAt(pt, replace_end);
+    const hint_offsets = inlay_edit.captureInlayOffsetsForReplace(self, pos, replace_end - pos, @intCast(word.len));
+    defer if (hint_offsets) |offsets| self.alloc.free(offsets);
     try self.cur().history.record(pt, pos, replace_end - pos, word);
     self.curCursor().* = pos + @as(u32, @intCast(word.len));
+    if (hint_offsets) |offsets| inlay_edit.applyInlayOffsetsAfterHistory(self, offsets);
     self.markDirtyRange(start_pos, end_pos, word);
     self.closeCompletion();
     if (continue_path) try self.maybeAutoComplete("/");

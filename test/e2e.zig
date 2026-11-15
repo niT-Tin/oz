@@ -27612,3 +27612,49 @@ test "path completion: delayed semantic resolve cannot revive over a path menu o
     defer a.free(bytes);
     try std.testing.expectEqualStrings("./fixture_file.txt", bytes);
 }
+
+test "path completion: accept transforms one-shot inlay anchors before any refresh" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const cases = [_]struct { initial: []const u8, target: []const u8 }{
+        .{ .initial = "fi", .target = "filename_long.txt" },
+        .{ .initial = "filename_obsolete_suffix.txt", .target = "file.txt" },
+    };
+    for (cases) |c| {
+        const source = try std.fmt.allocPrint(a, "const path = \"./{s}\";\nconst tail = 0;\n", .{c.initial});
+        defer a.free(source);
+        var fx = try startCompletionMock(io, a, "inlay_eol", source, 30, 120);
+        defer fx.deinit(io, a);
+        try aiWriteFile(io, fx.root, c.target, "target");
+        var grid = try Grid.initSizedCols(a, 30, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&fx.sess, &grid, ": eol", 8000);
+        try std.testing.expect(grid.contains("[NORMAL]"));
+        try fx.sess.send("f\"5li\x0e");
+        try gridWaitFor(&fx.sess, &grid, c.target, 5000);
+        try fx.sess.send("\r");
+        const expected_line = try std.fmt.allocPrint(a, "const path = \"./{s}\";", .{c.target});
+        defer a.free(expected_line);
+        const cursor_marker = try std.fmt.allocPrint(a, "L1:C{d}", .{expected_line.len - 2});
+        defer a.free(cursor_marker);
+        try gridWaitFor(&fx.sess, &grid, cursor_marker, 3000);
+        // Stay in the SAME Insert session. The mock answers inlayHint only
+        // once, so a new response cannot conceal a missing local transform.
+        const row = findRow(&grid, "const path") orelse return error.TestUnexpectedResult;
+        const src_col = aiCellIndexOf(&grid, row, expected_line) orelse {
+            grid.dump();
+            return error.TestUnexpectedResult;
+        };
+        const hint_col = aiCellIndexOf(&grid, row, ": eol") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(src_col + expected_line.len, hint_col);
+        try std.testing.expect(grid.contains("[INSERT]"));
+        try fx.sess.send("\x03");
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":wq\r"));
+        const bytes = try readDiskFile(io, a, fx.path);
+        defer a.free(bytes);
+        const expected = try std.fmt.allocPrint(a, "{s}\nconst tail = 0;\n", .{expected_line});
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, bytes);
+    }
+}

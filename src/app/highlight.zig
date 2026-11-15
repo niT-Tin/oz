@@ -337,6 +337,24 @@ fn clampHistoryCursor(self: *App, pos: u32) u32 {
     return p;
 }
 
+/// Capture anchors BEFORE a single replacement. The returned transformed
+/// offsets must be applied only AFTER the document edit succeeds; converting
+/// them against the old document would clamp a shifted EOL hint into text.
+pub fn captureInlayOffsetsForReplace(self: *App, pos: u32, removed: u32, inserted: u32) ?[]?u32 {
+    if (self.inlay_hints.items.len == 0 or self.inlay_buf != self.current) return null;
+    const pt = &self.cur().pt;
+    const offsets = self.alloc.alloc(?u32, self.inlay_hints.items.len) catch {
+        self.invalidateInlayHints();
+        return null;
+    };
+    const span = inlay_history.Span{ .pos = pos, .removed = removed, .inserted = inserted };
+    for (self.inlay_hints.items, offsets) |h, *off| {
+        const abs = pt.lineStart(h.line) + h.character;
+        off.* = if (abs <= pt.len()) inlay_history.transformOffset(abs, span) else null;
+    }
+    return offsets;
+}
+
 /// Capture the displayed hint anchors as absolute byte offsets in the
 /// CURRENT (pre-operation) document and transform them through the edit
 /// group. The conversion back to line/column MUST happen after the history
@@ -391,7 +409,7 @@ fn captureInlayOffsetsForHistory(
 /// validate UTF-8/line bounds, drop dead hints (freeing only their labels),
 /// then compute the new line/byte column. `offsets` maps 1:1 to the hint list
 /// captured before the operation.
-fn applyInlayOffsetsAfterHistory(self: *App, offsets: []const ?u32) void {
+pub fn applyInlayOffsetsAfterHistory(self: *App, offsets: []const ?u32) void {
     if (self.inlay_hints.items.len != offsets.len) return;
     const pt = &self.cur().pt;
     var write: usize = 0;
