@@ -27372,3 +27372,23 @@ test "editing input: Note F handles legacy and Kitty shifted command and target"
     defer a.free(saved);
     try std.testing.expectEqualStrings("body_OoneYtwo\n", saved);
 }
+
+test "editing input: quote pairs never manufacture a third quote" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const cases = [_]struct { label: []const u8, text: []const u8, keys: []const u8, want: []const u8 }{
+        .{ .label = "word double pair", .text = "word\n", .keys = "A\"\"", .want = "word\"\"\n" },
+        .{ .label = "word backtick pair", .text = "word\n", .keys = "A``", .want = "word``\n" },
+        .{ .label = "word apostrophe pair", .text = "word\n", .keys = "A''", .want = "word''\n" },
+        .{ .label = "first double quote pairs", .text = "word\n", .keys = "A\"", .want = "word\"\"\n" },
+        .{ .label = "first backtick pairs", .text = "word\n", .keys = "A`", .want = "word``\n" },
+        .{ .label = "contraction", .text = "don\n", .keys = "A't", .want = "don't\n" },
+        .{ .label = "existing string closes literally", .text = "\"abc\n", .keys = "A\"", .want = "\"abc\"\n" },
+        .{ .label = "escaped quote stays literal", .text = "foo\\\n", .keys = "A\"", .want = "foo\\\"\n" },
+        .{ .label = "apostrophe within word", .text = "ab\n", .keys = "li'", .want = "a'b\n" },
+        .{ .label = "non ASCII word apostrophes", .text = "中\n", .keys = "A''", .want = "中''\n" },
+        .{ .label = "empty pair backspace", .text = "\n", .keys = "i\"\x7f", .want = "\n" },
+        .{ .label = "pair undo is atomic", .text = "word\n", .keys = "A\"\"\x03u", .want = "word\n" },
+    };
+    for (cases) |c| try erEditorCase(io, a, c.label, c.text, c.keys, c.want);
+}
