@@ -1555,3 +1555,17 @@ test "completion dedup: object order is ignored but edits, data and documentatio
     try std.testing.expectEqualStrings("two", items.items[3].insertText());
     try std.testing.expectEqualStrings("different docs", items.items[4].doc.?);
 }
+
+test "navigation: hover preserves commentary and links after multiple code fences" {
+    const a = std.testing.allocator;
+    const text = "```zig\npub fn openFile() File\n```\n\nOpens a file. 中文\n[Go to File](file:///tmp/File.zig)\n```zig\nconst flags = .{};\n```\nFINAL_DOCUMENTATION";
+    const payload = try std.json.Stringify.valueAlloc(a, .{ .contents = .{ .kind = "markdown", .value = text } }, .{});
+    defer a.free(payload);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, payload, .{});
+    defer parsed.deinit();
+    var hover = (try parseHover(a, parsed.value)).?;
+    defer hover.deinit(a);
+    try std.testing.expectEqual(HoverKind.markdown, hover.kind);
+    try std.testing.expectEqualStrings(text, hover.text);
+    try std.testing.expect(std.mem.endsWith(u8, hover.text, "FINAL_DOCUMENTATION"));
+}

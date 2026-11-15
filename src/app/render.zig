@@ -25,6 +25,7 @@ const chrome = @import("chrome.zig");
 const statusline = @import("statusline.zig");
 const completion = @import("completion.zig");
 const completion_layout = @import("completion_layout.zig");
+const hover_layout = @import("hover_layout.zig");
 const server_config = @import("../lsp/server_config.zig");
 const tabstrip = @import("tabstrip.zig");
 const animation = @import("animation.zig");
@@ -2808,6 +2809,60 @@ pub fn drawRichPopup(
     }
 }
 
+/// Natural width is capped by the pane, but short hover payloads do not
+/// become a mostly empty 80-column panel. Measure rendered link labels and
+/// hide fence markers before spending columns on their transport syntax.
+fn hoverDocumentColumns(self: *App, a: std.mem.Allocator, win: vaxis.Window, text: []const u8, pane: completion_layout.Rect) !u32 {
+    var natural: u32 = 0;
+    var lines = std.mem.splitScalar(u8, hover_layout.bytePrefix(text, 256 * 1024), '\n');
+    var fenced = false;
+    while (lines.next()) |line| {
+        if (self.nav_hover_markdown and autil.isFenceLine(line) != null) {
+            fenced = !fenced;
+            continue;
+        }
+        const shown = if (self.nav_hover_markdown and !fenced) try hover_layout.readableLinks(a, line) else line;
+        natural = @max(natural, @as(u32, @intCast(autil.cellWidth(win, shown))));
+        if (natural >= 80) break;
+    }
+    return hover_layout.columns(pane, natural);
+}
+
+fn drawHoverDocument(self: *App, a: std.mem.Allocator, win: vaxis.Window, text: []u8, pane: completion_layout.Rect, cursor_row: u32, cursor_col: u32) !void {
+    self.nav_hover_visible_rows = 0;
+    self.nav_hover_scroll_max = 0;
+    const cols = try hoverDocumentColumns(self, a, win, text, pane);
+    if (cols == 0) return;
+    // Borrowed adapter: no deinit, because nav_hover_text owns the payload.
+    const item = lsp_nav.CompletionItem{ .label = @constCast(""), .doc = text, .doc_kind = if (self.nav_hover_markdown) .markdown else .plaintext };
+    const rows = try buildRichDocRows(self, a, win, &item, cols, .{ .max_rows = 2048, .max_bytes = 256 * 1024 });
+    const layout = hover_layout.plan(pane, cursor_row, cursor_col, @intCast(rows.len), cols);
+    self.nav_hover_visible_rows = layout.visible_rows;
+    self.nav_hover_scroll_max = layout.scroll_max;
+    self.nav_hover_scroll = @min(self.nav_hover_scroll, layout.scroll_max);
+    if (layout.visible_rows == 0) return;
+    const rect = layout.rect;
+    const outer = win.child(.{ .x_off = @intCast(rect.col), .y_off = @intCast(rect.row), .width = @intCast(rect.width), .height = @intCast(rect.height) });
+    const style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
+    outer.fill(.{ .style = .{ .bg = .{ .rgb = self.theme.bg_float } } });
+    for (0..rect.width) |c| {
+        outer.writeCell(@intCast(c), 0, .{ .char = .{ .grapheme = if (c == 0) "╭" else if (c + 1 == rect.width) "╮" else "─", .width = 1 }, .style = style });
+        outer.writeCell(@intCast(c), @intCast(rect.height - 1), .{ .char = .{ .grapheme = if (c == 0) "╰" else if (c + 1 == rect.width) "╯" else "─", .width = 1 }, .style = style });
+    }
+    for (0..layout.visible_rows) |row| {
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        try segs.append(a, .{ .text = "│", .style = style });
+        try segs.appendSlice(a, rows[self.nav_hover_scroll + row]);
+        try segs.append(a, .{ .text = "│", .style = style });
+        _ = outer.print(segs.items, .{ .row_offset = @intCast(row + 1), .wrap = .none });
+    }
+    if (layout.scroll_max > 0) {
+        const footer = try std.fmt.allocPrint(a, " {d}-{d}/{d}  ^F/^B ", .{ self.nav_hover_scroll + 1, self.nav_hover_scroll + layout.visible_rows, rows.len });
+        const n = @min(footer.len, cols);
+        for (0..n) |i| outer.writeCell(@intCast(i + 1), @intCast(rect.height - 1), .{ .char = .{ .grapheme = footer[i .. i + 1], .width = 1 }, .style = style });
+    }
+}
+
 /// Human name of the configured language server for a filetype (`zig` →
 /// `zls`), so the status line reports the service that is actually running,
 /// not the buffer's language. Falls back to the language when no server is
@@ -3232,6 +3287,7 @@ fn appendFencedBlockRows(
     lines: *std.ArrayList([]const u8),
     lang: []const u8,
     width: u32,
+    max_rows: usize,
 ) !bool {
     if (lines.items.len == 0) return true;
     var block = std.ArrayList(u8).empty;
@@ -3250,7 +3306,7 @@ fn appendFencedBlockRows(
     for (lines.items, offsets.items) |line, off| {
         const chunks = try wrapCompletionLine(a, win, line, width);
         for (chunks) |chunk| {
-            if (rows.items.len >= 256) return false;
+            if (rows.items.len >= max_rows) return false;
             const chunk_off = off + @as(u32, @intCast(@intFromPtr(chunk.ptr) - @intFromPtr(line.ptr)));
             try rows.append(a, try completionCodeRowFromBlock(
                 self,
@@ -3270,12 +3326,19 @@ fn appendFencedBlockRows(
 /// Build the wrapped display rows for the completion documentation popup:
 /// syntax-highlighted signature header, divider, then Markdown/plaintext
 /// body. Returns a slice of rows, each exactly `width` cells wide.
-fn buildCompletionDocRows(
+const RichDocLimits = struct { max_rows: usize = 256, max_bytes: usize = 64 * 1024 };
+
+fn buildCompletionDocRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, item: *const lsp_nav.CompletionItem, width: u32) ![]const []vaxis.Segment {
+    return buildRichDocRows(self, a, win, item, width, .{});
+}
+
+fn buildRichDocRows(
     self: *App,
     a: std.mem.Allocator,
     win: vaxis.Window,
     item: *const lsp_nav.CompletionItem,
     width: u32,
+    limits: RichDocLimits,
 ) ![]const []vaxis.Segment {
     var rows = std.ArrayList([]vaxis.Segment).empty;
     if (width == 0) return rows.toOwnedSlice(a);
@@ -3325,11 +3388,8 @@ fn buildCompletionDocRows(
     }
 
     if (has_body) {
-        var body = item.doc.?;
-        if (body.len > 64 * 1024) {
-            body = body[0 .. 64 * 1024];
-            while (body.len > 0 and (body[body.len - 1] & 0xC0) == 0x80) body = body[0 .. body.len - 1];
-        }
+        var body: []const u8 = item.doc.?;
+        body = hover_layout.bytePrefix(body, limits.max_bytes);
         var in_fence: ?[]const u8 = null;
         var fence_lines = std.ArrayList([]const u8).empty;
         defer fence_lines.deinit(a);
@@ -3338,8 +3398,8 @@ fn buildCompletionDocRows(
         // rows is far more than the pane can show, and the pane still
         // scrolls through all of it.
         var truncated_rows = false;
-        while (line_it.next()) |raw_line| {
-            if (rows.items.len >= 256) {
+        body_lines: while (line_it.next()) |raw_line| {
+            if (rows.items.len >= limits.max_rows) {
                 truncated_rows = true;
                 break;
             }
@@ -3350,7 +3410,7 @@ fn buildCompletionDocRows(
                         in_fence = lang;
                     } else {
                         // Closing fence: highlight the whole block once.
-                        if (!try appendFencedBlockRows(self, a, win, &rows, &fence_lines, in_fence.?, width)) {
+                        if (!try appendFencedBlockRows(self, a, win, &rows, &fence_lines, in_fence.?, width, limits.max_rows)) {
                             truncated_rows = true;
                             break;
                         }
@@ -3366,19 +3426,32 @@ fn buildCompletionDocRows(
                     try fence_lines.append(a, line);
                     continue;
                 }
-                const chunks = try wrapCompletionWords(a, win, line, width);
-                for (chunks) |chunk| try rows.append(a, try self.hoverLineSegs(a, chunk, width));
+                const readable = try hover_layout.readableLinks(a, line);
+                const chunks = try wrapCompletionWords(a, win, readable, width);
+                for (chunks) |chunk| {
+                    if (rows.items.len >= limits.max_rows) {
+                        truncated_rows = true;
+                        break :body_lines;
+                    }
+                    try rows.append(a, try self.hoverLineSegs(a, chunk, width));
+                }
                 continue;
             }
             // plaintext: preserve literal stars/backticks; word-wrap only at
             // spaces so prose stays readable.
             const chunks = try wrapCompletionWords(a, win, line, width);
-            for (chunks) |chunk| try rows.append(a, try completionLiteralRow(self, a, win, chunk, width, base));
+            for (chunks) |chunk| {
+                if (rows.items.len >= limits.max_rows) {
+                    truncated_rows = true;
+                    break :body_lines;
+                }
+                try rows.append(a, try completionLiteralRow(self, a, win, chunk, width, base));
+            }
         }
         if (in_fence) |lang| {
-            if (!try appendFencedBlockRows(self, a, win, &rows, &fence_lines, lang, width)) truncated_rows = true;
+            if (!try appendFencedBlockRows(self, a, win, &rows, &fence_lines, lang, width, limits.max_rows)) truncated_rows = true;
         }
-        if (item.doc.?.len > 64 * 1024 or truncated_rows) {
+        if (item.doc.?.len > limits.max_bytes or truncated_rows) {
             try rows.append(a, try completionLiteralRow(self, a, win, "… documentation truncated", width, dim));
         }
     } else if (sig == null) {
@@ -4883,24 +4956,34 @@ pub fn render(self: *App) !void {
         }
     }
 
-    // LSP hover / signature floating window: a small box below the
-    // cursor line (≤6 rows, ≤60 cols) showing nav_hover_text. Markdown
-    // fences and inline tokens are rendered by drawRichPopup.
+    // Explicit K documentation owns a pane-bounded, scrollable rich-text
+    // viewport. Automatic signatures retain their short passive window.
     if (self.nav_hover_text) |htext| {
         if (htext.len > 0 and self.navHoverAlive()) {
-            const h_line = self.cur().pt.lineOf(self.curCursor().*);
-            var hrows: u32 = 1;
-            for (htext) |c| {
-                if (c == '\n') hrows += 1;
+            if (self.nav_hover_action == .hover) {
+                const line = self.cur().pt.lineOf(self.curCursor().*);
+                const pos = self.focusedScreenPos(win, cur_rect, line, self.curCursor().*);
+                try drawHoverDocument(self, a, win, htext, .{
+                    .row = cur_rect.row,
+                    .col = cur_rect.col,
+                    .width = cur_rect.width,
+                    .height = cur_rect.height,
+                }, cur_rect.row + pos.row, cur_rect.col + gutter + pos.col);
+            } else {
+                const h_line = self.cur().pt.lineOf(self.curCursor().*);
+                var hrows: u32 = 1;
+                for (htext) |c| {
+                    if (c == '\n') hrows += 1;
+                }
+                hrows = @min(hrows, 6);
+                const h_sp = self.focusedScreenPos(win, cur_rect, h_line, self.curCursor().*);
+                var start_row = cur_rect.row + h_sp.row + 1;
+                if (start_row + hrows >= height) {
+                    start_row = (cur_rect.row + h_sp.row) -| hrows;
+                }
+                const col0 = cur_rect.col + gutter + 1;
+                try self.drawRichPopup(a, win, htext, start_row, col0, 6, 60, self.nav_hover_markdown);
             }
-            hrows = @min(hrows, 6);
-            const h_sp = self.focusedScreenPos(win, cur_rect, h_line, self.curCursor().*);
-            var start_row = cur_rect.row + h_sp.row + 1;
-            if (start_row + hrows >= height) {
-                start_row = (cur_rect.row + h_sp.row) -| hrows;
-            }
-            const col0 = cur_rect.col + gutter + 1;
-            try self.drawRichPopup(a, win, htext, start_row, col0, 6, 60, self.nav_hover_markdown);
         }
     }
 
@@ -5435,7 +5518,10 @@ pub fn run(self: *App) !void {
                     // Left press = click, wheel = scroll. Motion/drag/
                     // release/unbound buttons return false, so moving the
                     // mouse cannot cause renders or steal terminal selection.
-                    if (try self.handleMouse(m)) handled = true;
+                    if (try self.handleMouse(m)) {
+                        self.prev_insert_key = null;
+                        handled = true;
+                    }
                 },
                 .key_press => |key| {
                     handled = true;
@@ -5456,6 +5542,7 @@ pub fn run(self: *App) !void {
                 },
                 .paste_start => {
                     handled = true;
+                    self.prev_insert_key = null;
                     self.pasting = true;
                     self.paste_buf.clearRetainingCapacity();
                 },

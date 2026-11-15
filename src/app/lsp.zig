@@ -266,6 +266,9 @@ pub fn markDirtyBasePreserveInlays(self: *App) void {
 }
 
 fn markDirtyBaseImpl(self: *App, invalidate_inlays: bool) void {
+    // Paste, completion and external edits invalidate a pending j too.
+    // Direct typing re-arms it only after the j insertion has succeeded.
+    self.prev_insert_key = null;
     self.cur().dirty = true;
     self.edit_seq += 1;
     // A text edit ends the old passive hint context (displayed text and any

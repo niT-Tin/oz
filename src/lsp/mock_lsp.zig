@@ -91,6 +91,8 @@ pub const Script = enum {
     /// returns kind "plaintext" with no fence (like ZLS). This prevents a
     /// canned-markdown mock from hiding a missing capability negotiation.
     hover_cap,
+    hover_long,
+    hover_unclosed_cap,
     /// Completion ranking fixture: the server returns the reported bad order
     /// count_lines, read_lines, line, inline; every item has a distinct
     /// insertText so the accepted bytes prove insertText was used and the
@@ -152,6 +154,8 @@ pub const Script = enum {
         if (std.mem.eql(u8, name, "inlay_eol")) return .inlay_eol;
         if (std.mem.eql(u8, name, "rich")) return .rich;
         if (std.mem.eql(u8, name, "hover_cap")) return .hover_cap;
+        if (std.mem.eql(u8, name, "hover_long")) return .hover_long;
+        if (std.mem.eql(u8, name, "hover_unclosed_cap")) return .hover_unclosed_cap;
         if (std.mem.eql(u8, name, "completion_order")) return .completion_order;
         if (std.mem.eql(u8, name, "inlay_param")) return .inlay_param;
         if (std.mem.eql(u8, name, "inlay_indent")) return .inlay_indent;
@@ -1106,6 +1110,33 @@ pub fn initializeHoverMarkdownCap(params: ?std.json.Value) bool {
 fn buildHoverResult(a: std.mem.Allocator, script: Script, state: *State) !std.json.Value {
     var contents = try std.json.ObjectMap.init(a, &.{}, &.{});
     try contents.put(a, "kind", .{ .string = "markdown" });
+    if (script == .hover_unclosed_cap) {
+        var doc = std.ArrayList(u8).empty;
+        try doc.appendSlice(a, "```zig\n");
+        for (0..2200) |i| {
+            const line = try std.fmt.allocPrint(a, "const cap_{d}: usize = {d};\n", .{ i, i });
+            try doc.appendSlice(a, line);
+        }
+        try doc.appendSlice(a, "UNREACHABLE_AFTER_CAP");
+        try contents.put(a, "value", .{ .string = doc.items });
+        var result = try std.json.ObjectMap.init(a, &.{}, &.{});
+        try result.put(a, "contents", .{ .object = contents });
+        return .{ .object = result };
+    }
+    if (script == .hover_long) {
+        var doc = std.ArrayList(u8).empty;
+        try doc.appendSlice(a, "```zig\npub fn openFile(\n    self: Dir,\n    io: Io,\n    sub_path: []const u8,\n    flags: OpenFlags,\n) OpenError!File\n```\n\nOpens a file. HOVER_FIRST_DOC\n[Go to OpenFlags](file:///tmp/OpenFlags.zig)\n");
+        for (0..36) |i| {
+            const para = try std.fmt.allocPrint(a, "Paragraph {d}: complete documentation keeps Unicode 中文 and emoji 🐱 visible without cutting long prose at the old sixty-column boundary.\n", .{i});
+            try doc.appendSlice(a, para);
+        }
+        try doc.appendSlice(a, "```zig\nconst nested_doc_value: usize = 42;\n```\nHOVER_LAST_DOC\n");
+        try contents.put(a, "kind", .{ .string = if (state.hover_force_plaintext) "plaintext" else "markdown" });
+        try contents.put(a, "value", .{ .string = doc.items });
+        var result = try std.json.ObjectMap.init(a, &.{}, &.{});
+        try result.put(a, "contents", .{ .object = contents });
+        return .{ .object = result };
+    }
     if (script == .hover_cap) {
         // The negotiated format decides the payload: markdown gets a fenced
         // zig block (real syntax colors); plaintext stays literal prose with

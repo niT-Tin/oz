@@ -613,6 +613,12 @@ pub const App = struct {
     /// MarkedString language content). False means literal plaintext: the
     /// popup must not interpret fences/backticks/bold markers.
     nav_hover_markdown: bool = false,
+    /// Explicit K docs own a scroll viewport; automatic signature hints stay
+    /// short and never consume Normal paging keys.
+    nav_hover_action: NavAction = .none,
+    nav_hover_scroll: u32 = 0,
+    nav_hover_visible_rows: u32 = 0,
+    nav_hover_scroll_max: u32 = 0,
     /// Owned location list for gr/gI (uri strings owned per item).
     nav_locations: std.ArrayList(lsp_nav.NavLocation) = .empty,
     nav_list_active: bool = false,
@@ -1852,6 +1858,7 @@ pub const App = struct {
     pub const syncCompletionContext = @import("app/completion.zig").syncCompletionContext;
     pub const invalidateCompletionContext = @import("app/completion.zig").invalidateCompletionContext;
     pub const navHoverAlive = @import("app/navigation.zig").navHoverAlive;
+    pub const scrollHover = @import("app/navigation.zig").scrollHover;
     pub const syncPassiveFocus = @import("app/navigation.zig").syncPassiveFocus;
     pub const clearNavOverlays = @import("app/navigation.zig").clearNavOverlays;
     pub const clearHover = @import("app/navigation.zig").clearHover;
