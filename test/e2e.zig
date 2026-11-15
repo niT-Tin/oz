@@ -28140,11 +28140,29 @@ test "editing reliability: paste reindents by language in one undo group" {
     }
 }
 
+/// A write barrier must observe this stage's bytes, not a `written:`/NORMAL
+/// marker left by an older frame. Drain the real PTY while waiting so output
+/// backpressure cannot prevent the command from reaching the save handler.
+fn erWaitSavedBytes(sess: *Session, grid: *Grid, alloc: std.mem.Allocator, path: []const u8, expected: []const u8) !void {
+    const deadline = std.Io.Timestamp.now(sess.io, .awake).nanoseconds + 5000 * std.time.ns_per_ms;
+    while (std.Io.Timestamp.now(sess.io, .awake).nanoseconds < deadline) {
+        const bytes = try erRead(sess.io, alloc, path);
+        const equal = std.mem.eql(u8, bytes, expected);
+        alloc.free(bytes);
+        if (equal) return;
+        try gridDrain(sess, grid, 20);
+    }
+    grid.dump();
+    return error.SavedBytesTimeout;
+}
+
 test "editing reliability: linewise p reindents pasted lines and undo is one group" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
+    const initial = "fn f() {\n    a();\n}\nif (ok) {\ncall();\n}\n";
+    const expected = "fn f() {\n    a();\n    if (ok) {\n        call();\n    }\n}\nif (ok) {\ncall();\n}\n";
     var name_buf: [192:0]u8 = undefined;
-    const name = try erFixture(io, &name_buf, ".zig", "fn f() {\n    a();\n}\nif (ok) {\ncall();\n}\n");
+    const name = try erFixture(io, &name_buf, ".zig", initial);
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     var sess = try erStart(io, alloc, name, 30, 100);
     defer sess.close();
@@ -28152,21 +28170,28 @@ test "editing reliability: linewise p reindents pasted lines and undo is one gro
     var grid = try Grid.initSizedCols(alloc, 30, 100);
     defer grid.deinit(alloc);
     try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
-    // Yank the top-level block linewise, p it below `a();` inside the
-    // function: the put must be reindented to the surrounding block.
+    // Yank the top-level block linewise, then p below a() inside the fn.
+    // /10 is unique to the post-put document; NORMAL alone could match the
+    // initial /7 frame. The command already stays in Normal: a redundant
+    // bare ESC immediately before ':' can be decoded as Alt+':' by vaxis.
     try sess.send("3jVjjyggjp");
-    // The grid renders 8-space indentation as two indent guides, so assert
-    // the saved bytes after leaving the put (the semantic result).
-    try gridDrain(&sess, &grid, 300);
-    try sess.send("\x1b");
-    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+    try gridWaitFor(&sess, &grid, "/10 col", 5000);
+    try sess.send(":w\r");
+    try erWaitSavedBytes(&sess, &grid, alloc, name, expected);
+
+    // Really prove the stated undo contract: ONE u removes the complete put
+    // and its reindent, preserving every original line. Check saved bytes,
+    // not indent-guide glyphs, then redo the same transaction.
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "/7 col", 5000);
+    try sess.send(":w\r");
+    try erWaitSavedBytes(&sess, &grid, alloc, name, initial);
+    try sess.send("\x12");
+    try gridWaitFor(&sess, &grid, "/10 col", 5000);
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
     const saved = try erRead(io, alloc, name);
     defer alloc.free(saved);
-    try std.testing.expectEqualStrings(
-        "fn f() {\n    a();\n    if (ok) {\n        call();\n    }\n}\nif (ok) {\ncall();\n}\n",
-        saved,
-    );
+    try std.testing.expectEqualStrings(expected, saved);
 }
 
 test "editing reliability: late completion after movement or re-insert cannot reopen the menu" {
