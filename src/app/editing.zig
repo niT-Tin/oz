@@ -80,7 +80,7 @@ pub fn autoPairBackspace(self: *App) !bool {
     const col = start - self.cur().pt.lineStart(line);
     const start_pos = self.lspPositionAt(&self.cur().pt, start);
     const end_pos = self.lspPositionAt(&self.cur().pt, start + 2);
-    try self.cur().history.record(&self.cur().pt, start, 2, "");
+    try self.recordEdit(start, 2, "");
     self.curCursor().* = start;
     self.adjustInlayHintsDelete(line, col, &[_]u8{ open, closer });
     self.markDirtyRange(start_pos, end_pos, "");
@@ -139,7 +139,7 @@ pub fn applyOpRangeEx(self: *App, op: editor.KeyEvent.ActionId, from: u32, to: u
             const end_pos = self.lspPositionAt(&self.cur().pt, end);
             try self.setRegister(start, end, linewise);
             self.cur().history.beginGroup();
-            try self.cur().history.record(&self.cur().pt, start, end - start, "");
+            try self.recordEdit(start, end - start, "");
             self.cur().history.endGroup();
             self.curCursor().* = start;
             // deleting the last real line lands on the phantom empty
@@ -159,7 +159,7 @@ pub fn applyOpRangeEx(self: *App, op: editor.KeyEvent.ActionId, from: u32, to: u
             try self.setRegister(start, end, linewise);
             self.curCursor().* = start;
             self.cur().history.beginGroup();
-            try self.cur().history.record(&self.cur().pt, start, end - start, "");
+            try self.recordEdit(start, end - start, "");
             self.state.mode = .insert;
             self.in_insert = true; // keep the group open; exitInsert closes it
             self.markDirtyRange(start_pos, end_pos, "");
@@ -262,7 +262,7 @@ pub fn applyEdit(self: *App, start: u32, end: u32, text: []const u8) !void {
     const start_pos = self.lspPositionAt(&self.cur().pt, start);
     const end_pos = self.lspPositionAt(&self.cur().pt, end);
     self.cur().history.beginGroup();
-    try self.cur().history.record(&self.cur().pt, start, end - start, text);
+    try self.recordEdit(start, end - start, text);
     self.cur().history.endGroup();
     self.markDirtyRange(start_pos, end_pos, text);
 }
@@ -366,7 +366,7 @@ pub fn mcChangeWords(self: *App) !void {
         const w = self.mc.wordRange(pt, pos);
         if (w.end <= w.start) continue; // no word at this cursor → skip it
         const wlen = w.end - w.start;
-        try self.cur().history.record(pt, pos, wlen, "");
+        try self.recordEdit(pos, wlen, "");
         // shift every other cursor at/after the deleted range back; the
         // cursor at `pos` (a word start) stays put
         for (self.mc.cursors.items, 0..) |*c, j| {

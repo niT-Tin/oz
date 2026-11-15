@@ -277,11 +277,10 @@ fn markDirtyBaseImpl(self: *App, invalidate_inlays: bool) void {
     // server analyzes the new document instead of attaching them to new code.
     self.clearDiagnostics();
     self.diag_dirty = true;
-    // Any edit drops this buffer's fold set (all folds re-open): edit
-    // line shifts would otherwise leave the closed-fold start lines
-    // pointing at stale text, and shifting ranges per edit is not worth
-    // it — re-folding with zM costs one indent scan.
-    self.cur().folds.clearRetainingCapacity();
+    // Closed folds are NOT dropped here: each edit transforms the explicit
+    // fold anchors/ranges through the edit sequence before this bookkeeping
+    // runs (see app/fold_edit.zig + editor/fold.zig). Clearing them turned
+    // every unrelated edit into a full unfold + visible layout jump.
     // The visible text changed: the git gutter marks (buffer-vs-HEAD) are
     // stale until the run loop re-diffs once typing quiesces.
     self.gitMarksStaleNow();

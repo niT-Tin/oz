@@ -9,6 +9,7 @@ const buffer = @import("../buffer/root.zig");
 const workspace_edit = @import("../lsp/workspace_edit.zig");
 const edit_range = @import("../editor/edit_range.zig");
 const indent = @import("../editor/indent.zig");
+const fold = @import("../editor/fold.zig");
 const autil = @import("util.zig");
 
 const app_mod = @import("../app.zig");
@@ -145,12 +146,17 @@ const EditPlan = struct {
     prepared: workspace_edit.Prepared,
     new_buffer: ?App.Buffer = null,
     installed: bool = false,
+    /// Closed folds carried through this whole-document replacement,
+    /// re-anchored against the prepared text BEFORE installation (no
+    /// fallible work may run after the first buffer is installed).
+    folds: ?std.ArrayList(fold.Closed) = null,
 
     fn deinit(self: *EditPlan, app: *App) void {
         if (self.path) |p| app.alloc.free(p);
         app.alloc.free(self.buffer_uri);
         if (!self.installed) self.prepared.deinit(app.alloc);
         if (self.new_buffer) |*b| app.deinitBuffer(b);
+        if (self.folds) |*f| f.deinit(app.alloc);
     }
 };
 
@@ -239,9 +245,16 @@ fn planDocument(self: *App, doc: workspace_edit.Document) !?EditPlan {
         new_buffer.?.disk = try @import("../buffer/file.zig").Baseline.init(self.alloc, self.io, path, old);
         try workspace_edit.Prepared.reserve(&new_buffer.?.history);
     }
+    // Whole-document replacement (the Prepared swaps the piece table): carry
+    // the existing closed folds through by matching header text against the
+    // post-edit document. Precomputed here so installation stays fallible-free.
+    var planned_folds: std.ArrayList(fold.Closed) = .empty;
+    errdefer planned_folds.deinit(self.alloc);
+    if (index) |i| try planned_folds.appendSlice(self.alloc, self.buffers.items[i].folds.items);
+    if (planned_folds.items.len > 0) try fold.reanchor(self.alloc, &planned_folds, &prepared.pt);
     own_uri = false;
     own_path = false;
-    return .{ .path = path, .buffer_uri = buffer_uri, .text = prepared.group.edits.items[0].after, .buffer_index = index, .prepared = prepared, .new_buffer = new_buffer };
+    return .{ .path = path, .buffer_uri = buffer_uri, .text = prepared.group.edits.items[0].after, .buffer_index = index, .prepared = prepared, .new_buffer = new_buffer, .folds = planned_folds };
 }
 
 fn applyEditResponse(self: *App, result: std.json.Value) !void {
@@ -286,7 +299,16 @@ fn applyEditResponse(self: *App, result: std.json.Value) !void {
         p.installed = true;
         p.buffer_index = idx;
         b.dirty = true;
-        b.folds.clearRetainingCapacity();
+        // Closed folds from the pre-edit document, re-anchored against the
+        // new text. A plain clear here unfolded every block on each LSP
+        // workspace edit, even when the document only changed elsewhere.
+        if (p.folds) |*planned| {
+            b.folds.deinit(self.alloc);
+            b.folds = planned.*;
+            p.folds = null; // ownership moved into the buffer
+        } else {
+            b.folds.clearRetainingCapacity();
+        }
         b.syntax_revision = std.math.maxInt(u64);
         self.clearSpanCache(b);
         for (self.windows.items) |*w| if (w.buf == idx) {
@@ -704,7 +726,7 @@ pub fn acceptCompletion(self: *App) !void {
     // LSP range in the PRE-EDIT document: [pos, cursor) → word.
     const start_pos = self.lspPositionAt(pt, pos);
     const end_pos = self.lspPositionAt(pt, cursor);
-    try self.cur().history.record(pt, pos, cursor - pos, word);
+    try self.recordEdit(pos, cursor - pos, word);
     self.curCursor().* = pos + @as(u32, @intCast(word.len));
     self.markDirtyRange(start_pos, end_pos, word);
     self.closeCompletion();
@@ -809,7 +831,7 @@ pub fn insertNewline(self: *App) !void {
     defer self.alloc.free(plan.text);
     // LSP range in the PRE-EDIT document: a pure insert at [pos, pos).
     const at = self.lspPositionAt(pt, pos);
-    try self.cur().history.record(pt, pos, 0, plan.text);
+    try self.recordEdit(pos, 0, plan.text);
     self.curCursor().* = pos + plan.cursor_after;
     self.adjustInlayHintsInsert(line, col, plan.text);
     self.markDirtyRange(at, at, plan.text);
@@ -842,7 +864,7 @@ pub fn deleteToEol(self: *App) !void {
         const deleted = try self.alloc.alloc(u8, del_len);
         defer self.alloc.free(deleted);
         pt.copyRange(cursor, deleted);
-        try self.cur().history.record(pt, cursor, line_end - cursor, "");
+        try self.recordEdit(cursor, line_end - cursor, "");
         self.adjustInlayHintsDelete(line, col, deleted);
         self.markDirtyRange(start_pos, end_pos, "");
     } else if (line_end < pt.len()) {
@@ -853,7 +875,7 @@ pub fn deleteToEol(self: *App) !void {
         pt.copyRange(line_end, term[0..term_len]);
         const start_pos = self.lspPositionAt(pt, line_end);
         const end_pos = self.lspPositionAt(pt, line_end + term_len);
-        try self.cur().history.record(pt, line_end, term_len, "");
+        try self.recordEdit(line_end, term_len, "");
         self.adjustInlayHintsDelete(line, col, term[0..term_len]);
         self.markDirtyRange(start_pos, end_pos, "");
     } else {

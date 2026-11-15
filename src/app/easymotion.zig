@@ -86,7 +86,7 @@ pub fn deleteBeforeCursor(self: *App) !void {
     var deleted: [16]u8 = undefined;
     const del_len: usize = @intCast(cursor - start);
     self.cur().pt.copyRange(start, deleted[0..del_len]);
-    try self.cur().history.record(&self.cur().pt, start, cursor - start, "");
+    try self.recordEdit(start, cursor - start, "");
     self.curCursor().* = start;
     self.adjustInlayHintsDelete(line, col, deleted[0..del_len]);
     self.markDirtyRange(start_pos, end_pos, "");
@@ -116,7 +116,7 @@ pub fn deleteWordBefore(self: *App) !void {
     const deleted = try self.alloc.alloc(u8, del_len);
     defer self.alloc.free(deleted);
     self.cur().pt.copyRange(start, deleted);
-    try self.cur().history.record(&self.cur().pt, start, cursor - start, "");
+    try self.recordEdit(start, cursor - start, "");
     self.curCursor().* = start;
     self.adjustInlayHintsDelete(line, col, deleted);
     self.markDirtyRange(start_pos, end_pos, "");

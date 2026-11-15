@@ -102,7 +102,7 @@ pub fn applyBlockOp(self: *App, op: editor.KeyEvent.ActionId) !void {
                 const start = self.charBoundaryForward(pt, ls + rect.left, line_end);
                 const end = @min(self.charBoundaryForward(pt, ls + rect.right + 1, line_end), line_end);
                 if (end <= start) continue;
-                try self.cur().history.record(pt, start, end - start, "");
+                try self.recordEdit(start, end - start, "");
             }
             self.cur().history.endGroup();
             self.markDirty();
@@ -207,7 +207,7 @@ pub fn handleMcInsertKey(self: *App, key: vaxis.Key) !void {
                 const pos = self.mc.cursors.items[i];
                 if (pos > 0 and self.cur().pt.byteAt(pos - 1) == 'j') {
                     deleted_any = true;
-                    try self.cur().history.record(&self.cur().pt, pos - 1, 1, "");
+                    try self.recordEdit(pos - 1, 1, "");
                     // the deletion shifts every cursor at/after it back
                     for (self.mc.cursors.items[i..]) |*c| c.* -= 1;
                 }
@@ -256,7 +256,7 @@ pub fn mcInsertText(self: *App, text: []const u8) !void {
     while (i > 0) {
         i -= 1;
         const pos = self.mc.cursors.items[i];
-        try self.cur().history.record(&self.cur().pt, pos, 0, text);
+        try self.recordEdit(pos, 0, text);
         for (self.mc.cursors.items[i..]) |*c| c.* += tlen;
     }
     self.mcSyncCursor();
@@ -279,7 +279,7 @@ pub fn mcBackspace(self: *App) !void {
         if (pos == 0) continue;
         const start = buffer.ops.prevCharStart(&self.cur().pt, pos);
         const del = pos - start;
-        try self.cur().history.record(&self.cur().pt, start, del, "");
+        try self.recordEdit(start, del, "");
         var j: usize = 0;
         while (j < self.mc.cursors.items.len) : (j += 1) {
             const c = self.mc.cursors.items[j];
@@ -311,7 +311,7 @@ pub fn mcDeleteWordBefore(self: *App) !void {
         const start = buffer.ops.wordStartBefore(&self.cur().pt, pos);
         if (start == pos) continue;
         const del = pos - start;
-        try self.cur().history.record(&self.cur().pt, start, del, "");
+        try self.recordEdit(start, del, "");
         var j: usize = 0;
         while (j < self.mc.cursors.items.len) : (j += 1) {
             const c = self.mc.cursors.items[j];

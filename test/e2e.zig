@@ -13668,6 +13668,177 @@ test "folds: za toggles, zM/zR close/open all, j/k skip closed folds" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+test "folds: edits elsewhere keep closed folds closed" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}fold_edit.py", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\top
+            \\def alpha():
+            \\    body a1
+            \\    body a2
+            \\def beta():
+            \\    body b1
+            \\tail
+        );
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "body a1", 5000);
+
+    // close alpha's fold (cursor on its header)
+    try sess.send("jza");
+    try gridWaitFor(&sess, &grid, "… 2 lines", 5000);
+    try gridWaitGone(&sess, &grid, "body a1", 5000);
+
+    // dd on a REAL line above the fold: the header shifts up one line and the
+    // block must stay closed. (Regression: every edit cleared the fold set.)
+    const dd_mark = sess.used;
+    try sess.send("ggdd");
+    try gridWaitFor(&sess, &grid, "line 1/6", 5000);
+    try std.testing.expect(grid.contains("… 2 lines"));
+    try std.testing.expect(!grid.contains("body a1"));
+    try std.testing.expect(rowContains(&grid, 2, "def alpha"));
+    // No flash: the body must never be painted in the redraw triggered by the
+    // edit (a transient unfold would put it in the raw ANSI stream even if the
+    // final frame folded it again).
+    try std.testing.expect(std.mem.indexOf(u8, sess.out[dd_mark..sess.used], "body a1") == null);
+
+    // undo/redo of that edit keep the surviving fold closed.
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "line 1/7", 5000);
+    try std.testing.expect(grid.contains("… 2 lines"));
+    try std.testing.expect(!grid.contains("body a1"));
+    try sess.send("\x12");
+    try gridWaitFor(&sess, &grid, "line 1/6", 5000);
+    try std.testing.expect(grid.contains("… 2 lines"));
+    try std.testing.expect(!grid.contains("body a1"));
+
+    // A linewise paste above the block moves it (and its identity) down one
+    // line; the fold stays closed.
+    try sess.send("yyP");
+    try gridWaitFor(&sess, &grid, "line 1/7", 5000);
+    try std.testing.expect(grid.contains("… 2 lines"));
+    try std.testing.expect(!grid.contains("body a1"));
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "line 1/6", 5000);
+
+    // :%s edits a line INSIDE the closed body. The body text may change but
+    // the block must not expand.
+    try sess.send(":%s/body a1/BODY_A1/\r");
+    _ = try uiPump(&sess, &grid, 400);
+    try std.testing.expect(grid.contains("… 2 lines"));
+    try std.testing.expect(!grid.contains("BODY_A1"));
+    // Opening the fold shows the updated body.
+    try sess.send("za");
+    try gridWaitFor(&sess, &grid, "BODY_A1", 5000);
+    try gridWaitGone(&sess, &grid, "… 2 lines", 5000);
+
+    // Deleting the header really removes the block: the fold is dropped.
+    try sess.send("gg");
+    try sess.send("za");
+    try gridWaitFor(&sess, &grid, "… 2 lines", 5000);
+    try sess.send("dd");
+    try gridWaitFor(&sess, &grid, "line 1/5", 5000);
+    try std.testing.expect(!grid.contains("… 2 lines"));
+    try std.testing.expect(grid.contains("body a2"));
+    // Undo restores the text but does not resurrect the dropped fold
+    // (vim: fold state is not part of undo).
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "line 1/6", 5000);
+    try std.testing.expect(!grid.contains("… 2 lines"));
+
+    const exit_code = try sess.commandAndWaitExit(":qa!\r");
+    if (exit_code != 0) std.debug.print("fold edit exit {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "folds: split windows keep closed folds through edits" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}fold_split.py", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\top
+            \\def alpha():
+            \\    body a1
+            \\    body a2
+            \\def beta():
+            \\    body b1
+            \\tail
+        );
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "body a1", 5000);
+
+    try sess.send("jza");
+    try gridWaitFor(&sess, &grid, "… 2 lines", 5000);
+    try gridWaitGone(&sess, &grid, "body a1", 5000);
+
+    // :vs — both panes show the same buffer, hence the same closed fold.
+    try sess.send(":vs\r");
+    var waited: i32 = 0;
+    while (true) {
+        if (rowContains(&grid, 2, "│") and
+            std.mem.count(u8, grid.rowText(2), "… 2 lines") >= 1) break;
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) {
+            waited += 100;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(rowContains(&grid, 2, "│"));
+    try std.testing.expect(!grid.contains("body a1"));
+
+    // Edit AFTER the folds in the focused (right) window: deleting beta's
+    // body line must not expand alpha's closed block in either pane.
+    try sess.send("G");
+    try gridWaitFor(&sess, &grid, "line 7/7", 5000);
+    const dd_mark = sess.used;
+    try sess.send("kdd");
+    try gridWaitFor(&sess, &grid, "line 6/6", 5000);
+    try std.testing.expect(grid.contains("… 2 lines"));
+    try std.testing.expect(!grid.contains("body a1"));
+    try std.testing.expect(std.mem.indexOf(u8, sess.out[dd_mark..sess.used], "body a1") == null);
+    // Undo restores the deleted line (cursor at the restored span start,
+    // which is line 6); the fold is still closed in both panes.
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "line 6/7", 5000);
+    try std.testing.expect(grid.contains("… 2 lines"));
+    try std.testing.expect(!grid.contains("body a1"));
+
+    const exit_code = try sess.commandAndWaitExit(":qa!\r");
+    if (exit_code != 0) std.debug.print("fold split exit {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
 test "git: gutter signs, ]c hunk jump, hunk stage/reset, blame ghost, branch" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -20125,6 +20296,121 @@ test "approval: multi-file apply_patch writes both files, updates both buffers, 
     try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
 
     try aiQuit(&sess);
+}
+
+test "folds: multi-file agent patch preserves closed folds, undo and redo" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_fold_patch_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var a_buf: [220:0]u8 = undefined;
+    var b_buf: [220:0]u8 = undefined;
+    const a_path = try bufPrintZ(&a_buf, "{s}/a.py", .{root});
+    const b_path = try bufPrintZ(&b_buf, "{s}/b.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, a_path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "def alpha():\n    body a1\ntail line\n");
+    }
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, b_path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "gamma\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const patch_args = try aiPatchArgs(alloc,
+        \\diff --git a/a.py b/a.py
+        \\--- a/a.py
+        \\+++ b/a.py
+        \\@@ -1,3 +1,3 @@
+        \\ def alpha():
+        \\     body a1
+        \\-tail line
+        \\+TAIL LINE
+        \\diff --git a/b.txt b/b.txt
+        \\--- a/b.txt
+        \\+++ b/b.txt
+        \\@@ -1 +1 @@
+        \\-gamma
+        \\+GAMMA
+        \\
+    );
+    defer alloc.free(patch_args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_fold_patch", .name = "apply_patch", .args = patch_args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "FOLD_PATCH_DONE");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, a_path }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "body a1", 5000);
+
+    // Close alpha's fold, then open the second patch target so BOTH buffers
+    // are live when the multi-file patch is approved (approval then replaces
+    // each buffer's whole text instead of applying a localized edit).
+    try sess.send("za");
+    try gridWaitFor(&sess, &grid, "… 1 lines", 5000);
+    try gridWaitGone(&sess, &grid, "body a1", 5000);
+    try sess.send(":e b.txt\r");
+    try gridWaitFor(&sess, &grid, "gamma", 5000);
+    try sess.send(":e a.py\r");
+    try gridWaitFor(&sess, &grid, "… 1 lines", 5000);
+    try std.testing.expect(!grid.contains("body a1"));
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("patch both files while alpha is folded");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "changes 1", 10000);
+    try gridWaitFor(&sess, &grid, "file 1/2", 5000);
+    try gridWaitFor(&sess, &grid, "TAIL LINE", 5000);
+    try gridWaitFor(&sess, &grid, "idle", 10000);
+
+    // Review + approve the patch set.
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "2 files", 8000);
+    try gridWaitFor(&sess, &grid, "FOLD_PATCH_DONE", 10000);
+    try sess.send("d");
+    try gridWaitFor(&sess, &grid, "[a] approve", 5000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "changes 0", 5000);
+    try gridWaitFor(&sess, &grid, "TAIL LINE", 5000);
+    // Whole-document replacement must re-anchor the closed fold by header
+    // text: the body stays hidden and the marker stays on the header.
+    try std.testing.expect(grid.contains("… 1 lines"));
+    try std.testing.expect(!grid.contains("body a1"));
+    try expectNoDirtyMarker(&grid);
+
+    // Agent-patch undo/redo goes through the same transform (the transaction
+    // is one whole-document edit in each direction).
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "tail line", 5000);
+    try std.testing.expect(grid.contains("… 1 lines"));
+    try std.testing.expect(!grid.contains("body a1"));
+    try sess.send("\x12");
+    try gridWaitFor(&sess, &grid, "TAIL LINE", 5000);
+    try std.testing.expect(grid.contains("… 1 lines"));
+    try std.testing.expect(!grid.contains("body a1"));
+
+    const exit_code = try sess.commandAndWaitExit(":qa!\r");
+    if (exit_code != 0) std.debug.print("fold patch exit {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
 test "approval: multi-file apply_patch deny via mouse writes nothing" {

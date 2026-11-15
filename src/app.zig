@@ -229,10 +229,10 @@ pub const App = struct {
         /// start line. Kept PER BUFFER, not per window: two splits showing
         /// the same buffer share the fold state, so za in one split is
         /// visible in the other (folds are a property of the document view
-        /// of the buffer, like the dirty flag). Any edit clears the set
-        /// (markDirty) — line numbers drift after edits, and re-folding is
-        /// cheap; vim-style fold carryover across edits is out of scope.
-        folds: std.ArrayList(editor.fold.Range) = .empty,
+        /// of the buffer, like the dirty flag). Each entry carries an
+        /// explicit anchor + header signature; edits transform the set
+        /// (app/fold_edit.zig) instead of dropping it.
+        folds: std.ArrayList(editor.fold.Closed) = .empty,
         /// Cached syntax spans for this buffer's last-rendered visible byte
         /// range (owned; see SpanRangeCache). null until the first render.
         span_cache: ?SpanRangeCache = null,
@@ -996,7 +996,7 @@ pub const App = struct {
     /// The closed fold whose header is `line`, if any.
     pub fn foldAt(buf: *const Buffer, line: u32) ?editor.fold.Range {
         for (buf.folds.items) |f| {
-            if (f.start == line) return f;
+            if (f.range.start == line) return f.range;
         }
         return null;
     }
@@ -1006,8 +1006,8 @@ pub const App = struct {
     pub fn foldCovering(buf: *const Buffer, line: u32) ?editor.fold.Range {
         var best: ?editor.fold.Range = null;
         for (buf.folds.items) |f| {
-            if (line > f.start and line <= f.end) {
-                if (best == null or f.start < best.?.start) best = f;
+            if (line > f.range.start and line <= f.range.end) {
+                if (best == null or f.range.start < best.?.start) best = f.range;
             }
         }
         return best;
@@ -1054,11 +1054,11 @@ pub const App = struct {
                 for (ranges) |r| {
                     const covered = blk: {
                         for (buf.folds.items) |f| {
-                            if (r.start > f.start and r.end <= f.end) break :blk true;
+                            if (r.start > f.range.start and r.end <= f.range.end) break :blk true;
                         }
                         break :blk false;
                     };
-                    if (!covered) try buf.folds.append(self.alloc, r);
+                    if (!covered) try buf.folds.append(self.alloc, editor.fold.Closed.init(&buf.pt, r));
                 }
                 self.snapCursorOutOfFold();
             },
@@ -1076,8 +1076,8 @@ pub const App = struct {
                 // otherwise (zc, or za on an open fold) close `target`.
                 var closed_hit: ?usize = null;
                 for (buf.folds.items, 0..) |f, i| {
-                    if (line >= f.start and line <= f.end) {
-                        if (closed_hit == null or f.start > buf.folds.items[closed_hit.?].start) closed_hit = i;
+                    if (line >= f.range.start and line <= f.range.end) {
+                        if (closed_hit == null or f.range.start > buf.folds.items[closed_hit.?].range.start) closed_hit = i;
                     }
                 }
                 const want_open = action == .fold_open or (action == .fold_toggle and closed_hit != null);
@@ -1091,7 +1091,7 @@ pub const App = struct {
                     while (true) {
                         const already = blk: {
                             for (buf.folds.items) |f| {
-                                if (f.start == r.start) break :blk true;
+                                if (f.range.start == r.start) break :blk true;
                             }
                             break :blk false;
                         };
@@ -1101,10 +1101,10 @@ pub const App = struct {
                         if (outer == null) return;
                         r = outer.?;
                     }
-                    try buf.folds.append(self.alloc, r);
-                    std.mem.sort(editor.fold.Range, buf.folds.items, {}, struct {
-                        fn lt(_: void, x: editor.fold.Range, y: editor.fold.Range) bool {
-                            return x.start < y.start;
+                    try buf.folds.append(self.alloc, editor.fold.Closed.init(&buf.pt, r));
+                    std.mem.sort(editor.fold.Closed, buf.folds.items, {}, struct {
+                        fn lt(_: void, x: editor.fold.Closed, y: editor.fold.Closed) bool {
+                            return x.range.start < y.range.start;
                         }
                     }.lt);
                     self.snapCursorOutOfFold();
@@ -1996,6 +1996,11 @@ pub const App = struct {
     pub const lspHandler = @import("app/lsp.zig").lspHandler;
     pub const markDirtyBase = @import("app/lsp.zig").markDirtyBase;
     pub const markDirty = @import("app/lsp.zig").markDirty;
+    // fold-aware edit/history wrappers (app/fold_edit.zig)
+    pub const recordEdit = @import("app/fold_edit.zig").recordEdit;
+    pub const recordEditBuffer = @import("app/fold_edit.zig").recordEditBuffer;
+    pub const historyApply = @import("app/fold_edit.zig").historyApply;
+    pub const reanchorAfterDirectReplace = @import("app/fold_edit.zig").reanchorAfterDirectReplace;
     pub const markDirtyHistory = @import("app/lsp.zig").markDirtyHistory;
     pub const markDirtyRange = @import("app/lsp.zig").markDirtyRange;
     pub const syncLspFull = @import("app/lsp.zig").syncLspFull;
