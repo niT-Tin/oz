@@ -18,6 +18,7 @@ const term = @import("../term.zig");
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const nav_tabs = @import("navigator.zig");
+const gutter_model = @import("gutter.zig");
 const note_store = @import("note_store.zig");
 const autil = @import("util.zig");
 const chrome = @import("chrome.zig");
@@ -146,16 +147,11 @@ pub fn navigatorPeekActive(self: *App) bool {
         self.navigatorMode() == .compact;
 }
 
-/// Width of the relative-line-number gutter in cells: digits of the
-/// largest possible relative number (≤ the file's line count, since a
-/// relative number is a line offset) + one trailing space. Adaptive —
-/// narrow for small files (vim's relativenumber fits the digits).
+/// Adaptive numbers plus independent number/sign and sign/source padding.
+/// Every geometry consumer (render, wrap, mouse, cursor and popups) uses this.
 pub fn gutterWidth(self: *const App, line_count: u32) u32 {
     _ = self;
-    var digits: u32 = 1;
-    var n: u32 = line_count;
-    while (n >= 10) : (n /= 10) digits += 1;
-    return digits + 1;
+    return gutter_model.forLineCount(line_count).width;
 }
 
 /// Display column (in cells) of `byte_pos` within `line`. vaxis renders a
@@ -657,7 +653,8 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
     const line_count = buf.pt.lineCount();
     // relative-number gutter: computed once per frame per window
     const gutter = self.gutterWidth(line_count);
-    const gutter_digits = gutter - 1;
+    const gutter_layout = gutter_model.forLineCount(line_count);
+    const gutter_digits = gutter_layout.number_columns;
     // text columns per screen row: soft wrap splits a line every
     // content_width cells (long lines wrap instead of clipping)
     const content_width: u32 = @max(rect.width -| gutter, 1);
@@ -986,7 +983,7 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         @memcpy(num_str[gutter_digits - num_raw.len .. gutter_digits], num_raw);
         num_str[gutter - 1] = ' ';
 
-        // LSP diagnostic mark in the gutter's last column (this window
+        // LSP diagnostic mark in the gutter's dedicated sign column (this window
         // shows the current buffer → marks the current file's
         // diagnostics). Nerd Font icons (spec: 图标体系 = Nerd Font),
         // like nvim's diagnostic gutter: ✖ for errors, ⚠ warnings, ℹ
@@ -1620,7 +1617,7 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         if (diag_mark.len > 1) { // Nerd Font icon (multi-byte); " " = none
             var mark_style = cursorline_style;
             if (diag_mark_fg) |f| mark_style.fg = f.fg;
-            win.writeCell(@intCast(rect.col + gutter - 1), @intCast(line_row), .{
+            win.writeCell(@intCast(rect.col + gutter_layout.sign_column), @intCast(line_row), .{
                 .char = .{ .grapheme = diag_mark, .width = 1 },
                 .style = mark_style,
             });
@@ -1635,7 +1632,7 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
                 .removed_above => "\u{2581}", // ▁ lower eighth block
                 .removed_below => "\u{2594}", // ▔ upper eighth block
             };
-            win.writeCell(@intCast(rect.col + gutter - 1), @intCast(line_row), .{
+            win.writeCell(@intCast(rect.col + gutter_layout.sign_column), @intCast(line_row), .{
                 .char = .{ .grapheme = glyph, .width = 1 },
                 .style = mark_style,
             });
