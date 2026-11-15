@@ -234,7 +234,7 @@ pub fn draw(self: *App, a: std.mem.Allocator, win: vaxis.Window, rect: App.LeafR
         const shown: u32 = @intCast(@min(rows.items.len, @min(10, space - 2)));
         const height = shown + 2;
         const y = if (below >= height) anchor + 1 else anchor - height;
-        const x = @min(rect.col + self.gutterWidth(self.cur().pt.lineCount()) + point.col, pane_end - columns - 2);
+        const x = @min(rect.col + self.gutterWidthFor(self.cur().pt.lineCount(), rect.width) + point.col, pane_end - columns - 2);
         self.diag_float_scroll = @min(self.diag_float_scroll, rows.items.len - shown);
         const border = vaxis.Style{ .fg = .{ .rgb = tint }, .bg = .{ .rgb = self.theme.bg_float } };
         const label = try std.fmt.allocPrint(a, " Diagnostics ({d}) ", .{summary.count});
@@ -258,7 +258,7 @@ pub fn draw(self: *App, a: std.mem.Allocator, win: vaxis.Window, rect: App.LeafR
     const point = self.focusedScreenPos(win, rect, line, end);
     // An exactly full row has no room; never paint on the next source line.
     if ((point.col == 0 and end > self.cur().pt.lineStart(line)) or point.row >= rect.height) return true;
-    var x = rect.col + self.gutterWidth(self.cur().pt.lineCount()) + point.col;
+    var x = rect.col + self.gutterWidthFor(self.cur().pt.lineCount(), rect.width) + point.col;
     if (App.foldAt(self.cur(), line)) |fold| {
         const marker = try std.fmt.allocPrint(a, " … {d} lines", .{fold.hiddenCount()});
         x += self.textWidth(win, marker);

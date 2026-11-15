@@ -450,7 +450,7 @@ fn panePositionAt(self: *App, win_idx: usize, rect: mouse.Rect, col: u32, row: u
     if (row < rect.row or row >= rect.row + rect.height) return null;
 
     const win = self.vx.window();
-    const gutter = self.gutterWidth(line_count);
+    const gutter = self.gutterWidthFor(line_count, rect.width);
     const content_width: u32 = @max(rect.width -| gutter, 1);
     const dr = row - rect.row;
 

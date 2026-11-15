@@ -154,6 +154,13 @@ pub fn gutterWidth(self: *const App, line_count: u32) u32 {
     return gutter_model.forLineCount(line_count).width;
 }
 
+/// Pane-aware width for every source-coordinate consumer. The nominal API
+/// above remains available to callers that only need the full layout.
+pub fn gutterWidthFor(self: *const App, line_count: u32, pane_width: u32) u32 {
+    _ = self;
+    return gutter_model.forPane(line_count, pane_width).width;
+}
+
 /// Display column (in cells) of `byte_pos` within `line`. vaxis renders a
 /// multi-byte grapheme as one or two cells, so anything positioned from a
 /// byte offset (the text cursor, the completion menu, ghost text) must be
@@ -570,7 +577,7 @@ fn displayRowsWithMarkdown(self: *App, win: vaxis.Window, buf: *Buffer, buf_inde
 pub const ScreenPos = struct { row: u32, col: u32 };
 pub fn focusedScreenPos(self: *App, win: vaxis.Window, rect: LeafRect, line: u32, pos: u32) ScreenPos {
     const buf = self.cur();
-    const cw: u32 = @max(rect.width -| self.gutterWidth(buf.pt.lineCount()), 1);
+    const cw: u32 = @max(rect.width -| self.gutterWidthFor(buf.pt.lineCount(), rect.width), 1);
     const md_layout = if (self.state.mode == .normal and !self.mc_active and !self.em_active and self.markdown_frame_buf == self.current)
         self.markdown_frame
     else
@@ -652,13 +659,13 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
     const cursor_line = buf.pt.lineOf(w.cursor);
     const line_count = buf.pt.lineCount();
     // relative-number gutter: computed once per frame per window
-    const gutter = self.gutterWidth(line_count);
-    const gutter_layout = gutter_model.forLineCount(line_count);
+    const gutter_layout = gutter_model.forPane(line_count, rect.width);
+    const gutter = gutter_layout.width;
     const gutter_digits = gutter_layout.number_columns;
     // text columns per screen row: soft wrap splits a line every
     // content_width cells (long lines wrap instead of clipping)
     const content_width: u32 = @max(rect.width -| gutter, 1);
-    if (rect.height == 0) return;
+    if (rect.height == 0 or rect.width == 0) return;
     const conceal_mode = self.state.mode == .normal and !self.mc_active and !self.em_active;
     const initial_rows = @min(rect.height, line_count -| w.view_top);
     _ = try self.visibleSpansFor(buf, a, w.view_top, initial_rows);
@@ -989,8 +996,11 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         const row_i: usize = (row - rect.row);
         const num_str = num_buf[row_i * gutter ..][0..gutter];
         @memset(num_str[0..gutter], ' ');
-        @memcpy(num_str[gutter_digits - num_raw.len .. gutter_digits], num_raw);
-        num_str[gutter - 1] = ' ';
+        if (gutter_digits > 0) {
+            // forPane either reserves every digit or hides the field.
+            std.debug.assert(num_raw.len <= gutter_digits);
+            @memcpy(num_str[gutter_digits - num_raw.len .. gutter_digits], num_raw);
+        }
 
         // LSP diagnostic mark in the gutter's dedicated sign column (this window
         // shows the current buffer → marks the current file's
@@ -1148,8 +1158,11 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
             .{ .bg = .{ .rgb = self.theme.bg_curline }, .fg = .{ .rgb = self.theme.fg } }
         else
             .{ .bg = .{ .rgb = self.theme.bg_alt }, .fg = .{ .rgb = self.theme.fg_faint } };
-        try segs.append(a, .{ .text = num_str[0 .. gutter - 1], .style = cursorline_style });
-        try segs.append(a, .{ .text = num_str[gutter - 1 .. gutter], .style = cursorline_style });
+        const gutter_split = gutter -| 1;
+        // Always keep two segments: the wrap loop skips them, including
+        // when a one-cell pane has no number/sign gutter at all.
+        try segs.append(a, .{ .text = num_str[0..gutter_split], .style = cursorline_style });
+        try segs.append(a, .{ .text = num_str[gutter_split..gutter], .style = cursorline_style });
         if (md_source) |info| {
             if (info.prefix.len > 0) try segs.append(a, .{ .text = info.prefix, .style = .{
                 .fg = .{ .rgb = self.theme.fg_dim },
@@ -1641,30 +1654,32 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
                 break;
             }
         }
-        // diagnostic mark: writeCell AFTER the line print so the glyph is
-        // not overwritten by the gutter segment (on the line's FIRST row)
-        if (diag_mark.len > 1) { // Nerd Font icon (multi-byte); " " = none
-            var mark_style = cursorline_style;
-            if (diag_mark_fg) |f| mark_style.fg = f.fg;
-            win.writeCell(@intCast(rect.col + gutter_layout.sign_column), @intCast(line_row), .{
-                .char = .{ .grapheme = diag_mark, .width = 1 },
-                .style = mark_style,
-            });
-        } else if (git_mark) |k| {
-            // git sign in the same cell (diagnostics win the priority).
-            // Glyphs: ▎ for added/modified, ▁/▔ half-blocks for deleted
-            // (signify-style markers on the neighbor lines).
-            var mark_style = cursorline_style;
-            if (git_mark_fg) |f| mark_style.fg = f.fg;
-            const glyph: []const u8 = switch (k) {
-                .added, .modified => "\u{258e}", // ▎ left half block
-                .removed_above => "\u{2581}", // ▁ lower eighth block
-                .removed_below => "\u{2594}", // ▔ upper eighth block
-            };
-            win.writeCell(@intCast(rect.col + gutter_layout.sign_column), @intCast(line_row), .{
-                .char = .{ .grapheme = glyph, .width = 1 },
-                .style = mark_style,
-            });
+        if (gutter_layout.show_sign) {
+            // diagnostic mark: writeCell AFTER the line print so the glyph is
+            // not overwritten by the gutter segment (on the line's FIRST row)
+            if (diag_mark.len > 1) { // Nerd Font icon (multi-byte); " " = none
+                var mark_style = cursorline_style;
+                if (diag_mark_fg) |f| mark_style.fg = f.fg;
+                win.writeCell(@intCast(rect.col + gutter_layout.sign_column), @intCast(line_row), .{
+                    .char = .{ .grapheme = diag_mark, .width = 1 },
+                    .style = mark_style,
+                });
+            } else if (git_mark) |k| {
+                // git sign in the same cell (diagnostics win the priority).
+                // Glyphs: ▎ for added/modified, ▁/▔ half-blocks for deleted
+                // (signify-style markers on the neighbor lines).
+                var mark_style = cursorline_style;
+                if (git_mark_fg) |f| mark_style.fg = f.fg;
+                const glyph: []const u8 = switch (k) {
+                    .added, .modified => "\u{258e}", // ▎ left half block
+                    .removed_above => "\u{2581}", // ▁ lower eighth block
+                    .removed_below => "\u{2594}", // ▔ upper eighth block
+                };
+                win.writeCell(@intCast(rect.col + gutter_layout.sign_column), @intCast(line_row), .{
+                    .char = .{ .grapheme = glyph, .width = 1 },
+                    .style = mark_style,
+                });
+            }
         }
         if (md_info) |info| {
             const virtual_style: vaxis.Style = .{
@@ -3521,9 +3536,6 @@ pub fn render(self: *App) !void {
     // inlay hints, blame ghosts or soft-wrap row numbers. Internal byte,
     // UTF-16 and screen coordinates keep their own semantics.
     const status_col = self.lineCellCol(win, cursor_line, self.curCursor().*);
-    // relative-number gutter: computed once per frame, reused by the
-    // cursor offset, mc highlight and easymotion labels
-    const gutter = self.gutterWidth(line_count);
 
     // Label layers followed by one focused-editor context row. Vertical
     // splits share a label row; overlapping pane spans keep separate layers.
@@ -3787,6 +3799,8 @@ pub fn render(self: *App) !void {
         self.addMousePaneTarget(lr.win, lr.row, lr.col, lr.height, lr.width);
         try self.renderWindowLines(a, lr, false);
     }
+    // Cursor/overlays use the same focused-pane gutter as source and mouse.
+    const gutter = self.gutterWidthFor(line_count, cur_rect.width);
     self.addMousePaneTarget(cur_rect.win, cur_rect.row, cur_rect.col, cur_rect.height, cur_rect.width);
     try self.renderWindowLines(a, cur_rect, true);
     hideInactiveMarkdownImages(self);
@@ -3801,12 +3815,12 @@ pub fn render(self: *App) !void {
     for (layout.seps) |sep| {
         // A separator click is an explicit v1 no-op (no resize); its
         // 1-cell-thick rect wins over the adjacent pane by area.
-        self.addMouseSeparatorTarget(sep.row, sep.col, sep.len, sep.horizontal);
         const sep_style: vaxis.Style = .{
             .fg = .{ .rgb = if (sep.active) self.theme.win_sep_active else self.theme.win_sep },
             .bg = .{ .rgb = self.theme.bg },
         };
         if (sep.horizontal) {
+            self.addMouseSeparatorTarget(sep.row, sep.col, sep.len, true);
             var xs: u32 = 0;
             while (xs < sep.len) : (xs += 1) {
                 win.writeCell(@intCast(sep.col + xs), @intCast(sep.row), .{
@@ -3815,13 +3829,27 @@ pub fn render(self: *App) !void {
                 });
             }
         } else {
+            var segment_start: ?u32 = null;
             var ys: u32 = 0;
             while (ys < sep.len) : (ys += 1) {
+                const source_cell = blk: {
+                    for (leaves) |leaf| {
+                        if (leaf.width == 1 and leaf.col == sep.col and sep.row + ys >= leaf.row and sep.row + ys < leaf.row + leaf.height) break :blk true;
+                    }
+                    break :blk false;
+                };
+                if (source_cell) {
+                    if (segment_start) |start| self.addMouseSeparatorTarget(sep.row + start, sep.col, ys - start, false);
+                    segment_start = null;
+                    continue;
+                }
+                if (segment_start == null) segment_start = ys;
                 win.writeCell(@intCast(sep.col), @intCast(sep.row + ys), .{
                     .char = .{ .grapheme = "│", .width = 1 },
                     .style = sep_style,
                 });
             }
+            if (segment_start) |start| self.addMouseSeparatorTarget(sep.row + start, sep.col, sep.len - start, false);
         }
     }
 
@@ -5113,7 +5141,7 @@ pub fn render(self: *App) !void {
     }
     // cursor position — drawAiRail already placed the prompt/thread cursor
     // when the rail or prompt owns focus; otherwise the editor cursor wins.
-    var editor_cursor_hidden = false;
+    var editor_cursor_hidden = cur_rect.width == 0 or cur_rect.height == 0;
     if (self.inlinePromptOpen()) {
         // cursor was placed by drawInlinePrompt
     } else if (self.ai.rail_open and self.ai.focus != .editor) {
@@ -5153,8 +5181,8 @@ pub fn render(self: *App) !void {
             }
         }
         self.vx.screen.cursor = .{
-            .row = @intCast(@min(cursor_row, cur_rect.row + cur_rect.height -| 1)),
-            .col = @intCast(cursor_col),
+            .row = @intCast(@min(@min(cursor_row, cur_rect.row + cur_rect.height -| 1), win.height -| 1)),
+            .col = @intCast(@min(cursor_col, win.width -| 1)),
         };
     }
     self.vx.screen.cursor_vis = !editor_cursor_hidden;
