@@ -180,6 +180,22 @@ fn filetreeParent(self: *App) !void {
     // project_root, process cwd, picker/LSP/agent root remain unchanged.
 }
 
+fn treeEntryFiltered(name: []const u8) bool {
+    return name.len == 0 or name[0] == '.' or std.mem.eql(u8, name, "zig-out") or
+        std.mem.eql(u8, name, "zig-pkg") or std.mem.eql(u8, name, "node_modules");
+}
+
+fn appendTreeChild(self: *App, node: *TreeNode, name: []const u8, is_dir: bool) !void {
+    const child_path = try std.fs.path.join(self.alloc, &.{ node.path, name });
+    errdefer self.alloc.free(child_path);
+    const child_name = try self.alloc.dupe(u8, name);
+    errdefer self.alloc.free(child_name);
+    const child = try self.alloc.create(TreeNode);
+    errdefer self.alloc.destroy(child);
+    child.* = .{ .name = child_name, .path = child_path, .is_dir = is_dir, .expanded = false, .children = .empty, .parent = node };
+    try node.children.append(self.alloc, child);
+}
+
 /// Walk one directory level into `node.children` (lazy expansion). Child
 /// paths are ABSOLUTE (node.path + "/" + name, no trailing slash), so a file
 /// opens / a dir expands correctly regardless of which directory the tree is
@@ -187,26 +203,20 @@ fn filetreeParent(self: *App) !void {
 pub fn walkTreeLevel(self: *App, dir: std.Io.Dir, node: *TreeNode) !void {
     var it = dir.iterate();
     while (try it.next(self.io)) |entry| {
-        const name = entry.name;
-        if (name.len == 0 or name[0] == '.') continue;
-        if (std.mem.eql(u8, name, "zig-out") or std.mem.eql(u8, name, "zig-pkg") or std.mem.eql(u8, name, "node_modules")) continue;
-        const is_dir = (entry.kind == .directory);
-        const child_path = try std.fs.path.join(self.alloc, &.{ node.path, name });
-        errdefer self.alloc.free(child_path);
-        const child_name = try self.alloc.dupe(u8, name);
-        errdefer self.alloc.free(child_name);
-        const child = try self.alloc.create(TreeNode);
-        errdefer self.alloc.destroy(child);
-        child.* = .{
-            .name = child_name,
-            .path = child_path,
-            .is_dir = is_dir,
-            .expanded = false,
-            .children = .empty,
-            .parent = node,
-        };
-        try node.children.append(self.alloc, child);
+        if (treeEntryFiltered(entry.name)) continue;
+        try appendTreeChild(self, node, entry.name, entry.kind == .directory);
     }
+}
+
+/// The default filter remains in force. Only a directly requested entry,
+/// or one already explicitly revealed, is included during creation refresh.
+fn appendRevealedEntry(self: *App, dir: std.Io.Dir, node: *TreeNode, name: []const u8) !void {
+    for (node.children.items) |child| if (std.mem.eql(u8, child.name, name)) return;
+    const stat = dir.statFile(self.io, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return, // do not resurrect an externally deleted item
+        else => return err,
+    };
+    try appendTreeChild(self, node, name, stat.kind == .directory);
 }
 
 /// Directories first, then files; each group sorted by byte order.
@@ -498,7 +508,26 @@ fn refreshCreatedDirectory(self: *App, path: []const u8, leaf: []const u8) !void
     var dir = try std.Io.Dir.cwd().openDir(self.io, path, .{ .iterate = true });
     defer dir.close(self.io);
     try self.walkTreeLevel(dir, &replacement);
+    for (node.children.items) |child| {
+        if (treeEntryFiltered(child.name)) try appendRevealedEntry(self, dir, &replacement, child.name);
+    }
+    try appendRevealedEntry(self, dir, &replacement, leaf);
     self.sortTreeChildren(&replacement);
+    // All allocation and filesystem work is complete. Preserve explicitly
+    // revealed directories' loaded subtrees without borrowing ownership on
+    // an error path; their descendants must not vanish on an ancestor refresh.
+    for (replacement.children.items) |fresh| {
+        if (!treeEntryFiltered(fresh.name)) continue;
+        for (node.children.items) |old| {
+            if (fresh.is_dir == old.is_dir and std.mem.eql(u8, fresh.name, old.name)) {
+                fresh.expanded = old.expanded;
+                fresh.children = old.children;
+                old.children = .empty;
+                for (fresh.children.items) |child| child.parent = fresh;
+                break;
+            }
+        }
+    }
     for (node.children.items) |child| self.freeFiletreeNode(child);
     node.children.deinit(self.alloc);
     node.children = replacement.children;

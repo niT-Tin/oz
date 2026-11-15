@@ -29991,3 +29991,91 @@ test "gutter: an invisible editor leaf must not hide the visible AI prompt curso
     const hidden = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "\x1b[?25l") orelse 0;
     try std.testing.expect(shown > hidden);
 }
+
+test "file tree safety: explicitly created hidden entries stay visible across refresh" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [160]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/oz_navhidden_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "edit.txt", "ORIGINAL_DOCUMENT\n");
+    try writeTestFile(io, root, ".unrequested", "KEEP_HIDDEN\n");
+    const path = try std.fs.path.join(a, &.{ root, "edit.txt" });
+    defer a.free(path);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, null, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "ORIGINAL_DOCUMENT", 8000);
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "Files", 8000);
+    try std.testing.expect(!grid.contains(".unrequested"));
+    // Starting on a regular file captures its parent, then selects the
+    // explicitly created dotfile despite the default hidden-entry filter.
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    try sess.send(".gitignore\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    try gridWaitFor(&sess, &grid, ".gitignore", 8000);
+    try std.testing.expect(rowContains(&grid, grid.row, ".gitignore"));
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    try sess.send("normal.txt\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    try gridWaitFor(&sess, &grid, "normal.txt", 8000);
+    try std.testing.expect(grid.contains(".gitignore"));
+    try std.testing.expect(!grid.contains(".unrequested"));
+    // Hidden directories are selected too, so the next `a` creates inside
+    // them rather than silently creating a sibling in the wrong directory.
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    try sess.send(".config/\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    try gridWaitFor(&sess, &grid, ".config", 8000);
+    try std.testing.expect(rowContains(&grid, grid.row, ".config"));
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    try sess.send(".nested\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    try gridWaitFor(&sess, &grid, ".nested", 8000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    try sess.send("after.txt\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    try gridWaitFor(&sess, &grid, "after.txt", 8000);
+    try std.testing.expect(grid.contains(".nested"));
+    // Refresh the ancestor too: revealed hidden subtrees keep their open
+    // state and descendants, not just their top-level directory name.
+    try sess.send("G");
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    try sess.send("root-next.txt\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    try gridWaitFor(&sess, &grid, "root-next.txt", 8000);
+    try std.testing.expect(grid.contains(".nested"));
+    try std.testing.expect(!grid.contains(".unrequested"));
+    const ignore = try std.fs.path.join(a, &.{ root, ".gitignore" });
+    defer a.free(ignore);
+    try std.Io.Dir.cwd().deleteFile(io, ignore);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    try sess.send("refresh.txt\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    try gridWaitFor(&sess, &grid, "refresh.txt", 8000);
+    try gridWaitGone(&sess, &grid, ".gitignore", 8000);
+    try std.testing.expect(grid.contains(".nested"));
+    const code = try sess.commandAndWaitExit(":wq\r");
+    try std.testing.expectEqual(@as(u32, 0), code);
+    const saved = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024));
+    defer a.free(saved);
+    try std.testing.expectEqualStrings("ORIGINAL_DOCUMENT\n", saved);
+    const nested = try std.fs.path.join(a, &.{ root, ".config", ".nested" });
+    defer a.free(nested);
+    _ = try std.Io.Dir.cwd().statFile(io, nested, .{});
+    const after = try std.fs.path.join(a, &.{ root, ".config", "after.txt" });
+    defer a.free(after);
+    _ = try std.Io.Dir.cwd().statFile(io, after, .{});
+}
