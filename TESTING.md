@@ -17,9 +17,10 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-Current counts after the 2026-11-15 editing-reliability fixes:
-**738 unit tests** and **316 e2e tests** in the default filters (the three
-opt-in real-ZLS tests skip unless `-Dreal-zls` is supplied). `tools/verify.sh` covers diff check,
+Current counts after the 2026-11-15 editing-reliability fixes and the
+scope-range emphasis regression: **740 unit tests** and **319 e2e tests** in
+the default filters (the three opt-in real-ZLS tests skip unless
+`-Dreal-zls` is supplied). `tools/verify.sh` covers diff check,
 all unit tests and all e2e tests (including Agent-focus, `terminal:` and
 multi-file `approval:`). `tools/verify.sh`
 writes `.verify/unit.log`, `.verify/e2e.log`, and

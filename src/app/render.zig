@@ -917,6 +917,15 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
             }
         }
     }
+    // ---- scope range emphasis (issue #14) ----
+    // The horizontal rule marks the ACTIVE scope's header line: its source
+    // cells from the structural indent to the end of the line's text. It is
+    // deliberately not the removed full-row SGR underline — gutter/indent
+    // guides, inlay hints, diagnostic virtual text and EOL padding never
+    // carry it, and it is clipped to this window. Only the keyboard-active
+    // window shows it (focus loss drops it next frame); diagnostics are
+    // merged AFTER this style, so their curly/dotted underline wins.
+    const scope_rule_on = self.scope_underline and is_focused and self.editorOwnsKeys() and has_scope;
 
     var span_i: usize = 0;
     var decor_i: usize = 0; // moving pointer into `decors` (rows ascend)
@@ -1208,6 +1217,18 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         var indent_cols: u32 = 0;
         var ib: u32 = 0;
         while (ib < indent_end) : (ib += 1) indent_cols += if (text[ib] == '\t') tab_width else 1;
+        // Source byte range of the scope-header rule. Starting at the end of
+        // the structural indent skips the guide cells; trailing whitespace is
+        // not source emphasis, so it is trimmed off the end (never below the
+        // first source byte).
+        var scope_from: u32 = 0;
+        var scope_to: u32 = 0;
+        if (scope_rule_on and line == scope_start_line and indent_end < n) {
+            scope_from = indent_end;
+            var scope_end = n;
+            while (scope_end > scope_from and (text[scope_end - 1] == ' ' or text[scope_end - 1] == '\t')) scope_end -= 1;
+            scope_to = scope_end;
+        }
         if (indent_end > 0) {
             const indent_levels: u32 = indent_cols / tab_width;
             // hints anchored at/inside the indent region render before it
@@ -1449,11 +1470,17 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
                 style.ul = f.ul;
                 style.ul_style = f.ul_style;
             }
-            // Scope emphasis stays in the guide column (highlighted below)
-            // and the cursor line surface. The old full-width SGR underline
-            // on the scope's first line read as a stray rule across the
-            // reading surface and leaked into later virtual text on terminals
-            // that only repaint changed cells; it is deliberately gone.
+            // Scope-header range emphasis (issue #14): underline only, so
+            // the syntax fg and the selection/cursorline bg survive. The
+            // segment is clipped exactly at the source end (no EOL padding),
+            // and diagnostics below overwrite this underline when they
+            // overlap — they always keep priority.
+            if (scope_to > scope_from and col < scope_to) {
+                const scope_style = chrome.scopeRangeStyle(self.theme);
+                style.ul = scope_style.ul;
+                style.ul_style = scope_style.ul_style;
+                if (next > scope_to) next = scope_to;
+            }
             const diagnostic_run = lsp_diag.rangeRun(diagnostic_ranges, col, n);
             next = @min(next, diagnostic_run.end);
             if (diagnostic_run.severity) |severity| diagnostic_ui.underline(self, &style, severity);

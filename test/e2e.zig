@@ -5399,9 +5399,9 @@ test "visual: rainbow brackets, indent guides and scope highlight" {
     try std.testing.expectEqual(@as(?u32, indent0), grid.guideFgAt(4, 0));
     try std.testing.expectEqual(@as(?u32, guide_gray), grid.guideFgAt(4, 1));
 
-    // (The scope first line's underline — snacks.indent.scope underline — is
-    // SGR underline, which the e2e grid does not parse, so it is not
-    // asserted here.)
+    // (The scope header's horizontal rule is asserted by the scope-emphasis
+    // regressions below: only the active window's source cells take SGR 4:1,
+    // with diagnostics overriding it.)
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
@@ -25168,7 +25168,343 @@ test "search: match/current backgrounds are role-based; selection wins and :noh 
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
 }
 
-test "style observation: scope emphasis no longer paints a full-line underline" {
+/// Cell column of the `nth` (0-based) whole-cell occurrence of `needle` on
+/// screen row `row`, or null. Whole-cell matching keeps wide CJK glyphs and
+/// Nerd Font icons from shifting the byte/cell correspondence, and lets a
+/// split screen that renders the same line twice be addressed by occurrence.
+fn nthCellIndexOf(grid: *Grid, row: usize, needle: []const u8, nth: usize) ?usize {
+    var found: usize = 0;
+    var c: usize = 0;
+    while (c < grid.cols) : (c += 1) {
+        var bi: usize = 0;
+        var cc: usize = c;
+        while (bi < needle.len and cc < grid.cols) {
+            const t = frame.cellText(grid, row, cc);
+            if (t.len == 0) break;
+            if (!std.mem.startsWith(u8, needle[bi..], t)) break;
+            bi += t.len;
+            cc += 1;
+        }
+        if (bi == needle.len) {
+            if (found == nth) return c;
+            found += 1;
+            c = cc - 1; // skip the match, so overlapping starts count once
+        }
+    }
+    return null;
+}
+
+/// Assert that `cells` cells from `start` carry the single scope underline
+/// (SGR 4:1) in `color` — the visual contract for the active scope header:
+/// only source cells, never the gutter/inlay/padding.
+fn expectScopeUnderline(grid: *Grid, row: usize, start: usize, cells: usize, color: u32) !void {
+    for (0..cells) |i| {
+        if (frame.cellUnderlineStyle(grid, row, start + i) != 1 or frame.cellUl(grid, row, start + i) != color) {
+            std.debug.print("scope underline mismatch at ({d},{d}): style={d} ul=#{x:0>6}\n", .{
+                row, start + i, frame.cellUnderlineStyle(grid, row, start + i), frame.cellUl(grid, row, start + i),
+            });
+            grid.dump();
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+fn expectNoScopeUnderline(grid: *Grid, row: usize, start: usize, cells: usize) !void {
+    for (0..cells) |i| {
+        if (frame.cellUnderlineStyle(grid, row, start + i) != 0) {
+            std.debug.print("unexpected underline at ({d},{d}) text=\"{s}\"\n", .{
+                row, start + i, frame.cellText(grid, row, start + i),
+            });
+            grid.dump();
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+/// theme.scopeFg(kanagawa-wave): blend(fg_dim, accent_alt, 40) brightened to
+/// legibleVirtual's 3:1 floor — a quiet themed rule, never a diagnostic tint.
+const scope_ul = packRgb(148, 155, 160);
+
+test "indent: scope range emphasis marks only the focused header's source cells" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var name_buf: [160:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}scope.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "fn f() void {\n    if (x) {\n        y();\n    }\n    g();\n}\n");
+    }
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{});
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try gridWaitFor(&sess, &grid, "fn f() void", 5000);
+    try gridDrain(&sess, &grid, 700); // let the scope spread settle
+
+    // Line 0 is the scope header when the cursor is on the declaration. The
+    // underline covers exactly "fn f() void {" (14 source cells) from the
+    // first content cell: no gutter cell, no whitespace padding to the right.
+    const fn_row = findRow(&grid, "fn f() void {") orelse return error.TestUnexpectedResult;
+    const fn_col = aiCellIndexOf(&grid, fn_row, "fn f() void {") orelse return error.TestUnexpectedResult;
+    try expectScopeUnderline(&grid, fn_row, fn_col, 13, scope_ul);
+    try expectNoScopeUnderline(&grid, fn_row, 0, fn_col); // gutter
+    try expectNoScopeUnderline(&grid, fn_row, fn_col + 13, 20); // EOL padding
+    // The label/context strip is chrome, not the reading surface.
+    var c: usize = 0;
+    while (c < grid.cols) : (c += 1) {
+        try std.testing.expect(!frame.cellUnderlined(&grid, 0, c));
+        try std.testing.expect(!frame.cellUnderlined(&grid, 1, c));
+    }
+
+    // Entering the nested if-block moves the header to line 1: the old rule
+    // is gone and the new one starts at the block's structural indent (4
+    // cells), so the guide cells themselves stay un-underlined.
+    try sess.send("2j");
+    try gridDrain(&sess, &grid, 500);
+    const if_row = findRow(&grid, "if (x) {") orelse return error.TestUnexpectedResult;
+    const if_col = aiCellIndexOf(&grid, if_row, "if (x) {") orelse return error.TestUnexpectedResult;
+    try expectScopeUnderline(&grid, if_row, if_col, 8, scope_ul);
+    try expectNoScopeUnderline(&grid, if_row, if_col - 4, 4);
+    try expectNoScopeUnderline(&grid, fn_row, 0, grid.cols);
+
+    // Leaving the nested block restores the fn body's own header line.
+    try sess.send("2j");
+    try gridDrain(&sess, &grid, 500);
+    try expectScopeUnderline(&grid, fn_row, fn_col, 13, scope_ul);
+    try expectNoScopeUnderline(&grid, if_row, 0, grid.cols);
+
+    // Selection keeps its background and syntax-fg cells; the emphasis is
+    // only the SGR underline bit.
+    try sess.send("ggV");
+    try gridWaitFor(&sess, &grid, "[VISUAL]", 3000);
+    try gridDrain(&sess, &grid, 300);
+    const sel_bg = packRgb(0x2D, 0x4F, 0x67);
+    for (0..13) |i| {
+        try frame.expectCellBg(&grid, fn_row, fn_col + i, sel_bg);
+        try expectScopeUnderline(&grid, fn_row, fn_col + i, 1, scope_ul);
+    }
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+
+    // Split panes show the same buffer twice. Only the window that owns the
+    // keyboard carries the rule; focusing the other pane moves it without
+    // leaving a stale line behind in the first.
+    try sess.send(":vs\r");
+    try gridDrain(&sess, &grid, 600);
+    var left: ?usize = null;
+    var right: ?usize = null;
+    var tries: usize = 0;
+    while (tries < 10 and (left == null or right == null)) : (tries += 1) {
+        left = nthCellIndexOf(&grid, fn_row, "fn f() void {", 0);
+        right = nthCellIndexOf(&grid, fn_row, "fn f() void {", 1);
+        if (left == null or right == null) try gridDrain(&sess, &grid, 200);
+    }
+    const lcol = left orelse return error.TestUnexpectedResult;
+    const rcol = right orelse return error.TestUnexpectedResult;
+    try std.testing.expect(lcol + 13 <= rcol); // distinct panes, no bleed
+    try expectNoScopeUnderline(&grid, fn_row, lcol, 13);
+    try expectScopeUnderline(&grid, fn_row, rcol, 13, scope_ul);
+
+    try sess.send("\x17h");
+    try gridDrain(&sess, &grid, 400);
+    try expectScopeUnderline(&grid, fn_row, lcol, 13, scope_ul);
+    try expectNoScopeUnderline(&grid, fn_row, rcol, 13);
+
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "indent: scope underline follows soft wrap, CJK and tab indentation" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var name_buf: [160:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}scopewrap.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        // The header is 96 display cells (CJK is double width) at 80 columns,
+        // so it wraps onto a second screen row. The nested block is indented
+        // with a real tab to prove the rule starts after structural indent.
+        try f.writeStreamingAll(io, "fn 中文函数_very_long_scope_header_name_that_definitely_wraps_past_eighty_columns(a: i32) void {\n" ++
+            "\tif (x) {\n\t\ty();\n\t}\n}\n");
+    }
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{});
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try gridWaitFor(&sess, &grid, "fn 中文函数", 5000);
+    try gridDrain(&sess, &grid, 700);
+
+    // First wrapped row: the source continues, so every content cell carries
+    // the rule (the two-cell CJK glyph included). The gutter stays clean.
+    const first_row = findRow(&grid, "fn 中文函数") orelse return error.TestUnexpectedResult;
+    const first_col = aiCellIndexOf(&grid, first_row, "fn 中文函数") orelse return error.TestUnexpectedResult;
+    const gutter = first_col; // 2 cells for this file's line count
+    var c: usize = gutter;
+    while (c < grid.cols) : (c += 1) {
+        try expectScopeUnderline(&grid, first_row, c, 1, scope_ul);
+    }
+    try expectNoScopeUnderline(&grid, first_row, 0, gutter);
+    // A wide glyph takes two cells and BOTH are underlined: find the CJK
+    // glyph cell and assert the pair.
+    const cjk_col = aiCellIndexOf(&grid, first_row, "中") orelse return error.TestUnexpectedResult;
+    try expectScopeUnderline(&grid, first_row, cjk_col, 2, scope_ul);
+
+    // Second wrapped row: the rule stops at the last source `{`; the row
+    // padding after the source is not decorated.
+    const tail_row = findRow(&grid, "void {") orelse return error.TestUnexpectedResult;
+    const tail_col = aiCellIndexOf(&grid, tail_row, "void {") orelse return error.TestUnexpectedResult;
+    try expectScopeUnderline(&grid, tail_row, gutter, tail_col - gutter + 6, scope_ul);
+    try expectNoScopeUnderline(&grid, tail_row, tail_col + 6, 20);
+    try expectNoScopeUnderline(&grid, tail_row, 0, gutter);
+
+    // Moving into the tab-indented if body makes that first line the header:
+    // the four expanded indent cells are guides, not source, so they are not
+    // underlined; "if (x) {" is.
+    try sess.send("2j");
+    try gridDrain(&sess, &grid, 500);
+    const if_row = findRow(&grid, "if (x) {") orelse return error.TestUnexpectedResult;
+    const if_col = aiCellIndexOf(&grid, if_row, "if (x) {") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(gutter + 4, if_col);
+    try expectNoScopeUnderline(&grid, if_row, gutter, 4);
+    try expectScopeUnderline(&grid, if_row, if_col, 8, scope_ul);
+    try expectNoScopeUnderline(&grid, first_row, 0, grid.cols);
+
+    // Narrow split panes: each pane clips its own line; only the focused
+    // pane's header carries the rule.
+    try sess.send(":vs\r");
+    try gridDrain(&sess, &grid, 600);
+    // Narrower panes wrap line 0 onto one more row, so line 1 moves down;
+    // locate it again in the split frame instead of reusing the old row.
+    const split_if_row = findRow(&grid, "if (x) {") orelse return error.TestUnexpectedResult;
+    const left = nthCellIndexOf(&grid, split_if_row, "if (x) {", 0) orelse return error.TestUnexpectedResult;
+    const right = nthCellIndexOf(&grid, split_if_row, "if (x) {", 1) orelse return error.TestUnexpectedResult;
+    try expectNoScopeUnderline(&grid, split_if_row, left, 8);
+    try expectScopeUnderline(&grid, split_if_row, right, 8, scope_ul);
+
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "indent: diagnostics and inlay hints win over the scope underline" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const mock = try std.Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/mock_lsp", a);
+    defer a.free(mock);
+    const lsp_env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{mock});
+    defer a.free(lsp_env);
+
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    // Line 1 is a real multi-line function header. The mock's fixed range
+    // puts RANGE_WARNING at UTF-16 10..17 on that line, exactly over
+    // `missing`. Line 0 keeps the mock's default line-0 inlay hint out of
+    // the scope header, so the two sessions test the two virtual text kinds
+    // independently.
+    try aiWriteFile(io, root, "diag_scope.zig", "const inlay = 0;\nfn f() {  missing;\n    x();\n}\nconst top = 1;\n");
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/diag_scope.zig", .{root});
+    {
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{ lsp_env, "OZ_MOCK_SCRIPT=diagnostic_underlines" }, 24, 100, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 24, 100);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try sess.send("j"); // line 1: the fn declaration is the scope header
+        try gridWaitFor(&sess, &grid, "RANGE_WARNING", 8000);
+        try gridDrain(&sess, &grid, 400);
+        const row = findRow(&grid, "fn f() {") orelse return error.TestUnexpectedResult;
+        const col = aiCellIndexOf(&grid, row, "fn f() {") orelse return error.TestUnexpectedResult;
+        const missing_col = aiCellIndexOf(&grid, row, "missing") orelse return error.TestUnexpectedResult;
+        // Wait for the diagnostic range decoration to land (LSP is async).
+        var waited: i32 = 0;
+        while (frame.cellUnderlineStyle(&grid, row, missing_col) != 3) {
+            const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+            if (n > 0) {
+                sess.used += n;
+                grid.feed(sess.out[sess.used - n .. sess.used]);
+            } else {
+                waited += 200;
+                if (waited >= 5000) break;
+            }
+        }
+        if (frame.cellUnderlineStyle(&grid, row, missing_col) != 3) {
+            std.debug.print("diagnostic underline never landed on line1\n", .{});
+            grid.dump();
+            return error.TestUnexpectedResult;
+        }
+        // The warning's yellow curly underline beats the plain scope rule on
+        // all seven `missing` cells; syntax fg stays.
+        for (0..7) |i| {
+            try std.testing.expectEqual(@as(u8, 3), frame.cellUnderlineStyle(&grid, row, missing_col + i));
+            try std.testing.expectEqual(packRgb(0xFF, 0x9E, 0x3B), frame.cellUl(&grid, row, missing_col + i));
+        }
+        // Header cells the diagnostic does not cover keep the restrained
+        // single scope rule, including the structural spaces before `missing`.
+        try expectScopeUnderline(&grid, row, col, 10, scope_ul);
+        try expectScopeUnderline(&grid, row, missing_col + 7, 1, scope_ul); // ';'
+        // The end-of-line diagnostic message is virtual text: no scope rule.
+        const msg_col = aiCellIndexOf(&grid, row, "RANGE_WARNING") orelse return error.TestUnexpectedResult;
+        try expectNoScopeUnderline(&grid, row, msg_col, 13);
+        // Gutter cells (line number + severity mark) never take the rule.
+        try expectNoScopeUnderline(&grid, row, 0, col);
+
+        // Top-level code has no enclosing block: moving there removes the
+        // scope rule entirely (invalidation leaves no stale underline).
+        try sess.send("G");
+        try gridDrain(&sess, &grid, 600);
+        var r: usize = 2;
+        while (r + 1 < grid.rows) : (r += 1) {
+            var cc: usize = 0;
+            while (cc < grid.cols) : (cc += 1) {
+                if (frame.cellUnderlineStyle(&grid, r, cc) == 1) {
+                    std.debug.print("stale scope underline at ({d},{d})\n", .{ r, cc });
+                    grid.dump();
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+        // Returning to the function restores it.
+        try sess.send("ggj");
+        try gridDrain(&sess, &grid, 600);
+        try expectScopeUnderline(&grid, row, col, 10, scope_ul);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+    }
+
+    // Inlay hint spliced into the header: the hint is virtual, so it never
+    // takes the scope underline; source cells on both sides keep it.
+    try aiWriteFile(io, root, "inlay_scope.zig", "fn f() void {\n    x();\n}\n");
+    var ipath_buf: [220:0]u8 = undefined;
+    const ipath = try bufPrintZ(&ipath_buf, "{s}/inlay_scope.zig", .{root});
+    {
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, ipath }, &.{ lsp_env, "OZ_MOCK_SCRIPT=inlay_param" }, 24, 100, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 24, 100);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, ": usize", 8000);
+        try gridDrain(&sess, &grid, 400);
+        const row = findRow(&grid, "fn") orelse return error.TestUnexpectedResult;
+        const fn_col = aiCellIndexOf(&grid, row, "fn") orelse return error.TestUnexpectedResult;
+        const hint_col = aiCellIndexOf(&grid, row, ": usize") orelse return error.TestUnexpectedResult;
+        try expectScopeUnderline(&grid, row, fn_col, 2, scope_ul); // "fn"
+        try expectNoScopeUnderline(&grid, row, hint_col, 7); // ": usize"
+        const rest_col = aiCellIndexOf(&grid, row, "f() void {") orelse return error.TestUnexpectedResult;
+        try expectScopeUnderline(&grid, row, rest_col, 10, scope_ul);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+    }
+}
+
+test "style observation: scope emphasis is opt-out and never paints virtual text" {
     const io = std.testing.io;
     const a = std.testing.allocator;
     var name_buf: [160:0]u8 = undefined;
@@ -25180,7 +25516,7 @@ test "style observation: scope emphasis no longer paints a full-line underline" 
         defer f.close(io);
         try f.writeStreamingAll(io, "fn f() void {\n    if (x) {\n        y();\n    }\n}\n");
     }
-    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{});
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{ "OZ_NO_SCOPE_UNDERLINE=1" });
     defer sess.close();
     defer killPid(sess.pid);
     var grid = try Grid.initSizedCols(a, 24, 80);
@@ -25188,7 +25524,7 @@ test "style observation: scope emphasis no longer paints a full-line underline" 
     try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
     try gridWaitFor(&sess, &grid, "fn f() void", 5000);
     try gridDrain(&sess, &grid, 700); // let the scope spread settle
-    var r: usize = 1; // skip the tab strip (its chrome may underline)
+    var r: usize = 2; // skip the label + context strip (its chrome may underline)
     while (r + 1 < grid.rows) : (r += 1) {
         var c: usize = 0;
         while (c < grid.cols) : (c += 1) {
@@ -25199,7 +25535,8 @@ test "style observation: scope emphasis no longer paints a full-line underline" 
             }
         }
     }
-    // The scope guide color still identifies the active scope.
+    // The opt-out only drops the horizontal rule; the scope guide color still
+    // identifies the active scope.
     try std.testing.expect(grid.containsFg("│", packRgb(0xE0, 0x6C, 0x75)));
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
 }

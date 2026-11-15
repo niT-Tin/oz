@@ -150,6 +150,17 @@ pub fn panelBorderStyle(t: theme.Theme, focused: bool, bg: vaxis.Color) vaxis.St
     };
 }
 
+/// Active scope-range emphasis (issue #14): underline only, so the source
+/// cell keeps its syntax foreground and selection/cursorline background.
+/// Diagnostics are merged after this style and override it. This is the one
+/// entry point for the role — render.zig never hardcodes the underline.
+pub fn scopeRangeStyle(t: theme.Theme) vaxis.Style {
+    return .{
+        .ul = .{ .rgb = theme.scopeFg(t) },
+        .ul_style = .single,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -240,6 +251,21 @@ test "chrome: separators and panel borders are theme-derived, not fixed gray" {
     const light_tab = activeTabStyle(light);
     try expectRgb(light_tab.ul, light.accent_alt);
     try std.testing.expect(contrastRatio(light.fg, light.bg_sel) > 7.0);
+}
+
+test "chrome: scope range role is underline-only in every theme" {
+    for (theme.themes) |t| {
+        const style = scopeRangeStyle(t);
+        try std.testing.expectEqual(vaxis.Cell.Style.Underline.single, style.ul_style);
+        switch (style.ul) {
+            .rgb => |rgb| try expectRgb(.{ .rgb = rgb }, theme.scopeFg(t)),
+            else => return error.TestUnexpectedResult,
+        }
+        // No fg/bg override: syntax colors and selection/cursorline
+        // backgrounds must survive the emphasis.
+        try std.testing.expectEqual(vaxis.Color.default, style.fg);
+        try std.testing.expectEqual(vaxis.Color.default, style.bg);
+    }
 }
 
 test "chrome: surface band card and diff roles stay semantic in every theme" {
