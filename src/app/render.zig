@@ -2640,11 +2640,11 @@ pub fn drawRichPopup(
                     try kinds.append(a, 1);
                     in_fence = flang;
                     block_start = lines.items.len;
-                    } else {
-                        try kinds.append(a, 0);
-                    } else {
-                        try kinds.append(a, 0);
-                    }
+                } else {
+                    try kinds.append(a, 0);
+                } else {
+                    try kinds.append(a, 0);
+                }
             } else {
                 if (autil.isFenceLine(remaining[0..line_len]) != null) {
                     try kinds.append(a, 1);
@@ -3129,12 +3129,11 @@ fn completionLiteralRow(self: *App, a: std.mem.Allocator, win: vaxis.Window, tex
     return segs.toOwnedSlice(a);
 }
 
-/// One chunk of code/signature, syntax-highlighted in `lang` (falling back to
-/// the buffer language). Unknown languages stay plain fg rather than inventing
-/// token colors.
-fn completionCodeRow(self: *App, a: std.mem.Allocator, win: vaxis.Window, text: []const u8, lang: []const u8, width: u32) ![]vaxis.Segment {
-    _ = win;
-    var spans: []syntax.Span = &.{};
+/// Highlight one complete documentation code block with ONE tree-sitter
+/// Highlighter. The old per-line `completionCodeRow` created a parser/query/
+/// tree for every wrapped line, turning a 160-line fenced block into 160
+/// native parsers per frame (a multi-second stall on completion docs).
+fn completionBlockSpans(self: *App, a: std.mem.Allocator, text: []const u8, lang: []const u8) ![]syntax.Span {
     var hl: ?syntax.Highlighter = null;
     if (syntax.languageFor(lang)) |ln| hl = syntax.Highlighter.init(a, ln) catch null;
     if (hl == null) {
@@ -3162,9 +3161,69 @@ fn completionCodeRow(self: *App, a: std.mem.Allocator, win: vaxis.Window, text: 
             }
             try merged.append(a, sp);
         }
-        spans = try merged.toOwnedSlice(a);
+        return merged.toOwnedSlice(a);
     }
-    return self.hoverCodeLineSegs(a, text, 0, @intCast(text.len), spans, width);
+    return &.{};
+}
+
+/// One code row sliced out of a pre-highlighted block.
+fn completionCodeRowFromBlock(
+    self: *App,
+    a: std.mem.Allocator,
+    win: vaxis.Window,
+    block_text: []const u8,
+    line_start: u32,
+    line_end: u32,
+    spans: []const syntax.Span,
+    width: u32,
+) ![]vaxis.Segment {
+    _ = win;
+    return self.hoverCodeLineSegs(a, block_text, line_start, line_end, spans, width);
+}
+
+/// Append rows for one fenced code block (already collected as lines) using a
+/// single highlighter. Returns false when the row cap was reached.
+fn appendFencedBlockRows(
+    self: *App,
+    a: std.mem.Allocator,
+    win: vaxis.Window,
+    rows: *std.ArrayList([]vaxis.Segment),
+    lines: *std.ArrayList([]const u8),
+    lang: []const u8,
+    width: u32,
+) !bool {
+    if (lines.items.len == 0) return true;
+    var block = std.ArrayList(u8).empty;
+    // Do NOT deinit `block` here: the returned segment text slices reference
+    // this buffer and are drawn after this helper returns. The frame arena
+    // owns it until the frame ends (freeing it can rewind the arena and let
+    // later row allocations overwrite the text). `offsets` only holds numbers.
+    var offsets = std.ArrayList(u32).empty;
+    defer offsets.deinit(a);
+    for (lines.items) |line| {
+        try offsets.append(a, @intCast(block.items.len));
+        try block.appendSlice(a, line);
+        try block.append(a, '\n');
+    }
+    const spans = try completionBlockSpans(self, a, block.items, lang);
+    for (lines.items, offsets.items) |line, off| {
+        const chunks = try wrapCompletionLine(a, win, line, width);
+        for (chunks) |chunk| {
+            if (rows.items.len >= 256) return false;
+            const chunk_off = off + @as(u32, @intCast(@intFromPtr(chunk.ptr) - @intFromPtr(line.ptr)));
+            try rows.append(a, try completionCodeRowFromBlock(
+                self,
+                a,
+                win,
+                block.items,
+                chunk_off,
+                chunk_off + @as(u32, @intCast(chunk.len)),
+                spans,
+                width,
+            ));
+        }
+    }
+    return true;
 }
 
 /// Build the wrapped display rows for the completion documentation popup:
@@ -3193,10 +3252,25 @@ fn buildCompletionDocRows(
     const has_body = item.doc != null and item.doc.?.len > 0;
 
     if (sig) |sig_text| {
+        const sig_spans = try completionBlockSpans(self, a, sig_text, ft);
         var sig_lines = std.mem.splitScalar(u8, sig_text, '\n');
+        var line_off: u32 = 0;
         while (sig_lines.next()) |line| {
             const chunks = try wrapCompletionLine(a, win, line, width);
-            for (chunks) |chunk| try rows.append(a, try completionCodeRow(self, a, win, chunk, ft, width));
+            for (chunks) |chunk| {
+                const chunk_off = line_off + @as(u32, @intCast(@intFromPtr(chunk.ptr) - @intFromPtr(line.ptr)));
+                try rows.append(a, try completionCodeRowFromBlock(
+                    self,
+                    a,
+                    win,
+                    sig_text,
+                    chunk_off,
+                    chunk_off + @as(u32, @intCast(chunk.len)),
+                    sig_spans,
+                    width,
+                ));
+            }
+            line_off += @as(u32, @intCast(line.len)) + 1;
         }
         if (has_body) {
             // Divider between signature and prose; the signature is not lost
@@ -3216,6 +3290,8 @@ fn buildCompletionDocRows(
             while (body.len > 0 and (body[body.len - 1] & 0xC0) == 0x80) body = body[0 .. body.len - 1];
         }
         var in_fence: ?[]const u8 = null;
+        var fence_lines = std.ArrayList([]const u8).empty;
+        defer fence_lines.deinit(a);
         var line_it = std.mem.splitScalar(u8, body, '\n');
         // Bound per-frame layout work for pathological docs; 256 wrapped
         // rows is far more than the pane can show, and the pane still
@@ -3232,6 +3308,12 @@ fn buildCompletionDocRows(
                     if (in_fence == null) {
                         in_fence = lang;
                     } else {
+                        // Closing fence: highlight the whole block once.
+                        if (!try appendFencedBlockRows(self, a, win, &rows, &fence_lines, in_fence.?, width)) {
+                            truncated_rows = true;
+                            break;
+                        }
+                        fence_lines.clearRetainingCapacity();
                         in_fence = null;
                     }
                     // Fence markers are concealed: keep a blank row so the
@@ -3239,9 +3321,8 @@ fn buildCompletionDocRows(
                     try rows.append(a, try completionLiteralRow(self, a, win, "", width, .{ .bg = .{ .rgb = self.theme.bg_float } }));
                     continue;
                 }
-                if (in_fence) |lang| {
-                    const chunks = try wrapCompletionLine(a, win, line, width);
-                    for (chunks) |chunk| try rows.append(a, try completionCodeRow(self, a, win, chunk, lang, width));
+                if (in_fence != null) {
+                    try fence_lines.append(a, line);
                     continue;
                 }
                 const chunks = try wrapCompletionWords(a, win, line, width);
@@ -3252,6 +3333,9 @@ fn buildCompletionDocRows(
             // spaces so prose stays readable.
             const chunks = try wrapCompletionWords(a, win, line, width);
             for (chunks) |chunk| try rows.append(a, try completionLiteralRow(self, a, win, chunk, width, base));
+        }
+        if (in_fence) |lang| {
+            if (!try appendFencedBlockRows(self, a, win, &rows, &fence_lines, lang, width)) truncated_rows = true;
         }
         if (item.doc.?.len > 64 * 1024 or truncated_rows) {
             try rows.append(a, try completionLiteralRow(self, a, win, "… documentation truncated", width, dim));
