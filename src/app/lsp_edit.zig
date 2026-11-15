@@ -644,6 +644,18 @@ pub fn collectCompletionWords(self: *App, keep_sel: bool) !void {
         pending.clearRetainingCapacity();
     }
 
+    // Refresh replaces the previous snapshot. Appending here accumulated the
+    // old prefix's candidates on every keystroke (and kept non-matches alive).
+    const selected = if (keep_sel and self.completion_user_navigated and self.completion_sel < self.completion_words.items.len)
+        try self.alloc.dupe(u8, self.completion_words.items[self.completion_sel].label)
+    else
+        null;
+    defer if (selected) |label| self.alloc.free(label);
+    for (self.completion_words.items) |*item| item.deinit(self.alloc);
+    self.completion_words.clearRetainingCapacity();
+    self.completion_generation +%= 1;
+    self.completion_doc_scroll = 0;
+
     // (word, count) pairs, sorted by count desc then word asc
     const Pair = struct { word: []const u8, count: u32 };
     var pairs = std.ArrayList(Pair).empty;
@@ -671,9 +683,18 @@ pub fn collectCompletionWords(self: *App, keep_sel: bool) !void {
     var k: usize = 0;
     while (k < limit) : (k += 1) {
         const w = try self.alloc.dupe(u8, pairs.items[k].word);
-        try self.completion_words.append(self.alloc, .{ .label = w, .kind = 0 });
+        try self.completion_words.append(self.alloc, .{ .source = .buffer, .label = w, .kind = 0 });
     }
-    if (!keep_sel) self.completion_sel = 0;
+    self.completion_sel = 0;
+    if (selected) |label| {
+        for (self.completion_words.items, 0..) |item, index| {
+            if (std.mem.eql(u8, item.label, label)) {
+                self.completion_sel = index;
+                break;
+            }
+        }
+    }
+    self.completion_active = self.completion_words.items.len > 0;
 }
 
 /// Count one occurrence of `word` (skipping the word currently being
@@ -705,8 +726,8 @@ pub fn countCompletionWord(self: *App, counts: *std.StringHashMap(u32), word: []
     }
 }
 
-/// Enter while the menu is open: replace the typed prefix
-/// [completion_pos, cursor) with the selected word — one edit inside the
+/// Enter while the menu is open: replace the typed semantic prefix (or the
+/// full existing path basename) with the selected word — one edit inside the
 /// open insert-session undo group — then close the menu (insert stays
 /// active, the session continues). Matches the user's nvim (blink.cmp):
 /// Enter is the only accept key; Tab always inserts literal spaces.
@@ -715,21 +736,31 @@ pub fn acceptCompletion(self: *App) !void {
         self.closeCompletion();
         return;
     }
-    const word = self.completion_words.items[self.completion_sel].insertText();
+    const chosen = &self.completion_words.items[self.completion_sel];
+    const word = chosen.insertText();
+    const continue_path = chosen.source == .path and std.mem.endsWith(u8, word, "/");
     const pt = &self.cur().pt;
     const cursor = self.curCursor().*;
     const pos = @min(self.completion_pos, cursor);
+    var replace_end = cursor;
+    if (chosen.source == .path) {
+        replace_end = @min(pt.len(), @max(cursor, self.completion_path_end));
+        // Directory candidates already end in '/'. Consume an existing
+        // separator once, retaining the following component byte-for-byte.
+        if (continue_path and replace_end < pt.len() and pt.byteAt(replace_end) == '/') replace_end += 1;
+    }
     if (!self.in_insert) {
         self.cur().history.beginGroup();
         self.in_insert = true;
     }
-    // LSP range in the PRE-EDIT document: [pos, cursor) → word.
+    // LSP range in the PRE-EDIT document: [pos, replace_end) → word.
     const start_pos = self.lspPositionAt(pt, pos);
-    const end_pos = self.lspPositionAt(pt, cursor);
-    try self.recordEdit(pos, cursor - pos, word);
+    const end_pos = self.lspPositionAt(pt, replace_end);
+    try self.recordEdit(pos, replace_end - pos, word);
     self.curCursor().* = pos + @as(u32, @intCast(word.len));
     self.markDirtyRange(start_pos, end_pos, word);
     self.closeCompletion();
+    if (continue_path) try self.maybeAutoComplete("/");
 }
 
 /// Drop the completion menu and free its candidate words (the list keeps
@@ -744,6 +775,9 @@ pub fn closeCompletion(self: *App) void {
     for (self.completion_words.items) |*it| it.deinit(self.alloc);
     self.completion_words.clearRetainingCapacity();
     self.completion_active = false;
+    self.completion_path = false;
+    self.completion_path_end = 0;
+    self.completion_path_cache.deinit(self.alloc);
     self.completion_sel = 0;
     self.completion_user_navigated = false;
     self.completion_pos = 0;
