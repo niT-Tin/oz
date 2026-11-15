@@ -1208,28 +1208,30 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         var indent_cols: u32 = 0;
         var ib: u32 = 0;
         while (ib < indent_end) : (ib += 1) indent_cols += if (text[ib] == '\t') tab_width else 1;
-        if (indent_end > 0) {
+        {
             const indent_levels: u32 = indent_cols / tab_width;
-            // hints anchored at/inside the indent region render before it
-            // (normally none: hints annotate tokens, which start past the
-            // indent) — keeps the hint-before-text ordering of the main loop
-            while (hint_i < line_hints.len and line_hints[hint_i].character <= indent_end) {
-                const hint = line_hints[hint_i];
-                if (hint.label.len > 0) {
-                    const hint_sel = ib >= sel_s and ib < sel_e;
-                    try segs.append(a, .{
-                        .text = hint.label,
-                        .style = .{
-                            .fg = .{ .rgb = theme.hintFg(self.theme) },
-                            .bg = .{ .rgb = if (hint_sel) self.theme.bg_sel else if (is_cur_line) self.theme.bg_curline else self.theme.bg },
-                        },
-                    });
-                }
-                hint_i += 1;
-            }
-            var gcol: u32 = 0; // expanded column of the current indent cell
+            var gcol: u32 = 0; // source indentation cells, excluding hints
             ib = 0;
-            while (ib < indent_end) : (ib += 1) {
+            while (ib <= indent_end) : (ib += 1) {
+                // Interleave virtual text with the whitespace at its real
+                // byte anchor. A parameter hint at indent_end belongs AFTER
+                // the indent, while an anchor inside it splits the guides.
+                // The final iteration also handles BOL/empty-line anchors.
+                while (hint_i < line_hints.len and line_hints[hint_i].character <= ib) {
+                    const hint = line_hints[hint_i];
+                    if (hint.label.len > 0) {
+                        const hint_sel = ib >= sel_s and ib < sel_e;
+                        try segs.append(a, .{
+                            .text = hint.label,
+                            .style = .{
+                                .fg = .{ .rgb = theme.hintFg(self.theme) },
+                                .bg = .{ .rgb = if (hint_sel) self.theme.bg_sel else if (is_cur_line) self.theme.bg_curline else self.theme.bg },
+                            },
+                        });
+                    }
+                    hint_i += 1;
+                }
+                if (ib == indent_end) break;
                 const cell_w: u32 = if (text[ib] == '\t') tab_width else 1;
                 var j: u32 = 0;
                 while (j < cell_w) : (j += 1) {
