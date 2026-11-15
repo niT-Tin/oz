@@ -466,10 +466,10 @@ pub fn performHistoryStep(self: *App, kind: history_mod.UndoKind) HistoryOutcome
     // transaction, then convert to line/column in the NEW document.
     const inlay_offsets = captureInlayOffsetsForHistory(self, group.edits.items, kind);
     defer if (inlay_offsets) |o| self.alloc.free(o);
-    const res = switch (kind) {
-        .undo => self.cur().history.undoResult(&self.cur().pt),
-        .redo => self.cur().history.redoResult(&self.cur().pt),
-    };
+    // historyApply carries this buffer's closed folds through the same edit
+    // sequence (against a scratch copy) before running the transaction, so
+    // undo/redo never unfold blocks whose content survives.
+    const res = self.historyApply(self.cur(), kind);
     if (!res.changed) {
         return .{ .applied = false, .kind = kind, .before_cursor = before_cursor, .after_cursor = before_cursor, .revision = res.revision };
     }
@@ -586,7 +586,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             // (beginInsertSession does this, before the group opens).
             self.beginInsertSession();
             self.cur().history.beginGroup();
-            try self.cur().history.record(pt, ls + text_len, 0, open.text);
+            try self.recordEdit(ls + text_len, 0, open.text);
             self.curCursor().* = ls + text_len + open.cursor_off;
             self.in_insert = true;
             self.state.mode = .insert;
@@ -619,7 +619,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             defer open.deinit(self.alloc);
             self.beginInsertSession();
             self.cur().history.beginGroup();
-            try self.cur().history.record(pt, ls, 0, open.text);
+            try self.recordEdit(ls, 0, open.text);
             self.curCursor().* = ls + open.cursor_off;
             self.in_insert = true;
             self.state.mode = .insert;
@@ -672,7 +672,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
                     const pos = self.mc.cursors.items[i];
                     const w = self.mc.wordRange(pt, pos);
                     if (w.end <= w.start) continue;
-                    try self.cur().history.record(pt, w.start, w.end - w.start, "");
+                    try self.recordEdit(w.start, w.end - w.start, "");
                     for (self.mc.cursors.items, 0..) |*c, j| {
                         if (j == i) continue;
                         if (c.* >= w.end) c.* -= w.end - w.start;
@@ -810,7 +810,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
                 const seq = self.charLenAt(pt, c);
                 const end = @min(c + seq, pt.len());
                 if (end <= c) break;
-                try self.cur().history.record(pt, c, end - c, "");
+                try self.recordEdit(c, end - c, "");
             }
             self.cur().history.endGroup();
             self.markDirtyRange(start_pos, end_pos, "");
@@ -840,7 +840,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
                 // walk back to the start of the previous UTF-8 character
                 var start = c - 1;
                 while (start > 0 and (pt.byteAt(start) & 0xC0) == 0x80) start -= 1;
-                try self.cur().history.record(pt, start, c - start, "");
+                try self.recordEdit(start, c - start, "");
                 self.curCursor().* = start;
             }
             self.cur().history.endGroup();
@@ -864,7 +864,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
                 const start_pos = self.lspPositionAt(&self.cur().pt, c);
                 const end_pos = self.lspPositionAt(&self.cur().pt, end);
                 self.cur().history.beginGroup();
-                try self.cur().history.record(pt, c, end - c, "");
+                try self.recordEdit(c, end - c, "");
                 self.cur().history.endGroup();
                 self.curCursor().* = c;
                 self.markDirtyRange(start_pos, end_pos, "");
@@ -884,7 +884,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             const end_pos = self.lspPositionAt(&self.cur().pt, end);
             self.cur().history.beginGroup();
             if (end > c) {
-                try self.cur().history.record(pt, c, end - c, "");
+                try self.recordEdit(c, end - c, "");
             }
             self.state.mode = .insert;
             self.in_insert = true; // group stays open until exitInsert
@@ -911,7 +911,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             const start_pos = self.lspPositionAt(&self.cur().pt, start);
             const end_pos = self.lspPositionAt(&self.cur().pt, end);
             self.cur().history.beginGroup();
-            try self.cur().history.record(pt, start, end - start, "");
+            try self.recordEdit(start, end - start, "");
             self.state.mode = .insert;
             self.in_insert = true;
             self.markDirtyRange(start_pos, end_pos, "");
@@ -944,7 +944,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
                     swapped = buf[0] + 32;
                 }
                 if (swapped) |ch| {
-                    try self.cur().history.record(pt, c, 1, &.{ch});
+                    try self.recordEdit(c, 1, &.{ch});
                     self.curCursor().* = c + seq;
                 } else {
                     self.curCursor().* = c + seq;
@@ -975,16 +975,16 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             }
             self.cur().history.beginGroup();
             // remove the terminator; the next line now starts at term_start
-            try self.cur().history.record(pt, term_start, term_len, "");
+            try self.recordEdit(term_start, term_len, "");
             // collapse leading whitespace of the next line
             if (next_indent > 0) {
-                try self.cur().history.record(pt, term_start, next_indent, "");
+                try self.recordEdit(term_start, next_indent, "");
             }
             // join with a single space unless the first line is empty.
             // The next line's first char now sits at term_start; inserting
             // BEFORE it glues the lines.
             if (cur_text_len > 0) {
-                try self.cur().history.record(pt, term_start, 0, " ");
+                try self.recordEdit(term_start, 0, " ");
             }
             self.cur().history.endGroup();
             self.curCursor().* = @min(self.curCursor().*, pt.len());
@@ -1004,7 +1004,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             while (l <= end_line) : (l += 1) {
                 const ls = pt.lineStart(l);
                 if (action == .indent_line) {
-                    try self.cur().history.record(pt, ls, 0, indent);
+                    try self.recordEdit(ls, 0, indent);
                 } else {
                     // remove up to 4 leading spaces/tabs
                     var removed: u32 = 0;
@@ -1012,7 +1012,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
                         if (ls >= pt.len()) break;
                         const b = pt.byteAt(ls);
                         if (b == ' ' or b == '\t') {
-                            try self.cur().history.record(pt, ls, 1, "");
+                            try self.recordEdit(ls, 1, "");
                         } else break;
                     }
                 }
@@ -1064,7 +1064,7 @@ pub fn replaceCharsAtCursor(self: *App, ch: u8, count: u32) !void {
         const seq = self.charLenAt(pt, c);
         if (seq != 1) break; // only replace single-byte chars
         if (pt.byteAt(c) != ch) {
-            try self.cur().history.record(pt, c, 1, &.{ch});
+            try self.recordEdit(c, 1, &.{ch});
         }
         c += 1;
     }

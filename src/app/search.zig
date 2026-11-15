@@ -410,7 +410,7 @@ pub fn insertText(self: *App, text: []const u8) !void {
     // same before and after the edit).
     const at = self.lspPositionAt(&self.cur().pt, pos);
     // record() snapshots the pre-edit state and applies the edit itself
-    try self.cur().history.record(&self.cur().pt, pos, 0, text);
+    try self.recordEdit(pos, 0, text);
     self.curCursor().* += @intCast(text.len);
     // keep inlay hints aligned instead of clearing them (insert mode:
     // clearing + re-requesting on every keystroke makes the view flicker)
@@ -488,10 +488,10 @@ pub fn recordPasteEditNoCursor(self: *App, at: u32, delete_len: u32, text: []con
         const deleted = try self.alloc.alloc(u8, delete_len);
         defer self.alloc.free(deleted);
         pt.copyRange(at, deleted);
-        try self.cur().history.record(pt, at, delete_len, text);
+        try self.recordEdit(at, delete_len, text);
         self.adjustInlayHintsDelete(line, col, deleted);
     } else {
-        try self.cur().history.record(pt, at, 0, text);
+        try self.recordEdit(at, 0, text);
     }
     self.adjustInlayHintsInsert(line, col, text);
     self.markDirtyRange(start_pos, end_pos, text);

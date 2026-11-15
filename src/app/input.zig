@@ -278,7 +278,7 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
             while (i > 0) {
                 i -= 1;
                 const pos = self.mc.cursors.items[i];
-                try self.cur().history.record(&self.cur().pt, pos, wlen, "");
+                try self.recordEdit(pos, wlen, "");
             }
             self.cur().history.endGroup();
             // LSP sync (same rule as every other edit): the server's
@@ -462,7 +462,7 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
                     // LSP range in the PRE-EDIT document: [pos, pos+1).
                     const start_pos = self.lspPositionAt(&self.cur().pt, pos);
                     const end_pos = self.lspPositionAt(&self.cur().pt, pos + 1);
-                    try self.cur().history.record(&self.cur().pt, pos, 1, "");
+                    try self.recordEdit(pos, 1, "");
                     self.curCursor().* = pos;
                     // The 'j' was shift-adjusted INTO the hints when it
                     // was inserted (adjustInlayHintsInsert +1); removing

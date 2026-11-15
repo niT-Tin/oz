@@ -92,7 +92,7 @@ pub fn firstNumberInLine(self: *App, ls: u32, le: u32) ?Number {
 pub fn replaceNumber(self: *App, n: Number, delta: i64) !u32 {
     const new = try std.fmt.allocPrint(self.alloc, "{d}", .{n.value + delta});
     defer self.alloc.free(new);
-    try self.cur().history.record(&self.cur().pt, n.start, n.end - n.start, new);
+    try self.recordEdit(n.start, n.end - n.start, new);
     return n.start + @as(u32, @intCast(new.len));
 }
 
@@ -387,7 +387,7 @@ fn putBlock(self: *App, bytes: []const u8, width: u32, before: bool, count: u32)
     var row: u32 = top;
     var first: ?u32 = null;
     while (rows.next()) |text| : (row += 1) {
-        while (row >= pt.lineCount()) try self.cur().history.record(pt, pt.len(), 0, "\n");
+        while (row >= pt.lineCount()) try self.recordEdit(pt.len(), 0, "\n");
         const ls = pt.lineStart(row);
         const le = ls + pt.lineLen(row);
         var pos = ls;
@@ -408,7 +408,7 @@ fn putBlock(self: *App, bytes: []const u8, width: u32, before: bool, count: u32)
             try insert.appendSlice(self.alloc, text);
             if (text_cells < width) try insert.appendNTimes(self.alloc, ' ', width - text_cells);
         }
-        try self.cur().history.record(pt, pos, 0, insert.items);
+        try self.recordEdit(pos, 0, insert.items);
         if (first == null) first = start;
     }
     self.curCursor().* = first orelse anchor;
