@@ -85,6 +85,17 @@ pub const Script = enum {
     /// items with detail + markdown documentation and a wide label. Used by
     /// the popup-geometry/markdown e2e tests.
     rich,
+    /// Capability-aware hover fixture: returns MarkupContent kind "markdown"
+    /// with a zig fenced block ONLY when the client advertised
+    /// textDocument.hover.contentFormat containing "markdown"; otherwise it
+    /// returns kind "plaintext" with no fence (like ZLS). This prevents a
+    /// canned-markdown mock from hiding a missing capability negotiation.
+    hover_cap,
+    /// Completion ranking fixture: the server returns the reported bad order
+    /// count_lines, read_lines, line, inline; every item has a distinct
+    /// insertText so the accepted bytes prove insertText was used and the
+    /// label/filterText were not. The client must rank exact `line` first.
+    completion_order,
     /// Rich completion-only fixture: labelDetails (detail + description),
     /// display label != insertText, markdown/plaintext docs, a long
     /// scrollable body, duplicate labels and detail-only/no-docs items.
@@ -121,6 +132,8 @@ pub const Script = enum {
         if (std.mem.eql(u8, name, "inlay_range")) return .inlay_range;
         if (std.mem.eql(u8, name, "inlay_eol")) return .inlay_eol;
         if (std.mem.eql(u8, name, "rich")) return .rich;
+        if (std.mem.eql(u8, name, "hover_cap")) return .hover_cap;
+        if (std.mem.eql(u8, name, "completion_order")) return .completion_order;
         if (std.mem.eql(u8, name, "completion_rich")) return .completion_rich;
         if (std.mem.eql(u8, name, "completion_resolve")) return .completion_resolve;
         if (std.mem.eql(u8, name, "completion_resolve_hold")) return .completion_resolve_hold;
@@ -160,6 +173,14 @@ pub const State = struct {
     signature_mode: SignatureMode = .normal,
     signature_requests: u32 = 0,
     signature_responses: u32 = 0,
+    /// hover_cap script: client declared hover.contentFormat with markdown.
+    /// Recorded from initialize so the SAME fixture answers in the format the
+    /// client asked for, exactly like a real server.
+    hover_markdown_cap: bool = false,
+    /// hover_cap script test seam: a server may still answer plaintext even
+    /// when the client advertises markdown. The renderer must then keep
+    /// literal backticks/fences as prose. Set by OZ_HOVER_FORCE_PLAINTEXT=1.
+    hover_force_plaintext: bool = false,
 
     pub const ChangeRecord = struct {
         uri: []u8,
@@ -226,6 +247,7 @@ pub fn handleMessage(
         const a = arena.allocator();
 
         if (std.mem.eql(u8, method, "initialize")) {
+            state.hover_markdown_cap = initializeHoverMarkdownCap(msg.params);
             try pushResponse(alloc, &out, id, try buildInitializeResult(a, script));
         } else if (std.mem.eql(u8, method, "textDocument/completion")) {
             // echo the typed prefix in the labels ("mockItemmo") so tests can
@@ -269,7 +291,9 @@ pub fn handleMessage(
                 }
             }
             const prefix = completionPrefix(a, state, uri, line, col);
-            const result = if (script == .completion_rich)
+            const result = if (script == .completion_order)
+                try buildOrderCompletionResult(a)
+            else if (script == .completion_rich)
                 try buildRichCompletionResult(a, prefix)
             else if (script == .signature_lifecycle)
                 try buildLifecycleCompletionResult(a)
@@ -310,7 +334,7 @@ pub fn handleMessage(
             const result = if (script == .edit_safety or script == .edit_safety_documents or script == .edit_safety_alias)
                 try buildSafetyHover(a, state, msg.params, if (script == .edit_safety_alias) "linked-b.zig" else "b.zig")
             else
-                try buildHoverResult(a, script);
+                try buildHoverResult(a, script, state);
             try pushResponse(alloc, &out, id, result);
         } else if (std.mem.eql(u8, method, "textDocument/definition") or
             std.mem.eql(u8, method, "textDocument/declaration"))
@@ -739,6 +763,25 @@ fn richCompletionItem(
     return .{ .object = item };
 }
 
+/// Completion ordering fixture: the exact server order from the report, each
+/// item accepting a distinct insertText.
+fn buildOrderCompletionResult(a: std.mem.Allocator) !std.json.Value {
+    const labels = [_][]const u8{ "count_lines", "read_lines", "line", "inline" };
+    var items = std.json.Array.init(a);
+    for (labels) |label| {
+        var it = try std.json.ObjectMap.init(a, &.{}, &.{});
+        try it.put(a, "label", .{ .string = label });
+        try it.put(a, "kind", .{ .integer = 3 });
+        const insert = try std.fmt.allocPrint(a, "{s}_accepted", .{label});
+        try it.put(a, "insertText", .{ .string = insert });
+        try it.put(a, "filterText", .{ .string = label });
+        try items.append(.{ .object = it });
+    }
+    var result = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try result.put(a, "items", .{ .array = items });
+    return .{ .object = result };
+}
+
 fn buildRichCompletionResult(a: std.mem.Allocator, prefix: []const u8) !std.json.Value {
     _ = prefix;
     var items = std.json.Array.init(a);
@@ -845,9 +888,44 @@ fn buildCompletionResult(a: std.mem.Allocator, prefix: []const u8, script: Scrip
     return .{ .object = result };
 }
 
-fn buildHoverResult(a: std.mem.Allocator, script: Script) !std.json.Value {
+/// True when initialize.params.capabilities.textDocument.hover.contentFormat
+/// contains "markdown". Defensive about absent/mistyped fields: a missing
+/// capability must mean plaintext, not a panic.
+pub fn initializeHoverMarkdownCap(params: ?std.json.Value) bool {
+    const p = params orelse return false;
+    if (p != .object) return false;
+    const caps = p.object.get("capabilities") orelse return false;
+    if (caps != .object) return false;
+    const td = caps.object.get("textDocument") orelse return false;
+    if (td != .object) return false;
+    const hover = td.object.get("hover") orelse return false;
+    if (hover != .object) return false;
+    const formats = hover.object.get("contentFormat") orelse return false;
+    if (formats != .array) return false;
+    for (formats.array.items) |f| {
+        if (f == .string and std.mem.eql(u8, f.string, "markdown")) return true;
+    }
+    return false;
+}
+
+fn buildHoverResult(a: std.mem.Allocator, script: Script, state: *State) !std.json.Value {
     var contents = try std.json.ObjectMap.init(a, &.{}, &.{});
     try contents.put(a, "kind", .{ .string = "markdown" });
+    if (script == .hover_cap) {
+        // The negotiated format decides the payload: markdown gets a fenced
+        // zig block (real syntax colors); plaintext stays literal prose with
+        // no fences, so the renderer must not interpret it as Markdown.
+        const md = state.hover_markdown_cap and !state.hover_force_plaintext;
+        const value: []const u8 = if (md)
+            "```zig\nconst hover_sentinel: usize = 99;\n```\n(usize = 99)"
+        else
+            "const hover_sentinel: usize = 99;\n```not a fence\n(usize = 99)";
+        try contents.put(a, "kind", .{ .string = if (md) "markdown" else "plaintext" });
+        try contents.put(a, "value", .{ .string = value });
+        var result = try std.json.ObjectMap.init(a, &.{}, &.{});
+        try result.put(a, "contents", .{ .object = contents });
+        return .{ .object = result };
+    }
     if (script == .rich) {
         // Six lines (the hover cap): heading (markers concealed), an arrow
         // (byte/cell mismatch), a fenced zig block (syntax colors), and CJK
@@ -1516,6 +1594,9 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, mode, "null")) state.signature_mode = .null_result else if (std.mem.eql(u8, mode, "error")) state.signature_mode = .error_result else if (std.mem.eql(u8, mode, "ignore")) state.signature_mode = .ignore else if (std.mem.eql(u8, mode, "timeout")) state.signature_mode = .timeout;
         }
     }
+    if (init.environ_map.get("OZ_HOVER_FORCE_PLAINTEXT")) |v| {
+        if (v.len > 0 and !std.mem.eql(u8, v, "0")) state.hover_force_plaintext = true;
+    }
     const barrier_dir = init.environ_map.get("OZ_SIG_BARRIER_DIR");
     var seen_requests: u32 = 0;
     var seen_responses: u32 = 0;
@@ -2161,4 +2242,47 @@ test "full message cycle through frame functions and handleMessage" {
     const contents = rmsg.result.?.object.get("contents").?;
     try testing.expectEqualStrings("markdown", contents.object.get("kind").?.string);
     try testing.expectEqualStrings("**mock hover**\n`second line`\n```zig\nconst b = 2;\n```\nhttp://example.com third line", contents.object.get("value").?.string);
+}
+
+test "hover_cap: initialize capability decides markdown vs plaintext payload" {
+    const alloc = testing.allocator;
+    const cases = [_]struct { init_params: []const u8, want_markdown: bool }{
+        .{
+            .init_params = "{\"capabilities\":{\"textDocument\":{\"hover\":{\"contentFormat\":[\"markdown\",\"plaintext\"]}}}}",
+            .want_markdown = true,
+        },
+        // Missing hover capability (the pre-fix oz initialize params):
+        // plaintext, no fenced block.
+        .{ .init_params = "{\"capabilities\":{}}", .want_markdown = false },
+        // Unknown format only: still plaintext.
+        .{ .init_params = "{\"capabilities\":{\"textDocument\":{\"hover\":{\"contentFormat\":[\"html\"]}}}}", .want_markdown = false },
+    };
+    for (cases, 0..) |case, i| {
+        var state = State{};
+        defer state.deinit(alloc);
+        const init_json = try std.fmt.allocPrint(
+            alloc,
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{s}}}",
+            .{case.init_params},
+        );
+        defer alloc.free(init_json);
+        var init = try handleContent(alloc, .hover_cap, &state, init_json);
+        defer init.deinit(alloc);
+        try testing.expectEqual(case.want_markdown, state.hover_markdown_cap);
+
+        var hover = try handleContent(alloc, .hover_cap, &state, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///a.zig\"},\"position\":{\"line\":0,\"character\":1}}}");
+        defer hover.deinit(alloc);
+        try testing.expectEqual(@as(usize, 1), hover.frames.items.len);
+        var msg = try json_rpc.parseMessage(alloc, hover.frames.items[0]);
+        defer msg.deinit(alloc);
+        const contents = msg.result.?.object.get("contents").?.object;
+        const want_kind = if (case.want_markdown) "markdown" else "plaintext";
+        try testing.expectEqualStrings(want_kind, contents.get("kind").?.string);
+        const value = contents.get("value").?.string;
+        try testing.expectEqual(case.want_markdown, std.mem.indexOf(u8, value, "```zig") != null);
+        try testing.expect(std.mem.indexOf(u8, value, "hover_sentinel: usize = 99") != null);
+        if (i == 0) {
+            try testing.expect(std.mem.indexOf(u8, value, "```") != null);
+        }
+    }
 }

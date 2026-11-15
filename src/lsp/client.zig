@@ -599,6 +599,10 @@ pub const Client = struct {
         var inner = cap.get("capabilities").?;
         if (inner.object.getPtr("textDocument")) |td| {
             if (td.object.getPtr("inlayHint")) |ih| ih.object.deinit(self.alloc);
+            if (td.object.getPtr("hover")) |hover| {
+                if (hover.object.getPtr("contentFormat")) |cf| cf.array.deinit();
+                hover.object.deinit(self.alloc);
+            }
             if (td.object.getPtr("publishDiagnostics")) |pd| pd.object.deinit(self.alloc);
             if (td.object.getPtr("completion")) |comp| {
                 if (comp.object.getPtr("completionItem")) |ci| {
@@ -1092,6 +1096,18 @@ pub const Client = struct {
         try completion_cap.put(self.alloc, "dynamicRegistration", .{ .bool = false });
         try completion_cap.put(self.alloc, "completionItem", .{ .object = item_cap });
         try td_cap.put(self.alloc, "completion", .{ .object = completion_cap });
+        // Hover content negotiation is a DIFFERENT capability from completion's
+        // documentationFormat above. Declaring it makes zls/rust-analyzer
+        // return Markdown with fenced ```<lang> code, which the popup renderer
+        // can syntax-highlight; without it they fall back to plaintext.
+        var hover_formats = std.json.Array.init(self.alloc);
+        errdefer hover_formats.deinit();
+        try hover_formats.append(.{ .string = "markdown" });
+        try hover_formats.append(.{ .string = "plaintext" });
+        var hover_cap = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer hover_cap.deinit(self.alloc);
+        try hover_cap.put(self.alloc, "contentFormat", .{ .array = hover_formats });
+        try td_cap.put(self.alloc, "hover", .{ .object = hover_cap });
         try td_cap.put(self.alloc, "publishDiagnostics", .{ .object = diag_cap });
         var inner = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer inner.deinit(self.alloc);
@@ -1608,6 +1624,40 @@ test "initParams: rootUri/workspaceFolders derive from the document" {
     try std.testing.expectEqualStrings("plaintext", ci.get("documentationFormat").?.array.items[1].string);
     try std.testing.expectEqual(@as(usize, 3), ci.get("resolveSupport").?.object.get("properties").?.array.items.len);
     try std.testing.expect(!ci.get("snippetSupport").?.bool);
+}
+
+test "initParams: hover advertises markdown contentFormat as its own capability" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const fds = try std.Io.Threaded.pipe2(.{});
+    const read_end = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+    const write_end = std.Io.File{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+    defer std.Io.File.close(read_end, io);
+    defer std.Io.File.close(write_end, io);
+
+    var client = try testClient(alloc, io, write_end);
+    defer cleanupClient(alloc, &client);
+    var params = try client.initParams();
+    defer client.freeInitParams(&params);
+
+    const td = params.object.get("capabilities").?.object.get("textDocument").?.object;
+    // Hover content negotiation is a DIFFERENT capability from completion's
+    // documentationFormat: zls only returns Markdown (with fenced code) when
+    // textDocument.hover.contentFormat advertises markdown.
+    const hover = td.get("hover") orelse return error.TestUnexpectedResult;
+    const formats = hover.object.get("contentFormat") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), formats.array.items.len);
+    try std.testing.expectEqualStrings("markdown", formats.array.items[0].string);
+    try std.testing.expectEqualStrings("plaintext", formats.array.items[1].string);
+    // The completion declaration is untouched and the two capabilities do not
+    // accidentally share a structure.
+    const ci = td.get("completion").?.object.get("completionItem").?.object;
+    try std.testing.expectEqual(@as(usize, 2), ci.get("documentationFormat").?.array.items.len);
+    try std.testing.expect(hover.object.get("documentationFormat") == null);
+    try std.testing.expect(ci.get("contentFormat") == null);
+    // Existing declarations stay intact.
+    try std.testing.expect(td.get("inlayHint") != null);
+    try std.testing.expect(td.get("publishDiagnostics") != null);
 }
 
 test "reader: server stdout EOF sets server_died (crash detection)" {

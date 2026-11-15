@@ -1020,6 +1020,19 @@ fn handleVisual(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
     if (state.pending_find != null or state.pending_macro != null) {
         return handleNormal(state, key, keymap);
     }
+    // A pending 'g' prefix outranks the direct visual d/c/y shortcuts below:
+    // vim's visual `gc` toggles comments in TWO keys (`g`, `c`), while a bare
+    // `c` still changes the selection. Normal `gcc` remains a three-key
+    // sequence (handleNormal: pending_g -> pending_gc -> c).
+    if (state.pending_g or state.pending_gc) {
+        if (isPlain(key) and key.codepoint == 'c') {
+            resetPending(state);
+            return emitAction(state, .toggle_comment_line);
+        }
+        // Any other g-prefixed key (gg/ge/gd/...) is parsed by the sequence
+        // handler; the direct shortcuts only apply without a prefix.
+        return handleNormal(state, key, keymap);
+    }
     // visual 'o': flip the selection (swap anchor and cursor)
     if (isPlain(key) and key.codepoint == 'o') {
         return emitAction(state, .flip_visual);
@@ -1988,6 +2001,136 @@ test "visual: v → visual_char; h → motion with exclusive_end" {
     try testing.expectEqual(.motion, tag(r2));
     try testing.expectEqual(Motion.Motion.left, r2.motion.motion);
     try testing.expect(r2.motion.exclusive_end);
+}
+
+fn expectVisualGc(mode: Mode) !void {
+    var s = State.init();
+    s.mode = mode;
+    // 'g' alone is only the prefix: no action/motion is emitted and the mode
+    // is untouched.
+    try testing.expectEqual(.pending, tag(handle(&s, press('g'), Keymaps.normal)));
+    try testing.expect(s.pending_g);
+    try testing.expectEqual(mode, s.mode);
+    // The second key completes the TWO-key visual `gc`. The visual direct
+    // `c` shortcut (change/delete the selection) must not consume it.
+    const r = handle(&s, press('c'), Keymaps.normal);
+    try testing.expectEqual(.action, tag(r));
+    try testing.expectEqual(KeyEvent.ActionId.toggle_comment_line, r.action.action);
+    // The prefix is consumed; exiting Visual is the App's job after a
+    // successful toggle (Mode never edits the document itself).
+    try testing.expect(!s.pending_g);
+    try testing.expect(!s.pending_gc);
+    try testing.expectEqual(mode, s.mode);
+}
+
+test "visual gc: g+c emits toggle_comment_line (not change) in v/V/Ctrl-v" {
+    try expectVisualGc(.visual_char);
+    try expectVisualGc(.visual_line);
+    try expectVisualGc(.visual_block);
+}
+
+test "visual gc: v, V and Ctrl-v entry then gc toggles comments" {
+    var sc = State.init();
+    _ = handle(&sc, press('v'), Keymaps.normal);
+    try testing.expectEqual(Mode.visual_char, sc.mode);
+    _ = handle(&sc, press('g'), Keymaps.normal);
+    const rc = handle(&sc, press('c'), Keymaps.normal);
+    try testing.expectEqual(.action, tag(rc));
+    try testing.expectEqual(KeyEvent.ActionId.toggle_comment_line, rc.action.action);
+
+    var sl = State.init();
+    _ = handle(&sl, press('V'), Keymaps.normal);
+    try testing.expectEqual(Mode.visual_line, sl.mode);
+    _ = handle(&sl, press('g'), Keymaps.normal);
+    const rl = handle(&sl, press('c'), Keymaps.normal);
+    try testing.expectEqual(.action, tag(rl));
+    try testing.expectEqual(KeyEvent.ActionId.toggle_comment_line, rl.action.action);
+
+    var sb = State.init();
+    _ = handle(&sb, .{ .codepoint = 'v', .mods = .{ .ctrl = true } }, Keymaps.normal);
+    try testing.expectEqual(Mode.visual_block, sb.mode);
+    _ = handle(&sb, press('g'), Keymaps.normal);
+    const rb = handle(&sb, press('c'), Keymaps.normal);
+    try testing.expectEqual(.action, tag(rb));
+    try testing.expectEqual(KeyEvent.ActionId.toggle_comment_line, rb.action.action);
+}
+
+test "visual gc: Esc after g clears the prefix without editing" {
+    var s = State.init();
+    s.mode = .visual_line;
+    _ = handle(&s, press('g'), Keymaps.normal);
+    try testing.expect(s.pending_g);
+    // Esc in Visual exits to Normal and clears the pending gc prefix; no
+    // action is emitted (nothing is toggled, no text changes).
+    const r = handle(&s, esc(), Keymaps.normal);
+    try testing.expectEqual(.to_normal, tag(r));
+    try testing.expectEqual(Mode.normal, s.mode);
+    try testing.expect(!s.pending_g);
+    try testing.expect(!s.pending_gc);
+    try testing.expect(idle(&s));
+    // The next key starts a fresh command, not a comment toggle.
+    const rj = handle(&s, press('j'), Keymaps.normal);
+    try testing.expectEqual(.motion, tag(rj));
+    try testing.expectEqual(Motion.Motion.down, rj.motion.motion);
+}
+
+test "normal gcc: g c c still toggles; g then Esc cancels" {
+    var s = State.init();
+    try testing.expectEqual(.pending, tag(handle(&s, press('g'), Keymaps.normal)));
+    try testing.expectEqual(.pending, tag(handle(&s, press('c'), Keymaps.normal)));
+    try testing.expect(s.pending_gc);
+    const r = handle(&s, press('c'), Keymaps.normal);
+    try testing.expectEqual(.action, tag(r));
+    try testing.expectEqual(KeyEvent.ActionId.toggle_comment_line, r.action.action);
+    try testing.expect(!s.pending_g);
+    try testing.expect(!s.pending_gc);
+
+    var s2 = State.init();
+    _ = handle(&s2, press('g'), Keymaps.normal);
+    try testing.expectEqual(.pending, tag(handle(&s2, esc(), Keymaps.normal)));
+    try testing.expect(idle(&s2));
+    // After Esc, 'c' is the ordinary change operator, never a comment toggle.
+    try testing.expectEqual(.pending, tag(handle(&s2, press('c'), Keymaps.normal)));
+    try testing.expectEqual(@as(?KeyEvent.ActionId, .change), s2.pending_op);
+}
+
+test "visual: direct c/d/y without the g prefix keep their meaning" {
+    var sc = State.init();
+    sc.mode = .visual_line;
+    const rc = handle(&sc, press('c'), Keymaps.normal);
+    try testing.expectEqual(.action, tag(rc));
+    try testing.expectEqual(KeyEvent.ActionId.change, rc.action.action);
+
+    var sd = State.init();
+    sd.mode = .visual_char;
+    const rd = handle(&sd, press('d'), Keymaps.normal);
+    try testing.expectEqual(.action, tag(rd));
+    try testing.expectEqual(KeyEvent.ActionId.delete, rd.action.action);
+
+    var sy = State.init();
+    sy.mode = .visual_block;
+    const ry = handle(&sy, press('y'), Keymaps.normal);
+    try testing.expectEqual(.action, tag(ry));
+    try testing.expectEqual(KeyEvent.ActionId.yank, ry.action.action);
+}
+
+test "visual: a pending g prefix outranks the direct d/c/y shortcuts" {
+    // gd in Visual resolves through the g-prefix parser (definition), it
+    // never deletes the selection.
+    var sd = State.init();
+    sd.mode = .visual_line;
+    _ = handle(&sd, press('g'), Keymaps.normal);
+    const rd = handle(&sd, press('d'), Keymaps.normal);
+    try testing.expectEqual(.action, tag(rd));
+    try testing.expectEqual(KeyEvent.ActionId.definition, rd.action.action);
+
+    // gy is not a g command: the sequence is cancelled, nothing is yanked.
+    var sy = State.init();
+    sy.mode = .visual_char;
+    _ = handle(&sy, press('g'), Keymaps.normal);
+    const ry = handle(&sy, press('y'), Keymaps.normal);
+    try testing.expectEqual(.pending, tag(ry));
+    try testing.expect(!sy.pending_g);
 }
 
 test "Esc cancels pending count and pending operator" {

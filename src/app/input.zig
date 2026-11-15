@@ -17,6 +17,11 @@ const isWordByte = App.isWordByte;
 // ---- input ----
 
 pub fn handleKey(self: *App, key: vaxis.Key) !void {
+    // Observe the completion context BEFORE dispatch. Any key that changes
+    // it (movement, Esc/re-enter, typing) bumps the epoch so a response
+    // requested for the old state is rejected even if the cursor later
+    // returns to the same byte.
+    self.syncCompletionContext();
     // One key may move the cursor, edit text, enter/leave a session, and
     // issue a fresh signature request. Capture the passive context once and
     // invalidate after the key only when the key did not create its own new
@@ -321,6 +326,11 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
     // Insert mode: characters insert directly; jk exits (removing the
     // just-typed 'j'), backspace and Ctrl-w delete before the cursor.
     if (self.state.mode == .insert) {
+        // A non-vertical key ends the vim-like Up/Down goal column: the next
+        // vertical move re-aims from the cursor's actual position.
+        if (key.codepoint != vaxis.Key.up and key.codepoint != vaxis.Key.down) {
+            self.insert_goal_col = null;
+        }
         // Visual-block multi-cursor insert (I/A after <C-v>): every key
         // applies at every cursor. The single-cursor path below is
         // unchanged.
@@ -397,19 +407,44 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
         }
         // Arrow keys move the cursor without leaving insert mode (up/down
         // with the completion menu open select candidates, handled above).
-        // prev_insert_key is left untouched so a jk exit still works after
-        // arrow movement.
+        // Insert-mode arrows are insertion-point moves: right reaches the
+        // line-text END insertion point and up/down land on a short line's
+        // text end, unlike Normal `apply` which clamps to the last character
+        // (the "abcd, Left, Right, X -> abcXd" bug). prev_insert_key is left
+        // untouched so a jk exit still works after arrow movement.
         if (key.codepoint == vaxis.Key.left or key.codepoint == vaxis.Key.right or
             key.codepoint == vaxis.Key.up or key.codepoint == vaxis.Key.down)
         {
-            var c = self.curCursor().*;
-            editor.Motion.apply(&self.cur().pt, switch (key.codepoint) {
-                vaxis.Key.left => .left,
-                vaxis.Key.right => .right,
-                vaxis.Key.up => .up,
-                else => .down,
-            }, .{}, &c, 1);
+            const before = self.curCursor().*;
+            var c = before;
+            if (key.codepoint == vaxis.Key.up or key.codepoint == vaxis.Key.down) {
+                // Vim-style curswant: clamp on a short line, but remember the
+                // aimed column so the opposite vertical move returns to the
+                // real insertion point (Up-then-Down on a shorter line used
+                // to drift one character left).
+                const pt = &self.cur().pt;
+                const line = pt.lineOf(before);
+                const goal = self.insert_goal_col orelse (before - pt.lineStart(line));
+                self.insert_goal_col = goal;
+                const target = if (key.codepoint == vaxis.Key.up) line -| 1 else line + 1;
+                if (key.codepoint == vaxis.Key.down and line + 1 >= pt.lineCount()) {
+                    c = before;
+                } else if (key.codepoint == vaxis.Key.up and line == 0) {
+                    c = before;
+                } else {
+                    c = editor.Motion.insertPosForLineCol(pt, target, goal);
+                }
+            } else {
+                editor.Motion.applyInsert(&self.cur().pt, if (key.codepoint == vaxis.Key.left) .left else .right, .{}, &c, 1);
+            }
             self.curCursor().* = c;
+            if (c != before) {
+                // A list request captured before this move is for a cursor
+                // that no longer exists: reject its response the moment it
+                // lands instead of waiting for the next key's epoch bump
+                // (which never covers a response arriving while idle).
+                self.invalidateCompletionContext();
+            }
             self.clearHover();
             return;
         }
@@ -495,7 +530,7 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
         // as codepoint 'b'/'f' with mods.alt.
         if (key.mods.alt and !key.mods.ctrl and !key.mods.super) {
             if (key.codepoint == 'b') {
-                self.curCursor().* = buffer.ops.wordStartBefore(&self.cur().pt, self.curCursor().*);
+                self.curCursor().* = buffer.ops.bigWordStartBefore(&self.cur().pt, self.curCursor().*);
                 return;
             }
             if (key.codepoint == 'f') {
@@ -627,6 +662,7 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
 
 pub fn exitInsert(self: *App) void {
     self.insert_session +%= 1;
+    self.insert_goal_col = null;
     self.invalidatePassiveHints();
     self.state.mode = .normal;
     self.cur().history.endGroup();

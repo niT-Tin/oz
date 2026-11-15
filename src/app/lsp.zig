@@ -252,6 +252,20 @@ pub fn lspHandler(self: *App, client: *lsp.Client, msg: *json_rpc.Message) void 
 /// invalidation). The LSP sync is left to the caller: markDirty (full
 /// text) or markDirtyRange (incremental).
 pub fn markDirtyBase(self: *App) void {
+    markDirtyBaseImpl(self, true);
+}
+
+/// Bookkeeping that keeps the displayed inlay hints: undo/redo maps their
+/// anchors through the edit sequence itself (see inlay_history.zig) instead
+/// of clearing the list and re-requesting, which made the inline layout
+/// vanish and jump back. The request band is reset so the run loop refreshes
+/// the hint data in the background; the old (transformed) hints keep
+/// rendering until the atomic replacement lands.
+pub fn markDirtyBasePreserveInlays(self: *App) void {
+    markDirtyBaseImpl(self, false);
+}
+
+fn markDirtyBaseImpl(self: *App, invalidate_inlays: bool) void {
     self.cur().dirty = true;
     self.edit_seq += 1;
     // A text edit ends the old passive hint context (displayed text and any
@@ -277,7 +291,20 @@ pub fn markDirtyBase(self: *App) void {
     // the screen doesn't flicker on every keystroke; exitInsert forces a
     // fresh request once the session ends. One-shot normal-mode ops
     // (dd, x, o…) still invalidate here and let the auto-refresh re-request.
-    if (!self.in_insert) self.invalidateInlayHints();
+    // Undo/redo pass false and transform the anchors explicitly.
+    if (invalidate_inlays and !self.in_insert) self.invalidateInlayHints();
+}
+
+/// Undo/redo bookkeeping: keep the (anchor-transformed) hint list rendered,
+/// but make the next run-loop tick re-request the band so a fresh response
+/// atomically replaces the data. No `inlay_stale` here: that flag hides the
+/// hints during the request, which is exactly the layout jump this avoids.
+pub fn markDirtyHistory(self: *App) void {
+    markDirtyBasePreserveInlays(self);
+    // Forget the covered band: the run loop's band check then issues the
+    // refresh for the post-undo viewport. The old hints stay visible.
+    self.inlay_view_top = null;
+    self.syncLspFull();
 }
 
 /// Mark the current buffer dirty and push its FULL text to the LSP server

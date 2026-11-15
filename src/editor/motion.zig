@@ -105,6 +105,45 @@ pub fn target(
     return pos;
 }
 
+/// Insert-mode cursor movement. In Insert mode the cursor is an INSERTION
+/// POINT between characters, so it deliberately differs from Normal `apply`:
+/// - left/right move one UTF-8 scalar. right may land on the line-text END
+///   insertion point (just before the '\n', or before the '\r' of a CRLF) but
+///   never past it and never between the '\r' and '\n'; left works from that
+///   point. Neither wraps to another line (same as the old insert behavior).
+/// - up/down preserve a byte column and may land on the line-text end
+///   insertion point; Normal `apply` clamps a short line to its LAST character
+///   (the "abcd | Left Right X" bug: Normal right cannot return past `d`, so X
+///   landed before it).
+/// Any other motion delegates to `apply` unchanged, so Normal semantics and
+/// the operator paths are untouched. A stale cursor inside a wide character is
+/// snapped to its leading byte first.
+pub fn applyInsert(
+    pt: *const PieceTable,
+    motion: Motion,
+    args: Args,
+    cursor: *u32,
+    count: u32,
+) void {
+    switch (motion) {
+        .left, .right, .up, .down => {
+            var pos = edit_range.charStart(pt, @min(cursor.*, pt.len()));
+            const n = @max(count, 1);
+            var i: u32 = 0;
+            while (i < n) : (i += 1) {
+                pos = switch (motion) {
+                    .left => insertLeft(pt, pos),
+                    .right => insertRight(pt, pos),
+                    .up => insertVert(pt, pos, -1),
+                    else => insertVert(pt, pos, 1),
+                };
+            }
+            cursor.* = pos;
+        },
+        else => apply(pt, motion, args, cursor, count),
+    }
+}
+
 // ============================ one motion step ===============================
 
 /// One motion step: transform `pos` into the new position. Always returns a
@@ -307,6 +346,66 @@ pub fn toLineKeepCol(pt: *const PieceTable, pos: u32, target_line: u32) u32 {
     // Equal byte columns can point inside a wider UTF-8 character on the
     // destination line. Editing must always begin at its leading byte.
     return edit_range.charStart(pt, t_start + t_col);
+}
+
+// ----------------------- insert-mode single steps ---------------------------
+
+/// h in Insert mode: one UTF-8 scalar back inside the line; column 0 stays
+/// (no wrap). A cursor parked on a terminator is canonicalized to the
+/// line-text end insertion point first.
+fn insertLeft(pt: *const PieceTable, pos: u32) u32 {
+    const line = pt.lineOf(pos);
+    const start = pt.lineStart(line);
+    const end = start + pt.lineTextLen(line);
+    const p = @min(pos, end);
+    if (p <= start) return start;
+    var scan = DocScan.init(pt, true);
+    return prevCharBoundary(&scan, p);
+}
+
+/// l in Insert mode: one UTF-8 scalar forward, stopping at the line-text end
+/// insertion point; never lands on '\n' or between the '\r' and '\n' of a CRLF.
+fn insertRight(pt: *const PieceTable, pos: u32) u32 {
+    const line = pt.lineOf(pos);
+    const start = pt.lineStart(line);
+    const end = start + pt.lineTextLen(line);
+    const p = @min(pos, end);
+    if (p >= end) return end;
+    var scan = DocScan.init(pt, false);
+    return nextCharBoundary(&scan, p);
+}
+
+/// j/k in Insert mode: one line down (dir > 0) / up (dir < 0).
+fn insertVert(pt: *const PieceTable, pos: u32, dir: i8) u32 {
+    const line = pt.lineOf(pos);
+    if (dir > 0 and line + 1 >= pt.lineCount()) return pos;
+    if (dir < 0 and line == 0) return pos;
+    const target_line = if (dir > 0) line + 1 else line - 1;
+    return insertToLineKeepCol(pt, pos, target_line);
+}
+
+/// Insert-mode position for (target_line, goal byte column): a shorter target
+/// line lands on its line-text END insertion point instead of its last
+/// character (and never on the '\r'/'\n' of a CRLF). Public so the App can
+/// keep a vim-style goal column across consecutive Up/Down moves.
+pub fn insertPosForLineCol(pt: *const PieceTable, target_line: u32, goal_col: u32) u32 {
+    const tl = @min(target_line, pt.lineCount() - 1);
+    const t_start = pt.lineStart(tl);
+    const t_len = pt.lineTextLen(tl);
+    const t_col = @min(goal_col, t_len);
+    return edit_range.charStart(pt, t_start + t_col);
+}
+
+/// Insert-mode counterpart of `toLineKeepCol`: same byte column, but a
+/// shorter target line lands on its line-text END insertion point instead of
+/// its last character (and never on the '\r'/'\n' of a CRLF).
+fn insertToLineKeepCol(pt: *const PieceTable, pos: u32, target_line: u32) u32 {
+    const line = pt.lineOf(@min(pos, pt.len()));
+    const start = pt.lineStart(line);
+    const text_len = pt.lineTextLen(line);
+    var col = @min(pos, pt.len()) - start;
+    if (col > text_len) col = text_len; // never carry a terminator column
+    return insertPosForLineCol(pt, target_line, col);
 }
 
 // ------------------------------- word motions -------------------------------
@@ -1419,4 +1518,157 @@ test "target equals apply for a sweep of motions and positions" {
             }
         }
     }
+}
+
+// ---------------------- insert-mode insertion-point tests -------------------
+
+/// Apply the insert motion and assert the insertion point. Kept separate from
+/// `check` (which also asserts Normal target/apply equality) because insert
+/// motion is deliberately different from Normal character clamping.
+fn checkInsert(pt: *const PieceTable, motion: Motion, from: u32, count: u32, expected: u32) !void {
+    var cur = from;
+    applyInsert(pt, motion, .{}, &cur, count);
+    try testing.expectEqual(expected, cur);
+}
+
+test "insert motion: left then right returns to the EOL insertion point (abcdX, not abcXd)" {
+    // Repro from the report: with no LSP, type abcd (cursor at the EOL
+    // insertion point), Left, Right, X. The insertion point must return to
+    // past `d`, so the file becomes "abcdX" — Normal right clamps to the last
+    // character and produced "abcXd" (X inserted before d).
+    var pt = try PieceTable.init(testing.allocator, "abcd");
+    defer pt.deinit();
+    const args = Args{};
+
+    // Normal semantics are unchanged (guard for the insert API).
+    try check(&pt, .right, args, 3, 1, 3); // last character: clamp
+    try check(&pt, .right, args, 4, 1, 4);
+
+    try checkInsert(&pt, .left, 4, 1, 3); // one scalar back from EOL
+    try checkInsert(&pt, .right, 3, 1, 4); // back TO the EOL insertion point
+    try checkInsert(&pt, .right, 4, 1, 4); // EOL: stay (never past it)
+    try checkInsert(&pt, .left, 0, 1, 0); // column 0: stay (no wrap)
+    try checkInsert(&pt, .left, 3, 1, 2);
+    try checkInsert(&pt, .right, 0, 4, 4); // ASCII scalar steps, clamped at EOL
+}
+
+test "insert motion: empty lines and up/down keep the insert column" {
+    // "ab\n\ncd": a0 b1 \n2, empty line start 3, c4 d5; len 6.
+    var pt = try PieceTable.init(testing.allocator, "ab\n\ncd");
+    defer pt.deinit();
+
+    try checkInsert(&pt, .right, 1, 1, 2); // EOL insertion point after b
+    try checkInsert(&pt, .right, 2, 1, 2); // never onto '\n'
+    try checkInsert(&pt, .left, 2, 1, 1);
+    try checkInsert(&pt, .left, 3, 1, 3); // empty line: col 0 stays (no wrap)
+    try checkInsert(&pt, .right, 3, 1, 3); // empty line: EOL == line start
+    try checkInsert(&pt, .down, 2, 1, 3); // col 2 of line 0 clamps to line 1 start
+    try checkInsert(&pt, .down, 3, 1, 4);
+    try checkInsert(&pt, .down, 5, 1, 5); // last line: stay
+    try checkInsert(&pt, .up, 4, 1, 3);
+    try checkInsert(&pt, .up, 3, 1, 0);
+    try checkInsert(&pt, .up, 0, 1, 0); // first line: stay
+    try checkInsert(&pt, .down, 0, 2, 4); // 0 -> empty line 3 -> "cd" col 0 (4)
+}
+
+test "insert motion: UTF-8/CJK/emoji move one scalar and reach the EOL point" {
+    // "a中b\n🙂x": a0, 中1..3, b4, \n5, 🙂6..9, x10; len 11.
+    var pt = try PieceTable.init(testing.allocator, "a中b\n🙂x");
+    defer pt.deinit();
+
+    try checkInsert(&pt, .right, 0, 1, 1); // a -> start of 中
+    try checkInsert(&pt, .right, 1, 1, 4); // 中 -> b
+    try checkInsert(&pt, .right, 4, 1, 5); // b -> EOL insertion point (before '\n')
+    try checkInsert(&pt, .right, 5, 1, 5);
+    try checkInsert(&pt, .left, 5, 1, 4); // EOL -> b
+    try checkInsert(&pt, .left, 4, 1, 1); // b -> start of 中
+    try checkInsert(&pt, .left, 1, 1, 0);
+    try checkInsert(&pt, .down, 5, 1, 11); // EOL col 5 -> emoji line EOL (5 bytes)
+    try checkInsert(&pt, .up, 11, 1, 5);
+    try checkInsert(&pt, .down, 4, 1, 10); // col 4 -> x (not mid-emoji)
+    try checkInsert(&pt, .up, 10, 1, 4);
+    try checkInsert(&pt, .down, 1, 1, 6); // col 1 lies inside 中/🙂: snap to lead byte
+    try checkInsert(&pt, .down, 2, 1, 6);
+    try checkInsert(&pt, .right, 0, 3, 5); // a -> 中 -> b -> EOL
+
+    // No insertion point may rest on a UTF-8 continuation byte.
+    var from: u32 = 0;
+    while (from <= 11) : (from += 1) {
+        for ([_]Motion{ .left, .right, .up, .down }) |m| {
+            var cur = from;
+            applyInsert(&pt, m, .{}, &cur, 1);
+            try testing.expect(cur >= 0 and cur <= pt.len());
+            if (cur < pt.len()) try testing.expect((pt.byteAt(cur) & 0xC0) != 0x80);
+        }
+    }
+}
+
+test "insert motion: CRLF never lands between CR and LF" {
+    // "abcd\r\nef\r\n": a0..d3, \r4, \n5, e6, f7, \r8, \n9; len 10.
+    // Line-text ends: line 0 = 4 (before '\r'), line 1 = 8 (before '\r').
+    var pt = try PieceTable.init(testing.allocator, "abcd\r\nef\r\n");
+    defer pt.deinit();
+
+    try testing.expectEqual(@as(u32, 4), pt.lineStart(0) + pt.lineTextLen(0));
+    try testing.expectEqual(@as(u32, 8), pt.lineStart(1) + pt.lineTextLen(1));
+
+    try checkInsert(&pt, .right, 3, 1, 4); // d -> EOL insertion point before '\r'
+    try checkInsert(&pt, .right, 4, 1, 4); // never between '\r' and '\n' (5)
+    try checkInsert(&pt, .right, 0, 10, 4);
+    try checkInsert(&pt, .left, 4, 1, 3);
+    try checkInsert(&pt, .down, 4, 1, 8); // col 4 clamps to line 1's text end
+    try checkInsert(&pt, .down, 8, 1, 10); // then the empty EOF line
+    try checkInsert(&pt, .down, 8, 2, 10);
+    try checkInsert(&pt, .up, 10, 1, 6);
+    try checkInsert(&pt, .up, 6, 1, 0);
+    try checkInsert(&pt, .right, 7, 1, 8); // f -> EOL
+    try checkInsert(&pt, .right, 8, 1, 8);
+}
+
+test "insert motion: short target line lands on the line-text end, not the last character" {
+    // "abcd\nef\nghijk": starts 0,5,8; len 13. Normal `apply` clamps to the
+    // last character ("f"=6); insert movement keeps the insertion column and
+    // lands after "ef" (7).
+    var pt = try PieceTable.init(testing.allocator, "abcd\nef\nghijk");
+    defer pt.deinit();
+    const args = Args{};
+
+    // Normal behavior stays as it was.
+    try check(&pt, .down, args, 3, 1, 6);
+    try check(&pt, .up, args, 10, 1, 6);
+
+    try checkInsert(&pt, .down, 3, 1, 7); // after f
+    try checkInsert(&pt, .down, 2, 1, 7); // col 2 == line-text end
+    try checkInsert(&pt, .down, 1, 1, 6); // col 1 -> f
+    try checkInsert(&pt, .down, 4, 1, 7); // EOL of line 0 (col 4) clamps to 2
+    try checkInsert(&pt, .down, 7, 1, 10); // line 1 EOL -> line 2 col 2
+    try checkInsert(&pt, .up, 10, 1, 7); // line 2 col 2 -> after f
+    try checkInsert(&pt, .up, 9, 1, 6);
+    try checkInsert(&pt, .up, 12, 1, 7); // col 4 clamps to line 1's text end
+    try checkInsert(&pt, .down, 4, 2, 10);
+    try checkInsert(&pt, .down, 4, 3, 10); // last line: clamp
+    try checkInsert(&pt, .up, 10, 2, 2); // 10 -> after f -> line 0 col 2
+}
+
+test "insert motion: counts and out-of-range cursors" {
+    var pt = try PieceTable.init(testing.allocator, "abcd\nef\n");
+    defer pt.deinit();
+    try checkInsert(&pt, .right, 0, 2, 2);
+    try checkInsert(&pt, .right, 2, 3, 4); // 3 -> 4 -> stays
+    try checkInsert(&pt, .left, 4, 2, 2);
+    try checkInsert(&pt, .left, 4, 0, 3); // count 0 behaves like count 1
+    try checkInsert(&pt, .down, 0, 2, 8); // line1 col 0 -> EOF line start (len 8)
+    var cur: u32 = 1000;
+    applyInsert(&pt, .left, .{}, &cur, 1);
+    try testing.expectEqual(@as(u32, 8), cur); // clamped to len, then EOL empty line
+    cur = 1000;
+    applyInsert(&pt, .right, .{}, &cur, 1);
+    try testing.expectEqual(@as(u32, 8), cur);
+
+    // Non-arrow motions delegate to Normal apply (documented fallback).
+    var a: u32 = 0;
+    var b: u32 = 0;
+    apply(&pt, .word_next, .{}, &a, 1);
+    applyInsert(&pt, .word_next, .{}, &b, 1);
+    try testing.expectEqual(a, b);
 }

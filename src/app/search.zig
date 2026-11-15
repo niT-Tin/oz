@@ -7,6 +7,9 @@ const buffer = @import("../buffer/root.zig");
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
 
+const indent = @import("../editor/indent.zig");
+const autil = @import("util.zig");
+
 const InlayHint = app_mod.InlayHint;
 
 // ---- buffer search (/ ? n N) ----
@@ -415,13 +418,116 @@ pub fn insertText(self: *App, text: []const u8) !void {
     self.markDirtyRange(at, at, text);
 }
 
-/// Bracketed paste: insert `text` VERBATIM at the cursor — none of the
-/// typed-input transforms apply (no auto-indent on newlines, no auto-pairs,
-/// no completion triggers; they would mangle pasted content — an Enter per
-/// pasted line re-adds the previous line's indentation on top of the
-/// pasted line's own). Line endings are normalized (\r\n / \r -> \n). In
-/// insert mode the paste joins the session's undo group; in normal mode it
-/// is one undo group of its own and the mode stays normal.
+/// Bounded materialization of the current buffer for the pure indentation
+/// planner. Returns null above the planner limit; callers then keep the old
+/// bounded insert path instead of copying a huge document per paste.
+pub fn indentDocSlice(self: *App) !?[]u8 {
+    const pt = &self.cur().pt;
+    if (pt.len() > indent.max_insert_bytes) return null;
+    const doc = try self.alloc.alloc(u8, pt.len());
+    if (doc.len > 0) pt.copyRange(0, doc);
+    return doc;
+}
+
+/// Indentation style detected around `line`: tabs win when the current line
+/// (or a near, non-blank line above it) starts with a tab. The editor's tab
+/// width is the space fallback.
+pub fn indentConfigFor(self: *App, doc: []const u8, line: u32) indent.Config {
+    var cfg = indent.Config{ .indent_width = @intCast(app_mod.tab_width), .use_tabs = false };
+    const pt = &self.cur().pt;
+    var l = line;
+    var tries: u32 = 0;
+    while (tries < 8) : (tries += 1) {
+        const start: usize = pt.lineStart(l);
+        const len: usize = pt.lineLen(l);
+        var i = start;
+        var non_blank = false;
+        while (i < start + len) : (i += 1) {
+            const c = doc[i];
+            if (c == '\t') {
+                cfg.use_tabs = true;
+                return cfg;
+            }
+            if (c != ' ') {
+                non_blank = true;
+                break;
+            }
+        }
+        if (non_blank or l == 0) break;
+        l -= 1;
+    }
+    return cfg;
+}
+
+/// Plan one language-aware paste at `at`. The caller owns `text`.
+pub fn planPasteAt(
+    self: *App,
+    doc: []const u8,
+    at: u32,
+    text: []const u8,
+    ft: []const u8,
+    linewise: bool,
+) !indent.PastePlan {
+    const cfg = indentConfigFor(self, doc, self.cur().pt.lineOf(at));
+    return indent.planPaste(self.alloc, doc, at, text, ft, cfg, linewise);
+}
+
+/// Apply one paste edit as a SINGLE history record (one undo step, one LSP
+/// pre-edit range). `delete_len` replaces the all-blank prefix of a
+/// whitespace-only line (0 for ordinary inserts); the caller sets the cursor
+/// according to the paste kind afterwards.
+pub fn recordPasteEditNoCursor(self: *App, at: u32, delete_len: u32, text: []const u8) !void {
+    const pt = &self.cur().pt;
+    const line = pt.lineOf(at);
+    const line_start = pt.lineStart(line);
+    const col = at - line_start;
+    // LSP coordinates in the PRE-EDIT document: [at, at+delete_len) -> text.
+    const start_pos = self.lspPositionAt(pt, at);
+    const end_pos = self.lspPositionAt(pt, at + delete_len);
+    if (delete_len > 0) {
+        const deleted = try self.alloc.alloc(u8, delete_len);
+        defer self.alloc.free(deleted);
+        pt.copyRange(at, deleted);
+        try self.cur().history.record(pt, at, delete_len, text);
+        self.adjustInlayHintsDelete(line, col, deleted);
+    } else {
+        try self.cur().history.record(pt, at, 0, text);
+    }
+    self.adjustInlayHintsInsert(line, col, text);
+    self.markDirtyRange(start_pos, end_pos, text);
+}
+
+/// One language-aware paste insertion inside the current insert-session
+/// group (the caller opens/closes the group). No per-key simulation, no
+/// auto-pair/shortcut effects.
+fn pasteInsert(self: *App, text: []const u8) !void {
+    if (!self.in_insert) {
+        self.cur().history.beginGroup();
+        self.in_insert = true;
+    }
+    const ft = autil.filetypeOf(self.cur().path);
+    const doc_opt = try indentDocSlice(self);
+    if (doc_opt) |doc| {
+        defer self.alloc.free(doc);
+        const plan = try planPasteAt(self, doc, self.curCursor().*, text, ft, false);
+        defer self.alloc.free(plan.text);
+        try recordPasteEditNoCursor(self, plan.at, plan.delete_len, plan.text);
+        self.curCursor().* = plan.at + @as(u32, @intCast(plan.text.len));
+        return;
+    }
+    // Oversized buffer: bounded fallback, identical to the old verbatim path.
+    try self.insertText(text);
+}
+
+/// Bracketed paste: insert `text` with the current language's structural
+/// reindent. None of the typed-input transforms apply (no auto-indent per
+/// newline, no auto-pairs, no completion triggers). If the insertion point
+/// is inside the leading whitespace of a whitespace-only line, that prefix
+/// is replaced by the reindented first line (never doubled). Line endings
+/// are normalized to the buffer's dominant style by the planner (CRLF
+/// buffers stay CRLF; LF buffers keep LF). In insert mode the paste joins
+/// the session's undo group; in normal mode it is one undo group of its own
+/// and the mode stays normal.
 pub fn pasteText(self: *App, text: []const u8) !void {
     if (text.len == 0) return;
     var norm: []const u8 = text;
@@ -446,29 +552,66 @@ pub fn pasteText(self: *App, text: []const u8) !void {
         norm_buf = nb;
     }
     if (self.in_insert) {
-        try self.insertText(norm);
+        try pasteInsert(self, norm);
         return;
     }
     self.cur().history.beginGroup();
-    try self.insertText(norm);
+    try pasteInsert(self, norm);
     self.cur().history.endGroup();
-    self.in_insert = false; // insertText opened an insert session; close it
+    self.in_insert = false; // pasteInsert opened an insert session; close it
+}
+
+/// Pending first half of a CRLF pasted as ordinary key events. The parser
+/// maps a pasted 0x0D to Enter and the following 0x0A to Ctrl+j, so without
+/// this flag every CRLF became TWO newlines (a pasted Zig block acquired a
+/// blank line between every row before pasteText ever saw the bytes).
+/// `pasteAccumulate` resets it when the paste buffer is empty (paste start);
+/// any non-CR pasted key clears it, so a lone CR still becomes one '\n'.
+var paste_prev_cr: bool = false;
+
+/// Append one key event of a bracketed paste to `buf`. Pure enough to unit
+/// test: `prev_cr` carries the CR half across the Enter/Ctrl+j pair.
+pub fn pasteAppendKey(
+    buf: *std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+    key: vaxis.Key,
+    prev_cr: *bool,
+) !void {
+    if (key.text) |t| {
+        // Some parsers hand the LF half through `text` instead of Ctrl+j.
+        if (prev_cr.* and std.mem.eql(u8, t, "\n")) {
+            prev_cr.* = false;
+            return;
+        }
+        try buf.appendSlice(alloc, t);
+        prev_cr.* = t.len > 0 and t[t.len - 1] == '\r';
+        return;
+    }
+    if (key.codepoint == vaxis.Key.enter) {
+        try buf.append(alloc, '\n');
+        prev_cr.* = true;
+        return;
+    }
+    if (key.codepoint == 'j' and key.mods.ctrl) {
+        if (!prev_cr.*) try buf.append(alloc, '\n');
+        prev_cr.* = false;
+        return;
+    }
+    if (key.codepoint == vaxis.Key.tab) {
+        try buf.append(alloc, '\t');
+        prev_cr.* = false;
+        return;
+    }
+    // Escape sequences that were part of the pasted content are dropped
+    // rather than executed as editor commands; they also end a CR pair.
+    prev_cr.* = false;
 }
 
 /// One key event arriving between paste_start/paste_end: append the bytes
 /// it stands for to paste_buf. The parser maps pasted C0 bytes to key
 /// codes (0x0A -> Ctrl+j, 0x0D -> Enter, 0x09 -> Tab) — inside a paste
-/// they are TEXT, so translate them back; anything else without text
-/// (escape sequences that were part of the pasted content) is dropped
-/// rather than executed as an editor command.
+/// they are TEXT, so translate them back. CRLF is one newline, never two.
 pub fn pasteAccumulate(self: *App, key: vaxis.Key) !void {
-    if (key.text) |t| {
-        try self.paste_buf.appendSlice(self.alloc, t);
-    } else if (key.codepoint == vaxis.Key.enter or
-        (key.codepoint == 'j' and key.mods.ctrl))
-    {
-        try self.paste_buf.append(self.alloc, '\n');
-    } else if (key.codepoint == vaxis.Key.tab) {
-        try self.paste_buf.append(self.alloc, '\t');
-    }
+    if (self.paste_buf.items.len == 0) paste_prev_cr = false; // paste start
+    try pasteAppendKey(&self.paste_buf, self.alloc, key, &paste_prev_cr);
 }

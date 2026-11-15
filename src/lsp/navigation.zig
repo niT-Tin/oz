@@ -62,41 +62,118 @@ pub fn buildReferencesParams(alloc: std.mem.Allocator, uri: []const u8, line: u3
     return v;
 }
 
-/// Extract the hover text from a hover response (`contents` may be a string,
-/// `{kind,value}` or `{kind:"markdown",value}`). Returns an owned copy or
-/// null when there is nothing to show.
-pub fn parseHoverText(alloc: std.mem.Allocator, result: std.json.Value) !?[]u8 {
-    if (result != .object) return null;
-    const contents = result.object.get("contents") orelse return null;
-    switch (contents) {
-        .string => |s| return @as(?[]u8, try alloc.dupe(u8, s)),
-        .array => {
-            // MarkupContent[] — join with newlines
-            var out = std.ArrayList(u8).empty;
-            errdefer out.deinit(alloc);
-            for (contents.array.items) |item| {
-                if (item == .string) {
+/// Markup kind of a hover payload. It is preserved from the server so the
+/// renderer never interprets plaintext as Markdown (literal backticks, `*` or
+/// `#` in plaintext must stay literal), and so Markdown fenced code can take
+/// the tree-sitter highlighting path.
+pub const HoverKind = enum { markdown, plaintext };
+
+/// Parsed hover content: owned text plus how it must be rendered.
+pub const HoverContent = struct {
+    kind: HoverKind,
+    text: []u8,
+
+    pub fn deinit(self: *HoverContent, alloc: std.mem.Allocator) void {
+        alloc.free(self.text);
+    }
+};
+
+fn hoverKindOf(contents: std.json.Value) HoverKind {
+    if (contents == .object) {
+        if (contents.object.get("kind")) |k| {
+            if (k == .string and std.mem.eql(u8, k.string, "markdown")) return .markdown;
+        }
+    }
+    return .plaintext;
+}
+
+fn hoverPlain(alloc: std.mem.Allocator, text: []const u8) !?HoverContent {
+    if (text.len == 0) return null;
+    return .{ .kind = .plaintext, .text = try alloc.dupe(u8, text) };
+}
+
+fn appendHoverFence(out: *std.ArrayList(u8), alloc: std.mem.Allocator, language: []const u8, code: []const u8) !void {
+    try out.appendSlice(alloc, "```");
+    try out.appendSlice(alloc, language);
+    try out.append(alloc, '\n');
+    try out.appendSlice(alloc, code);
+    try out.appendSlice(alloc, "\n```");
+}
+
+fn hoverFence(alloc: std.mem.Allocator, language: []const u8, code: []const u8) !?HoverContent {
+    if (code.len == 0) return null;
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendHoverFence(&out, alloc, language, code);
+    return .{ .kind = .markdown, .text = try out.toOwnedSlice(alloc) };
+}
+
+/// MarkedString object: `{language, value}` keeps its language as a fenced
+/// code block; `{kind, value}` is MarkupContent and keeps its kind.
+fn parseHoverObject(alloc: std.mem.Allocator, contents: std.json.Value) !?HoverContent {
+    if (contents.object.get("language")) |lang| {
+        if (lang == .string) {
+            const value = contents.object.get("value") orelse return null;
+            if (value != .string) return null;
+            return try hoverFence(alloc, lang.string, value.string);
+        }
+    }
+    const value = contents.object.get("value") orelse return null;
+    if (value != .string) return null;
+    return try hoverPlainWithKind(alloc, contents, value.string);
+}
+
+fn hoverPlainWithKind(alloc: std.mem.Allocator, contents: std.json.Value, text: []const u8) !?HoverContent {
+    if (text.len == 0) return null;
+    return .{ .kind = hoverKindOf(contents), .text = try alloc.dupe(u8, text) };
+}
+
+/// MarkedString[]: strings and code-less objects concatenate as Markdown
+/// prose; `{language, value}` entries become fenced blocks with that language
+/// (an unknown language is preserved readably — the renderer falls back to the
+/// buffer's own language for the fence).
+fn parseHoverArray(alloc: std.mem.Allocator, items: []const std.json.Value) !?HoverContent {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(alloc);
+    for (items) |item| {
+        if (item == .string) {
+            if (item.string.len == 0) continue;
+            if (out.items.len > 0) try out.append(alloc, '\n');
+            try out.appendSlice(alloc, item.string);
+        } else if (item == .object) {
+            if (item.object.get("language")) |lang| {
+                if (lang == .string) {
+                    const value = item.object.get("value") orelse continue;
+                    if (value != .string or value.string.len == 0) continue;
                     if (out.items.len > 0) try out.append(alloc, '\n');
-                    try out.appendSlice(alloc, item.string);
-                } else if (item == .object) {
-                    if (item.object.get("value")) |val| {
-                        if (val == .string) {
-                            if (out.items.len > 0) try out.append(alloc, '\n');
-                            try out.appendSlice(alloc, val.string);
-                        }
-                    }
+                    try appendHoverFence(&out, alloc, lang.string, value.string);
+                    continue;
                 }
             }
-            if (out.items.len == 0) return null;
-            return @as(?[]u8, try out.toOwnedSlice(alloc));
-        },
-        .object => {
-            const value = contents.object.get("value") orelse return null;
-            if (value == .string) return @as(?[]u8, try alloc.dupe(u8, value.string));
-            return null;
-        },
-        else => return null,
+            const value = item.object.get("value") orelse continue;
+            if (value != .string or value.string.len == 0) continue;
+            if (out.items.len > 0) try out.append(alloc, '\n');
+            try out.appendSlice(alloc, value.string);
+        }
     }
+    if (out.items.len == 0) return null;
+    return .{ .kind = .markdown, .text = try out.toOwnedSlice(alloc) };
+}
+
+/// Parse a hover response (`contents` may be a MarkupContent object, a plain
+/// string, a legacy MarkedString `{language, value}` or an array of those).
+/// The Markdown/plaintext kind and legacy language information are preserved;
+/// absent/unknown kinds degrade to plaintext and empty content is "nothing to
+/// show" (null). The returned text is owned by the caller.
+pub fn parseHover(alloc: std.mem.Allocator, result: std.json.Value) !?HoverContent {
+    if (result != .object) return null;
+    const contents = result.object.get("contents") orelse return null;
+    return switch (contents) {
+        .string => |s| try hoverPlain(alloc, s),
+        .object => try parseHoverObject(alloc, contents),
+        .array => |a| try parseHoverArray(alloc, a.items),
+        else => null,
+    };
 }
 
 /// Parse a definition/references response (Location | Location[] | null)
@@ -261,6 +338,10 @@ pub const CompletionItem = struct {
     insert_text: ?[]u8 = null,
     /// filterText (owned, optional). null means "filter by label".
     filter_text: ?[]u8 = null,
+    /// CompletionItem.sortText (owned, optional): the server's PRESENTATION
+    /// order for tied candidates. Deliberately excluded from item_id /
+    /// selection_key — reordering must not change candidate identity.
+    sort_text: ?[]u8 = null,
     /// LSP CompletionItemKind (0 = unknown / buffer-word fallback).
     kind: u8 = 0,
     /// labelDetails.detail (owned, optional): e.g. "(comptime T: type)".
@@ -298,6 +379,7 @@ pub const CompletionItem = struct {
         alloc.free(self.label);
         if (self.insert_text) |v| alloc.free(v);
         if (self.filter_text) |v| alloc.free(v);
+        if (self.sort_text) |v| alloc.free(v);
         if (self.label_detail) |v| alloc.free(v);
         if (self.label_description) |v| alloc.free(v);
         if (self.detail) |v| alloc.free(v);
@@ -473,6 +555,11 @@ fn parseOne(alloc: std.mem.Allocator, item: std.json.Value) !?CompletionItem {
     }
     errdefer if (filter_copy) |v| alloc.free(v);
 
+    // Presentation order only: never part of item_id/selection_key.
+    var sort_copy: ?[]u8 = null;
+    if (stringField(item, "sortText")) |st| sort_copy = try alloc.dupe(u8, st);
+    errdefer if (sort_copy) |v| alloc.free(v);
+
     var data_json: ?[]u8 = null;
     if (item.object.get("data")) |data| {
         data_json = try std.json.Stringify.valueAlloc(alloc, data, .{});
@@ -510,6 +597,7 @@ fn parseOne(alloc: std.mem.Allocator, item: std.json.Value) !?CompletionItem {
         .label = label_copy,
         .insert_text = insert_copy,
         .filter_text = filter_copy,
+        .sort_text = sort_copy,
         .kind = kind,
         .label_detail = ld.detail,
         .label_description = ld.description,
@@ -539,6 +627,143 @@ fn uniqueCompletionMatch(items: []const CompletionItem, key: u64, comptime field
         found = i;
     }
     return found;
+}
+
+// ---- stable completion ranking (typed-prefix match quality) ----
+
+/// Match-quality tiers for the typed prefix: higher sorts first, 0 means the
+/// candidate does not match. Exact (`filterText` == typed) beats a
+/// case-insensitive exact match, which beats a prefix, which beats a
+/// word-boundary substring, which beats an interior substring. Case
+/// sensitivity breaks ties inside each tier. A prefix match always starts at
+/// a word boundary (position 0), so the boundary preference is what orders
+/// the substring tiers. Only `filterText` is used for matching (never the
+/// label or insertion text).
+const score_no_match: u32 = 0;
+/// Empty typed prefix: every candidate matches; sortText + stable parse
+/// order decide (used by trigger completions such as "b.").
+const score_empty_prefix: u32 = 1;
+const score_exact: u32 = 1000;
+const score_exact_ci: u32 = 900;
+const score_prefix: u32 = 800;
+const score_prefix_ci: u32 = 700;
+const score_boundary_substring: u32 = 600;
+const score_boundary_substring_ci: u32 = 500;
+const score_substring: u32 = 400;
+const score_substring_ci: u32 = 300;
+
+/// True when a match starting at `pos` begins a word: start of the candidate,
+/// after an alphanumeric separator such as `_` or punctuation, or at a
+/// camelCase hump (lowercase/digit followed by an uppercase ASCII letter).
+/// Non-ASCII bytes count as letters (no fabricated boundary inside UTF-8).
+fn isCompletionWordBoundary(haystack: []const u8, pos: usize) bool {
+    if (pos == 0) return true;
+    const prev = haystack[pos - 1];
+    const cur = haystack[pos];
+    const prev_alnum = (prev >= 'a' and prev <= 'z') or
+        (prev >= 'A' and prev <= 'Z') or
+        (prev >= '0' and prev <= '9') or
+        prev >= 0x80;
+    if (!prev_alnum) return true; // '_' / punctuation / space start a word
+    const prev_lower_or_digit = (prev >= 'a' and prev <= 'z') or (prev >= '0' and prev <= '9');
+    return prev_lower_or_digit and cur >= 'A' and cur <= 'Z';
+}
+
+/// Quality of `typed` against the candidate's `filterText` (label when the
+/// server omitted filterText). 0 = no match. Pure and allocation-free; the
+/// order is the documented ranking contract.
+pub fn completionMatchScore(typed: []const u8, item: *const CompletionItem) u32 {
+    if (typed.len == 0) return score_empty_prefix;
+    const hay = item.filterText();
+    if (typed.len > hay.len) return score_no_match;
+    if (std.mem.eql(u8, hay, typed)) return score_exact;
+    if (std.ascii.eqlIgnoreCase(hay, typed)) return score_exact_ci;
+    if (std.mem.startsWith(u8, hay, typed)) return score_prefix;
+    if (std.ascii.startsWithIgnoreCase(hay, typed)) return score_prefix_ci;
+
+    // Substring: prefer a match beginning at a word boundary, and prefer a
+    // case-sensitive match over a case-insensitive one at the same level.
+    var cs_boundary = false;
+    var ci_boundary = false;
+    var cs_any = false;
+    var ci_any = false;
+    var i: usize = 0;
+    while (i + typed.len <= hay.len) : (i += 1) {
+        const boundary = isCompletionWordBoundary(hay, i);
+        if (std.mem.eql(u8, hay[i .. i + typed.len], typed)) {
+            cs_any = true;
+            if (boundary) {
+                cs_boundary = true;
+                break; // best possible substring tier; no need to scan on
+            }
+        } else if (std.ascii.eqlIgnoreCase(hay[i .. i + typed.len], typed)) {
+            ci_any = true;
+            if (boundary) ci_boundary = true;
+        }
+    }
+    if (cs_boundary) return score_boundary_substring;
+    if (ci_boundary) return score_boundary_substring_ci;
+    if (cs_any) return score_substring;
+    if (ci_any) return score_substring_ci;
+    return score_no_match;
+}
+
+fn sortTextOrder(a: ?[]const u8, b: ?[]const u8) std.math.Order {
+    if (a) |av| {
+        if (b) |bv| return std.mem.order(u8, av, bv);
+        return .lt; // a present sortText sorts before an absent one
+    }
+    if (b != null) return .gt;
+    return .eq;
+}
+
+/// One sort entry: the match score is computed ONCE per candidate. The old
+/// insertion-sort implementation recomputed it for every comparison, which is
+/// O(n²) and froze the UI on servers that return a full unfiltered candidate
+/// set (zls). `index` is the original parse index and is part of the total
+/// order, so the result does not depend on the sort algorithm's stability.
+const CompletionSortEntry = struct {
+    score: u32,
+    sort_text: ?[]const u8,
+    index: usize,
+};
+
+/// Total order: match quality desc, server sortText (present before absent,
+/// lexicographic ascending), then original parse index ascending.
+fn completionSortEntryLessThan(_: void, a: CompletionSortEntry, b: CompletionSortEntry) bool {
+    if (a.score != b.score) return a.score > b.score;
+    const ord = sortTextOrder(a.sort_text, b.sort_text);
+    if (ord != .eq) return ord == .lt;
+    return a.index < b.index;
+}
+
+/// Stable-order in-place sort of completion candidates by match quality.
+/// O(n log n) with O(n) scratch: one score per item, then a total-order sort
+/// (score, sortText, original index) — equal candidates keep their original
+/// parse/caller order (local buffer-word frequency order, server order for
+/// equal sortText) because the original index is the final tiebreaker, not
+/// because the algorithm happens to be stable. Must run AFTER filtering and
+/// BEFORE display/selection/truncation. On allocation failure the caller's
+/// order is left untouched (server order) rather than freezing the editor.
+pub fn sortCompletionItems(alloc: std.mem.Allocator, items: []CompletionItem, typed: []const u8) void {
+    if (items.len < 2) return;
+    const entries = alloc.alloc(CompletionSortEntry, items.len) catch return;
+    defer alloc.free(entries);
+    for (items, 0..) |*it, i| {
+        entries[i] = .{
+            .score = completionMatchScore(typed, it),
+            .sort_text = it.sort_text,
+            .index = i,
+        };
+    }
+    std.mem.sort(CompletionSortEntry, entries, {}, completionSortEntryLessThan);
+    // Apply the sorted permutation. A second O(n) array keeps the permutation
+    // application trivially correct; sort_text slices are owned by `items` and
+    // moving items by value does not invalidate them.
+    const sorted = alloc.alloc(CompletionItem, items.len) catch return;
+    defer alloc.free(sorted);
+    for (entries, 0..) |entry, i| sorted[i] = items[entry.index];
+    @memcpy(items, sorted);
 }
 
 /// Parse a textDocument/completion response (CompletionList | CompletionItem[])
@@ -619,26 +844,73 @@ test "navigation: references params carry the mandatory context" {
     try std.testing.expectEqual(@as(i64, 3), pos.object.get("line").?.integer);
 }
 
-test "navigation: hover text from markdown/string/array" {
+fn expectHover(alloc: std.mem.Allocator, payload: []const u8, want_kind: HoverKind, want_text: []const u8) !void {
+    var p = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{ .allocate = .alloc_always });
+    defer p.deinit();
+    var hover = (try parseHover(alloc, p.value)) orelse return error.TestUnexpectedResult;
+    defer hover.deinit(alloc);
+    try std.testing.expectEqual(want_kind, hover.kind);
+    try std.testing.expectEqualStrings(want_text, hover.text);
+}
+
+fn expectNoHover(alloc: std.mem.Allocator, payload: []const u8) !void {
+    var p = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{ .allocate = .alloc_always });
+    defer p.deinit();
+    if (try parseHover(alloc, p.value)) |hover_value| {
+        var hover = hover_value;
+        hover.deinit(alloc);
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "hover content: MarkupContent keeps markdown, plaintext and unknown kinds" {
     const alloc = std.testing.allocator;
-    const j1 = "{\"contents\":{\"kind\":\"markdown\",\"value\":\"**doc**\"}}";
-    var p1 = try std.json.parseFromSlice(std.json.Value, alloc, j1, .{ .allocate = .alloc_always });
-    defer p1.deinit();
-    const t1 = (try parseHoverText(alloc, p1.value)).?;
-    defer alloc.free(t1);
-    try std.testing.expectEqualStrings("**doc**", t1);
+    try expectHover(alloc, "{\"contents\":{\"kind\":\"markdown\",\"value\":\"**doc** **bold**\"}}", .markdown, "**doc** **bold**");
+    try expectHover(alloc, "{\"contents\":{\"kind\":\"plaintext\",\"value\":\"**not markdown**\"}}", .plaintext, "**not markdown**");
+    // Unknown kind must degrade to plaintext instead of being rendered as
+    // Markdown; absent kind is plaintext per MarkupContent semantics.
+    try expectHover(alloc, "{\"contents\":{\"kind\":\"weird/lang\",\"value\":\"a * b\"}}", .plaintext, "a * b");
+    try expectHover(alloc, "{\"contents\":{\"value\":\"no kind given\"}}", .plaintext, "no kind given");
+}
 
-    const j2 = "{\"contents\":\"plain hover\"}";
-    var p2 = try std.json.parseFromSlice(std.json.Value, alloc, j2, .{ .allocate = .alloc_always });
-    defer p2.deinit();
-    const t2 = (try parseHoverText(alloc, p2.value)).?;
-    defer alloc.free(t2);
-    try std.testing.expectEqualStrings("plain hover", t2);
+test "hover content: plain string is plaintext; empty and null contents show nothing" {
+    const alloc = std.testing.allocator;
+    try expectHover(alloc, "{\"contents\":\"plain hover\"}", .plaintext, "plain hover");
+    try expectHover(alloc, "{\"contents\":{\"kind\":\"plaintext\",\"value\":\"use ``` fences literally\"}}", .plaintext, "use ``` fences literally");
+    // Empty content is "nothing to show" for every shape.
+    try expectNoHover(alloc, "{\"contents\":{\"kind\":\"plaintext\",\"value\":\"\"}}");
+    try expectNoHover(alloc, "{\"contents\":{\"kind\":\"markdown\",\"value\":\"\"}}");
+    try expectNoHover(alloc, "{\"contents\":\"\"}");
+    try expectNoHover(alloc, "{\"contents\":[]}");
+    try expectNoHover(alloc, "{\"contents\":null}");
+    try expectNoHover(alloc, "{}");
+    try expectNoHover(alloc, "null");
+}
 
-    const j3 = "{\"contents\":[]}";
-    var p3 = try std.json.parseFromSlice(std.json.Value, alloc, j3, .{ .allocate = .alloc_always });
-    defer p3.deinit();
-    try std.testing.expect((try parseHoverText(alloc, p3.value)) == null);
+test "hover content: legacy MarkedString language object becomes a fenced block" {
+    const alloc = std.testing.allocator;
+    try expectHover(alloc,
+        "{\"contents\":{\"language\":\"zig\",\"value\":\"const x = 1;\"}}",
+        .markdown, "```zig\nconst x = 1;\n```");
+    // Unknown fence language is preserved readably (the renderer falls back
+    // to the buffer's own language for an unknown fence).
+    try expectHover(alloc,
+        "{\"contents\":{\"language\":\"notalang\",\"value\":\"q\"}}",
+        .markdown, "```notalang\nq\n```");
+    try expectHover(alloc,
+        "{\"contents\":{\"language\":\"\",\"value\":\"q\"}}",
+        .markdown, "```\nq\n```");
+}
+
+test "hover content: MarkedString array mixes code fences and prose" {
+    const alloc = std.testing.allocator;
+    try expectHover(alloc,
+        "{\"contents\":[{\"language\":\"zig\",\"value\":\"const x = 1;\"},\"plain prose\",{\"language\":\"c\",\"value\":\"int y;\"}]}",
+        .markdown, "```zig\nconst x = 1;\n```\nplain prose\n```c\nint y;\n```");
+    // A code-only array still keeps each language in its own fence.
+    try expectHover(alloc,
+        "{\"contents\":[{\"language\":\"zig\",\"value\":\"a\"},{\"language\":\"zig\",\"value\":\"b\"}]}",
+        .markdown, "```zig\na\n```\n```zig\nb\n```");
 }
 
 test "navigation: locations from single and array responses" {
@@ -884,4 +1156,308 @@ test "navigation: selected completion survives a growing replacement range witho
     after.items[0].item_id = after.items[1].item_id;
     after.items[0].selection_key = after.items[1].selection_key;
     try std.testing.expect(completionSelection(after.items, before.items[1].item_id, before.items[1].selection_key) == null);
+}
+
+// ==================== completion ranking/ordering tests =====================
+
+const TestItems = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    items: std.ArrayList(CompletionItem),
+
+    fn deinit(self: *TestItems, alloc: std.mem.Allocator) void {
+        for (self.items.items) |*it| it.deinit(alloc);
+        self.items.deinit(alloc);
+        self.parsed.deinit();
+    }
+};
+
+fn testItems(alloc: std.mem.Allocator, payload: []const u8) !TestItems {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{ .allocate = .alloc_always });
+    errdefer parsed.deinit();
+    var items = std.ArrayList(CompletionItem).empty;
+    errdefer {
+        for (items.items) |*it| it.deinit(alloc);
+        items.deinit(alloc);
+    }
+    try parseCompletionItems(alloc, parsed.value, &items);
+    return .{ .parsed = parsed, .items = items };
+}
+
+fn expectLabels(items: []const CompletionItem, expected: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, items.len);
+    for (expected, 0..) |want, i| {
+        try std.testing.expectEqualStrings(want, items[i].label);
+    }
+}
+
+test "completion ranking: reported order count_lines/read_lines/line/inline puts exact line first" {
+    const alloc = std.testing.allocator;
+    var t = try testItems(alloc,
+        \\[{"label":"count_lines","data":{"id":"count"}},
+        \\ {"label":"read_lines","data":{"id":"read"}},
+        \\ {"label":"line","data":{"id":"line"}},
+        \\ {"label":"inline","data":{"id":"inline"}}]
+    );
+    defer t.deinit(alloc);
+
+    const exact = completionMatchScore("line", &t.items.items[2]);
+    const boundary = completionMatchScore("line", &t.items.items[0]);
+    const middle = completionMatchScore("line", &t.items.items[3]);
+    try std.testing.expect(exact > boundary);
+    try std.testing.expect(boundary > middle);
+    try std.testing.expectEqual(@as(u32, 0), completionMatchScore("zzz", &t.items.items[2]));
+
+    sortCompletionItems(alloc, t.items.items, "line");
+    try expectLabels(t.items.items, &.{ "line", "count_lines", "read_lines", "inline" });
+}
+
+test "completion ranking: case variants order exact, case-insensitive exact, prefix, substring" {
+    const alloc = std.testing.allocator;
+    var t = try testItems(alloc,
+        \\[{"label":"Line"},
+        \\ {"label":"line_item"},
+        \\ {"label":"LINE"},
+        \\ {"label":"line"},
+        \\ {"label":"inline"}]
+    );
+    defer t.deinit(alloc);
+    const s_line = completionMatchScore("line", &t.items.items[3]); // exact
+    const s_cap = completionMatchScore("line", &t.items.items[0]); // case-insensitive exact
+    const s_upper = completionMatchScore("line", &t.items.items[2]); // case-insensitive exact
+    const s_prefix = completionMatchScore("line", &t.items.items[1]); // prefix
+    const s_mid = completionMatchScore("line", &t.items.items[4]); // substring
+    try std.testing.expect(s_line > s_cap);
+    try std.testing.expectEqual(s_cap, s_upper);
+    try std.testing.expect(s_cap > s_prefix);
+    try std.testing.expect(s_prefix > s_mid);
+
+    sortCompletionItems(alloc, t.items.items, "line");
+    try expectLabels(t.items.items, &.{ "line", "Line", "LINE", "line_item", "inline" });
+}
+
+test "completion ranking: word-boundary and camelCase substring beat a plain middle match" {
+    const alloc = std.testing.allocator;
+    var t = try testItems(alloc,
+        \\[{"label":"inline"},
+        \\ {"label":"outline"},
+        \\ {"label":"count_lines"},
+        \\ {"label":"read_lines"},
+        \\ {"label":"getLine"}]
+    );
+    defer t.deinit(alloc);
+    try std.testing.expect(completionMatchScore("line", &t.items.items[2]) >
+        completionMatchScore("line", &t.items.items[0]));
+    try std.testing.expect(completionMatchScore("line", &t.items.items[4]) >
+        completionMatchScore("line", &t.items.items[1]));
+
+    sortCompletionItems(alloc, t.items.items, "line");
+    // Boundary matches (snake_case '_' and camelCase case change) rank above
+    // plain interior matches; equal scores keep the stable parse order.
+    try expectLabels(t.items.items, &.{ "count_lines", "read_lines", "getLine", "inline", "outline" });
+}
+
+test "completion ranking: sortText breaks ties (present before absent, ascending)" {
+    const alloc = std.testing.allocator;
+    var t = try testItems(alloc,
+        \\[{"label":"ab_one","sortText":"02"},
+        \\ {"label":"ab_three"},
+        \\ {"label":"ab_two","sortText":"01"},
+        \\ {"label":"ab_four","sortText":"01"}]
+    );
+    defer t.deinit(alloc);
+    try std.testing.expectEqualStrings("02", t.items.items[0].sort_text.?);
+    try std.testing.expect(t.items.items[1].sort_text == null);
+
+    sortCompletionItems(alloc, t.items.items, "ab");
+    try expectLabels(t.items.items, &.{ "ab_two", "ab_four", "ab_one", "ab_three" });
+}
+
+test "completion ranking: filterText drives matching, label displays, insertText inserts" {
+    const alloc = std.testing.allocator;
+    var t = try testItems(alloc,
+        \\[{"label":"display_label","filterText":"line","insertText":"inserted_line"},
+        \\ {"label":"line","filterText":"nope"}]
+    );
+    defer t.deinit(alloc);
+    const filtered = &t.items.items[0];
+    try std.testing.expectEqualStrings("display_label", filtered.label);
+    try std.testing.expectEqualStrings("line", filtered.filterText());
+    try std.testing.expectEqualStrings("inserted_line", filtered.insertText());
+    // The label alone would not match "line"; filterText is what is scored.
+    try std.testing.expectEqual(@as(u32, 0), completionMatchScore("line", &t.items.items[1]));
+    try std.testing.expect(completionMatchScore("line", filtered) > 0);
+
+    sortCompletionItems(alloc, t.items.items, "line");
+    try std.testing.expectEqualStrings("display_label", t.items.items[0].label);
+    try std.testing.expectEqualStrings("inserted_line", t.items.items[0].insertText());
+}
+
+test "completion ranking: sortText is presentation order, not identity" {
+    const alloc = std.testing.allocator;
+    var a = try testItems(alloc, "[{\"label\":\"alpha\",\"kind\":3,\"sortText\":\"05\",\"data\":{\"id\":1}}]");
+    defer a.deinit(alloc);
+    var b = try testItems(alloc, "[{\"label\":\"alpha\",\"kind\":3,\"sortText\":\"99\",\"data\":{\"id\":1}}]");
+    defer b.deinit(alloc);
+    try std.testing.expectEqualStrings("05", a.items.items[0].sort_text.?);
+    try std.testing.expectEqualStrings("99", b.items.items[0].sort_text.?);
+    // item_id/selection_key must not hash the presentation order.
+    try std.testing.expectEqual(a.items.items[0].item_id, b.items.items[0].item_id);
+    try std.testing.expectEqual(a.items.items[0].selection_key, b.items.items[0].selection_key);
+}
+
+test "completion ranking: duplicate labels with different data/textEdit keep their identity" {
+    const alloc = std.testing.allocator;
+    var t = try testItems(alloc,
+        \\[{"label":"dup","data":{"id":"A"},"sortText":"02",
+        \\  "textEdit":{"newText":"dup","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}},
+        \\ {"label":"dup","data":{"id":"B"},"sortText":"01",
+        \\  "textEdit":{"newText":"dup","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":2}}}}]
+    );
+    defer t.deinit(alloc);
+    const id_a = t.items.items[0].item_id;
+    const key_a = t.items.items[0].selection_key;
+    const id_b = t.items.items[1].item_id;
+    try std.testing.expect(id_a != id_b);
+
+    sortCompletionItems(alloc, t.items.items, "dup");
+    // Both are exact matches; sortText moves B before A without swapping data.
+    try std.testing.expectEqual(id_b, t.items.items[0].item_id);
+    try std.testing.expectEqual(id_a, t.items.items[1].item_id);
+    try std.testing.expectEqual(@as(?usize, 0), completionSelection(t.items.items, id_b, t.items.items[0].selection_key));
+    // The selection identity follows A after it moved to index 1.
+    try std.testing.expectEqual(@as(?usize, 1), completionSelection(t.items.items, id_a, key_a));
+}
+
+test "completion ranking: snippet fallback still inserts the label after sorting" {
+    const alloc = std.testing.allocator;
+    var t = try testItems(alloc,
+        \\[{"label":"snip","insertTextFormat":2,"insertText":"snip(${1:x})"},
+        \\ {"label":"snip_other"}]
+    );
+    defer t.deinit(alloc);
+    sortCompletionItems(alloc, t.items.items, "snip");
+    try expectLabels(t.items.items, &.{ "snip", "snip_other" });
+    try std.testing.expectEqualStrings("snip", t.items.items[0].insertText());
+}
+
+test "completion ranking: stable order preserves local frequency ordering" {
+    // Local buffer-word completion builds this list already sorted by
+    // frequency; all entries are case-sensitive prefix matches of "g", so
+    // equal scores + equal (absent) sortText must keep the caller's order.
+    const alloc = std.testing.allocator;
+    var t = try testItems(alloc,
+        \\[{"label":"gamma"},{"label":"gamma2"},{"label":"gammas"}]
+    );
+    defer t.deinit(alloc);
+    const s = completionMatchScore("g", &t.items.items[0]);
+    try std.testing.expect(s > 0);
+    try std.testing.expectEqual(s, completionMatchScore("g", &t.items.items[1]));
+    try std.testing.expectEqual(s, completionMatchScore("g", &t.items.items[2]));
+    sortCompletionItems(alloc, t.items.items, "g");
+    try expectLabels(t.items.items, &.{ "gamma", "gamma2", "gammas" });
+}
+
+test "completion ranking: first open is the best item and a refresh keeps the selection identity" {
+    const alloc = std.testing.allocator;
+    var t = try testItems(alloc,
+        \\[{"label":"count_lines","data":{"id":"count"}},
+        \\ {"label":"read_lines","data":{"id":"read"}},
+        \\ {"label":"line","data":{"id":"line"}},
+        \\ {"label":"inline","data":{"id":"inline"}}]
+    );
+    defer t.deinit(alloc);
+    // First open: no previous selection -> index 0 after sorting is the best.
+    sortCompletionItems(alloc, t.items.items, "line");
+    try std.testing.expectEqualStrings("line", t.items.items[0].label);
+    // The user had selected count_lines before a refresh; its identity must
+    // survive the reorder (the list is sorted first, then matched by id).
+    const want_id = t.items.items[1].item_id; // count_lines
+    const want_key = t.items.items[1].selection_key;
+    try std.testing.expectEqual(@as(?usize, 1), completionSelection(t.items.items, want_id, want_key));
+
+    // A refresh with a different server order must not reset a manual
+    // selection to "best": same identities, reordered.
+    var r = try testItems(alloc,
+        \\[{"label":"inline","data":{"id":"inline"}},
+        \\ {"label":"line","data":{"id":"line"}},
+        \\ {"label":"count_lines","data":{"id":"count"}},
+        \\ {"label":"read_lines","data":{"id":"read"}}]
+    );
+    defer r.deinit(alloc);
+    sortCompletionItems(alloc, r.items.items, "line");
+    try std.testing.expectEqualStrings("line", r.items.items[0].label);
+    const idx = completionSelection(r.items.items, want_id, want_key) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("count_lines", r.items.items[idx].label);
+}
+
+fn freeRankedItems(alloc: std.mem.Allocator, items: *std.ArrayList(CompletionItem)) void {
+    for (items.items) |*it| it.deinit(alloc);
+    items.deinit(alloc);
+}
+
+// Deterministic O(n log n) shape regression: reversed sortText forces a full
+// reorder of 5000 candidates while every score is identical. The old
+// insertion sort recomputed the score per comparison (O(n²), ~6.8 s in Debug
+// on this machine); the precomputed-score sort is milliseconds. The bound is
+// deliberately generous (10x+ the measured value) so it is not scheduler
+// sensitive, while still failing by orders of magnitude if the quadratic
+// behavior returns.
+test "completion ranking: 5000 reversed sortText items sort fast and in total order" {
+    const alloc = std.testing.allocator;
+    var items = std.ArrayList(CompletionItem).empty;
+    defer freeRankedItems(alloc, &items);
+    var label_buf: [32]u8 = undefined;
+    var sort_buf: [16]u8 = undefined;
+    var i: usize = 0;
+    while (i < 5000) : (i += 1) {
+        const label = try std.fmt.bufPrint(&label_buf, "item{d:0>4}", .{i});
+        const sort_text = try std.fmt.bufPrint(&sort_buf, "{d:0>4}", .{4999 - i});
+        try items.append(alloc, .{
+            .label = try alloc.dupe(u8, label),
+            .sort_text = try alloc.dupe(u8, sort_text),
+        });
+    }
+    const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    sortCompletionItems(alloc, items.items, "item");
+    const elapsed_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start;
+
+    try std.testing.expectEqual(@as(usize, 5000), items.items.len);
+    try std.testing.expectEqualStrings("item4999", items.items[0].label);
+    try std.testing.expectEqualStrings("item0000", items.items[4999].label);
+    var k: usize = 1;
+    while (k < items.items.len) : (k += 1) {
+        const prev = items.items[k - 1].sort_text.?;
+        const cur = items.items[k].sort_text.?;
+        try std.testing.expect(std.mem.lessThan(u8, prev, cur));
+    }
+    try std.testing.expect(elapsed_ns < 100 * std.time.ns_per_ms);
+}
+
+// 5000 equal-score, equal-sortText candidates: the original parse index is
+// the final tiebreaker, so the result is the original order on every run and
+// sorting an already-sorted list is idempotent (a real total order, not an
+// accident of a particular algorithm's stability).
+test "completion ranking: 5000 equal-score items keep the original order deterministically" {
+    const alloc = std.testing.allocator;
+    var items = std.ArrayList(CompletionItem).empty;
+    defer freeRankedItems(alloc, &items);
+    var label_buf: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < 5000) : (i += 1) {
+        const label = try std.fmt.bufPrint(&label_buf, "eq{d:0>4}", .{i});
+        try items.append(alloc, .{ .label = try alloc.dupe(u8, label) });
+    }
+    sortCompletionItems(alloc, items.items, "eq");
+    try std.testing.expectEqualStrings("eq0000", items.items[0].label);
+    try std.testing.expectEqualStrings("eq4999", items.items[4999].label);
+    // Idempotent: a second pass keeps the same total order.
+    sortCompletionItems(alloc, items.items, "eq");
+    try std.testing.expectEqualStrings("eq0000", items.items[0].label);
+    try std.testing.expectEqualStrings("eq4999", items.items[4999].label);
+    var k: usize = 0;
+    var expected_buf: [32]u8 = undefined;
+    while (k < items.items.len) : (k += 1) {
+        const expected = try std.fmt.bufPrint(&expected_buf, "eq{d:0>4}", .{k});
+        try std.testing.expectEqualStrings(expected, items.items[k].label);
+    }
 }

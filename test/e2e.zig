@@ -3689,6 +3689,49 @@ test "dashboard shows recent files; Enter reopens" {
     }
 }
 
+/// PATH for grep-picker tests: the hardened spawn env intentionally pins
+/// /usr/bin:/bin:/usr/local/bin, but ripgrep is a user-installed tool (e.g.
+/// ~/.cargo/bin). Discover its directory from the test runner's PATH so the
+/// grep test exercises the real `rg` instead of failing on a missing tool.
+fn grepPathEnv(io: Io, alloc: std.mem.Allocator) ![]u8 {
+    // Zig 0.17 exposes the environment through std.process.Init, not a global
+    // getenv; this Linux pty harness reads its own environ file instead.
+    // /proc files report size 0, so read to EOF with a streaming loop rather
+    // than readFileAlloc (which trusts the reported size).
+    var parent: []const u8 = "/usr/bin:/bin:/usr/local/bin";
+    var environ = std.ArrayList(u8).empty;
+    defer environ.deinit(alloc);
+    if (std.Io.Dir.cwd().openFile(io, "/proc/self/environ", .{})) |f| {
+        defer f.close(io);
+        var tmp: [4096]u8 = undefined;
+        while (environ.items.len < (1 << 20)) {
+            const n = f.readStreaming(io, &.{tmp[0..]}) catch break;
+            if (n == 0) break;
+            environ.appendSlice(alloc, tmp[0..n]) catch break;
+        }
+        var env_it = std.mem.splitScalar(u8, environ.items, 0);
+        while (env_it.next()) |entry| {
+            if (std.mem.startsWith(u8, entry, "PATH=")) {
+                parent = entry[5..];
+                break;
+            }
+        }
+    } else |_| {}
+    var it = std.mem.splitScalar(u8, parent, ':');
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        const candidate = try std.fmt.allocPrint(alloc, "{s}/rg", .{dir});
+        defer alloc.free(candidate);
+        if (std.Io.Dir.cwd().openFile(io, candidate, .{})) |f| {
+            f.close(io);
+            return std.fmt.allocPrint(alloc, "PATH={s}:/usr/bin:/bin:/usr/local/bin", .{dir});
+        } else |_| {}
+    }
+    // No rg anywhere: fall back to the pinned PATH; the test then fails with
+    // its normal "no matches" diagnostic rather than hiding the dependency.
+    return alloc.dupe(u8, "PATH=/usr/bin:/bin:/usr/local/bin");
+}
+
 test "grep picker: <leader>st finds matches and jumps" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -3703,7 +3746,9 @@ test "grep picker: <leader>st finds matches and jumps" {
         try f.writeStreamingAll(io, "grep target line\n");
     }
 
-    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    const grep_env = try grepPathEnv(io, alloc);
+    defer alloc.free(grep_env);
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{grep_env});
     defer sess.close();
     defer killPid(sess.pid);
 
@@ -3821,7 +3866,9 @@ test "grep picker: fixed-size panel with split syntax preview" {
         try f.writeStreamingAll(io, text.items);
     }
 
-    var sess = try Session.spawn(io, &.{ oz_exe_path, open_name });
+    const grep_env = try grepPathEnv(io, alloc);
+    defer alloc.free(grep_env);
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, open_name }, &.{grep_env});
     defer sess.close();
     defer killPid(sess.pid);
 
@@ -24586,13 +24633,11 @@ test "completion UI: real ZLS drives labelDetails, docs and insertion" {
     try sess.send("\x0e");
     try gridWaitFor(&sess, &grid, "ArrayList", 12000);
     // ZLS returns the full list; the client filters by the typed prefix.
-    // Move to the real ArrayList item and wait for its initial docs.
-    var i: usize = 0;
-    while (i < 7) : (i += 1) {
-        try sess.send("\x0e");
-        try gridDrain(&sess, &grid, 120);
-        if (grid.contains("A contiguous")) break;
-    }
+    // Narrow the prefix to the exact item by TYPING (the real user path)
+    // instead of a fixed Ctrl+n walk over server order: candidate order is a
+    // ranking contract now, not a zls promise. With prefix "ArrayList" the
+    // exact item is the default selection and its docs appear inline.
+    try sess.send("ayList");
     try gridWaitFor(&sess, &grid, "A contiguous", 8000);
     try std.testing.expect(grid.contains("(comptime T: type)"));
     try std.testing.expect(grid.contains("fn (comptime T: type) type"));
@@ -25980,4 +26025,983 @@ test "diagnostic UI: colored range underlines follow UTF-16, hints, wraps and pa
     try sess.send("\x1b");
     try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+// ===========================================================================
+// Editing reliability regressions (2026-11-15 audit, 8 issues).
+//
+// Every test uses an ABSOLUTE path to the freshly built binary (never PATH),
+// asserts saved bytes / current frame / mode, and sends CSI arrows as one
+// packet. Async peer barriers are file-based; no arbitrary sleeps.
+// ===========================================================================
+
+/// Absolute path to a freshly built artifact under the project root.
+fn erAbs(io: Io, alloc: std.mem.Allocator, rel: []const u8) ![]u8 {
+    const z = try std.Io.Dir.cwd().realPathFileAlloc(io, rel, alloc);
+    defer alloc.free(z);
+    return alloc.dupe(u8, z);
+}
+
+/// Fresh /tmp fixture with a unique name; caller deletes it.
+fn erFixture(io: Io, name_buf: *[192:0]u8, suffix: []const u8, content: []const u8) ![:0]const u8 {
+    const name = try bufPrintZ(name_buf, "/tmp/oz_er_{d}_{d}{s}", .{ linux.getpid(), tmp_counter, suffix });
+    tmp_counter += 1;
+    const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+    defer f.close(io);
+    try f.writeStreamingAll(io, content);
+    return name;
+}
+
+fn erRead(io: Io, alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(256 * 1024));
+}
+
+/// Spawn the real oz binary (absolute path) on one fixture.
+fn erStart(io: Io, alloc: std.mem.Allocator, fixture: []const u8, rows: u16, cols: u16) !Session {
+    const oz = try erAbs(io, alloc, oz_exe_path);
+    defer alloc.free(oz);
+    return Session.spawnEnvSize(io, &.{ oz, fixture }, null, rows, cols);
+}
+
+/// One editor case: initial bytes, keys, saved bytes. Fails with a dump of
+/// the mismatch so a red run is evidence, not a mystery.
+fn erEditorCase(io: Io, alloc: std.mem.Allocator, label: []const u8, initial: []const u8, keys: []const u8, expected: []const u8) !void {
+    var name_buf: [192:0]u8 = undefined;
+    const name = try erFixture(io, &name_buf, ".zig", initial);
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    var sess = try erStart(io, alloc, name, 24, 80);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send(keys);
+    // Force a normal-mode command line before saving: an unexpected Insert
+    // mode (the Visual gc bug) must fail on the saved bytes, not by typing
+    // the command into the buffer. Ctrl-c is unambiguous (a naked ESC sent
+    // right before ':' can be parsed as Alt+':', which does not leave Insert).
+    try sess.send("\x03");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 5000);
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    if (exit_code != 0) {
+        std.debug.print("{s}: exit code {d} after keys {s}; frame:\n", .{ label, exit_code, keys });
+        grid.dump();
+    }
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+    const saved = try erRead(io, alloc, name);
+    defer alloc.free(saved);
+    if (!std.mem.eql(u8, expected, saved)) {
+        std.debug.print("{s}: keys {s} initial {s}\n", .{ label, keys, initial });
+        std.debug.print("expected: {s}\nactual:   {s}\n", .{ expected, saved });
+    }
+    try std.testing.expectEqualStrings(expected, saved);
+}
+
+test "editing reliability: insert arrows keep the EOL insertion point" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { name: []const u8, initial: []const u8, keys: []const u8, expected: []const u8 }{
+        // Before the fix, Right stopped on the last Normal-mode character:
+        // "abcdX" became "abcXd".
+        .{ .name = "mid-left-right", .initial = "abcd\nxy\n", .keys = "A\x1b[D\x1b[CX", .expected = "abcdX\nxy\n" },
+        // A trailing newline creates an empty last line: Down reaches its
+        // insertion point (line 3, col 0), so X is a line of its own.
+        .{ .name = "empty-last-line", .initial = "abcd\nxy\n", .keys = "jA\x1b[BX", .expected = "abcd\nxy\nX" },
+        // UTF-8: one Left/Right is one scalar.
+        .{ .name = "utf8", .initial = "a中b\n", .keys = "A\x1b[D\x1b[CX", .expected = "a中bX\n" },
+        // Short line below: Down clamps to its text end (an Insert point, not
+        // the Normal last character). No trailing newline: line 2 is last.
+        .{ .name = "short-line", .initial = "abcd\nxy", .keys = "A\x1b[BX", .expected = "abcd\nxyX" },
+    };
+    for (cases) |case| try erEditorCase(io, alloc, case.name, case.initial, case.keys, case.expected);
+}
+
+test "editing reliability: completion accept then arrows move through the typed text" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var name_buf: [192:0]u8 = undefined;
+    const name = try erFixture(io, &name_buf, ".zig", "const x = std\n");
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    const oz = try erAbs(io, alloc, oz_exe_path);
+    defer alloc.free(oz);
+    const mock = try erAbs(io, alloc, "zig-out/bin/mock_lsp");
+    defer alloc.free(mock);
+    const lsp_env = try std.fmt.allocPrint(alloc, "OZ_LSP_CMD={s}", .{mock});
+    defer alloc.free(lsp_env);
+    var sess = try Session.spawnEnvSize(io, &.{ oz, name }, &.{ lsp_env, "OZ_MOCK_SCRIPT=completion_rich" }, 32, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 32, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    // Append "." to open the rich candidate list, accept the first item
+    // (ArrayList), then walk Left once and Right once: the cursor must end
+    // after the accepted bytes, so the sentinel lands LAST.
+    try sess.send("A.");
+    try gridWaitFor(&sess, &grid, "ArrayList", 8000);
+    try sess.send("\r");
+    try gridWaitGone(&sess, &grid, "A contiguous", 3000);
+    try sess.send("\x1b[D");
+    try sess.send("\x1b[C");
+    try sess.send("X\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try erRead(io, alloc, name);
+    defer alloc.free(saved);
+    try std.testing.expectEqualStrings("const x = std.ArrayListX\n", saved);
+}
+
+test "editing reliability: Enter indents real brace blocks only" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { name: []const u8, initial: []const u8, keys: []const u8, expected: []const u8 }{
+        // Insert point between the auto-pair braces.
+        .{ .name = "empty-block", .initial = "fn f() {}\n", .keys = "f}i\rx", .expected = "fn f() {\n    x\n}\n" },
+        // Already-expanded block: Enter at the end of the `{` line opens one
+        // indented level above the existing aligned closer.
+        .{ .name = "expanded", .initial = "fn f() {\n}\n", .keys = "A\rx", .expected = "fn f() {\n    x\n}\n" },
+        // A brace inside a string is not a block: no fake indentation.
+        .{ .name = "string-brace", .initial = "const s = \"{\";\n", .keys = "A\rx", .expected = "const s = \"{\";\nx\n" },
+        // A brace inside a line comment is not a block either.
+        .{ .name = "comment-brace", .initial = "// {\n", .keys = "A\rx", .expected = "// {\nx\n" },
+        // Nested one-liner block: the closer is realigned one level deeper.
+        .{ .name = "nested", .initial = "fn f() {\n    if (x) {}\n}\n", .keys = "j$i\rx", .expected = "fn f() {\n    if (x) {\n        x\n    }\n}\n" },
+        // CRLF stays CRLF and gets the indented blank line.
+        .{ .name = "crlf", .initial = "fn f() {}\r\n", .keys = "f}i\rx", .expected = "fn f() {\r\n    x\r\n}\r\n" },
+    };
+    for (cases) |case| try erEditorCase(io, alloc, case.name, case.initial, case.keys, case.expected);
+}
+
+test "editing reliability: Ctrl+W deletes a vim word, not a WORD" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { name: []const u8, initial: []const u8, keys: []const u8, expected: []const u8 }{
+        // The reported case: only word2 dies, the trailing '.' stays.
+        .{ .name = "dotted", .initial = "self.word1.word2\n", .keys = "A\x17X", .expected = "self.word1.X\n" },
+        // Consecutive: then the '.' punctuation run dies.
+        .{ .name = "consecutive", .initial = "self.word1.word2\n", .keys = "A\x17\x17X", .expected = "self.word1X\n" },
+        // The whole snake_case/number identifier is one word; trailing space
+        // is skipped with it.
+        .{ .name = "snake", .initial = "foo_bar123 baz\n", .keys = "A\x17\x17X", .expected = "X\n" },
+        // CJK letters are word characters; emoji is punctuation (separate run).
+        .{ .name = "cjk-emoji", .initial = "你好🙂\n", .keys = "A\x17X", .expected = "你好X\n" },
+        // Punctuation run with a path.
+        .{ .name = "path", .initial = "a/b/c\n", .keys = "A\x17X", .expected = "a/b/X\n" },
+    };
+    for (cases) |case| try erEditorCase(io, alloc, case.name, case.initial, case.keys, case.expected);
+}
+
+test "editing reliability: multi-cursor Ctrl+W uses the same word boundary" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var name_buf: [192:0]u8 = undefined;
+    const name = try erFixture(io, &name_buf, ".zig", "foo bar\nfoo bar\n");
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    var sess = try erStart(io, alloc, name, 24, 80);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    // Visual-block insert at column 0 of both lines, type the dotted value,
+    // then Ctrl+W at each cursor; both lines must delete only word2.
+    try sess.send("\x16jIself.word1.word2\x17X");
+    try gridWaitFor(&sess, &grid, "self.word1.X", 5000);
+    // Ctrl-c exits the multi-cursor insert unambiguously (ESC immediately
+    // followed by ':' can be parsed as Alt+':').
+    try sess.send("\x03");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try erRead(io, alloc, name);
+    defer alloc.free(saved);
+    try std.testing.expectEqualStrings("self.word1.Xfoo bar\nself.word1.Xfoo bar\n", saved);
+}
+
+test "editing reliability: Visual gc comments the selected lines" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { name: []const u8, initial: []const u8, keys: []const u8, expected: []const u8 }{
+        // The bug: g was a pending prefix, c was consumed as Visual change,
+        // deleting the lines and entering Insert.
+        .{ .name = "Vjgc", .initial = "alpha\nbeta\n", .keys = "Vjgc", .expected = "// alpha\n// beta\n" },
+        .{ .name = "char-visual", .initial = "alpha\nbeta\n", .keys = "vjgc", .expected = "// alpha\n// beta\n" },
+        .{ .name = "block-visual", .initial = "alpha\nbeta\n", .keys = "\x16jgc", .expected = "// alpha\n// beta\n" },
+        .{ .name = "reverse", .initial = "alpha\nbeta\n", .keys = "jVkgc", .expected = "// alpha\n// beta\n" },
+        .{ .name = "mixed", .initial = "// alpha\nbeta\n", .keys = "Vjgc", .expected = "// // alpha\n// beta\n" },
+        .{ .name = "blank-line", .initial = "alpha\n\nbeta\n", .keys = "Vjgc", .expected = "// alpha\n// \nbeta\n" },
+        .{ .name = "crlf", .initial = "alpha\r\nbeta\r\n", .keys = "Vjgc", .expected = "// alpha\r\n// beta\r\n" },
+        .{ .name = "register-preserved", .initial = "alpha\nbeta\n----\n", .keys = "yiwjVjgcj$p", .expected = "alpha\n// beta\n// ----alpha\n" },
+        .{ .name = "toggle-off", .initial = "// alpha\n// beta\n", .keys = "Vjgc", .expected = "alpha\nbeta\n" },
+        .{ .name = "normal-gcc", .initial = "alpha\n", .keys = "gcc", .expected = "// alpha\n" },
+        .{ .name = "undo", .initial = "alpha\nbeta\n", .keys = "Vjgcu", .expected = "alpha\nbeta\n" },
+        .{ .name = "redo", .initial = "alpha\nbeta\n", .keys = "Vjgcu\x12", .expected = "// alpha\n// beta\n" },
+    };
+    for (cases) |case| try erEditorCase(io, alloc, case.name, case.initial, case.keys, case.expected);
+}
+
+test "editing reliability: undo repositions the cursor and keeps inlay hints" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    // Saved bytes and cursor: an edit on line 2, cursor moved to line 1, u
+    // must return the cursor to the actual change on line 2.
+    {
+        var name_buf: [192:0]u8 = undefined;
+        const name = try erFixture(io, &name_buf, ".zig", "one\ntwo\nthree\n");
+        defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+        var sess = try erStart(io, alloc, name, 24, 80);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(alloc, 24, 80);
+        defer grid.deinit(alloc);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try sess.send("jA!\x1b");
+        try gridWaitFor(&sess, &grid, "two!", 4000);
+        try sess.send("gg");
+        try gridWaitFor(&sess, &grid, "line 1/", 3000);
+        try sess.send("u");
+        // Cursor lands on the undo change, not on the old line 1 offset.
+        try gridWaitFor(&sess, &grid, "line 2/", 4000);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+        const saved = try erRead(io, alloc, name);
+        defer alloc.free(saved);
+        try std.testing.expectEqualStrings("one\ntwo\nthree\n", saved);
+    }
+    // Empty undo stack: no dirty marker, no message, no file change.
+    {
+        var name_buf: [192:0]u8 = undefined;
+        const name = try erFixture(io, &name_buf, ".zig", "abc\n");
+        defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+        var sess = try erStart(io, alloc, name, 24, 80);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(alloc, 24, 80);
+        defer grid.deinit(alloc);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try sess.send("u");
+        try gridDrain(&sess, &grid, 300);
+        try expectNoDirtyMarker(&grid);
+        try std.testing.expect(!grid.contains("E"));
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q\r"));
+    }
+    // Inlay stability: the one-shot inlay peer never answers a second request.
+    // Before the fix, undo cleared the whole list and the hint vanished
+    // forever; afterwards the transformed hint stays rendered while the
+    // background refresh is pending. The raw stream around `u` must not
+    // contain a full-screen clear.
+    {
+        var name_buf: [192:0]u8 = undefined;
+        const name = try erFixture(io, &name_buf, ".zig", "const foo\n    = 1;\nconst bar = 2;\n");
+        defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+        const oz = try erAbs(io, alloc, oz_exe_path);
+        defer alloc.free(oz);
+        const mock = try erAbs(io, alloc, "zig-out/bin/mock_lsp");
+        defer alloc.free(mock);
+        const lsp_env = try std.fmt.allocPrint(alloc, "OZ_LSP_CMD={s}", .{mock});
+        defer alloc.free(lsp_env);
+        var sess = try Session.spawnEnvSize(io, &.{ oz, name }, &.{ lsp_env, "OZ_MOCK_SCRIPT=inlay_eol" }, 32, 120);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(alloc, 32, 120);
+        defer grid.deinit(alloc);
+        var waited: i32 = 0;
+        while (!grid.contains("NORMAL") or !grid.contains(": eol")) {
+            const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+            if (n == 0) {
+                waited += 200;
+                if (waited >= 8000) break;
+                continue;
+            }
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+        }
+        try std.testing.expect(grid.contains(": eol"));
+        try sess.send("jjA!\x1b");
+        try gridWaitFor(&sess, &grid, "const bar = 2;!", 4000);
+        const before_undo = sess.used;
+        try sess.send("u");
+        try gridDrain(&sess, &grid, 400);
+        // The hint for the (untouched or shifted) anchors must still be drawn.
+        try std.testing.expect(grid.contains(": eol"));
+        // No full-screen clear sequence in the undo output.
+        const undo_bytes = sess.out[before_undo..sess.used];
+        try std.testing.expect(std.mem.indexOf(u8, undo_bytes, "\x1b[2J") == null);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+        const saved = try erRead(io, alloc, name);
+        defer alloc.free(saved);
+        try std.testing.expectEqualStrings("const foo\n    = 1;\nconst bar = 2;\n", saved);
+    }
+}
+
+/// Wait for a file created by a local peer (absolute dir + name).
+fn erWaitBarrier(io: Io, dir: []const u8, name: []const u8, timeout_ms: i32) !bool {
+    var buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name });
+    const deadline = std.Io.Timestamp.now(io, .awake).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    while (std.Io.Timestamp.now(io, .awake).nanoseconds < deadline) {
+        if (pathExists(io, path)) return true;
+        std.Io.sleep(io, std.Io.Duration.fromNanoseconds(10 * std.time.ns_per_ms), .real) catch {};
+    }
+    return false;
+}
+
+test "editing reliability: undo keeps inlay hints until the replacement lands" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var name_buf: [192:0]u8 = undefined;
+    const name = try erFixture(io, &name_buf, ".zig", "const foo = 1;\nconst bar = 2;\n");
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    const oz = try erAbs(io, alloc, oz_exe_path);
+    defer alloc.free(oz);
+    const peer = try erAbs(io, alloc, "test/fixtures/inlay_gate.py");
+    defer alloc.free(peer);
+    var dir_buf: [128:0]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const lsp_env = try std.fmt.allocPrint(alloc, "OZ_LSP_CMD={s}", .{peer});
+    defer alloc.free(lsp_env);
+    const dir_env = try std.fmt.allocPrint(alloc, "OZ_INLAY_BARRIER_DIR={s}", .{dir});
+    defer alloc.free(dir_env);
+    var sess = try Session.spawnEnvSize(io, &.{ oz, name }, &.{ lsp_env, dir_env }, 32, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 32, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try gridWaitFor(&sess, &grid, ": eol", 8000);
+    try std.testing.expect(try erWaitBarrier(io, dir, "request-1", 3000));
+
+    // First edit + exit: a fresh request (2) is held. Releasing it gives the
+    // post-edit hint data, so the undo sequence starts from a known frame.
+    try sess.send("jA!\x1b");
+    try gridWaitFor(&sess, &grid, "const bar = 2;!", 4000);
+    try std.testing.expect(try erWaitBarrier(io, dir, "request-2", 5000));
+    try aiWriteFile(io, dir, "release-2", "go");
+    try gridWaitFor(&sess, &grid, ": fresh-2", 5000);
+
+    // Undo: request 3 is held. The transformed hints must stay on screen
+    // between "undo applied" and "new inlay data arrived", then be replaced.
+    const before_undo = sess.used;
+    try sess.send("u");
+    try std.testing.expect(try erWaitBarrier(io, dir, "request-3", 5000));
+    try gridDrain(&sess, &grid, 300);
+    try std.testing.expect(grid.contains(": fresh-2"));
+    try std.testing.expect(!grid.contains(": fresh-3"));
+    try aiWriteFile(io, dir, "release-3", "go");
+    try std.testing.expect(try erWaitBarrier(io, dir, "delivered-3", 5000));
+    try gridWaitFor(&sess, &grid, ": fresh-3", 5000);
+    try std.testing.expect(!grid.contains(": fresh-2"));
+    const undo_bytes = sess.out[before_undo..sess.used];
+    try std.testing.expect(std.mem.indexOf(u8, undo_bytes, "\x1b[2J") == null);
+
+    try gridWaitFor(&sess, &grid, "line 2/", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try erRead(io, alloc, name);
+    defer alloc.free(saved);
+    try std.testing.expectEqualStrings("const foo = 1;\nconst bar = 2;\n", saved);
+}
+
+test "editing reliability: hover negotiation controls syntax highlighting" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var name_buf: [192:0]u8 = undefined;
+    const name = try erFixture(io, &name_buf, ".zig", "const value: usize = 12;\n");
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    const oz = try erAbs(io, alloc, oz_exe_path);
+    defer alloc.free(oz);
+    const mock = try erAbs(io, alloc, "zig-out/bin/mock_lsp");
+    defer alloc.free(mock);
+    const lsp_env = try std.fmt.allocPrint(alloc, "OZ_LSP_CMD={s}", .{mock});
+    defer alloc.free(lsp_env);
+    var sess = try Session.spawnEnvSize(io, &.{ oz, name }, &.{ lsp_env, "OZ_MOCK_SCRIPT=hover_cap" }, 30, 100);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 100);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    // K on the declaration: the capability-aware mock returns Markdown with a
+    // zig fence only because oz now advertises hover.contentFormat. Without
+    // negotiation it returns plaintext and the fenced code is not highlighted.
+    try sess.send("K");
+    try gridWaitFor(&sess, &grid, "(usize = 99)", 8000);
+    try gridDrain(&sess, &grid, 200);
+    // The popup's code line (with the ';' only present in hover content) must
+    // carry the real tree-sitter keyword color for `const`.
+    var found = false;
+    for (0..grid.rows) |r| {
+        if (!rowContains(&grid, r, "hover_sentinel: usize = 99;")) continue;
+        if (rowContainsFg(&grid, r, "const", packRgb(0x95, 0x7F, 0xB8))) found = true;
+        break;
+    }
+    if (!found) {
+        std.debug.print("hover code line missing keyword color; frame:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(found);
+    // The MarkupContent kind is preserved (not a Markdown-only fallback): the
+    // plaintext row is literal prose, so the fenced code must not be the
+    // only rendered line.
+    try std.testing.expect(rowContains(&grid, (findRow(&grid, "(usize = 99)") orelse return error.TestUnexpectedResult), "(usize = 99)"));
+    try sess.send("\x1b");
+    try gridDrain(&sess, &grid, 100);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "editing reliability: completion ranking puts exact match first and inserts insertText" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var name_buf: [192:0]u8 = undefined;
+    const name = try erFixture(io, &name_buf, ".zig", "");
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    const oz = try erAbs(io, alloc, oz_exe_path);
+    defer alloc.free(oz);
+    const mock = try erAbs(io, alloc, "zig-out/bin/mock_lsp");
+    defer alloc.free(mock);
+    const lsp_env = try std.fmt.allocPrint(alloc, "OZ_LSP_CMD={s}", .{mock});
+    defer alloc.free(lsp_env);
+    var sess = try Session.spawnEnvSize(io, &.{ oz, name }, &.{ lsp_env, "OZ_MOCK_SCRIPT=completion_order" }, 32, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 32, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("iline");
+    try gridWaitFor(&sess, &grid, "count_lines", 8000);
+    try gridWaitFor(&sess, &grid, "inline", 4000);
+    try gridDrain(&sess, &grid, 200);
+    const count_row = findRow(&grid, "count_lines") orelse {
+        std.debug.print("completion menu missing; frame:\n", .{});
+        grid.dump();
+        return error.TestUnexpectedResult;
+    };
+    const read_row = findRow(&grid, "read_lines") orelse return error.TestUnexpectedResult;
+    const inline_row = findRow(&grid, "inline") orelse return error.TestUnexpectedResult;
+    // The exact `line` candidate is the menu row directly above count_lines;
+    // the document row (with the selected item's ghost preview) is above the
+    // popup border and must not be mistaken for the candidate order.
+    try std.testing.expect(count_row > 0);
+    try std.testing.expect(rowContains(&grid, count_row - 1, "line"));
+    try std.testing.expect(!rowContains(&grid, count_row - 1, "count_lines"));
+    try std.testing.expect(!rowContains(&grid, count_row - 1, "inline"));
+    // Exact match first; then server order for the remaining equal-quality
+    // post-prefix matches (stable, not reversed).
+    try std.testing.expect(count_row < read_row);
+    try std.testing.expect(read_row < inline_row);
+    // First Enter accepts the best candidate; insertText (not label or
+    // filterText) is what reaches the document.
+    try sess.send("\r\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try erRead(io, alloc, name);
+    defer alloc.free(saved);
+    try std.testing.expectEqualStrings("line_accepted", saved);
+}
+
+test "editing reliability: paste reindents by language in one undo group" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const block = "\x1b[200~if (ok) {\ncall();\n}\x1b[201~";
+    const cases = [_]struct { name: []const u8, suffix: []const u8, initial: []const u8, keys: []const u8, expected: []const u8 }{
+        // Insert point is after the 4-space blank prefix of a body line: the
+        // prefix must not be doubled.
+        .{
+            .name = "indented-blank",
+            .suffix = ".zig",
+            .initial = "fn f() {\n    \n}\n",
+            .keys = "j$a" ++ block,
+            .expected = "fn f() {\n    if (ok) {\n        call();\n    }\n}\n",
+        },
+        // Empty blank body line.
+        .{
+            .name = "empty-blank",
+            .suffix = ".zig",
+            .initial = "fn f() {\n\n}\n",
+            .keys = "ji" ++ block,
+            .expected = "fn f() {\n    if (ok) {\n        call();\n    }\n}\n",
+        },
+        // CRLF file: reindented content keeps CRLF terminators.
+        .{
+            .name = "crlf",
+            .suffix = ".zig",
+            .initial = "fn f() {\r\n    \r\n}\r\n",
+            .keys = "j$a" ++ "\x1b[200~if (ok) {\r\ncall();\r\n}\x1b[201~",
+            .expected = "fn f() {\r\n    if (ok) {\r\n        call();\r\n    }\r\n}\r\n",
+        },
+        // Unknown language: no structural indentation, content preserved.
+        .{
+            .name = "unknown-language",
+            .suffix = ".txt",
+            .initial = "note\n",
+            .keys = "i" ++ block,
+            .expected = "if (ok) {\ncall();\n}note\n",
+        },
+        // Normal-mode bracketed paste is its own single undo group.
+        .{
+            .name = "normal-mode-undo",
+            .suffix = ".zig",
+            .initial = "fn f() {\n    a();\n}\n",
+            .keys = "j0" ++ block ++ "u",
+            .expected = "fn f() {\n    a();\n}\n",
+        },
+    };
+    for (cases) |case| {
+        var name_buf: [192:0]u8 = undefined;
+        const name = try erFixture(io, &name_buf, case.suffix, case.initial);
+        defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+        var sess = try erStart(io, alloc, name, 30, 100);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(alloc, 30, 100);
+        defer grid.deinit(alloc);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try sess.send(case.keys);
+        try sess.send("\x03");
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 5000);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+        const saved = try erRead(io, alloc, name);
+        defer alloc.free(saved);
+        if (!std.mem.eql(u8, case.expected, saved)) {
+            std.debug.print("paste case {s}: expected {s} actual {s}\n", .{ case.name, case.expected, saved });
+        }
+        try std.testing.expectEqualStrings(case.expected, saved);
+    }
+}
+
+test "editing reliability: linewise p reindents pasted lines and undo is one group" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var name_buf: [192:0]u8 = undefined;
+    const name = try erFixture(io, &name_buf, ".zig", "fn f() {\n    a();\n}\nif (ok) {\ncall();\n}\n");
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    var sess = try erStart(io, alloc, name, 30, 100);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 100);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    // Yank the top-level block linewise, p it below `a();` inside the
+    // function: the put must be reindented to the surrounding block.
+    try sess.send("3jVjjyggjp");
+    // The grid renders 8-space indentation as two indent guides, so assert
+    // the saved bytes after leaving the put (the semantic result).
+    try gridDrain(&sess, &grid, 300);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try erRead(io, alloc, name);
+    defer alloc.free(saved);
+    try std.testing.expectEqualStrings(
+        "fn f() {\n    a();\n    if (ok) {\n        call();\n    }\n}\nif (ok) {\ncall();\n}\n",
+        saved,
+    );
+}
+
+test "editing reliability: late completion after movement or re-insert cannot reopen the menu" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const peer = try erAbs(io, alloc, "test/fixtures/completion_gate.py");
+    defer alloc.free(peer);
+    const oz = try erAbs(io, alloc, oz_exe_path);
+    defer alloc.free(oz);
+    const cases = [_]struct { name: []const u8, keys: []const u8 }{
+        // A request -> arrow movement (cursor no longer the request's) -> A.
+        .{ .name = "movement", .keys = "iga\x1b[D" },
+        // A request -> Esc -> re-enter Insert -> A.
+        .{ .name = "esc-reenter", .keys = "iga\x1b" },
+    };
+    for (cases) |case| {
+        var name_buf: [192:0]u8 = undefined;
+        const name = try erFixture(io, &name_buf, ".zig", "");
+        defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+        var dir_buf: [128:0]u8 = undefined;
+        const dir = try aiMockDir(io, &dir_buf);
+        defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+        const lsp_env = try std.fmt.allocPrint(alloc, "OZ_LSP_CMD={s}", .{peer});
+        defer alloc.free(lsp_env);
+        const gate_env = try std.fmt.allocPrint(alloc, "OZ_GATE_DIR={s}", .{dir});
+        defer alloc.free(gate_env);
+        var sess = try Session.spawnEnvSize(io, &.{ oz, name }, &.{ lsp_env, gate_env, "OZ_GATE_MODE=single" }, 30, 100);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(alloc, 30, 100);
+        defer grid.deinit(alloc);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try sess.send(case.keys);
+        if (std.mem.eql(u8, case.name, "esc-reenter")) {
+            try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+            try sess.send("i");
+            try gridWaitFor(&sess, &grid, "[INSERT]", 4000);
+        }
+        try std.testing.expect(try erWaitBarrier(io, dir, "received-2", 5000));
+        try aiWriteFile(io, dir, "release-all", "go");
+        try std.testing.expect(try erWaitBarrier(io, dir, "delivered-1", 5000));
+        try gridDrain(&sess, &grid, 700);
+        // The stale response was consumed, but no menu may open.
+        try std.testing.expect(!grid.contains("gaGATED_A_ONE"));
+        try std.testing.expect(!grid.contains("GATED_A_DOC"));
+        try std.testing.expectEqual(@as(usize, 0), try countPopupBoxes(&grid));
+        // Client-visible consumption barrier: Ctrl+n only sends a new manual
+        // request when the menu is CLOSED (an open menu would consume it as
+        // candidate navigation and send nothing). Receiving request 3 proves
+        // the client processed the late response without opening a menu.
+        try sess.send("\x0e");
+        try std.testing.expect(try erWaitBarrier(io, dir, "received-3", 5000));
+        // The fresh response for the new request does open a menu; hide it
+        // again. The old response must not be what produced it.
+        try gridWaitFor(&sess, &grid, "gaGATED_A_ONE", 4000);
+        try sess.send("\x05"); // Ctrl+e: hide menu, stay in insert
+        // Arrow right returns to the insertion point; the sentinel proves the
+        // buffer did not receive menu navigation/accept edits.
+        try sess.send("\x1b[CZ\x1b");
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+        const saved = try erRead(io, alloc, name);
+        defer alloc.free(saved);
+        try std.testing.expectEqualStrings("gaZ", saved);
+    }
+}
+
+test "editing reliability: B response stays installed when A arrives late" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var name_buf: [192:0]u8 = undefined;
+    const name = try erFixture(io, &name_buf, ".zig", "");
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    const peer = try erAbs(io, alloc, "test/fixtures/completion_gate.py");
+    defer alloc.free(peer);
+    const oz = try erAbs(io, alloc, oz_exe_path);
+    defer alloc.free(oz);
+    var dir_buf: [128:0]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const lsp_env = try std.fmt.allocPrint(alloc, "OZ_LSP_CMD={s}", .{peer});
+    defer alloc.free(lsp_env);
+    const gate_env = try std.fmt.allocPrint(alloc, "OZ_GATE_DIR={s}", .{dir});
+    defer alloc.free(gate_env);
+    var sess = try Session.spawnEnvSize(io, &.{ oz, name }, &.{ lsp_env, gate_env, "OZ_GATE_MODE=ablate" }, 30, 100);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 100);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    // Two auto requests (A) are held; Ctrl+n sends the third (B).
+    try sess.send("iga");
+    try std.testing.expect(try erWaitBarrier(io, dir, "received-2", 5000));
+    try sess.send("\x0e");
+    try std.testing.expect(try erWaitBarrier(io, dir, "received-3", 5000));
+    try aiWriteFile(io, dir, "release-b", "go");
+    try std.testing.expect(try erWaitBarrier(io, dir, "delivered-B", 5000));
+    try gridWaitFor(&sess, &grid, "gaB_TWO", 6000);
+    // Select B_TWO, then release the older A responses last.
+    try sess.send("\x0e");
+    try gridDrain(&sess, &grid, 200);
+    try aiWriteFile(io, dir, "release-a", "go");
+    try std.testing.expect(try erWaitBarrier(io, dir, "delivered-A", 5000));
+    try gridDrain(&sess, &grid, 700);
+    try std.testing.expect(grid.contains("gaB_ONE"));
+    try std.testing.expect(grid.contains("gaB_TWO"));
+    try std.testing.expect(!grid.contains("gaGATED_A_ONE"));
+    // A second selection move after the late-A release still sees only B;
+    // it wraps from B_TWO to B_ONE, proving the list/selection state is the
+    // B response and not a resurrected A list.
+    try sess.send("\x0e");
+    try gridDrain(&sess, &grid, 300);
+    try std.testing.expect(grid.contains("gaB_ONE"));
+    try std.testing.expect(grid.contains("gaB_TWO"));
+    try std.testing.expect(!grid.contains("gaGATED_A_ONE"));
+    // Enter accepts whichever B candidate is selected (now B_ONE).
+    try sess.send("\r\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try erRead(io, alloc, name);
+    defer alloc.free(saved);
+    try std.testing.expectEqualStrings("B_one_insert", saved);
+}
+
+test "editing reliability: plaintext hover is not interpreted as Markdown" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var name_buf: [192:0]u8 = undefined;
+    const name = try erFixture(io, &name_buf, ".zig", "const value: usize = 12;\n");
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    const oz = try erAbs(io, alloc, oz_exe_path);
+    defer alloc.free(oz);
+    const mock = try erAbs(io, alloc, "zig-out/bin/mock_lsp");
+    defer alloc.free(mock);
+    const lsp_env = try std.fmt.allocPrint(alloc, "OZ_LSP_CMD={s}", .{mock});
+    defer alloc.free(lsp_env);
+    var sess = try Session.spawnEnvSize(io, &.{ oz, name }, &.{ lsp_env, "OZ_MOCK_SCRIPT=hover_cap", "OZ_HOVER_FORCE_PLAINTEXT=1" }, 30, 100);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 100);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("K");
+    try gridWaitFor(&sess, &grid, "(usize = 99)", 8000);
+    try gridDrain(&sess, &grid, 200);
+    // The literal fence-looking line is prose in a plaintext MarkupContent:
+    // it must be shown with its backticks, not hidden/opened as a fence.
+    var fence_row: ?usize = null;
+    var code_row: ?usize = null;
+    for (0..grid.rows) |r| {
+        if (rowContains(&grid, r, "```not a fence")) fence_row = r;
+        if (rowContains(&grid, r, "const hover_sentinel: usize = 99;")) code_row = r;
+    }
+    if (fence_row == null or code_row == null) {
+        std.debug.print("plaintext hover rows missing; frame:\n", .{});
+        grid.dump();
+    }
+    try std.testing.expect(fence_row != null);
+    try std.testing.expect(code_row != null);
+    // No Markdown/fence syntax coloring: the code-looking line is plain text.
+    try std.testing.expect(!rowContainsFg(&grid, code_row.?, "const", packRgb(0x95, 0x7F, 0xB8)));
+    try sess.send("\x1b");
+    try gridDrain(&sess, &grid, 100);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "editing reliability: accept completion -> arrows -> Enter -> paste -> Esc -> undo/redo" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var name_buf: [192:0]u8 = undefined;
+    const name = try erFixture(io, &name_buf, ".zig", "fn main() void {\n    std\n}\n");
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    const oz = try erAbs(io, alloc, oz_exe_path);
+    defer alloc.free(oz);
+    const mock = try erAbs(io, alloc, "zig-out/bin/mock_lsp");
+    defer alloc.free(mock);
+    const lsp_env = try std.fmt.allocPrint(alloc, "OZ_LSP_CMD={s}", .{mock});
+    defer alloc.free(lsp_env);
+    var sess = try Session.spawnEnvSize(io, &.{ oz, name }, &.{ lsp_env, "OZ_MOCK_SCRIPT=completion_rich" }, 32, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 32, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    // Open the menu, accept ArrayList, then exercise all four insert arrows
+    // (the late-response/motion path) before Enter.
+    try sess.send("jA.");
+    try gridWaitFor(&sess, &grid, "ArrayList", 8000);
+    try sess.send("\r");
+    try gridWaitGone(&sess, &grid, "A contiguous", 3000);
+    try sess.send("\x1b[D\x1b[C\x1b[A\x1b[B");
+    try gridDrain(&sess, &grid, 150);
+    // Enter at the end of the accepted line opens one indented line; the
+    // bracketed paste is reindented into that block.
+    try sess.send("\r");
+    try sess.send("\x1b[200~if (ok) {\ncall();\n}\x1b[201~");
+    try gridWaitFor(&sess, &grid, "call();", 6000);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+    // The whole insert session is one undo group.
+    try sess.send("u");
+    try gridDrain(&sess, &grid, 300);
+    try std.testing.expect(!grid.contains("call();"));
+    try sess.send("\x12"); // Ctrl-r redo
+    try gridWaitFor(&sess, &grid, "call();", 4000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try erRead(io, alloc, name);
+    defer alloc.free(saved);
+    try std.testing.expectEqualStrings(
+        "fn main() void {\n    std.ArrayList\n    if (ok) {\n        call();\n    }\n}\n",
+        saved,
+    );
+}
+
+test "editing reliability: real ZLS K hover is syntax highlighted and lifecycle-clean" {
+    const zls_path = @import("e2e_options").real_zls orelse return error.SkipZigTest;
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const oz = try erAbs(io, alloc, oz_exe_path);
+    defer alloc.free(oz);
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "hover.zig", "const value: usize = 12;\n");
+    var path_buf: [240:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/hover.zig", .{root});
+    const env = try std.fmt.allocPrint(alloc, "OZ_LSP_CMD={s}", .{zls_path});
+    defer alloc.free(env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz, path }, &.{env}, 30, 100, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 100);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 10000);
+    // `w` puts the cursor on `value`; K asks the real server for hover.
+    try sess.send("wK");
+    try gridWaitFor(&sess, &grid, "(usize = 12)", 12000);
+    try gridDrain(&sess, &grid, 250);
+    // The negotiated Markdown response contains a ```zig fence, so the
+    // popup's code row must carry real tree-sitter token colors, not one
+    // uniform plaintext foreground.
+    var code_row: ?usize = null;
+    for (0..grid.rows) |r| {
+        // The popup's code line has no trailing semicolon (the buffer does),
+        // so this cannot match the editor text.
+        if (rowContains(&grid, r, "const value: usize = 12") and
+            !rowContains(&grid, r, "const value: usize = 12;"))
+        {
+            code_row = r;
+            break;
+        }
+    }
+    const cr = code_row orelse {
+        std.debug.print("real ZLS hover code row missing; frame:\n", .{});
+        grid.dump();
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expect(rowContainsFg(&grid, cr, "const", packRgb(0x95, 0x7F, 0xB8)));
+    try std.testing.expect(rowContainsFg(&grid, cr, "usize", packRgb(0x7A, 0xA8, 0x9F)));
+    try std.testing.expect(rowContainsFg(&grid, cr, "12", packRgb(0xD2, 0x7E, 0x99)));
+
+    // Movement clears the hover; asking again re-opens it (no stale revive).
+    try sess.send("l");
+    try gridWaitGone(&sess, &grid, "(usize = 12)", 5000);
+    try sess.send("K");
+    try gridWaitFor(&sess, &grid, "(usize = 12)", 8000);
+    try sess.send("\x1b");
+    try gridDrain(&sess, &grid, 100);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "editing reliability: insert Up/Down remember the goal column" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var name_buf: [192:0]u8 = undefined;
+    const name = try erFixture(io, &name_buf, ".zig", "longerlineABC\nab\nxy\n");
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    var sess = try erStart(io, alloc, name, 24, 80);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    // A puts the insertion point after ABC (col 13). Down clamps to the short
+    // line; Up must return to col 13, not to the clamped col 2.
+    try sess.send("A\x1b[B\x1b[AX\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try erRead(io, alloc, name);
+    defer alloc.free(saved);
+    try std.testing.expectEqualStrings("longerlineABCX\nab\nxy\n", saved);
+}
+
+test "editing reliability: system clipboard paste is reindented by language" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const oz = try erAbs(io, alloc, oz_exe_path);
+    defer alloc.free(oz);
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "wl-copy", "#!/bin/sh\n/bin/cat > \"$OZ_TEST_CLIPBOARD\"\n");
+    try aiWriteFile(io, root, "wl-paste", "#!/bin/sh\n/bin/cat \"$OZ_TEST_CLIPBOARD\"\nif [ \"$1\" != '--no-newline' ]; then printf '\\n'; fi\n");
+    for ([_][]const u8{ "wl-copy", "wl-paste" }) |name| {
+        const p = try std.fs.path.join(alloc, &.{ root, name });
+        defer alloc.free(p);
+        const f = try std.Io.Dir.cwd().openFile(io, p, .{});
+        defer f.close(io);
+        try f.setPermissions(io, std.Io.File.Permissions.fromMode(0o755));
+    }
+    // External system clipboard holds a top-level block (linewise: trailing
+    // newline). The unnamed register is empty, so pasteBuffer must take the
+    // system path and still reindent the put.
+    try aiWriteFile(io, root, "clipboard", "if (ok) {\ncall();\n}\n");
+    try aiWriteFile(io, root, "clip.zig", "fn f() {\n    a();\n}\n");
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/clip.zig", .{root});
+    const path_env = try std.fmt.allocPrint(alloc, "PATH={s}:/usr/bin:/bin", .{root});
+    defer alloc.free(path_env);
+    const clip_env = try std.fmt.allocPrint(alloc, "OZ_TEST_CLIPBOARD={s}/clipboard", .{root});
+    defer alloc.free(clip_env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz, path }, &.{ path_env, clip_env, "WAYLAND_DISPLAY=oz-fixture" }, 24, 90, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 90);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("jp");
+    try gridDrain(&sess, &grid, 400);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try erRead(io, alloc, path);
+    defer alloc.free(saved);
+    try std.testing.expectEqualStrings(
+        "fn f() {\n    a();\n    if (ok) {\n        call();\n    }\n}\n",
+        saved,
+    );
+}
+
+test "editing reliability: buffer/window switch rejects a pending completion" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const peer = try erAbs(io, alloc, "test/fixtures/completion_gate.py");
+    defer alloc.free(peer);
+    const oz = try erAbs(io, alloc, oz_exe_path);
+    defer alloc.free(oz);
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "a.zig", "");
+    try aiWriteFile(io, root, "b.zig", "const b = 1;\n");
+    var a_path_buf: [220:0]u8 = undefined;
+    const a_path = try bufPrintZ(&a_path_buf, "{s}/a.zig", .{root});
+    var b_path_buf: [220:0]u8 = undefined;
+    const b_path = try bufPrintZ(&b_path_buf, "{s}/b.zig", .{root});
+    var dir_buf: [128:0]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const lsp_env = try std.fmt.allocPrint(alloc, "OZ_LSP_CMD={s}", .{peer});
+    defer alloc.free(lsp_env);
+    const gate_env = try std.fmt.allocPrint(alloc, "OZ_GATE_DIR={s}", .{dir});
+    defer alloc.free(gate_env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz, a_path }, &.{ lsp_env, gate_env, "OZ_GATE_MODE=single" }, 30, 100, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 100);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("iga");
+    try std.testing.expect(try erWaitBarrier(io, dir, "received-2", 5000));
+    // Buffer switch: the pending list belongs to a.zig. Then window switch
+    // (split) changes the window identity again.
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+    try sess.send(":e ");
+    try sess.send(b_path);
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "const b = 1;", 5000);
+    try sess.send(":vs\r");
+    try gridDrain(&sess, &grid, 300);
+    try aiWriteFile(io, dir, "release-all", "go");
+    try std.testing.expect(try erWaitBarrier(io, dir, "delivered-1", 5000));
+    try gridDrain(&sess, &grid, 500);
+    try std.testing.expect(!grid.contains("GATED_A_ONE"));
+    try std.testing.expect(!grid.contains("GATED_A_DOC"));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "editing reliability: Visual gc without a comment style shows E505 and keeps bytes" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var name_buf: [192:0]u8 = undefined;
+    const name = try erFixture(io, &name_buf, ".txt", "alpha\nbeta\n");
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    var sess = try erStart(io, alloc, name, 24, 80);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("Vjgc");
+    try gridWaitFor(&sess, &grid, "E505", 4000);
+    // Safe fallback: no edit, selection stays visible for the user to see the
+    // message; no text is deleted and no Insert mode is entered.
+    try std.testing.expect(grid.contains("[VISUAL]"));
+    try std.testing.expect(!grid.contains("[INSERT]"));
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q\r"));
+    const saved = try erRead(io, alloc, name);
+    defer alloc.free(saved);
+    try std.testing.expectEqualStrings("alpha\nbeta\n", saved);
 }

@@ -92,8 +92,12 @@ pub fn deleteBeforeCursor(self: *App) !void {
     self.markDirtyRange(start_pos, end_pos, "");
 }
 
-/// Delete the word before the cursor (Ctrl-w). Vim semantics: walk back
-/// over whitespace then word characters; deletes [start, cursor).
+/// Delete the word before the cursor (Ctrl-w). Vim i_CTRL-W semantics:
+/// skip trailing whitespace, then delete ONE contiguous class run — a word
+/// (ASCII alnum/underscore + Unicode letters) or a punctuation run (`.`,
+/// `::`, `->`, brackets, …) — on UTF-8 scalar boundaries. Deletes
+/// [start, cursor). The classification lives in buffer/ops.wordStartBefore
+/// so the multi-cursor path (block_insert.mcDeleteWordBefore) is identical.
 pub fn deleteWordBefore(self: *App) !void {
     if (self.curCursor().* == 0) return;
     const start = buffer.ops.wordStartBefore(&self.cur().pt, self.curCursor().*);

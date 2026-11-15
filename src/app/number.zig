@@ -4,6 +4,9 @@ const std = @import("std");
 
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
+const indent = @import("../editor/indent.zig");
+const autil = @import("util.zig");
+const search = @import("search.zig");
 
 const BlockRect = App.BlockRect;
 
@@ -234,14 +237,34 @@ pub fn pasteBuffer(self: *App, before: bool, count: u32) !void {
     } else try self.putRegister(buf, self.yank_linewise, before, count);
 }
 
+/// Reindent one put insertion against the buffer context. `linewise` text is
+/// normalised to complete lines by the caller; reindenting is content
+/// preservation only (unknown languages are returned normalized-verbatim).
+fn reindentPut(self: *App, doc_opt: ?[]const u8, text: []const u8, at: u32, ft: []const u8) ![]u8 {
+    if (doc_opt) |doc| {
+        const cfg = search.indentConfigFor(self, doc, self.cur().pt.lineOf(at));
+        return indent.reindentInsertion(self.alloc, doc, at, text, ft, cfg, false);
+    }
+    return self.alloc.dupe(u8, text);
+}
+
 /// The put itself: paste `buf` with register type `linewise`. Split out
 /// of pasteBuffer so the system-clipboard path reuses it without touching
 /// the unnamed register (a foreign copy must not clobber the register's
 /// own content/type).
+///
+/// The final text is reindented against the insertion context and recorded
+/// as ONE history.edit (one undo group, one LSP pre-edit range) — never a
+/// per-key simulation. Block registers are handled by `putBlock` and keep
+/// their rectangular semantics (this path is never used for them).
 pub fn putRegister(self: *App, buf: []const u8, linewise: bool, before: bool, count: u32) !void {
     if (buf.len == 0 and !linewise) return;
     const pt = &self.cur().pt;
-    const n = @max(count, 1);
+    const n: usize = @max(count, 1);
+    const ft = autil.filetypeOf(self.cur().path);
+    const doc_opt = try search.indentDocSlice(self);
+    defer if (doc_opt) |doc| self.alloc.free(doc);
+
     if (linewise) {
         // normalize: the register must end with '\n' so every copy lands
         // as complete lines (yy on a final line without a trailing
@@ -258,43 +281,41 @@ pub fn putRegister(self: *App, buf: []const u8, linewise: bool, before: bool, co
             break :blk norm;
         };
         const line = pt.lineOf(self.curCursor().*);
-        self.cur().history.beginGroup();
-        var content_start: u32 = undefined; // first pasted byte (for the cursor)
+        var record_at: u32 = undefined;
+        var needs_prefix_newline = false;
         if (before) {
-            var pos = pt.lineStart(line);
-            content_start = pos;
-            var i: u32 = 0;
-            while (i < n) : (i += 1) {
-                try self.cur().history.record(pt, pos, 0, text);
-                pos += @intCast(text.len);
-            }
+            record_at = pt.lineStart(line);
         } else if (line + 1 < pt.lineCount()) {
-            var pos = pt.lineStart(line + 1);
-            content_start = pos;
-            var i: u32 = 0;
-            while (i < n) : (i += 1) {
-                try self.cur().history.record(pt, pos, 0, text);
-                pos += @intCast(text.len);
-            }
+            record_at = pt.lineStart(line + 1);
         } else {
             // cursor on the last line: terminate it first when the buffer
             // doesn't end with a newline, then the copies follow as
             // whole lines
-            var pos = pt.len();
-            if (pos > 0 and pt.byteAt(pos - 1) != '\n') {
-                try self.cur().history.record(pt, pos, 0, "\n");
-                pos += 1;
-            }
-            content_start = pos;
-            var i: u32 = 0;
-            while (i < n) : (i += 1) {
-                try self.cur().history.record(pt, pos, 0, text);
-                pos += @intCast(text.len);
-            }
+            record_at = pt.len();
+            needs_prefix_newline = record_at > 0 and pt.byteAt(record_at - 1) != '\n';
         }
-        self.cur().history.endGroup();
+        var repeated = try self.alloc.alloc(u8, text.len * n + @intFromBool(needs_prefix_newline));
+        defer self.alloc.free(repeated);
+        var rlen: usize = 0;
+        if (needs_prefix_newline) {
+            repeated[0] = '\n';
+            rlen = 1;
+        }
+        for (0..n) |_| {
+            @memcpy(repeated[rlen..][0..text.len], text);
+            rlen += text.len;
+        }
+        const final_text = try reindentPut(self, doc_opt, repeated[0..rlen], record_at, ft);
+        defer self.alloc.free(final_text);
+        self.cur().history.beginGroup();
+        defer self.cur().history.endGroup();
+        try search.recordPasteEditNoCursor(self, record_at, 0, final_text);
         // cursor on the first non-blank of the first pasted line (an
         // all-blank line leaves it at the line start)
+        var content_start = record_at;
+        if (needs_prefix_newline) {
+            content_start = record_at + @as(u32, @intCast(std.mem.indexOfScalar(u8, final_text, '\n') orelse 0)) + 1;
+        }
         var c = content_start;
         while (c < pt.len() and (pt.byteAt(c) == ' ' or pt.byteAt(c) == '\t')) c += 1;
         if (c < pt.len() and pt.byteAt(c) == '\n') c = content_start;
@@ -311,24 +332,26 @@ pub fn putRegister(self: *App, buf: []const u8, linewise: bool, before: bool, co
                 pos = i;
             }
         }
-        self.cur().history.beginGroup();
-        var i: u32 = 0;
-        while (i < n) : (i += 1) {
-            try self.cur().history.record(pt, pos, 0, buf);
-            pos += @as(u32, @intCast(buf.len));
+        var repeated = try self.alloc.alloc(u8, buf.len * n);
+        defer self.alloc.free(repeated);
+        var rlen: usize = 0;
+        for (0..n) |_| {
+            @memcpy(repeated[rlen..][0..buf.len], buf);
+            rlen += buf.len;
         }
-        self.cur().history.endGroup();
+        const final_text = try reindentPut(self, doc_opt, repeated, pos, ft);
+        defer self.alloc.free(final_text);
+        self.cur().history.beginGroup();
+        defer self.cur().history.endGroup();
+        try search.recordPasteEditNoCursor(self, pos, 0, final_text);
         // nvim: the cursor lands ON the last pasted character (not past
         // it) — back up over UTF-8 continuation bytes
-        var c = pos - 1;
-        const paste_begin = pos - @as(u32, @intCast(buf.len));
+        const pos_after = pos + @as(u32, @intCast(final_text.len));
+        var c = pos_after - 1;
+        const paste_begin = pos;
         while (c > paste_begin and (pt.byteAt(c) & 0xC0) == 0x80) c -= 1;
         self.curCursor().* = c;
     }
-    // markDirty is the single entry point for dirty flag / edit_seq /
-    // LSP didChange / inlay invalidation — paste must go through it or
-    // the server keeps an outdated document and hints stay stale.
-    self.markDirty();
 }
 
 /// Put each rectangular register row at the same display column. One undo

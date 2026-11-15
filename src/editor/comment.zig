@@ -44,21 +44,46 @@ fn isLeadingWs(b: u8) bool {
     return b == ' ' or b == '\t';
 }
 
+/// End of the line's TEXT: a `\r` that is the CR half of a CRLF terminator
+/// (i.e. any non-final line) is not content.
+fn lineTextEnd(buf: []const u8, line: u32, line_count: u32) usize {
+    if (line + 1 < line_count and buf.len > 0 and buf[buf.len - 1] == '\r') {
+        return buf.len - 1;
+    }
+    return buf.len;
+}
+
+/// A blank line has no content other than spaces/tabs. Vim's `gc` ignores
+/// blank lines when deciding whether the range is already commented.
+fn isBlankLine(text: []const u8) bool {
+    for (text) |b| {
+        if (!isLeadingWs(b)) return false;
+    }
+    return true;
+}
+
 /// Compute the toggled content for lines [start_line, end_line] inclusive.
 /// Lines are examined ignoring leading whitespace; a line is "commented" when
 /// its first non-blank bytes are exactly the marker ("// foo", "//foo" and
 /// "  // foo" all count; a missing space after the marker is fine).
 ///
 /// The operation is uniform over the range (vim gcc semantics):
-///   was_commented == true  (every line commented) -> strip the marker and
-///                             one following space (if any) from each line.
-///   was_commented == false (any line un-commented) -> comment every line:
-///                             insert marker + " " right after the leading
-///                             whitespace (indent kept); already-commented
-///                             lines get a second marker, like vim gc on a
-///                             mixed selection.
+///   was_commented == true  (every selected NON-BLANK line is commented)
+///                             -> strip the marker and one following space
+///                                (if any) from each commented line; blank
+///                                lines are left byte-for-byte unchanged.
+///   was_commented == false (any selected non-blank line is un-commented)
+///                             -> comment every line: insert marker + " "
+///                                right after the leading whitespace (indent
+///                                kept); already-commented lines get a second
+///                                marker, like vim gc on a mixed selection.
+/// Blank lines (only spaces/tabs) never decide the direction, mirroring vim
+/// gc / nvim: a selection of ["// foo", ""] un-comments instead of
+/// double-commenting, and an all-blank selection is a no-op (vacuous
+/// "all non-blank lines are commented" -> nothing to strip).
 /// The returned text replaces [lineStart(start_line),
-/// lineStart(end_line) + lineLen(end_line)) and keeps '\n' separators.
+/// lineStart(end_line) + lineLen(end_line)) and keeps '\n' separators (a CRLF
+/// line's '\r' stays part of the line, so CRLF survives unchanged).
 pub fn toggleLines(
     allocator: std.mem.Allocator,
     pt: *const PieceTable,
@@ -71,8 +96,11 @@ pub fn toggleLines(
 
     // Read every line once and record whether it is commented (first
     // non-blank bytes are exactly the marker). was_commented is the AND over
-    // all lines, mirroring vim gcc: only when *every* line is commented does
-    // the toggle un-comment; otherwise it comments the whole range.
+    // all NON-BLANK lines, mirroring vim gc: blank lines are ignored (a blank
+    // line must not turn "all commented -> uncomment" into "comment
+    // everything"), and only when every non-blank line is commented does the
+    // toggle un-comment.
+    const line_count = pt.lineCount();
     var line_bufs: std.ArrayList([]u8) = .empty;
     defer {
         for (line_bufs.items) |b| allocator.free(b);
@@ -88,8 +116,10 @@ pub fn toggleLines(
         pt.copyRange(pt.lineStart(line), buf);
         try line_bufs.append(allocator, buf);
 
+        const text_end = lineTextEnd(buf, line, line_count);
+        if (isBlankLine(buf[0..text_end])) continue;
         var i: usize = 0;
-        while (i < len and isLeadingWs(buf[i])) i += 1;
+        while (i < text_end and isLeadingWs(buf[i])) i += 1;
         was_commented = was_commented and std.mem.startsWith(u8, buf[i..], style.line);
     }
 
@@ -101,10 +131,24 @@ pub fn toggleLines(
     defer out.deinit(allocator);
     for (line_bufs.items, 0..) |buf, k| {
         if (k > 0) try out.append(allocator, '\n');
+        const actual_line = start_line + @as(u32, @intCast(k));
+        const text_end = lineTextEnd(buf, actual_line, line_count);
         var i: usize = 0;
-        while (i < buf.len and isLeadingWs(buf[i])) i += 1;
+        while (i < text_end and isLeadingWs(buf[i])) i += 1;
         if (was_commented) {
+            // Blank lines carry no marker: leave them byte-for-byte as they
+            // are (this also keeps a CRLF blank line's '\r').
+            if (isBlankLine(buf[0..text_end])) {
+                try out.appendSlice(allocator, buf);
+                continue;
+            }
             // Keep the indentation, drop the marker and one following space.
+            // was_commented guarantees the marker; guard anyway so a future
+            // invariant change can never slice past the line.
+            if (!std.mem.startsWith(u8, buf[i..], style.line)) {
+                try out.appendSlice(allocator, buf);
+                continue;
+            }
             try out.appendSlice(allocator, buf[0..i]);
             var j = i + style.line.len;
             if (j < buf.len and buf[j] == ' ') j += 1;
@@ -280,4 +324,139 @@ test "comment: toggle round trip restores the original" {
     _ = try pt.replace(0, pt.len(), t2.text);
 
     try expectDocEqual(&pt, alloc, original);
+}
+
+/// Replace exactly the selected lines (no trailing '\n') with `toggle.text`,
+/// mirroring what App.toggleCommentLine does with the pure result.
+fn applyToggle(
+    alloc: std.mem.Allocator,
+    pt: *PieceTable,
+    start_line: u32,
+    end_line: u32,
+    style: Style,
+) !Toggle {
+    const t = try toggleLines(alloc, pt, start_line, end_line, style);
+    errdefer alloc.free(t.text);
+    const start = pt.lineStart(start_line);
+    const end = pt.lineStart(end_line) + pt.lineLen(end_line);
+    _ = try pt.replace(start, end - start, t.text);
+    return t;
+}
+
+test "comment: blank lines are ignored when deciding to uncomment (vim gc)" {
+    // nvim 9.2 reference: `Vjgc` on "// foo\n\n" uncomments the line and
+    // leaves the blank line untouched. A blank line alone must not flip the
+    // range back to "comment" (that would double-comment real lines).
+    const alloc = std.testing.allocator;
+    const style = Style{ .line = "//" };
+    var pt = try PieceTable.init(alloc, "// foo\n\n");
+    defer pt.deinit();
+    try checkToggle(alloc, &pt, 0, 1, style, true, "foo\n");
+}
+
+test "comment: whitespace-only lines are ignored when deciding to uncomment" {
+    const alloc = std.testing.allocator;
+    const style = Style{ .line = "//" };
+    var pt = try PieceTable.init(alloc, "// foo\n   \n");
+    defer pt.deinit();
+    // Blank line is left exactly as it was (no marker to strip, no edit).
+    try checkToggle(alloc, &pt, 0, 1, style, true, "foo\n   ");
+}
+
+test "comment: gc round trip restores empty lines" {
+    const alloc = std.testing.allocator;
+    const style = Style{ .line = "//" };
+    const original = "foo\n\nbar";
+    var pt = try PieceTable.init(alloc, original);
+    defer pt.deinit();
+
+    // Commenting keeps a marker on the empty line (vim gc semantics).
+    const t = try applyToggle(alloc, &pt, 0, 2, style);
+    defer alloc.free(t.text);
+    try std.testing.expectEqual(false, t.was_commented);
+    try expectDocEqual(&pt, alloc, "// foo\n// \n// bar");
+
+    // Toggling again must restore the original bytes exactly.
+    const t2 = try applyToggle(alloc, &pt, 0, 2, style);
+    defer alloc.free(t2.text);
+    try std.testing.expectEqual(true, t2.was_commented);
+    try expectDocEqual(&pt, alloc, original);
+}
+
+test "comment: all-blank range is a no-op (guard, no panic)" {
+    const alloc = std.testing.allocator;
+    const style = Style{ .line = "//" };
+    // Empty lines: uncomment path must not slice past the (empty) line.
+    var pt = try PieceTable.init(alloc, "\n");
+    defer pt.deinit();
+    try checkToggle(alloc, &pt, 0, 1, style, true, "\n");
+
+    // Whitespace-only lines keep their whitespace byte-for-byte.
+    var pt2 = try PieceTable.init(alloc, "   \n");
+    defer pt2.deinit();
+    try checkToggle(alloc, &pt2, 0, 1, style, true, "   \n");
+}
+
+test "comment: CRLF range keeps CRLF and round-trips" {
+    const alloc = std.testing.allocator;
+    const style = Style{ .line = "//" };
+    const original = "foo\r\nbar\r\n";
+    var pt = try PieceTable.init(alloc, original);
+    defer pt.deinit();
+
+    const t = try applyToggle(alloc, &pt, 0, 1, style);
+    defer alloc.free(t.text);
+    try std.testing.expectEqual(false, t.was_commented);
+    try std.testing.expectEqualStrings("// foo\r\n// bar\r", t.text);
+    try expectDocEqual(&pt, alloc, "// foo\r\n// bar\r\n");
+
+    const t2 = try applyToggle(alloc, &pt, 0, 1, style);
+    defer alloc.free(t2.text);
+    try std.testing.expectEqual(true, t2.was_commented);
+    try expectDocEqual(&pt, alloc, original);
+}
+
+test "comment: CRLF blank line counts as blank for the direction decision" {
+    const alloc = std.testing.allocator;
+    const style = Style{ .line = "//" };
+    var pt = try PieceTable.init(alloc, "// foo\r\n\r\n");
+    defer pt.deinit();
+    // The "\r" of the blank CRLF line is terminator, not line text: it must
+    // not make the range look "not commented" and double-comment "// foo".
+    try checkToggle(alloc, &pt, 0, 1, style, true, "foo\r\n\r");
+}
+
+test "comment: last line without a trailing newline" {
+    const alloc = std.testing.allocator;
+    const style = Style{ .line = "//" };
+    const original = "foo\nbar";
+    var pt = try PieceTable.init(alloc, original);
+    defer pt.deinit();
+
+    const t = try applyToggle(alloc, &pt, 0, 1, style);
+    defer alloc.free(t.text);
+    try std.testing.expectEqual(false, t.was_commented);
+    try std.testing.expectEqualStrings("// foo\n// bar", t.text);
+    try expectDocEqual(&pt, alloc, "// foo\n// bar");
+
+    const t2 = try applyToggle(alloc, &pt, 0, 1, style);
+    defer alloc.free(t2.text);
+    try std.testing.expectEqual(true, t2.was_commented);
+    try expectDocEqual(&pt, alloc, original);
+}
+
+test "comment: last real line of a trailing-newline doc keeps the newline" {
+    const alloc = std.testing.allocator;
+    const style = Style{ .line = "#" };
+    var pt = try PieceTable.init(alloc, "a\nb\n");
+    defer pt.deinit();
+
+    const t = try applyToggle(alloc, &pt, 0, 1, style);
+    defer alloc.free(t.text);
+    try std.testing.expectEqualStrings("# a\n# b", t.text);
+    try expectDocEqual(&pt, alloc, "# a\n# b\n");
+
+    const t2 = try applyToggle(alloc, &pt, 0, 1, style);
+    defer alloc.free(t2.text);
+    try expectDocEqual(&pt, alloc, "a\nb\n");
 }
