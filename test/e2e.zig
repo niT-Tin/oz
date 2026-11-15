@@ -28698,3 +28698,57 @@ test "editing performance: fenced docs preserve CRLF Unicode and unclosed block 
         try std.testing.expectEqualStrings(source, saved);
     }
 }
+
+test "inlay indentation: parameter anchors preserve guides and source cursor cells" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const source = "fn hints() void {\n    call(\n        u8,\n        expected_value,\n\t\tactual_value,\n    );\n    mid_value,\n    zero_value,\n    pair_value,\n    \"中文😀\", next_value,\n}\n";
+    for ([_]u16{ 40, 80, 120 }) |cols| {
+        var name_buf: [192:0]u8 = undefined;
+        const name = try erFixture(io, &name_buf, ".zig", source);
+        defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+        const oz = try erAbs(io, alloc, oz_exe_path);
+        defer alloc.free(oz);
+        const mock = try erAbs(io, alloc, "zig-out/bin/mock_lsp");
+        defer alloc.free(mock);
+        const env = try std.fmt.allocPrint(alloc, "OZ_LSP_CMD={s}", .{mock});
+        defer alloc.free(env);
+        var sess = try Session.spawnEnvSize(io, &.{ oz, name }, &.{ env, "OZ_MOCK_SCRIPT=inlay_indent" }, 26, cols);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(alloc, 26, cols);
+        defer grid.deinit(alloc);
+        try gridWaitFor(&sess, &grid, "NEXT: ", 8000);
+        const header = findRow(&grid, "fn hints()") orelse return error.MissingHeader;
+        const origin = glyphCol(&grid, header, "f", 0) orelse return error.MissingOrigin;
+        const type_row = findRow(&grid, "T: ") orelse return error.MissingTypeHint;
+        try std.testing.expectEqual(origin + 8, glyphCol(&grid, type_row, "T", origin).?);
+        try std.testing.expectEqual(origin, nthPipeCol(&grid, type_row, 0).?);
+        try std.testing.expectEqual(origin + 4, nthPipeCol(&grid, type_row, 1).?);
+        try std.testing.expectEqual(origin + 11, glyphCol(&grid, type_row, "u", origin).?);
+        const expected = findRow(&grid, "expected: ") orelse return error.MissingExpectedHint;
+        try std.testing.expectEqual(origin + 8, glyphCol(&grid, expected, "e", origin).?);
+        const actual = findRow(&grid, "actual: ") orelse return error.MissingActualHint;
+        try std.testing.expectEqual(origin + 8, glyphCol(&grid, actual, "a", origin).?);
+        try std.testing.expectEqual(origin, nthPipeCol(&grid, actual, 0).?);
+        try std.testing.expectEqual(origin + 4, nthPipeCol(&grid, actual, 1).?);
+        const mid = findRow(&grid, "MID: ") orelse return error.MissingMidHint;
+        try std.testing.expectEqual(origin + 2, glyphCol(&grid, mid, "M", origin).?);
+        try std.testing.expectEqual(origin, nthPipeCol(&grid, mid, 0).?);
+        const zero = findRow(&grid, "ZERO: ") orelse return error.MissingZeroHint;
+        try std.testing.expectEqual(origin, glyphCol(&grid, zero, "Z", origin).?);
+        const pair = findRow(&grid, "AB: CD: ") orelse return error.MissingSameAnchorHints;
+        try std.testing.expectEqual(origin + 4, glyphCol(&grid, pair, "A", origin).?);
+        try std.testing.expectEqual(origin + 8, glyphCol(&grid, pair, "C", origin).?);
+        const unicode_row = findRow(&grid, "NEXT: ") orelse return error.MissingUnicodeHint;
+        try std.testing.expectEqual(origin + 14, glyphCol(&grid, unicode_row, "N", origin).?);
+        try sess.send("ggjj^");
+        try gridWaitFor(&sess, &grid, "L3:C8", 4000);
+        try std.testing.expectEqual(type_row, grid.row);
+        try std.testing.expectEqual(origin + 11, grid.col);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+        const saved = try erRead(io, alloc, name);
+        defer alloc.free(saved);
+        try std.testing.expectEqualStrings(source, saved);
+    }
+}

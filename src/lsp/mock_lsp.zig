@@ -102,6 +102,7 @@ pub const Script = enum {
     /// the undo replacement-start regression (the old transform underflowed
     /// when removed > offset).
     inlay_param,
+    inlay_indent,
     /// Progressive completion fixture: `lines` (sortText "a") and `line`
     /// (sortText "b"), docs tagged with the response generation. Typing "l"
     /// ranks lines first; typing the full "line" makes exact line best. Used
@@ -152,6 +153,7 @@ pub const Script = enum {
         if (std.mem.eql(u8, name, "hover_cap")) return .hover_cap;
         if (std.mem.eql(u8, name, "completion_order")) return .completion_order;
         if (std.mem.eql(u8, name, "inlay_param")) return .inlay_param;
+        if (std.mem.eql(u8, name, "inlay_indent")) return .inlay_indent;
         if (std.mem.eql(u8, name, "completion_progressive")) return .completion_progressive;
         if (std.mem.eql(u8, name, "completion_bulk_docs")) return .completion_bulk_docs;
         if (std.mem.eql(u8, name, "completion_fenced_edges")) return .completion_fenced_edges;
@@ -446,6 +448,8 @@ pub fn handleMessage(
                     state.inlay_answered = true;
                     try pushResponse(alloc, &out, id, try buildEolInlayResult(a, state, msg.params));
                 }
+            } else if (script == .inlay_indent) {
+                try pushResponse(alloc, &out, id, try buildIndentInlayResult(a));
             } else if (script == .inlay_param) {
                 try pushResponse(alloc, &out, id, try buildInlayParamHintResult(a));
             } else {
@@ -830,6 +834,33 @@ fn buildInlayParamHintResult(a: std.mem.Allocator) !std.json.Value {
     try hint.put(a, "label", .{ .string = ": usize" });
     var items = std.json.Array.init(a);
     try items.append(.{ .object = hint });
+    return .{ .array = items };
+}
+
+/// Fixed UTF-16 anchors on the indentation fixture, including real parameter
+/// positions and adversarial anchors inside/before whitespace.
+fn buildIndentInlayResult(a: std.mem.Allocator) !std.json.Value {
+    const Spec = struct { line: i64, character: i64, label: []const u8 };
+    const specs = [_]Spec{
+        .{ .line = 2, .character = 8, .label = "T: " },
+        .{ .line = 3, .character = 8, .label = "expected: " },
+        .{ .line = 4, .character = 2, .label = "actual: " },
+        .{ .line = 6, .character = 2, .label = "MID: " },
+        .{ .line = 7, .character = 0, .label = "ZERO: " },
+        .{ .line = 8, .character = 4, .label = "AB: " },
+        .{ .line = 8, .character = 4, .label = "CD: " },
+        .{ .line = 9, .character = 12, .label = "NEXT: " },
+    };
+    var items = std.json.Array.init(a);
+    for (specs) |spec| {
+        var pos = try std.json.ObjectMap.init(a, &.{}, &.{});
+        try pos.put(a, "line", .{ .integer = spec.line });
+        try pos.put(a, "character", .{ .integer = spec.character });
+        var hint = try std.json.ObjectMap.init(a, &.{}, &.{});
+        try hint.put(a, "position", .{ .object = pos });
+        try hint.put(a, "label", .{ .string = spec.label });
+        try items.append(.{ .object = hint });
+    }
     return .{ .array = items };
 }
 
