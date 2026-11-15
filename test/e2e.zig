@@ -10640,6 +10640,7 @@ test "lsp: diagnostics push repaints without a keypress (stale mark cleared)" {
     }
     try std.testing.expect(mark);
     const marked_cell = aiFindCell(&grid, "\u{f467}").?;
+    try std.testing.expectEqual(aiFindCell(&grid, "const a").?.row, marked_cell.row);
 
     // Edit once (didChange → mock pushes the empty list). The mark must
     // vanish with NO further keypress. Ctrl+e hides the completion menu the
@@ -10868,6 +10869,7 @@ test "lsp: diagnostics — gutter mark, gl, <leader>sd list" {
         grid.dump();
     }
     try std.testing.expect(mark);
+    try std.testing.expectEqual(aiFindCell(&grid, "const a").?.row, aiFindCell(&grid, "\u{f467}").?.row);
 
     // <leader>sd → diagnostics list with "1: mock error"
     try sess.send(" sd");
@@ -27339,8 +27341,10 @@ test "gutter: padding separates numbers signs and source with wide wrapped mouse
         try gridWaitFor(&sess, &grid, ": i32", 8000);
         const diagnostic = aiFindCellFrom(&grid, "\u{f467}", 0).?;
         const origin = .{ .row = diagnostic.row, .col = diagnostic.col + 2 };
-        try std.testing.expect(aiFindCellFrom(&grid, "const a", 0).?.col >= origin.col);
-        try std.testing.expect(origin.col >= 4);
+        const source_cell = aiFindCellFrom(&grid, "const a", 0).?;
+        try std.testing.expectEqual(source_cell.row, diagnostic.row);
+        try std.testing.expect(source_cell.col >= origin.col);
+        try std.testing.expectEqual(@as(usize, 4), origin.col);
         try std.testing.expectEqualStrings(" ", frame.cellText(&grid, origin.row, origin.col - 1));
         try std.testing.expectEqualStrings("\u{f467}", frame.cellText(&grid, origin.row, origin.col - 2));
         try std.testing.expectEqualStrings(" ", frame.cellText(&grid, origin.row, origin.col - 3));

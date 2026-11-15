@@ -908,18 +908,18 @@ pub const App = struct {
     /// math as focusedWinHeight so H/M/L and zz/zt/zb count wrapped rows
     /// the way the renderer draws them.
     pub fn focusedContentWidth(self: *App) u32 {
-        const gutter = self.gutterWidth(self.cur().pt.lineCount());
+        const count = self.cur().pt.lineCount();
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const win = self.vx.window();
         const height: u32 = win.height;
-        if (height <= status_row_count) return @max(win.width -| gutter, 1);
+        if (height <= status_row_count) return @max(win.width -| self.gutterWidthFor(count, win.width), 1);
         const content_rows = height - status_row_count - self.tabBarRows(arena.allocator());
-        const layout = self.layoutWindows(arena.allocator(), self.contentTop(arena.allocator()), content_rows, self.contentCol(), self.editorAreaWidth()) catch return @max(self.editorAreaWidth() -| gutter, 1);
+        const layout = self.layoutWindows(arena.allocator(), self.contentTop(arena.allocator()), content_rows, self.contentCol(), self.editorAreaWidth()) catch return @max(self.editorAreaWidth() -| self.gutterWidthFor(count, self.editorAreaWidth()), 1);
         for (layout.leaves) |leaf| {
-            if (leaf.win == self.current_win) return @max(leaf.width -| gutter, 1);
+            if (leaf.win == self.current_win) return @max(leaf.width -| self.gutterWidthFor(count, leaf.width), 1);
         }
-        return @max(self.editorAreaWidth() -| gutter, 1);
+        return @max(self.editorAreaWidth() -| self.gutterWidthFor(count, self.editorAreaWidth()), 1);
     }
 
     /// H/M/L: resolve a viewport motion to a document LINE using the focused
@@ -2127,6 +2127,7 @@ pub const App = struct {
     pub const navigatorBodyTop = @import("app/render.zig").navigatorBodyTop;
     pub const navigatorPeekActive = @import("app/render.zig").navigatorPeekActive;
     pub const gutterWidth = @import("app/render.zig").gutterWidth;
+    pub const gutterWidthFor = @import("app/render.zig").gutterWidthFor;
     pub const lineCellCol = @import("app/render.zig").lineCellCol;
     pub const textWidth = @import("app/render.zig").textWidth;
     pub const utf16Column = @import("app/render.zig").utf16Column;
