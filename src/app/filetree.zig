@@ -371,8 +371,16 @@ pub fn filetreeKey(self: *App, key: vaxis.Key) !bool {
     // Only explicit global surfaces may pass through; editor motions and
     // mutations must never run behind a focused navigator.
     if (key.mods.alt) return !(key.codepoint == 'r' or key.codepoint == 'w' or key.codepoint == 'e');
-    if (key.mods.ctrl or key.mods.super) return true;
-    switch (key.codepoint) {
+    if (key.mods.ctrl or key.mods.super or key.mods.hyper or key.mods.meta) return true;
+    // Kitty may report base g plus shifted/text G. Interpret the logical
+    // character only after command modifiers have been handled above.
+    const cp = key.shifted_codepoint orelse blk: {
+        if (key.text) |text| {
+            if (text.len > 0 and text.len <= 4) break :blk std.unicode.utf8Decode(text) catch key.codepoint;
+        }
+        break :blk key.codepoint;
+    };
+    switch (cp) {
         vaxis.Key.backspace => {
             try filetreeParent(self);
             return true;
