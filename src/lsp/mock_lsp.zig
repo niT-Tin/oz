@@ -112,6 +112,7 @@ pub const Script = enum {
     /// display label != insertText, markdown/plaintext docs, a long
     /// scrollable body, duplicate labels and detail-only/no-docs items.
     completion_rich,
+    completion_duplicates,
     /// Initial items without docs; completionProvider.resolveProvider=true.
     /// Resolve refines detail/documentation for the selected item.
     completion_resolve,
@@ -149,6 +150,7 @@ pub const Script = enum {
         if (std.mem.eql(u8, name, "inlay_param")) return .inlay_param;
         if (std.mem.eql(u8, name, "completion_progressive")) return .completion_progressive;
         if (std.mem.eql(u8, name, "completion_rich")) return .completion_rich;
+        if (std.mem.eql(u8, name, "completion_duplicates")) return .completion_duplicates;
         if (std.mem.eql(u8, name, "completion_resolve")) return .completion_resolve;
         if (std.mem.eql(u8, name, "completion_resolve_hold")) return .completion_resolve_hold;
         if (std.mem.eql(u8, name, "completion_resolve_error")) return .completion_resolve_error;
@@ -316,7 +318,9 @@ pub fn handleMessage(
             else if (script == .completion_progressive) blk: {
                 state.progressive_requests += 1;
                 break :blk try buildProgressiveCompletionResult(a, state.progressive_requests);
-            } else if (script == .completion_rich)
+            } else if (script == .completion_duplicates)
+                try buildDuplicateCompletionResult(a)
+            else if (script == .completion_rich)
                 try buildRichCompletionResult(a, prefix)
             else if (script == .signature_lifecycle)
                 try buildLifecycleCompletionResult(a)
@@ -870,6 +874,16 @@ fn buildOrderCompletionResult(a: std.mem.Allocator) !std.json.Value {
     var result = try std.json.ObjectMap.init(a, &.{}, &.{});
     try result.put(a, "items", .{ .array = items });
     return .{ .object = result };
+}
+
+fn buildDuplicateCompletionResult(a: std.mem.Allocator) !std.json.Value {
+    var items = std.json.Array.init(a);
+    for ([_][]const u8{ "A", "A", "B" }) |variant| {
+        const insert = try std.fmt.allocPrint(a, "duplicateProbe_{s}", .{variant});
+        const doc = try std.fmt.allocPrint(a, "DEDUP_{s}_DOC", .{variant});
+        try items.append(try richCompletionItem(a, "duplicateProbe", 6, insert, variant, "variable", null, "plaintext", doc));
+    }
+    return .{ .array = items };
 }
 
 fn buildRichCompletionResult(a: std.mem.Allocator, prefix: []const u8) !std.json.Value {

@@ -622,6 +622,18 @@ pub fn collectCompletionWords(self: *App, keep_sel: bool) !void {
         pending.clearRetainingCapacity();
     }
 
+    // Refresh replaces the previous snapshot. Appending here accumulated the
+    // old prefix's candidates on every keystroke (and kept non-matches alive).
+    const selected = if (keep_sel and self.completion_user_navigated and self.completion_sel < self.completion_words.items.len)
+        try self.alloc.dupe(u8, self.completion_words.items[self.completion_sel].label)
+    else
+        null;
+    defer if (selected) |label| self.alloc.free(label);
+    for (self.completion_words.items) |*item| item.deinit(self.alloc);
+    self.completion_words.clearRetainingCapacity();
+    self.completion_generation +%= 1;
+    self.completion_doc_scroll = 0;
+
     // (word, count) pairs, sorted by count desc then word asc
     const Pair = struct { word: []const u8, count: u32 };
     var pairs = std.ArrayList(Pair).empty;
@@ -651,7 +663,16 @@ pub fn collectCompletionWords(self: *App, keep_sel: bool) !void {
         const w = try self.alloc.dupe(u8, pairs.items[k].word);
         try self.completion_words.append(self.alloc, .{ .label = w, .kind = 0 });
     }
-    if (!keep_sel) self.completion_sel = 0;
+    self.completion_sel = 0;
+    if (selected) |label| {
+        for (self.completion_words.items, 0..) |item, index| {
+            if (std.mem.eql(u8, item.label, label)) {
+                self.completion_sel = index;
+                break;
+            }
+        }
+    }
+    self.completion_active = self.completion_words.items.len > 0;
 }
 
 /// Count one occurrence of `word` (skipping the word currently being

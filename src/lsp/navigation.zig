@@ -776,16 +776,94 @@ pub fn parseCompletionItems(alloc: std.mem.Allocator, result: std.json.Value, ou
     else
         result;
     if (items != .array) return;
-    for (items.array.items) |raw| {
+    // Deduplicate an individual response by its full JSON value, not by label
+    // or the selection hash. Same-looking overloads, opaque data and edit
+    // ranges must remain distinct. Object key order is immaterial; a hash
+    // bucket is always checked with deep equality before dropping an item.
+    var heads = std.AutoHashMap(u64, usize).init(alloc);
+    defer heads.deinit();
+    const next = try alloc.alloc(?usize, items.array.items.len);
+    defer alloc.free(next);
+    for (items.array.items, 0..) |raw, index| {
         const parsed = try parseOne(alloc, raw);
         if (parsed) |it| {
-            errdefer {
-                var tmp = it;
-                tmp.deinit(alloc);
+            var owned = it;
+            errdefer owned.deinit(alloc);
+            const h = completionJsonHash(raw);
+            const entry = try heads.getOrPut(h);
+            var prior: ?usize = if (entry.found_existing) entry.value_ptr.* else null;
+            var duplicate = false;
+            while (prior) |i| {
+                if (completionJsonEqual(raw, items.array.items[i])) {
+                    duplicate = true;
+                    break;
+                }
+                prior = next[i];
             }
-            try out.append(alloc, it);
+            if (duplicate) {
+                owned.deinit(alloc);
+                continue;
+            }
+            next[index] = if (entry.found_existing) entry.value_ptr.* else null;
+            entry.value_ptr.* = index;
+            try out.append(alloc, owned);
         }
     }
+}
+
+/// Order-independent object fingerprint; array order and scalar types remain
+/// significant. This is only a bucket key, never proof of candidate equality.
+fn completionJsonHash(value: std.json.Value) u64 {
+    var h = std.hash.Wyhash.init(@backingInt(std.meta.activeTag(value)));
+    switch (value) {
+        .null => {},
+        .bool => |v| h.update(std.mem.asBytes(&v)),
+        .integer => |v| h.update(std.mem.asBytes(&v)),
+        .float => |v| h.update(std.mem.asBytes(&v)),
+        .string, .number_string => |v| h.update(v),
+        .array => |v| for (v.items) |item| {
+            const child = completionJsonHash(item);
+            h.update(std.mem.asBytes(&child));
+        },
+        .object => |v| {
+            var sum: u64 = 0;
+            var iter = v.iterator();
+            while (iter.next()) |entry| {
+                const child = completionJsonHash(entry.value_ptr.*);
+                sum +%= std.hash.Wyhash.hash(child, entry.key_ptr.*);
+            }
+            h.update(std.mem.asBytes(&sum));
+            const count = v.count();
+            h.update(std.mem.asBytes(&count));
+        },
+    }
+    return h.final();
+}
+
+fn completionJsonEqual(left: std.json.Value, right: std.json.Value) bool {
+    if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+    return switch (left) {
+        .null => true,
+        .bool => |v| v == right.bool,
+        .integer => |v| v == right.integer,
+        .float => |v| v == right.float,
+        .string => |v| std.mem.eql(u8, v, right.string),
+        .number_string => |v| std.mem.eql(u8, v, right.number_string),
+        .array => |v| blk: {
+            if (v.items.len != right.array.items.len) break :blk false;
+            for (v.items, right.array.items) |a, b| if (!completionJsonEqual(a, b)) break :blk false;
+            break :blk true;
+        },
+        .object => |v| blk: {
+            if (v.count() != right.object.count()) break :blk false;
+            var iter = v.iterator();
+            while (iter.next()) |entry| {
+                const other = right.object.get(entry.key_ptr.*) orelse break :blk false;
+                if (!completionJsonEqual(entry.value_ptr.*, other)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
 }
 
 /// Fields a completionItem/resolve response may refine. Ownership: strings
@@ -889,28 +967,18 @@ test "hover content: plain string is plaintext; empty and null contents show not
 
 test "hover content: legacy MarkedString language object becomes a fenced block" {
     const alloc = std.testing.allocator;
-    try expectHover(alloc,
-        "{\"contents\":{\"language\":\"zig\",\"value\":\"const x = 1;\"}}",
-        .markdown, "```zig\nconst x = 1;\n```");
+    try expectHover(alloc, "{\"contents\":{\"language\":\"zig\",\"value\":\"const x = 1;\"}}", .markdown, "```zig\nconst x = 1;\n```");
     // Unknown fence language is preserved readably (the renderer falls back
     // to the buffer's own language for an unknown fence).
-    try expectHover(alloc,
-        "{\"contents\":{\"language\":\"notalang\",\"value\":\"q\"}}",
-        .markdown, "```notalang\nq\n```");
-    try expectHover(alloc,
-        "{\"contents\":{\"language\":\"\",\"value\":\"q\"}}",
-        .markdown, "```\nq\n```");
+    try expectHover(alloc, "{\"contents\":{\"language\":\"notalang\",\"value\":\"q\"}}", .markdown, "```notalang\nq\n```");
+    try expectHover(alloc, "{\"contents\":{\"language\":\"\",\"value\":\"q\"}}", .markdown, "```\nq\n```");
 }
 
 test "hover content: MarkedString array mixes code fences and prose" {
     const alloc = std.testing.allocator;
-    try expectHover(alloc,
-        "{\"contents\":[{\"language\":\"zig\",\"value\":\"const x = 1;\"},\"plain prose\",{\"language\":\"c\",\"value\":\"int y;\"}]}",
-        .markdown, "```zig\nconst x = 1;\n```\nplain prose\n```c\nint y;\n```");
+    try expectHover(alloc, "{\"contents\":[{\"language\":\"zig\",\"value\":\"const x = 1;\"},\"plain prose\",{\"language\":\"c\",\"value\":\"int y;\"}]}", .markdown, "```zig\nconst x = 1;\n```\nplain prose\n```c\nint y;\n```");
     // A code-only array still keeps each language in its own fence.
-    try expectHover(alloc,
-        "{\"contents\":[{\"language\":\"zig\",\"value\":\"a\"},{\"language\":\"zig\",\"value\":\"b\"}]}",
-        .markdown, "```zig\na\n```\n```zig\nb\n```");
+    try expectHover(alloc, "{\"contents\":[{\"language\":\"zig\",\"value\":\"a\"},{\"language\":\"zig\",\"value\":\"b\"}]}", .markdown, "```zig\na\n```\n```zig\nb\n```");
 }
 
 test "navigation: locations from single and array responses" {
@@ -1460,4 +1528,29 @@ test "completion ranking: 5000 equal-score items keep the original order determi
         const expected = try std.fmt.bufPrint(&expected_buf, "eq{d:0>4}", .{k});
         try std.testing.expectEqualStrings(expected, items.items[k].label);
     }
+}
+
+test "completion dedup: object order is ignored but edits, data and documentation stay distinct" {
+    const a = std.testing.allocator;
+    const input =
+        \\[{"label":"item","kind":6,"data":{"a":1,"b":[2,3]},"textEdit":{"newText":"one","range":{"start":{"line":0,"character":1},"end":{"line":0,"character":2}}}},
+        \\ {"textEdit":{"range":{"end":{"character":2,"line":0},"start":{"character":1,"line":0}},"newText":"one"},"data":{"b":[2,3],"a":1},"kind":6,"label":"item"},
+        \\ {"label":"item","kind":6,"data":{"a":2,"b":[2,3]},"textEdit":{"newText":"one","range":{"start":{"line":0,"character":1},"end":{"line":0,"character":2}}}},
+        \\ {"label":"item","kind":6,"data":{"a":1,"b":[2,3]},"textEdit":{"newText":"one","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":2}}}},
+        \\ {"label":"item","kind":6,"data":{"a":1,"b":[2,3]},"textEdit":{"newText":"two","range":{"start":{"line":0,"character":1},"end":{"line":0,"character":2}}}},
+        \\ {"label":"item","kind":6,"data":{"a":1,"b":[2,3]},"documentation":"different docs","textEdit":{"newText":"one","range":{"start":{"line":0,"character":1},"end":{"line":0,"character":2}}}}]
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, input, .{});
+    defer parsed.deinit();
+    var items = std.ArrayList(CompletionItem).empty;
+    defer {
+        for (items.items) |*item| item.deinit(a);
+        items.deinit(a);
+    }
+    try parseCompletionItems(a, parsed.value, &items);
+    try std.testing.expectEqual(@as(usize, 5), items.items.len);
+    try std.testing.expect(items.items[0].item_id != items.items[1].item_id);
+    try std.testing.expect(items.items[0].item_id != items.items[2].item_id);
+    try std.testing.expectEqualStrings("two", items.items[3].insertText());
+    try std.testing.expectEqualStrings("different docs", items.items[4].doc.?);
 }

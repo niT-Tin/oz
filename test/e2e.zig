@@ -27320,3 +27320,67 @@ test "editing reliability: manually selected completion survives a refresh" {
     defer alloc.free(saved);
     try std.testing.expectEqualStrings("lines_insert", saved);
 }
+
+fn completionDedupRows(grid: *Grid, needle: []const u8) usize {
+    var count: usize = 0;
+    for (0..grid.rows) |row| if (rowContains(grid, row, needle) and rowContains(grid, row, "│")) {
+        count += 1;
+    };
+    return count;
+}
+
+test "completion dedup: local refresh replaces old prefixes and does not accumulate candidates" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var path_buf: [128:0]u8 = undefined;
+    const path = try wsTempFile(io, &path_buf, "completion_dedup.txt", "alphabet alphanumeric azure\n\n");
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, path }, &.{});
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("Gi");
+    try gridWaitFor(&sess, &grid, "[INSERT]", 3000);
+    try sess.send("a");
+    try gridDrain(&sess, &grid, 300);
+    try std.testing.expectEqual(@as(usize, 1), completionDedupRows(&grid, "azure"));
+    try sess.send("l");
+    try gridDrain(&sess, &grid, 300);
+    try std.testing.expectEqual(@as(usize, 0), completionDedupRows(&grid, "azure"));
+    try std.testing.expectEqual(@as(usize, 1), completionDedupRows(&grid, "alphabet"));
+    try sess.send("p");
+    try gridDrain(&sess, &grid, 300);
+    try std.testing.expectEqual(@as(usize, 1), completionDedupRows(&grid, "alphabet"));
+    try std.testing.expectEqual(@as(usize, 1), completionDedupRows(&grid, "alphanumeric"));
+    try sess.send("\x05z"); // C-e dismisses before a nonmatching suffix.
+    try gridDrain(&sess, &grid, 300);
+    try std.testing.expectEqual(@as(usize, 0), completionDedupRows(&grid, "alphabet"));
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "completion dedup: LSP duplicates collapse while same-label different insertions survive" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var fx = try startCompletionMock(io, a, "completion_duplicates", "const x = ", 30, 120);
+    defer fx.deinit(io, a);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send("Adu");
+    try gridWaitFor(&fx.sess, &grid, "DEDUP_A_DOC", 8000);
+    try std.testing.expectEqual(@as(usize, 2), completionDedupRows(&grid, "duplicateProbe"));
+    try fx.sess.send("\x0e");
+    try gridWaitFor(&fx.sess, &grid, "DEDUP_B_DOC", 5000);
+    try fx.sess.send("\r");
+    try gridWaitFor(&fx.sess, &grid, "const x = duplicateProbe_B", 5000);
+    try fx.sess.send("\x1b");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":wq\r"));
+    const disk = try readDiskFile(io, a, fx.path);
+    defer a.free(disk);
+    try std.testing.expectEqualStrings("const x = duplicateProbe_B", disk);
+}
