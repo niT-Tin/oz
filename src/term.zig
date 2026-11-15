@@ -220,6 +220,33 @@ pub fn layoutRect(layout: Layout, content_top: u32, content_rows: u32, screen_w:
     }
 }
 
+/// Interior rectangle of a bordered terminal frame: the PTY cell grid lives
+/// inside the one-cell border, so a frame never covers child content. A
+/// rectangle too small to hold a border plus at least one content cell
+/// yields a zero-size rect (callers skip drawing/resizing it).
+pub fn frameInnerRect(r: Rect) Rect {
+    if (r.w < 3 or r.h < 3) return .{ .x = r.x, .y = r.y, .w = 0, .h = 0 };
+    return .{ .x = r.x + 1, .y = r.y + 1, .w = r.w - 2, .h = r.h - 2 };
+}
+
+/// What a terminal toggle key must do to an existing session. Session
+/// lifecycle is deliberately separate from visibility/focus/layout:
+///   - no session        -> create a new shell
+///   - another layout    -> move (and show/focus) the SAME session
+///   - hidden            -> show + focus the same session
+///   - visible, focused  -> hide (keep the session alive)
+///   - visible, unfocused-> focus it
+/// Only an explicit close / child exit / app shutdown destroys the session.
+pub const ToggleAction = enum { create, relayout, show, hide, focus };
+
+pub fn toggleAction(has_session: bool, visible: bool, focused: bool, same_layout: bool) ToggleAction {
+    if (!has_session) return .create;
+    if (!same_layout) return .relayout;
+    if (!visible) return .show;
+    if (focused) return .hide;
+    return .focus;
+}
+
 /// Wrapper around `vaxis.widgets.Terminal` (PTY + VT emulation + scrollback).
 ///
 /// Owns the PTY write buffer: create() allocates it, destroy() frees it after
@@ -473,4 +500,37 @@ test "layoutRect floating: screen_h clamps a loose content_rows" {
     const r = layoutRect(.floating, 4, 50, 120, 40);
     // h = max(60% of 36 = 21, 12) = 21; y = 4 + (36-21)/2 = 11.
     try testing.expectEqual(Rect{ .x = 12, .y = 11, .w = 96, .h = 21 }, r);
+}
+
+test "frameInnerRect: reserves one border cell on every side" {
+    try testing.expectEqual(Rect{ .x = 9, .y = 6, .w = 62, .h = 10 }, frameInnerRect(.{ .x = 8, .y = 5, .w = 64, .h = 12 }));
+    // 40-column layouts: floating/bottom outer 40 -> 38 PTY cols, right
+    // outer 30 -> 28 PTY cols.
+    try testing.expectEqual(@as(u32, 38), frameInnerRect(.{ .x = 0, .y = 0, .w = 40, .h = 12 }).w);
+    try testing.expectEqual(@as(u32, 28), frameInnerRect(.{ .x = 10, .y = 1, .w = 30, .h = 21 }).w);
+}
+
+test "frameInnerRect: too small for a border means zero content" {
+    const zero = frameInnerRect(.{ .x = 3, .y = 4, .w = 2, .h = 9 });
+    try testing.expectEqual(@as(u32, 0), zero.w);
+    try testing.expectEqual(@as(u32, 0), zero.h);
+    const zero_h = frameInnerRect(.{ .x = 0, .y = 0, .w = 40, .h = 2 });
+    try testing.expectEqual(@as(u32, 0), zero_h.h);
+}
+
+test "toggleAction: lifecycle is separate from visibility/focus/layout" {
+    // No session at all -> create.
+    try testing.expectEqual(ToggleAction.create, toggleAction(false, false, false, true));
+    try testing.expectEqual(ToggleAction.create, toggleAction(false, false, false, false));
+    // Hidden (same or different layout) -> show the SAME session; a layout
+    // key also moves it.
+    try testing.expectEqual(ToggleAction.show, toggleAction(true, false, false, true));
+    try testing.expectEqual(ToggleAction.relayout, toggleAction(true, false, false, false));
+    // Visible + focused + same key -> hide (never destroy).
+    try testing.expectEqual(ToggleAction.hide, toggleAction(true, true, true, true));
+    // Visible + unfocused + same key -> focus.
+    try testing.expectEqual(ToggleAction.focus, toggleAction(true, true, false, true));
+    // Another layout always moves the one session and refocuses it.
+    try testing.expectEqual(ToggleAction.relayout, toggleAction(true, true, true, false));
+    try testing.expectEqual(ToggleAction.relayout, toggleAction(true, true, false, false));
 }

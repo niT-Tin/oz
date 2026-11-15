@@ -218,6 +218,7 @@ fn railContains(self: *App, col: u32, row: u32) bool {
 fn terminalContains(self: *App, col: u32, row: u32) bool {
     if (!term.supported) return false;
     if (self.term_pane == null) return false;
+    if (!self.term_pane.?.visible) return false;
     var arena = std.heap.ArenaAllocator.init(self.alloc);
     defer arena.deinit();
     const r = self.termRect(arena.allocator());
