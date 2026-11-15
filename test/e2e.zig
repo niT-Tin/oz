@@ -29192,6 +29192,15 @@ test "file tree safety: G gg and editing keys stay in the navigator" {
     try sess.send("gg");
     try gridWaitFor(&sess, &grid, "z00.txt", 8000);
     try std.testing.expect(!grid.contains("z39.txt"));
+    // Kitty reports base g plus logical G, with Ctrl/Alt preserved.
+    try sess.send("\x1b[103:71;6;71u\x1b[103:71;4;71u");
+    try gridDrain(&sess, &grid, 150);
+    try std.testing.expect(!grid.contains("z39.txt"));
+    try std.testing.expect(grid.contains("L1:C0"));
+    try sess.send("\x1b[103:71;2;71u");
+    try gridWaitFor(&sess, &grid, "z39.txt", 8000);
+    try sess.send("gg");
+    try gridWaitFor(&sess, &grid, "z00.txt", 8000);
     try sess.send("xux\x12");
     try sess.send("\x17l");
     try gridWaitFor(&sess, &grid, "NORMAL", 8000);
