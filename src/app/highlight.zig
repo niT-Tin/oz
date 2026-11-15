@@ -299,11 +299,21 @@ pub fn execOpMotion(self: *App, m: editor.OpMotion) !void {
         return;
     }
     // normal mode: d/c/y over [cursor, target). vim semantics:
-    // naturally-exclusive motions (w/b/h/l/t/^) yield a half-open
-    // range [cursor, target) as-is; inclusive motions ($/e/f/%)
+    // naturally-exclusive motions (w/b/h/l/^) yield a half-open
+    // range [cursor, target) as-is; inclusive motions ($/e/f/t/%)
     // include the full character at the sorted right endpoint, including
     // multibyte characters and backward inclusive find motions.
-    const target_pos = editor.Motion.target(&self.cur().pt, m.motion, m.args, self.curCursor().*, m.count);
+    //
+    // Forward t needs its own resolution: Motion.target cannot distinguish
+    // "target not found" from "target adjacent" — both land on the cursor —
+    // yet vim aborts the whole operator only for the former (dtZ is a no-op,
+    // while dtu deletes the character under the cursor). tillTarget reports
+    // the miss explicitly; the inclusive flag (set by Mode for t only)
+    // covers the landing character on a hit.
+    const target_pos = if (m.motion == .till)
+        editor.Motion.tillTarget(&self.cur().pt, self.curCursor().*, m.args.ch, 1, m.count) orelse return
+    else
+        editor.Motion.target(&self.cur().pt, m.motion, m.args, self.curCursor().*, m.count);
     const range = edit_range.characterwise(&self.cur().pt, self.curCursor().*, target_pos, m.inclusive);
     try self.applyOpRange(m.op, range.start, range.end, false, false);
 }
