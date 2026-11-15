@@ -14672,7 +14672,8 @@ test "terminal: wheel and Shift+PageUp/Down scroll history without moving the ed
     try termAwaitFloatLayout(&sess, &grid);
     try sess.send("i=0; while [ $i -lt 100 ]; do printf 'HIST_%03d\\n' \"$i\"; i=$((i+1)); done\r");
     try gridWaitFor(&sess, &grid, "HIST_099", 20000);
-    try std.testing.expect(grid.contains("HIST_090"));
+    // Keep this independent of #18 reserving two rows for the terminal frame.
+    try std.testing.expect(grid.contains("HIST_098"));
 
     // Baseline AFTER the terminal owns focus: the status bar legitimately
     // drops its split separator for terminal focus, and scrolling must not
