@@ -1933,6 +1933,63 @@ test "text regression: vertical movement then insert preserves UTF-8" {
     try std.testing.expectEqualStrings("ab\nX你好\n", saved);
 }
 
+test "text regression: enclosing bracket pair contains the cursor" {
+    // Issue #17: with the cursor on the space before the outer ')' of
+    // "for (args.iterate().next() != null ) |arg| {", di( must delete the
+    // OUTER pair's content, not the already-closed `.next(` pair.
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var name_buf: [192:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}_bracket.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "for (args.iterate().next() != null ) |arg| {\n");
+    }
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, null, 24, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "args.iterate().next()", 8000);
+
+    // f) -> first ')' (of iterate()), ';' -> ') of next(', ';' -> outer ')',
+    // h -> the space before it (byte 34). Then di(.
+    try sess.send("f);;hdi(");
+    try gridWaitFor(&sess, &grid, "for () |arg| {", 4000);
+    try gridWaitGone(&sess, &grid, "args.iterate()", 4000);
+
+    // undo restores the line, redo deletes the same enclosing range.
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "args.iterate().next()", 4000);
+    try sess.send("\x12"); // Ctrl-R
+    try gridWaitFor(&sess, &grid, "for () |arg| {", 4000);
+
+    // yi( yanks the same enclosing content; $p proves the exact register
+    // bytes including the trailing space before the outer ')'.
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "args.iterate().next()", 4000);
+    try sess.send("f);;hyi($p");
+    try gridWaitFor(&sess, &grid, "{args.iterate().next() != null ", 4000);
+
+    // Undo the put, then ci( on the same spot: the changed range is the
+    // enclosing content and the sentinel lands inside the parentheses.
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "for (args.iterate().next() != null ) |arg| {", 4000);
+    try sess.send("0f);;hci(X\x1b");
+    try gridWaitFor(&sess, &grid, "for (X) |arg| {", 4000);
+    try gridWaitGone(&sess, &grid, "INSERT", 4000);
+    try gridWaitFor(&sess, &grid, "NORMAL", 4000);
+
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try std.Io.Dir.cwd().readFileAlloc(io, name, alloc, .limited(1024));
+    defer alloc.free(saved);
+    try std.testing.expectEqualStrings("for (X) |arg| {\n", saved);
+}
+
 test "insert text in insert mode, esc back to normal" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
