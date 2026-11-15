@@ -27320,3 +27320,55 @@ test "editing reliability: manually selected completion survives a refresh" {
     defer alloc.free(saved);
     try std.testing.expectEqualStrings("lines_insert", saved);
 }
+
+test "editing input: Note F handles legacy and Kitty shifted command and target" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var plain_buf: [192:0]u8 = undefined;
+    const plain = try erFixture(io, &plain_buf, ".txt", "OTHER_BUFFER\n");
+    defer std.Io.Dir.cwd().deleteFile(io, plain) catch {};
+    var notes_buf: [128]u8 = undefined;
+    const notes_dir = try notesTestDir(io, &notes_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, notes_dir) catch {};
+    const note = try std.fmt.allocPrint(a, "{s}/find.md", .{notes_dir});
+    defer a.free(note);
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, note, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "body_OoneOtwo\n");
+    }
+    const env = try std.fmt.allocPrint(a, "OZ_NOTES_DIR={s}", .{notes_dir});
+    defer a.free(env);
+    const oz = try erAbs(io, a, oz_exe_path);
+    defer a.free(oz);
+    var sess = try Session.spawnEnvSize(io, &.{ oz, plain }, &.{env}, 30, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "Files", 5000);
+    try sess.send("2");
+    try gridWaitFor(&sess, &grid, "find.md", 5000);
+    try sess.send("\r");
+    var elapsed: u32 = 0;
+    while (aiFindCellFrom(&grid, "body_OoneOtwo", 30) == null and elapsed < 5000) : (elapsed += 100) {
+        try gridDrain(&sess, &grid, 100);
+    }
+    try std.testing.expect(aiFindCellFrom(&grid, "body_OoneOtwo", 30) != null);
+    // A cursor/edit acknowledgement in the editor proves Notes gave away focus.
+    try sess.send("$FOrX");
+    try gridWaitFor(&sess, &grid, "body_OoneXtwo", 5000);
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "body_OoneOtwo", 5000);
+    // Same logical line and same backwards match, but both shifted letters
+    // use Kitty's alternate-codepoint encoding rather than legacy bytes.
+    try sess.send("$\x1b[102:70;2;70u\x1b[111:79;2;79urY");
+    try gridWaitFor(&sess, &grid, "body_OoneYtwo", 5000);
+    try std.testing.expect(grid.contains("[NORMAL]"));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try erRead(io, a, note);
+    defer a.free(saved);
+    try std.testing.expectEqualStrings("body_OoneYtwo\n", saved);
+}

@@ -6,9 +6,9 @@
 //! `mods: Modifiers` field. Special keys are u21 *constants* on the type
 //! (`vaxis.Key.escape`, `vaxis.Key.tab`, ...), not struct fields. Key itself
 //! has no `.eql` method — `Modifiers` has one, and `Key` offers the matching
-//! helpers `matches` / `matchExact` / ...; lookup uses `matchExact`
-//! (codepoint + modifiers, caps/num lock ignored), which is the right
-//! semantics for a compile-time table.
+//! helpers `matches` / `matchExact` / ...; lookup matches the incoming event
+//! against each binding, including Kitty alternate shifted/text codepoints
+//! while preserving Ctrl/Alt/Super modifiers.
 const std = @import("std");
 const vaxis = @import("vaxis");
 
@@ -181,13 +181,13 @@ pub const KeyMapEntry = struct {
 
 pub const KeyMap = []const KeyMapEntry;
 
-/// Exact match lookup (key + modifiers). vaxis.Key has no `.eql`; we use
-/// `matchExact`, which compares codepoint and modifiers (ignoring caps_lock /
-/// num_lock, mirroring vaxis's own shortcut matching). Returns null when
-/// unbound.
+/// Match the incoming event against the binding. Kitty can encode Shift+F
+/// as base `f` plus shifted/text `F`; matching only its base codepoint loses
+/// uppercase commands. `matches` consumes Shift only through the reported
+/// logical character and keeps command modifiers (Ctrl/Alt/Super) intact.
 pub fn lookup(map: KeyMap, key: Key) ?ActionId {
     for (map) |e| {
-        if (e.key.matchExact(key.codepoint, key.mods)) return e.action;
+        if (key.matches(e.key.codepoint, e.key.mods)) return e.action;
     }
     return null;
 }
@@ -207,4 +207,19 @@ test "lookup: exact key + modifier matching" {
     try std.testing.expectEqual(.move_left, lookup(map, .{ .codepoint = 'h', .mods = .{ .caps_lock = true } }).?);
     // unbound
     try std.testing.expectEqual(@as(?ActionId, null), lookup(map, .{ .codepoint = 'x' }));
+}
+
+test "lookup: Kitty alternate uppercase and text preserve command modifiers" {
+    const map: KeyMap = &.{
+        .{ .key = .{ .codepoint = 'f' }, .action = .find_char },
+        .{ .key = .{ .codepoint = 'F' }, .action = .find_char_back },
+        .{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } }, .action = .half_page_up },
+    };
+    const shifted = Key{ .codepoint = 'f', .shifted_codepoint = 'F', .text = "F", .mods = .{ .shift = true } };
+    try std.testing.expectEqual(.find_char_back, lookup(map, shifted).?);
+    const text_only = Key{ .codepoint = 'f', .text = "F", .mods = .{ .shift = true } };
+    try std.testing.expectEqual(.find_char_back, lookup(map, text_only).?);
+    try std.testing.expectEqual(.find_char, lookup(map, .{ .codepoint = 'f' }).?);
+    try std.testing.expectEqual(@as(?ActionId, null), lookup(map, .{ .codepoint = 'f', .shifted_codepoint = 'F', .text = "F", .mods = .{ .shift = true, .alt = true } }));
+    try std.testing.expectEqual(.half_page_up, lookup(map, .{ .codepoint = 'u', .mods = .{ .ctrl = true } }).?);
 }

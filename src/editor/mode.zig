@@ -588,7 +588,8 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
             resetPending(state);
             return .pending;
         }
-        var cp = key.codepoint;
+        var cp = if (key.mods.shift) key.shifted_codepoint orelse key.codepoint else key.codepoint;
+        if (key.text) |text| cp = std.unicode.utf8Decode(text) catch cp;
         if (cp == 0 or cp > 0x10FFFF or
             (cp >= 0xD800 and cp <= 0xDFFF))
         {
