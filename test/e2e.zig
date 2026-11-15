@@ -27448,3 +27448,39 @@ test "gutter: tiny split fallbacks keep source visible and the one-cell editor c
         try std.testing.expectEqualStrings("OTHER_BUFFER\n", untouched);
     }
 }
+
+test "gutter: an invisible editor leaf must not hide the visible AI prompt cursor" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "zero.txt", "S\n");
+    const file = try std.fs.path.join(a, &.{ root, "zero.txt" });
+    defer a.free(file);
+    const home = try std.fmt.allocPrint(a, "HOME={s}", .{root});
+    defer a.free(home);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, file }, &.{home}, 24, 40, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 40);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    // A seventh split creates a zero-width neighbor. Ctrl-w h chooses it
+    // at the same column (geometric distance zero), then rZ proves dispatch.
+    try sess.send(":vs\r:vs\r:vs\r:vs\r:vs\r:vs\r:vs\r\x17hrZ");
+    try gridWaitFor(&sess, &grid, "Z", 5000);
+    const source_z = aiFindCellFrom(&grid, "Z", 0).?;
+    try std.testing.expectEqual(@as(usize, 4), source_z.col);
+    try std.testing.expect(source_z.row >= 2);
+    try gridDrain(&sess, &grid, 200);
+    const before_show = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "\x1b[?25h") orelse 0;
+    const before_hide = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "\x1b[?25l") orelse 0;
+    try std.testing.expect(before_hide > before_show);
+    try sess.send(" aZERO_PROMPT");
+    try gridWaitFor(&sess, &grid, "ZERO_PROMPT", 5000);
+    try gridDrain(&sess, &grid, 200);
+    const shown = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "\x1b[?25h") orelse 0;
+    const hidden = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "\x1b[?25l") orelse 0;
+    try std.testing.expect(shown > hidden);
+}
