@@ -14617,6 +14617,20 @@ fn termRowIs(grid: *Grid, row: usize, before: []const u8) bool {
     return std.mem.eql(u8, grid.rowText(row), before);
 }
 
+/// The embedded session is spawned at 24x80 and only resized to the floating
+/// rect on the app's first draw. That resize re-initializes the screen and
+/// drops the local history, so child output produced before it can be wiped
+/// between the child writing it and the app's first float draw. Wait until
+/// the child observes a winsize other than the spawn size and only then emit
+/// the fixture output: TERM_READY is produced after that point, so seeing it
+/// proves the resize happened and that a post-resize frame was rendered.
+/// (Without this the scrollback fixture can be cleared before the test looks
+/// at it; the shell also records its final size in $FLOAT.)
+fn termAwaitFloatLayout(sess: *Session, grid: *Grid) !void {
+    try sess.send("while [ \"$(stty size)\" = '24 80' ]; do sleep 0.05; done; FLOAT=$(stty size); printf 'TERM_READY\\n'\r");
+    try gridWaitFor(sess, grid, "TERM_READY", 10000);
+}
+
 /// Fill a file with `count` numbered lines ("EDIT_<n>") and return it via the
 /// caller's ArrayList.
 fn termWriteNumberedFixture(io: Io, alloc: std.mem.Allocator, dir: []const u8, name: []const u8, count: usize) !void {
@@ -14655,6 +14669,7 @@ test "terminal: wheel and Shift+PageUp/Down scroll history without moving the ed
     try gridWaitFor(&sess, &grid, "L50:C0", 8000);
 
     try sess.send("\x1br");
+    try termAwaitFloatLayout(&sess, &grid);
     try sess.send("i=0; while [ $i -lt 100 ]; do printf 'HIST_%03d\\n' \"$i\"; i=$((i+1)); done\r");
     try gridWaitFor(&sess, &grid, "HIST_099", 20000);
     try std.testing.expect(grid.contains("HIST_090"));
@@ -14754,6 +14769,7 @@ test "terminal: history across alt-screen, mouse reporting, clear and resize" {
     try gridWaitFor(&sess, &grid, "EDIT_LINE_1", 5000);
 
     try sess.send("\x1br");
+    try termAwaitFloatLayout(&sess, &grid);
     try sess.send("i=0; while [ $i -lt 60 ]; do printf 'HIST_%03d\\n' \"$i\"; i=$((i+1)); done\r");
     try gridWaitFor(&sess, &grid, "HIST_059", 20000);
 
@@ -14808,10 +14824,14 @@ test "terminal: history across alt-screen, mouse reporting, clear and resize" {
     try sess.send("\x1b[5;2~");
     try gridWaitFor(&sess, &grid, "HIST2_015", 8000);
     try sess.send("\x1bw");
-    // The resize clears the child screen; synchronize on output produced AFTER
-    // it (the shell-side delay guarantees the layout switch was rendered).
-    try sess.send("sleep 1; printf 'RESIZED_MARK\\n'\r");
-    try gridWaitFor(&sess, &grid, "RESIZED_MARK", 8000);
+    // The layout switch resizes the pty (floating 12x64 -> bottom 8x80) and
+    // that resize clears the child screen and the local history. A fixed
+    // sleep is not a barrier (the switch's draw can land after it under
+    // load), so wait until the child observes a winsize distinct from the
+    // floating one before printing the marker: RESIZED_MARK then cannot be
+    // wiped by a later draw.
+    try sess.send("while [ \"$(stty size)\" = \"$FLOAT\" ]; do sleep 0.05; done; printf 'RESIZED_MARK\\n'\r");
+    try gridWaitFor(&sess, &grid, "RESIZED_MARK", 10000);
     try sess.send("\x1b[5;2~");
     try gridSettle(&sess, &grid, 150, 3000);
     try std.testing.expect(!grid.contains("HIST2_015"));
@@ -14848,6 +14868,7 @@ test "terminal: scrollback is bounded and preserves CJK, emoji and ANSI colors" 
     try gridWaitFor(&sess, &grid, "EDIT_LINE_1", 5000);
 
     try sess.send("\x1br");
+    try termAwaitFloatLayout(&sess, &grid);
     // 600 numbered lines, then one true-color CJK+emoji line, then 20 more
     // lines so the wide/colored line is only reachable through scrollback.
     try sess.send("i=0; while [ $i -lt 600 ]; do printf 'HIST_%03d\\n' \"$i\"; i=$((i+1)); done\r");
@@ -25663,6 +25684,19 @@ fn waitBarrierMarker(io: Io, a: std.mem.Allocator, root: []const u8, name: []con
     return error.TestUnexpectedResult;
 }
 
+/// Barrier for the held-signature subcases below: the LSP barrier fires as
+/// soon as the app sends the request, which can be before the app has
+/// rendered the Insert frame for the "A(" that triggered it. Without this
+/// wait the grid can still show the stale `[NORMAL]` from before "A(", so
+/// the post-Escape `gridWaitFor("[NORMAL]")` returns immediately. The
+/// following `:` then arrives while Escape is still unconsumed and vaxis
+/// parses the pair as Alt+`:` -- the app stays in Insert and the command is
+/// typed into the buffer (the CI failure typed `:e other.zig` into the
+/// document). Seeing the Insert frame first makes the Normal wait meaningful.
+fn awaitInsertFrame(sess: *Session, grid: *Grid) !void {
+    try gridWaitFor(sess, grid, "[INSERT]", 3000);
+}
+
 test "signature lifecycle: stale signature is gone before the new completion" {
     const io = std.testing.io;
     const a = std.testing.allocator;
@@ -25770,6 +25804,7 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("x");
         try releaseSignatureA(io, fx.root);
         try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
@@ -25788,6 +25823,7 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("\x1b");
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try releaseSignatureA(io, fx.root);
@@ -25806,6 +25842,7 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("\x1b");
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try fx.sess.send(":e other.zig\r");
@@ -25825,6 +25862,7 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try sendMouseButton(&fx.sess, 8, 4, 0, false);
         try sendMouseButton(&fx.sess, 8, 4, 0, true);
         try gridDrain(&fx.sess, &grid, 200);
@@ -25832,7 +25870,11 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
         try gridDrain(&fx.sess, &grid, 300);
         try std.testing.expect(!grid.contains("SIG_A"));
-        try fx.sess.send("\x1b");
+        // The click itself finalizes the Insert session
+        // (prepareMouseAction exits insert), so the visible [NORMAL] frame is
+        // the click's barrier. Sending a redundant Escape here would race the
+        // following ':' and pair with it as Alt+':' if the app has not
+        // consumed it yet, leaving the quit command untyped.
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
     }
@@ -25845,6 +25887,7 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("\x1b");
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try fx.sess.send(":vs\r");
@@ -26117,6 +26160,7 @@ test "signature lifecycle: delayed response released in the same Insert context"
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("\x1b");
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try fx.sess.send("i");
