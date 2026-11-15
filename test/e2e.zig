@@ -26066,8 +26066,12 @@ fn erStart(io: Io, alloc: std.mem.Allocator, fixture: []const u8, rows: u16, col
 /// One editor case: initial bytes, keys, saved bytes. Fails with a dump of
 /// the mismatch so a red run is evidence, not a mystery.
 fn erEditorCase(io: Io, alloc: std.mem.Allocator, label: []const u8, initial: []const u8, keys: []const u8, expected: []const u8) !void {
+    return erEditorFileCase(io, alloc, label, ".zig", initial, keys, expected);
+}
+
+fn erEditorFileCase(io: Io, alloc: std.mem.Allocator, label: []const u8, suffix: []const u8, initial: []const u8, keys: []const u8, expected: []const u8) !void {
     var name_buf: [192:0]u8 = undefined;
-    const name = try erFixture(io, &name_buf, ".zig", initial);
+    const name = try erFixture(io, &name_buf, suffix, initial);
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     var sess = try erStart(io, alloc, name, 24, 80);
     defer sess.close();
@@ -27391,4 +27395,23 @@ test "editing input: quote pairs never manufacture a third quote" {
         .{ .label = "pair undo is atomic", .text = "word\n", .keys = "A\"\"\x03u", .want = "word\n" },
     };
     for (cases) |c| try erEditorCase(io, a, c.label, c.text, c.keys, c.want);
+}
+
+test "editing input: Normal o indents open blocks and expands the selected empty block" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const cases = [_]struct { label: []const u8, suffix: []const u8 = ".zig", text: []const u8, keys: []const u8, want: []const u8 }{
+        .{ .label = "empty brace block", .text = "{}\n", .keys = "oX", .want = "{\n    X\n}\n" },
+        .{ .label = "empty function", .text = "fn f() {}\n", .keys = "f{oX", .want = "fn f() {\n    X\n}\n" },
+        .{ .label = "already expanded block", .text = "fn f() {\n}\n", .keys = "f{oX", .want = "fn f() {\n    X\n}\n" },
+        .{ .label = "closer stays ordinary o", .text = "{}\n", .keys = "loX", .want = "{}\nX\n" },
+        .{ .label = "tabs and CRLF", .text = "\tif (x) {}\r\n", .keys = "f{oX", .want = "\tif (x) {\r\n\t\tX\r\n\t}\r\n" },
+        .{ .label = "quoted braces are literal", .text = "const s = \"{}\";\n", .keys = "f{oX", .want = "const s = \"{}\";\nX\n" },
+        .{ .label = "comment braces are literal", .text = "// {}\n", .keys = "f{oX", .want = "// {}\nX\n" },
+        .{ .label = "Markdown remains literal", .suffix = ".md", .text = "{}\n", .keys = "oX", .want = "{}\nX\n" },
+        .{ .label = "Python language rule", .suffix = ".py", .text = "def f():\n    pass\n", .keys = "oX", .want = "def f():\n    X\n    pass\n" },
+        .{ .label = "undo open plus typing atomically", .text = "{}\n", .keys = "oX\x03u", .want = "{}\n" },
+        .{ .label = "redo restores expanded block", .text = "{}\n", .keys = "oX\x03u\x12", .want = "{\n    X\n}\n" },
+    };
+    for (cases) |c| try erEditorFileCase(io, a, c.label, c.suffix, c.text, c.keys, c.want);
 }
