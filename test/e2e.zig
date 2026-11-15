@@ -27606,3 +27606,33 @@ test "editing reliability: manually selected completion survives a refresh" {
     defer alloc.free(saved);
     try std.testing.expectEqualStrings("lines_insert", saved);
 }
+
+test "folds: indenting the boundary updates closed range through undo and redo" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var name_buf: [192:0]u8 = undefined;
+    const name = try erFixture(io, &name_buf, ".txt", "head\n    body\nboundary\n    next\ntail\n");
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    var sess = try erStart(io, a, name, 24, 80);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("za");
+    try gridWaitFor(&sess, &grid, "1 lines", 3000);
+    try sess.send("j>");
+    try gridWaitFor(&sess, &grid, "3 lines", 3000);
+    try std.testing.expect(!grid.contains("boundary"));
+    try std.testing.expect(!grid.contains("next"));
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "1 lines", 3000);
+    try std.testing.expect(grid.contains("boundary"));
+    try sess.send("\x12");
+    try gridWaitFor(&sess, &grid, "3 lines", 3000);
+    try std.testing.expect(!grid.contains("boundary"));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try erRead(io, a, name);
+    defer a.free(saved);
+    try std.testing.expectEqualStrings("head\n    body\n    boundary\n    next\ntail\n", saved);
+}

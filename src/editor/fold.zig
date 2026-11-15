@@ -317,6 +317,15 @@ pub fn transformClosed(f: *Closed, span: EditSpan, after: *const PieceTable) boo
             const end = start + hidden;
             if (end >= after.lineCount()) return false;
             f.range = .{ .start = start, .end = end };
+            // The first dedented non-blank line is a dependency of this
+            // range even though it was outside the hidden body. Indenting
+            // or deleting that boundary can extend the surviving fold.
+            // Check only the boundary; rescan the body only when it changed.
+            var boundary = end + 1;
+            while (boundary < after.lineCount() and isBlank(after, boundary)) : (boundary += 1) {}
+            if (boundary < after.lineCount() and indentOf(after, boundary) > indentOf(after, start)) {
+                f.range = rangeAt(after, start) orelse return false;
+            }
             // Header text is unchanged; only offsets/line numbers moved.
             f.refreshOffsets(after);
             return true;
@@ -644,4 +653,19 @@ test "closed fold: edit-span helpers" {
     try testing.expectEqual(@as(u32, 0), newlinesIn(&pt, 2, 1)); // "b"
     try testing.expect(isWholeDocument(.{ .pos = 0, .removed = 6, .inserted = 1, .removed_newlines = 2, .inserted_newlines = 0 }, 6));
     try testing.expect(!isWholeDocument(.{ .pos = 0, .removed = 3, .inserted = 1, .removed_newlines = 1, .inserted_newlines = 0 }, 6));
+}
+
+test "closed fold: editing the closing boundary extends a surviving fold" {
+    var before = try table("head\n    body\nboundary\n    next\ntail\n");
+    defer before.deinit();
+    var after = try table("head\n    body\n    boundary\n    next\ntail\n");
+    defer after.deinit();
+    var folds: std.ArrayList(Closed) = .empty;
+    defer folds.deinit(testing.allocator);
+    try appendClosed(&folds, &before, 0);
+    // Indenting the first dedented line changes the extent of the closed
+    // indent fold, even though its byte position is after the old fold_end.
+    transformFolds(&folds, .{ .pos = 14, .removed = 0, .inserted = 4, .removed_newlines = 0, .inserted_newlines = 0 }, &after);
+    try testing.expectEqual(@as(usize, 1), folds.items.len);
+    try testing.expectEqual(rangeAt(&after, 0).?, folds.items[0].range);
 }
