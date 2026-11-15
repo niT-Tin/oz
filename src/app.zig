@@ -341,6 +341,10 @@ pub const App = struct {
     /// OZ_NO_ITALIC=1 keeps the palette but strips italic glyphs (fonts or
     /// terminals without a real italic variant still get a usable editor).
     italics_enabled: bool = true,
+    /// Scope-range emphasis (issue #14): the restrained horizontal underline
+    /// on the active block's header line. Default on; `OZ_NO_SCOPE_UNDERLINE=1`
+    /// opts out without touching the guide-column scope highlight.
+    scope_underline: bool = true,
     /// Theme when the theme picker opened — Esc restores it (no allocation;
     /// value copy, nothing to free in deinit).
     theme_saved: ?theme.Theme = null,
@@ -867,6 +871,17 @@ pub const App = struct {
     /// state lives here, per-window cursor/viewport in `windows`).
     pub fn cur(self: *App) *Buffer {
         return &self.buffers.items[self.windows.items[self.current_win].buf];
+    }
+
+    /// True while the editor buffer owns the keyboard: the navigator, the AI
+    /// rail's prompt/thread list and a focused embedded terminal all take
+    /// precedence. Emphasis that marks "the active editing scope" yields
+    /// while another surface owns input; input routing itself is unchanged.
+    pub fn editorOwnsKeys(self: *App) bool {
+        if (self.focus != .buffer) return false;
+        if (self.ai.focus != .editor) return false;
+        if (term.supported) if (self.term_pane) |pane| if (pane.focused) return false;
+        return true;
     }
 
     /// Monotonic milliseconds since boot for animation timing. Never used as
@@ -1539,6 +1554,7 @@ pub const App = struct {
             .env_map = init.environ_map,
             .theme = theme.withItalics(theme.default, !std.mem.eql(u8, init.environ_map.get("OZ_NO_ITALIC") orelse "", "1")),
             .italics_enabled = !std.mem.eql(u8, init.environ_map.get("OZ_NO_ITALIC") orelse "", "1"),
+            .scope_underline = !std.mem.eql(u8, init.environ_map.get("OZ_NO_SCOPE_UNDERLINE") orelse "", "1"),
             .vx = vx,
             .tty = tty,
             .tty_buffer = tty_buffer,
