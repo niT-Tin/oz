@@ -477,3 +477,10 @@ test "mouse: wrapped CJK gaps, combining clusters and tab continuation" {
     try t.expectEqual(@as(u32, 0), wrappedCellToByte("e\u{0301}b", 0, 0, 5, 4, .wcwidth, &.{}, &.{}));
     try t.expectEqual(@as(u32, 4), wrappedCellToByte("aaaa\tb", 1, 1, 5, 4, .wcwidth, &.{}, &.{}));
 }
+
+test "mouse: CJK tab wrapped tail maps to exact source bytes" {
+    const line = "中中\tabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdef_TAIL";
+    for ([_]vaxis.gwidth.Method{ .unicode, .unicode_explicit, .wcwidth, .no_zwj }) |method| {
+        try testing.expectEqual(@as(u32, 65), wrappedCellToByte(line, 1, 30, 36, 4, method, &.{}, &.{}));
+    }
+}

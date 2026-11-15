@@ -1448,12 +1448,14 @@ test "mouse: split pane focuses and places cursor; separator/status are no-ops; 
     }
     try std.testing.expect(std.mem.indexOf(u8, grid.rowText(2), "│") != null);
 
-    // Left pane click on line 3, text cell 2 (gutter=2 for 9 lines).
-    try mouseClickAt(&sess, 4, 4);
+    // Derive source origin from the rendered pane rather than gutter width.
+    const source_col = aiCellIndexOf(&grid, 4, "line3").?;
+    try mouseClickAt(&sess, source_col + 2, 4);
     try gridWaitFor(&sess, &grid, "line 3/9 col 2", 5000);
 
-    // Right pane click on line 5, text cell 1.
-    try mouseClickAt(&sess, 53, 6);
+    // Equal-width split: the right source starts one half-screen later.
+    const right_text_col = grid.cols / 2 + source_col + 1;
+    try mouseClickAt(&sess, right_text_col, 6);
     try gridWaitFor(&sess, &grid, "line 5/9 col 1", 5000);
 
     // Clicking the separator must NOT resize or move the cursor (v1 no-op).
@@ -1463,16 +1465,16 @@ test "mouse: split pane focuses and places cursor; separator/status are no-ops; 
 
     // Wheel over the right pane: 3 lines per notch, clamped at the file end
     // and the file start without overflow.
-    try mouseWheelAt(&sess, 53, 6, 1);
+    try mouseWheelAt(&sess, right_text_col, 6, 1);
     try gridWaitFor(&sess, &grid, "line 8/9 col 1", 5000);
-    try mouseWheelAt(&sess, 53, 6, 1);
+    try mouseWheelAt(&sess, right_text_col, 6, 1);
     try gridWaitFor(&sess, &grid, "line 9/9 col 1", 5000);
-    for (0..5) |_| try mouseWheelAt(&sess, 53, 6, -1);
+    for (0..5) |_| try mouseWheelAt(&sess, right_text_col, 6, -1);
     try gridWaitFor(&sess, &grid, "line 1/9 col 1", 5000);
 
     // Cursor placement: click line 2 cell 3 in the LEFT pane, insert Q at the
     // mapped byte (line2: l/i/n/e/2 → insert before 'e').
-    try mouseClickAt(&sess, 5, 3);
+    try mouseClickAt(&sess, source_col + 3, 3);
     try gridWaitFor(&sess, &grid, "line 2/9 col 3", 5000);
     try sess.send("iQ");
     std.Io.sleep(io, .fromMilliseconds(150), .real) catch {};
@@ -1481,7 +1483,7 @@ test "mouse: split pane focuses and places cursor; separator/status are no-ops; 
     try gridWaitFor(&sess, &grid, "linQe2", 5000);
 
     // Right pane click line 5 cell 1 → insert R after 'l'.
-    try mouseClickAt(&sess, 53, 6);
+    try mouseClickAt(&sess, right_text_col, 6);
     try gridWaitFor(&sess, &grid, "line 5/9 col 1", 5000);
     try sess.send("iR");
     std.Io.sleep(io, .fromMilliseconds(150), .real) catch {};
@@ -5726,9 +5728,8 @@ test "visual block: rectangle semantics — highlight and d delete per column" {
 
     const sel_bg = packRgb(45, 79, 103);
     // cursor → col 1, Ctrl+v (anchor col 1), j j → cursor line 2 col 1.
-    // Screen layout: row 0 = tab bar, content col 0 = gutter (2 wide for a
-    // 3-line file), so file line n sits on screen row n+1 and its byte col 1
-    // is screen col 3.
+    // Source origin moves with number/sign padding; selection stays on bytes.
+    const block_col = aiFindCellFrom(&grid, "aaa", 0).?.col + 1;
     try sess.send("l\x16jj");
     waited = 0;
     var block_hl = false;
@@ -5741,9 +5742,9 @@ test "visual block: rectangle semantics — highlight and d delete per column" {
         }
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
-        if (grid.bg_buf[2 * grid.cols + 3] == sel_bg and
-            grid.bg_buf[3 * grid.cols + 3] == sel_bg and
-            grid.bg_buf[4 * grid.cols + 3] == sel_bg)
+        if (grid.bg_buf[2 * grid.cols + block_col] == sel_bg and
+            grid.bg_buf[3 * grid.cols + block_col] == sel_bg and
+            grid.bg_buf[4 * grid.cols + block_col] == sel_bg)
         {
             block_hl = true;
         }
@@ -5753,12 +5754,11 @@ test "visual block: rectangle semantics — highlight and d delete per column" {
         grid.dump();
     }
     try std.testing.expect(block_hl);
-    // the rectangle must NOT light column 0 or 2 on any row (the byte-range
-    // path lit col 2 on row 0 and col 0..3 on row 1)
-    try std.testing.expect(grid.bg_buf[2 * grid.cols + 2] != sel_bg);
-    try std.testing.expect(grid.bg_buf[2 * grid.cols + 4] != sel_bg);
-    try std.testing.expect(grid.bg_buf[3 * grid.cols + 2] != sel_bg);
-    try std.testing.expect(grid.bg_buf[4 * grid.cols + 2] != sel_bg);
+    // Neighboring source cells stay outside the selected byte column.
+    try std.testing.expect(grid.bg_buf[2 * grid.cols + block_col - 1] != sel_bg);
+    try std.testing.expect(grid.bg_buf[2 * grid.cols + block_col + 1] != sel_bg);
+    try std.testing.expect(grid.bg_buf[3 * grid.cols + block_col - 1] != sel_bg);
+    try std.testing.expect(grid.bg_buf[4 * grid.cols + block_col - 1] != sel_bg);
 
     // d deletes exactly one column from every covered row: aa / bbb / c
     try sess.send("d");
@@ -8319,13 +8319,13 @@ test "gutter: relative line numbers never overlap content on deep files" {
     }
     try std.testing.expect(std.mem.eql(u8, grid.rowText(22)[0..6], "15000 "));
 
-    // every visible content row: the first content cell is at the dynamic
-    // gutter width (column 6, preceded by the trailing space) — line
-    // numbers never run into the text
+    const source_col = aiCellIndexOf(&grid, 22, "x").?;
+    try std.testing.expectEqual(@as(usize, 8), source_col); // 5 digits + gap/sign/gap
+    // Every visible row shares this source origin and keeps its padding.
     var r: usize = 2;
     while (r < 23) : (r += 1) {
-        try std.testing.expect(grid.buf[(r * 80 + 6) * 4] == 'x');
-        try std.testing.expect(grid.buf[(r * 80 + 5) * 4] == ' ');
+        try std.testing.expectEqualStrings("x", frame.cellText(&grid, r, source_col));
+        for (1..4) |gap| try std.testing.expectEqualStrings(" ", frame.cellText(&grid, r, source_col - gap));
     }
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
@@ -10834,15 +10834,14 @@ test "lsp: diagnostics push repaints without a keypress (stale mark cleared)" {
             sess.used += n;
             grid.feed(sess.out[sess.used - n .. sess.used]);
         }
-        if (grid.buf[(2 * grid.cols + 1) * 4] == 0xEF and
-            grid.buf[(2 * grid.cols + 1) * 4 + 1] == 0x91 and
-            grid.buf[(2 * grid.cols + 1) * 4 + 2] == 0xA7) mark = true;
+        if (aiFindCell(&grid, "\u{f467}") != null) mark = true;
     }
     if (!mark) {
         std.debug.print("diagnostics mark never appeared without a keypress:\n", .{});
         grid.dump();
     }
     try std.testing.expect(mark);
+    const marked_cell = aiFindCell(&grid, "\u{f467}").?;
 
     // Edit once (didChange → mock pushes the empty list). The mark must
     // vanish with NO further keypress. Ctrl+e hides the completion menu the
@@ -10859,8 +10858,7 @@ test "lsp: diagnostics push repaints without a keypress (stale mark cleared)" {
             sess.used += n;
             grid.feed(sess.out[sess.used - n .. sess.used]);
         }
-        const gutter = grid.buf[(1 * grid.cols + 1) * 4 ..][0..3];
-        if (!(gutter[0] == 0xEF and gutter[1] == 0x91 and gutter[2] == 0xA7)) cleared = true;
+        if (!std.mem.eql(u8, frame.cellText(&grid, marked_cell.row, marked_cell.col), "\u{f467}")) cleared = true;
     }
     if (!cleared) {
         std.debug.print("stale diagnostics mark survived the clear push:\n", .{});
@@ -11065,16 +11063,10 @@ test "lsp: diagnostics — gutter mark, gl, <leader>sd list" {
         }
         // gutter col 1 on screen row 2: the Nerd Font ✖ (nf-fa-times_circle,
         // U+F467 → EF 91 A7) — no longer a bare 'E'
-        if (grid.buf[(2 * grid.cols + 1) * 4] == 0xEF and
-            grid.buf[(2 * grid.cols + 1) * 4 + 1] == 0x91 and
-            grid.buf[(2 * grid.cols + 1) * 4 + 2] == 0xA7) mark = true;
+        if (aiFindCell(&grid, "\u{f467}") != null) mark = true;
     }
     if (!mark) {
-        std.debug.print("no gutter mark; col1={x}{x}{x}\n", .{
-            grid.buf[(2 * grid.cols + 1) * 4],
-            grid.buf[(2 * grid.cols + 1) * 4 + 1],
-            grid.buf[(2 * grid.cols + 1) * 4 + 2],
-        });
+        std.debug.print("no gutter diagnostic mark\n", .{});
         grid.dump();
     }
     try std.testing.expect(mark);
@@ -29825,5 +29817,58 @@ test "path completion: accept transforms one-shot inlay anchors before any refre
         const expected = try std.fmt.allocPrint(a, "{s}\nconst tail = 0;\n", .{expected_line});
         defer a.free(expected);
         try std.testing.expectEqualStrings(expected, bytes);
+    }
+}
+
+test "gutter: padding separates numbers signs and source with wide wrapped mouse targets" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const mock = try std.Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/mock_lsp", a);
+    defer a.free(mock);
+    const env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{mock});
+    defer a.free(env);
+    const wide_line = "中中\tabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdef_TAIL";
+    const source = "const a = 1;\n" ++ wide_line ++ "\n";
+    for ([_]u16{ 40, 80, 120 }) |cols| {
+        var root_buf: [128]u8 = undefined;
+        const root = try aiMockDir(io, &root_buf);
+        defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        try writeTestFile(io, root, "gutter.zig", source);
+        var path_buf: [220:0]u8 = undefined;
+        const path = try bufPrintZ(&path_buf, "{s}/gutter.zig", .{root});
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{env}, 24, cols, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 24, cols);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "const a", 8000);
+        try gridWaitFor(&sess, &grid, "\u{f467}", 8000);
+        try gridWaitFor(&sess, &grid, ": i32", 8000);
+        const diagnostic = aiFindCellFrom(&grid, "\u{f467}", 0).?;
+        const origin = .{ .row = diagnostic.row, .col = diagnostic.col + 2 };
+        try std.testing.expect(aiFindCellFrom(&grid, "const a", 0).?.col >= origin.col);
+        try std.testing.expect(origin.col >= 4);
+        try std.testing.expectEqualStrings(" ", frame.cellText(&grid, origin.row, origin.col - 1));
+        try std.testing.expectEqualStrings("\u{f467}", frame.cellText(&grid, origin.row, origin.col - 2));
+        try std.testing.expectEqualStrings(" ", frame.cellText(&grid, origin.row, origin.col - 3));
+        try std.testing.expectEqualStrings("1", frame.cellText(&grid, origin.row, origin.col - 4));
+        try std.testing.expectEqual(@as(u8, 0), frame.cellUnderlineStyle(&grid, origin.row, origin.col - 1));
+        const wide = aiFindCellFrom(&grid, "中中", 0).?;
+        try mouseClickAt(&sess, @intCast(wide.col + 1), @intCast(wide.row));
+        try gridWaitFor(&sess, &grid, "L2:C0", 8000);
+        const tail = aiFindCellFrom(&grid, "_TAIL", 0).?;
+        try std.testing.expectEqualStrings("A", frame.cellText(&grid, tail.row, tail.col + 2));
+        try mouseClickAt(&sess, @intCast(tail.col + 2), @intCast(tail.row));
+        // 2 CJK glyphs (4 cells), a 4-cell tab, 56 letters, then "_T".
+        try gridWaitFor(&sess, &grid, "L2:C66", 8000);
+        try sess.send("rX");
+        try gridWaitFor(&sess, &grid, "_TXIL", 8000);
+        const code = try sess.commandAndWaitExit(":wq\r");
+        try std.testing.expectEqual(@as(u32, 0), code);
+        const saved = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024));
+        defer a.free(saved);
+        const target_byte = comptime std.mem.indexOf(u8, source, "_TAIL").? + 2;
+        const expected = source[0..target_byte] ++ "X" ++ source[target_byte + 1 ..];
+        try std.testing.expectEqualStrings(expected, saved);
     }
 }
