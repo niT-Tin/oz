@@ -1878,6 +1878,25 @@ test "text regression: Unicode ranges and reversed selections save exact bytes" 
         .{ .initial = "abcd\n", .keys = "$dFa", .expected = "\n" },
         .{ .initial = "你好世界\n", .keys = "$dF好", .expected = "你\n" },
         .{ .initial = "one\ntwo\nthree\nfour\n", .keys = "jjVkd", .expected = "one\nfour\n" },
+        // forward t includes the landing character (one before the target);
+        // backward T stays exclusive (one after the target is NOT removed).
+        .{ .initial = "stdout_buffer\n", .keys = "llldt_", .expected = "std_buffer\n" },
+        .{ .initial = "stdout_buffer\n", .keys = "lllct_X\x1b", .expected = "stdX_buffer\n" },
+        .{ .initial = "stdout_buffer\n", .keys = "lllyt_$p", .expected = "stdout_bufferout\n" },
+        .{ .initial = "abc_def\n", .keys = "lllllldT_", .expected = "abc_f\n" },
+        // a missing target is NOT the same as an adjacent target: no-op.
+        .{ .initial = "stdout_buffer\n", .keys = "llldtZ", .expected = "stdout_buffer\n" },
+        // the target immediately after the cursor makes t land on the cursor;
+        // the operator still deletes the character under it.
+        .{ .initial = "stdout_buffer\n", .keys = "llldtu", .expected = "stdut_buffer\n" },
+        // count = the count-th match (operator aborts when it does not exist).
+        .{ .initial = "aXbXcX\n", .keys = "d2tX", .expected = "XcX\n" },
+        .{ .initial = "aXbXcX\n", .keys = "d4tX", .expected = "aXbXcX\n" },
+        .{ .initial = "a,b,c,\n", .keys = "d2t,", .expected = ",c,\n" },
+        // UTF-8: the landing character is a whole codepoint, not one byte.
+        .{ .initial = "你好🙂世\n", .keys = "dt世", .expected = "世\n" },
+        // CRLF: the range never eats the terminator.
+        .{ .initial = "stdout_buffer\r\n", .keys = "llldt_", .expected = "std_buffer\r\n" },
     };
     for (cases, 0..) |case, index| {
         var name_buf: [128:0]u8 = undefined;
@@ -1896,6 +1915,12 @@ test "text regression: Unicode ranges and reversed selections save exact bytes" 
         defer grid.deinit(alloc);
         try gridWaitFor(&sess, &grid, "NORMAL", 8000);
         try sess.send(case.keys);
+        // A case may deliberately end in Insert mode (ct_): wait for its
+        // Esc to land before sending the ex command. Sending ":wq" while
+        // the ESC is still in flight coalesces into Alt+':' and types the
+        // command into the buffer instead of opening the cmdline.
+        try gridWaitGone(&sess, &grid, "INSERT", 4000);
+        try gridWaitFor(&sess, &grid, "NORMAL", 4000);
         try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
         const saved = try std.Io.Dir.cwd().readFileAlloc(io, name, alloc, .limited(1024));
         defer alloc.free(saved);

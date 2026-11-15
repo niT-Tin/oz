@@ -83,6 +83,14 @@ pub fn apply(
 ) void {
     var pos = @min(cursor.*, pt.len());
     const n = @max(count, 1);
+    // t/T count from the MATCH of the previous step, not from its landing
+    // (landing + 1 would find the same target again). On a missing target
+    // vim leaves a bare motion at the original position.
+    if (motion == .till or motion == .till_back) {
+        const dir: i8 = if (motion == .till) 1 else -1;
+        cursor.* = tillTarget(pt, pos, args.ch, dir, n) orelse pos;
+        return;
+    }
     var i: u32 = 0;
     while (i < n) : (i += 1) {
         pos = moveOnce(pt, motion, args, pos);
@@ -728,13 +736,11 @@ fn pageMove(pt: *const PieceTable, pos: u32, lines: u32, dir: i8) u32 {
 
 // ------------------------------ find / till ---------------------------------
 
-/// f/F/t/T — search `ch` (a codepoint, so Chinese/emoji targets work) within
-/// the current line only (never across '\n'). dir: +1 searches forward from
-/// the next character, -1 backward from the previous character. till: land one
-/// character before the match (forward) / after it (backward). Not found (or
-/// no target char): stays put.
-fn findInLine(pt: *const PieceTable, pos: u32, ch: u21, dir: i8, till: bool) u32 {
-    if (ch == 0) return pos;
+/// The raw match position of the next `ch` in the current line (not the
+/// till landing): +1 scans after `pos`, -1 before it. Never crosses '\n'.
+/// null when the codepoint does not occur (or `ch` is NUL).
+fn findMatch(pt: *const PieceTable, pos: u32, ch: u21, dir: i8) ?u32 {
+    if (ch == 0) return null;
     const line = pt.lineOf(pos);
     const start = pt.lineStart(line);
     const end = start + pt.lineTextLen(line);
@@ -744,25 +750,60 @@ fn findInLine(pt: *const PieceTable, pos: u32, ch: u21, dir: i8, till: bool) u32
         while (p < end) {
             p = nextCharBoundary(&scan, p);
             if (p >= end) break;
-            if (decodeAt(&scan, p).cp == ch) {
-                if (!till) return p;
-                const t = prevCharBoundary(&scan, p);
-                return if (t < start) start else t;
-            }
+            if (decodeAt(&scan, p).cp == ch) return p;
         }
     } else {
         var p = pos;
         while (p > start) {
             const q = prevCharBoundary(&scan, p);
-            if (decodeAt(&scan, q).cp == ch) {
-                if (!till) return q;
-                const t = nextCharBoundary(&scan, q);
-                return @min(t, end);
-            }
+            if (decodeAt(&scan, q).cp == ch) return q;
             p = q;
         }
     }
-    return pos;
+    return null;
+}
+
+/// Where a till motion lands for a match at `match`: one whole UTF-8
+/// character before it (forward t) / after it (backward T), clamped inside
+/// the match's line. Byte-1 would split a multibyte target.
+fn tillLanding(pt: *const PieceTable, match: u32, dir: i8) u32 {
+    const line = pt.lineOf(match);
+    const start = pt.lineStart(line);
+    const end = start + pt.lineTextLen(line);
+    var scan = DocScan.init(pt, dir < 0);
+    if (dir > 0) {
+        const t = prevCharBoundary(&scan, match);
+        return if (t < start) start else t;
+    }
+    const t = nextCharBoundary(&scan, match);
+    return @min(t, end);
+}
+
+/// Landing position of `count` successive forward `t` or backward `T`
+/// steps, or null when the count-th target does not exist. Like vim, each
+/// step searches from the previous MATCH (not its landing), so `2t,` finds
+/// the second comma, and a failed step makes the whole motion/operator
+/// fail instead of silently landing on the cursor.
+pub fn tillTarget(pt: *const PieceTable, from: u32, ch: u21, dir: i8, count: u32) ?u32 {
+    var pos = @min(from, pt.len());
+    const n = @max(count, 1);
+    var i: u32 = 0;
+    var match: u32 = undefined;
+    while (i < n) : (i += 1) {
+        match = findMatch(pt, pos, ch, dir) orelse return null;
+        pos = match;
+    }
+    return tillLanding(pt, match, dir);
+}
+
+/// f/F/t/T — search `ch` (a codepoint, so Chinese/emoji targets work) within
+/// the current line only (never across '\n'). dir: +1 searches forward from
+/// the next character, -1 backward from the previous character. till: land one
+/// character before the match (forward) / after it (backward). Not found (or
+/// no target char): stays put.
+fn findInLine(pt: *const PieceTable, pos: u32, ch: u21, dir: i8, till: bool) u32 {
+    const m = findMatch(pt, pos, ch, dir) orelse return pos;
+    return if (till) tillLanding(pt, m, dir) else m;
 }
 
 // ------------------------------ match pair (%) ------------------------------
@@ -1400,6 +1441,32 @@ test "find/till: direction, duplicates, line confinement, not-found" {
     try check(&pt, .find, .{ .ch = 'b' }, 0, 2, 4); // 1 -> 4
     try check(&pt, .find, .{ .ch = 'b' }, 0, 3, 4); // clamps at the last match
     try check(&pt, .find_back, .{ .ch = 'b' }, 5, 2, 1); // 4 -> 1
+}
+
+test "find/till: till counts the nth match and reports failure" {
+    // "aXbXcX": a0 X1 b2 X3 c4 X5. A t{ch} count lands one character
+    // before the count-th match; a missing match leaves a bare motion put.
+    var pt = try PieceTable.init(testing.allocator, "aXbXcX");
+    defer pt.deinit();
+    try check(&pt, .till, .{ .ch = 'X' }, 0, 1, 0); // 1st X at 1 -> a
+    try check(&pt, .till, .{ .ch = 'X' }, 0, 2, 2); // 2nd X at 3 -> b
+    try check(&pt, .till, .{ .ch = 'X' }, 0, 3, 4); // 3rd X at 5 -> c
+    try check(&pt, .till, .{ .ch = 'X' }, 0, 4, 0); // no 4th X: stay put
+    try check(&pt, .till, .{ .ch = 'z' }, 0, 1, 0); // target absent: stay put
+    try std.testing.expectEqual(@as(u32, 2), tillTarget(&pt, 0, 'X', 1, 2).?);
+    try std.testing.expectEqual(@as(?u32, null), tillTarget(&pt, 0, 'X', 1, 4));
+    try std.testing.expectEqual(@as(?u32, null), tillTarget(&pt, 0, 'z', 1, 1));
+
+    // Backward T counts the same way: "a,b,c," commas at 1,3,5. From 5,
+    // 2T, lands one character after the 2nd comma (at 2 = b); a 3rd comma
+    // does not exist before the cursor.
+    var commas = try PieceTable.init(testing.allocator, "a,b,c,");
+    defer commas.deinit();
+    try check(&commas, .till_back, .{ .ch = ',' }, 5, 1, 4);
+    try check(&commas, .till_back, .{ .ch = ',' }, 5, 2, 2);
+    try check(&commas, .till_back, .{ .ch = ',' }, 5, 3, 5); // only 2 before: stay
+    try std.testing.expectEqual(@as(?u32, 2), tillTarget(&commas, 5, ',', -1, 2));
+    try std.testing.expectEqual(@as(?u32, null), tillTarget(&commas, 5, ',', -1, 3));
 }
 
 test "match_pair %: pairs, nesting, non-bracket, unmatched" {
