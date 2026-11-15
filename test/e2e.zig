@@ -27369,3 +27369,82 @@ test "gutter: padding separates numbers signs and source with wide wrapped mouse
         try std.testing.expectEqualStrings(expected, saved);
     }
 }
+
+/// Observe a specific source cell, never a status/global substring which
+/// could acknowledge an older frame or a different pane's label.
+fn gutterWaitCell(sess: *Session, grid: *Grid, row: usize, col: usize, expected: []const u8) !void {
+    var elapsed: i32 = 0;
+    while (!std.mem.eql(u8, frame.cellText(grid, row, col), expected) and elapsed < 5000) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) {
+            elapsed += 100;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!std.mem.eql(u8, frame.cellText(grid, row, col), expected)) grid.dump();
+    try std.testing.expectEqualStrings(expected, frame.cellText(grid, row, col));
+}
+
+test "gutter: tiny split fallbacks keep source visible and the one-cell editor clickable" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |deep| {
+        var doc = std.ArrayList(u8).empty;
+        defer doc.deinit(a);
+        try doc.appendSlice(a, "S\n");
+        if (deep) {
+            for (0..14998) |_| try doc.appendSlice(a, "x\n");
+            try doc.append(a, 'x'); // exactly 15,000 logical lines
+        }
+        var name_buf: [192:0]u8 = undefined;
+        var other_buf: [192:0]u8 = undefined;
+        const name = try erFixture(io, &name_buf, ".txt", doc.items);
+        defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+        const other = try erFixture(io, &other_buf, ".txt", "OTHER_BUFFER\n");
+        defer std.Io.Dir.cwd().deleteFile(io, other) catch {};
+        var sess = try erStart(io, a, name, 24, 40);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 24, 40);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        // The first pane remains 20 columns wide, so its nominal source cell
+        // is an independent edit acknowledgement before checking tiny panes.
+        const first_source: usize = if (deep) 8 else 4;
+        try sess.send(":vs\r:vs\r:vs\r:vs\rrA");
+        try gutterWaitCell(&sess, &grid, 2, first_source, "A");
+        // Right-most leaf widths are 3, then 2, then 1. A deep file hides
+        // its five-digit numbers, keeping a separator pad in a 3-cell pane.
+        try gutterWaitCell(&sess, &grid, 2, if (deep) 38 else 39, "A");
+        try sess.send(":vs\rrB");
+        try gutterWaitCell(&sess, &grid, 2, first_source, "B");
+        try gutterWaitCell(&sess, &grid, 2, 39, "B");
+        try sess.send(":vs\rrC");
+        try gutterWaitCell(&sess, &grid, 2, first_source, "C");
+        try gutterWaitCell(&sess, &grid, 2, 39, "C");
+        // Opening another buffer deliberately focuses a different (leftmost)
+        // editor. A click on the one-cell source must reclaim keyboard focus,
+        // even though a historical separator occupied that exact same cell.
+        const command = try std.fmt.allocPrint(a, ":e {s}\r", .{other});
+        defer a.free(command);
+        try sess.send(command);
+        try gridWaitFor(&sess, &grid, "OTHER_BUFFER", 5000);
+        try mouseClickAt(&sess, 39, 2);
+        try sess.send("rD:w\r");
+        try gridWaitFor(&sess, &grid, "written:", 5000);
+        try gutterWaitCell(&sess, &grid, 2, 39, "D");
+        try std.testing.expect(grid.contains("OTHER_BUFFER"));
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+        const saved = try erRead(io, a, name);
+        defer a.free(saved);
+        const expected = try a.dupe(u8, doc.items);
+        defer a.free(expected);
+        expected[0] = 'D';
+        try std.testing.expectEqualStrings(expected, saved);
+        const untouched = try erRead(io, a, other);
+        defer a.free(untouched);
+        try std.testing.expectEqualStrings("OTHER_BUFFER\n", untouched);
+    }
+}
