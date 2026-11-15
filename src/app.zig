@@ -496,6 +496,10 @@ pub const App = struct {
     // file tree (<leader>e)
     filetree_active: bool = false,
     filetree_sel: usize = 0,
+    /// Files owns its gg prefix; it never enters the editor motion state.
+    filetree_pending_g: bool = false,
+    /// Captured creation directory; command input belongs to the Files float.
+    pending_filetree_create: ?[]u8 = null,
     /// Scroll-window top for the sidebar: the selection moves freely inside
     /// the window; the window scrolls only when it crosses an edge.
     filetree_top: usize = 0,
@@ -1666,6 +1670,7 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        if (self.pending_filetree_create) |path| self.alloc.free(path);
         self.loop.stop();
         // An in-flight LSP attach must be cancelled and joined before the
         // pieces it borrows (env_map, io, the vaxis loop its wake posts to)

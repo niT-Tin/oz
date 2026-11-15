@@ -67,6 +67,7 @@ pub const app_inlay_history = @import("app/inlay_history.zig");
 pub const app_view_state = @import("app/view_state.zig");
 // M2b1 navigator tabs + note store (pure; app/notes.zig is e2e-tested)
 pub const app_navigator = @import("app/navigator.zig");
+pub const app_filetree_create = @import("app/filetree_create.zig");
 pub const app_note_store = @import("app/note_store.zig");
 // M2b2 inline assistant (pure request/diff/pending model; app/inline_ui.zig is e2e-tested)
 pub const app_inline = @import("app/inline.zig");

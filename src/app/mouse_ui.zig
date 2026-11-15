@@ -314,6 +314,7 @@ fn hintActionFocusesEditor(action: hints.Action) bool {
 /// replace/multi-cursor state is cleared so the next key cannot act on a
 /// stale target. No new business logic: this is the same teardown Esc uses.
 fn prepareMouseAction(self: *App) void {
+    self.filetree_pending_g = false;
     if (self.state.mode == .insert) self.exitInsert();
     self.pending_window = false;
     self.pending_replace = null;

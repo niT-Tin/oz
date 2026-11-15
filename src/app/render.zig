@@ -3768,6 +3768,7 @@ pub fn render(self: *App) !void {
         // M2.6a: labels + status indicator are the topmost layer, and must be
         // drawn after rail/filetree/dashboard before the frame is flushed.
         try self.drawHintOverlay(a, win);
+        try @import("filetree.zig").drawFiletreeCreate(self, a, win);
         hideInactiveMarkdownImages(self);
         try self.vx.render(self.tty.writer());
         return;
@@ -4278,6 +4279,11 @@ pub fn render(self: *App) !void {
     // status bar (or command line in command mode)
     if (self.state.mode == .command) {
         self.drawStatusChrome(win);
+        if (self.pending_filetree_create != null) {
+            try @import("filetree.zig").drawFiletreeCreate(self, a, win);
+            try self.vx.render(self.tty.writer());
+            return;
+        }
         const prompt_char: []const u8 = switch (self.cmdline_kind) {
             .ex => ":",
             .search_fwd => "/",
@@ -5431,6 +5437,11 @@ pub fn run(self: *App) !void {
                     if (!self.pasting) continue;
                     self.pasting = false;
                     if (term_focused) continue; // child got the keys already
+                    if (self.pending_filetree_create != null) {
+                        try @import("filetree.zig").filetreeCreatePaste(self, self.paste_buf.items);
+                        self.paste_buf.clearRetainingCapacity();
+                        continue;
+                    }
                     if (self.inlinePromptOpen()) {
                         try self.inlinePaste(self.paste_buf.items);
                         self.paste_buf.clearRetainingCapacity();
@@ -5465,7 +5476,9 @@ pub fn run(self: *App) !void {
                             }
                         }
                     }
-                    if (self.inlinePromptOpen()) {
+                    if (self.pending_filetree_create != null) {
+                        try @import("filetree.zig").filetreeCreatePaste(self, text);
+                    } else if (self.inlinePromptOpen()) {
                         try self.inlinePaste(text);
                     } else if (self.ai.rail_open and self.ai.focus != .editor) {
                         try self.aiPaste(text);
