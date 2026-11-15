@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const edit_range = @import("../editor/edit_range.zig");
+const indent_mod = @import("../editor/indent.zig");
 const editor = @import("../editor/root.zig");
 const syntax = @import("../syntax.zig");
 const term = @import("../term.zig");
@@ -299,11 +300,21 @@ pub fn execOpMotion(self: *App, m: editor.OpMotion) !void {
         return;
     }
     // normal mode: d/c/y over [cursor, target). vim semantics:
-    // naturally-exclusive motions (w/b/h/l/t/^) yield a half-open
-    // range [cursor, target) as-is; inclusive motions ($/e/f/%)
+    // naturally-exclusive motions (w/b/h/l/^) yield a half-open
+    // range [cursor, target) as-is; inclusive motions ($/e/f/t/%)
     // include the full character at the sorted right endpoint, including
     // multibyte characters and backward inclusive find motions.
-    const target_pos = editor.Motion.target(&self.cur().pt, m.motion, m.args, self.curCursor().*, m.count);
+    //
+    // Forward t needs its own resolution: Motion.target cannot distinguish
+    // "target not found" from "target adjacent" — both land on the cursor —
+    // yet vim aborts the whole operator only for the former (dtZ is a no-op,
+    // while dtu deletes the character under the cursor). tillTarget reports
+    // the miss explicitly; the inclusive flag (set by Mode for t only)
+    // covers the landing character on a hit.
+    const target_pos = if (m.motion == .till)
+        editor.Motion.tillTarget(&self.cur().pt, self.curCursor().*, m.args.ch, 1, m.count) orelse return
+    else
+        editor.Motion.target(&self.cur().pt, m.motion, m.args, self.curCursor().*, m.count);
     const range = edit_range.characterwise(&self.cur().pt, self.curCursor().*, target_pos, m.inclusive);
     try self.applyOpRange(m.op, range.start, range.end, false, false);
 }
@@ -335,6 +346,24 @@ fn clampHistoryCursor(self: *App, pos: u32) u32 {
     const text_end = line_start + pt.lineTextLen(line);
     if (p > text_end) p = text_end;
     return p;
+}
+
+/// Capture anchors BEFORE a single replacement. The returned transformed
+/// offsets must be applied only AFTER the document edit succeeds; converting
+/// them against the old document would clamp a shifted EOL hint into text.
+pub fn captureInlayOffsetsForReplace(self: *App, pos: u32, removed: u32, inserted: u32) ?[]?u32 {
+    if (self.inlay_hints.items.len == 0 or self.inlay_buf != self.current) return null;
+    const pt = &self.cur().pt;
+    const offsets = self.alloc.alloc(?u32, self.inlay_hints.items.len) catch {
+        self.invalidateInlayHints();
+        return null;
+    };
+    const span = inlay_history.Span{ .pos = pos, .removed = removed, .inserted = inserted };
+    for (self.inlay_hints.items, offsets) |h, *off| {
+        const abs = pt.lineStart(h.line) + h.character;
+        off.* = if (abs <= pt.len()) inlay_history.transformOffset(abs, span) else null;
+    }
+    return offsets;
 }
 
 /// Capture the displayed hint anchors as absolute byte offsets in the
@@ -391,7 +420,7 @@ fn captureInlayOffsetsForHistory(
 /// validate UTF-8/line bounds, drop dead hints (freeing only their labels),
 /// then compute the new line/byte column. `offsets` maps 1:1 to the hint list
 /// captured before the operation.
-fn applyInlayOffsetsAfterHistory(self: *App, offsets: []const ?u32) void {
+pub fn applyInlayOffsetsAfterHistory(self: *App, offsets: []const ?u32) void {
     if (self.inlay_hints.items.len != offsets.len) return;
     const pt = &self.cur().pt;
     var write: usize = 0;
@@ -456,10 +485,10 @@ pub fn performHistoryStep(self: *App, kind: history_mod.UndoKind) HistoryOutcome
     // transaction, then convert to line/column in the NEW document.
     const inlay_offsets = captureInlayOffsetsForHistory(self, group.edits.items, kind);
     defer if (inlay_offsets) |o| self.alloc.free(o);
-    const res = switch (kind) {
-        .undo => self.cur().history.undoResult(&self.cur().pt),
-        .redo => self.cur().history.redoResult(&self.cur().pt),
-    };
+    // historyApply carries this buffer's closed folds through the same edit
+    // sequence (against a scratch copy) before running the transaction, so
+    // undo/redo never unfold blocks whose content survives.
+    const res = self.historyApply(self.cur(), kind);
     if (!res.changed) {
         return .{ .applied = false, .kind = kind, .before_cursor = before_cursor, .after_cursor = before_cursor, .revision = res.revision };
     }
@@ -559,41 +588,45 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             self.state.mode = .insert;
         },
         .insert_line_after => {
-            // o: new line below, cursor on it. One record (line ending +
-            // auto-indent) joins the insert-session undo group opened here,
-            // so a single undo reverts the whole o+typing session.
             const pt = &self.cur().pt;
             const line = pt.lineOf(self.curCursor().*);
             const ls = pt.lineStart(line);
             const text_len = pt.lineTextLen(line);
-            const indent = try self.leadingIndent(line);
-            defer self.alloc.free(indent);
-            const ending = editor.line_open.preferredEnding(pt, line);
-            const open = try editor.line_open.plan(self.alloc, ending, indent, false);
-            defer open.deinit(self.alloc);
-            // Opening a line is a fresh edit context: drop any completion
-            // menu / pending manual request left by the previous session
-            // (beginInsertSession does this, before the group opens).
+            const leading = try self.leadingIndent(line);
+            defer self.alloc.free(leading);
+            var insert_pos = ls + text_len;
+            var plan: indent_mod.NewlinePlan = undefined;
+            if (pt.len() <= indent_mod.max_insert_bytes) {
+                const doc = try self.curText();
+                defer self.alloc.free(doc);
+                const open = try indent_mod.planOpenBelow(self.alloc, doc, self.curCursor().*, autil.filetypeOf(self.cur().path), .{
+                    .indent_width = @intCast(app_mod.tab_width),
+                    .use_tabs = std.mem.indexOfScalar(u8, leading, '\t') != null,
+                });
+                insert_pos = open.pos;
+                plan = open.newline;
+            } else {
+                const ending = editor.line_open.preferredEnding(pt, line);
+                const open = try editor.line_open.plan(self.alloc, ending, leading, false);
+                plan = .{ .text = open.text, .cursor_after = open.cursor_off };
+            }
+            defer self.alloc.free(plan.text);
+            const at = self.lspPositionAt(pt, insert_pos);
             self.beginInsertSession();
             self.cur().history.beginGroup();
-            try self.cur().history.record(pt, ls + text_len, 0, open.text);
-            self.curCursor().* = ls + text_len + open.cursor_off;
+            try self.recordEdit(insert_pos, 0, plan.text);
+            self.curCursor().* = insert_pos + plan.cursor_after;
             self.in_insert = true;
             self.state.mode = .insert;
-            // Re-anchor hints by LINE only: no text was inserted inside the
-            // edited line, so an end-of-line hint belongs to it — moving it
-            // to character 0 of the new row made the insert cursor ride
-            // after stale virtual text. Hints below shift down one line.
-            self.adjustInlayHintsLineOpen(line, false);
-            // keep the git gutter marks glued to their lines (o splits the
-            // line at its end: content below shifts down one)
-            self.gitShiftInsertAt(line, text_len, 1);
-            // structural edit (newline): force a full reparse next frame —
-            // incremental parsing of a newline is where highlight drift
-            // shows up ("o then type then jk leaves gray chars")
+            if (insert_pos == ls + text_len and std.mem.count(u8, plan.text, "\n") == 1) {
+                // End-of-line hints stay attached to their original source;
+                // only rows below an ordinary open-below move down.
+                self.adjustInlayHintsLineOpen(line, false);
+            } else {
+                self.adjustInlayHintsInsert(line, insert_pos - ls, plan.text);
+            }
             self.cur().syntax_revision = std.math.maxInt(u64);
-            // Notify LSP (the new line + indent changed the document).
-            self.markDirty();
+            self.markDirtyRange(at, at, plan.text);
         },
         .insert_line_before => {
             // O: new line above, cursor on it (same open-group semantics).
@@ -609,7 +642,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             defer open.deinit(self.alloc);
             self.beginInsertSession();
             self.cur().history.beginGroup();
-            try self.cur().history.record(pt, ls, 0, open.text);
+            try self.recordEdit(ls, 0, open.text);
             self.curCursor().* = ls + open.cursor_off;
             self.in_insert = true;
             self.state.mode = .insert;
@@ -662,7 +695,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
                     const pos = self.mc.cursors.items[i];
                     const w = self.mc.wordRange(pt, pos);
                     if (w.end <= w.start) continue;
-                    try self.cur().history.record(pt, w.start, w.end - w.start, "");
+                    try self.recordEdit(w.start, w.end - w.start, "");
                     for (self.mc.cursors.items, 0..) |*c, j| {
                         if (j == i) continue;
                         if (c.* >= w.end) c.* -= w.end - w.start;
@@ -800,7 +833,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
                 const seq = self.charLenAt(pt, c);
                 const end = @min(c + seq, pt.len());
                 if (end <= c) break;
-                try self.cur().history.record(pt, c, end - c, "");
+                try self.recordEdit(c, end - c, "");
             }
             self.cur().history.endGroup();
             self.markDirtyRange(start_pos, end_pos, "");
@@ -830,7 +863,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
                 // walk back to the start of the previous UTF-8 character
                 var start = c - 1;
                 while (start > 0 and (pt.byteAt(start) & 0xC0) == 0x80) start -= 1;
-                try self.cur().history.record(pt, start, c - start, "");
+                try self.recordEdit(start, c - start, "");
                 self.curCursor().* = start;
             }
             self.cur().history.endGroup();
@@ -854,7 +887,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
                 const start_pos = self.lspPositionAt(&self.cur().pt, c);
                 const end_pos = self.lspPositionAt(&self.cur().pt, end);
                 self.cur().history.beginGroup();
-                try self.cur().history.record(pt, c, end - c, "");
+                try self.recordEdit(c, end - c, "");
                 self.cur().history.endGroup();
                 self.curCursor().* = c;
                 self.markDirtyRange(start_pos, end_pos, "");
@@ -874,7 +907,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             const end_pos = self.lspPositionAt(&self.cur().pt, end);
             self.cur().history.beginGroup();
             if (end > c) {
-                try self.cur().history.record(pt, c, end - c, "");
+                try self.recordEdit(c, end - c, "");
             }
             self.state.mode = .insert;
             self.in_insert = true; // group stays open until exitInsert
@@ -901,7 +934,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             const start_pos = self.lspPositionAt(&self.cur().pt, start);
             const end_pos = self.lspPositionAt(&self.cur().pt, end);
             self.cur().history.beginGroup();
-            try self.cur().history.record(pt, start, end - start, "");
+            try self.recordEdit(start, end - start, "");
             self.state.mode = .insert;
             self.in_insert = true;
             self.markDirtyRange(start_pos, end_pos, "");
@@ -934,7 +967,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
                     swapped = buf[0] + 32;
                 }
                 if (swapped) |ch| {
-                    try self.cur().history.record(pt, c, 1, &.{ch});
+                    try self.recordEdit(c, 1, &.{ch});
                     self.curCursor().* = c + seq;
                 } else {
                     self.curCursor().* = c + seq;
@@ -965,16 +998,16 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             }
             self.cur().history.beginGroup();
             // remove the terminator; the next line now starts at term_start
-            try self.cur().history.record(pt, term_start, term_len, "");
+            try self.recordEdit(term_start, term_len, "");
             // collapse leading whitespace of the next line
             if (next_indent > 0) {
-                try self.cur().history.record(pt, term_start, next_indent, "");
+                try self.recordEdit(term_start, next_indent, "");
             }
             // join with a single space unless the first line is empty.
             // The next line's first char now sits at term_start; inserting
             // BEFORE it glues the lines.
             if (cur_text_len > 0) {
-                try self.cur().history.record(pt, term_start, 0, " ");
+                try self.recordEdit(term_start, 0, " ");
             }
             self.cur().history.endGroup();
             self.curCursor().* = @min(self.curCursor().*, pt.len());
@@ -994,7 +1027,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             while (l <= end_line) : (l += 1) {
                 const ls = pt.lineStart(l);
                 if (action == .indent_line) {
-                    try self.cur().history.record(pt, ls, 0, indent);
+                    try self.recordEdit(ls, 0, indent);
                 } else {
                     // remove up to 4 leading spaces/tabs
                     var removed: u32 = 0;
@@ -1002,7 +1035,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
                         if (ls >= pt.len()) break;
                         const b = pt.byteAt(ls);
                         if (b == ' ' or b == '\t') {
-                            try self.cur().history.record(pt, ls, 1, "");
+                            try self.recordEdit(ls, 1, "");
                         } else break;
                     }
                 }
@@ -1054,7 +1087,7 @@ pub fn replaceCharsAtCursor(self: *App, ch: u8, count: u32) !void {
         const seq = self.charLenAt(pt, c);
         if (seq != 1) break; // only replace single-byte chars
         if (pt.byteAt(c) != ch) {
-            try self.cur().history.record(pt, c, 1, &.{ch});
+            try self.recordEdit(c, 1, &.{ch});
         }
         c += 1;
     }

@@ -998,6 +998,15 @@ pub fn blameFg(t: Theme) Rgb {
     return legibleVirtual(t, t.fg_dim);
 }
 
+/// Active scope-range emphasis (the horizontal rule on the block header
+/// line). A dedicated quiet role, not a diagnostic tint: the palette's muted
+/// foreground blended with its accent, then lifted to the 3:1 legibility
+/// floor on every surface the header can land on (bg, cursorline, selection,
+/// float). Diagnostics are applied AFTER this and keep priority.
+pub fn scopeFg(t: Theme) Rgb {
+    return legibleVirtual(t, blend(t.fg_dim, t.accent_alt, 40));
+}
+
 /// Virtual text is smaller/quieter than source, but must stay identifiable.
 /// Blend the palette's muted role toward the main foreground until it clears
 /// 3:1 against every surface it can land on (editor, cursorline, selection,
@@ -1176,6 +1185,29 @@ test "themes: row background composition never lets search/cursorline hide selec
     try t.expectEqual(pal.bg_float, composeRowBg(pal, .float, true, false, .none));
     try t.expect(!std.mem.eql(u8, &searchBg(pal, .match).?, &pal.bg_sel));
     try t.expect(!std.mem.eql(u8, &searchBg(pal, .match).?, &searchBg(pal, .current).?));
+}
+
+test "themes: scope rule role is quiet, themed and not a diagnostic tint" {
+    const t = std.testing;
+    var first: ?Rgb = null;
+    var varied = false;
+    for (themes) |palette| {
+        const c = scopeFg(palette);
+        // Quiet structure, still visible on every surface the header can
+        // land on: editor, cursorline, selection and a float behind it.
+        try t.expect(contrastRatio(c, palette.bg) >= 3.0);
+        try t.expect(contrastRatio(c, palette.bg_curline) >= 3.0);
+        try t.expect(contrastRatio(c, palette.bg_sel) >= 3.0);
+        try t.expect(contrastRatio(c, palette.bg_float) >= 3.0);
+        // Never confusable with the diagnostic underlines that outrank it.
+        try t.expect(!std.mem.eql(u8, &c, &palette.diag_error));
+        try t.expect(!std.mem.eql(u8, &c, &palette.diag_warn));
+        try t.expect(!std.mem.eql(u8, &c, &palette.diag_info));
+        if (first) |f| {
+            if (!std.mem.eql(u8, &f, &c)) varied = true;
+        } else first = c;
+    }
+    try t.expect(varied); // palette-derived, not one hardcoded grey
 }
 
 test "themes: byName accepts unique prefixes and rejects ambiguity" {

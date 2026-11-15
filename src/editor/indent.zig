@@ -672,6 +672,38 @@ pub fn planEnter(
     return fallbackPlan(alloc, doc, cursor, preferredEnding(doc, cursor));
 }
 
+/// Normal o normally opens after the entire current line. The explicit
+/// empty-block contract is narrower: when the cursor is ON a code `{` and
+/// its matching same-line body is empty, expand that block and put the
+/// insertion point inside. Braces in strings/comments and other cursor
+/// columns keep ordinary open-below semantics.
+pub const OpenBelowPlan = struct {
+    pos: u32,
+    newline: NewlinePlan,
+};
+
+pub fn planOpenBelow(
+    alloc: std.mem.Allocator,
+    doc: []const u8,
+    cursor_in: u32,
+    ft: []const u8,
+    cfg: Config,
+) !OpenBelowPlan {
+    const cursor = @min(@as(usize, cursor_in), doc.len);
+    const line_start = lineStartOf(doc, cursor);
+    const line_end = lineContentEndOf(doc, line_start);
+    if (languageForFiletype(ft) == .brace and cursor < line_end and doc[cursor] == '{') {
+        var closer = cursor + 1;
+        while (closer < line_end and (doc[closer] == ' ' or doc[closer] == '\t')) closer += 1;
+        if (closer < line_end and doc[closer] == '}') {
+            if (try planBrace(alloc, doc, cursor + 1, cfg, ft)) |p| {
+                return .{ .pos = @intCast(cursor + 1), .newline = p };
+            }
+        }
+    }
+    return .{ .pos = @intCast(line_end), .newline = try planEnter(alloc, doc, @intCast(line_end), ft, cfg) };
+}
+
 // ========================= paste reindentation ============================
 
 /// Structural anchor for an insertion: the line the pasted text is attached
@@ -1487,4 +1519,25 @@ test "indent paste plan: structural blank line replaces only its indent prefix" 
     const saved = try applyPastePlan(alloc, doc, plan);
     defer alloc.free(saved);
     try testing.expectEqualStrings("fn f() {\n    if (ok) {\n        call();\n    }\n}\n", saved);
+}
+
+test "indent Normal o: only the selected empty code block expands" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { doc: []const u8, cursor: u32, ft: []const u8, tabs: bool = false, pos: u32, text: []const u8, offset: u32 }{
+        .{ .doc = "{}\n", .cursor = 0, .ft = "zig", .pos = 1, .text = "\n    \n", .offset = 5 },
+        .{ .doc = "{}\n", .cursor = 1, .ft = "zig", .pos = 2, .text = "\n", .offset = 1 },
+        .{ .doc = "\tif (x) {}\r\n", .cursor = 8, .ft = "zig", .tabs = true, .pos = 9, .text = "\r\n\t\t\r\n\t", .offset = 4 },
+        .{ .doc = "\"{}\"\n", .cursor = 1, .ft = "zig", .pos = 4, .text = "\n", .offset = 1 },
+        .{ .doc = "// {}\n", .cursor = 3, .ft = "zig", .pos = 5, .text = "\n", .offset = 1 },
+        .{ .doc = "{}\n", .cursor = 0, .ft = "md", .pos = 2, .text = "\n", .offset = 1 },
+        .{ .doc = "def f():\n", .cursor = 0, .ft = "py", .pos = 8, .text = "\n    ", .offset = 5 },
+        .{ .doc = "if (x) {\n}\n", .cursor = 7, .ft = "zig", .pos = 8, .text = "\n    ", .offset = 5 },
+    };
+    for (cases) |c| {
+        const p = try planOpenBelow(a, c.doc, c.cursor, c.ft, .{ .use_tabs = c.tabs });
+        defer a.free(p.newline.text);
+        try std.testing.expectEqual(c.pos, p.pos);
+        try std.testing.expectEqualStrings(c.text, p.newline.text);
+        try std.testing.expectEqual(c.offset, p.newline.cursor_after);
+    }
 }

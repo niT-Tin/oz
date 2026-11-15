@@ -13,27 +13,43 @@ const App = app_mod.App;
 /// Switch to the buffer at index `i` (clamped, wraps).
 pub fn switchTo(self: *App, i: usize) void {
     if (self.buffers.items.len == 0) return;
-    self.current = i % self.buffers.items.len;
-    // re-home the buffer the focused pane is leaving: if another pane
-    // still shows it, its tab moves to THAT pane ("displayed in which
-    // pane, the tab belongs to which pane"); hidden from every pane, it
-    // keeps this one — the pane that last showed it
-    const leaving = self.windows.items[self.current_win].buf;
-    if (leaving != self.current) {
+    const target = i % self.buffers.items.len;
+    const win = &self.windows.items[self.current_win];
+    const leaving = win.buf;
+    const changed = leaving != target;
+    if (changed) {
+        // Cursor/viewport belong to the (window, buffer) pair: save the
+        // position the focused pane is leaving before it starts showing the
+        // new document. Without this the shared window slot carried the old
+        // cursor, clamped to the new document length, in both directions.
+        self.saveWindowView(win);
+        // re-home the buffer the focused pane is leaving: if another pane
+        // still shows it, its tab moves to THAT pane ("displayed in which
+        // pane, the tab belongs to which pane"); hidden from every pane, it
+        // keeps this one — the pane that last showed it
         for (self.windows.items, 0..) |w, wi| {
             if (wi != self.current_win and w.buf == leaving) {
                 self.buffers.items[leaving].last_win = wi;
                 break;
             }
         }
+        // the focused window follows the switch; other split windows keep
+        // showing whatever buffer they had. This must happen BEFORE
+        // ensureLsp: cur() resolves through the window's buf index, so with
+        // the old order the server was started/retargeted against the
+        // PREVIOUS buffer — files opened via the tree / :e / the picker got
+        // no LSP session at all.
+        win.buf = target;
+        self.current = target;
+        // Restore this pane's last position in the target buffer (validated
+        // against the current document), or start at the top if it has
+        // never shown it.
+        self.restoreWindowView(win);
+    } else {
+        // Re-selecting the buffer already shown must not reset its position;
+        // only keep the cursor inside a document that shrank underneath it.
+        self.current = target;
     }
-    // the focused window follows the switch; other split windows keep
-    // showing whatever buffer they had. This must happen BEFORE
-    // ensureLsp: cur() resolves through the window's buf index, so with
-    // the old order the server was started/retargeted against the
-    // PREVIOUS buffer — files opened via the tree / :e / the picker got
-    // no LSP session at all.
-    self.windows.items[self.current_win].buf = self.current;
     // the buffer's tab belongs to the pane now showing it
     self.buffers.items[self.current].last_win = self.current_win;
     self.ensureLsp();
@@ -176,6 +192,8 @@ pub fn openInBuffer(self: *App, path: []const u8) !void {
         buf.history.deinit();
         buf.history = buffer.History.init(self.alloc);
         self.clearSpanCache(buf);
+        // Saved positions described the replaced scratch document.
+        buf.views.clear();
         buf.path = new_path;
         buf.disk = disk;
         own_loaded = false;
@@ -288,8 +306,12 @@ pub fn closeBufferAtForce(self: *App, buf_idx: usize, force: bool) void {
     for (self.windows.items) |*w| {
         if (w.buf > buf_idx) {
             w.buf -= 1;
+            w.cursor = @min(w.cursor, self.buffers.items[w.buf].pt.len());
         } else if (w.buf == buf_idx) {
             w.buf = self.current;
+            // the pane did not choose this buffer: install its own saved
+            // position there (or the top), not the closed buffer's cursor
+            self.restoreWindowView(w);
         }
     }
     self.winTreeSanity();

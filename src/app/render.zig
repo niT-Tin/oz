@@ -18,6 +18,7 @@ const term = @import("../term.zig");
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const nav_tabs = @import("navigator.zig");
+const gutter_model = @import("gutter.zig");
 const note_store = @import("note_store.zig");
 const autil = @import("util.zig");
 const chrome = @import("chrome.zig");
@@ -146,16 +147,18 @@ pub fn navigatorPeekActive(self: *App) bool {
         self.navigatorMode() == .compact;
 }
 
-/// Width of the relative-line-number gutter in cells: digits of the
-/// largest possible relative number (≤ the file's line count, since a
-/// relative number is a line offset) + one trailing space. Adaptive —
-/// narrow for small files (vim's relativenumber fits the digits).
+/// Adaptive numbers plus independent number/sign and sign/source padding.
+/// Every geometry consumer (render, wrap, mouse, cursor and popups) uses this.
 pub fn gutterWidth(self: *const App, line_count: u32) u32 {
     _ = self;
-    var digits: u32 = 1;
-    var n: u32 = line_count;
-    while (n >= 10) : (n /= 10) digits += 1;
-    return digits + 1;
+    return gutter_model.forLineCount(line_count).width;
+}
+
+/// Pane-aware width for every source-coordinate consumer. The nominal API
+/// above remains available to callers that only need the full layout.
+pub fn gutterWidthFor(self: *const App, line_count: u32, pane_width: u32) u32 {
+    _ = self;
+    return gutter_model.forPane(line_count, pane_width).width;
 }
 
 /// Display column (in cells) of `byte_pos` within `line`. vaxis renders a
@@ -574,7 +577,7 @@ fn displayRowsWithMarkdown(self: *App, win: vaxis.Window, buf: *Buffer, buf_inde
 pub const ScreenPos = struct { row: u32, col: u32 };
 pub fn focusedScreenPos(self: *App, win: vaxis.Window, rect: LeafRect, line: u32, pos: u32) ScreenPos {
     const buf = self.cur();
-    const cw: u32 = @max(rect.width -| self.gutterWidth(buf.pt.lineCount()), 1);
+    const cw: u32 = @max(rect.width -| self.gutterWidthFor(buf.pt.lineCount(), rect.width), 1);
     const md_layout = if (self.state.mode == .normal and !self.mc_active and !self.em_active and self.markdown_frame_buf == self.current)
         self.markdown_frame
     else
@@ -656,12 +659,13 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
     const cursor_line = buf.pt.lineOf(w.cursor);
     const line_count = buf.pt.lineCount();
     // relative-number gutter: computed once per frame per window
-    const gutter = self.gutterWidth(line_count);
-    const gutter_digits = gutter - 1;
+    const gutter_layout = gutter_model.forPane(line_count, rect.width);
+    const gutter = gutter_layout.width;
+    const gutter_digits = gutter_layout.number_columns;
     // text columns per screen row: soft wrap splits a line every
     // content_width cells (long lines wrap instead of clipping)
     const content_width: u32 = @max(rect.width -| gutter, 1);
-    if (rect.height == 0) return;
+    if (rect.height == 0 or rect.width == 0) return;
     const conceal_mode = self.state.mode == .normal and !self.mc_active and !self.em_active;
     const initial_rows = @min(rect.height, line_count -| w.view_top);
     _ = try self.visibleSpansFor(buf, a, w.view_top, initial_rows);
@@ -917,6 +921,15 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
             }
         }
     }
+    // ---- scope range emphasis (issue #14) ----
+    // The horizontal rule marks the ACTIVE scope's header line: its source
+    // cells from the structural indent to the end of the line's text. It is
+    // deliberately not the removed full-row SGR underline — gutter/indent
+    // guides, inlay hints, diagnostic virtual text and EOL padding never
+    // carry it, and it is clipped to this window. Only the keyboard-active
+    // window shows it (focus loss drops it next frame); diagnostics are
+    // merged AFTER this style, so their curly/dotted underline wins.
+    const scope_rule_on = self.scope_underline and is_focused and self.editorOwnsKeys() and has_scope;
 
     var span_i: usize = 0;
     var decor_i: usize = 0; // moving pointer into `decors` (rows ascend)
@@ -983,10 +996,13 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         const row_i: usize = (row - rect.row);
         const num_str = num_buf[row_i * gutter ..][0..gutter];
         @memset(num_str[0..gutter], ' ');
-        @memcpy(num_str[gutter_digits - num_raw.len .. gutter_digits], num_raw);
-        num_str[gutter - 1] = ' ';
+        if (gutter_digits > 0) {
+            // forPane either reserves every digit or hides the field.
+            std.debug.assert(num_raw.len <= gutter_digits);
+            @memcpy(num_str[gutter_digits - num_raw.len .. gutter_digits], num_raw);
+        }
 
-        // LSP diagnostic mark in the gutter's last column (this window
+        // LSP diagnostic mark in the gutter's dedicated sign column (this window
         // shows the current buffer → marks the current file's
         // diagnostics). Nerd Font icons (spec: 图标体系 = Nerd Font),
         // like nvim's diagnostic gutter: ✖ for errors, ⚠ warnings, ℹ
@@ -1142,8 +1158,11 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
             .{ .bg = .{ .rgb = self.theme.bg_curline }, .fg = .{ .rgb = self.theme.fg } }
         else
             .{ .bg = .{ .rgb = self.theme.bg_alt }, .fg = .{ .rgb = self.theme.fg_faint } };
-        try segs.append(a, .{ .text = num_str[0 .. gutter - 1], .style = cursorline_style });
-        try segs.append(a, .{ .text = num_str[gutter - 1 .. gutter], .style = cursorline_style });
+        const gutter_split = gutter -| 1;
+        // Always keep two segments: the wrap loop skips them, including
+        // when a one-cell pane has no number/sign gutter at all.
+        try segs.append(a, .{ .text = num_str[0..gutter_split], .style = cursorline_style });
+        try segs.append(a, .{ .text = num_str[gutter_split..gutter], .style = cursorline_style });
         if (md_source) |info| {
             if (info.prefix.len > 0) try segs.append(a, .{ .text = info.prefix, .style = .{
                 .fg = .{ .rgb = self.theme.fg_dim },
@@ -1208,28 +1227,42 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         var indent_cols: u32 = 0;
         var ib: u32 = 0;
         while (ib < indent_end) : (ib += 1) indent_cols += if (text[ib] == '\t') tab_width else 1;
-        if (indent_end > 0) {
+        // Source byte range of the scope-header rule. Starting at the end of
+        // the structural indent skips the guide cells; trailing whitespace is
+        // not source emphasis, so it is trimmed off the end (never below the
+        // first source byte).
+        var scope_from: u32 = 0;
+        var scope_to: u32 = 0;
+        if (scope_rule_on and line == scope_start_line and indent_end < n) {
+            scope_from = indent_end;
+            var scope_end = n;
+            while (scope_end > scope_from and (text[scope_end - 1] == ' ' or text[scope_end - 1] == '\t')) scope_end -= 1;
+            scope_to = scope_end;
+        }
+        {
             const indent_levels: u32 = indent_cols / tab_width;
-            // hints anchored at/inside the indent region render before it
-            // (normally none: hints annotate tokens, which start past the
-            // indent) — keeps the hint-before-text ordering of the main loop
-            while (hint_i < line_hints.len and line_hints[hint_i].character <= indent_end) {
-                const hint = line_hints[hint_i];
-                if (hint.label.len > 0) {
-                    const hint_sel = ib >= sel_s and ib < sel_e;
-                    try segs.append(a, .{
-                        .text = hint.label,
-                        .style = .{
-                            .fg = .{ .rgb = theme.hintFg(self.theme) },
-                            .bg = .{ .rgb = if (hint_sel) self.theme.bg_sel else if (is_cur_line) self.theme.bg_curline else self.theme.bg },
-                        },
-                    });
-                }
-                hint_i += 1;
-            }
-            var gcol: u32 = 0; // expanded column of the current indent cell
+            var gcol: u32 = 0; // source indentation cells, excluding hints
             ib = 0;
-            while (ib < indent_end) : (ib += 1) {
+            while (ib <= indent_end) : (ib += 1) {
+                // Interleave virtual text with the whitespace at its real
+                // byte anchor. A parameter hint at indent_end belongs AFTER
+                // the indent, while an anchor inside it splits the guides.
+                // The final iteration also handles BOL/empty-line anchors.
+                while (hint_i < line_hints.len and line_hints[hint_i].character <= ib) {
+                    const hint = line_hints[hint_i];
+                    if (hint.label.len > 0) {
+                        const hint_sel = ib >= sel_s and ib < sel_e;
+                        try segs.append(a, .{
+                            .text = hint.label,
+                            .style = .{
+                                .fg = .{ .rgb = theme.hintFg(self.theme) },
+                                .bg = .{ .rgb = if (hint_sel) self.theme.bg_sel else if (is_cur_line) self.theme.bg_curline else self.theme.bg },
+                            },
+                        });
+                    }
+                    hint_i += 1;
+                }
+                if (ib == indent_end) break;
                 const cell_w: u32 = if (text[ib] == '\t') tab_width else 1;
                 var j: u32 = 0;
                 while (j < cell_w) : (j += 1) {
@@ -1449,11 +1482,17 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
                 style.ul = f.ul;
                 style.ul_style = f.ul_style;
             }
-            // Scope emphasis stays in the guide column (highlighted below)
-            // and the cursor line surface. The old full-width SGR underline
-            // on the scope's first line read as a stray rule across the
-            // reading surface and leaked into later virtual text on terminals
-            // that only repaint changed cells; it is deliberately gone.
+            // Scope-header range emphasis (issue #14): underline only, so
+            // the syntax fg and the selection/cursorline bg survive. The
+            // segment is clipped exactly at the source end (no EOL padding),
+            // and diagnostics below overwrite this underline when they
+            // overlap — they always keep priority.
+            if (scope_to > scope_from and col < scope_to) {
+                const scope_style = chrome.scopeRangeStyle(self.theme);
+                style.ul = scope_style.ul;
+                style.ul_style = scope_style.ul_style;
+                if (next > scope_to) next = scope_to;
+            }
             const diagnostic_run = lsp_diag.rangeRun(diagnostic_ranges, col, n);
             next = @min(next, diagnostic_run.end);
             if (diagnostic_run.severity) |severity| diagnostic_ui.underline(self, &style, severity);
@@ -1615,30 +1654,32 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
                 break;
             }
         }
-        // diagnostic mark: writeCell AFTER the line print so the glyph is
-        // not overwritten by the gutter segment (on the line's FIRST row)
-        if (diag_mark.len > 1) { // Nerd Font icon (multi-byte); " " = none
-            var mark_style = cursorline_style;
-            if (diag_mark_fg) |f| mark_style.fg = f.fg;
-            win.writeCell(@intCast(rect.col + gutter - 1), @intCast(line_row), .{
-                .char = .{ .grapheme = diag_mark, .width = 1 },
-                .style = mark_style,
-            });
-        } else if (git_mark) |k| {
-            // git sign in the same cell (diagnostics win the priority).
-            // Glyphs: ▎ for added/modified, ▁/▔ half-blocks for deleted
-            // (signify-style markers on the neighbor lines).
-            var mark_style = cursorline_style;
-            if (git_mark_fg) |f| mark_style.fg = f.fg;
-            const glyph: []const u8 = switch (k) {
-                .added, .modified => "\u{258e}", // ▎ left half block
-                .removed_above => "\u{2581}", // ▁ lower eighth block
-                .removed_below => "\u{2594}", // ▔ upper eighth block
-            };
-            win.writeCell(@intCast(rect.col + gutter - 1), @intCast(line_row), .{
-                .char = .{ .grapheme = glyph, .width = 1 },
-                .style = mark_style,
-            });
+        if (gutter_layout.show_sign) {
+            // diagnostic mark: writeCell AFTER the line print so the glyph is
+            // not overwritten by the gutter segment (on the line's FIRST row)
+            if (diag_mark.len > 1) { // Nerd Font icon (multi-byte); " " = none
+                var mark_style = cursorline_style;
+                if (diag_mark_fg) |f| mark_style.fg = f.fg;
+                win.writeCell(@intCast(rect.col + gutter_layout.sign_column), @intCast(line_row), .{
+                    .char = .{ .grapheme = diag_mark, .width = 1 },
+                    .style = mark_style,
+                });
+            } else if (git_mark) |k| {
+                // git sign in the same cell (diagnostics win the priority).
+                // Glyphs: ▎ for added/modified, ▁/▔ half-blocks for deleted
+                // (signify-style markers on the neighbor lines).
+                var mark_style = cursorline_style;
+                if (git_mark_fg) |f| mark_style.fg = f.fg;
+                const glyph: []const u8 = switch (k) {
+                    .added, .modified => "\u{258e}", // ▎ left half block
+                    .removed_above => "\u{2581}", // ▁ lower eighth block
+                    .removed_below => "\u{2594}", // ▔ upper eighth block
+                };
+                win.writeCell(@intCast(rect.col + gutter_layout.sign_column), @intCast(line_row), .{
+                    .char = .{ .grapheme = glyph, .width = 1 },
+                    .style = mark_style,
+                });
+            }
         }
         if (md_info) |info| {
             const virtual_style: vaxis.Style = .{
@@ -2640,11 +2681,11 @@ pub fn drawRichPopup(
                     try kinds.append(a, 1);
                     in_fence = flang;
                     block_start = lines.items.len;
-                    } else {
-                        try kinds.append(a, 0);
-                    } else {
-                        try kinds.append(a, 0);
-                    }
+                } else {
+                    try kinds.append(a, 0);
+                } else {
+                    try kinds.append(a, 0);
+                }
             } else {
                 if (autil.isFenceLine(remaining[0..line_len]) != null) {
                     try kinds.append(a, 1);
@@ -3129,12 +3170,11 @@ fn completionLiteralRow(self: *App, a: std.mem.Allocator, win: vaxis.Window, tex
     return segs.toOwnedSlice(a);
 }
 
-/// One chunk of code/signature, syntax-highlighted in `lang` (falling back to
-/// the buffer language). Unknown languages stay plain fg rather than inventing
-/// token colors.
-fn completionCodeRow(self: *App, a: std.mem.Allocator, win: vaxis.Window, text: []const u8, lang: []const u8, width: u32) ![]vaxis.Segment {
-    _ = win;
-    var spans: []syntax.Span = &.{};
+/// Highlight one complete documentation code block with ONE tree-sitter
+/// Highlighter. The old per-line `completionCodeRow` created a parser/query/
+/// tree for every wrapped line, turning a 160-line fenced block into 160
+/// native parsers per frame (a multi-second stall on completion docs).
+fn completionBlockSpans(self: *App, a: std.mem.Allocator, text: []const u8, lang: []const u8) ![]syntax.Span {
     var hl: ?syntax.Highlighter = null;
     if (syntax.languageFor(lang)) |ln| hl = syntax.Highlighter.init(a, ln) catch null;
     if (hl == null) {
@@ -3162,9 +3202,69 @@ fn completionCodeRow(self: *App, a: std.mem.Allocator, win: vaxis.Window, text: 
             }
             try merged.append(a, sp);
         }
-        spans = try merged.toOwnedSlice(a);
+        return merged.toOwnedSlice(a);
     }
-    return self.hoverCodeLineSegs(a, text, 0, @intCast(text.len), spans, width);
+    return &.{};
+}
+
+/// One code row sliced out of a pre-highlighted block.
+fn completionCodeRowFromBlock(
+    self: *App,
+    a: std.mem.Allocator,
+    win: vaxis.Window,
+    block_text: []const u8,
+    line_start: u32,
+    line_end: u32,
+    spans: []const syntax.Span,
+    width: u32,
+) ![]vaxis.Segment {
+    _ = win;
+    return self.hoverCodeLineSegs(a, block_text, line_start, line_end, spans, width);
+}
+
+/// Append rows for one fenced code block (already collected as lines) using a
+/// single highlighter. Returns false when the row cap was reached.
+fn appendFencedBlockRows(
+    self: *App,
+    a: std.mem.Allocator,
+    win: vaxis.Window,
+    rows: *std.ArrayList([]vaxis.Segment),
+    lines: *std.ArrayList([]const u8),
+    lang: []const u8,
+    width: u32,
+) !bool {
+    if (lines.items.len == 0) return true;
+    var block = std.ArrayList(u8).empty;
+    // Do NOT deinit `block` here: the returned segment text slices reference
+    // this buffer and are drawn after this helper returns. The frame arena
+    // owns it until the frame ends (freeing it can rewind the arena and let
+    // later row allocations overwrite the text). `offsets` only holds numbers.
+    var offsets = std.ArrayList(u32).empty;
+    defer offsets.deinit(a);
+    for (lines.items) |line| {
+        try offsets.append(a, @intCast(block.items.len));
+        try block.appendSlice(a, line);
+        try block.append(a, '\n');
+    }
+    const spans = try completionBlockSpans(self, a, block.items, lang);
+    for (lines.items, offsets.items) |line, off| {
+        const chunks = try wrapCompletionLine(a, win, line, width);
+        for (chunks) |chunk| {
+            if (rows.items.len >= 256) return false;
+            const chunk_off = off + @as(u32, @intCast(@intFromPtr(chunk.ptr) - @intFromPtr(line.ptr)));
+            try rows.append(a, try completionCodeRowFromBlock(
+                self,
+                a,
+                win,
+                block.items,
+                chunk_off,
+                chunk_off + @as(u32, @intCast(chunk.len)),
+                spans,
+                width,
+            ));
+        }
+    }
+    return true;
 }
 
 /// Build the wrapped display rows for the completion documentation popup:
@@ -3193,10 +3293,25 @@ fn buildCompletionDocRows(
     const has_body = item.doc != null and item.doc.?.len > 0;
 
     if (sig) |sig_text| {
+        const sig_spans = try completionBlockSpans(self, a, sig_text, ft);
         var sig_lines = std.mem.splitScalar(u8, sig_text, '\n');
+        var line_off: u32 = 0;
         while (sig_lines.next()) |line| {
             const chunks = try wrapCompletionLine(a, win, line, width);
-            for (chunks) |chunk| try rows.append(a, try completionCodeRow(self, a, win, chunk, ft, width));
+            for (chunks) |chunk| {
+                const chunk_off = line_off + @as(u32, @intCast(@intFromPtr(chunk.ptr) - @intFromPtr(line.ptr)));
+                try rows.append(a, try completionCodeRowFromBlock(
+                    self,
+                    a,
+                    win,
+                    sig_text,
+                    chunk_off,
+                    chunk_off + @as(u32, @intCast(chunk.len)),
+                    sig_spans,
+                    width,
+                ));
+            }
+            line_off += @as(u32, @intCast(line.len)) + 1;
         }
         if (has_body) {
             // Divider between signature and prose; the signature is not lost
@@ -3216,6 +3331,8 @@ fn buildCompletionDocRows(
             while (body.len > 0 and (body[body.len - 1] & 0xC0) == 0x80) body = body[0 .. body.len - 1];
         }
         var in_fence: ?[]const u8 = null;
+        var fence_lines = std.ArrayList([]const u8).empty;
+        defer fence_lines.deinit(a);
         var line_it = std.mem.splitScalar(u8, body, '\n');
         // Bound per-frame layout work for pathological docs; 256 wrapped
         // rows is far more than the pane can show, and the pane still
@@ -3232,6 +3349,12 @@ fn buildCompletionDocRows(
                     if (in_fence == null) {
                         in_fence = lang;
                     } else {
+                        // Closing fence: highlight the whole block once.
+                        if (!try appendFencedBlockRows(self, a, win, &rows, &fence_lines, in_fence.?, width)) {
+                            truncated_rows = true;
+                            break;
+                        }
+                        fence_lines.clearRetainingCapacity();
                         in_fence = null;
                     }
                     // Fence markers are concealed: keep a blank row so the
@@ -3239,9 +3362,8 @@ fn buildCompletionDocRows(
                     try rows.append(a, try completionLiteralRow(self, a, win, "", width, .{ .bg = .{ .rgb = self.theme.bg_float } }));
                     continue;
                 }
-                if (in_fence) |lang| {
-                    const chunks = try wrapCompletionLine(a, win, line, width);
-                    for (chunks) |chunk| try rows.append(a, try completionCodeRow(self, a, win, chunk, lang, width));
+                if (in_fence != null) {
+                    try fence_lines.append(a, line);
                     continue;
                 }
                 const chunks = try wrapCompletionWords(a, win, line, width);
@@ -3252,6 +3374,9 @@ fn buildCompletionDocRows(
             // spaces so prose stays readable.
             const chunks = try wrapCompletionWords(a, win, line, width);
             for (chunks) |chunk| try rows.append(a, try completionLiteralRow(self, a, win, chunk, width, base));
+        }
+        if (in_fence) |lang| {
+            if (!try appendFencedBlockRows(self, a, win, &rows, &fence_lines, lang, width)) truncated_rows = true;
         }
         if (item.doc.?.len > 64 * 1024 or truncated_rows) {
             try rows.append(a, try completionLiteralRow(self, a, win, "… documentation truncated", width, dim));
@@ -3411,9 +3536,6 @@ pub fn render(self: *App) !void {
     // inlay hints, blame ghosts or soft-wrap row numbers. Internal byte,
     // UTF-16 and screen coordinates keep their own semantics.
     const status_col = self.lineCellCol(win, cursor_line, self.curCursor().*);
-    // relative-number gutter: computed once per frame, reused by the
-    // cursor offset, mc highlight and easymotion labels
-    const gutter = self.gutterWidth(line_count);
 
     // Label layers followed by one focused-editor context row. Vertical
     // splits share a label row; overlapping pane spans keep separate layers.
@@ -3655,6 +3777,7 @@ pub fn render(self: *App) !void {
         // M2.6a: labels + status indicator are the topmost layer, and must be
         // drawn after rail/filetree/dashboard before the frame is flushed.
         try self.drawHintOverlay(a, win);
+        try @import("filetree.zig").drawFiletreeCreate(self, a, win);
         hideInactiveMarkdownImages(self);
         try self.vx.render(self.tty.writer());
         return;
@@ -3676,6 +3799,8 @@ pub fn render(self: *App) !void {
         self.addMousePaneTarget(lr.win, lr.row, lr.col, lr.height, lr.width);
         try self.renderWindowLines(a, lr, false);
     }
+    // Cursor/overlays use the same focused-pane gutter as source and mouse.
+    const gutter = self.gutterWidthFor(line_count, cur_rect.width);
     self.addMousePaneTarget(cur_rect.win, cur_rect.row, cur_rect.col, cur_rect.height, cur_rect.width);
     try self.renderWindowLines(a, cur_rect, true);
     hideInactiveMarkdownImages(self);
@@ -3690,12 +3815,12 @@ pub fn render(self: *App) !void {
     for (layout.seps) |sep| {
         // A separator click is an explicit v1 no-op (no resize); its
         // 1-cell-thick rect wins over the adjacent pane by area.
-        self.addMouseSeparatorTarget(sep.row, sep.col, sep.len, sep.horizontal);
         const sep_style: vaxis.Style = .{
             .fg = .{ .rgb = if (sep.active) self.theme.win_sep_active else self.theme.win_sep },
             .bg = .{ .rgb = self.theme.bg },
         };
         if (sep.horizontal) {
+            self.addMouseSeparatorTarget(sep.row, sep.col, sep.len, true);
             var xs: u32 = 0;
             while (xs < sep.len) : (xs += 1) {
                 win.writeCell(@intCast(sep.col + xs), @intCast(sep.row), .{
@@ -3704,13 +3829,27 @@ pub fn render(self: *App) !void {
                 });
             }
         } else {
+            var segment_start: ?u32 = null;
             var ys: u32 = 0;
             while (ys < sep.len) : (ys += 1) {
+                const source_cell = blk: {
+                    for (leaves) |leaf| {
+                        if (leaf.width == 1 and leaf.col == sep.col and sep.row + ys >= leaf.row and sep.row + ys < leaf.row + leaf.height) break :blk true;
+                    }
+                    break :blk false;
+                };
+                if (source_cell) {
+                    if (segment_start) |start| self.addMouseSeparatorTarget(sep.row + start, sep.col, ys - start, false);
+                    segment_start = null;
+                    continue;
+                }
+                if (segment_start == null) segment_start = ys;
                 win.writeCell(@intCast(sep.col), @intCast(sep.row + ys), .{
                     .char = .{ .grapheme = "│", .width = 1 },
                     .style = sep_style,
                 });
             }
+            if (segment_start) |start| self.addMouseSeparatorTarget(sep.row + start, sep.col, sep.len - start, false);
         }
     }
 
@@ -4165,6 +4304,11 @@ pub fn render(self: *App) !void {
     // status bar (or command line in command mode)
     if (self.state.mode == .command) {
         self.drawStatusChrome(win);
+        if (self.pending_filetree_create != null) {
+            try @import("filetree.zig").drawFiletreeCreate(self, a, win);
+            try self.vx.render(self.tty.writer());
+            return;
+        }
         const prompt_char: []const u8 = switch (self.cmdline_kind) {
             .ex => ":",
             .search_fwd => "/",
@@ -4418,25 +4562,26 @@ pub fn render(self: *App) !void {
                 const icon = if (item.kind != 0) kindGlyph(item.kind) else " ";
                 max_icon = @max(max_icon, @as(u32, @intCast(autil.cellWidth(win, icon))));
             }
-            const budget: u32 = pane_width -| 4;
+            var doc_rows_list = try buildCompletionDocRows(self, a, win, &self.completion_words.items[self.completion_sel], @min(@as(u32, 64), pane_width -| 4));
+            const menu_budget = completion_layout.menuWidthBudget(pane_width, doc_rows_list.len > 0, 24);
+            const budget: u32 = menu_budget -| 4;
             // Keep the label identifiable before spending cells on detail
             // and description. The cap is a cell budget, not a byte count.
             var label_w = @min(max_label, @min(@as(u32, 46), budget -| 4));
             var detail_w = @min(max_detail, @min(@as(u32, 34), budget -| (max_icon + 1 + label_w + 2)));
             var desc_w = @min(max_desc, @min(@as(u32, 20), budget -| (max_icon + 1 + label_w + detail_w + 2)));
             while (max_icon + 1 + label_w + (if (detail_w > 0) 1 + detail_w else 0) +
-                (if (desc_w > 0) 1 + desc_w else 0) + 2 > pane_width and label_w > 8)
+                (if (desc_w > 0) 1 + desc_w else 0) + 2 > menu_budget and label_w > 8)
             {
                 if (detail_w > 0) detail_w -= 1 else if (desc_w > 0) desc_w -= 1 else label_w -= 1;
             }
             const inner_cells: u32 = max_icon + 1 + label_w +
                 (if (detail_w > 0) 1 + detail_w else 0) +
                 (if (desc_w > 0) 1 + desc_w else 0);
-            const box_w = @min(inner_cells + 2, pane_width);
+            const box_w = @min(inner_cells + 2, menu_budget);
             // Joint menu/docs placement inside the focused pane. Doc rows
             // are wrapped at a provisional width, then rebuilt at the width
             // the planner actually granted (narrow pane/split/Agent rail).
-            var doc_rows_list = try buildCompletionDocRows(self, a, win, &self.completion_words.items[self.completion_sel], @min(@as(u32, 64), pane_width -| 4));
             var lp = completion_layout.plan(.{
                 .pane = .{ .row = cur_rect.row, .col = cur_rect.col, .width = cur_rect.width, .height = cur_rect.height },
                 .cursor_row = cur_rect.row + c_sp.row,
@@ -5018,6 +5163,7 @@ pub fn render(self: *App) !void {
             .col = @intCast(self.nav_float_col + 1),
         };
     } else {
+        editor_cursor_hidden = cur_rect.width == 0 or cur_rect.height == 0;
         // The row is recorded while painting the cursorline itself, so
         // markdown virtual rows can never make the terminal cursor and the
         // highlighted source row disagree. Columns still use byte-to-cell
@@ -5036,8 +5182,8 @@ pub fn render(self: *App) !void {
             }
         }
         self.vx.screen.cursor = .{
-            .row = @intCast(@min(cursor_row, cur_rect.row + cur_rect.height -| 1)),
-            .col = @intCast(cursor_col),
+            .row = @intCast(@min(@min(cursor_row, cur_rect.row + cur_rect.height -| 1), win.height -| 1)),
+            .col = @intCast(@min(cursor_col, win.width -| 1)),
         };
     }
     self.vx.screen.cursor_vis = !editor_cursor_hidden;
@@ -5318,6 +5464,11 @@ pub fn run(self: *App) !void {
                     if (!self.pasting) continue;
                     self.pasting = false;
                     if (term_focused) continue; // child got the keys already
+                    if (self.pending_filetree_create != null) {
+                        try @import("filetree.zig").filetreeCreatePaste(self, self.paste_buf.items);
+                        self.paste_buf.clearRetainingCapacity();
+                        continue;
+                    }
                     if (self.inlinePromptOpen()) {
                         try self.inlinePaste(self.paste_buf.items);
                         self.paste_buf.clearRetainingCapacity();
@@ -5352,7 +5503,9 @@ pub fn run(self: *App) !void {
                             }
                         }
                     }
-                    if (self.inlinePromptOpen()) {
+                    if (self.pending_filetree_create != null) {
+                        try @import("filetree.zig").filetreeCreatePaste(self, text);
+                    } else if (self.inlinePromptOpen()) {
                         try self.inlinePaste(text);
                     } else if (self.ai.rail_open and self.ai.focus != .editor) {
                         try self.aiPaste(text);

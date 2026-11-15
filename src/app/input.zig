@@ -17,6 +17,7 @@ const isWordByte = App.isWordByte;
 // ---- input ----
 
 pub fn handleKey(self: *App, key: vaxis.Key) !void {
+    if (key.codepoint != 'g') self.filetree_pending_g = false;
     // Observe the completion context BEFORE dispatch. Any key that changes
     // it (movement, Esc/re-enter, typing) bumps the epoch so a response
     // requested for the old state is rejected even if the cursor later
@@ -278,7 +279,7 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
             while (i > 0) {
                 i -= 1;
                 const pos = self.mc.cursors.items[i];
-                try self.cur().history.record(&self.cur().pt, pos, wlen, "");
+                try self.recordEdit(pos, wlen, "");
             }
             self.cur().history.endGroup();
             // LSP sync (same rule as every other edit): the server's
@@ -402,7 +403,7 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
             // Esc exit and text entry behave as usual.
             const is_comp_input = key.text != null and key.text.?.len > 0 and
                 !key.mods.ctrl and !key.mods.alt and !key.mods.super and
-                (isWordByte(key.text.?[0]) or self.isCompletionTriggerText(key.text.?));
+                (isWordByte(key.text.?[0]) or self.isCompletionTriggerText(key.text.?) or self.completion_path or key.text.?[0] == '/' or key.text.?[0] == '~');
             if (!is_comp_input) self.closeCompletion();
         }
         // Arrow keys move the cursor without leaving insert mode (up/down
@@ -462,7 +463,7 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
                     // LSP range in the PRE-EDIT document: [pos, pos+1).
                     const start_pos = self.lspPositionAt(&self.cur().pt, pos);
                     const end_pos = self.lspPositionAt(&self.cur().pt, pos + 1);
-                    try self.cur().history.record(&self.cur().pt, pos, 1, "");
+                    try self.recordEdit(pos, 1, "");
                     self.curCursor().* = pos;
                     // The 'j' was shift-adjusted INTO the hints when it
                     // was inserted (adjustInlayHintsInsert +1); removing
@@ -561,8 +562,8 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
             // jk is the insert-exit shortcut, and asking the server on
             // the 'j' alone makes the menu flash between 'j' and 'k'.
             if (!key.mods.ctrl and !key.mods.alt and !key.mods.super and
-                key.codepoint != 'j' and
-                (isWordByte(text[0]) or self.isCompletionTriggerText(text)))
+                (key.codepoint != 'j' or self.completion_path) and
+                (isWordByte(text[0]) or self.isCompletionTriggerText(text) or self.completion_path or text[0] == '/' or text[0] == '~'))
             {
                 try self.maybeAutoComplete(text);
             }

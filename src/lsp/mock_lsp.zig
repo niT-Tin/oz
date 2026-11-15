@@ -102,16 +102,23 @@ pub const Script = enum {
     /// the undo replacement-start regression (the old transform underflowed
     /// when removed > offset).
     inlay_param,
+    inlay_indent,
     /// Progressive completion fixture: `lines` (sortText "a") and `line`
     /// (sortText "b"), docs tagged with the response generation. Typing "l"
     /// ranks lines first; typing the full "line" makes exact line best. Used
     /// to separate default-best selection from an explicit Ctrl+n selection
     /// across refreshes.
     completion_progressive,
+    /// Performance fixture: one item with a large Markdown body containing a
+    /// 160-line zig fenced block. Used to profile/document the per-frame
+    /// documentation layout cost while the completion menu is open.
+    completion_bulk_docs,
+    completion_fenced_edges,
     /// Rich completion-only fixture: labelDetails (detail + description),
     /// display label != insertText, markdown/plaintext docs, a long
     /// scrollable body, duplicate labels and detail-only/no-docs items.
     completion_rich,
+    completion_duplicates,
     /// Initial items without docs; completionProvider.resolveProvider=true.
     /// Resolve refines detail/documentation for the selected item.
     completion_resolve,
@@ -147,8 +154,12 @@ pub const Script = enum {
         if (std.mem.eql(u8, name, "hover_cap")) return .hover_cap;
         if (std.mem.eql(u8, name, "completion_order")) return .completion_order;
         if (std.mem.eql(u8, name, "inlay_param")) return .inlay_param;
+        if (std.mem.eql(u8, name, "inlay_indent")) return .inlay_indent;
         if (std.mem.eql(u8, name, "completion_progressive")) return .completion_progressive;
+        if (std.mem.eql(u8, name, "completion_bulk_docs")) return .completion_bulk_docs;
+        if (std.mem.eql(u8, name, "completion_fenced_edges")) return .completion_fenced_edges;
         if (std.mem.eql(u8, name, "completion_rich")) return .completion_rich;
+        if (std.mem.eql(u8, name, "completion_duplicates")) return .completion_duplicates;
         if (std.mem.eql(u8, name, "completion_resolve")) return .completion_resolve;
         if (std.mem.eql(u8, name, "completion_resolve_hold")) return .completion_resolve_hold;
         if (std.mem.eql(u8, name, "completion_resolve_error")) return .completion_resolve_error;
@@ -309,14 +320,20 @@ pub fn handleMessage(
                 }
             }
             const prefix = completionPrefix(a, state, uri, line, col);
-            const result = if (script == .completion_order)
+            const result = if (script == .completion_fenced_edges)
+                try buildFencedEdgeCompletionResult(a)
+            else if (script == .completion_bulk_docs)
+                try buildBulkDocsCompletionResult(a)
+            else if (script == .completion_order)
                 try buildOrderCompletionResult(a)
             else if (script == .inlay_param)
                 try buildInlayParamCompletionResult(a)
             else if (script == .completion_progressive) blk: {
                 state.progressive_requests += 1;
                 break :blk try buildProgressiveCompletionResult(a, state.progressive_requests);
-            } else if (script == .completion_rich)
+            } else if (script == .completion_duplicates)
+                try buildDuplicateCompletionResult(a)
+            else if (script == .completion_rich)
                 try buildRichCompletionResult(a, prefix)
             else if (script == .signature_lifecycle)
                 try buildLifecycleCompletionResult(a)
@@ -435,6 +452,8 @@ pub fn handleMessage(
                     state.inlay_answered = true;
                     try pushResponse(alloc, &out, id, try buildEolInlayResult(a, state, msg.params));
                 }
+            } else if (script == .inlay_indent) {
+                try pushResponse(alloc, &out, id, try buildIndentInlayResult(a));
             } else if (script == .inlay_param) {
                 try pushResponse(alloc, &out, id, try buildInlayParamHintResult(a));
             } else {
@@ -822,6 +841,33 @@ fn buildInlayParamHintResult(a: std.mem.Allocator) !std.json.Value {
     return .{ .array = items };
 }
 
+/// Fixed UTF-16 anchors on the indentation fixture, including real parameter
+/// positions and adversarial anchors inside/before whitespace.
+fn buildIndentInlayResult(a: std.mem.Allocator) !std.json.Value {
+    const Spec = struct { line: i64, character: i64, label: []const u8 };
+    const specs = [_]Spec{
+        .{ .line = 2, .character = 8, .label = "T: " },
+        .{ .line = 3, .character = 8, .label = "expected: " },
+        .{ .line = 4, .character = 2, .label = "actual: " },
+        .{ .line = 6, .character = 2, .label = "MID: " },
+        .{ .line = 7, .character = 0, .label = "ZERO: " },
+        .{ .line = 8, .character = 4, .label = "AB: " },
+        .{ .line = 8, .character = 4, .label = "CD: " },
+        .{ .line = 9, .character = 12, .label = "NEXT: " },
+    };
+    var items = std.json.Array.init(a);
+    for (specs) |spec| {
+        var pos = try std.json.ObjectMap.init(a, &.{}, &.{});
+        try pos.put(a, "line", .{ .integer = spec.line });
+        try pos.put(a, "character", .{ .integer = spec.character });
+        var hint = try std.json.ObjectMap.init(a, &.{}, &.{});
+        try hint.put(a, "position", .{ .object = pos });
+        try hint.put(a, "label", .{ .string = spec.label });
+        try items.append(.{ .object = hint });
+    }
+    return .{ .array = items };
+}
+
 /// completion_progressive: two prefix-related items where the best match
 /// changes with the typed prefix, while both identities stay selectable.
 /// Initial order (typed "l") is `lines` (sortText a) then `line` (b); typing
@@ -853,6 +899,55 @@ fn buildProgressiveCompletionResult(a: std.mem.Allocator, generation: u32) !std.
     return .{ .object = result };
 }
 
+/// completion_bulk_docs: one item whose documentation has a 160-line fenced
+/// code block (bounded by the editor's 64 KiB / 256-row doc cap).
+fn buildBulkDocsCompletionResult(a: std.mem.Allocator) !std.json.Value {
+    var items = std.json.Array.init(a);
+    var it = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try it.put(a, "label", .{ .string = "std_bulk" });
+    try it.put(a, "filterText", .{ .string = "std_bulk" });
+    try it.put(a, "insertText", .{ .string = "std_bulk" });
+    try it.put(a, "kind", .{ .integer = 6 });
+    try it.put(a, "detail", .{ .string = "fn std_bulk() void" });
+    var doc_text = std.ArrayList(u8).empty;
+    // No deinit here: the result's `value` slice is encoded after this
+    // builder returns, and the handler's arena is the owner until then.
+    try doc_text.appendSlice(a, "BULK_DOC_START\n```zig\n");
+    var i: usize = 0;
+    while (i < 160) : (i += 1) {
+        var line_buf: [96]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "const value_{d}: usize = {d};\n", .{ i, i });
+        try doc_text.appendSlice(a, line);
+    }
+    try doc_text.appendSlice(a, "```\nBULK_DOC_END");
+    var doc = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try doc.put(a, "kind", .{ .string = "markdown" });
+    try doc.put(a, "value", .{ .string = doc_text.items });
+    try it.put(a, "documentation", .{ .object = doc });
+    try items.append(.{ .object = it });
+    var result = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try result.put(a, "items", .{ .array = items });
+    return .{ .object = result };
+}
+
+/// Adversarial block slicing: CRLF, multiple blocks, UTF-8 and an unclosed
+/// final fence must retain their own source offsets after batch highlighting.
+fn buildFencedEdgeCompletionResult(a: std.mem.Allocator) !std.json.Value {
+    var it = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try it.put(a, "label", .{ .string = "std_fenced" });
+    try it.put(a, "kind", .{ .integer = 3 });
+    try it.put(a, "detail", .{ .string = "fn std_fenced() void" });
+    var doc = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try doc.put(a, "kind", .{ .string = "markdown" });
+    try doc.put(a, "value", .{ .string = "FENCE_EDGE_START\r\n```zig\r\nconst first = \"中😀\";\r\n```\r\nAFTER_FIRST\r\n```zig\r\nconst second = 2;\r\n```\r\nAFTER_SECOND\r\n```zig\r\nconst last = \"EDGE_UNCLOSED_LAST\";" });
+    try it.put(a, "documentation", .{ .object = doc });
+    var items = std.json.Array.init(a);
+    try items.append(.{ .object = it });
+    var result = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try result.put(a, "items", .{ .array = items });
+    return .{ .object = result };
+}
+
 /// Completion ordering fixture: the exact server order from the report, each
 /// item accepting a distinct insertText.
 fn buildOrderCompletionResult(a: std.mem.Allocator) !std.json.Value {
@@ -870,6 +965,16 @@ fn buildOrderCompletionResult(a: std.mem.Allocator) !std.json.Value {
     var result = try std.json.ObjectMap.init(a, &.{}, &.{});
     try result.put(a, "items", .{ .array = items });
     return .{ .object = result };
+}
+
+fn buildDuplicateCompletionResult(a: std.mem.Allocator) !std.json.Value {
+    var items = std.json.Array.init(a);
+    for ([_][]const u8{ "A", "A", "B" }) |variant| {
+        const insert = try std.fmt.allocPrint(a, "duplicateProbe_{s}", .{variant});
+        const doc = try std.fmt.allocPrint(a, "DEDUP_{s}_DOC", .{variant});
+        try items.append(try richCompletionItem(a, "duplicateProbe", 6, insert, variant, "variable", null, "plaintext", doc));
+    }
+    return .{ .array = items };
 }
 
 fn buildRichCompletionResult(a: std.mem.Allocator, prefix: []const u8) !std.json.Value {

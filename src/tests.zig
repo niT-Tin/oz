@@ -22,6 +22,7 @@ pub const edit_range = @import("editor/edit_range.zig");
 pub const line_open = @import("editor/line_open.zig");
 // language-aware Enter/paste indentation (pure; app/lsp_edit.zig + paste glue)
 pub const indent = @import("editor/indent.zig");
+pub const auto_pair = @import("editor/auto_pair.zig");
 pub const ex_command = @import("editor/ex_command.zig");
 pub const text_object = @import("editor/text_object.zig");
 pub const surround = @import("editor/surround.zig");
@@ -62,8 +63,12 @@ pub const app_completion_layout = @import("app/completion_layout.zig");
 pub const app_completion_context = @import("app/completion_context.zig");
 // undo/redo inlay-anchor transforms (pure; app/highlight.zig wires them)
 pub const app_inlay_history = @import("app/inlay_history.zig");
+// per-(window, buffer) cursor/viewport save/restore + document clamping
+pub const app_view_state = @import("app/view_state.zig");
 // M2b1 navigator tabs + note store (pure; app/notes.zig is e2e-tested)
 pub const app_navigator = @import("app/navigator.zig");
+pub const app_filetree_create = @import("app/filetree_create.zig");
+pub const app_gutter = @import("app/gutter.zig");
 pub const app_note_store = @import("app/note_store.zig");
 // M2b2 inline assistant (pure request/diff/pending model; app/inline_ui.zig is e2e-tested)
 pub const app_inline = @import("app/inline.zig");
@@ -104,3 +109,5 @@ test {
 pub const ai_acp = @import("ai/acp.zig");
 
 pub const app_wrap = @import("app/wrap.zig");
+
+pub const editor_path_completion = @import("editor/path_completion.zig");

@@ -4,6 +4,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const term = @import("../term.zig");
 const theme_mod = @import("../theme.zig");
+const chrome = @import("chrome.zig");
 
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
@@ -17,6 +18,10 @@ const status_row_count = app_mod.status_row_count;
 pub const TermPane = if (term.supported) struct {
     t: *term.Terminal,
     layout: term.Layout = .floating,
+    /// The pane is drawn and receives pointer hits only while visible. The
+    /// session itself (child, cwd, env, history, jobs) stays alive while
+    /// hidden, and `focused` must be false whenever `visible` is false.
+    visible: bool = true,
     focused: bool = false,
     /// Duped from .title_change events (widget events borrow its own
     /// buffer, unsafe across frames).
@@ -47,10 +52,13 @@ pub fn termRect(self: *App, a: std.mem.Allocator) term.Rect {
     const top = self.contentTop(a);
     const avail_rows = win.height -| status_row_count -| top;
     const tp = &self.term_pane.?;
-    return switch (tp.layout) {
+    const r: term.Rect = switch (tp.layout) {
         .floating => blk: {
-            const w = @max(40, @min(win.width * 8 / 10, win.width));
-            const h = @max(12, @min(avail_rows * 6 / 10, avail_rows));
+            // The minimums are caps too: a narrow window must not compute a
+            // rect wider/taller than the screen (the old @max(40, ...) made
+            // every sub-40-column float skip drawing entirely).
+            const w = @min(win.width, @max(40, win.width * 8 / 10));
+            const h = @min(avail_rows, @max(12, avail_rows * 6 / 10));
             break :blk .{
                 .x = (win.width - w) / 2,
                 .y = top + (avail_rows - h) / 3,
@@ -58,41 +66,114 @@ pub fn termRect(self: *App, a: std.mem.Allocator) term.Rect {
                 .h = h,
             };
         },
-        .bottom => .{
-            .x = 0,
-            .y = win.height -| status_row_count -| @max(8, @min((win.height -| status_row_count) * 3 / 10, win.height -| status_row_count)),
-            .w = win.width,
-            .h = @max(8, @min((win.height -| status_row_count) * 3 / 10, win.height -| status_row_count)),
+        .bottom => blk: {
+            const h = @min(avail_rows, @max(8, (win.height -| status_row_count) * 3 / 10));
+            break :blk .{
+                .x = 0,
+                .y = win.height -| status_row_count -| h,
+                .w = win.width,
+                .h = h,
+            };
         },
-        .right => .{
-            .x = win.width -| @max(30, @min(win.width * 4 / 10, win.width -| 1)),
-            .y = top,
-            .w = @max(30, @min(win.width * 4 / 10, win.width -| 1)),
-            .h = avail_rows,
+        .right => blk: {
+            const w = @min(win.width, @max(30, win.width * 4 / 10));
+            break :blk .{
+                .x = win.width - w,
+                .y = top,
+                .w = w,
+                .h = avail_rows,
+            };
         },
     };
+    // Too small to hold a border plus even one PTY cell: callers skip it
+    // (drawTerm then leaves the editor untouched rather than painting a
+    // zero/negative-size child).
+    if (r.w < 3 or r.h < 3) return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+    return r;
+}
+
+/// Draw the themed outer frame around the terminal's rect. The frame is the
+/// visual boundary of the float/strip: a `bg_float` plate, a focus-aware
+/// border and an `oz terminal` title. The child grid is drawn afterwards
+/// into the interior, so the border never covers PTY content.
+fn drawTermFrame(self: *App, win: vaxis.Window, r: term.Rect, focused: bool) !void {
+    const t = self.theme;
+    const bg: vaxis.Color = .{ .rgb = t.bg_float };
+    const outer = win.child(.{
+        .x_off = @intCast(r.x),
+        .y_off = @intCast(r.y),
+        .width = @intCast(r.w),
+        .height = @intCast(r.h),
+    });
+    outer.fill(.{ .style = .{ .bg = bg } });
+    const border = chrome.panelBorderStyle(t, focused, bg);
+    const title_style: vaxis.Style = .{
+        .fg = .{ .rgb = if (focused) t.accent else t.fg_dim },
+        .bg = bg,
+        .bold = focused,
+    };
+    const cell = struct {
+        fn at(grapheme: []const u8, style: vaxis.Style) vaxis.Cell {
+            return .{ .char = .{ .grapheme = grapheme, .width = 1 }, .style = style };
+        }
+    }.at;
+
+    const w = outer.width;
+    const h = outer.height;
+    if (w < 3 or h < 3) return;
+    // Top edge: `╭─ oz terminal ────╮` when the title fits, a plain rule
+    // otherwise (40-column layouts still get a complete box).
+    const title = "oz terminal";
+    const title_len: u16 = @intCast(title.len);
+    outer.writeCell(0, 0, cell("╭", border));
+    outer.writeCell(w - 1, 0, cell("╮", border));
+    var col: u16 = 1;
+    while (col + 1 < w) : (col += 1) outer.writeCell(col, 0, cell("─", border));
+    if (w >= title_len + 6) {
+        outer.writeCell(1, 0, cell("─", border));
+        outer.writeCell(2, 0, cell(" ", title_style));
+        var i: u16 = 0;
+        while (i < title_len) : (i += 1) {
+            outer.writeCell(3 + i, 0, cell(title[i .. i + 1], title_style));
+        }
+        outer.writeCell(3 + title_len, 0, cell(" ", title_style));
+    }
+    // Sides + bottom edge.
+    var row: u16 = 1;
+    while (row + 1 < h) : (row += 1) {
+        outer.writeCell(0, row, cell("│", border));
+        outer.writeCell(w - 1, row, cell("│", border));
+    }
+    outer.writeCell(0, h - 1, cell("╰", border));
+    outer.writeCell(w - 1, h - 1, cell("╯", border));
+    col = 1;
+    while (col + 1 < w) : (col += 1) outer.writeCell(col, h - 1, cell("─", border));
 }
 
 /// Draw the terminal overlay (bottom/right/floating all overlay the
 /// buffer area; the panes do not shrink). Called on the dashboard too
 /// (its early return would skip the normal path). resize() no-ops when
-/// unchanged; draw() is cheap when nothing changed.
+/// unchanged; draw() is cheap when nothing changed. Hidden sessions are
+/// not drawn, but the app loop keeps polling their events.
 pub fn drawTerm(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
     if (!term.supported) return;
     if (self.term_pane) |*tp| {
+        if (!tp.visible) return;
         const r = self.termRect(a);
-        if (r.w > 0 and r.h > 0 and r.w <= win.width and r.h <= win.height) {
-            try tp.t.resize(@intCast(r.h), @intCast(r.w));
-            const sub = win.child(.{
-                .x_off = @intCast(r.x),
-                .y_off = @intCast(r.y),
-                .width = @intCast(r.w),
-                .height = @intCast(r.h),
-            });
-            try tp.t.draw(sub);
-            restyleTerm(sub, self.theme);
-            if (!tp.focused) sub.hideCursor();
-        }
+        const inner = term.frameInnerRect(r);
+        if (r.w == 0 or r.h == 0) return;
+        if (inner.w == 0 or inner.h == 0) return;
+        try tp.t.resize(@intCast(inner.h), @intCast(inner.w));
+        try drawTermFrame(self, win, r, tp.focused);
+        const sub = win.child(.{
+            .x_off = @intCast(inner.x),
+            .y_off = @intCast(inner.y),
+            .width = @intCast(inner.w),
+            .height = @intCast(inner.h),
+        });
+        try tp.t.draw(sub);
+        restyleTerm(sub, self.theme);
+        if (!tp.focused) sub.hideCursor();
     }
 }
 
@@ -125,27 +206,45 @@ fn restyleTerm(sub: vaxis.Window, t: theme_mod.Theme) void {
     }
 }
 
-/// <M-r>/<M-w>/<M-e>: toggle the terminal in `layout`. The same key
-/// again closes it (spec: 开关); a different layout key switches the
-/// placement of the SAME session (spec: 可复用会话) and refocuses it.
+/// <M-r>/<M-w>/<M-e>: toggle the terminal in `layout`. Visibility/focus/
+/// layout changes never destroy the session: the same shell (cwd/env/
+/// history/jobs) is hidden, shown or moved. Only `<M-r>` on a visible,
+/// focused pane hides it; a layout key moves the same session; from the
+/// editor a visible-but-unfocused pane is refocused. `closeTerm` remains the
+/// explicit destroy path (child exit / app shutdown).
 pub fn toggleTerm(self: *App, layout: term.Layout) !void {
     if (!term.supported) return;
     if (self.term_pane) |*tp| {
-        if (tp.layout == layout) {
-            self.closeTerm();
-        } else {
-            tp.layout = layout;
-            tp.focused = true;
+        switch (term.toggleAction(true, tp.visible, tp.focused, tp.layout == layout)) {
+            .create => unreachable,
+            .relayout => {
+                tp.layout = layout;
+                tp.visible = true;
+                tp.focused = true;
+            },
+            .show => {
+                tp.visible = true;
+                tp.focused = true;
+            },
+            .hide => {
+                // Keep the child + reader draining; only the presentation
+                // and keyboard focus go away.
+                tp.visible = false;
+                tp.focused = false;
+            },
+            .focus => {
+                tp.visible = true;
+                tp.focused = true;
+            },
         }
         return;
     }
     const shell = self.env_map.get("SHELL") orelse "/bin/sh";
     const t = term.Terminal.create(self.io, self.alloc, &.{shell}, self.env_map, .{
         .winsize = .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 },
-        // vaxis's scrollback is a TODO (its copyTo can't render it);
-        // 0 keeps the back screen the same size as the front so line
-        // scrolling works
-        .scrollback_size = 0,
+        // Bounded primary-screen history rendered by the terminal viewport
+        // (wheel / Shift+PageUp&Dn); the visible back screen stays rows tall.
+        .scrollback_size = term.scrollback_lines,
         .initial_working_directory = self.termCwd(),
     }) catch |e| {
         const m = std.fmt.allocPrint(self.alloc, "terminal: {s}", .{@errorName(e)}) catch return;
@@ -178,6 +277,22 @@ pub fn handleTerminalKey(self: *App, key: vaxis.Key) !void {
         tp.focused = false;
         return;
     }
+    // Shift+PageUp/Down are local terminal-history shortcuts: they never go
+    // to the child as input. PageUp/PageDown without Shift still belong to
+    // the program/shell.
+    if (key.mods.shift) {
+        switch (key.codepoint) {
+            vaxis.Key.page_up => {
+                _ = tp.t.scrollPageUp();
+                return;
+            },
+            vaxis.Key.page_down => {
+                _ = tp.t.scrollPageDown();
+                return;
+            },
+            else => {},
+        }
+    }
     if (key.mods.alt) {
         switch (key.codepoint) {
             'r' => return self.toggleTerm(.floating),
@@ -198,15 +313,13 @@ pub fn launchLazygit(self: *App) void {
     if (term.supported) {
         if (self.term_pane) |*tp| {
             tp.layout = .floating;
+            tp.visible = true;
             tp.focused = true;
             return;
         }
         const t = term.Terminal.create(self.io, self.alloc, &.{"lazygit"}, self.env_map, .{
             .winsize = .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 },
-            // vaxis's scrollback is a TODO (its copyTo can't render it);
-            // 0 keeps the back screen the same size as the front so line
-            // scrolling works
-            .scrollback_size = 0,
+            .scrollback_size = term.scrollback_lines,
             .initial_working_directory = self.termCwd(),
         }) catch |e| {
             const m = std.fmt.allocPrint(self.alloc, "lazygit: {s}", .{@errorName(e)}) catch return;

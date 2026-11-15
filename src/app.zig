@@ -21,6 +21,7 @@ const git = @import("git.zig");
 const term = @import("term.zig");
 
 const autil = @import("app/util.zig");
+const app_view = @import("app/view_state.zig");
 const git_job = @import("app/git_job.zig");
 const app_ai = @import("app/ai.zig");
 const app_hints = @import("app/hints.zig");
@@ -229,10 +230,14 @@ pub const App = struct {
         /// start line. Kept PER BUFFER, not per window: two splits showing
         /// the same buffer share the fold state, so za in one split is
         /// visible in the other (folds are a property of the document view
-        /// of the buffer, like the dirty flag). Any edit clears the set
-        /// (markDirty) — line numbers drift after edits, and re-folding is
-        /// cheap; vim-style fold carryover across edits is out of scope.
-        folds: std.ArrayList(editor.fold.Range) = .empty,
+        /// of the buffer, like the dirty flag). Each entry carries an
+        /// explicit anchor + header signature; edits transform the set
+        /// (app/fold_edit.zig) instead of dropping it.
+        folds: std.ArrayList(editor.fold.Closed) = .empty,
+        /// Saved cursor/viewport per window that has shown this buffer (see
+        /// app/view_state.zig). Owned here so it travels with the buffer
+        /// across closes/workspace swaps and is freed with the document.
+        views: app_view.Store = .{},
         /// Cached syntax spans for this buffer's last-rendered visible byte
         /// range (owned; see SpanRangeCache). null until the first render.
         span_cache: ?SpanRangeCache = null,
@@ -254,6 +259,9 @@ pub const App = struct {
 
     /// One split window: which buffer it shows plus its own cursor/viewport.
     pub const Window = struct {
+        /// Stable identity for per-(window, buffer) saved views. List
+        /// indices shift on close, so they must never be used as keys.
+        id: u64 = 0,
         buf: usize = 0,
         cursor: u32 = 0,
         view_top: u32 = 0,
@@ -341,6 +349,10 @@ pub const App = struct {
     /// OZ_NO_ITALIC=1 keeps the palette but strips italic glyphs (fonts or
     /// terminals without a real italic variant still get a usable editor).
     italics_enabled: bool = true,
+    /// Scope-range emphasis (issue #14): the restrained horizontal underline
+    /// on the active block's header line. Default on; `OZ_NO_SCOPE_UNDERLINE=1`
+    /// opts out without touching the guide-column scope highlight.
+    scope_underline: bool = true,
     /// Theme when the theme picker opened — Esc restores it (no allocation;
     /// value copy, nothing to free in deinit).
     theme_saved: ?theme.Theme = null,
@@ -356,6 +368,8 @@ pub const App = struct {
     windows: std.ArrayList(Window) = .empty,
     win_root: ?*WinNode = null,
     current_win: usize = 0,
+    /// Monotonic identity source for split windows (see Window.id).
+    next_win_id: u64 = 1,
     markdown_frame: ?*const markdown.Layout = null,
     markdown_frame_buf: usize = std.math.maxInt(usize),
     markdown_images: std.StringHashMap(union(enum) { loaded: vaxis.Image, failed: void }),
@@ -482,6 +496,10 @@ pub const App = struct {
     // file tree (<leader>e)
     filetree_active: bool = false,
     filetree_sel: usize = 0,
+    /// Files owns its gg prefix; it never enters the editor motion state.
+    filetree_pending_g: bool = false,
+    /// Captured creation directory; command input belongs to the Files float.
+    pending_filetree_create: ?[]u8 = null,
     /// Scroll-window top for the sidebar: the selection moves freely inside
     /// the window; the window scrolls only when it crosses an edge.
     filetree_top: usize = 0,
@@ -671,6 +689,10 @@ pub const App = struct {
 
     // insert-mode completion (Ctrl+n and auto-suggest on word chars)
     completion_active: bool = false,
+    completion_path: bool = false,
+    /// End of the existing basename for a path menu opened mid-component.
+    completion_path_end: u32 = 0,
+    completion_path_cache: @import("editor/path_completion.zig").Cache = .{},
     /// Owned candidate items (text + LSP kind for the menu icon).
     completion_words: std.ArrayList(lsp_nav.CompletionItem) = .empty,
     completion_sel: usize = 0,
@@ -869,6 +891,17 @@ pub const App = struct {
         return &self.buffers.items[self.windows.items[self.current_win].buf];
     }
 
+    /// True while the editor buffer owns the keyboard: the navigator, the AI
+    /// rail's prompt/thread list and a focused embedded terminal all take
+    /// precedence. Emphasis that marks "the active editing scope" yields
+    /// while another surface owns input; input routing itself is unchanged.
+    pub fn editorOwnsKeys(self: *App) bool {
+        if (self.focus != .buffer) return false;
+        if (self.ai.focus != .editor) return false;
+        if (term.supported) if (self.term_pane) |pane| if (pane.focused) return false;
+        return true;
+    }
+
     /// Monotonic milliseconds since boot for animation timing. Never used as
     /// a wall-clock/date; a clock adjustment merely shifts a phase (the pure
     /// helpers wrap negative values safely).
@@ -884,6 +917,44 @@ pub const App = struct {
     /// The focused window's viewport top (first visible line).
     pub fn curViewTop(self: *App) *u32 {
         return &self.windows.items[self.current_win].view_top;
+    }
+
+    /// Allocate the stable identity of a new split window.
+    pub fn newWindowId(self: *App) u64 {
+        const id = self.next_win_id;
+        self.next_win_id +%= 1;
+        if (self.next_win_id == 0) self.next_win_id = 1; // skip a wrapped id
+        return id;
+    }
+
+    /// Remember `w`'s cursor/viewport for the buffer it currently shows.
+    /// Best-effort: losing a saved position is not worth failing a switch.
+    pub fn saveWindowView(self: *App, w: *Window) void {
+        const buf = &self.buffers.items[w.buf];
+        buf.views.save(self.alloc, w.id, .{
+            .cursor = w.cursor,
+            .view_top = w.view_top,
+            .view_wrap = w.view_wrap,
+            .view_pinned = w.view_pinned,
+        }) catch {};
+    }
+
+    /// Install `w`'s saved position for the buffer it now shows, validated
+    /// against the current document. A window that has never shown this
+    /// buffer starts at the top — never at the previous buffer's cursor
+    /// clamped to the new document length.
+    pub fn restoreWindowView(self: *App, w: *Window) void {
+        const buf = &self.buffers.items[w.buf];
+        const snap = if (buf.views.get(w.id)) |s| app_view.clamp(&buf.pt, s) else app_view.Snapshot{};
+        w.cursor = snap.cursor;
+        w.view_top = snap.view_top;
+        w.view_wrap = snap.view_wrap;
+        w.view_pinned = snap.view_pinned;
+        // Fold state is per buffer and may have changed (or been dropped)
+        // while another document was shown: a hidden body is not a legal
+        // cursor/viewport line.
+        w.cursor = foldSnapPos(buf, w.cursor);
+        if (foldCovering(buf, w.view_top)) |f| w.view_top = f.start;
     }
 
     /// Height (in text rows) of the focused window's leaf rect. Runs the same
@@ -908,18 +979,18 @@ pub const App = struct {
     /// math as focusedWinHeight so H/M/L and zz/zt/zb count wrapped rows
     /// the way the renderer draws them.
     pub fn focusedContentWidth(self: *App) u32 {
-        const gutter = self.gutterWidth(self.cur().pt.lineCount());
+        const count = self.cur().pt.lineCount();
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const win = self.vx.window();
         const height: u32 = win.height;
-        if (height <= status_row_count) return @max(win.width -| gutter, 1);
+        if (height <= status_row_count) return @max(win.width -| self.gutterWidthFor(count, win.width), 1);
         const content_rows = height - status_row_count - self.tabBarRows(arena.allocator());
-        const layout = self.layoutWindows(arena.allocator(), self.contentTop(arena.allocator()), content_rows, self.contentCol(), self.editorAreaWidth()) catch return @max(self.editorAreaWidth() -| gutter, 1);
+        const layout = self.layoutWindows(arena.allocator(), self.contentTop(arena.allocator()), content_rows, self.contentCol(), self.editorAreaWidth()) catch return @max(self.editorAreaWidth() -| self.gutterWidthFor(count, self.editorAreaWidth()), 1);
         for (layout.leaves) |leaf| {
-            if (leaf.win == self.current_win) return @max(leaf.width -| gutter, 1);
+            if (leaf.win == self.current_win) return @max(leaf.width -| self.gutterWidthFor(count, leaf.width), 1);
         }
-        return @max(self.editorAreaWidth() -| gutter, 1);
+        return @max(self.editorAreaWidth() -| self.gutterWidthFor(count, self.editorAreaWidth()), 1);
     }
 
     /// H/M/L: resolve a viewport motion to a document LINE using the focused
@@ -996,7 +1067,7 @@ pub const App = struct {
     /// The closed fold whose header is `line`, if any.
     pub fn foldAt(buf: *const Buffer, line: u32) ?editor.fold.Range {
         for (buf.folds.items) |f| {
-            if (f.start == line) return f;
+            if (f.range.start == line) return f.range;
         }
         return null;
     }
@@ -1006,8 +1077,8 @@ pub const App = struct {
     pub fn foldCovering(buf: *const Buffer, line: u32) ?editor.fold.Range {
         var best: ?editor.fold.Range = null;
         for (buf.folds.items) |f| {
-            if (line > f.start and line <= f.end) {
-                if (best == null or f.start < best.?.start) best = f;
+            if (line > f.range.start and line <= f.range.end) {
+                if (best == null or f.range.start < best.?.start) best = f.range;
             }
         }
         return best;
@@ -1054,11 +1125,11 @@ pub const App = struct {
                 for (ranges) |r| {
                     const covered = blk: {
                         for (buf.folds.items) |f| {
-                            if (r.start > f.start and r.end <= f.end) break :blk true;
+                            if (r.start > f.range.start and r.end <= f.range.end) break :blk true;
                         }
                         break :blk false;
                     };
-                    if (!covered) try buf.folds.append(self.alloc, r);
+                    if (!covered) try buf.folds.append(self.alloc, editor.fold.Closed.init(&buf.pt, r));
                 }
                 self.snapCursorOutOfFold();
             },
@@ -1076,8 +1147,8 @@ pub const App = struct {
                 // otherwise (zc, or za on an open fold) close `target`.
                 var closed_hit: ?usize = null;
                 for (buf.folds.items, 0..) |f, i| {
-                    if (line >= f.start and line <= f.end) {
-                        if (closed_hit == null or f.start > buf.folds.items[closed_hit.?].start) closed_hit = i;
+                    if (line >= f.range.start and line <= f.range.end) {
+                        if (closed_hit == null or f.range.start > buf.folds.items[closed_hit.?].range.start) closed_hit = i;
                     }
                 }
                 const want_open = action == .fold_open or (action == .fold_toggle and closed_hit != null);
@@ -1091,7 +1162,7 @@ pub const App = struct {
                     while (true) {
                         const already = blk: {
                             for (buf.folds.items) |f| {
-                                if (f.start == r.start) break :blk true;
+                                if (f.range.start == r.start) break :blk true;
                             }
                             break :blk false;
                         };
@@ -1101,10 +1172,10 @@ pub const App = struct {
                         if (outer == null) return;
                         r = outer.?;
                     }
-                    try buf.folds.append(self.alloc, r);
-                    std.mem.sort(editor.fold.Range, buf.folds.items, {}, struct {
-                        fn lt(_: void, x: editor.fold.Range, y: editor.fold.Range) bool {
-                            return x.start < y.start;
+                    try buf.folds.append(self.alloc, editor.fold.Closed.init(&buf.pt, r));
+                    std.mem.sort(editor.fold.Closed, buf.folds.items, {}, struct {
+                        fn lt(_: void, x: editor.fold.Closed, y: editor.fold.Closed) bool {
+                            return x.range.start < y.range.start;
                         }
                     }.lt);
                     self.snapCursorOutOfFold();
@@ -1174,10 +1245,14 @@ pub const App = struct {
     /// (vim: the split command focuses the new window).
     pub fn splitWindow(self: *App, dir: SplitDir) !void {
         const cur_win = self.current_win;
+        const src = self.windows.items[cur_win];
         try self.windows.append(self.alloc, .{
-            .buf = self.windows.items[cur_win].buf,
-            .cursor = self.windows.items[cur_win].cursor,
-            .view_top = self.windows.items[cur_win].view_top,
+            .id = self.newWindowId(),
+            .buf = src.buf,
+            .cursor = src.cursor,
+            .view_top = src.view_top,
+            .view_wrap = src.view_wrap,
+            .view_pinned = src.view_pinned,
         });
         const new_idx: usize = self.windows.items.len - 1;
         // the new pane (which takes focus) is the last to SHOW the shared
@@ -1363,6 +1438,9 @@ pub const App = struct {
         }
         const cur_win = self.current_win;
         const root = self.win_root orelse return;
+        // The removed window is gone for good; its saved positions in every
+        // buffer are unreachable state (ids are never reused).
+        for (self.buffers.items) |*buf| buf.views.removeWindow(self.windows.items[cur_win].id);
         const new_root = self.removeWindow(root, cur_win) orelse unreachable; // ≥2 windows: never the root itself
         self.win_root = new_root;
         _ = self.windows.orderedRemove(cur_win);
@@ -1539,6 +1617,7 @@ pub const App = struct {
             .env_map = init.environ_map,
             .theme = theme.withItalics(theme.default, !std.mem.eql(u8, init.environ_map.get("OZ_NO_ITALIC") orelse "", "1")),
             .italics_enabled = !std.mem.eql(u8, init.environ_map.get("OZ_NO_ITALIC") orelse "", "1"),
+            .scope_underline = !std.mem.eql(u8, init.environ_map.get("OZ_NO_SCOPE_UNDERLINE") orelse "", "1"),
             .vx = vx,
             .tty = tty,
             .tty_buffer = tty_buffer,
@@ -1558,7 +1637,7 @@ pub const App = struct {
             .history = buffer.History.init(init.gpa),
         });
         // one window showing buffer 0 (the initial empty buffer)
-        try self.windows.append(init.gpa, .{ .buf = 0 });
+        try self.windows.append(init.gpa, .{ .buf = 0, .id = self.newWindowId() });
         const leaf = try init.gpa.create(WinNode);
         leaf.* = .{ .leaf = 0 };
         self.win_root = leaf;
@@ -1595,6 +1674,7 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        if (self.pending_filetree_create) |path| self.alloc.free(path);
         self.loop.stop();
         // An in-flight LSP attach must be cancelled and joined before the
         // pieces it borrows (env_map, io, the vaxis loop its wake posts to)
@@ -1694,6 +1774,7 @@ pub const App = struct {
         self.inlay_hints.deinit(self.alloc);
         for (self.completion_words.items) |*it| it.deinit(self.alloc);
         self.completion_words.deinit(self.alloc);
+        self.completion_path_cache.deinit(self.alloc);
         // M3a git state
         if (self.git_job) |job| {
             if (job.thread) |t| t.join(); // let the worker finish, then free
@@ -1996,6 +2077,11 @@ pub const App = struct {
     pub const lspHandler = @import("app/lsp.zig").lspHandler;
     pub const markDirtyBase = @import("app/lsp.zig").markDirtyBase;
     pub const markDirty = @import("app/lsp.zig").markDirty;
+    // fold-aware edit/history wrappers (app/fold_edit.zig)
+    pub const recordEdit = @import("app/fold_edit.zig").recordEdit;
+    pub const recordEditBuffer = @import("app/fold_edit.zig").recordEditBuffer;
+    pub const historyApply = @import("app/fold_edit.zig").historyApply;
+    pub const reanchorAfterDirectReplace = @import("app/fold_edit.zig").reanchorAfterDirectReplace;
     pub const markDirtyHistory = @import("app/lsp.zig").markDirtyHistory;
     pub const markDirtyRange = @import("app/lsp.zig").markDirtyRange;
     pub const syncLspFull = @import("app/lsp.zig").syncLspFull;
@@ -2127,6 +2213,7 @@ pub const App = struct {
     pub const navigatorBodyTop = @import("app/render.zig").navigatorBodyTop;
     pub const navigatorPeekActive = @import("app/render.zig").navigatorPeekActive;
     pub const gutterWidth = @import("app/render.zig").gutterWidth;
+    pub const gutterWidthFor = @import("app/render.zig").gutterWidthFor;
     pub const lineCellCol = @import("app/render.zig").lineCellCol;
     pub const textWidth = @import("app/render.zig").textWidth;
     pub const utf16Column = @import("app/render.zig").utf16Column;

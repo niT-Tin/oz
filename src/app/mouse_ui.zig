@@ -218,6 +218,7 @@ fn railContains(self: *App, col: u32, row: u32) bool {
 fn terminalContains(self: *App, col: u32, row: u32) bool {
     if (!term.supported) return false;
     if (self.term_pane == null) return false;
+    if (!self.term_pane.?.visible) return false;
     var arena = std.heap.ArenaAllocator.init(self.alloc);
     defer arena.deinit();
     const r = self.termRect(arena.allocator());
@@ -313,6 +314,7 @@ fn hintActionFocusesEditor(action: hints.Action) bool {
 /// replace/multi-cursor state is cleared so the next key cannot act on a
 /// stale target. No new business logic: this is the same teardown Esc uses.
 fn prepareMouseAction(self: *App) void {
+    self.filetree_pending_g = false;
     if (self.state.mode == .insert) self.exitInsert();
     self.pending_window = false;
     self.pending_replace = null;
@@ -332,14 +334,26 @@ fn handleWheel(self: *App, col: u32, row: u32, dir: i64) !bool {
     if (mouseBlocked(self)) return false;
     // Never scroll the editor behind an open compact peek.
     if (self.navigatorPeekActive() and col >= nav_tabs.panel_width) return false;
-    // The embedded terminal owns the wheel while it has focus; vaxis's
-    // terminal widget has no mouse forwarding, so the safe behavior is
-    // no-op (never scroll the editor behind it).
-    if (term.supported and self.term_pane != null and self.term_pane.?.focused) return false;
     const in_rail = railContains(self, col, row);
-    // The rail is drawn above the terminal, so its rect wins when covered;
-    // elsewhere wheel over the terminal is a no-op.
-    if (!in_rail and terminalContains(self, col, row)) return false;
+    // The embedded terminal owns the wheel over its rect (focused OR pointer
+    // over it): scroll only its local history and consume the event, so the
+    // background editor never scrolls through the overlay. Alternate-screen
+    // and program-mouse-reporting children consume the event without local
+    // scrolling (the child owns the screen/pointer; we do not forward mouse
+    // events yet).
+    if (!in_rail and terminalContains(self, col, row)) {
+        if (self.term_pane) |*tp| {
+            if (dir < 0) {
+                _ = tp.t.wheelUp(wheel_lines);
+            } else {
+                _ = tp.t.wheelDown(wheel_lines);
+            }
+        }
+        return true;
+    }
+    // A focused terminal whose pointer is elsewhere must still not scroll
+    // the editor behind the overlay.
+    if (term.supported and self.term_pane != null and self.term_pane.?.focused) return false;
     const hit = self.mouse.hitScroll(col, row) orelse return false;
     // Inside the peek only its list scroll regions are eligible; the editor
     // pane target underneath must not scroll through the header/blank cells.
@@ -436,7 +450,7 @@ fn panePositionAt(self: *App, win_idx: usize, rect: mouse.Rect, col: u32, row: u
     if (row < rect.row or row >= rect.row + rect.height) return null;
 
     const win = self.vx.window();
-    const gutter = self.gutterWidth(line_count);
+    const gutter = self.gutterWidthFor(line_count, rect.width);
     const content_width: u32 = @max(rect.width -| gutter, 1);
     const dr = row - rect.row;
 

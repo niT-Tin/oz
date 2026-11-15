@@ -67,6 +67,131 @@ pub const Cursor = struct {
     }
 };
 
+/// Copy the rendered part of one cell (grapheme, style, width) into `dst`.
+/// OSC 8 URI metadata is intentionally not part of local scrollback.
+fn copyCellInto(dst: *Cell, allocator: std.mem.Allocator, src: *const Cell) !void {
+    dst.char.clearRetainingCapacity();
+    try dst.char.appendSlice(allocator, src.char.items);
+    dst.style = src.style;
+    dst.width = src.width;
+    dst.wrapped = src.wrapped;
+    dst.dirty = true;
+}
+
+fn blankCellInto(dst: *Cell, allocator: std.mem.Allocator) !void {
+    dst.char.clearRetainingCapacity();
+    try dst.char.append(allocator, ' ');
+    dst.style = .{};
+    dst.width = 1;
+    dst.wrapped = false;
+    dst.dirty = true;
+}
+
+/// Bounded ring of primary-screen rows that scrolled off the top. Cells are
+/// MOVED out of the screen row (zero-copy text buffers) and the source cells
+/// are reset; eviction frees the oldest row's cell buffers, so memory is
+/// bounded by `capacity * width` cells plus those cells' graphemes.
+pub const History = struct {
+    allocator: std.mem.Allocator = undefined,
+    width: u16 = 0,
+    slots: []?[]Cell = &.{},
+    /// Ring position of the oldest retained row.
+    start: usize = 0,
+    /// Number of retained rows (<= slots.len).
+    len: usize = 0,
+    /// Monotonic count of rows ever pushed. Readers use deltas to keep a
+    /// scrolled viewport anchored while output continues.
+    pushes: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator, width: u16, cap: u16) !History {
+        const slots = try allocator.alloc(?[]Cell, cap);
+        @memset(slots, null);
+        return .{ .allocator = allocator, .width = width, .slots = slots };
+    }
+
+    pub fn deinit(self: *History) void {
+        if (self.slots.len == 0) {
+            self.* = .{};
+            return;
+        }
+        self.clear();
+        self.allocator.free(self.slots);
+        self.* = .{};
+    }
+
+    pub fn count(self: *const History) usize {
+        return self.len;
+    }
+
+    pub fn capacity(self: *const History) usize {
+        return self.slots.len;
+    }
+
+    /// Drop every retained row and free its cell buffers (the ring stays
+    /// allocated and reusable).
+    pub fn clear(self: *History) void {
+        for (self.slots) |slot| {
+            if (slot) |row| {
+                for (row) |*cell| {
+                    cell.char.deinit(self.allocator);
+                    cell.uri.deinit(self.allocator);
+                    cell.uri_id.deinit(self.allocator);
+                    cell.* = .{};
+                }
+                self.allocator.free(row);
+            }
+        }
+        @memset(self.slots, null);
+        self.start = 0;
+        self.len = 0;
+    }
+
+    /// Move one full screen row into the ring, evicting the oldest row when
+    /// full. The source row's cells are reset to empty owned cells.
+    pub fn push(self: *History, src: []Cell) !void {
+        if (self.slots.len == 0 or src.len == 0) return;
+        var idx: usize = undefined;
+        if (self.len < self.slots.len) {
+            idx = (self.start + self.len) % self.slots.len;
+            self.len += 1;
+            if (self.slots[idx] == null) {
+                const row = try self.allocator.alloc(Cell, self.width);
+                for (row) |*cell| cell.* = .{};
+                self.slots[idx] = row;
+            }
+        } else {
+            idx = self.start;
+            self.start = (self.start + 1) % self.slots.len;
+            const row = self.slots[idx].?;
+            for (row) |*cell| {
+                cell.char.deinit(self.allocator);
+                cell.uri.deinit(self.allocator);
+                cell.uri_id.deinit(self.allocator);
+                cell.* = .{};
+            }
+        }
+        const dst = self.slots[idx].?;
+        const n = @min(src.len, dst.len);
+        for (dst[0..n], src[0..n]) |*d, *s| {
+            d.* = s.*;
+            s.* = .{};
+        }
+        self.pushes += 1;
+    }
+
+    /// Deep-copy retained row `index` (0 = oldest) into `dst`.
+    pub fn copyRow(self: *History, row_index: usize, allocator: std.mem.Allocator, dst: []Cell) !void {
+        if (row_index >= self.len) {
+            for (dst) |*cell| try blankCellInto(cell, allocator);
+            return;
+        }
+        const row = self.slots[(self.start + row_index) % self.slots.len].?;
+        const n = @min(row.len, dst.len);
+        for (row[0..n], dst[0..n]) |*src, *out| try copyCellInto(out, allocator, src);
+        for (dst[n..]) |*cell| try blankCellInto(cell, allocator);
+    }
+};
+
 pub const ScrollingRegion = struct {
     top: u16,
     bottom: u16,
@@ -94,8 +219,19 @@ cursor: Cursor = .{},
 
 csi_u_flags: vaxis.Key.KittyFlags = @bitCast(@as(u5, 0)),
 
+/// Primary-screen local scrollback (capacity 0 = disabled). The visible
+/// `buf` always stays exactly `height` rows tall; off-screen rows live here.
+history: History = .{},
+
 /// sets each cell to the default cell
 pub fn init(alloc: std.mem.Allocator, w: u16, h: u16) !Screen {
+    return initWithHistory(alloc, w, h, 0);
+}
+
+/// Like `init`, but retains up to `scrollback` scrolled-off rows when this
+/// screen is used as the primary back screen. Only full-screen scrolling
+/// regions feed the history; the alt screen is always created with 0.
+pub fn initWithHistory(alloc: std.mem.Allocator, w: u16, h: u16, scrollback: u16) !Screen {
     var screen = Screen{
         .allocator = alloc,
         .buf = try alloc.alloc(Cell, @as(usize, @intCast(w)) * h),
@@ -114,6 +250,7 @@ pub fn init(alloc: std.mem.Allocator, w: u16, h: u16) !Screen {
         };
         try screen.buf[i].char.append(alloc, ' ');
     }
+    if (scrollback > 0) screen.history = try History.init(alloc, w, scrollback);
     return screen;
 }
 
@@ -125,6 +262,7 @@ pub fn deinit(self: *Screen, alloc: std.mem.Allocator) void {
     }
 
     alloc.free(self.buf);
+    self.history.deinit();
 }
 
 /// copies the visible area to the destination screen
@@ -139,6 +277,40 @@ pub fn copyTo(self: *Screen, allocator: std.mem.Allocator, dst: *Screen) !void {
         dst.buf[i].width = cell.width;
         dst.buf[i].style = cell.style;
     }
+}
+
+/// Compose the visible grid for a history viewport: `offset` rows above the
+/// live bottom (0 = live screen, follow mode). The oldest retained history
+/// row is at offset `history.count()`. Clears the source dirty flags for the
+/// live rows copied so a later `copyTo` stays incremental.
+pub fn copyViewportTo(self: *Screen, allocator: std.mem.Allocator, dst: *Screen, offset: usize) !void {
+    std.debug.assert(dst.width == self.width and dst.height == self.height);
+    const hist = self.history.count();
+    const off = @min(offset, hist);
+    const top = hist - off;
+    var row: usize = 0;
+    while (row < self.height) : (row += 1) {
+        const virtual = top + row;
+        const dst_row = dst.buf[row * self.width ..][0..self.width];
+        if (virtual < hist) {
+            try self.history.copyRow(virtual, allocator, dst_row);
+        } else {
+            const src = self.buf[(virtual - hist) * self.width ..][0..self.width];
+            for (src, dst_row) |*cell, *out| {
+                try copyCellInto(out, allocator, cell);
+                cell.dirty = false;
+            }
+        }
+    }
+    dst.cursor = self.cursor;
+}
+
+pub fn historyCount(self: *const Screen) usize {
+    return self.history.count();
+}
+
+pub fn clearScrollback(self: *Screen) void {
+    self.history.clear();
 }
 
 pub fn readCell(self: *Screen, col: usize, row: usize) ?vaxis.Cell {
@@ -215,8 +387,7 @@ pub fn index(self: *Screen) !void {
     if (self.cursor.row == self.scrolling_region.bottom) {
         // Inside scrolling region *and* at bottom of screen, we scroll contents up and insert a
         // blank line
-        // TODO: scrollback if scrolling region is entire visible screen
-        try self.deleteLine(1);
+        try self.scrollUp(1);
         return;
     }
     self.cursor.row += 1;
@@ -237,7 +408,7 @@ pub fn sgr(self: *Screen, seq: ansi.CSI) void {
             3 => self.cursor.style.italic = true,
             4 => {
                 const kind: vaxis.Style.Underline = if (iter.next_is_sub)
-                    @enumFromInt(iter.next() orelse 1)
+                    @fromBackingInt(@intCast(iter.next() orelse 1))
                 else
                     .single;
                 self.cursor.style.ul_style = kind;
@@ -393,8 +564,22 @@ pub fn eraseLine(self: *Screen) void {
     }
 }
 
-/// delete n lines from the bottom of the scrolling region
+/// Delete live rows starting at the cursor (DL). Deletion edits the screen;
+/// only an actual scroll at the top of the viewport contributes history.
 pub fn deleteLine(self: *Screen, n: usize) !void {
+    try self.deleteLineImpl(n, false);
+}
+
+/// Scroll the region upward (IND at the bottom / SU), preserving the cursor.
+pub fn scrollUp(self: *Screen, n: usize) !void {
+    const saved = self.cursor;
+    defer self.cursor = saved;
+    self.cursor.row = self.scrolling_region.top;
+    self.cursor.col = self.scrolling_region.left;
+    try self.deleteLineImpl(n, true);
+}
+
+fn deleteLineImpl(self: *Screen, n: usize, retain: bool) !void {
     if (n == 0) return;
 
     // Don't delete if outside scroll region
@@ -406,7 +591,22 @@ pub fn deleteLine(self: *Screen, n: usize) !void {
     const cnt = @min(self.scrolling_region.bottom - self.cursor.row + 1, n);
     const stride = (self.width) * cnt;
 
-    var row: usize = self.scrolling_region.top;
+    // Local scrollback: before the shift overwrites them, move the rows that
+    // leave the top of a FULL-SCREEN scrolling region into the bounded
+    // primary-screen history. Alt screens / partial regions have capacity 0.
+    if (retain and self.history.capacity() > 0 and
+        self.scrolling_region.top == 0 and
+        self.scrolling_region.bottom == self.height - 1 and
+        self.scrolling_region.left == 0 and
+        self.scrolling_region.right == self.width - 1)
+    {
+        var r: usize = 0;
+        while (r < cnt) : (r += 1) {
+            try self.history.push(self.buf[r * self.width .. (r + 1) * self.width]);
+        }
+    }
+
+    var row: usize = self.cursor.row;
     while (row <= self.scrolling_region.bottom) : (row += 1) {
         var col: usize = self.scrolling_region.left;
         while (col <= self.scrolling_region.right) : (col += 1) {

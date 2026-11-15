@@ -17,9 +17,10 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-Current counts after the 2026-11-15 editing-reliability fixes:
-**738 unit tests** and **316 e2e tests** in the default filters (the three
-opt-in real-ZLS tests skip unless `-Dreal-zls` is supplied). `tools/verify.sh` covers diff check,
+Current counts after the 2026-11-15 editing-reliability fixes and the
+scope-range emphasis regression: **740 unit tests** and **319 e2e tests** in
+the default filters (the three opt-in real-ZLS tests skip unless
+`-Dreal-zls` is supplied). `tools/verify.sh` covers diff check,
 all unit tests and all e2e tests (including Agent-focus, `terminal:` and
 multi-file `approval:`). `tools/verify.sh`
 writes `.verify/unit.log`, `.verify/e2e.log`, and
@@ -836,6 +837,13 @@ Pure L1 groups behind those paths: `insert motion:`, `completion ranking:`,
 `completion context:`, `hover content:`, `initParams: hover`, `indent:`,
 `visual gc:`, `comment:`, `undoResult:`, `inlay transform:`,
 `wordStartBefore`/`bigWordStartBefore`.
+
+Completion documentation performance (`zig build e2e -Dtest-filter='editing performance:'`):
+the `completion_bulk_docs` mock returns a Markdown item with a 160-line fenced
+code block. Fenced code and signature rows are highlighted once per block, not
+once per wrapped line; the PTY test requires the menu/docs to appear within 5 s
+(the old per-line highlighter path took ~15 s in a Debug build) and checks the
+documentation pane is scrollable.
 
 Diagnostic range underlines use the server's UTF-16, end-exclusive ranges:
 errors/warnings are colored curls, information dotted and hints dashed. The

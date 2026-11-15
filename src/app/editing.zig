@@ -3,6 +3,7 @@
 const std = @import("std");
 const editor = @import("../editor/root.zig");
 const edit_range = @import("../editor/edit_range.zig");
+const auto_pair = @import("../editor/auto_pair.zig");
 
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
@@ -27,8 +28,8 @@ pub fn pairCloser(ch: u8) ?u8 {
 /// cursor — multi-cursor edits go through handleMcInsertKey and stay
 /// literal). Returns true when the key was handled here:
 /// - opener: insert the pair, cursor ends up between the two
-/// - quote: same, but not right after a word char ("don't"), and typing
-///   the quote again over an identical quote skips over it
+/// - quote: open a pair, close an existing quote literally, or skip an
+///   identical next quote; word-ending apostrophes remain prose ("don't")
 /// - closer: when the cursor sits on that same closer, skip over it
 ///   instead of inserting a duplicate
 pub fn autoPairInsert(self: *App, text: []const u8) !bool {
@@ -43,11 +44,11 @@ pub fn autoPairInsert(self: *App, text: []const u8) !bool {
             return true;
         },
         '"', '\'', '`' => {
-            if (pos < len and self.cur().pt.byteAt(pos) == ch) {
+            if (!auto_pair.escaped(&self.cur().pt, pos) and pos < len and self.cur().pt.byteAt(pos) == ch) {
                 self.curCursor().* = pos + 1; // skip over
                 return true;
             }
-            if (pos > 0 and isWordByte(self.cur().pt.byteAt(pos - 1))) return false;
+            if (!auto_pair.quoteShouldPair(&self.cur().pt, pos, ch)) return false;
             try self.insertText(&[_]u8{ ch, ch });
             self.curCursor().* = pos + 1;
             return true;
@@ -80,7 +81,7 @@ pub fn autoPairBackspace(self: *App) !bool {
     const col = start - self.cur().pt.lineStart(line);
     const start_pos = self.lspPositionAt(&self.cur().pt, start);
     const end_pos = self.lspPositionAt(&self.cur().pt, start + 2);
-    try self.cur().history.record(&self.cur().pt, start, 2, "");
+    try self.recordEdit(start, 2, "");
     self.curCursor().* = start;
     self.adjustInlayHintsDelete(line, col, &[_]u8{ open, closer });
     self.markDirtyRange(start_pos, end_pos, "");
@@ -139,7 +140,7 @@ pub fn applyOpRangeEx(self: *App, op: editor.KeyEvent.ActionId, from: u32, to: u
             const end_pos = self.lspPositionAt(&self.cur().pt, end);
             try self.setRegister(start, end, linewise);
             self.cur().history.beginGroup();
-            try self.cur().history.record(&self.cur().pt, start, end - start, "");
+            try self.recordEdit(start, end - start, "");
             self.cur().history.endGroup();
             self.curCursor().* = start;
             // deleting the last real line lands on the phantom empty
@@ -159,7 +160,7 @@ pub fn applyOpRangeEx(self: *App, op: editor.KeyEvent.ActionId, from: u32, to: u
             try self.setRegister(start, end, linewise);
             self.curCursor().* = start;
             self.cur().history.beginGroup();
-            try self.cur().history.record(&self.cur().pt, start, end - start, "");
+            try self.recordEdit(start, end - start, "");
             self.state.mode = .insert;
             self.in_insert = true; // keep the group open; exitInsert closes it
             self.markDirtyRange(start_pos, end_pos, "");
@@ -262,7 +263,7 @@ pub fn applyEdit(self: *App, start: u32, end: u32, text: []const u8) !void {
     const start_pos = self.lspPositionAt(&self.cur().pt, start);
     const end_pos = self.lspPositionAt(&self.cur().pt, end);
     self.cur().history.beginGroup();
-    try self.cur().history.record(&self.cur().pt, start, end - start, text);
+    try self.recordEdit(start, end - start, text);
     self.cur().history.endGroup();
     self.markDirtyRange(start_pos, end_pos, text);
 }
@@ -366,7 +367,7 @@ pub fn mcChangeWords(self: *App) !void {
         const w = self.mc.wordRange(pt, pos);
         if (w.end <= w.start) continue; // no word at this cursor → skip it
         const wlen = w.end - w.start;
-        try self.cur().history.record(pt, pos, wlen, "");
+        try self.recordEdit(pos, wlen, "");
         // shift every other cursor at/after the deleted range back; the
         // cursor at `pos` (a word start) stays put
         for (self.mc.cursors.items, 0..) |*c, j| {

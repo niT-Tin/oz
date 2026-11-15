@@ -178,6 +178,7 @@ pub fn navigatorCompact(self: *App) bool {
 /// compact mode opens the peek so the focused pane has visible content
 /// (and closes the AI drawer: the two overlays never stack).
 pub fn navigatorEnter(self: *App) void {
+    self.filetree_pending_g = false;
     if (self.navigatorCompact()) {
         self.navigator_peek = true;
         if (self.ai.rail_open and self.aiLayout().mode == .drawer) {
@@ -192,6 +193,7 @@ pub fn navigatorEnter(self: *App) void {
 /// Close the compact peek overlay (no-op in full mode) and return the
 /// keyboard to the editor. The icon rail stays visible.
 pub fn navigatorPeekClose(self: *App) void {
+    self.filetree_pending_g = false;
     self.navigator_peek = false;
     self.focus = .buffer;
     self.ai.focus = .editor;
@@ -200,6 +202,7 @@ pub fn navigatorPeekClose(self: *App) void {
 /// Close the navigator. In compact mode Esc closes only the peek overlay and
 /// keeps the icon rail; full mode hides the panel (the existing behavior).
 pub fn closeNavigator(self: *App) void {
+    self.filetree_pending_g = false;
     if (self.navigatorCompact() and self.navigator_peek) {
         self.navigatorPeekClose();
         return;
@@ -215,6 +218,7 @@ pub fn closeNavigator(self: *App) void {
 /// provider config for the model label. In compact mode the same call opens
 /// (or, for the already-open tab, closes) the peek.
 pub fn navigatorSetTab(self: *App, tab: nav.Tab) !void {
+    self.filetree_pending_g = false;
     const was_active = self.filetree_active;
     if (!was_active) try self.toggleFiletree();
 

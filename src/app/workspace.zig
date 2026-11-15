@@ -38,6 +38,7 @@ pub fn deinitBuffer(self: *App, buf: *Buffer) void {
     buf.pt.deinit();
     if (buf.disk) |*disk| disk.deinit(self.alloc);
     buf.folds.deinit(self.alloc);
+    buf.views.deinit(self.alloc);
     if (buf.spans_cache.len > 0) self.alloc.free(buf.spans_cache);
     if (buf.decors_cache.len > 0) self.alloc.free(buf.decors_cache);
     if (buf.markdown_arena) |*arena| arena.deinit();
@@ -213,7 +214,7 @@ pub fn wsNew(self: *App) !void {
         .pt = try buffer.PieceTable.init(self.alloc, ""),
         .history = buffer.History.init(self.alloc),
     });
-    try fresh_wins.append(self.alloc, .{ .buf = 0 });
+    try fresh_wins.append(self.alloc, .{ .buf = 0, .id = self.newWindowId() });
     const leaf = try self.alloc.create(WinNode);
     leaf.* = .{ .leaf = 0 };
     fresh_root = leaf;
@@ -390,7 +391,7 @@ pub fn wsKillSession(self: *App) !void {
         .pt = try buffer.PieceTable.init(self.alloc, ""),
         .history = buffer.History.init(self.alloc),
     });
-    try fresh_wins.append(self.alloc, .{ .buf = 0 });
+    try fresh_wins.append(self.alloc, .{ .buf = 0, .id = self.newWindowId() });
     const leaf = try self.alloc.create(WinNode);
     leaf.* = .{ .leaf = 0 };
     fresh_root = leaf;

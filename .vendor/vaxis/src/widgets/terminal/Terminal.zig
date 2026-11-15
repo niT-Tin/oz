@@ -9,7 +9,7 @@ const Parser = @import("Parser.zig");
 const Pty = @import("Pty.zig");
 const vaxis = @import("../../main.zig");
 const Winsize = vaxis.Winsize;
-const Screen = @import("Screen.zig");
+pub const Screen = @import("Screen.zig");
 const Key = vaxis.Key;
 const Queue = vaxis.Queue(Event, 16);
 const key = @import("key.zig");
@@ -27,6 +27,8 @@ const posix = std.posix;
 const log = std.log.scoped(.terminal);
 
 pub const Options = struct {
+    /// Capacity of the bounded primary-screen local scrollback (rows that
+    /// scroll off the top of a full-screen region). 0 disables retention.
     scrollback_size: u16 = 500,
     winsize: Winsize = .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 },
     initial_working_directory: ?[]const u8 = null,
@@ -72,6 +74,13 @@ back_screen_pri: Screen,
 back_screen_alt: Screen,
 // only applies to primary screen
 scroll_offset: usize = 0,
+/// True after the last draw rendered a history viewport; the first draw back
+/// at the bottom must repaint every cell (front still holds the old view).
+was_scrolled: bool = false,
+/// DEC private mouse-reporting modes 1000/1002/1003 currently enabled by the
+/// child (bit 0/1/2). Wheel scrolling local history is suppressed while any
+/// program is tracking the mouse: the app owns pointer input then.
+mouse_report_bits: u8 = 0,
 back_mutex: std.Io.Mutex = .init,
 // dirty is protected by back_mutex. Only access this field when you hold that mutex
 dirty: bool = false,
@@ -127,7 +136,7 @@ pub fn init(
         .cmd = cmd,
         .scrollback_size = opts.scrollback_size,
         .front_screen = try Screen.init(allocator, opts.winsize.cols, opts.winsize.rows),
-        .back_screen_pri = try Screen.init(allocator, opts.winsize.cols, opts.winsize.rows + opts.scrollback_size),
+        .back_screen_pri = try Screen.initWithHistory(allocator, opts.winsize.cols, opts.winsize.rows, opts.scrollback_size),
         .back_screen_alt = try Screen.init(allocator, opts.winsize.cols, opts.winsize.rows),
         .tab_stops = tabs,
         .event_queue = .init(io),
@@ -212,8 +221,12 @@ pub fn resize(self: *Terminal, ws: Winsize) !void {
 
     self.back_screen_pri.deinit(self.allocator);
     self.back_screen_alt.deinit(self.allocator);
-    self.back_screen_pri = try Screen.init(self.allocator, ws.cols, ws.rows + self.scrollback_size);
+    self.back_screen_pri = try Screen.initWithHistory(self.allocator, ws.cols, ws.rows, self.scrollback_size);
     self.back_screen_alt = try Screen.init(self.allocator, ws.cols, ws.rows);
+    // Retained rows are width-dependent; the visible grid is reset too, so
+    // both the history and the viewport position start fresh.
+    self.scroll_offset = 0;
+    self.was_scrolled = false;
 
     try self.pty.setSize(ws);
 }
@@ -224,7 +237,17 @@ pub fn draw(self: *Terminal, allocator: std.mem.Allocator, win: vaxis.Window) !v
         // We keep this as a separate condition so we don't deadlock by obtaining the lock but not
         // having sync
         if (!self.mode.sync) {
-            try self.back_screen.copyTo(allocator, &self.front_screen);
+            const primary = self.back_screen == &self.back_screen_pri;
+            const scrolled = primary and self.scroll_offset > 0;
+            if (primary and (scrolled or self.was_scrolled)) {
+                // Render the history viewport (offset 0 after scrolling back
+                // to the bottom is a full repaint, then normal incremental
+                // copyTo resumes).
+                try self.back_screen_pri.copyViewportTo(allocator, &self.front_screen, self.scroll_offset);
+            } else {
+                try self.back_screen.copyTo(allocator, &self.front_screen);
+            }
+            self.was_scrolled = scrolled;
             self.dirty = false;
         }
     }
@@ -239,10 +262,77 @@ pub fn draw(self: *Terminal, allocator: std.mem.Allocator, win: vaxis.Window) !v
         }
     }
 
-    if (self.mode.cursor) {
+    // The live child cursor is only meaningful at the bottom (follow mode);
+    // while the user is reading history it stays hidden.
+    if (self.mode.cursor and self.scroll_offset == 0) {
         win.setCursorShape(self.front_screen.cursor.shape);
         win.showCursor(self.front_screen.cursor.col, self.front_screen.cursor.row);
+    } else {
+        win.hideCursor();
     }
+}
+
+/// Scroll the primary-screen history up by `n` rows (keyboard/local path).
+/// Returns whether the viewport moved. Alt-screen and empty history are
+/// no-ops.
+pub fn scrollUp(self: *Terminal, n: usize) bool {
+    if (n == 0) return false;
+    self.back_mutex.lock(self.io) catch return false;
+    defer self.back_mutex.unlock(self.io);
+    return self.scrollUpLocked(n);
+}
+
+fn scrollUpLocked(self: *Terminal, n: usize) bool {
+    if (self.back_screen != &self.back_screen_pri) return false;
+    const max = self.back_screen_pri.history.count();
+    if (max == 0 or self.scroll_offset >= max) return false;
+    self.scroll_offset = @min(self.scroll_offset + n, max);
+    return true;
+}
+
+/// Scroll back toward the live bottom by `n` rows (0 resumes follow mode).
+pub fn scrollDown(self: *Terminal, n: usize) bool {
+    if (n == 0) return false;
+    self.back_mutex.lock(self.io) catch return false;
+    defer self.back_mutex.unlock(self.io);
+    return self.scrollDownLocked(n);
+}
+
+fn scrollDownLocked(self: *Terminal, n: usize) bool {
+    if (self.back_screen != &self.back_screen_pri or self.scroll_offset == 0) return false;
+    self.scroll_offset -|= n;
+    return true;
+}
+
+/// Wheel path: never scroll local history while the child is on the
+/// alternate screen or is tracking the mouse itself (the app owns the
+/// pointer). The event is still consumed by the caller either way.
+pub fn wheelUp(self: *Terminal, n: usize) bool {
+    if (n == 0) return false;
+    self.back_mutex.lock(self.io) catch return false;
+    defer self.back_mutex.unlock(self.io);
+    if (self.mouse_report_bits != 0) return false;
+    return self.scrollUpLocked(n);
+}
+
+pub fn wheelDown(self: *Terminal, n: usize) bool {
+    if (n == 0) return false;
+    self.back_mutex.lock(self.io) catch return false;
+    defer self.back_mutex.unlock(self.io);
+    if (self.mouse_report_bits != 0) return false;
+    return self.scrollDownLocked(n);
+}
+
+/// Jump one viewport page (Shift+PageUp/Down). The child's status line is
+/// kept visible where possible.
+pub fn scrollPageUp(self: *Terminal) bool {
+    const page = @max(@as(usize, 1), @as(usize, self.front_screen.height) -| 2);
+    return self.scrollUp(page);
+}
+
+pub fn scrollPageDown(self: *Terminal) bool {
+    const page = @max(@as(usize, 1), @as(usize, self.front_screen.height) -| 2);
+    return self.scrollDown(page);
 }
 
 pub fn tryEvent(self: *Terminal) !?Event {
@@ -288,6 +378,12 @@ fn _run(self: *Terminal) !void {
 
         if (!self.dirty and try self.event_queue.tryPush(.redraw))
             self.dirty = true;
+
+        // New rows scrolled into local history move the bottom away from a
+        // viewport the user is reading; shift the offset by the same amount
+        // so the visible historical lines stay put and output never yanks
+        // the view back to the live screen.
+        const pushes_before = self.back_screen_pri.history.pushes;
 
         switch (event) {
             .print => |str| {
@@ -401,8 +497,13 @@ fn _run(self: *Terminal) !void {
                         switch (kind) {
                             0 => self.back_screen.eraseBelow(),
                             1 => self.back_screen.eraseAbove(),
+                            // ED2 clears the visible screen but keeps saved
+                            // lines (ED3 below erases them).
                             2 => self.back_screen.eraseAll(),
-                            3 => {},
+                            3 => {
+                                self.back_screen.clearScrollback();
+                                self.scroll_offset = 0;
+                            },
                             else => {},
                         }
                     },
@@ -448,9 +549,7 @@ fn _run(self: *Terminal) !void {
                             self.back_screen.cursor.col = cur_col;
                             self.back_screen.cursor.pending_wrap = wrap;
                         }
-                        self.back_screen.cursor.col = self.back_screen.scrolling_region.left;
-                        self.back_screen.cursor.row = self.back_screen.scrolling_region.top;
-                        try self.back_screen.deleteLine(n);
+                        try self.back_screen.scrollUp(n);
                     },
                     // Scroll Down
                     'T' => {
@@ -582,6 +681,7 @@ fn _run(self: *Terminal) !void {
                         // There is only one collision (mode = 4), and we don't support the private
                         // version of it
                         if (seq.private_marker != null and mode == 4) continue;
+                        if (seq.private_marker != null) self.setMouseMode(mode, seq.final == 'h');
                         self.setMode(mode, seq.final == 'h');
                     },
                     'm' => {
@@ -633,7 +733,7 @@ fn _run(self: *Terminal) !void {
                                 ' ' => {
                                     var iter = seq.iterator(u8);
                                     const shape = iter.next() orelse 0;
-                                    self.back_screen.cursor.shape = @enumFromInt(shape);
+                                    self.back_screen.cursor.shape = @fromBackingInt(@intCast(shape));
                                 },
                                 else => {},
                             }
@@ -718,6 +818,16 @@ fn _run(self: *Terminal) !void {
             },
             .apc => |apc| log.info("unhandled apc: {s}", .{apc}),
         }
+
+        if (self.back_screen == &self.back_screen_pri and self.scroll_offset > 0) {
+            const added = self.back_screen_pri.history.pushes - pushes_before;
+            if (added > 0) {
+                self.scroll_offset = @min(
+                    self.scroll_offset + added,
+                    self.back_screen_pri.history.count(),
+                );
+            }
+        }
     }
 }
 
@@ -733,8 +843,24 @@ inline fn handleC0(self: *Terminal, b: ansi.C0) !void {
         .CR => self.carriageReturn(),
         .SO => {}, // TODO: Charset shift out
         .SI => {}, // TODO: Charset shift in
-        else => log.warn("unhandled C0: 0x{x}", .{@intFromEnum(b)}),
+        else => log.warn("unhandled C0: 0x{x}", .{@backingInt(b)}),
     }
+}
+
+/// Track DEC private mouse-reporting modes (1000 normal, 1002 button,
+/// 1003 any-motion). Any of them means the program owns pointer events, so
+/// the wheel must not reveal local scrollback.
+fn setMouseMode(self: *Terminal, mode: u16, val: bool) void {
+    const mask: u8 = switch (mode) {
+        1000 => 1,
+        1002 => 2,
+        1003 => 4,
+        else => return,
+    };
+    if (val)
+        self.mouse_report_bits |= mask
+    else
+        self.mouse_report_bits &= ~mask;
 }
 
 pub fn setMode(self: *Terminal, mode: u16, val: bool) void {
@@ -746,6 +872,12 @@ pub fn setMode(self: *Terminal, mode: u16, val: bool) void {
                 self.back_screen = &self.back_screen_alt
             else
                 self.back_screen = &self.back_screen_pri;
+            // The alternate screen owns no local history; leaving it always
+            // resumes follow mode on the primary screen. A TUI that forgot
+            // to disable mouse tracking must not poison the shell either.
+            self.scroll_offset = 0;
+            self.was_scrolled = false;
+            self.mouse_report_bits = 0;
             var i: usize = 0;
             while (i < self.back_screen.buf.len) : (i += 1) {
                 self.back_screen.buf[i].dirty = true;

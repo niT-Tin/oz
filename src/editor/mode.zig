@@ -90,9 +90,9 @@ pub const Result = union(enum) {
         args: Motion.Args,
         count: u32,
         exclusive_end: bool,
-        /// vim inclusive motions ($, e, ge, f, F, %): the operator target
+        /// vim inclusive motions ($, e, ge, f, F, t, %): the operator target
         /// INCLUDES the character at the target. Natural-exclusive motions
-        /// (w/b/h/l/t/^/0) stay half-open [start, target).
+        /// (w/b/h/l/T/^/0) stay half-open [start, target).
         inclusive: bool = false,
     },
     /// Operator + motion combo (d{motion}): apply operator over the range.
@@ -588,7 +588,8 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
             resetPending(state);
             return .pending;
         }
-        var cp = key.codepoint;
+        var cp = if (key.mods.shift) key.shifted_codepoint orelse key.codepoint else key.codepoint;
+        if (key.text) |text| cp = std.unicode.utf8Decode(text) catch cp;
         if (cp == 0 or cp > 0x10FFFF or
             (cp >= 0xD800 and cp <= 0xDFFF))
         {
@@ -1097,8 +1098,9 @@ fn emitMotion(state: *State, motion: Motion.Motion, args: Motion.Args) Result {
 }
 
 /// vim motions whose operator range INCLUDES the character at the target
-/// (d$ keeps the last char, de keeps the word end, dfx keeps x, d% keeps
-/// the matching bracket). All others are naturally exclusive (half-open).
+/// (d$ keeps the last char, de keeps the word end, dfx keeps x, dt_ keeps
+/// the char before _, d% keeps the matching bracket). All others are
+/// naturally exclusive (half-open; backward T is exclusive too).
 fn isInclusive(motion: Motion.Motion) bool {
     return switch (motion) {
         .word_next_end, // e
@@ -1108,6 +1110,9 @@ fn isInclusive(motion: Motion.Motion) bool {
         .line_end, // $
         .find, // f
         .find_back, // F
+        .till, // t (the landing character IS the last deleted/yanked byte;
+        //        dt_ on "stdout_buffer" leaves "std_buffer"). Backward T
+        //        stays exclusive: dT_ on "abc_def" leaves "abc_f".
         .match_pair, // %
         => true,
         else => false,
@@ -1774,6 +1779,35 @@ test "f + x → motion find with args.ch='x'; ;/, repeat via last" {
     try testing.expectEqual(.motion, tag(r3));
     try testing.expectEqual(Motion.Motion.find_back, r3.motion.motion);
     try testing.expectEqual(@as(u8, 'x'), r3.motion.args.ch);
+}
+
+test "dt/ct: forward till is inclusive for operators; T stays exclusive" {
+    // The range layer uses `inclusive` to include the landing character.
+    // Forward t lands on the char before the target and vim includes it
+    // (dt_ on "stdout_buffer" leaves "std_buffer"); backward T excludes
+    // the char after the target (dT_ on "abc_def" leaves "abc_f").
+    var s = State.init();
+    _ = handle(&s, press('d'), Keymaps.normal);
+    _ = handle(&s, press('t'), Keymaps.normal);
+    const r = handle(&s, press('_'), Keymaps.normal);
+    try testing.expectEqual(.op_motion, tag(r));
+    try testing.expectEqual(Motion.Motion.till, r.op_motion.motion);
+    try testing.expect(r.op_motion.inclusive);
+
+    var s2 = State.init();
+    _ = handle(&s2, press('d'), Keymaps.normal);
+    _ = handle(&s2, press('T'), Keymaps.normal);
+    const r2 = handle(&s2, press('_'), Keymaps.normal);
+    try testing.expectEqual(.op_motion, tag(r2));
+    try testing.expectEqual(Motion.Motion.till_back, r2.op_motion.motion);
+    try testing.expect(!r2.op_motion.inclusive);
+
+    // find f/F remain inclusive (they always were): dfx keeps x.
+    var s3 = State.init();
+    _ = handle(&s3, press('d'), Keymaps.normal);
+    _ = handle(&s3, press('f'), Keymaps.normal);
+    const r3 = handle(&s3, press('x'), Keymaps.normal);
+    try testing.expect(r3.op_motion.inclusive);
 }
 
 test "dfx: operator + find motion" {

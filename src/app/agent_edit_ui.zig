@@ -20,6 +20,7 @@
 //! `:w` as the user's separate action.
 const std = @import("std");
 const disk_file = @import("../buffer/file.zig");
+const history_mod = @import("../buffer/history.zig");
 const vaxis = @import("vaxis");
 
 const app_mod = @import("../app.zig");
@@ -985,11 +986,12 @@ fn replaceBufferText(self: *App, idx: usize, text: []const u8) !void {
     if (idx >= self.buffers.items.len) return;
     const buf = &self.buffers.items[idx];
     buf.history.beginGroup();
-    try buf.history.record(&buf.pt, 0, buf.pt.len(), text);
+    // Whole-document replacement: recordEditBuffer re-anchors the closed
+    // folds by header text instead of dropping them.
+    try self.recordEditBuffer(buf, 0, buf.pt.len(), text);
     buf.history.endGroup();
     buf.dirty = false;
     if (buf.disk) |*disk| disk.didWrite(text);
-    buf.folds.clearRetainingCapacity();
     self.clearSpanCache(buf);
     for (self.windows.items) |*window| {
         if (window.buf == idx) {
@@ -1012,6 +1014,9 @@ fn replaceBufferTextDirect(self: *App, idx: usize, text: []const u8, dirty: bool
     if (idx >= self.buffers.items.len) return;
     const buf = &self.buffers.items[idx];
     _ = try buf.pt.replace(0, buf.pt.len(), text);
+    // Direct replacement bypasses the history/fold wrapper; re-match the
+    // surviving closed folds by header text.
+    self.reanchorAfterDirectReplace(buf);
     for (buf.history.undo_stack.items) |*group| group.deinit(self.alloc);
     buf.history.undo_stack.clearRetainingCapacity();
     for (buf.history.redo_stack.items) |*group| group.deinit(self.alloc);
@@ -1477,7 +1482,8 @@ fn afterBufferHistory(self: *App, idx: usize, dirty: bool) void {
     if (idx >= self.buffers.items.len) return;
     const buf = &self.buffers.items[idx];
     buf.dirty = dirty;
-    buf.folds.clearRetainingCapacity();
+    // Folds are transformed by the caller's historyApply/replace wrapper;
+    // clearing them here would unfold on every agent-patch undo/redo.
     self.clearSpanCache(buf);
     for (self.windows.items) |*window| {
         if (window.buf == idx) {
@@ -1690,10 +1696,11 @@ fn patchHistoryStep(self: *App, direction: PatchHistoryDirection) bool {
             if (self.buffers.items[idx].disk) |*disk| disk.didWrite(set.targetDiskText(i));
             if (use_history[i]) {
                 const hist = &self.buffers.items[idx].history;
-                switch (direction) {
-                    .undo => _ = hist.undo(&self.buffers.items[idx].pt),
-                    .redo => _ = hist.redo(&self.buffers.items[idx].pt),
-                }
+                const kind: history_mod.UndoKind = switch (direction) {
+                    .undo => .undo,
+                    .redo => .redo,
+                };
+                _ = self.historyApply(&self.buffers.items[idx], kind);
                 afterBufferHistory(self, idx, direction == .undo and file.old_dirty);
                 file.revision = hist.revision;
             } else {

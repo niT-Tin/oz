@@ -1448,12 +1448,14 @@ test "mouse: split pane focuses and places cursor; separator/status are no-ops; 
     }
     try std.testing.expect(std.mem.indexOf(u8, grid.rowText(2), "│") != null);
 
-    // Left pane click on line 3, text cell 2 (gutter=2 for 9 lines).
-    try mouseClickAt(&sess, 4, 4);
+    // Derive source origin from the rendered pane rather than gutter width.
+    const source_col = aiCellIndexOf(&grid, 4, "line3").?;
+    try mouseClickAt(&sess, source_col + 2, 4);
     try gridWaitFor(&sess, &grid, "line 3/9 col 2", 5000);
 
-    // Right pane click on line 5, text cell 1.
-    try mouseClickAt(&sess, 53, 6);
+    // Equal-width split: the right source starts one half-screen later.
+    const right_text_col = grid.cols / 2 + source_col + 1;
+    try mouseClickAt(&sess, right_text_col, 6);
     try gridWaitFor(&sess, &grid, "line 5/9 col 1", 5000);
 
     // Clicking the separator must NOT resize or move the cursor (v1 no-op).
@@ -1463,16 +1465,16 @@ test "mouse: split pane focuses and places cursor; separator/status are no-ops; 
 
     // Wheel over the right pane: 3 lines per notch, clamped at the file end
     // and the file start without overflow.
-    try mouseWheelAt(&sess, 53, 6, 1);
+    try mouseWheelAt(&sess, right_text_col, 6, 1);
     try gridWaitFor(&sess, &grid, "line 8/9 col 1", 5000);
-    try mouseWheelAt(&sess, 53, 6, 1);
+    try mouseWheelAt(&sess, right_text_col, 6, 1);
     try gridWaitFor(&sess, &grid, "line 9/9 col 1", 5000);
-    for (0..5) |_| try mouseWheelAt(&sess, 53, 6, -1);
+    for (0..5) |_| try mouseWheelAt(&sess, right_text_col, 6, -1);
     try gridWaitFor(&sess, &grid, "line 1/9 col 1", 5000);
 
     // Cursor placement: click line 2 cell 3 in the LEFT pane, insert Q at the
     // mapped byte (line2: l/i/n/e/2 → insert before 'e').
-    try mouseClickAt(&sess, 5, 3);
+    try mouseClickAt(&sess, source_col + 3, 3);
     try gridWaitFor(&sess, &grid, "line 2/9 col 3", 5000);
     try sess.send("iQ");
     std.Io.sleep(io, .fromMilliseconds(150), .real) catch {};
@@ -1481,7 +1483,7 @@ test "mouse: split pane focuses and places cursor; separator/status are no-ops; 
     try gridWaitFor(&sess, &grid, "linQe2", 5000);
 
     // Right pane click line 5 cell 1 → insert R after 'l'.
-    try mouseClickAt(&sess, 53, 6);
+    try mouseClickAt(&sess, right_text_col, 6);
     try gridWaitFor(&sess, &grid, "line 5/9 col 1", 5000);
     try sess.send("iR");
     std.Io.sleep(io, .fromMilliseconds(150), .real) catch {};
@@ -1878,6 +1880,25 @@ test "text regression: Unicode ranges and reversed selections save exact bytes" 
         .{ .initial = "abcd\n", .keys = "$dFa", .expected = "\n" },
         .{ .initial = "你好世界\n", .keys = "$dF好", .expected = "你\n" },
         .{ .initial = "one\ntwo\nthree\nfour\n", .keys = "jjVkd", .expected = "one\nfour\n" },
+        // forward t includes the landing character (one before the target);
+        // backward T stays exclusive (one after the target is NOT removed).
+        .{ .initial = "stdout_buffer\n", .keys = "llldt_", .expected = "std_buffer\n" },
+        .{ .initial = "stdout_buffer\n", .keys = "lllct_X\x1b", .expected = "stdX_buffer\n" },
+        .{ .initial = "stdout_buffer\n", .keys = "lllyt_$p", .expected = "stdout_bufferout\n" },
+        .{ .initial = "abc_def\n", .keys = "lllllldT_", .expected = "abc_f\n" },
+        // a missing target is NOT the same as an adjacent target: no-op.
+        .{ .initial = "stdout_buffer\n", .keys = "llldtZ", .expected = "stdout_buffer\n" },
+        // the target immediately after the cursor makes t land on the cursor;
+        // the operator still deletes the character under it.
+        .{ .initial = "stdout_buffer\n", .keys = "llldtu", .expected = "stdut_buffer\n" },
+        // count = the count-th match (operator aborts when it does not exist).
+        .{ .initial = "aXbXcX\n", .keys = "d2tX", .expected = "XcX\n" },
+        .{ .initial = "aXbXcX\n", .keys = "d4tX", .expected = "aXbXcX\n" },
+        .{ .initial = "a,b,c,\n", .keys = "d2t,", .expected = ",c,\n" },
+        // UTF-8: the landing character is a whole codepoint, not one byte.
+        .{ .initial = "你好🙂世\n", .keys = "dt世", .expected = "世\n" },
+        // CRLF: the range never eats the terminator.
+        .{ .initial = "stdout_buffer\r\n", .keys = "llldt_", .expected = "std_buffer\r\n" },
     };
     for (cases, 0..) |case, index| {
         var name_buf: [128:0]u8 = undefined;
@@ -1896,6 +1917,12 @@ test "text regression: Unicode ranges and reversed selections save exact bytes" 
         defer grid.deinit(alloc);
         try gridWaitFor(&sess, &grid, "NORMAL", 8000);
         try sess.send(case.keys);
+        // A case may deliberately end in Insert mode (ct_): wait for its
+        // Esc to land before sending the ex command. Sending ":wq" while
+        // the ESC is still in flight coalesces into Alt+':' and types the
+        // command into the buffer instead of opening the cmdline.
+        try gridWaitGone(&sess, &grid, "INSERT", 4000);
+        try gridWaitFor(&sess, &grid, "NORMAL", 4000);
         try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
         const saved = try std.Io.Dir.cwd().readFileAlloc(io, name, alloc, .limited(1024));
         defer alloc.free(saved);
@@ -1931,6 +1958,63 @@ test "text regression: vertical movement then insert preserves UTF-8" {
     const saved = try std.Io.Dir.cwd().readFileAlloc(io, name, alloc, .limited(1024));
     defer alloc.free(saved);
     try std.testing.expectEqualStrings("ab\nX你好\n", saved);
+}
+
+test "text regression: enclosing bracket pair contains the cursor" {
+    // Issue #17: with the cursor on the space before the outer ')' of
+    // "for (args.iterate().next() != null ) |arg| {", di( must delete the
+    // OUTER pair's content, not the already-closed `.next(` pair.
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var name_buf: [192:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}_bracket.txt", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "for (args.iterate().next() != null ) |arg| {\n");
+    }
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, name }, null, 24, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "args.iterate().next()", 8000);
+
+    // f) -> first ')' (of iterate()), ';' -> ') of next(', ';' -> outer ')',
+    // h -> the space before it (byte 34). Then di(.
+    try sess.send("f);;hdi(");
+    try gridWaitFor(&sess, &grid, "for () |arg| {", 4000);
+    try gridWaitGone(&sess, &grid, "args.iterate()", 4000);
+
+    // undo restores the line, redo deletes the same enclosing range.
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "args.iterate().next()", 4000);
+    try sess.send("\x12"); // Ctrl-R
+    try gridWaitFor(&sess, &grid, "for () |arg| {", 4000);
+
+    // yi( yanks the same enclosing content; $p proves the exact register
+    // bytes including the trailing space before the outer ')'.
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "args.iterate().next()", 4000);
+    try sess.send("f);;hyi($p");
+    try gridWaitFor(&sess, &grid, "{args.iterate().next() != null ", 4000);
+
+    // Undo the put, then ci( on the same spot: the changed range is the
+    // enclosing content and the sentinel lands inside the parentheses.
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "for (args.iterate().next() != null ) |arg| {", 4000);
+    try sess.send("0f);;hci(X\x1b");
+    try gridWaitFor(&sess, &grid, "for (X) |arg| {", 4000);
+    try gridWaitGone(&sess, &grid, "INSERT", 4000);
+    try gridWaitFor(&sess, &grid, "NORMAL", 4000);
+
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try std.Io.Dir.cwd().readFileAlloc(io, name, alloc, .limited(1024));
+    defer alloc.free(saved);
+    try std.testing.expectEqualStrings("for (X) |arg| {\n", saved);
 }
 
 test "insert text in insert mode, esc back to normal" {
@@ -4312,6 +4396,126 @@ test "multi-buffer: :e opens a tab, gt/:bn switch, :bd closes" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+test "buffers: switching restores each window's cursor and viewport" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var dir_buf: [128:0]u8 = undefined;
+    const dir = try bufPrintZ(&dir_buf, "/tmp/oz_e2e_{d}_{d}view", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().createDir(io, dir, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var a_buf: [160:0]u8 = undefined;
+    const a = try bufPrintZ(&a_buf, "{s}/long.txt", .{dir});
+    var b_buf: [160:0]u8 = undefined;
+    const b = try bufPrintZ(&b_buf, "{s}/short.txt", .{dir});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, a, .{ .truncate = true });
+        defer f.close(io);
+        var text: [512]u8 = undefined;
+        var used: usize = 0;
+        var i: usize = 1;
+        while (i <= 60) : (i += 1) {
+            used += (try std.fmt.bufPrint(text[used..], "L{d:0>2}\n", .{i})).len;
+        }
+        try f.writeStreamingAll(io, text[0..used]);
+    }
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, b, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "BBB\n");
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, a });
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "L01", 5000);
+
+    // Line 20 with the view pinned to it: cursor and viewport are now both
+    // distinguishable from the startup top-of-file position.
+    try sess.send("19jzt");
+    try gridWaitFor(&sess, &grid, "line 20/61", 5000);
+    try gridWaitGone(&sess, &grid, "L01", 5000);
+    try std.testing.expect(rowContains(&grid, 2, "L20"));
+
+    // :e opens the short buffer; :bp returns and must restore BOTH the
+    // cursor line and the viewport top (L01 stays out of sight).
+    var cmd_buf: [320]u8 = undefined;
+    const open_b = try std.fmt.bufPrint(&cmd_buf, ":e {s}\r", .{b});
+    try sess.send(open_b);
+    try gridWaitFor(&sess, &grid, "line 1/2", 5000);
+    try gridWaitFor(&sess, &grid, "BBB", 5000);
+    try sess.send(":bp\r");
+    try gridWaitFor(&sess, &grid, "line 20/61", 5000);
+    try std.testing.expect(!grid.contains("L01"));
+    try std.testing.expect(rowContains(&grid, 2, "L20"));
+
+    // :bn / :bp round-trip: the short buffer's own position is remembered
+    // too (no stale cursor from the long buffer leaking in).
+    try sess.send(":bn\r");
+    try gridWaitFor(&sess, &grid, "line 1/2", 5000);
+    try sess.send(":bp\r");
+    try gridWaitFor(&sess, &grid, "line 20/61", 5000);
+    try std.testing.expect(rowContains(&grid, 2, "L20"));
+
+    // gt cycles through the buffer list and shares the same switch path.
+    try sess.send("gt");
+    try gridWaitFor(&sess, &grid, "BBB", 5000);
+    try sess.send("gt");
+    try gridWaitFor(&sess, &grid, "line 20/61", 5000);
+    try std.testing.expect(!grid.contains("L01"));
+    try std.testing.expect(rowContains(&grid, 2, "L20"));
+
+    // Two splits on the same buffer keep independent positions: the right
+    // window moves to line 40, the left changes buffer and comes back.
+    try sess.send(":vs\r");
+    var waited: i32 = 0;
+    while (true) {
+        const row = grid.rowText(2);
+        const first = std.mem.indexOf(u8, row, "L20");
+        const second = if (first) |f| std.mem.indexOfPos(u8, row, f + 1, "L20") else null;
+        if (first != null and second != null) break;
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) {
+            waited += 100;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(2), "L20") != null);
+    // focused right window (copied at line 20) moves to line 40 and pins it
+    // to the top
+    try sess.send("20jzt");
+    try gridWaitFor(&sess, &grid, "line 40/61", 5000);
+    try std.testing.expect(rowContains(&grid, 2, "L40"));
+    // left window (line 20) switches away and back; the right window's
+    // position must not be disturbed
+    try sess.send("\x17h");
+    try gridWaitFor(&sess, &grid, "line 20/61", 5000);
+    try sess.send(open_b);
+    try gridWaitFor(&sess, &grid, "line 1/2", 5000);
+    try sess.send(":bp\r");
+    try gridWaitFor(&sess, &grid, "line 20/61", 5000);
+    try std.testing.expect(rowContains(&grid, 2, "L20"));
+    try std.testing.expect(rowContains(&grid, 2, "L40"));
+    // back to the right window: still line 40 with L40 at the top
+    try sess.send("\x17l");
+    try gridWaitFor(&sess, &grid, "line 40/61", 5000);
+    try std.testing.expect(rowContains(&grid, 2, "L40"));
+
+    const exit_code = try sess.commandAndWaitExit(":qa\r");
+    if (exit_code != 0) std.debug.print("view-state e2e exit {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
 test "buffer picker: <leader>sb lists open buffers, Enter switches" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -5197,9 +5401,9 @@ test "visual: rainbow brackets, indent guides and scope highlight" {
     try std.testing.expectEqual(@as(?u32, indent0), grid.guideFgAt(4, 0));
     try std.testing.expectEqual(@as(?u32, guide_gray), grid.guideFgAt(4, 1));
 
-    // (The scope first line's underline — snacks.indent.scope underline — is
-    // SGR underline, which the e2e grid does not parse, so it is not
-    // asserted here.)
+    // (The scope header's horizontal rule is asserted by the scope-emphasis
+    // regressions below: only the active window's source cells take SGR 4:1,
+    // with diagnostics overriding it.)
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     if (exit_code != 0) std.debug.print("oz exited with code {d}\n", .{exit_code});
@@ -5524,9 +5728,8 @@ test "visual block: rectangle semantics — highlight and d delete per column" {
 
     const sel_bg = packRgb(45, 79, 103);
     // cursor → col 1, Ctrl+v (anchor col 1), j j → cursor line 2 col 1.
-    // Screen layout: row 0 = tab bar, content col 0 = gutter (2 wide for a
-    // 3-line file), so file line n sits on screen row n+1 and its byte col 1
-    // is screen col 3.
+    // Source origin moves with number/sign padding; selection stays on bytes.
+    const block_col = aiFindCellFrom(&grid, "aaa", 0).?.col + 1;
     try sess.send("l\x16jj");
     waited = 0;
     var block_hl = false;
@@ -5539,9 +5742,9 @@ test "visual block: rectangle semantics — highlight and d delete per column" {
         }
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
-        if (grid.bg_buf[2 * grid.cols + 3] == sel_bg and
-            grid.bg_buf[3 * grid.cols + 3] == sel_bg and
-            grid.bg_buf[4 * grid.cols + 3] == sel_bg)
+        if (grid.bg_buf[2 * grid.cols + block_col] == sel_bg and
+            grid.bg_buf[3 * grid.cols + block_col] == sel_bg and
+            grid.bg_buf[4 * grid.cols + block_col] == sel_bg)
         {
             block_hl = true;
         }
@@ -5551,12 +5754,11 @@ test "visual block: rectangle semantics — highlight and d delete per column" {
         grid.dump();
     }
     try std.testing.expect(block_hl);
-    // the rectangle must NOT light column 0 or 2 on any row (the byte-range
-    // path lit col 2 on row 0 and col 0..3 on row 1)
-    try std.testing.expect(grid.bg_buf[2 * grid.cols + 2] != sel_bg);
-    try std.testing.expect(grid.bg_buf[2 * grid.cols + 4] != sel_bg);
-    try std.testing.expect(grid.bg_buf[3 * grid.cols + 2] != sel_bg);
-    try std.testing.expect(grid.bg_buf[4 * grid.cols + 2] != sel_bg);
+    // Neighboring source cells stay outside the selected byte column.
+    try std.testing.expect(grid.bg_buf[2 * grid.cols + block_col - 1] != sel_bg);
+    try std.testing.expect(grid.bg_buf[2 * grid.cols + block_col + 1] != sel_bg);
+    try std.testing.expect(grid.bg_buf[3 * grid.cols + block_col - 1] != sel_bg);
+    try std.testing.expect(grid.bg_buf[4 * grid.cols + block_col - 1] != sel_bg);
 
     // d deletes exactly one column from every covered row: aa / bbb / c
     try sess.send("d");
@@ -8117,13 +8319,13 @@ test "gutter: relative line numbers never overlap content on deep files" {
     }
     try std.testing.expect(std.mem.eql(u8, grid.rowText(22)[0..6], "15000 "));
 
-    // every visible content row: the first content cell is at the dynamic
-    // gutter width (column 6, preceded by the trailing space) — line
-    // numbers never run into the text
+    const source_col = aiCellIndexOf(&grid, 22, "x").?;
+    try std.testing.expectEqual(@as(usize, 8), source_col); // 5 digits + gap/sign/gap
+    // Every visible row shares this source origin and keeps its padding.
     var r: usize = 2;
     while (r < 23) : (r += 1) {
-        try std.testing.expect(grid.buf[(r * 80 + 6) * 4] == 'x');
-        try std.testing.expect(grid.buf[(r * 80 + 5) * 4] == ' ');
+        try std.testing.expectEqualStrings("x", frame.cellText(&grid, r, source_col));
+        for (1..4) |gap| try std.testing.expectEqualStrings(" ", frame.cellText(&grid, r, source_col - gap));
     }
 
     const exit_code = try sess.commandAndWaitExit(":q!\r");
@@ -8735,6 +8937,19 @@ test "e2e: yy/dd/p/P linewise register matches nvim (lines below/above, cursor o
         }
     };
 
+    const Check = struct {
+        fn row(g: *Grid, r: usize, source_col: usize, number: []const u8, source: []const u8) !void {
+            try std.testing.expectEqualStrings(number, frame.cellText(g, r, 0));
+            for (source, 0..) |byte, i| try std.testing.expectEqual(byte, g.cell(r, source_col + i)[0]);
+            // Preserve indentation and exact EOL, without making the
+            // editing oracle depend on the chrome's number/sign spacing.
+            for (source_col + source.len..g.cols) |col| {
+                const cell = frame.cellText(g, r, col);
+                try std.testing.expect(cell.len == 0 or std.mem.eql(u8, cell, " "));
+            }
+        }
+    };
+
     try std.testing.expect(try Wait.until(&sess, &grid, "NORMAL"));
 
     // yy p: the yanked line goes BELOW the cursor line as a whole line
@@ -8742,10 +8957,10 @@ test "e2e: yy/dd/p/P linewise register matches nvim (lines below/above, cursor o
     // Buffer: abc / abc / bbb / ccc / ddd; cursor lands on the pasted line.
     try sess.send("yyp");
     try std.testing.expect(try Wait.until(&sess, &grid, "line 2/6"));
-    // rowText keeps the bg-padded trailing spaces — trim before comparing
-    try std.testing.expectEqualStrings("1 abc", std.mem.trim(u8, grid.rowText(2), " "));
-    try std.testing.expectEqualStrings("2 abc", std.mem.trim(u8, grid.rowText(3), " "));
-    try std.testing.expectEqualStrings("1   bbb", std.mem.trim(u8, grid.rowText(4), " "));
+    const source_col = aiCellIndexOf(&grid, 2, "abc").?;
+    try Check.row(&grid, 2, source_col, "1", "abc");
+    try Check.row(&grid, 3, source_col, "2", "abc");
+    try Check.row(&grid, 4, source_col, "1", "  bbb");
 
     // one u undoes the whole paste (single undo group). The cursor stays at
     // the change site, so wait for the restored line count, then gg home
@@ -8758,8 +8973,8 @@ test "e2e: yy/dd/p/P linewise register matches nvim (lines below/above, cursor o
     // non-blank of the pasted line (col 2), like nvim
     try sess.send("jyyP");
     try std.testing.expect(try Wait.until(&sess, &grid, "line 2/6 col 2"));
-    try std.testing.expectEqualStrings("2   bbb", std.mem.trim(u8, grid.rowText(3), " "));
-    try std.testing.expectEqualStrings("1   bbb", std.mem.trim(u8, grid.rowText(4), " "));
+    try Check.row(&grid, 3, source_col, "2", "  bbb");
+    try Check.row(&grid, 4, source_col, "1", "  bbb");
 
     // u, then dd p: dd fills the register LINEWISE (vim unnamed register),
     // p puts the cut line below the next one — abc moves under bbb
@@ -8769,9 +8984,9 @@ test "e2e: yy/dd/p/P linewise register matches nvim (lines below/above, cursor o
     try std.testing.expect(try Wait.until(&sess, &grid, "line 1/5"));
     try sess.send("ddp");
     try std.testing.expect(try Wait.until(&sess, &grid, "line 2/5"));
-    try std.testing.expectEqualStrings("1   bbb", std.mem.trim(u8, grid.rowText(2), " "));
-    try std.testing.expectEqualStrings("2 abc", std.mem.trim(u8, grid.rowText(3), " "));
-    try std.testing.expectEqualStrings("1 ccc", std.mem.trim(u8, grid.rowText(4), " "));
+    try Check.row(&grid, 2, source_col, "1", "  bbb");
+    try Check.row(&grid, 3, source_col, "2", "abc");
+    try Check.row(&grid, 4, source_col, "1", "ccc");
 
     // save and verify the exact bytes
     const exit_code = try sess.commandAndWaitExit(":wq\r");
@@ -10632,15 +10847,15 @@ test "lsp: diagnostics push repaints without a keypress (stale mark cleared)" {
             sess.used += n;
             grid.feed(sess.out[sess.used - n .. sess.used]);
         }
-        if (grid.buf[(2 * grid.cols + 1) * 4] == 0xEF and
-            grid.buf[(2 * grid.cols + 1) * 4 + 1] == 0x91 and
-            grid.buf[(2 * grid.cols + 1) * 4 + 2] == 0xA7) mark = true;
+        if (aiFindCell(&grid, "\u{f467}") != null) mark = true;
     }
     if (!mark) {
         std.debug.print("diagnostics mark never appeared without a keypress:\n", .{});
         grid.dump();
     }
     try std.testing.expect(mark);
+    const marked_cell = aiFindCell(&grid, "\u{f467}").?;
+    try std.testing.expectEqual(aiFindCell(&grid, "const a").?.row, marked_cell.row);
 
     // Edit once (didChange → mock pushes the empty list). The mark must
     // vanish with NO further keypress. Ctrl+e hides the completion menu the
@@ -10657,8 +10872,7 @@ test "lsp: diagnostics push repaints without a keypress (stale mark cleared)" {
             sess.used += n;
             grid.feed(sess.out[sess.used - n .. sess.used]);
         }
-        const gutter = grid.buf[(1 * grid.cols + 1) * 4 ..][0..3];
-        if (!(gutter[0] == 0xEF and gutter[1] == 0x91 and gutter[2] == 0xA7)) cleared = true;
+        if (!std.mem.eql(u8, frame.cellText(&grid, marked_cell.row, marked_cell.col), "\u{f467}")) cleared = true;
     }
     if (!cleared) {
         std.debug.print("stale diagnostics mark survived the clear push:\n", .{});
@@ -10729,12 +10943,9 @@ test "lsp: jk exit re-syncs the phantom 'j' removal (no stale diagnostic)" {
             waited += 200;
             if (waited >= 8000) break;
         }
-        var r: usize = 0;
-        while (r < grid.rows) : (r += 1) {
-            const g = grid.buf[(r * grid.cols + 1) * 4 ..][0..3];
-            if (g[0] == 0xEF and g[1] == 0x91 and g[2] == 0xA7) {
-                phantom_seen = true;
-                break;
+        if (aiFindCell(&grid, "\u{f467}")) |mark| {
+            if (aiFindCell(&grid, "jconst a")) |source_cell| {
+                phantom_seen = mark.row == source_cell.row;
             }
         }
     }
@@ -10760,15 +10971,8 @@ test "lsp: jk exit re-syncs the phantom 'j' removal (no stale diagnostic)" {
             waited += 200;
             if (waited >= 8000) break;
         }
-        var r: usize = 0;
-        phantom_gone = true;
-        while (r < grid.rows) : (r += 1) {
-            const g = grid.buf[(r * grid.cols + 1) * 4 ..][0..3];
-            if (g[0] == 0xEF and g[1] == 0x91 and g[2] == 0xA7) {
-                phantom_gone = false;
-                break;
-            }
-        }
+        phantom_gone = aiFindCell(&grid, "\u{f467}") == null and
+            grid.contains("NORMAL") and !grid.contains("jconst a");
     }
     if (!phantom_gone) {
         std.debug.print("phantom j diagnostic stayed after jk exit:\n", .{});
@@ -10863,19 +11067,14 @@ test "lsp: diagnostics — gutter mark, gl, <leader>sd list" {
         }
         // gutter col 1 on screen row 2: the Nerd Font ✖ (nf-fa-times_circle,
         // U+F467 → EF 91 A7) — no longer a bare 'E'
-        if (grid.buf[(2 * grid.cols + 1) * 4] == 0xEF and
-            grid.buf[(2 * grid.cols + 1) * 4 + 1] == 0x91 and
-            grid.buf[(2 * grid.cols + 1) * 4 + 2] == 0xA7) mark = true;
+        if (aiFindCell(&grid, "\u{f467}") != null) mark = true;
     }
     if (!mark) {
-        std.debug.print("no gutter mark; col1={x}{x}{x}\n", .{
-            grid.buf[(2 * grid.cols + 1) * 4],
-            grid.buf[(2 * grid.cols + 1) * 4 + 1],
-            grid.buf[(2 * grid.cols + 1) * 4 + 2],
-        });
+        std.debug.print("no gutter diagnostic mark\n", .{});
         grid.dump();
     }
     try std.testing.expect(mark);
+    try std.testing.expectEqual(aiFindCell(&grid, "const a").?.row, aiFindCell(&grid, "\u{f467}").?.row);
 
     // <leader>sd → diagnostics list with "1: mock error"
     try sess.send(" sd");
@@ -13668,6 +13867,177 @@ test "folds: za toggles, zM/zR close/open all, j/k skip closed folds" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+test "folds: edits elsewhere keep closed folds closed" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}fold_edit.py", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\top
+            \\def alpha():
+            \\    body a1
+            \\    body a2
+            \\def beta():
+            \\    body b1
+            \\tail
+        );
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "body a1", 5000);
+
+    // close alpha's fold (cursor on its header)
+    try sess.send("jza");
+    try gridWaitFor(&sess, &grid, "… 2 lines", 5000);
+    try gridWaitGone(&sess, &grid, "body a1", 5000);
+
+    // dd on a REAL line above the fold: the header shifts up one line and the
+    // block must stay closed. (Regression: every edit cleared the fold set.)
+    const dd_mark = sess.used;
+    try sess.send("ggdd");
+    try gridWaitFor(&sess, &grid, "line 1/6", 5000);
+    try std.testing.expect(grid.contains("… 2 lines"));
+    try std.testing.expect(!grid.contains("body a1"));
+    try std.testing.expect(rowContains(&grid, 2, "def alpha"));
+    // No flash: the body must never be painted in the redraw triggered by the
+    // edit (a transient unfold would put it in the raw ANSI stream even if the
+    // final frame folded it again).
+    try std.testing.expect(std.mem.indexOf(u8, sess.out[dd_mark..sess.used], "body a1") == null);
+
+    // undo/redo of that edit keep the surviving fold closed.
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "line 1/7", 5000);
+    try std.testing.expect(grid.contains("… 2 lines"));
+    try std.testing.expect(!grid.contains("body a1"));
+    try sess.send("\x12");
+    try gridWaitFor(&sess, &grid, "line 1/6", 5000);
+    try std.testing.expect(grid.contains("… 2 lines"));
+    try std.testing.expect(!grid.contains("body a1"));
+
+    // A linewise paste above the block moves it (and its identity) down one
+    // line; the fold stays closed.
+    try sess.send("yyP");
+    try gridWaitFor(&sess, &grid, "line 1/7", 5000);
+    try std.testing.expect(grid.contains("… 2 lines"));
+    try std.testing.expect(!grid.contains("body a1"));
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "line 1/6", 5000);
+
+    // :%s edits a line INSIDE the closed body. The body text may change but
+    // the block must not expand.
+    try sess.send(":%s/body a1/BODY_A1/\r");
+    _ = try uiPump(&sess, &grid, 400);
+    try std.testing.expect(grid.contains("… 2 lines"));
+    try std.testing.expect(!grid.contains("BODY_A1"));
+    // Opening the fold shows the updated body.
+    try sess.send("za");
+    try gridWaitFor(&sess, &grid, "BODY_A1", 5000);
+    try gridWaitGone(&sess, &grid, "… 2 lines", 5000);
+
+    // Deleting the header really removes the block: the fold is dropped.
+    try sess.send("gg");
+    try sess.send("za");
+    try gridWaitFor(&sess, &grid, "… 2 lines", 5000);
+    try sess.send("dd");
+    try gridWaitFor(&sess, &grid, "line 1/5", 5000);
+    try std.testing.expect(!grid.contains("… 2 lines"));
+    try std.testing.expect(grid.contains("body a2"));
+    // Undo restores the text but does not resurrect the dropped fold
+    // (vim: fold state is not part of undo).
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "line 1/6", 5000);
+    try std.testing.expect(!grid.contains("… 2 lines"));
+
+    const exit_code = try sess.commandAndWaitExit(":qa!\r");
+    if (exit_code != 0) std.debug.print("fold edit exit {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "folds: split windows keep closed folds through edits" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var name_buf: [128:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}fold_split.py", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\top
+            \\def alpha():
+            \\    body a1
+            \\    body a2
+            \\def beta():
+            \\    body b1
+            \\tail
+        );
+    }
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, name });
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "body a1", 5000);
+
+    try sess.send("jza");
+    try gridWaitFor(&sess, &grid, "… 2 lines", 5000);
+    try gridWaitGone(&sess, &grid, "body a1", 5000);
+
+    // :vs — both panes show the same buffer, hence the same closed fold.
+    try sess.send(":vs\r");
+    var waited: i32 = 0;
+    while (true) {
+        if (rowContains(&grid, 2, "│") and
+            std.mem.count(u8, grid.rowText(2), "… 2 lines") >= 1) break;
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) {
+            waited += 100;
+            if (waited >= 5000) break;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    try std.testing.expect(rowContains(&grid, 2, "│"));
+    try std.testing.expect(!grid.contains("body a1"));
+
+    // Edit AFTER the folds in the focused (right) window: deleting beta's
+    // body line must not expand alpha's closed block in either pane.
+    try sess.send("G");
+    try gridWaitFor(&sess, &grid, "line 7/7", 5000);
+    const dd_mark = sess.used;
+    try sess.send("kdd");
+    try gridWaitFor(&sess, &grid, "line 6/6", 5000);
+    try std.testing.expect(grid.contains("… 2 lines"));
+    try std.testing.expect(!grid.contains("body a1"));
+    try std.testing.expect(std.mem.indexOf(u8, sess.out[dd_mark..sess.used], "body a1") == null);
+    // Undo restores the deleted line (cursor at the restored span start,
+    // which is line 6); the fold is still closed in both panes.
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "line 6/7", 5000);
+    try std.testing.expect(grid.contains("… 2 lines"));
+    try std.testing.expect(!grid.contains("body a1"));
+
+    const exit_code = try sess.commandAndWaitExit(":qa!\r");
+    if (exit_code != 0) std.debug.print("fold split exit {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
 test "git: gutter signs, ]c hunk jump, hunk stage/reset, blame ghost, branch" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -14598,6 +14968,726 @@ test "terminal: shell-integration OSC sequences never print vaxis logs" {
     // terminal session still alive (teardown path already covered above).
     try sess.send("\x1b");
     std.Io.sleep(io, .fromMilliseconds(250), .real) catch {};
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+// ---- issue #18: persistent terminal sessions + framed PTY ----
+
+/// Parse `<key><digits>` from the current reconstructed frame. A typed shell
+/// command echoes its `printf` format (`<key>%s`) too, so the digit guard is
+/// what distinguishes the real output from the echo.
+fn termGridPid(grid: *Grid, key: []const u8) ?i64 {
+    var r: usize = 0;
+    while (r < grid.rows) : (r += 1) {
+        const text = grid.rowText(r);
+        const at = std.mem.indexOf(u8, text, key) orelse continue;
+        var i = at + key.len;
+        const start = i;
+        while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {}
+        if (i == start) continue;
+        return std.fmt.parseInt(i64, text[start..i], 10) catch null;
+    }
+    return null;
+}
+
+fn termWaitPid(sess: *Session, grid: *Grid, key: []const u8, timeout_ms: i32) !i64 {
+    const deadline = std.Io.Timestamp.now(sess.io, .awake).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    while (std.Io.Timestamp.now(sess.io, .awake).nanoseconds < deadline) {
+        if (termGridPid(grid, key)) |pid| return pid;
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) continue;
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    std.debug.print("missing terminal pid '{s}':\n", .{key});
+    grid.dump();
+    return error.TestUnexpectedResult;
+}
+
+fn termGridHasValue(grid: *Grid, key: []const u8, value: []const u8) bool {
+    var r: usize = 0;
+    while (r < grid.rows) : (r += 1) {
+        const text = grid.rowText(r);
+        const at = std.mem.indexOf(u8, text, key) orelse continue;
+        const rest = text[at + key.len ..];
+        if (!std.mem.startsWith(u8, rest, value)) continue;
+        if (rest.len == value.len or rest[value.len] == ' ') return true;
+    }
+    return false;
+}
+
+fn termWaitValue(sess: *Session, grid: *Grid, key: []const u8, value: []const u8, timeout_ms: i32) !void {
+    const deadline = std.Io.Timestamp.now(sess.io, .awake).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    while (std.Io.Timestamp.now(sess.io, .awake).nanoseconds < deadline) {
+        if (termGridHasValue(grid, key, value)) return;
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) continue;
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    std.debug.print("missing terminal value '{s}{s}':\n", .{ key, value });
+    grid.dump();
+    return error.TestUnexpectedResult;
+}
+
+const TermSize = struct { rows: u32, cols: u32 };
+
+/// `<key><rows> <cols>`: the `stty size` answer printed by the child. The
+/// echoed command line carries `<key>%s` and is rejected by the digit guard.
+fn termParseSize(grid: *Grid, key: []const u8) ?TermSize {
+    var r: usize = 0;
+    while (r < grid.rows) : (r += 1) {
+        const text = grid.rowText(r);
+        const at = std.mem.indexOf(u8, text, key) orelse continue;
+        var i = at + key.len;
+        const rows_start = i;
+        while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {}
+        if (i == rows_start) continue;
+        const rows = std.fmt.parseInt(u32, text[rows_start..i], 10) catch continue;
+        if (i >= text.len or text[i] != ' ') continue;
+        while (i < text.len and text[i] == ' ') : (i += 1) {}
+        const cols_start = i;
+        while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {}
+        if (i == cols_start) continue;
+        const cols = std.fmt.parseInt(u32, text[cols_start..i], 10) catch continue;
+        if (rows == 0 or cols == 0) continue;
+        return .{ .rows = rows, .cols = cols };
+    }
+    return null;
+}
+
+fn termWaitSize(sess: *Session, grid: *Grid, key: []const u8, timeout_ms: i32) !TermSize {
+    const deadline = std.Io.Timestamp.now(sess.io, .awake).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    while (std.Io.Timestamp.now(sess.io, .awake).nanoseconds < deadline) {
+        if (termParseSize(grid, key)) |size| return size;
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) continue;
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    std.debug.print("missing terminal size '{s}':\n", .{key});
+    grid.dump();
+    return error.TestUnexpectedResult;
+}
+
+fn termWaitBox(sess: *Session, grid: *Grid, timeout_ms: i32) !frame.Rect {
+    const deadline = std.Io.Timestamp.now(sess.io, .awake).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    while (std.Io.Timestamp.now(sess.io, .awake).nanoseconds < deadline) {
+        if (frame.findBoxByTitle(grid, "oz terminal")) |box| return box;
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) continue;
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    std.debug.print("missing terminal frame 'oz terminal':\n", .{});
+    grid.dump();
+    return error.TestUnexpectedResult;
+}
+
+const TermBoxKind = enum { floating, bottom, right };
+
+/// True when the drawn frame has the geometry of `kind` for this grid. Used
+/// to wait for a layout switch's redraw BEFORE typing into the child: a
+/// command executed in the old-size PTY would be erased by the resize's
+/// screen reset.
+fn termBoxIsKind(box: frame.Rect, kind: TermBoxKind, grid: *Grid) bool {
+    switch (kind) {
+        .floating => return box.width() < grid.cols and box.left > 0 and
+            box.top > 2 and box.bottom + 2 < grid.rows,
+        .bottom => return box.width() == grid.cols and box.bottom == grid.rows - 2,
+        .right => return box.width() < grid.cols and box.left > 0 and
+            box.left * 2 > grid.cols and box.bottom == grid.rows - 2,
+    }
+}
+
+fn termWaitLayout(sess: *Session, grid: *Grid, kind: TermBoxKind, timeout_ms: i32) !frame.Rect {
+    const deadline = std.Io.Timestamp.now(sess.io, .awake).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    while (std.Io.Timestamp.now(sess.io, .awake).nanoseconds < deadline) {
+        if (frame.findBoxByTitle(grid, "oz terminal")) |box| {
+            if (termBoxIsKind(box, kind, grid)) return box;
+        }
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) continue;
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    std.debug.print("missing '{s}' terminal frame:\n", .{@tagName(kind)});
+    grid.dump();
+    return error.TestUnexpectedResult;
+}
+
+fn termWaitBoxInner(sess: *Session, grid: *Grid, want_w: usize, want_h: usize, timeout_ms: i32) !frame.Rect {
+    const deadline = std.Io.Timestamp.now(sess.io, .awake).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    while (std.Io.Timestamp.now(sess.io, .awake).nanoseconds < deadline) {
+        if (frame.findBoxByTitle(grid, "oz terminal")) |box| {
+            if (box.width() - 2 == want_w and box.height() - 2 == want_h) return box;
+        }
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) continue;
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    std.debug.print("missing {d}x{d}-inner terminal frame:\n", .{ want_w, want_h });
+    grid.dump();
+    return error.TestUnexpectedResult;
+}
+
+/// Focus is rendered as the border color: accent while the child owns the
+/// keys, quiet `win_sep` after Esc. Waiting on the FRAME (not a sleep) also
+/// separates a lone Esc from the next key, which the input parser would
+/// otherwise coalesce with the following ESC as Alt+Esc.
+fn termBorderIsFocused(grid: *Grid, box: frame.Rect, accent: u32) bool {
+    return grid.fg_buf[box.top * grid.cols + box.left] == accent;
+}
+
+fn termWaitFocus(sess: *Session, grid: *Grid, box: frame.Rect, accent: u32, want: bool, timeout_ms: i32) !void {
+    const deadline = std.Io.Timestamp.now(sess.io, .awake).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    while (std.Io.Timestamp.now(sess.io, .awake).nanoseconds < deadline) {
+        if (termBorderIsFocused(grid, box, accent) == want) return;
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+        if (n == 0) continue;
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    std.debug.print("terminal frame focus never became {}\n", .{want});
+    grid.dump();
+    return error.TestUnexpectedResult;
+}
+
+/// First cell (row, col) where `needle` starts in the reconstructed frame.
+fn termFindText(grid: *Grid, needle: []const u8) ?struct { row: usize, col: usize } {
+    var r: usize = 0;
+    while (r < grid.rows) : (r += 1) {
+        const text = grid.rowText(r);
+        if (std.mem.indexOf(u8, text, needle)) |byte_at| {
+            // Convert the byte offset to a cell column; rows may contain
+            // multi-byte box glyphs, so byte and cell offsets differ.
+            var byte: usize = 0;
+            var c: usize = 0;
+            while (c < grid.cols and byte < byte_at) : (c += 1) {
+                const slot = grid.buf[(r * grid.cols + c) * 4 ..][0..4];
+                var k: usize = 0;
+                while (k < 4 and slot[k] != 0) : (k += 1) {}
+                byte += k;
+            }
+            return .{ .row = r, .col = c };
+        }
+    }
+    return null;
+}
+
+test "terminal: Alt+R hide/show reuses the shell session; layouts keep it; exit replaces it" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var dir_buf: [160]u8 = undefined;
+    const root = try std.fmt.bufPrint(&dir_buf, "/tmp/oz_term18_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDir(io, root, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "reuse.txt", "terminal session fixture\n");
+    const path = try std.fmt.allocPrint(alloc, "{s}/reuse.txt", .{root});
+    defer alloc.free(path);
+
+    var mark_buf: [64]u8 = undefined;
+    const mark = try std.fmt.bufPrint(&mark_buf, "ozmark18_{d}", .{linux.getpid()});
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, null, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+    const accent = packRgb(0xE6, 0xC3, 0x84); // focused kanagawa-wave border
+
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "terminal session fixture", 5000);
+
+    // First session: identity (PID), exported environment and cwd.
+    try sess.send("\x1br");
+    _ = try termWaitLayout(&sess, &grid, .floating, 15000);
+    var export_buf: [96]u8 = undefined;
+    try sess.send(try std.fmt.bufPrint(&export_buf, "export OZ_TERM_MARK={s}\r", .{mark}));
+    try sess.send("printf 'OZPID1=%s\\n' \"$$\"\r");
+    const pid1 = try termWaitPid(&sess, &grid, "OZPID1=", 15000);
+    try sess.send("printf 'OZMARK1=%s\\n' \"$OZ_TERM_MARK\"\r");
+    try termWaitValue(&sess, &grid, "OZMARK1=", mark, 8000);
+    try sess.send("printf 'OZCWD1=%s\\n' \"$PWD\"\r");
+    try termWaitValue(&sess, &grid, "OZCWD1=", root, 8000);
+
+    // Alt+R hides the pane instead of destroying the session: the child must
+    // keep running and its rendered cells disappear from the frame.
+    try sess.send("\x1br");
+    try gridWaitGone(&sess, &grid, "OZPID1=", 8000);
+
+    // Showing it again reuses the SAME shell: PID, exported env and cwd all
+    // survive, which a destroy+respawn cannot fake.
+    try sess.send("\x1br");
+    _ = try termWaitLayout(&sess, &grid, .floating, 15000);
+    try sess.send("printf 'OZPID2=%s\\n' \"$$\"\r");
+    const pid2 = try termWaitPid(&sess, &grid, "OZPID2=", 15000);
+    try std.testing.expectEqual(pid1, pid2);
+    try sess.send("printf 'OZMARK2=%s\\n' \"$OZ_TERM_MARK\"\r");
+    try termWaitValue(&sess, &grid, "OZMARK2=", mark, 8000);
+    try sess.send("printf 'OZCWD2=%s\\n' \"$PWD\"\r");
+    try termWaitValue(&sess, &grid, "OZCWD2=", root, 8000);
+
+    // Layout switches only move the same session (bottom -> right -> float).
+    // Wait for the switched frame before typing: input sent into the OLD
+    // PTY size would be wiped by the resize's screen reset.
+    try sess.send("\x1bw");
+    _ = try termWaitLayout(&sess, &grid, .bottom, 15000);
+    try sess.send("printf 'OZPID3=%s\\n' \"$$\"\r");
+    try std.testing.expectEqual(pid1, try termWaitPid(&sess, &grid, "OZPID3=", 15000));
+    try sess.send("\x1be");
+    _ = try termWaitLayout(&sess, &grid, .right, 15000);
+    try sess.send("printf 'OZPID4=%s\\n' \"$$\"\r");
+    try std.testing.expectEqual(pid1, try termWaitPid(&sess, &grid, "OZPID4=", 15000));
+    try sess.send("\x1br");
+    const box5 = try termWaitLayout(&sess, &grid, .floating, 15000);
+    try sess.send("printf 'OZPID5=%s\\n' \"$$\"\r");
+    try std.testing.expectEqual(pid1, try termWaitPid(&sess, &grid, "OZPID5=", 15000));
+
+    // Visible but unfocused + Alt+R focuses the session (does not hide or
+    // recreate it); the next Alt+R hides it. Esc is acknowledged by the frame
+    // turning to the quiet border color before the next key is sent.
+    try sess.send("\x1b");
+    try termWaitFocus(&sess, &grid, box5, accent, false, 8000);
+    try sess.send("\x1br");
+    try termWaitFocus(&sess, &grid, box5, accent, true, 8000);
+    try sess.send("printf 'OZPID6=%s\\n' \"$$\"\r");
+    try std.testing.expectEqual(pid1, try termWaitPid(&sess, &grid, "OZPID6=", 15000));
+    try sess.send("\x1br");
+    try gridWaitGone(&sess, &grid, "OZPID6=", 8000);
+    try sess.send("\x1br");
+    _ = try termWaitLayout(&sess, &grid, .floating, 15000);
+    try sess.send("printf 'OZPID7=%s\\n' \"$$\"\r");
+    try std.testing.expectEqual(pid1, try termWaitPid(&sess, &grid, "OZPID7=", 15000));
+
+    // Only an explicit child exit destroys the session; the next Alt+R starts
+    // a genuinely new shell (different PID, marker no longer exported).
+    try sess.send("exit\r");
+    try gridWaitFor(&sess, &grid, "terminal exited", 15000);
+    try sess.send("\x1br");
+    _ = try termWaitLayout(&sess, &grid, .floating, 15000);
+    try sess.send("printf 'OZPID8=%s\\n' \"$$\"\r");
+    const pid8 = try termWaitPid(&sess, &grid, "OZPID8=", 15000);
+    try std.testing.expect(pid8 != pid1);
+    try sess.send("printf 'OZMARK8=%s\\n' \"${OZ_TERM_MARK:-unset}\"\r");
+    try termWaitValue(&sess, &grid, "OZMARK8=", "unset", 8000);
+
+    // A hidden session must not block app shutdown.
+    try sess.send("\x1br");
+    try gridWaitGone(&sess, &grid, "OZPID8=", 8000);
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "terminal: frame bounds the inner PTY across layouts at 80 and 40 columns" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var dir_buf: [160]u8 = undefined;
+    const root = try std.fmt.bufPrint(&dir_buf, "/tmp/oz_termframe_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDir(io, root, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "frame.txt", "terminal frame fixture\n");
+    const path = try std.fmt.allocPrint(alloc, "{s}/frame.txt", .{root});
+    defer alloc.free(path);
+
+    const accent = packRgb(0xE6, 0xC3, 0x84); // kanagawa-wave win_sep_active
+
+    const Case = struct { cols: usize, key: []const u8, layout: []const u8, want_inner_w: usize, want_inner_h: usize };
+    const cases = [_]Case{
+        .{ .cols = 80, .key = "OZ_SIZE_1=", .layout = "\x1br", .want_inner_w = 62, .want_inner_h = 10 },
+        .{ .cols = 80, .key = "OZ_SIZE_2=", .layout = "\x1bw", .want_inner_w = 78, .want_inner_h = 6 },
+        .{ .cols = 80, .key = "OZ_SIZE_3=", .layout = "\x1be", .want_inner_w = 30, .want_inner_h = 19 },
+        .{ .cols = 40, .key = "OZ_SIZE_4=", .layout = "\x1br", .want_inner_w = 38, .want_inner_h = 10 },
+        .{ .cols = 40, .key = "OZ_SIZE_5=", .layout = "\x1bw", .want_inner_w = 38, .want_inner_h = 6 },
+        .{ .cols = 40, .key = "OZ_SIZE_6=", .layout = "\x1be", .want_inner_w = 28, .want_inner_h = 19 },
+    };
+
+    var by_cols = [_]?Session{ null, null };
+    var grids = [_]?Grid{ null, null };
+    defer {
+        for (&by_cols) |*s| {
+            if (s.*) |*ss| {
+                ss.close();
+                killPid(ss.pid);
+            }
+        }
+    }
+    defer {
+        for (&grids) |*g| {
+            if (g.*) |*gg| gg.deinit(alloc);
+        }
+    }
+
+    for (cases) |case| {
+        const slot: usize = if (case.cols == 80) 0 else 1;
+        if (by_cols[slot] == null) {
+            by_cols[slot] = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, null, 24, @intCast(case.cols), root);
+            grids[slot] = try Grid.initSizedCols(alloc, 24, case.cols);
+        }
+        const sess = &by_cols[slot].?;
+        const grid = &grids[slot].?;
+        if (!grid.contains("NORMAL")) try gridWaitFor(sess, grid, "NORMAL", 8000);
+        try sess.send(case.layout);
+        // Wait for the switched frame BEFORE typing: the resize resets the
+        // terminal screens, so output produced at the old size would vanish.
+        _ = try termWaitBoxInner(sess, grid, case.want_inner_w, case.want_inner_h, 15000);
+        // `printf 'OZ_SIZE_N=%s\n' "$(stty size)"` — the echoed literal keeps
+        // the percent placeholder, so termParseSize only accepts real output.
+        var cmd_buf: [96]u8 = undefined;
+        const cmd = try std.fmt.bufPrint(&cmd_buf, "printf '{s}%s\\n' \"$(stty size)\"\r", .{case.key});
+        try sess.send(cmd);
+        const size = try termWaitSize(sess, grid, case.key, 15000);
+        const box = try termWaitBoxInner(sess, grid, case.want_inner_w, case.want_inner_h, 15000);
+
+        // The drawn frame is the authority: its border must be themed and
+        // its interior must be exactly the PTY size (the border never covers
+        // child content, and the PTY was resized to the inner rect).
+        try frame.expectBorderBox(grid, box, accent);
+        const inner_w = box.width() - 2;
+        const inner_h = box.height() - 2;
+        try std.testing.expectEqual(@as(usize, case.want_inner_w), inner_w);
+        try std.testing.expectEqual(@as(usize, case.want_inner_h), inner_h);
+        try std.testing.expectEqual(inner_h, @as(usize, size.rows));
+        try std.testing.expectEqual(inner_w, @as(usize, size.cols));
+
+        // The reported size text must itself sit strictly inside the border.
+        const at = termFindText(grid, case.key) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(at.row > box.top and at.row < box.bottom);
+        try std.testing.expect(at.col > box.left and at.col < box.right);
+    }
+
+    // Hide each pane with its CURRENT layout key (both ended on the right
+    // strip); Alt+R would move them back to the float, not hide.
+    try by_cols[0].?.send("\x1be");
+    try gridWaitGone(&by_cols[0].?, &grids[0].?, "OZ_SIZE_3=", 8000);
+    try by_cols[1].?.send("\x1be");
+    try gridWaitGone(&by_cols[1].?, &grids[1].?, "OZ_SIZE_6=", 8000);
+    const exit80 = try by_cols[0].?.commandAndWaitExit(":q!\r");
+    const exit40 = try by_cols[1].?.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit80);
+    try std.testing.expectEqual(@as(u32, 0), exit40);
+}
+
+// ---- issue #19: terminal scrollback / mouse-wheel history viewport ----
+
+/// Copy a reconstructed grid row into `out` (Grid.rowText reuses one scratch
+/// buffer, so baselines must be copied before the next read).
+fn termCopyRow(grid: *Grid, row: usize, out: []u8) []const u8 {
+    const text = grid.rowText(row);
+    const n = @min(text.len, out.len);
+    @memcpy(out[0..n], text[0..n]);
+    return out[0..n];
+}
+
+fn termRowIs(grid: *Grid, row: usize, before: []const u8) bool {
+    return std.mem.eql(u8, grid.rowText(row), before);
+}
+
+/// The embedded session is spawned at 24x80 and only resized to the floating
+/// rect on the app's first draw. That resize re-initializes the screen and
+/// drops the local history, so child output produced before it can be wiped
+/// between the child writing it and the app's first float draw. Wait until
+/// the child observes a winsize other than the spawn size and only then emit
+/// the fixture output: TERM_READY is produced after that point, so seeing it
+/// proves the resize happened and that a post-resize frame was rendered.
+/// (Without this the scrollback fixture can be cleared before the test looks
+/// at it; the shell also records its final size in $FLOAT.)
+fn termAwaitFloatLayout(sess: *Session, grid: *Grid) !void {
+    try sess.send("while [ \"$(stty size)\" = '24 80' ]; do sleep 0.05; done; FLOAT=$(stty size); printf 'TERM_%s\\n' READY\r");
+    try gridWaitFor(sess, grid, "TERM_READY", 10000);
+}
+
+/// Fill a file with `count` numbered lines ("EDIT_<n>") and return it via the
+/// caller's ArrayList.
+fn termWriteNumberedFixture(io: Io, alloc: std.mem.Allocator, dir: []const u8, name: []const u8, count: usize) !void {
+    var text = std.ArrayList(u8).empty;
+    defer text.deinit(alloc);
+    var n: usize = 1;
+    var line_buf: [64]u8 = undefined;
+    while (n <= count) : (n += 1) {
+        try text.appendSlice(alloc, try std.fmt.bufPrint(&line_buf, "EDIT_LINE_{d}\n", .{n}));
+    }
+    try writeTestFile(io, dir, name, text.items);
+}
+
+test "terminal: wheel and Shift+PageUp/Down scroll history without moving the editor" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var dir_buf: [160]u8 = undefined;
+    const root = try std.fmt.bufPrint(&dir_buf, "/tmp/oz_termscroll_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDir(io, root, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try termWriteNumberedFixture(io, alloc, root, "scroll.txt", 60);
+    const path = try std.fmt.allocPrint(alloc, "{s}/scroll.txt", .{root});
+    defer alloc.free(path);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, null, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "EDIT_LINE_1", 5000);
+    try sess.send(":50\r");
+    try gridWaitFor(&sess, &grid, "L50:C0", 8000);
+
+    try sess.send("\x1br");
+    try termAwaitFloatLayout(&sess, &grid);
+    try sess.send("i=0; while [ $i -lt 100 ]; do printf 'HIST_%03d\\n' \"$i\"; i=$((i+1)); done\r");
+    try gridWaitFor(&sess, &grid, "HIST_099", 20000);
+    // Keep this independent of #18 reserving two rows for the terminal frame.
+    try std.testing.expect(grid.contains("HIST_098"));
+
+    // Baseline AFTER the terminal owns focus: the status bar legitimately
+    // drops its split separator for terminal focus, and scrolling must not
+    // change it further.
+    var base_row2: [512]u8 = undefined;
+    var base_status: [512]u8 = undefined;
+    const row2 = termCopyRow(&grid, 2, &base_row2);
+    const status = termCopyRow(&grid, 23, &base_status);
+
+    // Wheel up over the terminal shows older output; the editor rows and the
+    // status line must not move.
+    var k: usize = 0;
+    while (k < 3) : (k += 1) try mouseWheelAt(&sess, 20, 10, -1);
+    try gridWaitFor(&sess, &grid, "HIST_085", 8000);
+    try std.testing.expect(!grid.contains("HIST_099"));
+    try std.testing.expect(termRowIs(&grid, 2, row2));
+    if (!termRowIs(&grid, 23, status)) {
+        std.debug.print("status before=[{s}] after=[{s}]\n", .{ status, grid.rowText(23) });
+    }
+    try std.testing.expect(termRowIs(&grid, 23, status));
+
+    // Wheel down returns to the bottom and resumes follow/cursor.
+    k = 0;
+    while (k < 3) : (k += 1) try mouseWheelAt(&sess, 20, 10, 1);
+    try gridWaitFor(&sess, &grid, "HIST_099", 8000);
+
+    // Shift+PageUp/Down are local terminal shortcuts even while the child
+    // owns the keyboard (they must not be forwarded as shell input).
+    try sess.send("\x1b[5;2~");
+    try gridWaitFor(&sess, &grid, "HIST_085", 8000);
+    try std.testing.expect(!grid.contains("HIST_099"));
+    try std.testing.expect(termRowIs(&grid, 2, row2));
+    try std.testing.expect(termRowIs(&grid, 23, status));
+    try sess.send("\x1b[6;2~");
+    try gridWaitFor(&sess, &grid, "HIST_099", 8000);
+
+    // A click outside the terminal returns focus to the editor (deterministic
+    // frame sync without a sleep); "gg" then proves editor input is active.
+    try mouseClickAt(&sess, 10, 3);
+    try sess.send("gg");
+    try gridWaitFor(&sess, &grid, "L1:C0", 8000);
+
+    var base2_row2: [512]u8 = undefined;
+    var base2_status: [512]u8 = undefined;
+    const row2_b = termCopyRow(&grid, 2, &base2_row2);
+    const status_b = termCopyRow(&grid, 23, &base2_status);
+
+    // Pointer-over-terminal scrolling works without keyboard focus too, and
+    // still must never scroll the background editor.
+    k = 0;
+    while (k < 3) : (k += 1) try mouseWheelAt(&sess, 20, 10, -1);
+    try gridWaitFor(&sess, &grid, "HIST_085", 8000);
+    try std.testing.expect(!grid.contains("HIST_099"));
+    try std.testing.expect(termRowIs(&grid, 2, row2_b));
+    try std.testing.expect(termRowIs(&grid, 23, status_b));
+    k = 0;
+    while (k < 3) : (k += 1) try mouseWheelAt(&sess, 20, 10, 1);
+    try gridWaitFor(&sess, &grid, "HIST_099", 8000);
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    // Scrolling history must not have touched the file bytes.
+    const f = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    try std.testing.expect(std.mem.startsWith(u8, buf, "EDIT_LINE_1\n"));
+    try std.testing.expect(std.mem.endsWith(u8, buf, "EDIT_LINE_60\n"));
+}
+
+test "terminal: history across alt-screen, mouse reporting, clear and resize" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var dir_buf: [160]u8 = undefined;
+    const root = try std.fmt.bufPrint(&dir_buf, "/tmp/oz_terraces_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDir(io, root, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try termWriteNumberedFixture(io, alloc, root, "races.txt", 60);
+    const path = try std.fmt.allocPrint(alloc, "{s}/races.txt", .{root});
+    defer alloc.free(path);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, null, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "EDIT_LINE_1", 5000);
+
+    try sess.send("\x1br");
+    try termAwaitFloatLayout(&sess, &grid);
+    try sess.send("i=0; while [ $i -lt 60 ]; do printf 'HIST_%03d\\n' \"$i\"; i=$((i+1)); done\r");
+    try gridWaitFor(&sess, &grid, "HIST_059", 20000);
+
+    var base_row2: [512]u8 = undefined;
+    var base_status: [512]u8 = undefined;
+    const row2 = termCopyRow(&grid, 2, &base_row2);
+    const status = termCopyRow(&grid, 23, &base_status);
+    try sess.send("\x1b[5;2~");
+    try gridWaitFor(&sess, &grid, "HIST_045", 8000);
+    try sess.send("\x1b[6;2~");
+    try gridWaitFor(&sess, &grid, "HIST_059", 8000);
+
+    // Alternate screen + program mouse reporting: the child owns the screen.
+    // Wheel/page keys must not reveal primary scrollback or leak to the
+    // editor; ALT_MARK survives every scroll attempt.
+    try sess.send("printf '\\033[?1049h'; printf 'ALT_MARK\\n'; printf '\\033[?1000h\\033[?1006h'\r");
+    try gridWaitFor(&sess, &grid, "ALT_MARK", 8000);
+    var k: usize = 0;
+    while (k < 3) : (k += 1) try mouseWheelAt(&sess, 20, 10, -1);
+    try sess.send("\x1b[5;2~");
+    try gridSettle(&sess, &grid, 150, 3000);
+    try std.testing.expect(grid.contains("ALT_MARK"));
+    try std.testing.expect(!grid.contains("HIST_0"));
+    try std.testing.expect(termRowIs(&grid, 23, status));
+
+    // Leaving the alternate screen restores the primary scrollback.
+    try sess.send("printf '\\033[?1000l\\033[?1006l'; printf '\\033[?1049l'\r");
+    try gridWaitFor(&sess, &grid, "HIST_059", 8000);
+    try sess.send("\x1b[5;2~");
+    try gridWaitFor(&sess, &grid, "HIST_045", 8000);
+    try sess.send("\x1b[6;2~");
+
+    // ED2 clears the visible screen but keeps saved lines...
+    try sess.send("printf '\\033[2J\\033[H'\r");
+    try gridSettle(&sess, &grid, 150, 3000);
+    try sess.send("\x1b[5;2~");
+    try gridWaitFor(&sess, &grid, "HIST_045", 8000);
+    try sess.send("\x1b[6;2~");
+    try gridSettle(&sess, &grid, 150, 3000);
+
+    // ...ED3 (erase saved lines) clears the scrollback itself.
+    try sess.send("printf '\\033[3J'\r");
+    try gridSettle(&sess, &grid, 150, 3000);
+    try sess.send("\x1b[5;2~");
+    try gridSettle(&sess, &grid, 150, 3000);
+    try std.testing.expect(!grid.contains("HIST_045"));
+
+    // A resize (layout switch) resets the width-dependent saved rows; a
+    // scroll attempt afterwards must not resurrect them.
+    try sess.send("i=0; while [ $i -lt 30 ]; do printf 'HIST2_%03d\\n' \"$i\"; i=$((i+1)); done\r");
+    try gridWaitFor(&sess, &grid, "HIST2_029", 20000);
+    try sess.send("\x1b[5;2~");
+    try gridWaitFor(&sess, &grid, "HIST2_015", 8000);
+    try sess.send("\x1bw");
+    // The layout switch resizes the pty (floating 12x64 -> bottom 8x80) and
+    // that resize clears the child screen and the local history. A fixed
+    // sleep is not a barrier (the switch's draw can land after it under
+    // load), so wait until the child observes a winsize distinct from the
+    // floating one before printing the marker: RESIZED_MARK then cannot be
+    // wiped by a later draw.
+    try sess.send("while [ \"$(stty size)\" = \"$FLOAT\" ]; do sleep 0.05; done; printf 'RESIZED_MARK\\n'\r");
+    try gridWaitFor(&sess, &grid, "RESIZED_MARK", 10000);
+    try sess.send("\x1b[5;2~");
+    try gridSettle(&sess, &grid, 150, 3000);
+    try std.testing.expect(!grid.contains("HIST2_015"));
+    try std.testing.expect(!grid.contains("HIST2_029"));
+
+    try mouseClickAt(&sess, 10, 3);
+    try sess.send("gg");
+    try gridWaitFor(&sess, &grid, "L1:C0", 8000);
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+    try std.testing.expect(termRowIs(&grid, 2, row2));
+}
+
+test "terminal: scrollback is bounded and preserves CJK, emoji and ANSI colors" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var dir_buf: [160]u8 = undefined;
+    const root = try std.fmt.bufPrint(&dir_buf, "/tmp/oz_termbound_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDir(io, root, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try termWriteNumberedFixture(io, alloc, root, "bound.txt", 60);
+    const path = try std.fmt.allocPrint(alloc, "{s}/bound.txt", .{root});
+    defer alloc.free(path);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, null, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "EDIT_LINE_1", 5000);
+
+    try sess.send("\x1br");
+    try termAwaitFloatLayout(&sess, &grid);
+    // 600 numbered lines, then one true-color CJK+emoji line, then 20 more
+    // lines so the wide/colored line is only reachable through scrollback.
+    try sess.send("i=0; while [ $i -lt 600 ]; do printf 'HIST_%03d\\n' \"$i\"; i=$((i+1)); done\r");
+    try gridWaitFor(&sess, &grid, "HIST_599", 30000);
+    try sess.send("printf '\\033[38;2;18;52;86m第三行 😀\\033[0m\\n'\r");
+    try gridWaitFor(&sess, &grid, "第三行", 8000);
+    try sess.send("i=600; while [ $i -lt 620 ]; do printf 'HIST_%03d\\n' \"$i\"; i=$((i+1)); done\r");
+    try gridWaitFor(&sess, &grid, "HIST_619", 20000);
+
+    var base_row2: [512]u8 = undefined;
+    var base_status: [512]u8 = undefined;
+    const row2 = termCopyRow(&grid, 2, &base_row2);
+    const status = termCopyRow(&grid, 23, &base_status);
+
+    // Walk the wheel up until the saved colored line enters the viewport; the
+    // cell style and the wide glyphs must have survived the history copy.
+    // (Shell prompt/command-echo lines also scroll, so the exact offset is
+    // environment-dependent; one wheel event is 3 rows and each step waits
+    // for its frame.)
+    var k: usize = 0;
+    while (!grid.contains("第三行") and k < 60) : (k += 1) {
+        try mouseWheelAt(&sess, 20, 10, -1);
+        try gridSettle(&sess, &grid, 40, 1500);
+    }
+    try gridWaitFor(&sess, &grid, "第三行", 4000);
+    try std.testing.expect(grid.contains("😀"));
+    try std.testing.expect(grid.containsFg("第三行", packRgb(0x12, 0x34, 0x56)));
+    try std.testing.expect(termRowIs(&grid, 2, row2));
+    try std.testing.expect(termRowIs(&grid, 23, status));
+
+    // Scroll to the oldest retained row. The ring caps at 500 rows: the
+    // viewport lands on HIST_1xx lines, never the original HIST_0xx rows
+    // (which an unbounded history would still show at the top).
+    var page_up: [6 * 80]u8 = undefined;
+    var off: usize = 0;
+    while (off + 6 <= page_up.len) : (off += 6) @memcpy(page_up[off .. off + 6], "\x1b[5;2~");
+    try sess.send(page_up[0..off]);
+    try gridWaitFor(&sess, &grid, "HIST_1", 12000);
+    try gridSettle(&sess, &grid, 200, 4000);
+    try std.testing.expect(!grid.contains("HIST_0"));
+    try std.testing.expect(!grid.contains("HIST_100"));
+    try std.testing.expect(!grid.contains("第三行"));
+
+    try mouseClickAt(&sess, 10, 3);
+    try sess.send("gg");
+    try gridWaitFor(&sess, &grid, "L1:C0", 8000);
     const exit_code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
@@ -20127,6 +21217,121 @@ test "approval: multi-file apply_patch writes both files, updates both buffers, 
     try aiQuit(&sess);
 }
 
+test "folds: multi-file agent patch preserves closed folds, undo and redo" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root_buf: [160:0]u8 = undefined;
+    const root = try bufPrintZ(&root_buf, "/tmp/oz_fold_patch_{d}_{d}", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var a_buf: [220:0]u8 = undefined;
+    var b_buf: [220:0]u8 = undefined;
+    const a_path = try bufPrintZ(&a_buf, "{s}/a.py", .{root});
+    const b_path = try bufPrintZ(&b_buf, "{s}/b.txt", .{root});
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, a_path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "def alpha():\n    body a1\ntail line\n");
+    }
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, b_path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "gamma\n");
+    }
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const patch_args = try aiPatchArgs(alloc,
+        \\diff --git a/a.py b/a.py
+        \\--- a/a.py
+        \\+++ b/a.py
+        \\@@ -1,3 +1,3 @@
+        \\ def alpha():
+        \\     body a1
+        \\-tail line
+        \\+TAIL LINE
+        \\diff --git a/b.txt b/b.txt
+        \\--- a/b.txt
+        \\+++ b/b.txt
+        \\@@ -1 +1 @@
+        \\-gamma
+        \\+GAMMA
+        \\
+    );
+    defer alloc.free(patch_args);
+    const round1 = try aiToolCallsSse(alloc, &.{
+        .{ .id = "call_fold_patch", .name = "apply_patch", .args = patch_args },
+    });
+    defer alloc.free(round1);
+    try aiWriteFile(io, dir, "stream-1.sse", round1);
+    const round2 = try aiTextSse(alloc, "FOLD_PATCH_DONE");
+    defer alloc.free(round2);
+    try aiWriteFile(io, dir, "stream-2.sse", round2);
+    const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
+    defer alloc.free(mock_env);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, a_path }, &.{ mock_env, "OZ_AI_MODEL=mock-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "body a1", 5000);
+
+    // Close alpha's fold, then open the second patch target so BOTH buffers
+    // are live when the multi-file patch is approved (approval then replaces
+    // each buffer's whole text instead of applying a localized edit).
+    try sess.send("za");
+    try gridWaitFor(&sess, &grid, "… 1 lines", 5000);
+    try gridWaitGone(&sess, &grid, "body a1", 5000);
+    try sess.send(":e b.txt\r");
+    try gridWaitFor(&sess, &grid, "gamma", 5000);
+    try sess.send(":e a.py\r");
+    try gridWaitFor(&sess, &grid, "… 1 lines", 5000);
+    try std.testing.expect(!grid.contains("body a1"));
+
+    try aiEnterRail(&sess, &grid);
+    try sess.send("patch both files while alpha is folded");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "changes 1", 10000);
+    try gridWaitFor(&sess, &grid, "file 1/2", 5000);
+    try gridWaitFor(&sess, &grid, "TAIL LINE", 5000);
+    try gridWaitFor(&sess, &grid, "idle", 10000);
+
+    // Review + approve the patch set.
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "2 files", 8000);
+    try gridWaitFor(&sess, &grid, "FOLD_PATCH_DONE", 10000);
+    try sess.send("d");
+    try gridWaitFor(&sess, &grid, "[a] approve", 5000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "changes 0", 5000);
+    try gridWaitFor(&sess, &grid, "TAIL LINE", 5000);
+    // Whole-document replacement must re-anchor the closed fold by header
+    // text: the body stays hidden and the marker stays on the header.
+    try std.testing.expect(grid.contains("… 1 lines"));
+    try std.testing.expect(!grid.contains("body a1"));
+    try expectNoDirtyMarker(&grid);
+
+    // Agent-patch undo/redo goes through the same transform (the transaction
+    // is one whole-document edit in each direction).
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "tail line", 5000);
+    try std.testing.expect(grid.contains("… 1 lines"));
+    try std.testing.expect(!grid.contains("body a1"));
+    try sess.send("\x12");
+    try gridWaitFor(&sess, &grid, "TAIL LINE", 5000);
+    try std.testing.expect(grid.contains("… 1 lines"));
+    try std.testing.expect(!grid.contains("body a1"));
+
+    const exit_code = try sess.commandAndWaitExit(":qa!\r");
+    if (exit_code != 0) std.debug.print("fold patch exit {d}\n", .{exit_code});
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
 test "approval: multi-file apply_patch deny via mouse writes nothing" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -23875,7 +25080,9 @@ test "regression wrap: inserted tail and cursor stay together past row and viewp
     defer a.free(prefix);
     @memset(prefix, 'x');
     try sess.send(prefix);
-    try gridWaitFor(&sess, &grid, "col 78", 5000);
+    var boundary_buf: [32]u8 = undefined;
+    const boundary = try std.fmt.bufPrint(&boundary_buf, "col {d}", .{cw});
+    try gridWaitFor(&sess, &grid, boundary, 5000);
     try std.testing.expectEqual(first_row + 1, grid.row);
     try std.testing.expectEqual(gutter, grid.col);
     try sess.send("TAIL");
@@ -23892,7 +25099,7 @@ test "regression wrap: inserted tail and cursor stay together past row and viewp
     try std.testing.expect(grid.row < grid.rows - 1);
     try std.testing.expect(rowContains(&grid, grid.row, "END"));
     try sess.send("\x1b");
-    std.Io.sleep(io, .fromMilliseconds(100), .real) catch {};
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 5000);
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
     const saved = try absFileText(io, a, path);
     defer a.free(saved);
@@ -24282,7 +25489,12 @@ test "diagnostic UI: real ZLS matches source, fixes and line movement" {
     const parameter = aiFindCellFrom(&grid, "aaa: usize", 0).?;
     try std.testing.expectEqual(@as(u8, 0), frame.cellUnderlineStyle(&grid, parameter.row, parameter.col + 3));
     const function = aiFindCellFrom(&grid, "peek", 0).?;
-    try std.testing.expectEqual(@as(u8, 0), frame.cellUnderlineStyle(&grid, function.row, function.col));
+    // The real diagnostic belongs to aaa. The focused function header has
+    // its own quiet, straight scope rule; it must never borrow the error's
+    // red curly style. Check both roles explicitly instead of requiring
+    // every non-diagnostic cell to have no underline at all.
+    try std.testing.expectEqual(@as(u8, 1), frame.cellUnderlineStyle(&grid, function.row, function.col));
+    try std.testing.expectEqual(scope_ul, frame.cellUl(&grid, function.row, function.col));
     try sess.send("gl");
     try gridWaitFor(&sess, &grid, "Diagnostics (1)", 5000);
     try gridWaitFor(&sess, &grid, "Error: unused function parameter", 5000);
@@ -24966,7 +26178,343 @@ test "search: match/current backgrounds are role-based; selection wins and :noh 
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
 }
 
-test "style observation: scope emphasis no longer paints a full-line underline" {
+/// Cell column of the `nth` (0-based) whole-cell occurrence of `needle` on
+/// screen row `row`, or null. Whole-cell matching keeps wide CJK glyphs and
+/// Nerd Font icons from shifting the byte/cell correspondence, and lets a
+/// split screen that renders the same line twice be addressed by occurrence.
+fn nthCellIndexOf(grid: *Grid, row: usize, needle: []const u8, nth: usize) ?usize {
+    var found: usize = 0;
+    var c: usize = 0;
+    while (c < grid.cols) : (c += 1) {
+        var bi: usize = 0;
+        var cc: usize = c;
+        while (bi < needle.len and cc < grid.cols) {
+            const t = frame.cellText(grid, row, cc);
+            if (t.len == 0) break;
+            if (!std.mem.startsWith(u8, needle[bi..], t)) break;
+            bi += t.len;
+            cc += 1;
+        }
+        if (bi == needle.len) {
+            if (found == nth) return c;
+            found += 1;
+            c = cc - 1; // skip the match, so overlapping starts count once
+        }
+    }
+    return null;
+}
+
+/// Assert that `cells` cells from `start` carry the single scope underline
+/// (SGR 4:1) in `color` — the visual contract for the active scope header:
+/// only source cells, never the gutter/inlay/padding.
+fn expectScopeUnderline(grid: *Grid, row: usize, start: usize, cells: usize, color: u32) !void {
+    for (0..cells) |i| {
+        if (frame.cellUnderlineStyle(grid, row, start + i) != 1 or frame.cellUl(grid, row, start + i) != color) {
+            std.debug.print("scope underline mismatch at ({d},{d}): style={d} ul=#{x:0>6}\n", .{
+                row, start + i, frame.cellUnderlineStyle(grid, row, start + i), frame.cellUl(grid, row, start + i),
+            });
+            grid.dump();
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+fn expectNoScopeUnderline(grid: *Grid, row: usize, start: usize, cells: usize) !void {
+    for (0..cells) |i| {
+        if (frame.cellUnderlineStyle(grid, row, start + i) != 0) {
+            std.debug.print("unexpected underline at ({d},{d}) text=\"{s}\"\n", .{
+                row, start + i, frame.cellText(grid, row, start + i),
+            });
+            grid.dump();
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+/// theme.scopeFg(kanagawa-wave): blend(fg_dim, accent_alt, 40) brightened to
+/// legibleVirtual's 3:1 floor — a quiet themed rule, never a diagnostic tint.
+const scope_ul = packRgb(148, 155, 160);
+
+test "indent: scope range emphasis marks only the focused header's source cells" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var name_buf: [160:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}scope.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "fn f() void {\n    if (x) {\n        y();\n    }\n    g();\n}\n");
+    }
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{});
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try gridWaitFor(&sess, &grid, "fn f() void", 5000);
+    try gridDrain(&sess, &grid, 700); // let the scope spread settle
+
+    // Line 0 is the scope header when the cursor is on the declaration. The
+    // underline covers exactly "fn f() void {" (14 source cells) from the
+    // first content cell: no gutter cell, no whitespace padding to the right.
+    const fn_row = findRow(&grid, "fn f() void {") orelse return error.TestUnexpectedResult;
+    const fn_col = aiCellIndexOf(&grid, fn_row, "fn f() void {") orelse return error.TestUnexpectedResult;
+    try expectScopeUnderline(&grid, fn_row, fn_col, 13, scope_ul);
+    try expectNoScopeUnderline(&grid, fn_row, 0, fn_col); // gutter
+    try expectNoScopeUnderline(&grid, fn_row, fn_col + 13, 20); // EOL padding
+    // The label/context strip is chrome, not the reading surface.
+    var c: usize = 0;
+    while (c < grid.cols) : (c += 1) {
+        try std.testing.expect(!frame.cellUnderlined(&grid, 0, c));
+        try std.testing.expect(!frame.cellUnderlined(&grid, 1, c));
+    }
+
+    // Entering the nested if-block moves the header to line 1: the old rule
+    // is gone and the new one starts at the block's structural indent (4
+    // cells), so the guide cells themselves stay un-underlined.
+    try sess.send("2j");
+    try gridDrain(&sess, &grid, 500);
+    const if_row = findRow(&grid, "if (x) {") orelse return error.TestUnexpectedResult;
+    const if_col = aiCellIndexOf(&grid, if_row, "if (x) {") orelse return error.TestUnexpectedResult;
+    try expectScopeUnderline(&grid, if_row, if_col, 8, scope_ul);
+    try expectNoScopeUnderline(&grid, if_row, if_col - 4, 4);
+    try expectNoScopeUnderline(&grid, fn_row, 0, grid.cols);
+
+    // Leaving the nested block restores the fn body's own header line.
+    try sess.send("2j");
+    try gridDrain(&sess, &grid, 500);
+    try expectScopeUnderline(&grid, fn_row, fn_col, 13, scope_ul);
+    try expectNoScopeUnderline(&grid, if_row, 0, grid.cols);
+
+    // Selection keeps its background and syntax-fg cells; the emphasis is
+    // only the SGR underline bit.
+    try sess.send("ggV");
+    try gridWaitFor(&sess, &grid, "[VISUAL]", 3000);
+    try gridDrain(&sess, &grid, 300);
+    const sel_bg = packRgb(0x2D, 0x4F, 0x67);
+    for (0..13) |i| {
+        try frame.expectCellBg(&grid, fn_row, fn_col + i, sel_bg);
+        try expectScopeUnderline(&grid, fn_row, fn_col + i, 1, scope_ul);
+    }
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+
+    // Split panes show the same buffer twice. Only the window that owns the
+    // keyboard carries the rule; focusing the other pane moves it without
+    // leaving a stale line behind in the first.
+    try sess.send(":vs\r");
+    try gridDrain(&sess, &grid, 600);
+    var left: ?usize = null;
+    var right: ?usize = null;
+    var tries: usize = 0;
+    while (tries < 10 and (left == null or right == null)) : (tries += 1) {
+        left = nthCellIndexOf(&grid, fn_row, "fn f() void {", 0);
+        right = nthCellIndexOf(&grid, fn_row, "fn f() void {", 1);
+        if (left == null or right == null) try gridDrain(&sess, &grid, 200);
+    }
+    const lcol = left orelse return error.TestUnexpectedResult;
+    const rcol = right orelse return error.TestUnexpectedResult;
+    try std.testing.expect(lcol + 13 <= rcol); // distinct panes, no bleed
+    try expectNoScopeUnderline(&grid, fn_row, lcol, 13);
+    try expectScopeUnderline(&grid, fn_row, rcol, 13, scope_ul);
+
+    try sess.send("\x17h");
+    try gridDrain(&sess, &grid, 400);
+    try expectScopeUnderline(&grid, fn_row, lcol, 13, scope_ul);
+    try expectNoScopeUnderline(&grid, fn_row, rcol, 13);
+
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "indent: scope underline follows soft wrap, CJK and tab indentation" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var name_buf: [160:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}scopewrap.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        // The header is 96 display cells (CJK is double width) at 80 columns,
+        // so it wraps onto a second screen row. The nested block is indented
+        // with a real tab to prove the rule starts after structural indent.
+        try f.writeStreamingAll(io, "fn 中文函数_very_long_scope_header_name_that_definitely_wraps_past_eighty_columns(a: i32) void {\n" ++
+            "\tif (x) {\n\t\ty();\n\t}\n}\n");
+    }
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{});
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try gridWaitFor(&sess, &grid, "fn 中文函数", 5000);
+    try gridDrain(&sess, &grid, 700);
+
+    // First wrapped row: the source continues, so every content cell carries
+    // the rule (the two-cell CJK glyph included). The gutter stays clean.
+    const first_row = findRow(&grid, "fn 中文函数") orelse return error.TestUnexpectedResult;
+    const first_col = aiCellIndexOf(&grid, first_row, "fn 中文函数") orelse return error.TestUnexpectedResult;
+    const gutter = first_col; // 2 cells for this file's line count
+    var c: usize = gutter;
+    while (c < grid.cols) : (c += 1) {
+        try expectScopeUnderline(&grid, first_row, c, 1, scope_ul);
+    }
+    try expectNoScopeUnderline(&grid, first_row, 0, gutter);
+    // A wide glyph takes two cells and BOTH are underlined: find the CJK
+    // glyph cell and assert the pair.
+    const cjk_col = aiCellIndexOf(&grid, first_row, "中") orelse return error.TestUnexpectedResult;
+    try expectScopeUnderline(&grid, first_row, cjk_col, 2, scope_ul);
+
+    // Second wrapped row: the rule stops at the last source `{`; the row
+    // padding after the source is not decorated.
+    const tail_row = findRow(&grid, "void {") orelse return error.TestUnexpectedResult;
+    const tail_col = aiCellIndexOf(&grid, tail_row, "void {") orelse return error.TestUnexpectedResult;
+    try expectScopeUnderline(&grid, tail_row, gutter, tail_col - gutter + 6, scope_ul);
+    try expectNoScopeUnderline(&grid, tail_row, tail_col + 6, 20);
+    try expectNoScopeUnderline(&grid, tail_row, 0, gutter);
+
+    // Moving into the tab-indented if body makes that first line the header:
+    // the four expanded indent cells are guides, not source, so they are not
+    // underlined; "if (x) {" is.
+    try sess.send("2j");
+    try gridDrain(&sess, &grid, 500);
+    const if_row = findRow(&grid, "if (x) {") orelse return error.TestUnexpectedResult;
+    const if_col = aiCellIndexOf(&grid, if_row, "if (x) {") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(gutter + 4, if_col);
+    try expectNoScopeUnderline(&grid, if_row, gutter, 4);
+    try expectScopeUnderline(&grid, if_row, if_col, 8, scope_ul);
+    try expectNoScopeUnderline(&grid, first_row, 0, grid.cols);
+
+    // Narrow split panes: each pane clips its own line; only the focused
+    // pane's header carries the rule.
+    try sess.send(":vs\r");
+    try gridDrain(&sess, &grid, 600);
+    // Narrower panes wrap line 0 onto one more row, so line 1 moves down;
+    // locate it again in the split frame instead of reusing the old row.
+    const split_if_row = findRow(&grid, "if (x) {") orelse return error.TestUnexpectedResult;
+    const left = nthCellIndexOf(&grid, split_if_row, "if (x) {", 0) orelse return error.TestUnexpectedResult;
+    const right = nthCellIndexOf(&grid, split_if_row, "if (x) {", 1) orelse return error.TestUnexpectedResult;
+    try expectNoScopeUnderline(&grid, split_if_row, left, 8);
+    try expectScopeUnderline(&grid, split_if_row, right, 8, scope_ul);
+
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "indent: diagnostics and inlay hints win over the scope underline" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const mock = try std.Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/mock_lsp", a);
+    defer a.free(mock);
+    const lsp_env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{mock});
+    defer a.free(lsp_env);
+
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    // Line 1 is a real multi-line function header. The mock's fixed range
+    // puts RANGE_WARNING at UTF-16 10..17 on that line, exactly over
+    // `missing`. Line 0 keeps the mock's default line-0 inlay hint out of
+    // the scope header, so the two sessions test the two virtual text kinds
+    // independently.
+    try aiWriteFile(io, root, "diag_scope.zig", "const inlay = 0;\nfn f() {  missing;\n    x();\n}\nconst top = 1;\n");
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/diag_scope.zig", .{root});
+    {
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{ lsp_env, "OZ_MOCK_SCRIPT=diagnostic_underlines" }, 24, 100, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 24, 100);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try sess.send("j"); // line 1: the fn declaration is the scope header
+        try gridWaitFor(&sess, &grid, "RANGE_WARNING", 8000);
+        try gridDrain(&sess, &grid, 400);
+        const row = findRow(&grid, "fn f() {") orelse return error.TestUnexpectedResult;
+        const col = aiCellIndexOf(&grid, row, "fn f() {") orelse return error.TestUnexpectedResult;
+        const missing_col = aiCellIndexOf(&grid, row, "missing") orelse return error.TestUnexpectedResult;
+        // Wait for the diagnostic range decoration to land (LSP is async).
+        var waited: i32 = 0;
+        while (frame.cellUnderlineStyle(&grid, row, missing_col) != 3) {
+            const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
+            if (n > 0) {
+                sess.used += n;
+                grid.feed(sess.out[sess.used - n .. sess.used]);
+            } else {
+                waited += 200;
+                if (waited >= 5000) break;
+            }
+        }
+        if (frame.cellUnderlineStyle(&grid, row, missing_col) != 3) {
+            std.debug.print("diagnostic underline never landed on line1\n", .{});
+            grid.dump();
+            return error.TestUnexpectedResult;
+        }
+        // The warning's yellow curly underline beats the plain scope rule on
+        // all seven `missing` cells; syntax fg stays.
+        for (0..7) |i| {
+            try std.testing.expectEqual(@as(u8, 3), frame.cellUnderlineStyle(&grid, row, missing_col + i));
+            try std.testing.expectEqual(packRgb(0xFF, 0x9E, 0x3B), frame.cellUl(&grid, row, missing_col + i));
+        }
+        // Header cells the diagnostic does not cover keep the restrained
+        // single scope rule, including the structural spaces before `missing`.
+        try expectScopeUnderline(&grid, row, col, 10, scope_ul);
+        try expectScopeUnderline(&grid, row, missing_col + 7, 1, scope_ul); // ';'
+        // The end-of-line diagnostic message is virtual text: no scope rule.
+        const msg_col = aiCellIndexOf(&grid, row, "RANGE_WARNING") orelse return error.TestUnexpectedResult;
+        try expectNoScopeUnderline(&grid, row, msg_col, 13);
+        // Gutter cells (line number + severity mark) never take the rule.
+        try expectNoScopeUnderline(&grid, row, 0, col);
+
+        // Top-level code has no enclosing block: moving there removes the
+        // scope rule entirely (invalidation leaves no stale underline).
+        try sess.send("G");
+        try gridDrain(&sess, &grid, 600);
+        var r: usize = 2;
+        while (r + 1 < grid.rows) : (r += 1) {
+            var cc: usize = 0;
+            while (cc < grid.cols) : (cc += 1) {
+                if (frame.cellUnderlineStyle(&grid, r, cc) == 1) {
+                    std.debug.print("stale scope underline at ({d},{d})\n", .{ r, cc });
+                    grid.dump();
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+        // Returning to the function restores it.
+        try sess.send("ggj");
+        try gridDrain(&sess, &grid, 600);
+        try expectScopeUnderline(&grid, row, col, 10, scope_ul);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+    }
+
+    // Inlay hint spliced into the header: the hint is virtual, so it never
+    // takes the scope underline; source cells on both sides keep it.
+    try aiWriteFile(io, root, "inlay_scope.zig", "fn f() void {\n    x();\n}\n");
+    var ipath_buf: [220:0]u8 = undefined;
+    const ipath = try bufPrintZ(&ipath_buf, "{s}/inlay_scope.zig", .{root});
+    {
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, ipath }, &.{ lsp_env, "OZ_MOCK_SCRIPT=inlay_param" }, 24, 100, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 24, 100);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, ": usize", 8000);
+        try gridDrain(&sess, &grid, 400);
+        const row = findRow(&grid, "fn") orelse return error.TestUnexpectedResult;
+        const fn_col = aiCellIndexOf(&grid, row, "fn") orelse return error.TestUnexpectedResult;
+        const hint_col = aiCellIndexOf(&grid, row, ": usize") orelse return error.TestUnexpectedResult;
+        try expectScopeUnderline(&grid, row, fn_col, 2, scope_ul); // "fn"
+        try expectNoScopeUnderline(&grid, row, hint_col, 7); // ": usize"
+        const rest_col = aiCellIndexOf(&grid, row, "f() void {") orelse return error.TestUnexpectedResult;
+        try expectScopeUnderline(&grid, row, rest_col, 10, scope_ul);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+    }
+}
+
+test "style observation: scope emphasis is opt-out and never paints virtual text" {
     const io = std.testing.io;
     const a = std.testing.allocator;
     var name_buf: [160:0]u8 = undefined;
@@ -24978,7 +26526,7 @@ test "style observation: scope emphasis no longer paints a full-line underline" 
         defer f.close(io);
         try f.writeStreamingAll(io, "fn f() void {\n    if (x) {\n        y();\n    }\n}\n");
     }
-    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{});
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{ "OZ_NO_SCOPE_UNDERLINE=1" });
     defer sess.close();
     defer killPid(sess.pid);
     var grid = try Grid.initSizedCols(a, 24, 80);
@@ -24986,7 +26534,7 @@ test "style observation: scope emphasis no longer paints a full-line underline" 
     try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
     try gridWaitFor(&sess, &grid, "fn f() void", 5000);
     try gridDrain(&sess, &grid, 700); // let the scope spread settle
-    var r: usize = 1; // skip the tab strip (its chrome may underline)
+    var r: usize = 2; // skip the label + context strip (its chrome may underline)
     while (r + 1 < grid.rows) : (r += 1) {
         var c: usize = 0;
         while (c < grid.cols) : (c += 1) {
@@ -24997,7 +26545,8 @@ test "style observation: scope emphasis no longer paints a full-line underline" 
             }
         }
     }
-    // The scope guide color still identifies the active scope.
+    // The opt-out only drops the horizontal rule; the scope guide color still
+    // identifies the active scope.
     try std.testing.expect(grid.containsFg("│", packRgb(0xE0, 0x6C, 0x75)));
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
 }
@@ -25086,18 +26635,20 @@ test "completion layout: bottom edge and resize round-trip keep both boxes insid
     try gridWaitFor(&fx.sess, &grid, "ArrayList", 8000);
     try gridSettle(&fx.sess, &grid, 100, 3000);
     try frame.expectNoHorizontalOverflow(&grid, 80);
-    // At 20 rows the menu flips above the bottom-edge cursor; the docs pane
-    // has no admissible rectangle and is omitted instead of overlapping.
-    try std.testing.expect(!grid.contains("A contiguous"));
+    // At 80 columns the joint budget now reserves a right-hand explanation
+    // even above a bottom-edge caret; both boxes stop before the caret row.
+    try gridWaitFor(&fx.sess, &grid, "A contiguous", 5000);
+    try expectAdjacentCompletionPanels(&grid);
     try std.testing.expect(glyphCol(&grid, 0, "╭", 0) == null);
     const boxes = try countPopupBoxes(&grid);
     try std.testing.expect(boxes >= 1);
 
     // Grow: menu/docs re-plan side-by-side; no old border or out-of-pane
-    // cell may survive. Shrink again: docs disappear cleanly, menu remains.
+    // cell may survive. At 40 columns docs disappear; returning to 80 restores them.
     for ([_]struct { rows: u16, cols: u16, docs: bool }{
         .{ .rows = 30, .cols = 120, .docs = true },
-        .{ .rows = 20, .cols = 80, .docs = false },
+        .{ .rows = 20, .cols = 40, .docs = false },
+        .{ .rows = 20, .cols = 80, .docs = true },
     }) |shape| {
         const size = Winsize{ .ws_row = shape.rows, .ws_col = shape.cols, .ws_xpixel = shape.cols * 10, .ws_ypixel = shape.rows * 20 };
         _ = linux.ioctl(fx.sess.pty.master, TIOCSWINSZ, @intFromPtr(&size));
@@ -25367,6 +26918,19 @@ fn waitBarrierMarker(io: Io, a: std.mem.Allocator, root: []const u8, name: []con
     return error.TestUnexpectedResult;
 }
 
+/// Barrier for the held-signature subcases below: the LSP barrier fires as
+/// soon as the app sends the request, which can be before the app has
+/// rendered the Insert frame for the "A(" that triggered it. Without this
+/// wait the grid can still show the stale `[NORMAL]` from before "A(", so
+/// the post-Escape `gridWaitFor("[NORMAL]")` returns immediately. The
+/// following `:` then arrives while Escape is still unconsumed and vaxis
+/// parses the pair as Alt+`:` -- the app stays in Insert and the command is
+/// typed into the buffer (the CI failure typed `:e other.zig` into the
+/// document). Seeing the Insert frame first makes the Normal wait meaningful.
+fn awaitInsertFrame(sess: *Session, grid: *Grid) !void {
+    try gridWaitFor(sess, grid, "[INSERT]", 3000);
+}
+
 test "signature lifecycle: stale signature is gone before the new completion" {
     const io = std.testing.io;
     const a = std.testing.allocator;
@@ -25474,6 +27038,7 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("x");
         try releaseSignatureA(io, fx.root);
         try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
@@ -25492,6 +27057,7 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("\x1b");
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try releaseSignatureA(io, fx.root);
@@ -25510,6 +27076,7 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("\x1b");
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try fx.sess.send(":e other.zig\r");
@@ -25529,6 +27096,7 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try sendMouseButton(&fx.sess, 8, 4, 0, false);
         try sendMouseButton(&fx.sess, 8, 4, 0, true);
         try gridDrain(&fx.sess, &grid, 200);
@@ -25536,7 +27104,11 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
         try gridDrain(&fx.sess, &grid, 300);
         try std.testing.expect(!grid.contains("SIG_A"));
-        try fx.sess.send("\x1b");
+        // The click itself finalizes the Insert session
+        // (prepareMouseAction exits insert), so the visible [NORMAL] frame is
+        // the click's barrier. Sending a redundant Escape here would race the
+        // following ':' and pair with it as Alt+':' if the app has not
+        // consumed it yet, leaving the quit command untyped.
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
     }
@@ -25549,6 +27121,7 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("\x1b");
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try fx.sess.send(":vs\r");
@@ -25821,6 +27394,7 @@ test "signature lifecycle: delayed response released in the same Insert context"
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("\x1b");
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try fx.sess.send("i");
@@ -26066,8 +27640,12 @@ fn erStart(io: Io, alloc: std.mem.Allocator, fixture: []const u8, rows: u16, col
 /// One editor case: initial bytes, keys, saved bytes. Fails with a dump of
 /// the mismatch so a red run is evidence, not a mystery.
 fn erEditorCase(io: Io, alloc: std.mem.Allocator, label: []const u8, initial: []const u8, keys: []const u8, expected: []const u8) !void {
+    return erEditorFileCase(io, alloc, label, ".zig", initial, keys, expected);
+}
+
+fn erEditorFileCase(io: Io, alloc: std.mem.Allocator, label: []const u8, suffix: []const u8, initial: []const u8, keys: []const u8, expected: []const u8) !void {
     var name_buf: [192:0]u8 = undefined;
-    const name = try erFixture(io, &name_buf, ".zig", initial);
+    const name = try erFixture(io, &name_buf, suffix, initial);
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     var sess = try erStart(io, alloc, name, 24, 80);
     defer sess.close();
@@ -26566,11 +28144,29 @@ test "editing reliability: paste reindents by language in one undo group" {
     }
 }
 
+/// A write barrier must observe this stage's bytes, not a `written:`/NORMAL
+/// marker left by an older frame. Drain the real PTY while waiting so output
+/// backpressure cannot prevent the command from reaching the save handler.
+fn erWaitSavedBytes(sess: *Session, grid: *Grid, alloc: std.mem.Allocator, path: []const u8, expected: []const u8) !void {
+    const deadline = std.Io.Timestamp.now(sess.io, .awake).nanoseconds + 5000 * std.time.ns_per_ms;
+    while (std.Io.Timestamp.now(sess.io, .awake).nanoseconds < deadline) {
+        const bytes = try erRead(sess.io, alloc, path);
+        const equal = std.mem.eql(u8, bytes, expected);
+        alloc.free(bytes);
+        if (equal) return;
+        try gridDrain(sess, grid, 20);
+    }
+    grid.dump();
+    return error.SavedBytesTimeout;
+}
+
 test "editing reliability: linewise p reindents pasted lines and undo is one group" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
+    const initial = "fn f() {\n    a();\n}\nif (ok) {\ncall();\n}\n";
+    const expected = "fn f() {\n    a();\n    if (ok) {\n        call();\n    }\n}\nif (ok) {\ncall();\n}\n";
     var name_buf: [192:0]u8 = undefined;
-    const name = try erFixture(io, &name_buf, ".zig", "fn f() {\n    a();\n}\nif (ok) {\ncall();\n}\n");
+    const name = try erFixture(io, &name_buf, ".zig", initial);
     defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
     var sess = try erStart(io, alloc, name, 30, 100);
     defer sess.close();
@@ -26578,21 +28174,28 @@ test "editing reliability: linewise p reindents pasted lines and undo is one gro
     var grid = try Grid.initSizedCols(alloc, 30, 100);
     defer grid.deinit(alloc);
     try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
-    // Yank the top-level block linewise, p it below `a();` inside the
-    // function: the put must be reindented to the surrounding block.
+    // Yank the top-level block linewise, then p below a() inside the fn.
+    // /10 is unique to the post-put document; NORMAL alone could match the
+    // initial /7 frame. The command already stays in Normal: a redundant
+    // bare ESC immediately before ':' can be decoded as Alt+':' by vaxis.
     try sess.send("3jVjjyggjp");
-    // The grid renders 8-space indentation as two indent guides, so assert
-    // the saved bytes after leaving the put (the semantic result).
-    try gridDrain(&sess, &grid, 300);
-    try sess.send("\x1b");
-    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+    try gridWaitFor(&sess, &grid, "/10 col", 5000);
+    try sess.send(":w\r");
+    try erWaitSavedBytes(&sess, &grid, alloc, name, expected);
+
+    // Really prove the stated undo contract: ONE u removes the complete put
+    // and its reindent, preserving every original line. Check saved bytes,
+    // not indent-guide glyphs, then redo the same transaction.
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "/7 col", 5000);
+    try sess.send(":w\r");
+    try erWaitSavedBytes(&sess, &grid, alloc, name, initial);
+    try sess.send("\x12");
+    try gridWaitFor(&sess, &grid, "/10 col", 5000);
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
     const saved = try erRead(io, alloc, name);
     defer alloc.free(saved);
-    try std.testing.expectEqualStrings(
-        "fn f() {\n    a();\n    if (ok) {\n        call();\n    }\n}\nif (ok) {\ncall();\n}\n",
-        saved,
-    );
+    try std.testing.expectEqualStrings(expected, saved);
 }
 
 test "editing reliability: late completion after movement or re-insert cannot reopen the menu" {
@@ -27319,4 +28922,1170 @@ test "editing reliability: manually selected completion survives a refresh" {
     const saved = try erRead(io, alloc, name);
     defer alloc.free(saved);
     try std.testing.expectEqualStrings("lines_insert", saved);
+}
+
+test "editing performance: large fenced docs render without per-line parser stall" {
+    // Issue #11: a completion item with 160 fenced code lines used to create
+    // one tree-sitter Highlighter per line on every docs layout (~15.5 s
+    // stall in Debug). The block is now highlighted once; this test fails on
+    // the old per-line path because the menu does not appear within 5 s.
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var name_buf: [192:0]u8 = undefined;
+    const name = try erFixture(io, &name_buf, ".zig", "const a = 1;\n");
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    const oz = try erAbs(io, alloc, oz_exe_path);
+    defer alloc.free(oz);
+    const mock = try erAbs(io, alloc, "zig-out/bin/mock_lsp");
+    defer alloc.free(mock);
+    const lsp_env = try std.fmt.allocPrint(alloc, "OZ_LSP_CMD={s}", .{mock});
+    defer alloc.free(lsp_env);
+    var sess = try Session.spawnEnvSize(io, &.{ oz, name }, &.{ lsp_env, "OZ_MOCK_SCRIPT=completion_bulk_docs" }, 32, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 32, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("i");
+    try gridWaitFor(&sess, &grid, "[INSERT]", 4000);
+    const start_ns = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    try sess.send("s");
+    // 5 s is already the red threshold (old path took ~15 s); the explicit
+    // elapsed assertion keeps a slow runner from passing vacuously.
+    try gridWaitFor(&sess, &grid, "BULK_DOC_START", 5000);
+    const elapsed_ms: u64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds - start_ns, std.time.ns_per_ms));
+    if (elapsed_ms >= 5000) std.debug.print("bulk docs render took {d} ms\n", .{elapsed_ms});
+    try std.testing.expect(elapsed_ms < 5000);
+    // The docs pane is scrollable (footer only appears when rows overflow).
+    try sess.send("\x06");
+    try gridWaitFor(&sess, &grid, "^F/^B", 6000);
+    try sess.send("\x03");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "editing performance: fenced docs preserve CRLF Unicode and unclosed block offsets" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    for ([_]u16{ 80, 120 }) |cols| {
+        var name_buf: [192:0]u8 = undefined;
+        const source = "const unchanged = 1;\n";
+        const name = try erFixture(io, &name_buf, ".zig", source);
+        defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+        const oz = try erAbs(io, alloc, oz_exe_path);
+        defer alloc.free(oz);
+        const mock = try erAbs(io, alloc, "zig-out/bin/mock_lsp");
+        defer alloc.free(mock);
+        const env = try std.fmt.allocPrint(alloc, "OZ_LSP_CMD={s}", .{mock});
+        defer alloc.free(env);
+        var sess = try Session.spawnEnvSize(io, &.{ oz, name }, &.{ env, "OZ_MOCK_SCRIPT=completion_fenced_edges" }, 32, cols);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(alloc, 32, cols);
+        defer grid.deinit(alloc);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try sess.send("i");
+        try gridWaitFor(&sess, &grid, "[INSERT]", 4000);
+        try sess.send("s");
+        try gridWaitFor(&sess, &grid, "FENCE_EDGE_START", 8000);
+        var first = false;
+        var second = false;
+        var last = false;
+        var unicode = false;
+        var syntax_colored = false;
+        for (0..6) |_| {
+            first = first or grid.contains("AFTER_FIRST");
+            second = second or grid.contains("AFTER_SECOND");
+            last = last or grid.contains("EDGE_UNCLOSED_LAST");
+            unicode = unicode or grid.contains("中😀");
+            for (0..grid.rows) |row| {
+                syntax_colored = syntax_colored or rowContainsFg(&grid, row, "const first", packRgb(0x95, 0x7F, 0xB8));
+            }
+            if (first and second and last and unicode and syntax_colored) break;
+            try sess.send("\x06");
+            try gridDrain(&sess, &grid, 250);
+        }
+        try std.testing.expect(first and second and last and unicode and syntax_colored);
+        // Rebuilding the frame while scrolling must not reuse/fill freed
+        // arena-owned block text with later row allocations.
+        try sess.send("\x02\x02\x02\x02");
+        try gridWaitFor(&sess, &grid, "FENCE_EDGE_START", 4000);
+        try std.testing.expect(grid.contains("std_fenced"));
+        try sess.send("\x03");
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+        const saved = try erRead(io, alloc, name);
+        defer alloc.free(saved);
+        try std.testing.expectEqualStrings(source, saved);
+    }
+}
+
+test "inlay indentation: parameter anchors preserve guides and source cursor cells" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const source = "fn hints() void {\n    call(\n        u8,\n        expected_value,\n\t\tactual_value,\n    );\n    mid_value,\n    zero_value,\n    pair_value,\n    \"中文😀\", next_value,\n}\n";
+    for ([_]u16{ 40, 80, 120 }) |cols| {
+        var name_buf: [192:0]u8 = undefined;
+        const name = try erFixture(io, &name_buf, ".zig", source);
+        defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+        const oz = try erAbs(io, alloc, oz_exe_path);
+        defer alloc.free(oz);
+        const mock = try erAbs(io, alloc, "zig-out/bin/mock_lsp");
+        defer alloc.free(mock);
+        const env = try std.fmt.allocPrint(alloc, "OZ_LSP_CMD={s}", .{mock});
+        defer alloc.free(env);
+        var sess = try Session.spawnEnvSize(io, &.{ oz, name }, &.{ env, "OZ_MOCK_SCRIPT=inlay_indent" }, 26, cols);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(alloc, 26, cols);
+        defer grid.deinit(alloc);
+        try gridWaitFor(&sess, &grid, "NEXT: ", 8000);
+        const header = findRow(&grid, "fn hints()") orelse return error.MissingHeader;
+        const origin = glyphCol(&grid, header, "f", 0) orelse return error.MissingOrigin;
+        const type_row = findRow(&grid, "T: ") orelse return error.MissingTypeHint;
+        try std.testing.expectEqual(origin + 8, glyphCol(&grid, type_row, "T", origin).?);
+        try std.testing.expectEqual(origin, nthPipeCol(&grid, type_row, 0).?);
+        try std.testing.expectEqual(origin + 4, nthPipeCol(&grid, type_row, 1).?);
+        try std.testing.expectEqual(origin + 11, glyphCol(&grid, type_row, "u", origin).?);
+        const expected = findRow(&grid, "expected: ") orelse return error.MissingExpectedHint;
+        try std.testing.expectEqual(origin + 8, glyphCol(&grid, expected, "e", origin).?);
+        const actual = findRow(&grid, "actual: ") orelse return error.MissingActualHint;
+        try std.testing.expectEqual(origin + 8, glyphCol(&grid, actual, "a", origin).?);
+        try std.testing.expectEqual(origin, nthPipeCol(&grid, actual, 0).?);
+        try std.testing.expectEqual(origin + 4, nthPipeCol(&grid, actual, 1).?);
+        const mid = findRow(&grid, "MID: ") orelse return error.MissingMidHint;
+        try std.testing.expectEqual(origin + 2, glyphCol(&grid, mid, "M", origin).?);
+        try std.testing.expectEqual(origin, nthPipeCol(&grid, mid, 0).?);
+        const zero = findRow(&grid, "ZERO: ") orelse return error.MissingZeroHint;
+        try std.testing.expectEqual(origin, glyphCol(&grid, zero, "Z", origin).?);
+        const pair = findRow(&grid, "AB: CD: ") orelse return error.MissingSameAnchorHints;
+        try std.testing.expectEqual(origin + 4, glyphCol(&grid, pair, "A", origin).?);
+        try std.testing.expectEqual(origin + 8, glyphCol(&grid, pair, "C", origin).?);
+        const unicode_row = findRow(&grid, "NEXT: ") orelse return error.MissingUnicodeHint;
+        try std.testing.expectEqual(origin + 14, glyphCol(&grid, unicode_row, "N", origin).?);
+        try sess.send("ggjj^");
+        try gridWaitFor(&sess, &grid, "L3:C8", 4000);
+        try std.testing.expectEqual(type_row, grid.row);
+        try std.testing.expectEqual(origin + 11, grid.col);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+        const saved = try erRead(io, alloc, name);
+        defer alloc.free(saved);
+        try std.testing.expectEqualStrings(source, saved);
+    }
+}
+
+test "folds: indenting the boundary updates closed range through undo and redo" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var name_buf: [192:0]u8 = undefined;
+    const name = try erFixture(io, &name_buf, ".txt", "head\n    body\nboundary\n    next\ntail\n");
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    var sess = try erStart(io, a, name, 24, 80);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("za");
+    try gridWaitFor(&sess, &grid, "1 lines", 3000);
+    try sess.send("j>");
+    try gridWaitFor(&sess, &grid, "3 lines", 3000);
+    try std.testing.expect(!grid.contains("boundary"));
+    try std.testing.expect(!grid.contains("next"));
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "1 lines", 3000);
+    try std.testing.expect(grid.contains("boundary"));
+    try sess.send("\x12");
+    try gridWaitFor(&sess, &grid, "3 lines", 3000);
+    try std.testing.expect(!grid.contains("boundary"));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try erRead(io, a, name);
+    defer a.free(saved);
+    try std.testing.expectEqualStrings("head\n    body\n    boundary\n    next\ntail\n", saved);
+}
+
+test "editing input: Note F handles legacy and Kitty shifted command and target" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var plain_buf: [192:0]u8 = undefined;
+    const plain = try erFixture(io, &plain_buf, ".txt", "OTHER_BUFFER\n");
+    defer std.Io.Dir.cwd().deleteFile(io, plain) catch {};
+    var notes_buf: [128]u8 = undefined;
+    const notes_dir = try notesTestDir(io, &notes_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, notes_dir) catch {};
+    const note = try std.fmt.allocPrint(a, "{s}/find.md", .{notes_dir});
+    defer a.free(note);
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, note, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "body_OoneOtwo\n");
+    }
+    const env = try std.fmt.allocPrint(a, "OZ_NOTES_DIR={s}", .{notes_dir});
+    defer a.free(env);
+    const oz = try erAbs(io, a, oz_exe_path);
+    defer a.free(oz);
+    var sess = try Session.spawnEnvSize(io, &.{ oz, plain }, &.{env}, 30, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "Files", 5000);
+    try sess.send("2");
+    try gridWaitFor(&sess, &grid, "find.md", 5000);
+    try sess.send("\r");
+    var elapsed: u32 = 0;
+    while (aiFindCellFrom(&grid, "body_OoneOtwo", 30) == null and elapsed < 5000) : (elapsed += 100) {
+        try gridDrain(&sess, &grid, 100);
+    }
+    try std.testing.expect(aiFindCellFrom(&grid, "body_OoneOtwo", 30) != null);
+    // A cursor/edit acknowledgement in the editor proves Notes gave away focus.
+    try sess.send("$FOrX");
+    try gridWaitFor(&sess, &grid, "body_OoneXtwo", 5000);
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "body_OoneOtwo", 5000);
+    // Same logical line and same backwards match, but both shifted letters
+    // use Kitty's alternate-codepoint encoding rather than legacy bytes.
+    try sess.send("$\x1b[102:70;2;70u\x1b[111:79;2;79urY");
+    try gridWaitFor(&sess, &grid, "body_OoneYtwo", 5000);
+    try std.testing.expect(grid.contains("[NORMAL]"));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try erRead(io, a, note);
+    defer a.free(saved);
+    try std.testing.expectEqualStrings("body_OoneYtwo\n", saved);
+}
+
+test "editing input: quote pairs never manufacture a third quote" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const cases = [_]struct { label: []const u8, text: []const u8, keys: []const u8, want: []const u8 }{
+        .{ .label = "word double pair", .text = "word\n", .keys = "A\"\"", .want = "word\"\"\n" },
+        .{ .label = "word backtick pair", .text = "word\n", .keys = "A``", .want = "word``\n" },
+        .{ .label = "word apostrophe pair", .text = "word\n", .keys = "A''", .want = "word''\n" },
+        .{ .label = "first double quote pairs", .text = "word\n", .keys = "A\"", .want = "word\"\"\n" },
+        .{ .label = "first backtick pairs", .text = "word\n", .keys = "A`", .want = "word``\n" },
+        .{ .label = "contraction", .text = "don\n", .keys = "A't", .want = "don't\n" },
+        .{ .label = "existing string closes literally", .text = "\"abc\n", .keys = "A\"", .want = "\"abc\"\n" },
+        .{ .label = "escaped quote stays literal", .text = "foo\\\n", .keys = "A\"", .want = "foo\\\"\n" },
+        .{ .label = "apostrophe within word", .text = "ab\n", .keys = "li'", .want = "a'b\n" },
+        .{ .label = "non ASCII word apostrophes", .text = "中\n", .keys = "A''", .want = "中''\n" },
+        .{ .label = "empty pair backspace", .text = "\n", .keys = "i\"\x7f", .want = "\n" },
+        .{ .label = "pair undo is atomic", .text = "word\n", .keys = "A\"\"\x03u", .want = "word\n" },
+    };
+    for (cases) |c| try erEditorCase(io, a, c.label, c.text, c.keys, c.want);
+}
+
+test "editing input: Normal o indents open blocks and expands the selected empty block" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const cases = [_]struct { label: []const u8, suffix: []const u8 = ".zig", text: []const u8, keys: []const u8, want: []const u8 }{
+        .{ .label = "empty brace block", .text = "{}\n", .keys = "oX", .want = "{\n    X\n}\n" },
+        .{ .label = "empty function", .text = "fn f() {}\n", .keys = "f{oX", .want = "fn f() {\n    X\n}\n" },
+        .{ .label = "already expanded block", .text = "fn f() {\n}\n", .keys = "f{oX", .want = "fn f() {\n    X\n}\n" },
+        .{ .label = "closer stays ordinary o", .text = "{}\n", .keys = "loX", .want = "{}\nX\n" },
+        .{ .label = "tabs and CRLF", .text = "\tif (x) {}\r\n", .keys = "f{oX", .want = "\tif (x) {\r\n\t\tX\r\n\t}\r\n" },
+        .{ .label = "quoted braces are literal", .text = "const s = \"{}\";\n", .keys = "f{oX", .want = "const s = \"{}\";\nX\n" },
+        .{ .label = "comment braces are literal", .text = "// {}\n", .keys = "f{oX", .want = "// {}\nX\n" },
+        .{ .label = "Markdown remains literal", .suffix = ".md", .text = "{}\n", .keys = "oX", .want = "{}\nX\n" },
+        .{ .label = "Python language rule", .suffix = ".py", .text = "def f():\n    pass\n", .keys = "oX", .want = "def f():\n    X\n    pass\n" },
+        .{ .label = "undo open plus typing atomically", .text = "{}\n", .keys = "oX\x03u", .want = "{}\n" },
+        .{ .label = "redo restores expanded block", .text = "{}\n", .keys = "oX\x03u\x12", .want = "{\n    X\n}\n" },
+    };
+    for (cases) |c| try erEditorFileCase(io, a, c.label, c.suffix, c.text, c.keys, c.want);
+}
+
+test "file tree safety: G gg and editing keys stay in the navigator" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var root_buf: [160]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/oz_navroute_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDir(io, root, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const original = "SOURCE_A\nSOURCE_B\nSOURCE_C\n";
+    try writeTestFile(io, root, "edit.txt", original);
+    var name_buf: [24]u8 = undefined;
+    for (0..40) |n| try writeTestFile(io, root, try std.fmt.bufPrint(&name_buf, "z{d:0>2}.txt", .{n}), "");
+    const path = try std.fmt.allocPrint(alloc, "{s}/edit.txt", .{root});
+    defer alloc.free(path);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, null, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "SOURCE_A", 8000);
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "z00.txt", 8000);
+    try sess.send("G");
+    try gridWaitFor(&sess, &grid, "z39.txt", 8000);
+    try std.testing.expect(grid.contains("L1:C0"));
+    try sess.send("gg");
+    try gridWaitFor(&sess, &grid, "z00.txt", 8000);
+    try std.testing.expect(!grid.contains("z39.txt"));
+    // Kitty reports base g plus logical G, with Ctrl/Alt preserved.
+    try sess.send("\x1b[103:71;6;71u\x1b[103:71;4;71u");
+    try gridDrain(&sess, &grid, 150);
+    try std.testing.expect(!grid.contains("z39.txt"));
+    try std.testing.expect(grid.contains("L1:C0"));
+    try sess.send("\x1b[103:71;2;71u");
+    try gridWaitFor(&sess, &grid, "z39.txt", 8000);
+    try sess.send("gg");
+    try gridWaitFor(&sess, &grid, "z00.txt", 8000);
+    try sess.send("xux\x12");
+    try sess.send("\x17l");
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    const exit_code = try sess.commandAndWaitExit(":wq\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+    const f = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer f.close(io);
+    var saved: [128]u8 = undefined;
+    const count = try f.readPositionalAll(io, &saved, 0);
+    try std.testing.expectEqualStrings(original, saved[0..count]);
+}
+
+test "file tree safety: Backspace changes only browsing root and persists" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var root_buf: [160]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/oz_navparent_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const project = try std.fmt.allocPrint(alloc, "{s}/project", .{root});
+    defer alloc.free(project);
+    try std.Io.Dir.cwd().createDirPath(io, project);
+    try writeTestFile(io, root, "PARENT_ONLY.txt", "outside\n");
+    try writeTestFile(io, project, "inside.txt", "UNCHANGED_BODY\n");
+    const path = try std.fmt.allocPrint(alloc, "{s}/inside.txt", .{project});
+    defer alloc.free(path);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, null, 30, 120, project);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "UNCHANGED_BODY", 8000);
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "Files", 8000);
+    try std.testing.expect(!grid.contains("PARENT_ONLY"));
+    try sess.send("\x7f");
+    try gridWaitFor(&sess, &grid, "PARENT_ONLY", 8000);
+    // Closing/reopening retains the browsing directory, not project cwd.
+    try sess.send(" e");
+    try gridWaitGone(&sess, &grid, "PARENT_ONLY", 8000);
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "PARENT_ONLY", 8000);
+    try std.testing.expect(grid.contains("L1:C0"));
+    try std.testing.expect(grid.contains("NORMAL"));
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "file tree safety: a creates files and directories in a modal without overwriting" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var root_buf: [160]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/oz_navcreate_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const folder = try std.fs.path.join(alloc, &.{ root, "folder" });
+    defer alloc.free(folder);
+    try std.Io.Dir.cwd().createDirPath(io, folder);
+    try writeTestFile(io, root, "edit.txt", "KEEP_DOCUMENT\n");
+    const path = try std.fs.path.join(alloc, &.{ root, "edit.txt" });
+    defer alloc.free(path);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, null, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 30, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "KEEP_DOCUMENT", 8000);
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "folder", 8000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    // Bracketed paste belongs to the filename prompt, not the background.
+    try sess.send("\x1b[200~child.txt\x1b[201~\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    try gridWaitFor(&sess, &grid, "child.txt", 8000);
+    const child = try std.fs.path.join(alloc, &.{ folder, "child.txt" });
+    defer alloc.free(child);
+    _ = try std.Io.Dir.cwd().statFile(io, child, .{});
+    try writeTestFile(io, folder, "child.txt", "PRESERVE_EXISTING\n");
+    // The newly selected file creates siblings in its parent directory.
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    try sess.send("child.txt\r");
+    try gridWaitFor(&sess, &grid, "PathAlreadyExists", 8000);
+    try std.testing.expect(grid.contains("New file / directory"));
+    try sess.send("\x15../escape.txt\r");
+    try gridWaitFor(&sess, &grid, "InvalidName", 8000);
+    try mouseClickAt(&sess, 100, 3);
+    try std.testing.expect(grid.contains("New file / directory"));
+    // Error recovery keeps the input usable and allows UTF-8 + spaces.
+    try sess.send("\x15子 目录/\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    const made_dir = try std.fs.path.join(alloc, &.{ folder, "子 目录" });
+    defer alloc.free(made_dir);
+    var directory = try std.Io.Dir.cwd().openDir(io, made_dir, .{});
+    directory.close(io);
+    try gridWaitFor(&sess, &grid, "子 目录", 8000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    try sess.send("cancelled.txt\x1b");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    const cancelled = try std.fs.path.join(alloc, &.{ made_dir, "cancelled.txt" });
+    defer alloc.free(cancelled);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, cancelled, .{}));
+    try std.testing.expect(grid.contains("L1:C0"));
+    try std.testing.expect(grid.contains("NORMAL"));
+    const code = try sess.commandAndWaitExit(":wq\r");
+    try std.testing.expectEqual(@as(u32, 0), code);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1024));
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings("KEEP_DOCUMENT\n", bytes);
+    const kept = try std.Io.Dir.cwd().readFileAlloc(io, child, alloc, .limited(1024));
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("PRESERVE_EXISTING\n", kept);
+}
+
+test "file tree safety: creation works in an empty compact dashboard" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var root_buf: [160]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/oz_navempty_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var sess = try Session.spawnEnvSizeCwd(io, &.{oz_exe_path}, null, 24, 40, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 40);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "oz", 8000);
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "Files", 8000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    // Empty confirmation cancels without making a filesystem entry.
+    try sess.send("\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    try sess.send("文\x7fempty.txt\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    try gridWaitFor(&sess, &grid, "empty.txt", 8000);
+    const created = try std.fs.path.join(alloc, &.{ root, "empty.txt" });
+    defer alloc.free(created);
+    _ = try std.Io.Dir.cwd().statFile(io, created, .{});
+    const code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), code);
+}
+
+
+test "integration repair: Normal o and undo preserve closed folds and inlay anchors" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const source = "fn folded() {\n    hidden();\n}\nfn empty() {}\n";
+    var name_buf: [192:0]u8 = undefined;
+    const name = try erFixture(io, &name_buf, ".zig", source);
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    const oz = try erAbs(io, a, oz_exe_path);
+    defer a.free(oz);
+    const mock = try erAbs(io, a, "zig-out/bin/mock_lsp");
+    defer a.free(mock);
+    const env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{mock});
+    defer a.free(env);
+    // Only the first hint request is answered: undo cannot pass by waiting
+    // for a later LSP response to repair a stale local hint transform.
+    var sess = try Session.spawnEnvSize(io, &.{ oz, name }, &.{ env, "OZ_MOCK_SCRIPT=inlay_eol" }, 26, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 26, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, ": eol", 8000);
+    try sess.send("za");
+    try gridWaitFor(&sess, &grid, "1 lines", 4000);
+    try sess.send("jjf{oX");
+    try gridWaitFor(&sess, &grid, "[INSERT]", 4000);
+    try gridWaitFor(&sess, &grid, "L5:C5", 4000);
+    try std.testing.expect(!grid.contains("hidden"));
+    const header = findRow(&grid, "fn empty() {") orelse return error.MissingEmptyHeader;
+    try std.testing.expect(!rowContains(&grid, header, ": eol"));
+    try std.testing.expect(rowContains(&grid, header + 2, "}: eol"));
+    try sess.send("\x03");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "fn empty() {}: eol", 4000);
+    try std.testing.expect(!grid.contains("hidden"));
+    try std.testing.expect(grid.contains("1 lines"));
+    try sess.send("\x12");
+    try gridWaitGone(&sess, &grid, "fn empty() {}", 4000);
+    const restored = findRow(&grid, "fn empty() {") orelse return error.MissingRedoHeader;
+    try std.testing.expect(rowContains(&grid, restored + 2, "}: eol"));
+    try std.testing.expect(grid.contains("1 lines"));
+    try std.testing.expect(!grid.contains("hidden"));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try erRead(io, a, name);
+    defer a.free(saved);
+    try std.testing.expectEqualStrings("fn folded() {\n    hidden();\n}\nfn empty() {\n    X\n}\n", saved);
+}
+
+fn completionDedupRows(grid: *Grid, needle: []const u8) usize {
+    var count: usize = 0;
+    for (0..grid.rows) |row| if (rowContains(grid, row, needle) and rowContains(grid, row, "│")) {
+        count += 1;
+    };
+    return count;
+}
+
+test "completion dedup: local refresh replaces old prefixes and does not accumulate candidates" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var path_buf: [128:0]u8 = undefined;
+    const path = try wsTempFile(io, &path_buf, "completion_dedup.txt", "alphabet alphanumeric azure\n\n");
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, path }, &.{});
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("Gi");
+    try gridWaitFor(&sess, &grid, "[INSERT]", 3000);
+    try sess.send("a");
+    try gridDrain(&sess, &grid, 300);
+    try std.testing.expectEqual(@as(usize, 1), completionDedupRows(&grid, "azure"));
+    try sess.send("l");
+    try gridDrain(&sess, &grid, 300);
+    try std.testing.expectEqual(@as(usize, 0), completionDedupRows(&grid, "azure"));
+    try std.testing.expectEqual(@as(usize, 1), completionDedupRows(&grid, "alphabet"));
+    try sess.send("p");
+    try gridDrain(&sess, &grid, 300);
+    try std.testing.expectEqual(@as(usize, 1), completionDedupRows(&grid, "alphabet"));
+    try std.testing.expectEqual(@as(usize, 1), completionDedupRows(&grid, "alphanumeric"));
+    try sess.send("\x05z"); // C-e dismisses before a nonmatching suffix.
+    try gridDrain(&sess, &grid, 300);
+    try std.testing.expectEqual(@as(usize, 0), completionDedupRows(&grid, "alphabet"));
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "completion dedup: LSP duplicates collapse while same-label different insertions survive" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var fx = try startCompletionMock(io, a, "completion_duplicates", "const x = ", 30, 120);
+    defer fx.deinit(io, a);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send("Adu");
+    try gridWaitFor(&fx.sess, &grid, "DEDUP_A_DOC", 8000);
+    try std.testing.expectEqual(@as(usize, 2), completionDedupRows(&grid, "duplicateProbe"));
+    try fx.sess.send("\x0e");
+    try gridWaitFor(&fx.sess, &grid, "DEDUP_B_DOC", 5000);
+    try fx.sess.send("\r");
+    try gridWaitFor(&fx.sess, &grid, "const x = duplicateProbe_B", 5000);
+    try fx.sess.send("\x1b");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":wq\r"));
+    const disk = try readDiskFile(io, a, fx.path);
+    defer a.free(disk);
+    try std.testing.expectEqualStrings("const x = duplicateProbe_B", disk);
+}
+
+test "path completion: bare HOME, nested directories, prefix refresh and exact insertion" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "Docs", .default_dir);
+    try tmp.dir.createDir(io, "Docs/jump", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "Docs/note.txt", .data = "note" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Docs/.hidden", .data = "hidden" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "editor.txt", .data = "" });
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+    const home = try std.fmt.allocPrint(a, "HOME={s}", .{root});
+    defer a.free(home);
+    const file = try std.fs.path.join(a, &.{ root, "editor.txt" });
+    defer a.free(file);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, file }, &.{home}, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("i~");
+    try gridWaitFor(&sess, &grid, "Docs/", 5000);
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "note.txt", 5000);
+    try std.testing.expect(!grid.contains(".hidden"));
+    try sess.send("j");
+    try gridDrain(&sess, &grid, 250);
+    try std.testing.expectEqual(@as(usize, 0), completionDedupRows(&grid, "note.txt"));
+    try std.testing.expectEqual(@as(usize, 1), completionDedupRows(&grid, "jump/"));
+    try sess.send("\x7fn");
+    try gridWaitFor(&sess, &grid, "note.txt", 5000);
+    try sess.send("\r");
+    try gridDrain(&sess, &grid, 250);
+    try std.testing.expectEqual(@as(usize, 0), completionDedupRows(&grid, "note.txt"));
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const bytes = try readDiskFile(io, a, file);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("~/Docs/note.txt", bytes);
+}
+
+test "path completion: quoted Unicode paths with spaces preserve both delimiters" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "中文 dir", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "中文 dir/file name.txt", .data = "content" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "editor.txt", .data = "" });
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+    const file = try std.fs.path.join(a, &.{ root, "editor.txt" });
+    defer a.free(file);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, file }, &.{}, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    const keys = try std.fmt.allocPrint(a, "i\"{s}/中文 dir/fi", .{root});
+    defer a.free(keys);
+    try sess.send(keys);
+    try gridWaitFor(&sess, &grid, "file name.txt", 5000);
+    try sess.send("\r");
+    try gridDrain(&sess, &grid, 250);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const bytes = try readDiskFile(io, a, file);
+    defer a.free(bytes);
+    const expected = try std.fmt.allocPrint(a, "\"{s}/中文 dir/file name.txt\"", .{root});
+    defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, bytes);
+}
+
+test "path completion: local paths beat a genuinely late LSP response and survive reentry" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var fx = try startCompletionMock(io, a, "edge:gated", "gated", 30, 120);
+    defer fx.deinit(io, a);
+    try aiWriteFile(io, fx.root, "fixture_file.txt", "content");
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send("A\x0e");
+    try gridWaitFor(&fx.sess, &grid, "[INSERT]", 3000);
+    try waitBarrierMarker(io, a, fx.root, "completion-received-1", 5000);
+    try fx.sess.send("\x17./");
+    try gridWaitFor(&fx.sess, &grid, "fixture_file.txt", 5000);
+    // The old server is released only AFTER a real path menu is rendered.
+    try aiWriteFile(io, fx.root, "release-completion", "go");
+    try waitBarrierMarker(io, a, fx.root, "completion-delivered", 5000);
+    try gridDrain(&fx.sess, &grid, 300);
+    try std.testing.expect(grid.contains("fixture_file.txt"));
+    try std.testing.expect(!grid.contains("gated_alpha"));
+    try std.testing.expect(!grid.contains("GATED_ALPHA_DOC"));
+    try fx.sess.send("\x1b[D");
+    try gridWaitGone(&fx.sess, &grid, "fixture_file.txt", 3000);
+    try fx.sess.send("\x1b");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+    try fx.sess.send("Af");
+    try gridWaitFor(&fx.sess, &grid, "fixture_file.txt", 5000);
+    try std.testing.expect(!grid.contains("gated_alpha"));
+    try fx.sess.send("\r");
+    try gridDrain(&fx.sess, &grid, 150);
+    try fx.sess.send("\x1b");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":wq\r"));
+    const bytes = try readDiskFile(io, a, fx.path);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("./fixture_file.txt", bytes);
+}
+
+test "path completion: accepting mid-component replaces its suffix and preserves the tail" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const cases = [_]struct { text: []const u8, keys: []const u8, want: []const u8 }{
+        .{ .text = "./longname.txt", .keys = "4li\x0e", .want = "./longname.txt" },
+        .{ .text = "\"./long file.txt\"; AFTER", .keys = "5li\x0e", .want = "\"./long file.txt\"; AFTER" },
+        .{ .text = "./subold/child.txt", .keys = "4li\x0e", .want = "./subnew/child.txt" },
+    };
+    for (cases) |c| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const target = if (c.text[0] == '"') "long file.txt" else "longname.txt";
+        try tmp.dir.writeFile(io, .{ .sub_path = target, .data = "target" });
+        try tmp.dir.createDir(io, "subnew", .default_dir);
+        try tmp.dir.writeFile(io, .{ .sub_path = "subnew/child.txt", .data = "target" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "editor.txt", .data = c.text });
+        var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &root_buf);
+        const root = root_buf[0..root_len];
+        const file = try std.fs.path.join(a, &.{ root, "editor.txt" });
+        defer a.free(file);
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, file }, &.{}, 30, 120, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 30, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try sess.send(c.keys);
+        try gridWaitFor(&sess, &grid, "[INSERT]", 3000);
+        // Enter follows the synchronous local-provider request in FIFO order.
+        try sess.send("\r\x03");
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+        const bytes = try readDiskFile(io, a, file);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings(c.want, bytes);
+    }
+}
+
+test "path completion: relative CLI files resolve dot and dotdot against their own directory" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const cases = [_]struct { text: []const u8, candidate: []const u8, want: []const u8 }{
+        .{ .text = "./si", .candidate = "sibling.txt", .want = "./sibling.txt" },
+        .{ .text = "../pa", .candidate = "parent.txt", .want = "../parent.txt" },
+    };
+    for (cases) |c| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDir(io, "src", .default_dir);
+        try tmp.dir.writeFile(io, .{ .sub_path = "src/sibling.txt", .data = "target" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "parent.txt", .data = "target" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "src/editor.txt", .data = c.text });
+        var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const root_len = try tmp.dir.realPath(io, &root_buf);
+        const root = root_buf[0..root_len];
+        const file = try std.fs.path.join(a, &.{ root, "src/editor.txt" });
+        defer a.free(file);
+        // Deliberately use a relative CLI argument, with a distinct process cwd.
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "src/editor.txt" }, &.{}, 30, 120, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 30, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try sess.send("A\x0e");
+        try gridWaitFor(&sess, &grid, c.candidate, 3000);
+        try sess.send("\r\x03");
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+        const bytes = try readDiskFile(io, a, file);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings(c.want, bytes);
+    }
+}
+
+test "path completion: delayed semantic resolve cannot revive over a path menu or reentry" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var fx = try startCompletionMock(io, a, "edge:duplicate", "du", 30, 120);
+    defer fx.deinit(io, a);
+    try aiWriteFile(io, fx.root, "fixture_file.txt", "target");
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send("A\x0e");
+    try gridWaitFor(&fx.sess, &grid, "fn duplicate() void", 5000);
+    try fx.sess.send("\x17./");
+    try gridWaitFor(&fx.sess, &grid, "fixture_file.txt", 5000);
+    // Delivery is gated until the newer filesystem provider is visible.
+    try aiWriteFile(io, fx.root, "release-resolve", "go");
+    try waitBarrierMarker(io, a, fx.root, "resolve-delivered", 5000);
+    try gridDrain(&fx.sess, &grid, 400);
+    try std.testing.expect(grid.contains("fixture_file.txt"));
+    try std.testing.expect(!grid.contains("A_LATE_DOC"));
+    try fx.sess.send("\x1b[D");
+    try gridWaitGone(&fx.sess, &grid, "fixture_file.txt", 3000);
+    try fx.sess.send("\x03");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+    try fx.sess.send("Af");
+    try gridWaitFor(&fx.sess, &grid, "fixture_file.txt", 5000);
+    try std.testing.expect(!grid.contains("A_LATE_DOC"));
+    try fx.sess.send("\r\x03");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":wq\r"));
+    const bytes = try readDiskFile(io, a, fx.path);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("./fixture_file.txt", bytes);
+}
+
+fn expectAdjacentCompletionPanels(grid: *Grid) !void {
+    for (0..grid.rows) |row| {
+        const left = glyphCol(grid, row, "╭", 0) orelse continue;
+        const menu_right = glyphCol(grid, row, "╮", left + 1) orelse continue;
+        const doc_left = glyphCol(grid, row, "╭", menu_right + 1) orelse continue;
+        const doc_right = glyphCol(grid, row, "╮", doc_left + 1) orelse continue;
+        try std.testing.expectEqual(menu_right + 1, doc_left);
+        _ = try assertPopupBoxAt(grid, row, left, menu_right);
+        _ = assertPopupBoxAt(grid, row, doc_left, doc_right) catch |err| {
+            grid.dump();
+            return err;
+        };
+        try std.testing.expect(doc_right < grid.cols);
+        return;
+    }
+    grid.dump();
+    return error.TestUnexpectedResult;
+}
+
+test "completion adjacent: explanation remains right and touching across right-edge cursor and resize" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 96);
+    defer a.free(padding);
+    @memset(padding, ' ');
+    const source = try std.fmt.allocPrint(a, "{s}std", .{padding});
+    defer a.free(source);
+    var fx = try startCompletionMock(io, a, "completion_rich", source, 30, 120);
+    defer fx.deinit(io, a);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send("A.");
+    try gridWaitFor(&fx.sess, &grid, "A contiguous", 8000);
+    try gridSettle(&fx.sess, &grid, 100, 3000);
+    try expectAdjacentCompletionPanels(&grid);
+    try fx.sess.send("\x0e");
+    try gridWaitFor(&fx.sess, &grid, "Duplicates ArrayList", 5000);
+    try gridSettle(&fx.sess, &grid, 100, 3000);
+    try expectAdjacentCompletionPanels(&grid);
+    try fx.sess.send("\x10");
+    try gridWaitFor(&fx.sess, &grid, "A contiguous", 5000);
+    for ([_]u16{ 80, 40, 120 }) |cols| {
+        const size = Winsize{ .ws_row = 30, .ws_col = cols, .ws_xpixel = cols * 10, .ws_ypixel = 600 };
+        _ = linux.ioctl(fx.sess.pty.master, TIOCSWINSZ, @intFromPtr(&size));
+        grid.deinit(a);
+        grid = try Grid.initSizedCols(a, 30, cols);
+        try gridWaitFor(&fx.sess, &grid, "ArrayList", 8000);
+        try gridSettle(&fx.sess, &grid, 100, 3000);
+        if (cols >= 64) {
+            try gridWaitFor(&fx.sess, &grid, "A contiguous", 5000);
+            try gridSettle(&fx.sess, &grid, 100, 3000);
+            try expectAdjacentCompletionPanels(&grid);
+        } else {
+            try gridWaitGone(&fx.sess, &grid, "A contiguous", 3000);
+            try std.testing.expectEqual(@as(usize, 1), try countPopupBoxes(&grid));
+        }
+        try frame.expectNoHorizontalOverflow(&grid, cols);
+    }
+    try fx.sess.send("\x1b");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "path completion: accept transforms one-shot inlay anchors before any refresh" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const cases = [_]struct { initial: []const u8, target: []const u8 }{
+        .{ .initial = "fi", .target = "filename_long.txt" },
+        .{ .initial = "filename_obsolete_suffix.txt", .target = "file.txt" },
+    };
+    for (cases) |c| {
+        const source = try std.fmt.allocPrint(a, "const path = \"./{s}\";\nconst tail = 0;\n", .{c.initial});
+        defer a.free(source);
+        var fx = try startCompletionMock(io, a, "inlay_eol", source, 30, 120);
+        defer fx.deinit(io, a);
+        try aiWriteFile(io, fx.root, c.target, "target");
+        var grid = try Grid.initSizedCols(a, 30, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&fx.sess, &grid, ": eol", 8000);
+        try std.testing.expect(grid.contains("[NORMAL]"));
+        try fx.sess.send("f\"5li\x0e");
+        try gridWaitFor(&fx.sess, &grid, c.target, 5000);
+        try fx.sess.send("\r");
+        const expected_line = try std.fmt.allocPrint(a, "const path = \"./{s}\";", .{c.target});
+        defer a.free(expected_line);
+        const cursor_marker = try std.fmt.allocPrint(a, "L1:C{d}", .{expected_line.len - 2});
+        defer a.free(cursor_marker);
+        try gridWaitFor(&fx.sess, &grid, cursor_marker, 3000);
+        // Stay in the SAME Insert session. The mock answers inlayHint only
+        // once, so a new response cannot conceal a missing local transform.
+        const row = findRow(&grid, "const path") orelse return error.TestUnexpectedResult;
+        const src_col = aiCellIndexOf(&grid, row, expected_line) orelse {
+            grid.dump();
+            return error.TestUnexpectedResult;
+        };
+        const hint_col = aiCellIndexOf(&grid, row, ": eol") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(src_col + expected_line.len, hint_col);
+        try std.testing.expect(grid.contains("[INSERT]"));
+        try fx.sess.send("\x03");
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":wq\r"));
+        const bytes = try readDiskFile(io, a, fx.path);
+        defer a.free(bytes);
+        const expected = try std.fmt.allocPrint(a, "{s}\nconst tail = 0;\n", .{expected_line});
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, bytes);
+    }
+}
+
+test "gutter: padding separates numbers signs and source with wide wrapped mouse targets" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const mock = try std.Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/mock_lsp", a);
+    defer a.free(mock);
+    const env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{mock});
+    defer a.free(env);
+    const wide_line = "中中\tabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdef_TAIL";
+    const source = "const a = 1;\n" ++ wide_line ++ "\n";
+    for ([_]u16{ 40, 80, 120 }) |cols| {
+        var root_buf: [128]u8 = undefined;
+        const root = try aiMockDir(io, &root_buf);
+        defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        try writeTestFile(io, root, "gutter.zig", source);
+        var path_buf: [220:0]u8 = undefined;
+        const path = try bufPrintZ(&path_buf, "{s}/gutter.zig", .{root});
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{env}, 24, cols, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 24, cols);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "const a", 8000);
+        try gridWaitFor(&sess, &grid, "\u{f467}", 8000);
+        try gridWaitFor(&sess, &grid, ": i32", 8000);
+        const diagnostic = aiFindCellFrom(&grid, "\u{f467}", 0).?;
+        const origin = .{ .row = diagnostic.row, .col = diagnostic.col + 2 };
+        const source_cell = aiFindCellFrom(&grid, "const a", 0).?;
+        try std.testing.expectEqual(source_cell.row, diagnostic.row);
+        try std.testing.expect(source_cell.col >= origin.col);
+        try std.testing.expectEqual(@as(usize, 4), origin.col);
+        try std.testing.expectEqualStrings(" ", frame.cellText(&grid, origin.row, origin.col - 1));
+        try std.testing.expectEqualStrings("\u{f467}", frame.cellText(&grid, origin.row, origin.col - 2));
+        try std.testing.expectEqualStrings(" ", frame.cellText(&grid, origin.row, origin.col - 3));
+        try std.testing.expectEqualStrings("1", frame.cellText(&grid, origin.row, origin.col - 4));
+        try std.testing.expectEqual(@as(u8, 0), frame.cellUnderlineStyle(&grid, origin.row, origin.col - 1));
+        const wide = aiFindCellFrom(&grid, "中中", 0).?;
+        try mouseClickAt(&sess, @intCast(wide.col + 1), @intCast(wide.row));
+        try gridWaitFor(&sess, &grid, "L2:C0", 8000);
+        const tail = aiFindCellFrom(&grid, "_TAIL", 0).?;
+        try std.testing.expectEqualStrings("A", frame.cellText(&grid, tail.row, tail.col + 2));
+        try mouseClickAt(&sess, @intCast(tail.col + 2), @intCast(tail.row));
+        // 2 CJK glyphs (4 cells), a 4-cell tab, 56 letters, then "_T".
+        try gridWaitFor(&sess, &grid, "L2:C66", 8000);
+        try sess.send("rX");
+        try gridWaitFor(&sess, &grid, "_TXIL", 8000);
+        const code = try sess.commandAndWaitExit(":wq\r");
+        try std.testing.expectEqual(@as(u32, 0), code);
+        const saved = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024));
+        defer a.free(saved);
+        const target_byte = comptime std.mem.indexOf(u8, source, "_TAIL").? + 2;
+        const expected = source[0..target_byte] ++ "X" ++ source[target_byte + 1 ..];
+        try std.testing.expectEqualStrings(expected, saved);
+    }
+}
+
+/// Observe a specific source cell, never a status/global substring which
+/// could acknowledge an older frame or a different pane's label.
+fn gutterWaitCell(sess: *Session, grid: *Grid, row: usize, col: usize, expected: []const u8) !void {
+    var elapsed: i32 = 0;
+    while (!std.mem.eql(u8, frame.cellText(grid, row, col), expected) and elapsed < 5000) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        if (n == 0) {
+            elapsed += 100;
+            continue;
+        }
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    if (!std.mem.eql(u8, frame.cellText(grid, row, col), expected)) grid.dump();
+    try std.testing.expectEqualStrings(expected, frame.cellText(grid, row, col));
+}
+
+test "gutter: tiny split fallbacks keep source visible and the one-cell editor clickable" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |deep| {
+        var doc = std.ArrayList(u8).empty;
+        defer doc.deinit(a);
+        try doc.appendSlice(a, "S\n");
+        if (deep) {
+            for (0..14998) |_| try doc.appendSlice(a, "x\n");
+            try doc.append(a, 'x'); // exactly 15,000 logical lines
+        }
+        var name_buf: [192:0]u8 = undefined;
+        var other_buf: [192:0]u8 = undefined;
+        const name = try erFixture(io, &name_buf, ".txt", doc.items);
+        defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+        const other = try erFixture(io, &other_buf, ".txt", "OTHER_BUFFER\n");
+        defer std.Io.Dir.cwd().deleteFile(io, other) catch {};
+        var sess = try erStart(io, a, name, 24, 40);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 24, 40);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        // The first pane remains 20 columns wide, so its nominal source cell
+        // is an independent edit acknowledgement before checking tiny panes.
+        const first_source: usize = if (deep) 8 else 4;
+        try sess.send(":vs\r:vs\r:vs\r:vs\rrA");
+        try gutterWaitCell(&sess, &grid, 2, first_source, "A");
+        // Right-most leaf widths are 3, then 2, then 1. A deep file hides
+        // its five-digit numbers, keeping a separator pad in a 3-cell pane.
+        try gutterWaitCell(&sess, &grid, 2, if (deep) 38 else 39, "A");
+        try sess.send(":vs\rrB");
+        try gutterWaitCell(&sess, &grid, 2, first_source, "B");
+        try gutterWaitCell(&sess, &grid, 2, 39, "B");
+        try sess.send(":vs\rrC");
+        try gutterWaitCell(&sess, &grid, 2, first_source, "C");
+        try gutterWaitCell(&sess, &grid, 2, 39, "C");
+        // Opening another buffer deliberately focuses a different (leftmost)
+        // editor. A click on the one-cell source must reclaim keyboard focus,
+        // even though a historical separator occupied that exact same cell.
+        const command = try std.fmt.allocPrint(a, ":e {s}\r", .{other});
+        defer a.free(command);
+        try sess.send(command);
+        try gridWaitFor(&sess, &grid, "OTHER_BUFFER", 5000);
+        try mouseClickAt(&sess, 39, 2);
+        try sess.send("rD:w\r");
+        try gridWaitFor(&sess, &grid, "written:", 5000);
+        try gutterWaitCell(&sess, &grid, 2, 39, "D");
+        try std.testing.expect(grid.contains("OTHER_BUFFER"));
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+        const saved = try erRead(io, a, name);
+        defer a.free(saved);
+        const expected = try a.dupe(u8, doc.items);
+        defer a.free(expected);
+        expected[0] = 'D';
+        try std.testing.expectEqualStrings(expected, saved);
+        const untouched = try erRead(io, a, other);
+        defer a.free(untouched);
+        try std.testing.expectEqualStrings("OTHER_BUFFER\n", untouched);
+    }
+}
+
+test "gutter: an invisible editor leaf must not hide the visible AI prompt cursor" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "zero.txt", "S\n");
+    const file = try std.fs.path.join(a, &.{ root, "zero.txt" });
+    defer a.free(file);
+    const home = try std.fmt.allocPrint(a, "HOME={s}", .{root});
+    defer a.free(home);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, file }, &.{home}, 24, 40, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 40);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    // A seventh split creates a zero-width neighbor. Ctrl-w h chooses it
+    // at the same column (geometric distance zero), then rZ proves dispatch.
+    try sess.send(":vs\r:vs\r:vs\r:vs\r:vs\r:vs\r:vs\r\x17hrZ");
+    try gridWaitFor(&sess, &grid, "Z", 5000);
+    const source_z = aiFindCellFrom(&grid, "Z", 0).?;
+    try std.testing.expectEqual(@as(usize, 4), source_z.col);
+    try std.testing.expect(source_z.row >= 2);
+    try gridDrain(&sess, &grid, 200);
+    const before_show = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "\x1b[?25h") orelse 0;
+    const before_hide = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "\x1b[?25l") orelse 0;
+    try std.testing.expect(before_hide > before_show);
+    try sess.send(" aZERO_PROMPT");
+    try gridWaitFor(&sess, &grid, "ZERO_PROMPT", 5000);
+    try gridDrain(&sess, &grid, 200);
+    const shown = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "\x1b[?25h") orelse 0;
+    const hidden = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "\x1b[?25l") orelse 0;
+    try std.testing.expect(shown > hidden);
+}
+
+test "file tree safety: explicitly created hidden entries stay visible across refresh" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [160]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/oz_navhidden_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "edit.txt", "ORIGINAL_DOCUMENT\n");
+    try writeTestFile(io, root, ".unrequested", "KEEP_HIDDEN\n");
+    const path = try std.fs.path.join(a, &.{ root, "edit.txt" });
+    defer a.free(path);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, null, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "ORIGINAL_DOCUMENT", 8000);
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "Files", 8000);
+    try std.testing.expect(!grid.contains(".unrequested"));
+    // Starting on a regular file captures its parent, then selects the
+    // explicitly created dotfile despite the default hidden-entry filter.
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    try sess.send(".gitignore\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    try gridWaitFor(&sess, &grid, ".gitignore", 8000);
+    try std.testing.expect(rowContains(&grid, grid.row, ".gitignore"));
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    try sess.send("normal.txt\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    try gridWaitFor(&sess, &grid, "normal.txt", 8000);
+    try std.testing.expect(grid.contains(".gitignore"));
+    try std.testing.expect(!grid.contains(".unrequested"));
+    // Hidden directories are selected too, so the next `a` creates inside
+    // them rather than silently creating a sibling in the wrong directory.
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    try sess.send(".config/\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    try gridWaitFor(&sess, &grid, ".config", 8000);
+    try std.testing.expect(rowContains(&grid, grid.row, ".config"));
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    try sess.send(".nested\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    try gridWaitFor(&sess, &grid, ".nested", 8000);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    try sess.send("after.txt\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    try gridWaitFor(&sess, &grid, "after.txt", 8000);
+    try std.testing.expect(grid.contains(".nested"));
+    // Refresh the ancestor too: revealed hidden subtrees keep their open
+    // state and descendants, not just their top-level directory name.
+    try sess.send("G");
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    try sess.send("root-next.txt\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    try gridWaitFor(&sess, &grid, "root-next.txt", 8000);
+    try std.testing.expect(grid.contains(".nested"));
+    try std.testing.expect(!grid.contains(".unrequested"));
+    const ignore = try std.fs.path.join(a, &.{ root, ".gitignore" });
+    defer a.free(ignore);
+    try std.Io.Dir.cwd().deleteFile(io, ignore);
+    try sess.send("a");
+    try gridWaitFor(&sess, &grid, "New file / directory", 8000);
+    try sess.send("refresh.txt\r");
+    try gridWaitGone(&sess, &grid, "New file / directory", 8000);
+    try gridWaitFor(&sess, &grid, "refresh.txt", 8000);
+    try gridWaitGone(&sess, &grid, ".gitignore", 8000);
+    try std.testing.expect(grid.contains(".nested"));
+    const code = try sess.commandAndWaitExit(":wq\r");
+    try std.testing.expectEqual(@as(u32, 0), code);
+    const saved = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024));
+    defer a.free(saved);
+    try std.testing.expectEqualStrings("ORIGINAL_DOCUMENT\n", saved);
+    const nested = try std.fs.path.join(a, &.{ root, ".config", ".nested" });
+    defer a.free(nested);
+    _ = try std.Io.Dir.cwd().statFile(io, nested, .{});
+    const after = try std.fs.path.join(a, &.{ root, ".config", "after.txt" });
+    defer a.free(after);
+    _ = try std.Io.Dir.cwd().statFile(io, after, .{});
 }
