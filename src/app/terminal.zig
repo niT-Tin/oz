@@ -142,10 +142,9 @@ pub fn toggleTerm(self: *App, layout: term.Layout) !void {
     const shell = self.env_map.get("SHELL") orelse "/bin/sh";
     const t = term.Terminal.create(self.io, self.alloc, &.{shell}, self.env_map, .{
         .winsize = .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 },
-        // vaxis's scrollback is a TODO (its copyTo can't render it);
-        // 0 keeps the back screen the same size as the front so line
-        // scrolling works
-        .scrollback_size = 0,
+        // Bounded primary-screen history rendered by the terminal viewport
+        // (wheel / Shift+PageUp&Dn); the visible back screen stays rows tall.
+        .scrollback_size = term.scrollback_lines,
         .initial_working_directory = self.termCwd(),
     }) catch |e| {
         const m = std.fmt.allocPrint(self.alloc, "terminal: {s}", .{@errorName(e)}) catch return;
@@ -178,6 +177,22 @@ pub fn handleTerminalKey(self: *App, key: vaxis.Key) !void {
         tp.focused = false;
         return;
     }
+    // Shift+PageUp/Down are local terminal-history shortcuts: they never go
+    // to the child as input. PageUp/PageDown without Shift still belong to
+    // the program/shell.
+    if (key.mods.shift) {
+        switch (key.codepoint) {
+            vaxis.Key.page_up => {
+                _ = tp.t.scrollPageUp();
+                return;
+            },
+            vaxis.Key.page_down => {
+                _ = tp.t.scrollPageDown();
+                return;
+            },
+            else => {},
+        }
+    }
     if (key.mods.alt) {
         switch (key.codepoint) {
             'r' => return self.toggleTerm(.floating),
@@ -203,10 +218,7 @@ pub fn launchLazygit(self: *App) void {
         }
         const t = term.Terminal.create(self.io, self.alloc, &.{"lazygit"}, self.env_map, .{
             .winsize = .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 },
-            // vaxis's scrollback is a TODO (its copyTo can't render it);
-            // 0 keeps the back screen the same size as the front so line
-            // scrolling works
-            .scrollback_size = 0,
+            .scrollback_size = term.scrollback_lines,
             .initial_working_directory = self.termCwd(),
         }) catch |e| {
             const m = std.fmt.allocPrint(self.alloc, "lazygit: {s}", .{@errorName(e)}) catch return;
