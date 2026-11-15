@@ -8937,6 +8937,19 @@ test "e2e: yy/dd/p/P linewise register matches nvim (lines below/above, cursor o
         }
     };
 
+    const Check = struct {
+        fn row(g: *Grid, r: usize, source_col: usize, number: []const u8, source: []const u8) !void {
+            try std.testing.expectEqualStrings(number, frame.cellText(g, r, 0));
+            for (source, 0..) |byte, i| try std.testing.expectEqual(byte, g.cell(r, source_col + i)[0]);
+            // Preserve indentation and exact EOL, without making the
+            // editing oracle depend on the chrome's number/sign spacing.
+            for (source_col + source.len..g.cols) |col| {
+                const cell = frame.cellText(g, r, col);
+                try std.testing.expect(cell.len == 0 or std.mem.eql(u8, cell, " "));
+            }
+        }
+    };
+
     try std.testing.expect(try Wait.until(&sess, &grid, "NORMAL"));
 
     // yy p: the yanked line goes BELOW the cursor line as a whole line
@@ -8944,10 +8957,10 @@ test "e2e: yy/dd/p/P linewise register matches nvim (lines below/above, cursor o
     // Buffer: abc / abc / bbb / ccc / ddd; cursor lands on the pasted line.
     try sess.send("yyp");
     try std.testing.expect(try Wait.until(&sess, &grid, "line 2/6"));
-    // rowText keeps the bg-padded trailing spaces — trim before comparing
-    try std.testing.expectEqualStrings("1 abc", std.mem.trim(u8, grid.rowText(2), " "));
-    try std.testing.expectEqualStrings("2 abc", std.mem.trim(u8, grid.rowText(3), " "));
-    try std.testing.expectEqualStrings("1   bbb", std.mem.trim(u8, grid.rowText(4), " "));
+    const source_col = aiCellIndexOf(&grid, 2, "abc").?;
+    try Check.row(&grid, 2, source_col, "1", "abc");
+    try Check.row(&grid, 3, source_col, "2", "abc");
+    try Check.row(&grid, 4, source_col, "1", "  bbb");
 
     // one u undoes the whole paste (single undo group). The cursor stays at
     // the change site, so wait for the restored line count, then gg home
@@ -8960,8 +8973,8 @@ test "e2e: yy/dd/p/P linewise register matches nvim (lines below/above, cursor o
     // non-blank of the pasted line (col 2), like nvim
     try sess.send("jyyP");
     try std.testing.expect(try Wait.until(&sess, &grid, "line 2/6 col 2"));
-    try std.testing.expectEqualStrings("2   bbb", std.mem.trim(u8, grid.rowText(3), " "));
-    try std.testing.expectEqualStrings("1   bbb", std.mem.trim(u8, grid.rowText(4), " "));
+    try Check.row(&grid, 3, source_col, "2", "  bbb");
+    try Check.row(&grid, 4, source_col, "1", "  bbb");
 
     // u, then dd p: dd fills the register LINEWISE (vim unnamed register),
     // p puts the cut line below the next one — abc moves under bbb
@@ -8971,9 +8984,9 @@ test "e2e: yy/dd/p/P linewise register matches nvim (lines below/above, cursor o
     try std.testing.expect(try Wait.until(&sess, &grid, "line 1/5"));
     try sess.send("ddp");
     try std.testing.expect(try Wait.until(&sess, &grid, "line 2/5"));
-    try std.testing.expectEqualStrings("1   bbb", std.mem.trim(u8, grid.rowText(2), " "));
-    try std.testing.expectEqualStrings("2 abc", std.mem.trim(u8, grid.rowText(3), " "));
-    try std.testing.expectEqualStrings("1 ccc", std.mem.trim(u8, grid.rowText(4), " "));
+    try Check.row(&grid, 2, source_col, "1", "  bbb");
+    try Check.row(&grid, 3, source_col, "2", "abc");
+    try Check.row(&grid, 4, source_col, "1", "ccc");
 
     // save and verify the exact bytes
     const exit_code = try sess.commandAndWaitExit(":wq\r");
@@ -10930,12 +10943,9 @@ test "lsp: jk exit re-syncs the phantom 'j' removal (no stale diagnostic)" {
             waited += 200;
             if (waited >= 8000) break;
         }
-        var r: usize = 0;
-        while (r < grid.rows) : (r += 1) {
-            const g = grid.buf[(r * grid.cols + 1) * 4 ..][0..3];
-            if (g[0] == 0xEF and g[1] == 0x91 and g[2] == 0xA7) {
-                phantom_seen = true;
-                break;
+        if (aiFindCell(&grid, "\u{f467}")) |mark| {
+            if (aiFindCell(&grid, "jconst a")) |source_cell| {
+                phantom_seen = mark.row == source_cell.row;
             }
         }
     }
@@ -10961,15 +10971,8 @@ test "lsp: jk exit re-syncs the phantom 'j' removal (no stale diagnostic)" {
             waited += 200;
             if (waited >= 8000) break;
         }
-        var r: usize = 0;
-        phantom_gone = true;
-        while (r < grid.rows) : (r += 1) {
-            const g = grid.buf[(r * grid.cols + 1) * 4 ..][0..3];
-            if (g[0] == 0xEF and g[1] == 0x91 and g[2] == 0xA7) {
-                phantom_gone = false;
-                break;
-            }
-        }
+        phantom_gone = aiFindCell(&grid, "\u{f467}") == null and
+            grid.contains("NORMAL") and !grid.contains("jconst a");
     }
     if (!phantom_gone) {
         std.debug.print("phantom j diagnostic stayed after jk exit:\n", .{});
@@ -25077,7 +25080,9 @@ test "regression wrap: inserted tail and cursor stay together past row and viewp
     defer a.free(prefix);
     @memset(prefix, 'x');
     try sess.send(prefix);
-    try gridWaitFor(&sess, &grid, "col 78", 5000);
+    var boundary_buf: [32]u8 = undefined;
+    const boundary = try std.fmt.bufPrint(&boundary_buf, "col {d}", .{cw});
+    try gridWaitFor(&sess, &grid, boundary, 5000);
     try std.testing.expectEqual(first_row + 1, grid.row);
     try std.testing.expectEqual(gutter, grid.col);
     try sess.send("TAIL");
@@ -25094,7 +25099,7 @@ test "regression wrap: inserted tail and cursor stay together past row and viewp
     try std.testing.expect(grid.row < grid.rows - 1);
     try std.testing.expect(rowContains(&grid, grid.row, "END"));
     try sess.send("\x1b");
-    std.Io.sleep(io, .fromMilliseconds(100), .real) catch {};
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 5000);
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
     const saved = try absFileText(io, a, path);
     defer a.free(saved);
