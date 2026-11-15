@@ -124,12 +124,12 @@ pub fn plan(o: Options) Plan {
     if (available < o.min_doc_width + 2) return out;
     const doc_w = @min(want_w + 2, available);
     const pair_w = menu_w + doc_w;
-    out.menu.col = std.math.clamp(o.cursor_col, o.pane.col, o.pane.right() - pair_w);
     var avail_rows = o.pane.bottom() -| menu_row;
     // When a bottom-edge menu flips above the caret, a tall right panel must
     // not extend back down over the caret after the pair shifts left.
     if (menu_row < o.cursor_row) avail_rows = @min(avail_rows, o.cursor_row - menu_row);
     if (avail_rows < 3) return out;
+    out.menu.col = std.math.clamp(o.cursor_col, o.pane.col, o.pane.right() - pair_w);
     const rows = @min(doc_rows, avail_rows - 2);
     out.doc = .{ .row = menu_row, .col = out.menu.right(), .width = doc_w, .height = rows + 2 };
     out.side = .right;
@@ -260,6 +260,32 @@ test "completion layout: tiny and split panes keep every border and the caret in
                         try std.testing.expect(caret < p.doc.row or caret >= p.doc.bottom() or column < p.doc.col or column >= p.doc.right());
                         try std.testing.expectEqual(p.doc.height - 2, p.doc_visible_rows);
                     }
+                }
+            }
+        }
+    }
+}
+
+test "completion layout: short menu-only fallbacks keep the standalone clamp" {
+    const t = std.testing;
+    for ([_]u32{ 40, 50, 80, 120 }) |width| {
+        for (1..10) |height| {
+            const r = Rect{ .row = 3, .col = 7, .width = width, .height = @intCast(height) };
+            for (0..height) |offset| {
+                for ([_]u32{ 20, 74 }) |menu_width| {
+                    const o = Options{
+                        .pane = r,
+                        .cursor_row = r.row + @as(u32, @intCast(offset)),
+                        .cursor_col = r.right() - 1,
+                        .menu_width = menu_width,
+                        .menu_rows = 8,
+                        .doc_total_rows = 40,
+                    };
+                    const pair = plan(o);
+                    if (pair.side != .none) continue;
+                    var menu_only = o;
+                    menu_only.doc_total_rows = 0;
+                    try t.expectEqualDeep(plan(menu_only).menu, pair.menu);
                 }
             }
         }
