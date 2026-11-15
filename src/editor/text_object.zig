@@ -18,14 +18,16 @@
 //!   between two words). `aw` includes trailing blanks up to the end of the
 //!   line, never the '\n' itself; vim's `aw` on blanks includes the blanks
 //!   BEFORE the word.
-//! - Brackets: the search is "nearest opener to the left, then match forward;
-//!   fall back to nearest closer to the right, then match backward", per the
-//!   contract, plus a vim-compatibility refinement for a closer under the
-//!   cursor. Vim's backward search finds the innermost ENCLOSING opener
-//!   (e.g. "(a(b)c)" with the cursor between the inner ')' and the outer ')'
-//!   selects the outer pair), and does nothing when the cursor sits outside a
-//!   pair; M0 always pairs the nearest opener/closer it finds. Only brackets
-//!   of the requested kind affect the nesting depth (vim's 'smartmatch').
+//! - Brackets: the innermost matched pair that CONTAINS the cursor wins
+//!   (vim behavior: "(a(b)c)" with the cursor between the inner ')' and the
+//!   outer ')' selects the outer pair), and a bracket under the cursor pairs
+//!   with itself. An opener whose closer is already behind the cursor is
+//!   skipped — selecting it would act on text that does not span the cursor.
+//!   When the cursor sits outside every pair, the M0 fallback still pairs
+//!   the nearest opener to the left (matched forward) or, failing that, the
+//!   nearest closer to the right (matched backward); vim does nothing there.
+//!   Only brackets of the requested kind affect the nesting depth (vim's
+//!   'smartmatch').
 //! - Quotes: pairs are confined to one line (vim's quote objects are too) and
 //!   escaped quotes are not treated specially (vim skips quotes escaped with
 //!   the 'quoteescape' char). `a'` includes only the quotes; vim's `a'` also
@@ -216,37 +218,68 @@ fn wordRangeCount(pt: *const PieceTable, include: bool, pos_in: u32, count: u32)
 
 // ----------------------------- bracket objects ------------------------------
 
-/// i(/a( etc. Search order (contract + vim-compat refinement):
-///   1. A bracket under the cursor wins: an opener is matched forward, a
-///      closer backward. Matching the closer itself (rather than scanning past
-///      it for an opener) is a vim-compatibility refinement: without it the
-///      outer ')' of "((a))" would pair with the inner '(' and select the
-///      inner pair, while vim pairs the closer with its own opener.
-///   2. Otherwise the nearest opener to the left is matched forward with
-///      nesting depth (same kind only).
-///   3. If no opener is found, the nearest closer to the right is matched
-///      backward.
-/// No pair: {pos, pos}. Different bracket kinds never affect each other's
-/// depth. M0 deviation from vim: vim's backward search picks the innermost
-/// ENCLOSING opener ("(a(b)c)" with the cursor between the inner ')' and the
-/// outer ')' selects the outer pair) and fails when the cursor is outside any
-/// pair ("ab(cd)ef" with the cursor after it); M0 takes the nearest opener or
-/// closer it can find instead.
+/// A matched opener/closer pair, in document byte offsets.
+const Pair = struct { open: u32, close: u32 };
+
+/// The innermost matched `open`/`close` pair that CONTAINS `pos`, or null.
+///   1. A bracket under the cursor pairs with itself (an opener is matched
+///      forward, a closer backward). This is a vim-compatibility refinement:
+///      without it the outer ')' of "((a))" would pair with the inner '('.
+///   2. Otherwise the nearest opener to the LEFT whose forward match closes
+///      AFTER the cursor. A closer before the cursor means that pair is
+///      already behind it and cannot contain it, so the walk continues to
+///      the enclosing opener (issue #17: the space before the outer ')' in
+///      "for (args...()) |arg| {" must select `for (...)`, not the closed
+///      `.next(` pair). Walking from nearest to farthest makes the first hit
+///      the innermost enclosing pair.
+/// Different bracket kinds never affect each other's depth.
+fn enclosingPair(pt: *const PieceTable, open: u8, close: u8, pos: u32) ?Pair {
+    const len = pt.len();
+    if (pos < len) {
+        const b = pt.byteAt(pos);
+        if (b == close) {
+            if (backwardMatch(pt, pos, open, close)) |o| return .{ .open = o, .close = pos };
+        } else if (b == open) {
+            if (forwardMatch(pt, pos, open, close)) |c| return .{ .open = pos, .close = c };
+        }
+    }
+    // Discard pairs already closed to the left in one backwards pass.
+    // Re-running forwardMatch for every unmatched opener makes an incomplete
+    // buffer of N opening brackets quadratic while the user is still typing.
+    var depth: u32 = 0;
+    var p = pos;
+    while (p > 0) {
+        p -= 1;
+        const b = pt.byteAt(p);
+        if (b == close) {
+            depth += 1;
+        } else if (b == open) {
+            if (depth > 0) {
+                depth -= 1;
+            } else {
+                // This is the nearest opener not already closed before the
+                // cursor. If it cannot close, no outer opener can close either.
+                const c = forwardMatch(pt, p, open, close) orelse return null;
+                return .{ .open = p, .close = c };
+            }
+        }
+    }
+    return null;
+}
+
+/// i(/a( etc. The enclosing pair (see `enclosingPair`) wins; when the cursor
+/// is outside every pair the historical M0 fallback still applies: nearest
+/// opener to the left matched forward, else nearest closer to the right
+/// matched backward. No pair: {pos, pos}.
 fn bracketRange(pt: *const PieceTable, open: u8, close: u8, include: bool, pos_in: u32) Range {
     const len = pt.len();
     const pos = @min(pos_in, len);
     const empty = Range{ .start = pos, .end = pos };
 
-    if (pos < len) {
-        const b = pt.byteAt(pos);
-        if (b == close) {
-            if (backwardMatch(pt, pos, open, close)) |o| return pairResult(o, pos, include);
-        } else if (b == open) {
-            if (forwardMatch(pt, pos, open, close)) |c| return pairResult(pos, c, include);
-        }
-    }
+    if (enclosingPair(pt, open, close, pos)) |pair| return pairResult(pair.open, pair.close, include);
 
-    // Nearest opener to the left; match it forward.
+    // No pair CONTAINS the cursor (vim would fail here; M0 keeps pairing the
+    // nearest opener/closer it can find).
     var p = pos;
     while (p > 0) {
         p -= 1;
@@ -255,8 +288,6 @@ fn bracketRange(pt: *const PieceTable, open: u8, close: u8, include: bool, pos_i
             return pairResult(p, c, include);
         }
     }
-
-    // No opener on the left: nearest closer to the right; match it backward.
     var q = pos;
     while (q < len) : (q += 1) {
         if (pt.byteAt(q) == close) {
@@ -268,40 +299,32 @@ fn bracketRange(pt: *const PieceTable, open: u8, close: u8, include: bool, pos_i
 }
 
 /// i(/a( etc. with a vim count: the `count`-th nesting level enclosing the
-/// cursor (1 = the innermost pair, exactly like `range`). Each further level
-/// is the nearest opener before the current pair whose match ENDS after the
-/// current pair's closer — i.e. the pair enclosing it. When no enclosing
-/// pair exists (or the object cannot be resolved), the innermost result is
-/// returned.
+/// cursor (1 = the innermost containing pair, exactly like `range`). Each
+/// further level is the nearest opener before the current pair whose match
+/// ENDS after the current pair's closer — i.e. the pair enclosing it. When no
+/// enclosing pair exists (or the object cannot be resolved), the innermost
+/// result is returned. The walk starts from a real containing pair, never
+/// from a closed empty pair that does not span the cursor.
 fn bracketRangeCount(pt: *const PieceTable, open: u8, close: u8, include: bool, pos_in: u32, count: u32) Range {
     const pos = @min(pos_in, pt.len());
-    const inner = bracketRange(pt, open, close, false, pos); // inner pair, delimiters stripped
-    if (count <= 1 or inner.start == inner.end) return bracketRange(pt, open, close, include, pos);
-    var o = inner.start -| 1; // the inner pair's opener
-    var c = inner.end; // the inner pair's closer
+    if (count <= 1) return bracketRange(pt, open, close, include, pos);
+    var pair = enclosingPair(pt, open, close, pos) orelse return bracketRange(pt, open, close, include, pos);
     var i: u32 = 1;
     while (i < count) : (i += 1) {
-        var p = o;
-        var found = false;
+        var found: ?Pair = null;
+        var p = pair.open;
         while (p > 0) {
             p -= 1;
-            if (pt.byteAt(p) == open) {
-                if (forwardMatch(pt, p, open, close)) |c2| {
-                    if (c2 > c) { // encloses the current pair
-                        o = p;
-                        c = c2;
-                        found = true;
-                        break;
-                    }
-                }
+            if (pt.byteAt(p) != open) continue;
+            const c = forwardMatch(pt, p, open, close) orelse continue;
+            if (c > pair.close) { // encloses the current pair
+                found = .{ .open = p, .close = c };
+                break;
             }
         }
-        if (!found) break; // no more enclosing pairs
+        pair = found orelse break; // no more enclosing pairs: clamp
     }
-    return if (include)
-        .{ .start = o, .end = c + 1 }
-    else
-        .{ .start = o + 1, .end = c };
+    return pairResult(pair.open, pair.close, include);
 }
 
 /// Nesting-aware scan right from an opener for its matching closer. Only
@@ -549,10 +572,11 @@ test "brackets: nested pairs across every cursor position" {
     // cursor on the inner ')': closer under the cursor matches backward
     try expectRange(&pt, .inner_paren, 4, 3, 4, "b");
     try expectRange(&pt, .around_paren, 4, 2, 5, "(b)");
-    // cursor on 'c' (between inner ')' and outer ')'): the contract's
-    // left-nearest-opener rule picks the inner pair; vim would pick the outer
-    // (its backward search finds the innermost ENCLOSING opener) -- M0 note.
-    try expectRange(&pt, .inner_paren, 5, 3, 4, "b");
+    // cursor on 'c' (between inner ')' and outer ')'): the closed inner pair
+    // does not contain the cursor, so the enclosing pair wins (vim behavior,
+    // fixed in #17; this was the old M0 left-nearest-opener deviation).
+    try expectRange(&pt, .inner_paren, 5, 1, 6, "a(b)c");
+    try expectRange(&pt, .around_paren, 5, 0, 7, "(a(b)c)");
     // cursor on the outer '(' / ')' : the whole block
     try expectRange(&pt, .inner_paren, 0, 1, 6, "a(b)c");
     try expectRange(&pt, .around_paren, 0, 0, 7, "(a(b)c)");
@@ -631,6 +655,69 @@ test "brackets: all four kinds, mismatched kinds, nesting across kinds" {
     try expectRange(&pt5, .around_brace, 2, 2, 4, "{}");
     try expectRange(&pt5, .inner_paren, 2, 1, 5, "[{}]");
     try expectRange(&pt5, .around_paren, 2, 0, 6, "([{}])");
+}
+
+test "brackets: the innermost pair CONTAINING the cursor wins (#17)" {
+    // Issue #17: "for (args.iterate().next() != null ) |arg| {" with the
+    // cursor on the space before the OUTER ')' (byte 34). The nearest opener
+    // to the left is `.next(` (24) whose closer (25) is already behind the
+    // cursor; selecting that empty pair made di( a no-op. The innermost pair
+    // that actually contains the cursor is the `for (...)` pair (4,35).
+    const line = "for (args.iterate().next() != null ) |arg| {";
+    var pt = try PieceTable.init(testing.allocator, line);
+    defer pt.deinit();
+    const outer_inner = "args.iterate().next() != null ";
+    try expectRange(&pt, .inner_paren, 34, 5, 35, outer_inner); // space before outer )
+    try expectRange(&pt, .around_paren, 34, 4, 36, "(args.iterate().next() != null )");
+    try expectRange(&pt, .inner_paren, 26, 5, 35, outer_inner); // space after .next()
+    try expectRange(&pt, .inner_paren, 29, 5, 35, outer_inner); // space before !=
+    try expectRange(&pt, .inner_paren, 6, 5, 35, outer_inner); // "args" (outside inner pairs)
+    try expectRange(&pt, .inner_paren, 19, 5, 35, outer_inner); // between .iterate() and .next()
+    // Cursor ON a bracket still pairs that bracket (existing refinement).
+    try expectRange(&pt, .inner_paren, 18, 18, 18, ""); // ) of iterate() -> empty inner
+    try expectRange(&pt, .inner_paren, 25, 25, 25, ""); // ) of next()
+    try expectRange(&pt, .inner_paren, 17, 18, 18, ""); // ( of iterate() -> empty inner
+    try expectRange(&pt, .inner_paren, 24, 25, 25, ""); // ( of next() -> empty inner
+
+    // "(a(b)c)" cursor on 'c' (byte 5): the closed inner pair (2,4) does not
+    // contain the cursor, so the enclosing pair must win (vim behavior; the
+    // old M0 note asserted the inner pair here).
+    var pt2 = try PieceTable.init(testing.allocator, "(a(b)c)");
+    defer pt2.deinit();
+    try expectRange(&pt2, .inner_paren, 5, 1, 6, "a(b)c");
+    try expectRange(&pt2, .around_paren, 5, 0, 7, "(a(b)c)");
+
+    // Empty inner pairs are skipped the same way: "f(a(), b)" cursor on the
+    // space before the outer ')' (byte 6) -> outer content "a(), b".
+    var pt3 = try PieceTable.init(testing.allocator, "f(a(), b)");
+    defer pt3.deinit();
+    try expectRange(&pt3, .inner_paren, 6, 2, 8, "a(), b");
+    try expectRange(&pt3, .around_paren, 6, 1, 9, "(a(), b)");
+    // count=2 from the empty inner pair climbs outward instead of clamping
+    // to the empty range (vim d2i( on the second level).
+    try testing.expectEqual(Range{ .start = 2, .end = 8 }, range(&pt3, .inner_paren, 4, 2));
+    try testing.expectEqual(Range{ .start = 1, .end = 9 }, range(&pt3, .around_paren, 4, 2));
+
+    // [] and {} use the same containment rule.
+    var brackets = try PieceTable.init(testing.allocator, "a [b [c] d] e");
+    defer brackets.deinit();
+    try expectRange(&brackets, .inner_bracket, 8, 3, 10, "b [c] d"); // space before outer ]
+    var braces = try PieceTable.init(testing.allocator, "{a {b} c}");
+    defer braces.deinit();
+    try expectRange(&braces, .inner_brace, 7, 1, 8, "a {b} c"); // space before outer }
+
+    // CRLF/multiline content stays byte-exact.
+    var crlf = try PieceTable.init(testing.allocator, "(x\r\n y\r\n)");
+    defer crlf.deinit();
+    try expectRange(&crlf, .inner_paren, 5, 1, 8, "x\r\n y\r\n");
+    try expectRange(&crlf, .around_paren, 5, 0, 9, "(x\r\n y\r\n)");
+
+    // Outside every pair the historical M0 fallback (nearest opener/closer)
+    // still runs: this fix only prefers a pair that CONTAINS the cursor.
+    var outside = try PieceTable.init(testing.allocator, "ab(cd)ef");
+    defer outside.deinit();
+    try expectRange(&outside, .inner_paren, 0, 3, 5, "cd"); // nearest closer right
+    try expectRange(&outside, .inner_paren, 7, 3, 5, "cd"); // nearest opener left
 }
 
 test "brackets: unbalanced and missing partners" {
@@ -833,4 +920,19 @@ test "count: 2i( acts on the second nesting level; count past nesting clamps" {
     r = range(&pt, .around_paren, 12, 2);
     try testing.expectEqual(@as(u32, 5), r.start);
     try testing.expectEqual(@as(u32, 15), r.end);
+}
+
+test "brackets: unmatched opening brackets stay bounded" {
+    const a = std.testing.allocator;
+    const n = 40000;
+    const input = try a.alloc(u8, n + 1);
+    defer a.free(input);
+    @memset(input[0..n], '(');
+    input[n] = 'x';
+    var pt = try PieceTable.init(a, input);
+    defer pt.deinit();
+    const deadline = std.Io.Clock.awake.now(testing.io).addDuration(.fromSeconds(2));
+    const selected = range(&pt, .inner_paren, n, 1);
+    try testing.expect(std.Io.Clock.awake.now(testing.io).compare(.lt, deadline));
+    try testing.expectEqual(Range{ .start = n, .end = n }, selected);
 }
