@@ -57,9 +57,10 @@
 //!      reader holds the lock it draws the stale front screen), then writes
 //!      every front_screen cell into `win` (writeCell clips silently — win must
 //!      be at least the terminal size) and finally sets the cursor shape and
-//!      position via win (shell cursor). It does NOT manage scrollback: the
-//!      widget never changes `scroll_offset` (0 by default); to view scrollback
-//!      the app sets `term.inner.scroll_offset` under back_mutex and draw()s.
+//!      position via win (shell cursor). When the primary history viewport is
+//!      scrolled up (`scroll_offset > 0`) it copies the composed
+//!      history+screen viewport instead (Screen.copyViewportTo) and hides the
+//!      live cursor; at offset 0 it resumes follow mode and shows it.
 //!    - `dirty` is set by the reader when it pushes `.redraw` and cleared after
 //!      a successful copyTo. draw() is cheap when nothing changed — call it
 //!      every frame or at least on `.redraw` events.
@@ -104,11 +105,14 @@
 //!    call every frame with the terminal's OWN rect size (from layoutRect), not
 //!    the full screen size.
 //!
-//! 7. Options — scrollback_size (u16, default 500): extra rows in the primary
-//!    back screen above the visible area; the widget never scrolls it itself.
-//!    initial_working_directory: MUST be absolute (error.InvalidWorkingDirectory
-//!    otherwise); null → child inherits the cwd at spawn() time. winsize: the
-//!    pty's initial size — set rows/cols from the layout rect before spawn.
+//! 7. Options — scrollback_size (u16, default 500): capacity of the bounded
+//!    primary-screen local history. Rows that scroll off the top of a
+//!    full-screen region are retained (cells are moved, evicted rows freed);
+//!    the visible back screen stays exactly `winsize.rows` tall. The alternate
+//!    screen never retains history. initial_working_directory: MUST be
+//!    absolute (error.InvalidWorkingDirectory otherwise); null → child
+//!    inherits the cwd at spawn() time. winsize: the pty's initial size — set
+//!    rows/cols from the layout rect before spawn.
 //!
 //! 8. Command — argv/env: fork + setsid + TIOCSCTTY + dup2(0,1,2) + chdir +
 //!    execvpe(argv[0]). argv[0] is exec'd directly (no shell wrapper). env is
@@ -254,6 +258,11 @@ pub fn toggleAction(has_session: bool, visible: bool, focused: bool, same_layout
 /// called from the main thread; `pollEvent` must be drained every frame (see
 /// module notes). `inner` is exposed for advanced use (e.g. scrollback via
 /// `inner.scroll_offset` under `inner.back_mutex`).
+/// Bounded primary-screen scrollback retained by the embedded terminal.
+/// 500 rows is the vaxis default; eviction frees the oldest rows' cells, so
+/// memory stays bounded by (rows × width) cells + their graphemes.
+pub const scrollback_lines: u16 = 500;
+
 /// Platforms with a working PTY backend (vaxis widgets/terminal). Linux was
 /// the first; macOS joined via the posix_openpt path in patches/vaxis-Pty.zig.
 pub const supported = switch (builtin.os.tag) {
@@ -381,6 +390,28 @@ pub const Terminal = if (supported) struct {
     pub fn draw(self: *Terminal, win: vaxis.Window) !void {
         try self.inner.draw(self.allocator, win);
     }
+
+    /// Scroll the local primary-screen history by `n` rows (negative =
+    /// toward the bottom). No-op on the alternate screen, with empty
+    /// history, or when the program owns mouse reporting (wheel path only).
+    pub fn scrollUp(self: *Terminal, n: usize) bool {
+        return self.inner.scrollUp(n);
+    }
+    pub fn scrollDown(self: *Terminal, n: usize) bool {
+        return self.inner.scrollDown(n);
+    }
+    pub fn wheelUp(self: *Terminal, n: usize) bool {
+        return self.inner.wheelUp(n);
+    }
+    pub fn wheelDown(self: *Terminal, n: usize) bool {
+        return self.inner.wheelDown(n);
+    }
+    pub fn scrollPageUp(self: *Terminal) bool {
+        return self.inner.scrollPageUp();
+    }
+    pub fn scrollPageDown(self: *Terminal) bool {
+        return self.inner.scrollPageDown();
+    }
 } else struct {
     // Unsupported-platform stub: keeps this module compileable everywhere
     // (tests.zig runs refAllDecls); every call fails at runtime with
@@ -428,6 +459,34 @@ pub const Terminal = if (supported) struct {
         _ = self;
         _ = win;
         return error.UnsupportedPlatform;
+    }
+    pub fn scrollUp(self: *Terminal, n: usize) bool {
+        _ = self;
+        _ = n;
+        return false;
+    }
+    pub fn scrollDown(self: *Terminal, n: usize) bool {
+        _ = self;
+        _ = n;
+        return false;
+    }
+    pub fn wheelUp(self: *Terminal, n: usize) bool {
+        _ = self;
+        _ = n;
+        return false;
+    }
+    pub fn wheelDown(self: *Terminal, n: usize) bool {
+        _ = self;
+        _ = n;
+        return false;
+    }
+    pub fn scrollPageUp(self: *Terminal) bool {
+        _ = self;
+        return false;
+    }
+    pub fn scrollPageDown(self: *Terminal) bool {
+        _ = self;
+        return false;
     }
 };
 
@@ -533,4 +592,140 @@ test "toggleAction: lifecycle is separate from visibility/focus/layout" {
     // Another layout always moves the one session and refocuses it.
     try testing.expectEqual(ToggleAction.relayout, toggleAction(true, true, true, false));
     try testing.expectEqual(ToggleAction.relayout, toggleAction(true, true, false, false));
+}
+
+fn screenPrintText(s: *vaxis.widgets.Terminal.Screen, text: []const u8) !void {
+    for (text) |b| try s.print(&[_]u8{b}, 1, true);
+}
+
+fn screenRowString(s: *vaxis.widgets.Terminal.Screen, row: usize, out: []u8) []const u8 {
+    var w: usize = 0;
+    var col: usize = 0;
+    while (col < s.width and w < out.len) {
+        const cell = s.buf[row * s.width + col];
+        const n = @min(cell.char.items.len, out.len - w);
+        @memcpy(out[w..][0..n], cell.char.items[0..n]);
+        w += n;
+        col += @max(cell.width, 1);
+    }
+    return out[0..w];
+}
+
+test "terminal screen scrollback: bounded ring, viewport and styles" {
+    const Screen = vaxis.widgets.Terminal.Screen;
+    const alloc = testing.allocator;
+
+    var scr = try Screen.initWithHistory(alloc, 8, 3, 4);
+    defer scr.deinit(alloc);
+    // Screen.init leaves the cursor's OSC 8 link slices undefined; the app
+    // adapter resets them after create/resize and so must this test.
+    scr.cursor.uri = .empty;
+    scr.cursor.uri_id = .empty;
+
+    var n: usize = 0;
+    while (n < 8) : (n += 1) {
+        if (n == 4) {
+            // Wide CJK glyph + an RGB style must survive the move into
+            // history and the deep copy back into a viewport.
+            scr.cursor.style.fg = .{ .rgb = .{ 0x12, 0x34, 0x56 } };
+            try scr.print("第", 2, true);
+            scr.cursor.style = .{};
+            try screenPrintText(&scr, "4");
+        } else {
+            var line_buf: [8]u8 = undefined;
+            try screenPrintText(&scr, try std.fmt.bufPrint(&line_buf, "L{d}", .{n}));
+        }
+        scr.cursor.col = 0;
+        scr.cursor.pending_wrap = false;
+        try scr.index();
+    }
+
+    // 8 lines in a 3-row screen: 5 scrolled off, the ring keeps the last 4.
+    try testing.expectEqual(@as(usize, 4), scr.historyCount());
+
+    var front = try Screen.init(alloc, 8, 3);
+    defer front.deinit(alloc);
+    var row_buf: [16]u8 = undefined;
+
+    // Follow mode: the live screen after the last index() is L6/L7/blank.
+    try scr.copyViewportTo(alloc, &front, 0);
+    try testing.expectEqualStrings("L6", std.mem.trimEnd(u8, screenRowString(&front, 0, &row_buf), " "));
+    try testing.expectEqualStrings("L7", std.mem.trimEnd(u8, screenRowString(&front, 1, &row_buf), " "));
+
+    // Two rows back: the oldest retained row is L2 (L0/L1 were evicted), so
+    // the viewport is L4 (the colored wide line), L5, L6.
+    try scr.copyViewportTo(alloc, &front, 2);
+    try testing.expectEqualStrings("第4", std.mem.trimEnd(u8, screenRowString(&front, 0, &row_buf), " "));
+    try testing.expectEqualStrings("L5", std.mem.trimEnd(u8, screenRowString(&front, 1, &row_buf), " "));
+    try testing.expectEqualStrings("L6", std.mem.trimEnd(u8, screenRowString(&front, 2, &row_buf), " "));
+    try testing.expectEqualStrings("第", front.buf[0 * front.width].char.items);
+    try testing.expectEqual(@as(u8, 2), front.buf[0 * front.width].width);
+    try testing.expectEqual(vaxis.Color{ .rgb = .{ 0x12, 0x34, 0x56 } }, front.buf[0 * front.width].style.fg);
+
+    // Oldest retained row; offset is clamped to the retained count.
+    try scr.copyViewportTo(alloc, &front, 4);
+    try testing.expectEqualStrings("L2", std.mem.trimEnd(u8, screenRowString(&front, 0, &row_buf), " "));
+    try scr.copyViewportTo(alloc, &front, 999);
+    try testing.expectEqualStrings("L2", std.mem.trimEnd(u8, screenRowString(&front, 0, &row_buf), " "));
+
+    // Keep pushing: the ring stays bounded and evicts oldest-first
+    // (16 lines -> history L10..L13, live L14/L15/blank).
+    while (n < 16) : (n += 1) {
+        var line_buf: [8]u8 = undefined;
+        try screenPrintText(&scr, try std.fmt.bufPrint(&line_buf, "L{d}", .{n}));
+        scr.cursor.col = 0;
+        scr.cursor.pending_wrap = false;
+        try scr.index();
+    }
+    try testing.expectEqual(@as(usize, 4), scr.historyCount());
+    try scr.copyViewportTo(alloc, &front, 4);
+    try testing.expectEqualStrings("L10", std.mem.trimEnd(u8, screenRowString(&front, 0, &row_buf), " "));
+
+    // ED3-style clear frees the ring and returns the viewport to follow mode.
+    scr.clearScrollback();
+    try testing.expectEqual(@as(usize, 0), scr.historyCount());
+    try scr.copyViewportTo(alloc, &front, 4);
+    try testing.expectEqualStrings("L14", std.mem.trimEnd(u8, screenRowString(&front, 0, &row_buf), " "));
+}
+
+test "terminal scrollback adversarial: deleting a live row is not history" {
+    var scr = try vaxis.widgets.Terminal.Screen.initWithHistory(testing.allocator, 12, 4, 5);
+    defer scr.deinit(testing.allocator);
+    for ([_][]const u8{ "KEEP_TOP", "DELETE_ME", "KEEP_MID", "KEEP_LAST" }, 0..) |line, row| {
+        scr.cursor.row = @intCast(row);
+        scr.cursor.col = 0;
+        try screenPrintText(&scr, line);
+    }
+    scr.cursor.row = 1;
+    scr.cursor.col = 0;
+    try scr.deleteLine(1);
+    // DL is an in-place edit, not output scrolling off the viewport.
+    try testing.expectEqual(@as(usize, 0), scr.historyCount());
+    var buf: [80]u8 = undefined;
+    try testing.expectEqualStrings("KEEP_TOP", std.mem.trimEnd(u8, screenRowString(&scr, 0, &buf), " "));
+    try testing.expectEqualStrings("KEEP_MID", std.mem.trimEnd(u8, screenRowString(&scr, 1, &buf), " "));
+    try testing.expectEqualStrings("KEEP_LAST", std.mem.trimEnd(u8, screenRowString(&scr, 2, &buf), " "));
+}
+
+test "terminal scrollback adversarial: only full-screen scrolling retains rows" {
+    var scr = try vaxis.widgets.Terminal.Screen.initWithHistory(testing.allocator, 12, 4, 5);
+    defer scr.deinit(testing.allocator);
+    for ([_][]const u8{ "ROW_ZERO", "ROW_ONE", "ROW_TWO", "ROW_THREE" }, 0..) |line, row| {
+        scr.cursor.row = @intCast(row);
+        scr.cursor.col = 0;
+        try screenPrintText(&scr, line);
+    }
+    scr.cursor.row = 2;
+    scr.cursor.col = 3;
+    try scr.scrollUp(2);
+    try testing.expectEqual(@as(usize, 2), scr.historyCount());
+    try testing.expectEqual(@as(u16, 2), scr.cursor.row);
+    try testing.expectEqual(@as(u16, 3), scr.cursor.col);
+    var buf: [80]u8 = undefined;
+    try testing.expectEqualStrings("ROW_TWO", std.mem.trimEnd(u8, screenRowString(&scr, 0, &buf), " "));
+    scr.scrolling_region = .{ .top = 1, .bottom = 3, .left = 0, .right = 11 };
+    scr.cursor.row = 3;
+    try scr.index();
+    // A subregion must not add the application's interior rows to history.
+    try testing.expectEqual(@as(usize, 2), scr.historyCount());
 }

@@ -15206,6 +15206,324 @@ test "terminal: frame bounds the inner PTY across layouts at 80 and 40 columns" 
     try std.testing.expectEqual(@as(u32, 0), exit40);
 }
 
+// ---- issue #19: terminal scrollback / mouse-wheel history viewport ----
+
+/// Copy a reconstructed grid row into `out` (Grid.rowText reuses one scratch
+/// buffer, so baselines must be copied before the next read).
+fn termCopyRow(grid: *Grid, row: usize, out: []u8) []const u8 {
+    const text = grid.rowText(row);
+    const n = @min(text.len, out.len);
+    @memcpy(out[0..n], text[0..n]);
+    return out[0..n];
+}
+
+fn termRowIs(grid: *Grid, row: usize, before: []const u8) bool {
+    return std.mem.eql(u8, grid.rowText(row), before);
+}
+
+/// The embedded session is spawned at 24x80 and only resized to the floating
+/// rect on the app's first draw. That resize re-initializes the screen and
+/// drops the local history, so child output produced before it can be wiped
+/// between the child writing it and the app's first float draw. Wait until
+/// the child observes a winsize other than the spawn size and only then emit
+/// the fixture output: TERM_READY is produced after that point, so seeing it
+/// proves the resize happened and that a post-resize frame was rendered.
+/// (Without this the scrollback fixture can be cleared before the test looks
+/// at it; the shell also records its final size in $FLOAT.)
+fn termAwaitFloatLayout(sess: *Session, grid: *Grid) !void {
+    try sess.send("while [ \"$(stty size)\" = '24 80' ]; do sleep 0.05; done; FLOAT=$(stty size); printf 'TERM_%s\\n' READY\r");
+    try gridWaitFor(sess, grid, "TERM_READY", 10000);
+}
+
+/// Fill a file with `count` numbered lines ("EDIT_<n>") and return it via the
+/// caller's ArrayList.
+fn termWriteNumberedFixture(io: Io, alloc: std.mem.Allocator, dir: []const u8, name: []const u8, count: usize) !void {
+    var text = std.ArrayList(u8).empty;
+    defer text.deinit(alloc);
+    var n: usize = 1;
+    var line_buf: [64]u8 = undefined;
+    while (n <= count) : (n += 1) {
+        try text.appendSlice(alloc, try std.fmt.bufPrint(&line_buf, "EDIT_LINE_{d}\n", .{n}));
+    }
+    try writeTestFile(io, dir, name, text.items);
+}
+
+test "terminal: wheel and Shift+PageUp/Down scroll history without moving the editor" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var dir_buf: [160]u8 = undefined;
+    const root = try std.fmt.bufPrint(&dir_buf, "/tmp/oz_termscroll_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDir(io, root, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try termWriteNumberedFixture(io, alloc, root, "scroll.txt", 60);
+    const path = try std.fmt.allocPrint(alloc, "{s}/scroll.txt", .{root});
+    defer alloc.free(path);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, null, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "EDIT_LINE_1", 5000);
+    try sess.send(":50\r");
+    try gridWaitFor(&sess, &grid, "L50:C0", 8000);
+
+    try sess.send("\x1br");
+    try termAwaitFloatLayout(&sess, &grid);
+    try sess.send("i=0; while [ $i -lt 100 ]; do printf 'HIST_%03d\\n' \"$i\"; i=$((i+1)); done\r");
+    try gridWaitFor(&sess, &grid, "HIST_099", 20000);
+    // Keep this independent of #18 reserving two rows for the terminal frame.
+    try std.testing.expect(grid.contains("HIST_098"));
+
+    // Baseline AFTER the terminal owns focus: the status bar legitimately
+    // drops its split separator for terminal focus, and scrolling must not
+    // change it further.
+    var base_row2: [512]u8 = undefined;
+    var base_status: [512]u8 = undefined;
+    const row2 = termCopyRow(&grid, 2, &base_row2);
+    const status = termCopyRow(&grid, 23, &base_status);
+
+    // Wheel up over the terminal shows older output; the editor rows and the
+    // status line must not move.
+    var k: usize = 0;
+    while (k < 3) : (k += 1) try mouseWheelAt(&sess, 20, 10, -1);
+    try gridWaitFor(&sess, &grid, "HIST_085", 8000);
+    try std.testing.expect(!grid.contains("HIST_099"));
+    try std.testing.expect(termRowIs(&grid, 2, row2));
+    if (!termRowIs(&grid, 23, status)) {
+        std.debug.print("status before=[{s}] after=[{s}]\n", .{ status, grid.rowText(23) });
+    }
+    try std.testing.expect(termRowIs(&grid, 23, status));
+
+    // Wheel down returns to the bottom and resumes follow/cursor.
+    k = 0;
+    while (k < 3) : (k += 1) try mouseWheelAt(&sess, 20, 10, 1);
+    try gridWaitFor(&sess, &grid, "HIST_099", 8000);
+
+    // Shift+PageUp/Down are local terminal shortcuts even while the child
+    // owns the keyboard (they must not be forwarded as shell input).
+    try sess.send("\x1b[5;2~");
+    try gridWaitFor(&sess, &grid, "HIST_085", 8000);
+    try std.testing.expect(!grid.contains("HIST_099"));
+    try std.testing.expect(termRowIs(&grid, 2, row2));
+    try std.testing.expect(termRowIs(&grid, 23, status));
+    try sess.send("\x1b[6;2~");
+    try gridWaitFor(&sess, &grid, "HIST_099", 8000);
+
+    // A click outside the terminal returns focus to the editor (deterministic
+    // frame sync without a sleep); "gg" then proves editor input is active.
+    try mouseClickAt(&sess, 10, 3);
+    try sess.send("gg");
+    try gridWaitFor(&sess, &grid, "L1:C0", 8000);
+
+    var base2_row2: [512]u8 = undefined;
+    var base2_status: [512]u8 = undefined;
+    const row2_b = termCopyRow(&grid, 2, &base2_row2);
+    const status_b = termCopyRow(&grid, 23, &base2_status);
+
+    // Pointer-over-terminal scrolling works without keyboard focus too, and
+    // still must never scroll the background editor.
+    k = 0;
+    while (k < 3) : (k += 1) try mouseWheelAt(&sess, 20, 10, -1);
+    try gridWaitFor(&sess, &grid, "HIST_085", 8000);
+    try std.testing.expect(!grid.contains("HIST_099"));
+    try std.testing.expect(termRowIs(&grid, 2, row2_b));
+    try std.testing.expect(termRowIs(&grid, 23, status_b));
+    k = 0;
+    while (k < 3) : (k += 1) try mouseWheelAt(&sess, 20, 10, 1);
+    try gridWaitFor(&sess, &grid, "HIST_099", 8000);
+
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+
+    // Scrolling history must not have touched the file bytes.
+    const f = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try alloc.alloc(u8, @intCast(size));
+    defer alloc.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    try std.testing.expect(std.mem.startsWith(u8, buf, "EDIT_LINE_1\n"));
+    try std.testing.expect(std.mem.endsWith(u8, buf, "EDIT_LINE_60\n"));
+}
+
+test "terminal: history across alt-screen, mouse reporting, clear and resize" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var dir_buf: [160]u8 = undefined;
+    const root = try std.fmt.bufPrint(&dir_buf, "/tmp/oz_terraces_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDir(io, root, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try termWriteNumberedFixture(io, alloc, root, "races.txt", 60);
+    const path = try std.fmt.allocPrint(alloc, "{s}/races.txt", .{root});
+    defer alloc.free(path);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, null, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "EDIT_LINE_1", 5000);
+
+    try sess.send("\x1br");
+    try termAwaitFloatLayout(&sess, &grid);
+    try sess.send("i=0; while [ $i -lt 60 ]; do printf 'HIST_%03d\\n' \"$i\"; i=$((i+1)); done\r");
+    try gridWaitFor(&sess, &grid, "HIST_059", 20000);
+
+    var base_row2: [512]u8 = undefined;
+    var base_status: [512]u8 = undefined;
+    const row2 = termCopyRow(&grid, 2, &base_row2);
+    const status = termCopyRow(&grid, 23, &base_status);
+    try sess.send("\x1b[5;2~");
+    try gridWaitFor(&sess, &grid, "HIST_045", 8000);
+    try sess.send("\x1b[6;2~");
+    try gridWaitFor(&sess, &grid, "HIST_059", 8000);
+
+    // Alternate screen + program mouse reporting: the child owns the screen.
+    // Wheel/page keys must not reveal primary scrollback or leak to the
+    // editor; ALT_MARK survives every scroll attempt.
+    try sess.send("printf '\\033[?1049h'; printf 'ALT_MARK\\n'; printf '\\033[?1000h\\033[?1006h'\r");
+    try gridWaitFor(&sess, &grid, "ALT_MARK", 8000);
+    var k: usize = 0;
+    while (k < 3) : (k += 1) try mouseWheelAt(&sess, 20, 10, -1);
+    try sess.send("\x1b[5;2~");
+    try gridSettle(&sess, &grid, 150, 3000);
+    try std.testing.expect(grid.contains("ALT_MARK"));
+    try std.testing.expect(!grid.contains("HIST_0"));
+    try std.testing.expect(termRowIs(&grid, 23, status));
+
+    // Leaving the alternate screen restores the primary scrollback.
+    try sess.send("printf '\\033[?1000l\\033[?1006l'; printf '\\033[?1049l'\r");
+    try gridWaitFor(&sess, &grid, "HIST_059", 8000);
+    try sess.send("\x1b[5;2~");
+    try gridWaitFor(&sess, &grid, "HIST_045", 8000);
+    try sess.send("\x1b[6;2~");
+
+    // ED2 clears the visible screen but keeps saved lines...
+    try sess.send("printf '\\033[2J\\033[H'\r");
+    try gridSettle(&sess, &grid, 150, 3000);
+    try sess.send("\x1b[5;2~");
+    try gridWaitFor(&sess, &grid, "HIST_045", 8000);
+    try sess.send("\x1b[6;2~");
+    try gridSettle(&sess, &grid, 150, 3000);
+
+    // ...ED3 (erase saved lines) clears the scrollback itself.
+    try sess.send("printf '\\033[3J'\r");
+    try gridSettle(&sess, &grid, 150, 3000);
+    try sess.send("\x1b[5;2~");
+    try gridSettle(&sess, &grid, 150, 3000);
+    try std.testing.expect(!grid.contains("HIST_045"));
+
+    // A resize (layout switch) resets the width-dependent saved rows; a
+    // scroll attempt afterwards must not resurrect them.
+    try sess.send("i=0; while [ $i -lt 30 ]; do printf 'HIST2_%03d\\n' \"$i\"; i=$((i+1)); done\r");
+    try gridWaitFor(&sess, &grid, "HIST2_029", 20000);
+    try sess.send("\x1b[5;2~");
+    try gridWaitFor(&sess, &grid, "HIST2_015", 8000);
+    try sess.send("\x1bw");
+    // The layout switch resizes the pty (floating 12x64 -> bottom 8x80) and
+    // that resize clears the child screen and the local history. A fixed
+    // sleep is not a barrier (the switch's draw can land after it under
+    // load), so wait until the child observes a winsize distinct from the
+    // floating one before printing the marker: RESIZED_MARK then cannot be
+    // wiped by a later draw.
+    try sess.send("while [ \"$(stty size)\" = \"$FLOAT\" ]; do sleep 0.05; done; printf 'RESIZED_MARK\\n'\r");
+    try gridWaitFor(&sess, &grid, "RESIZED_MARK", 10000);
+    try sess.send("\x1b[5;2~");
+    try gridSettle(&sess, &grid, 150, 3000);
+    try std.testing.expect(!grid.contains("HIST2_015"));
+    try std.testing.expect(!grid.contains("HIST2_029"));
+
+    try mouseClickAt(&sess, 10, 3);
+    try sess.send("gg");
+    try gridWaitFor(&sess, &grid, "L1:C0", 8000);
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+    try std.testing.expect(termRowIs(&grid, 2, row2));
+}
+
+test "terminal: scrollback is bounded and preserves CJK, emoji and ANSI colors" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var dir_buf: [160]u8 = undefined;
+    const root = try std.fmt.bufPrint(&dir_buf, "/tmp/oz_termbound_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDir(io, root, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try termWriteNumberedFixture(io, alloc, root, "bound.txt", 60);
+    const path = try std.fmt.allocPrint(alloc, "{s}/bound.txt", .{root});
+    defer alloc.free(path);
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, null, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 80);
+    defer grid.deinit(alloc);
+
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, "EDIT_LINE_1", 5000);
+
+    try sess.send("\x1br");
+    try termAwaitFloatLayout(&sess, &grid);
+    // 600 numbered lines, then one true-color CJK+emoji line, then 20 more
+    // lines so the wide/colored line is only reachable through scrollback.
+    try sess.send("i=0; while [ $i -lt 600 ]; do printf 'HIST_%03d\\n' \"$i\"; i=$((i+1)); done\r");
+    try gridWaitFor(&sess, &grid, "HIST_599", 30000);
+    try sess.send("printf '\\033[38;2;18;52;86m第三行 😀\\033[0m\\n'\r");
+    try gridWaitFor(&sess, &grid, "第三行", 8000);
+    try sess.send("i=600; while [ $i -lt 620 ]; do printf 'HIST_%03d\\n' \"$i\"; i=$((i+1)); done\r");
+    try gridWaitFor(&sess, &grid, "HIST_619", 20000);
+
+    var base_row2: [512]u8 = undefined;
+    var base_status: [512]u8 = undefined;
+    const row2 = termCopyRow(&grid, 2, &base_row2);
+    const status = termCopyRow(&grid, 23, &base_status);
+
+    // Walk the wheel up until the saved colored line enters the viewport; the
+    // cell style and the wide glyphs must have survived the history copy.
+    // (Shell prompt/command-echo lines also scroll, so the exact offset is
+    // environment-dependent; one wheel event is 3 rows and each step waits
+    // for its frame.)
+    var k: usize = 0;
+    while (!grid.contains("第三行") and k < 60) : (k += 1) {
+        try mouseWheelAt(&sess, 20, 10, -1);
+        try gridSettle(&sess, &grid, 40, 1500);
+    }
+    try gridWaitFor(&sess, &grid, "第三行", 4000);
+    try std.testing.expect(grid.contains("😀"));
+    try std.testing.expect(grid.containsFg("第三行", packRgb(0x12, 0x34, 0x56)));
+    try std.testing.expect(termRowIs(&grid, 2, row2));
+    try std.testing.expect(termRowIs(&grid, 23, status));
+
+    // Scroll to the oldest retained row. The ring caps at 500 rows: the
+    // viewport lands on HIST_1xx lines, never the original HIST_0xx rows
+    // (which an unbounded history would still show at the top).
+    var page_up: [6 * 80]u8 = undefined;
+    var off: usize = 0;
+    while (off + 6 <= page_up.len) : (off += 6) @memcpy(page_up[off .. off + 6], "\x1b[5;2~");
+    try sess.send(page_up[0..off]);
+    try gridWaitFor(&sess, &grid, "HIST_1", 12000);
+    try gridSettle(&sess, &grid, 200, 4000);
+    try std.testing.expect(!grid.contains("HIST_0"));
+    try std.testing.expect(!grid.contains("HIST_100"));
+    try std.testing.expect(!grid.contains("第三行"));
+
+    try mouseClickAt(&sess, 10, 3);
+    try sess.send("gg");
+    try gridWaitFor(&sess, &grid, "L1:C0", 8000);
+    const exit_code = try sess.commandAndWaitExit(":q!\r");
+    try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
 // ================= workspace e2e (M5) =================
 //
 // Shared feed-loop helpers for the workspace tests below (same shape as the
@@ -26308,6 +26626,19 @@ fn waitBarrierMarker(io: Io, a: std.mem.Allocator, root: []const u8, name: []con
     return error.TestUnexpectedResult;
 }
 
+/// Barrier for the held-signature subcases below: the LSP barrier fires as
+/// soon as the app sends the request, which can be before the app has
+/// rendered the Insert frame for the "A(" that triggered it. Without this
+/// wait the grid can still show the stale `[NORMAL]` from before "A(", so
+/// the post-Escape `gridWaitFor("[NORMAL]")` returns immediately. The
+/// following `:` then arrives while Escape is still unconsumed and vaxis
+/// parses the pair as Alt+`:` -- the app stays in Insert and the command is
+/// typed into the buffer (the CI failure typed `:e other.zig` into the
+/// document). Seeing the Insert frame first makes the Normal wait meaningful.
+fn awaitInsertFrame(sess: *Session, grid: *Grid) !void {
+    try gridWaitFor(sess, grid, "[INSERT]", 3000);
+}
+
 test "signature lifecycle: stale signature is gone before the new completion" {
     const io = std.testing.io;
     const a = std.testing.allocator;
@@ -26415,6 +26746,7 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("x");
         try releaseSignatureA(io, fx.root);
         try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
@@ -26433,6 +26765,7 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("\x1b");
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try releaseSignatureA(io, fx.root);
@@ -26451,6 +26784,7 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("\x1b");
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try fx.sess.send(":e other.zig\r");
@@ -26470,6 +26804,7 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try sendMouseButton(&fx.sess, 8, 4, 0, false);
         try sendMouseButton(&fx.sess, 8, 4, 0, true);
         try gridDrain(&fx.sess, &grid, 200);
@@ -26477,7 +26812,11 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
         try gridDrain(&fx.sess, &grid, 300);
         try std.testing.expect(!grid.contains("SIG_A"));
-        try fx.sess.send("\x1b");
+        // The click itself finalizes the Insert session
+        // (prepareMouseAction exits insert), so the visible [NORMAL] frame is
+        // the click's barrier. Sending a redundant Escape here would race the
+        // following ':' and pair with it as Alt+':' if the app has not
+        // consumed it yet, leaving the quit command untyped.
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
     }
@@ -26490,6 +26829,7 @@ test "signature lifecycle: delayed response after typing, escape, buffer and mou
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("\x1b");
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try fx.sess.send(":vs\r");
@@ -26762,6 +27102,7 @@ test "signature lifecycle: delayed response released in the same Insert context"
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
         try fx.sess.send("A(");
         try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try awaitInsertFrame(&fx.sess, &grid);
         try fx.sess.send("\x1b");
         try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
         try fx.sess.send("i");
