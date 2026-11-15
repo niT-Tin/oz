@@ -29340,3 +29340,52 @@ test "file tree safety: creation works in an empty compact dashboard" {
     const code = try sess.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), code);
 }
+
+
+test "integration repair: Normal o and undo preserve closed folds and inlay anchors" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const source = "fn folded() {\n    hidden();\n}\nfn empty() {}\n";
+    var name_buf: [192:0]u8 = undefined;
+    const name = try erFixture(io, &name_buf, ".zig", source);
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    const oz = try erAbs(io, a, oz_exe_path);
+    defer a.free(oz);
+    const mock = try erAbs(io, a, "zig-out/bin/mock_lsp");
+    defer a.free(mock);
+    const env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{mock});
+    defer a.free(env);
+    // Only the first hint request is answered: undo cannot pass by waiting
+    // for a later LSP response to repair a stale local hint transform.
+    var sess = try Session.spawnEnvSize(io, &.{ oz, name }, &.{ env, "OZ_MOCK_SCRIPT=inlay_eol" }, 26, 120);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 26, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, ": eol", 8000);
+    try sess.send("za");
+    try gridWaitFor(&sess, &grid, "1 lines", 4000);
+    try sess.send("jjf{oX");
+    try gridWaitFor(&sess, &grid, "[INSERT]", 4000);
+    try gridWaitFor(&sess, &grid, "L5:C5", 4000);
+    try std.testing.expect(!grid.contains("hidden"));
+    const header = findRow(&grid, "fn empty() {") orelse return error.MissingEmptyHeader;
+    try std.testing.expect(!rowContains(&grid, header, ": eol"));
+    try std.testing.expect(rowContains(&grid, header + 2, "}: eol"));
+    try sess.send("\x03");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "fn empty() {}: eol", 4000);
+    try std.testing.expect(!grid.contains("hidden"));
+    try std.testing.expect(grid.contains("1 lines"));
+    try sess.send("\x12");
+    try gridWaitGone(&sess, &grid, "fn empty() {}", 4000);
+    const restored = findRow(&grid, "fn empty() {") orelse return error.MissingRedoHeader;
+    try std.testing.expect(rowContains(&grid, restored + 2, "}: eol"));
+    try std.testing.expect(grid.contains("1 lines"));
+    try std.testing.expect(!grid.contains("hidden"));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try erRead(io, a, name);
+    defer a.free(saved);
+    try std.testing.expectEqualStrings("fn folded() {\n    hidden();\n}\nfn empty() {\n    X\n}\n", saved);
+}
