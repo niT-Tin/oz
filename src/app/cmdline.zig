@@ -274,7 +274,10 @@ pub fn execCommand(self: *App, cmd: editor.ex_command.Command) !void {
         .buffer_delete => self.closeCurrentBuffer(),
         .buffer_delete_force => @import("buffers.zig").closeCurrentBufferForce(self, true),
         .buffer_list => try self.listBuffers(),
-        .noh => try self.setMsg(try self.alloc.dupe(u8, "")),
+        .noh => {
+            self.search_hl_active = false;
+            try self.setMsg(try self.alloc.dupe(u8, ""));
+        },
         .help => try self.openKeymapPicker(),
         .goto_line => |ln| {
             // :<number> — vim: 1-based, clamped to the last line (:0
@@ -308,7 +311,7 @@ pub fn execTheme(self: *App, name: []const u8) !void {
         try self.setMsg(try std.fmt.allocPrint(self.alloc, "unknown theme: {s} (see :theme)", .{name}));
         return;
     };
-    self.theme = t;
+    self.theme = theme.withItalics(t, self.italics_enabled);
     self.saveTheme() catch {};
     try self.setMsg(try std.fmt.allocPrint(self.alloc, "theme: {s}", .{t.name}));
 }
@@ -328,7 +331,7 @@ pub fn loadTheme(self: *App) !void {
     const n: usize = @intCast(size);
     _ = try file.readPositionalAll(self.io, content[0..n], 0);
     const name = std.mem.trim(u8, content[0..n], " \t\r\n");
-    if (theme.byName(name)) |t| self.theme = t;
+    if (theme.byName(name)) |t| self.theme = theme.withItalics(t, self.italics_enabled);
 }
 
 /// Persist the active theme to ~/.cache/oz/theme (next to recent files).

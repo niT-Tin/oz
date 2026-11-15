@@ -401,3 +401,49 @@ pub fn expectRegionPainted(grid: anytype, rect: Rect) !void {
         }
     }
 }
+
+/// SGR 1 / 2 / 3 state of one cell (the pty harness records them).
+pub fn cellBold(grid: anytype, row: usize, col: usize) bool {
+    if (row >= grid.rows or col >= grid.cols) return false;
+    return grid.bold_buf[row * grid.cols + col];
+}
+
+pub fn cellDim(grid: anytype, row: usize, col: usize) bool {
+    if (row >= grid.rows or col >= grid.cols) return false;
+    return grid.dim_buf[row * grid.cols + col];
+}
+
+pub fn cellItalic(grid: anytype, row: usize, col: usize) bool {
+    if (row >= grid.rows or col >= grid.cols) return false;
+    return grid.italic_buf[row * grid.cols + col];
+}
+
+pub fn expectCellItalic(grid: anytype, row: usize, col: usize, want: bool) !void {
+    const got = cellItalic(grid, row, col);
+    if (got != want) {
+        std.debug.print("cell italic mismatch at ({d},{d}): expected {any}, got {any} (text \"{s}\")\n", .{
+            row, col, want, got, cellText(grid, row, col),
+        });
+        return error.TestUnexpectedResult;
+    }
+}
+
+pub fn expectCellBold(grid: anytype, row: usize, col: usize, want: bool) !void {
+    const got = cellBold(grid, row, col);
+    if (got != want) {
+        std.debug.print("cell bold mismatch at ({d},{d}): expected {any}, got {any} (text \"{s}\")\n", .{
+            row, col, want, got, cellText(grid, row, col),
+        });
+        return error.TestUnexpectedResult;
+    }
+}
+
+pub fn expectCellDim(grid: anytype, row: usize, col: usize, want: bool) !void {
+    const got = cellDim(grid, row, col);
+    if (got != want) {
+        std.debug.print("cell dim mismatch at ({d},{d}): expected {any}, got {any} (text \"{s}\")\n", .{
+            row, col, want, got, cellText(grid, row, col),
+        });
+        return error.TestUnexpectedResult;
+    }
+}

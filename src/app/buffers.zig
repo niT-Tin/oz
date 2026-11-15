@@ -363,6 +363,8 @@ pub fn contentHash(self: *App) u64 {
 /// the first Enter on the new line show "completion pending…" instead of
 /// inserting a newline).
 pub fn beginInsertSession(self: *App) void {
+    self.insert_session +%= 1;
+    self.invalidatePassiveHints();
     self.closeCompletion();
     self.insert_base_hash = self.contentHash();
     self.insert_was_dirty = self.cur().dirty;

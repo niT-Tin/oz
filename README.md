@@ -33,7 +33,7 @@ A terminal text editor written in Zig.
 
 - Async attach (never blocks startup); works with zls and other common servers (auto-detects mason install paths)
 - Hover (K), goto definition/declaration/references/implementation (gd/gD/gr/gI), signature help (gs)
-- Diagnostics gutter marks + `]d`/`[d` jumps + diagnostics list (`<leader>sd`)
+- Diagnostics gutter marks + current-line severity-colored messages; `gl` opens a wrapped diagnostic float (`Ctrl+f`/`Ctrl+b` scroll, `Esc` closes), with `]d`/`[d` jumps and a diagnostics list (`<leader>sd`)
 - Auto-completion menu + ghost text (`<C-n>`/trigger characters), inlay hints (`<leader>ti`). Esc leaves Insert and closes the menu in one press; `<C-e>` only hides the menu and keeps Insert.
 - Rename (`<leader>rn`), format (`<leader>lf`), document outline (`<leader>o`)
 

@@ -33,7 +33,7 @@
 
 - 异步接入（不阻塞启动），支持 zls 等常见 server（自动探测 mason 安装路径）
 - hover（K）、定义/声明/引用/实现跳转（gd/gD/gr/gI）、signature help（gs）
-- 诊断 gutter 标记 + `]d`/`[d` 跳转 + 诊断列表（`<leader>sd`）
+- 诊断 gutter 标记 + 当前行末按严重级别着色的提示；`gl` 打开自动换行的完整诊断浮窗（`Ctrl+f`/`Ctrl+b` 滚动，`Esc` 关闭），支持 `]d`/`[d` 跳转和诊断列表（`<leader>sd`）
 - 自动补全菜单 + ghost text（`<C-n>`/触发字符）、inlay hints（`<leader>ti`）
 - 重命名（`<leader>rn`）、格式化（`<leader>lf`）、文档大纲（`<leader>o`）
 

@@ -647,7 +647,7 @@ pub fn collectCompletionWords(self: *App, keep_sel: bool) !void {
     var k: usize = 0;
     while (k < limit) : (k += 1) {
         const w = try self.alloc.dupe(u8, pairs.items[k].word);
-        try self.completion_words.append(self.alloc, .{ .text = w, .kind = 0 });
+        try self.completion_words.append(self.alloc, .{ .label = w, .kind = 0 });
     }
     if (!keep_sel) self.completion_sel = 0;
 }
@@ -691,7 +691,7 @@ pub fn acceptCompletion(self: *App) !void {
         self.closeCompletion();
         return;
     }
-    const word = self.completion_words.items[self.completion_sel].text;
+    const word = self.completion_words.items[self.completion_sel].insertText();
     const pt = &self.cur().pt;
     const cursor = self.curCursor().*;
     const pos = @min(self.completion_pos, cursor);
@@ -721,6 +721,14 @@ pub fn closeCompletion(self: *App) void {
     self.completion_pos = 0;
     self.completion_manual = false;
     self.completion_waiting_enter = false;
+    // Any in-flight resolve belongs to the closing session; drop the slot so
+    // a late response cannot reopen or mutate the next menu.
+    if (self.completion_resolve_slot) |*v| json_rpc.freeValue(self.alloc, v);
+    self.completion_resolve_slot = null;
+    self.completion_resolve_item_id = 0;
+    self.completion_resolve_session = 0;
+    self.completion_session +%= 1;
+    self.completion_doc_scroll = 0;
 }
 
 /// Enter in insert mode (vim semantics): split the current line at the

@@ -6,6 +6,20 @@
 const std = @import("std");
 const types = @import("types.zig");
 
+/// A versioned publication must describe the text we last sent. Missing/null
+/// versions remain valid: servers such as ZLS publish unversioned diagnostics.
+pub fn matchesVersion(params: std.json.Value, current: ?i32) bool {
+    if (params != .object) return false;
+    const value = params.object.get("version") orelse return true;
+    const version: i32 = switch (value) {
+        .null => return true,
+        .integer => |n| std.math.cast(i32, n) orelse return false,
+        .number_string => |s| std.fmt.parseInt(i32, s, 10) catch return false,
+        else => return false,
+    };
+    return version >= 0 and current != null and version == current.?;
+}
+
 /// Parse `params` into `out`. Only diagnostics whose `uri` equals `uri` are
 /// kept; malformed entries are skipped. `message` is dupe'd (allocator-owned).
 pub fn parseDiagnostics(alloc: std.mem.Allocator, params: std.json.Value, uri: []const u8, out: *std.ArrayList(types.Diagnostic)) !void {
@@ -115,6 +129,28 @@ test "parseDiagnostics: mock hello payload is parsed for the matching uri" {
     try std.testing.expectEqualStrings("mock error", out.items[0].message);
 }
 
+test "diagnostics: publication versions must match current text, unversioned servers remain supported" {
+    const cases = [_]struct { json: []const u8, current: ?i32 = 3, accepted: bool }{
+        .{ .json = "{}", .accepted = true },
+        .{ .json = "{\"version\":null}", .accepted = true },
+        .{ .json = "{\"version\":3}", .accepted = true },
+        .{ .json = "{\"version\":2}", .accepted = false },
+        .{ .json = "{\"version\":4}", .accepted = false },
+        .{ .json = "{\"version\":-1}", .accepted = false },
+        .{ .json = "{\"version\":2147483648}", .accepted = false },
+        .{ .json = "{\"version\":\"3\"}", .accepted = false },
+        .{ .json = "{\"version\":true}", .accepted = false },
+        .{ .json = "{\"version\":3}", .current = null, .accepted = false },
+    };
+    for (cases) |c| {
+        for ([_]bool{ false, true }) |number_strings| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, c.json, .{ .parse_numbers = !number_strings });
+            defer parsed.deinit();
+            try std.testing.expectEqual(c.accepted, matchesVersion(parsed.value, c.current));
+        }
+    }
+}
+
 test "parseDiagnostics: other-file diagnostics are dropped, malformed skipped" {
     const alloc = std.testing.allocator;
     const json =
@@ -147,4 +183,55 @@ test "diagnostics: sortByLine and next/prev helpers" {
     try std.testing.expectEqual(@as(?usize, null), nextAtOrAfter(diags.items, 5));
     try std.testing.expectEqual(@as(?usize, 1), prevAtOrBefore(diags.items, 4));
     try std.testing.expectEqual(@as(?usize, 0), prevAtOrBefore(diags.items, 2));
+}
+
+/// LSP ranges are end-exclusive; a zero-length range still marks its point.
+pub fn coversLine(d: types.Diagnostic, line: u32) bool {
+    if (line < d.range.start.line or line > d.range.end.line) return false;
+    return line == d.range.start.line or line < d.range.end.line or d.range.end.character > 0;
+}
+pub const LineSummary = struct { index: usize, count: usize };
+pub fn lineSummary(diags: []const types.Diagnostic, line: u32) ?LineSummary {
+    var result: ?LineSummary = null;
+    for (diags, 0..) |d, i| {
+        if (!coversLine(d, line)) continue;
+        if (result) |*r| {
+            r.count += 1;
+            if (@backingInt(d.severity) < @backingInt(diags[r.index].severity)) r.index = i;
+        } else result = .{ .index = i, .count = 1 };
+    }
+    return result;
+}
+pub fn severityLabel(s: types.Severity) []const u8 {
+    return switch (s) {
+        .err => "Error",
+        .warning => "Warning",
+        .info => "Info",
+        .hint => "Hint",
+    };
+}
+pub fn severityMark(s: types.Severity) []const u8 {
+    return switch (s) {
+        .err => "E",
+        .warning => "W",
+        .info => "I",
+        .hint => "H",
+    };
+}
+test "diagnostics: current-line summary picks highest severity and respects range ends" {
+    const t = std.testing;
+    const warning = types.Diagnostic{ .range = .{ .start = .{ .line = 1, .character = 0 }, .end = .{ .line = 3, .character = 0 } }, .severity = .warning, .message = @constCast("warning") };
+    var err = warning;
+    err.severity = .err;
+    err.range.start.line = 2;
+    const ds = [_]types.Diagnostic{ warning, err };
+    const summary = lineSummary(&ds, 2).?;
+    try t.expectEqual(@as(usize, 1), summary.index);
+    try t.expectEqual(@as(usize, 2), summary.count);
+    try t.expect(lineSummary(&ds, 3) == null);
+    try t.expect(lineSummary(&ds, 0) == null);
+    err.range.end.character = 1;
+    try t.expect(coversLine(err, 3));
+    err.range.end = err.range.start;
+    try t.expect(coversLine(err, 2));
 }

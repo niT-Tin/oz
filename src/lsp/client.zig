@@ -166,6 +166,9 @@ pub const Client = struct {
     /// member access) — auto-suggest fires on these too, like blink.cmp's
     /// show_on_trigger_character. Owned strings; empty when undeclared.
     completion_triggers: std.ArrayList([]u8) = .empty,
+    /// CompletionProvider.resolveProvider from initialize. Resolve requests
+    /// are only sent when the server actually advertises support.
+    caps_completion_resolve: bool = false,
 
     proc: std.process.Child,
     stdin: std.Io.File,
@@ -420,6 +423,13 @@ pub const Client = struct {
                         // on these too ("b." member access, "::", …)
                         if (caps.object.get("completionProvider")) |cp| {
                             if (cp == .object) {
+                                if (cp.object.get("resolveProvider")) |rp| {
+                                    self.caps_completion_resolve = switch (rp) {
+                                        .bool => |b| b,
+                                        .object => true,
+                                        else => false,
+                                    };
+                                }
                                 if (cp.object.get("triggerCharacters")) |tc| {
                                     if (tc == .array) {
                                         for (tc.array.items) |ch| {
@@ -590,6 +600,17 @@ pub const Client = struct {
         if (inner.object.getPtr("textDocument")) |td| {
             if (td.object.getPtr("inlayHint")) |ih| ih.object.deinit(self.alloc);
             if (td.object.getPtr("publishDiagnostics")) |pd| pd.object.deinit(self.alloc);
+            if (td.object.getPtr("completion")) |comp| {
+                if (comp.object.getPtr("completionItem")) |ci| {
+                    if (ci.object.getPtr("documentationFormat")) |df| df.array.deinit();
+                    if (ci.object.getPtr("resolveSupport")) |rs| {
+                        if (rs.object.getPtr("properties")) |props| props.array.deinit();
+                        rs.object.deinit(self.alloc);
+                    }
+                    ci.object.deinit(self.alloc);
+                }
+                comp.object.deinit(self.alloc);
+            }
             td.object.deinit(self.alloc);
         }
         inner.object.deinit(self.alloc);
@@ -1039,9 +1060,38 @@ pub const Client = struct {
         var diag_cap = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer diag_cap.deinit(self.alloc);
         try diag_cap.put(self.alloc, "relatedInformation", .{ .bool = true });
+        try diag_cap.put(self.alloc, "versionSupport", .{ .bool = true });
         var td_cap = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer td_cap.deinit(self.alloc);
         try td_cap.put(self.alloc, "inlayHint", .{ .object = hint_cap });
+        // Completion capabilities are declared only for what the editor
+        // actually consumes: display labelDetails, both documentation
+        // formats, and resolve of documentation/detail/labelDetails. Snippet
+        // support stays false (the editor has a safe label fallback, not a
+        // snippet engine).
+        var item_cap = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer item_cap.deinit(self.alloc);
+        try item_cap.put(self.alloc, "snippetSupport", .{ .bool = false });
+        try item_cap.put(self.alloc, "labelDetailsSupport", .{ .bool = true });
+        var doc_formats = std.json.Array.init(self.alloc);
+        errdefer doc_formats.deinit();
+        try doc_formats.append(.{ .string = "markdown" });
+        try doc_formats.append(.{ .string = "plaintext" });
+        try item_cap.put(self.alloc, "documentationFormat", .{ .array = doc_formats });
+        var resolve_props = std.json.Array.init(self.alloc);
+        errdefer resolve_props.deinit();
+        try resolve_props.append(.{ .string = "documentation" });
+        try resolve_props.append(.{ .string = "detail" });
+        try resolve_props.append(.{ .string = "labelDetails" });
+        var resolve_cap = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer resolve_cap.deinit(self.alloc);
+        try resolve_cap.put(self.alloc, "properties", .{ .array = resolve_props });
+        try item_cap.put(self.alloc, "resolveSupport", .{ .object = resolve_cap });
+        var completion_cap = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
+        errdefer completion_cap.deinit(self.alloc);
+        try completion_cap.put(self.alloc, "dynamicRegistration", .{ .bool = false });
+        try completion_cap.put(self.alloc, "completionItem", .{ .object = item_cap });
+        try td_cap.put(self.alloc, "completion", .{ .object = completion_cap });
         try td_cap.put(self.alloc, "publishDiagnostics", .{ .object = diag_cap });
         var inner = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
         errdefer inner.deinit(self.alloc);
@@ -1547,6 +1597,17 @@ test "initParams: rootUri/workspaceFolders derive from the document" {
     try std.testing.expectEqual(@as(usize, 1), folders.array.items.len);
     const folder = folders.array.items[0].object;
     try std.testing.expectEqualStrings("file:///", folder.get("uri").?.string);
+
+    // Client capabilities declare only implemented completion features.
+    const td = params.object.get("capabilities").?.object.get("textDocument").?.object;
+    const comp = td.get("completion").?.object;
+    const ci = comp.get("completionItem").?.object;
+    try std.testing.expect(ci.get("labelDetailsSupport").?.bool);
+    try std.testing.expectEqual(@as(usize, 2), ci.get("documentationFormat").?.array.items.len);
+    try std.testing.expectEqualStrings("markdown", ci.get("documentationFormat").?.array.items[0].string);
+    try std.testing.expectEqualStrings("plaintext", ci.get("documentationFormat").?.array.items[1].string);
+    try std.testing.expectEqual(@as(usize, 3), ci.get("resolveSupport").?.object.get("properties").?.array.items.len);
+    try std.testing.expect(!ci.get("snippetSupport").?.bool);
 }
 
 test "reader: server stdout EOF sets server_died (crash detection)" {

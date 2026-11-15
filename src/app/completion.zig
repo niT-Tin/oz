@@ -4,6 +4,7 @@ const std = @import("std");
 const lsp_types = @import("../lsp/types.zig");
 const lsp_nav = @import("../lsp/navigation.zig");
 const json_rpc = @import("../util/json_rpc.zig");
+const theme = @import("../theme.zig");
 
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
@@ -59,6 +60,26 @@ pub fn kindGlyph(kind: u8) []const u8 {
     };
 }
 
+/// Category color for a completion kind. Kept separate from the label row
+/// color so the selected row never paints every icon the same; unknown kinds
+/// get the neutral muted role (never a fabricated type color).
+pub fn kindColor(t: theme.Theme, kind: u8) theme.Rgb {
+    return switch (kind) {
+        2, 3, 4 => t.function, // Method / Function / Constructor
+        7, 8, 13, 22, 25 => t.type, // Class / Interface / Enum / Struct / TypeParameter
+        5, 10, 20 => t.property, // Field / Property / EnumMember
+        6, 12, 18 => t.variable, // Variable / Value / Reference
+        9, 19 => t.namespace, // Module / Folder
+        21 => t.constant,
+        14, 15 => t.keyword, // Keyword / Snippet
+        16 => t.number, // Color
+        17 => t.type, // File
+        23 => t.diag_warn, // Event
+        24 => t.operator,
+        else => t.fg_dim,
+    };
+}
+
 /// Ctrl+n in insert mode with the cursor inside a word: collect keyword
 /// candidates from the whole buffer and open the completion menu. Without
 /// a word prefix the key is swallowed (no candidates, no side effect).
@@ -77,6 +98,7 @@ pub fn startCompletion(self: *App) !void {
     }
     try self.collectCompletionWords(false);
     if (self.completion_words.items.len > 0) {
+        self.invalidatePassiveHints();
         self.completion_active = true;
     }
 }
@@ -95,6 +117,10 @@ pub fn requestLspCompletion(self: *App, c: anytype, no_prefix: bool) !void {
         if (pos == self.curCursor().*) return;
     }
     self.completion_pos = pos;
+    // A request issued while no menu is open belongs to a fresh session;
+    // resolve results from a previous menu must never revive it.
+    if (!self.completion_active and self.completion_slot == null) self.completion_session +%= 1;
+    self.completion_req_buf = self.current;
     const uri = lsp_types.pathToFileUri(self.alloc, self.cur().path orelse return) catch return;
     defer self.alloc.free(uri);
     const line = self.cur().pt.lineOf(self.curCursor().*);
@@ -145,6 +171,7 @@ pub fn maybeAutoComplete(self: *App, text: []const u8) !void {
     const was_active = self.completion_active;
     try self.collectCompletionWords(was_active);
     if (self.completion_words.items.len > 0) {
+        self.invalidatePassiveHints();
         self.completion_active = true;
     }
 }
@@ -164,12 +191,25 @@ pub fn processCompletion(self: *App) bool {
     // The manual request's response is still consumed, so Enter must be
     // unblocked (otherwise it would stay stuck on "completion pending…"
     // forever with no menu to open).
-    if (self.edit_seq != self.completion_req_seq or self.state.mode != .insert) {
+    if (self.edit_seq != self.completion_req_seq or self.state.mode != .insert or
+        self.completion_req_buf != self.current)
+    {
         self.completion_waiting_enter = false;
         return true;
     }
+    // Preserve the SELECTED ITEM, not its old index: a refresh may reorder
+    // the list, and keeping the index silently swaps the documentation.
+    const prev_id: ?u64 = if (self.completion_sel < self.completion_words.items.len)
+        self.completion_words.items[self.completion_sel].item_id
+    else
+        null;
+    const prev_key: ?u64 = if (self.completion_sel < self.completion_words.items.len)
+        self.completion_words.items[self.completion_sel].selection_key
+    else
+        null;
     for (self.completion_words.items) |*it| it.deinit(self.alloc);
     self.completion_words.clearRetainingCapacity();
+    self.completion_generation +%= 1;
     lsp_nav.parseCompletionItems(self.alloc, result, &self.completion_words) catch {};
     // Client-side filter: servers like zls return the FULL candidate set
     // and leave matching to the client (blink/nvim do the same via
@@ -184,7 +224,7 @@ pub fn processCompletion(self: *App) bool {
             const typed = typed_buf[0..typed_len];
             var write: usize = 0;
             for (self.completion_words.items) |*it| {
-                if (containsIgnoreCase(it.text, typed)) {
+                if (containsIgnoreCase(it.filterText(), typed)) {
                     self.completion_words.items[write] = it.*;
                     write += 1;
                 } else {
@@ -195,9 +235,24 @@ pub fn processCompletion(self: *App) bool {
         }
     }
     if (self.completion_words.items.len > 0) {
+        self.invalidatePassiveHints();
         self.completion_active = true;
-        // keep the user's selection when the list refreshed while typing
-        if (self.completion_sel >= self.completion_words.items.len) self.completion_sel = 0;
+        var next_sel: usize = 0;
+        var same_selection = false;
+        if (prev_id) |want| {
+            if (lsp_nav.completionSelection(self.completion_words.items, want, prev_key.?)) |i| {
+                next_sel = i;
+                same_selection = true;
+            }
+        }
+        const selection_changed = !same_selection;
+        self.completion_sel = next_sel;
+        if (selection_changed) {
+            self.completion_doc_scroll = 0;
+        }
+        // Fresh items do not own the previous array's resolved fields. Check
+        // the selected object after EVERY refresh, even at the same index.
+        self.maybeResolveCompletion();
     } else {
         // nothing matches the typed prefix: keep typing clean. A manual
         // Ctrl+n with zero matches gets a status hint — otherwise the
@@ -214,4 +269,180 @@ pub fn processCompletion(self: *App) bool {
     // again (accept if the menu opened, newline otherwise)
     self.completion_waiting_enter = false;
     return true;
+}
+
+/// True when the selected candidate still lacks information that a server
+/// may provide through completionItem/resolve.
+fn needsResolve(item: *const lsp_nav.CompletionItem) bool {
+    return item.doc == null;
+}
+
+/// Ask the server for the selected item's details/docs. Called on selection
+/// changes and list refreshes; existing initial documentation is used as-is
+/// (no pointless resolve request). The request is tagged with the session and
+/// item identity so a late answer cannot attach to another candidate.
+pub fn maybeResolveCompletion(self: *App) void {
+    if (!self.completion_active) return;
+    if (self.completion_sel >= self.completion_words.items.len) return;
+    const c = self.lsp_client orelse return;
+    if (!c.caps_completion_resolve) return;
+    var item = &self.completion_words.items[self.completion_sel];
+    if (!needsResolve(item) or item.resolve_requested) return;
+
+    var arena = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var params = std.json.ObjectMap.init(a, &.{}, &.{}) catch return;
+    params.put(a, "label", .{ .string = item.label }) catch return;
+    if (item.kind != 0) params.put(a, "kind", .{ .integer = item.kind }) catch return;
+    if (item.detail) |d| params.put(a, "detail", .{ .string = d }) catch return;
+    if (item.label_detail != null or item.label_description != null) {
+        var ld = std.json.ObjectMap.init(a, &.{}, &.{}) catch return;
+        if (item.label_detail) |d| ld.put(a, "detail", .{ .string = d }) catch return;
+        if (item.label_description) |d| ld.put(a, "description", .{ .string = d }) catch return;
+        params.put(a, "labelDetails", .{ .object = ld }) catch return;
+    }
+    if (item.data_json) |raw| {
+        var parsed = std.json.parseFromSlice(std.json.Value, a, raw, .{}) catch null;
+        if (parsed) |*p| {
+            params.put(a, "data", p.value) catch return;
+            // The arena owns both copies until the request has been encoded.
+        }
+    }
+    // drain may have filled the old resolve slot in the same batch as a
+    // completion refresh. Never relabel that completed payload with the new
+    // request's generation/index before processCompletionResolve consumes it.
+    if (self.completion_resolve_slot) |*old| json_rpc.freeValue(self.alloc, old);
+    self.completion_resolve_slot = null;
+    item.resolve_requested = true;
+    item.resolve_state = .loading;
+    // A new request replaces the pending slot. The old item must be allowed
+    // to retry if the user comes back; its canceled reply will never arrive.
+    if (self.completion_resolve_generation == self.completion_generation and
+        self.completion_resolve_index != self.completion_sel and
+        self.completion_resolve_index < self.completion_words.items.len)
+    {
+        const previous = &self.completion_words.items[self.completion_resolve_index];
+        if (previous.resolve_state == .loading) {
+            previous.resolve_state = .none;
+            previous.resolve_requested = false;
+        }
+    }
+    self.completion_resolve_item_id = item.item_id;
+    self.completion_resolve_session = self.completion_session;
+    self.completion_resolve_generation = self.completion_generation;
+    self.completion_resolve_index = self.completion_sel;
+    self.completion_resolve_seq = self.edit_seq;
+    self.completion_resolve_buf = self.current;
+    self.completion_resolve_started_ms = self.nowMs();
+    c.request("completionItem/resolve", .{ .object = params }, &self.completion_resolve_slot) catch {
+        item.resolve_state = .failed;
+        self.completion_resolve_item_id = 0;
+    };
+}
+
+/// Consume a completed resolve response (run loop, each frame). Returns true
+/// when a response was consumed so the caller repaints immediately.
+pub fn processCompletionResolve(self: *App) bool {
+    if (self.completion_resolve_slot) |result| {
+        var owned = result;
+        self.completion_resolve_slot = null;
+        defer json_rpc.freeValue(self.alloc, &owned);
+
+        if (!self.completion_active or self.completion_resolve_session != self.completion_session or
+            self.completion_resolve_generation != self.completion_generation or
+            self.completion_resolve_seq != self.edit_seq or self.completion_resolve_buf != self.current)
+        {
+            return true;
+        }
+        if (self.completion_resolve_index >= self.completion_words.items.len) return true;
+        // A reply can populate its original (now unselected) item, never the
+        // item at the current selection. Equal-looking candidates are distinct.
+        var item = &self.completion_words.items[self.completion_resolve_index];
+        if (item.item_id != self.completion_resolve_item_id) return true;
+
+        var resolved = lsp_nav.parseCompletionResolve(self.alloc, owned) catch {
+            item.resolve_state = .failed;
+            return true;
+        };
+        defer resolved.deinit(self.alloc);
+        var any = false;
+        if (resolved.detail) |v| {
+            if (item.detail) |old| self.alloc.free(old);
+            item.detail = v;
+            resolved.detail = null;
+            any = true;
+        }
+        if (resolved.doc) |v| {
+            if (item.doc) |old| self.alloc.free(old);
+            item.doc = v;
+            item.doc_kind = resolved.doc_kind;
+            resolved.doc = null;
+            any = true;
+        }
+        if (resolved.label_detail) |v| {
+            if (item.label_detail) |old| self.alloc.free(old);
+            item.label_detail = v;
+            resolved.label_detail = null;
+            any = true;
+        }
+        if (resolved.label_description) |v| {
+            if (item.label_description) |old| self.alloc.free(old);
+            item.label_description = v;
+            resolved.label_description = null;
+            any = true;
+        }
+        item.resolve_state = if (any) .ready else .empty;
+        if (self.completion_sel == self.completion_resolve_index) self.completion_doc_scroll = 0;
+        return true;
+    }
+
+    // A request that produced no response (error/null/timeout) must not keep
+    // the pane in "loading" forever. It also must not block Enter.
+    if (self.completion_active and self.completion_sel < self.completion_words.items.len) {
+        const item = &self.completion_words.items[self.completion_sel];
+        if (item.resolve_state == .loading and self.nowMs() - self.completion_resolve_started_ms > 3000) {
+            item.resolve_state = .failed;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// True while the selected item is waiting for an asynchronous resolve. The
+/// run loop polls in short slices during this window so the timeout can fire
+/// without a keypress; no LSP request is made just to advance it.
+pub fn completionResolveWaiting(self: *App) bool {
+    if (!self.completion_active or self.completion_sel >= self.completion_words.items.len) return false;
+    return self.completion_words.items[self.completion_sel].resolve_state == .loading;
+}
+
+/// True when the selected candidate has any documentation content to scroll.
+pub fn completionDocsVisible(self: *App) bool {
+    if (self.completion_sel >= self.completion_words.items.len) return false;
+    const it = &self.completion_words.items[self.completion_sel];
+    return (it.doc != null and it.doc.?.len > 0) or (it.detail != null and it.detail.?.len > 0);
+}
+
+/// Move the selection by `delta` (Ctrl+n/Ctrl+p/Up/Down) and refresh the
+/// documentation state. Selection never edits the buffer.
+pub fn moveCompletion(self: *App, delta: isize) void {
+    const n = self.completion_words.items.len;
+    if (n == 0) return;
+    const cur: isize = @intCast(self.completion_sel);
+    self.completion_sel = @intCast(@mod(cur + delta, @as(isize, @intCast(n))));
+    self.completion_doc_scroll = 0;
+    self.maybeResolveCompletion();
+}
+
+/// Ctrl+f / Ctrl+b while the documentation pane is visible: scroll display
+/// lines without touching the cursor, selection or buffer.
+pub fn scrollCompletionDocs(self: *App, delta: i32) void {
+    if (!self.completion_active) return;
+    if (self.completion_sel >= self.completion_words.items.len) return;
+    if (delta > 0) {
+        self.completion_doc_scroll +|= @intCast(delta);
+    } else {
+        self.completion_doc_scroll -|= @intCast(-delta);
+    }
 }

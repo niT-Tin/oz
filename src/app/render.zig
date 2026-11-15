@@ -6,6 +6,7 @@ const buffer = @import("../buffer/root.zig");
 const util = @import("../util/root.zig");
 const syntax = @import("../syntax.zig");
 const lsp_types = @import("../lsp/types.zig");
+const lsp_nav = @import("../lsp/navigation.zig");
 const theme = @import("../theme.zig");
 const icons = @import("../icons.zig");
 const keymap_list = @import("../editor/keymap_list.zig");
@@ -18,6 +19,10 @@ const nav_tabs = @import("navigator.zig");
 const note_store = @import("note_store.zig");
 const autil = @import("util.zig");
 const chrome = @import("chrome.zig");
+const statusline = @import("statusline.zig");
+const completion = @import("completion.zig");
+const completion_layout = @import("completion_layout.zig");
+const server_config = @import("../lsp/server_config.zig");
 const tabstrip = @import("tabstrip.zig");
 const animation = @import("animation.zig");
 const git_job = @import("git_job.zig");
@@ -994,7 +999,11 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
             // (rows ascend, so diag_i only moves forward)
             while (diag_i < diags.len and diags[diag_i].range.start.line < line) diag_i += 1;
             if (diag_i < diags.len and diags[diag_i].range.start.line == line) {
-                const d = diags[diag_i];
+                var d = diags[diag_i];
+                var same = diag_i + 1;
+                while (same < diags.len and diags[same].range.start.line == line) : (same += 1) {
+                    if (@backingInt(diags[same].severity) < @backingInt(d.severity)) d = diags[same];
+                }
                 diag_mark = switch (d.severity) {
                     .err => "\u{f467}", // nf-fa-times_circle ✖
                     .warning => "\u{f071}", // nf-fa-warning ⚠
@@ -1201,9 +1210,13 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
             while (hint_i < line_hints.len and line_hints[hint_i].character <= indent_end) {
                 const hint = line_hints[hint_i];
                 if (hint.label.len > 0) {
+                    const hint_sel = ib >= sel_s and ib < sel_e;
                     try segs.append(a, .{
                         .text = hint.label,
-                        .style = .{ .dim = true, .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg } },
+                        .style = .{
+                            .fg = .{ .rgb = theme.hintFg(self.theme) },
+                            .bg = .{ .rgb = if (hint_sel) self.theme.bg_sel else if (is_cur_line) self.theme.bg_curline else self.theme.bg },
+                        },
                     });
                 }
                 hint_i += 1;
@@ -1368,9 +1381,13 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
             while (hint_i < line_hints.len and line_hints[hint_i].character <= col) {
                 const hint = line_hints[hint_i];
                 if (hint.label.len > 0) {
+                    const hint_sel = col >= sel_s and col < sel_e;
                     try segs.append(a, .{
                         .text = hint.label,
-                        .style = .{ .dim = true, .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg } },
+                        .style = .{
+                            .fg = .{ .rgb = theme.hintFg(self.theme) },
+                            .bg = .{ .rgb = if (hint_sel) self.theme.bg_sel else if (is_cur_line) self.theme.bg_curline else self.theme.bg },
+                        },
                     });
                 }
                 hint_i += 1;
@@ -1424,16 +1441,11 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
                 style.ul = f.ul;
                 style.ul_style = f.ul_style;
             }
-            // snacks.indent.scope underline: the scope's FIRST line (its
-            // declaration/opening line) is underlined from the text start
-            // to end of line, once the animation spread has covered it
-            // (snacks draws it when scope.from == from), in the scope's
-            // own guide color. The e2e grid parses SGR colors only, so
-            // this is cosmetic, never asserted.
-            if (is_focused and in_scope and line == scope_start_line and anim_from <= scope_start_line) {
-                style.ul = .{ .rgb = self.theme.indent[(scope_indent_col / tab_width) % 8] };
-                style.ul_style = .single;
-            }
+            // Scope emphasis stays in the guide column (highlighted below)
+            // and the cursor line surface. The old full-width SGR underline
+            // on the scope's first line read as a stray rule across the
+            // reading surface and leaked into later virtual text on terminals
+            // that only repaint changed cells; it is deliberately gone.
             const seg_text = text[col..next];
             if (std.mem.indexOfScalar(u8, seg_text, '\t') != null) {
                 // Expand tabs to `tab_width` spaces so they render (vaxis
@@ -1459,9 +1471,13 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         while (hint_i < line_hints.len) {
             const hint = line_hints[hint_i];
             if (hint.label.len > 0) {
+                const hint_sel = sel_e > col and sel_s <= col;
                 try segs.append(a, .{
                     .text = hint.label,
-                    .style = .{ .dim = true, .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg } },
+                    .style = .{
+                        .fg = .{ .rgb = theme.hintFg(self.theme) },
+                        .bg = .{ .rgb = if (hint_sel) self.theme.bg_sel else if (is_cur_line) self.theme.bg_curline else self.theme.bg },
+                    },
                 });
             }
             hint_i += 1;
@@ -1508,6 +1524,14 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
             }
         }
 
+        if (self.search_hl_active and self.last_search != null) {
+            const cursor_off: u32 = if (line == cursor_line and self.curCursor().* >= line_start)
+                self.curCursor().* - line_start
+            else
+                0;
+            try applySearchHighlight(self, a, &segs, text[0..n], cursor_off, line == cursor_line);
+        }
+
         // Soft wrap: split the content segments (everything past the two
         // gutter segments) into content_width-cell chunks, one screen row
         // each. The gutter shows the line number on the first chunk row
@@ -1522,6 +1546,12 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         const skip_rows = if (line == w.view_top) w.view_wrap else 0;
         while (row < rect.row + rect.height) {
             const visible = wrap_row >= skip_rows;
+            // Cursor line is a full-width surface: paint the whole content
+            // row (gutter + blank after EOL) before text so it never stops at
+            // the last glyph. Selection/hint segments repaint over it.
+            if (visible and is_cur_line) {
+                fillStripRow(win, row, rect.col, rect.width, .{ .rgb = self.theme.bg_curline });
+            }
             if (visible and wrap_row == 0) {
                 const gseg = [_]vaxis.Segment{.{ .text = num_str, .style = cursorline_style }};
                 _ = win.print(&gseg, .{ .row_offset = @intCast(row), .col_offset = @intCast(rect.col), .wrap = .none });
@@ -2635,6 +2665,7 @@ pub fn drawRichPopup(
             if (syntax.languageFor(ft)) |ln| hl = syntax.Highlighter.init(a, ln) catch null;
         }
         if (hl) |*h| {
+            defer h.deinit();
             h.reparse(blk.text) catch {};
             var raw = std.ArrayList(syntax.Span).empty;
             h.spansInRange(0, @intCast(blk.text.len), a, &raw) catch {};
@@ -2707,6 +2738,16 @@ pub fn drawRichPopup(
     }
 }
 
+/// Human name of the configured language server for a filetype (`zig` →
+/// `zls`), so the status line reports the service that is actually running,
+/// not the buffer's language. Falls back to the language when no server is
+/// configured.
+fn lspServerName(lang: []const u8) []const u8 {
+    const cmd = server_config.commandFor(lang) orelse return lang;
+    if (cmd.len == 0) return lang;
+    return std.fs.path.basename(cmd[0]);
+}
+
 /// Bottom chrome: one quiet status band. The background change supplies the
 /// boundary without spending another row on a full-width rule.
 pub fn drawStatusChrome(self: *App, win: vaxis.Window) void {
@@ -2736,6 +2777,23 @@ fn fillStripRow(win: vaxis.Window, row: u32, col: u32, width: u32, bg: vaxis.Col
 }
 
 const BufferTabKind = enum { plain, diff, note };
+
+/// Tab label: basename normally, parent/basename when two open buffers
+/// share a basename (CMP/tab identity without a permanent path row).
+fn bufferTabName(self: *App, buf: *const Buffer) []const u8 {
+    const path = buf.path orelse return "[No Name]";
+    const base = std.fs.path.basename(path);
+    var duplicate = false;
+    for (self.buffers.items) |*other| {
+        const op = other.path orelse continue;
+        if (op.ptr == path.ptr and op.len == path.len) continue;
+        if (std.mem.eql(u8, std.fs.path.basename(op), base)) {
+            duplicate = true;
+            break;
+        }
+    }
+    return tabstrip.displayName(path, duplicate);
+}
 
 fn bufferTabKind(self: *App, buf: *const Buffer) BufferTabKind {
     const path = buf.path orelse return .plain;
@@ -2782,20 +2840,26 @@ pub fn drawBufferTabPlan(
             });
         }
         const icon = icons.forPath(if (buf.path) |path| path else "", false);
-        const icon_style: vaxis.Style = if (slot.active)
-            chrome.activeSurfaceTabMarkerStyle(t)
-        else
-            .{
-                .fg = .{ .rgb = icons.rgbOf(t, icon.color) },
-                .bg = strip_bg,
-            };
+        const icon_style: vaxis.Style = .{
+            // Active tabs keep the file-type color: selection is carried by
+            // the marker and weight, not by painting every icon the same.
+            .fg = .{ .rgb = icons.rgbOf(t, icon.color) },
+            .bg = body_bg,
+            .bold = slot.active,
+        };
+        if (slot.active and slot.width > 0) {
+            win.writeCell(@intCast(tab_x), @intCast(label_row), .{
+                .char = .{ .grapheme = "▏", .width = 1 },
+                .style = chrome.activeSurfaceTabCellStyle(t),
+            });
+        }
         if (slot.width > tabstrip.pad_left) {
             win.writeCell(@intCast(tab_x + tabstrip.pad_left), @intCast(label_row), .{
                 .char = .{ .grapheme = icon.glyph, .width = 1 },
                 .style = icon_style,
             });
         }
-        const name = if (buf.path) |path| std.fs.path.basename(path) else "[No Name]";
+        const name = bufferTabName(self, buf);
         var kind_fg = t.fg_dim;
         switch (bufferTabKind(self, buf)) {
             .plain => {},
@@ -2805,7 +2869,7 @@ pub fn drawBufferTabPlan(
         const name_style: vaxis.Style = if (slot.active)
             chrome.activeSurfaceTabStyle(t)
         else
-            .{ .fg = .{ .rgb = kind_fg }, .bg = strip_bg };
+            chrome.inactiveTabNameStyle(t, strip_bg);
         if (slot.name_alloc > 0) {
             var text = name;
             if (slot.truncated) {
@@ -2889,7 +2953,13 @@ fn drawEditorContext(
     const base = chrome.surfaceStyle(self.theme);
     fillStripRow(win, row, col, width, base.bg);
 
-    const path = tabstrip.contextPath(self.cur().path, self.project_root);
+    const raw_path = tabstrip.contextPath(self.cur().path, self.project_root);
+    // Absolute paths (no project root) keep one parent fragment; the full
+    // path no longer competes with the status line.
+    const path = if (raw_path.len > 0 and raw_path[0] == '/')
+        tabstrip.displayName(self.cur().path, true)
+    else
+        raw_path;
     const cursor = try std.fmt.allocPrint(a, "L{d}:C{d}", .{ cursor_line + 1, cursor_col });
     const right = try std.fmt.allocPrint(a, "{s}  {s}", .{ cursor, tabstrip.ask_agent_hint });
     const right_cells: u32 = @intCast(autil.cellWidth(win, right));
@@ -2920,7 +2990,343 @@ fn drawEditorContext(
     }
 }
 
+/// Wrap one source line into slices that each fit `width` display cells.
+/// Slices point into the caller's line (no copy); grapheme boundaries are
+/// respected so CJK/emoji are never split. An empty line yields one empty
+/// slice.
+fn wrapCompletionLine(a: std.mem.Allocator, win: vaxis.Window, line: []const u8, width: u32) ![][]const u8 {
+    var out = std.ArrayList([]const u8).empty;
+    if (width == 0) {
+        try out.append(a, line[0..0]);
+        return out.toOwnedSlice(a);
+    }
+    var start: usize = 0;
+    var used: u32 = 0;
+    var iter = vaxis.unicode.graphemeIterator(line);
+    while (iter.next()) |g| {
+        const bytes = g.bytes(line);
+        const gw: u32 = win.gwidth(bytes);
+        if (used > 0 and used + gw > width) {
+            try out.append(a, line[start..g.start]);
+            start = g.start;
+            used = 0;
+        }
+        used += gw;
+    }
+    try out.append(a, line[start..]);
+    return out.toOwnedSlice(a);
+}
+
+/// Word-aware wrap for prose: fill lines up to `width` cells, breaking at
+/// spaces when possible. A word wider than the pane still uses grapheme
+/// wrapping so no text is lost. Returned slices point into `line`.
+fn wrapCompletionWords(a: std.mem.Allocator, win: vaxis.Window, line: []const u8, width: u32) ![][]const u8 {
+    var out = std.ArrayList([]const u8).empty;
+    if (line.len == 0 or width == 0) {
+        try out.append(a, line);
+        return out.toOwnedSlice(a);
+    }
+    const cellsIn = struct {
+        fn f(w: vaxis.Window, text: []const u8) u32 {
+            var n: u32 = 0;
+            var it = vaxis.unicode.graphemeIterator(text);
+            while (it.next()) |g| n += w.gwidth(g.bytes(text));
+            return n;
+        }
+    }.f;
+    var line_start: usize = 0;
+    var last_space: ?usize = null;
+    var used: u32 = 0;
+    var iter = vaxis.unicode.graphemeIterator(line);
+    while (iter.next()) |g| {
+        const bytes = g.bytes(line);
+        const gw: u32 = win.gwidth(bytes);
+        if (used > 0 and used + gw > width) {
+            if (last_space) |sp| {
+                if (sp > line_start) {
+                    try out.append(a, line[line_start..sp]);
+                    line_start = sp + 1;
+                    used = cellsIn(win, line[line_start..g.start]);
+                    last_space = null;
+                } else {
+                    try out.append(a, line[line_start..g.start]);
+                    line_start = g.start;
+                    used = 0;
+                    last_space = null;
+                }
+            } else {
+                try out.append(a, line[line_start..g.start]);
+                line_start = g.start;
+                used = 0;
+            }
+        }
+        if (std.mem.eql(u8, bytes, " ")) last_space = g.start;
+        used += gw;
+    }
+    try out.append(a, line[line_start..]);
+    return out.toOwnedSlice(a);
+}
+
+fn completionPad(a: std.mem.Allocator, win: vaxis.Window, used: u32, width: u32, style: vaxis.Style) !?vaxis.Segment {
+    _ = win;
+    if (used >= width) return null;
+    const pad = try a.alloc(u8, width - used);
+    @memset(pad, ' ');
+    return .{ .text = pad, .style = style };
+}
+
+const CompletionFit = struct { slice: []const u8, cells: u32 };
+
+/// Fit a menu column to `max` cells, replacing the cut tail with one ellipsis
+/// cell. Keeps the first readable part of a label/signature instead of a hard
+/// chop ("comptim type" → "comptim…").
+fn completionFit(a: std.mem.Allocator, win: vaxis.Window, text: []const u8, max: u32) !CompletionFit {
+    const cells: u32 = @intCast(autil.cellWidth(win, text));
+    if (cells <= max) return .{ .slice = text, .cells = cells };
+    if (max == 0) return .{ .slice = text[0..0], .cells = 0 };
+    if (max == 1) return .{ .slice = "…", .cells = 1 };
+    const fit = autil.cellFitPrefix(win, text, max - 1);
+    return .{ .slice = try std.fmt.allocPrint(a, "{s}…", .{fit.slice}), .cells = @intCast(fit.cells + 1) };
+}
+
+/// Literal (non-Markdown) documentation row: the text is shown exactly, then
+/// padded to the pane width with the floating surface.
+fn completionLiteralRow(self: *App, a: std.mem.Allocator, win: vaxis.Window, text: []const u8, width: u32, style: vaxis.Style) ![]vaxis.Segment {
+    _ = self;
+    var segs = std.ArrayList(vaxis.Segment).empty;
+    const fit = autil.cellFitPrefix(win, text, width);
+    if (fit.slice.len > 0) try segs.append(a, .{ .text = fit.slice, .style = style });
+    if (try completionPad(a, win, @intCast(fit.cells), width, style)) |pad| try segs.append(a, pad);
+    return segs.toOwnedSlice(a);
+}
+
+/// One chunk of code/signature, syntax-highlighted in `lang` (falling back to
+/// the buffer language). Unknown languages stay plain fg rather than inventing
+/// token colors.
+fn completionCodeRow(self: *App, a: std.mem.Allocator, win: vaxis.Window, text: []const u8, lang: []const u8, width: u32) ![]vaxis.Segment {
+    _ = win;
+    var spans: []syntax.Span = &.{};
+    var hl: ?syntax.Highlighter = null;
+    if (syntax.languageFor(lang)) |ln| hl = syntax.Highlighter.init(a, ln) catch null;
+    if (hl == null) {
+        const ft = autil.filetypeOf(self.cur().path);
+        if (syntax.languageFor(ft)) |ln| hl = syntax.Highlighter.init(a, ln) catch null;
+    }
+    if (hl) |*h| {
+        // Parser/query/tree/cursor are native resources: freeing the frame
+        // arena alone does not release them. Spans contain byte offsets only.
+        defer h.deinit();
+        h.reparse(text) catch {};
+        var raw = std.ArrayList(syntax.Span).empty;
+        h.spansInRange(0, @intCast(text.len), a, &raw) catch {};
+        var merged = std.ArrayList(syntax.Span).empty;
+        for (raw.items) |sp| {
+            while (merged.items.len > 0) {
+                var last = &merged.items[merged.items.len - 1];
+                if (sp.start >= last.end) break;
+                if (sp.start <= last.start) {
+                    _ = merged.pop();
+                    continue;
+                }
+                last.end = sp.start;
+                break;
+            }
+            try merged.append(a, sp);
+        }
+        spans = try merged.toOwnedSlice(a);
+    }
+    return self.hoverCodeLineSegs(a, text, 0, @intCast(text.len), spans, width);
+}
+
+/// Build the wrapped display rows for the completion documentation popup:
+/// syntax-highlighted signature header, divider, then Markdown/plaintext
+/// body. Returns a slice of rows, each exactly `width` cells wide.
+fn buildCompletionDocRows(
+    self: *App,
+    a: std.mem.Allocator,
+    win: vaxis.Window,
+    item: *const lsp_nav.CompletionItem,
+    width: u32,
+) ![]const []vaxis.Segment {
+    var rows = std.ArrayList([]vaxis.Segment).empty;
+    if (width == 0) return rows.toOwnedSlice(a);
+    const base: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_float } };
+    const faint: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
+    const dim: vaxis.Style = .{ .fg = .{ .rgb = theme.hintFg(self.theme) }, .bg = .{ .rgb = self.theme.bg_float } };
+    const ft = autil.filetypeOf(self.cur().path);
+
+    const sig: ?[]const u8 = if (item.detail) |d|
+        d
+    else if (item.label_detail) |d|
+        d
+    else
+        null;
+    const has_body = item.doc != null and item.doc.?.len > 0;
+
+    if (sig) |sig_text| {
+        var sig_lines = std.mem.splitScalar(u8, sig_text, '\n');
+        while (sig_lines.next()) |line| {
+            const chunks = try wrapCompletionLine(a, win, line, width);
+            for (chunks) |chunk| try rows.append(a, try completionCodeRow(self, a, win, chunk, ft, width));
+        }
+        if (has_body) {
+            // Divider between signature and prose; the signature is not lost
+            // when documentation exists (the old `doc orelse detail` bug).
+            var rule: std.ArrayList(u8) = .empty;
+            try rule.append(a, ' ');
+            var ri: u32 = 1;
+            while (ri < width) : (ri += 1) try rule.appendSlice(a, "─");
+            try rows.append(a, try completionLiteralRow(self, a, win, rule.items, width, faint));
+        }
+    }
+
+    if (has_body) {
+        var body = item.doc.?;
+        if (body.len > 64 * 1024) {
+            body = body[0 .. 64 * 1024];
+            while (body.len > 0 and (body[body.len - 1] & 0xC0) == 0x80) body = body[0 .. body.len - 1];
+        }
+        var in_fence: ?[]const u8 = null;
+        var line_it = std.mem.splitScalar(u8, body, '\n');
+        // Bound per-frame layout work for pathological docs; 256 wrapped
+        // rows is far more than the pane can show, and the pane still
+        // scrolls through all of it.
+        var truncated_rows = false;
+        while (line_it.next()) |raw_line| {
+            if (rows.items.len >= 256) {
+                truncated_rows = true;
+                break;
+            }
+            const line = if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r') raw_line[0 .. raw_line.len - 1] else raw_line;
+            if (item.doc_kind == .markdown) {
+                if (autil.isFenceLine(line)) |lang| {
+                    if (in_fence == null) {
+                        in_fence = lang;
+                    } else {
+                        in_fence = null;
+                    }
+                    // Fence markers are concealed: keep a blank row so the
+                    // block keeps its vertical rhythm.
+                    try rows.append(a, try completionLiteralRow(self, a, win, "", width, .{ .bg = .{ .rgb = self.theme.bg_float } }));
+                    continue;
+                }
+                if (in_fence) |lang| {
+                    const chunks = try wrapCompletionLine(a, win, line, width);
+                    for (chunks) |chunk| try rows.append(a, try completionCodeRow(self, a, win, chunk, lang, width));
+                    continue;
+                }
+                const chunks = try wrapCompletionWords(a, win, line, width);
+                for (chunks) |chunk| try rows.append(a, try self.hoverLineSegs(a, chunk, width));
+                continue;
+            }
+            // plaintext: preserve literal stars/backticks; word-wrap only at
+            // spaces so prose stays readable.
+            const chunks = try wrapCompletionWords(a, win, line, width);
+            for (chunks) |chunk| try rows.append(a, try completionLiteralRow(self, a, win, chunk, width, base));
+        }
+        if (item.doc.?.len > 64 * 1024 or truncated_rows) {
+            try rows.append(a, try completionLiteralRow(self, a, win, "… documentation truncated", width, dim));
+        }
+    } else if (sig == null) {
+        const status: ?[]const u8 = switch (item.resolve_state) {
+            .loading => "loading documentation…",
+            .failed => "documentation unavailable",
+            .empty => "no documentation",
+            else => null,
+        };
+        if (status) |txt| try rows.append(a, try completionLiteralRow(self, a, win, txt, width, dim));
+    }
+    return rows.toOwnedSlice(a);
+}
+
+/// Overlay search-match backgrounds on the already-built text segments.
+/// Selection wins; otherwise search (current hit stronger) overrides the
+/// cursorline/band surfaces. Segments that are not verbatim slices of the
+/// line (expanded tabs, concealed markdown, virtual text) are left alone:
+/// highlight is visual only and never changes bytes or columns.
+fn applySearchHighlight(self: *App, a: std.mem.Allocator, segs: *std.ArrayList(vaxis.Segment), text: []const u8, cursor_off: u32, cursor_line: bool) !void {
+    if (!self.search_hl_active) return;
+    const q = self.last_search orelse return;
+    if (q.len == 0 or text.len < q.len) return;
+    const Range = struct { start: usize, end: usize };
+    var ranges: [128]Range = undefined;
+    var n: usize = 0;
+    var from: usize = 0;
+    while (from + q.len <= text.len and n < ranges.len) {
+        const idx = std.mem.indexOfPos(u8, text, from, q) orelse break;
+        ranges[n] = .{ .start = idx, .end = idx + q.len };
+        n += 1;
+        from = idx + q.len;
+    }
+    if (n == 0) return;
+    var current: ?Range = null;
+    if (cursor_line) {
+        for (ranges[0..n]) |r| {
+            if (cursor_off >= r.start and cursor_off < r.end) {
+                current = r;
+                break;
+            }
+        }
+    }
+    const sel_bg = self.theme.bg_sel;
+    const match_bg = theme.searchBg(self.theme, .match).?;
+    const current_bg = theme.searchBg(self.theme, .current).?;
+    var out = std.ArrayList(vaxis.Segment).empty;
+    // The first two segments are gutter number + separator: never tint them.
+    var si: usize = 0;
+    while (si < segs.items.len and si < 2) : (si += 1) try out.append(a, segs.items[si]);
+    var scan: usize = 0;
+    while (si < segs.items.len) : (si += 1) {
+        const seg = segs.items[si];
+        if (seg.text.len == 0) continue;
+        const at = std.mem.indexOfPos(u8, text, scan, seg.text) orelse {
+            try out.append(a, seg);
+            continue;
+        };
+        scan = at + seg.text.len;
+        const keep_sel = switch (seg.style.bg) {
+            .rgb => |rgb| rgb[0] == sel_bg[0] and rgb[1] == sel_bg[1] and rgb[2] == sel_bg[2],
+            else => false,
+        };
+        if (keep_sel) {
+            try out.append(a, seg);
+            continue;
+        }
+        var pos = at;
+        const end = at + seg.text.len;
+        while (pos < end) {
+            var next = end;
+            var bg: ?theme.Rgb = null;
+            for (ranges[0..n]) |r| {
+                if (r.end <= pos) continue;
+                if (r.start >= next) {
+                    if (next == end and r.start < next) next = r.start;
+                    continue;
+                }
+                if (r.start > pos and r.start < next) next = r.start;
+                if (pos >= r.start and pos < r.end) {
+                    bg = if (current != null and current.?.start == r.start and current.?.end == r.end)
+                        current_bg
+                    else
+                        match_bg;
+                    if (r.end <= next) next = r.end;
+                }
+            }
+            if (next <= pos) next = pos + 1;
+            var style = seg.style;
+            if (bg) |c| style.bg = .{ .rgb = c };
+            try out.append(a, .{ .text = seg.text[pos - at .. next - at], .style = style });
+            pos = next;
+        }
+    }
+    segs.* = out;
+}
+
 pub fn render(self: *App) !void {
+    // Final safeguard for focus changes outside input dispatch. Event
+    // boundaries already synchronize before subsequent input can request
+    // a new hint in that focus.
+    self.syncPassiveFocus();
     // vaxis cells reference the text slices passed to print, so all text
     // must stay alive until vx.render(); a per-frame arena handles that.
     var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -2971,7 +3377,11 @@ pub fn render(self: *App) !void {
 
     const cursor_line = self.cur().pt.lineOf(self.curCursor().*);
     const line_count = self.cur().pt.lineCount();
-    const status_col = self.screenCellCol(win, cursor_line, self.curCursor().*);
+    // Document column for user-facing position text: display cells of the
+    // source line prefix (tabs expanded, wide graphemes counted), WITHOUT
+    // inlay hints, blame ghosts or soft-wrap row numbers. Internal byte,
+    // UTF-16 and screen coordinates keep their own semantics.
+    const status_col = self.lineCellCol(win, cursor_line, self.curCursor().*);
     // relative-number gutter: computed once per frame, reused by the
     // cursor offset, mc highlight and easymotion labels
     const gutter = self.gutterWidth(line_count);
@@ -2999,7 +3409,7 @@ pub fn render(self: *App) !void {
         if (self.windows.items.len <= 1) {
             var n: usize = 0;
             for (self.buffers.items, 0..) |*buf, bi| {
-                const name = if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
+                const name = bufferTabName(self, buf);
                 tab_specs[n] = .{
                     .name_cells = @intCast(autil.cellWidth(win, name)),
                     .dirty = buf.dirty,
@@ -3072,7 +3482,7 @@ pub fn render(self: *App) !void {
                         if (self.windows.items[self.current_win].buf == tab_i) owner = self.current_win;
                         if (owner != lr.win) continue;
                         const buf = &self.buffers.items[tab_i];
-                        const name = if (buf.path) |p| std.fs.path.basename(p) else "[No Name]";
+                        const name = bufferTabName(self, buf);
                         tab_specs[n] = .{
                             .name_cells = @intCast(autil.cellWidth(win, name)),
                             .dirty = buf.dirty,
@@ -3947,79 +4357,150 @@ pub fn render(self: *App) !void {
 
     // insert-mode completion menu (Ctrl+n / auto-suggest): a floating
     // window like nvim's blink.cmp — rounded border, solid bg_float
-    // panel, selected row in bg_sel with a Nerd Font kind icon column.
-    // The buffer cursor is left untouched.
+    // panel, selected row in bg_sel. The row is split into measured
+    // segments: kind icon (category color), label, labelDetails.detail
+    // and a right-aligned labelDetails.description. Descriptions are never
+    // synthesized from `kind` or from the signature.
     if (self.completion_active) {
         const total = self.completion_words.items.len;
-        if (total > 0) {
-            const list_rows = @min(@as(usize, 8), total);
-            var top: usize = 0;
-            if (self.completion_sel >= list_rows) top = self.completion_sel - list_rows + 1;
+        if (total > 0) completion_menu: {
             const c_line = self.cur().pt.lineOf(self.curCursor().*);
             const c_sp = self.focusedScreenPos(win, cur_rect, c_line, self.curCursor().*);
-            // Box width in CELLS, not bytes: a label with any non-ASCII
-            // glyph (or a wide kind icon) otherwise makes the right border
-            // land left of the corners while the top/bottom edges stay put.
+            const pane_left = cur_rect.col;
+            const pane_width = cur_rect.width;
+            const pane_rect = completion_layout.Rect{ .row = cur_rect.row, .col = pane_left, .width = pane_width, .height = cur_rect.height };
+            const list_rows = completion_layout.visibleMenuRows(pane_rect, cur_rect.row + c_sp.row, @intCast(@min(@as(usize, 8), total)));
+            if (list_rows == 0 or pane_width < 6) break :completion_menu;
+            var top: usize = 0;
+            if (self.completion_sel >= list_rows) top = self.completion_sel - list_rows + 1;
+
+            // Measure the visible rows first. The description column is
+            // stable across rows so long signatures cannot make it jump.
             var max_label: u32 = 0;
+            var max_detail: u32 = 0;
+            var max_desc: u32 = 0;
             var max_icon: u32 = 1;
             var k: usize = 0;
             while (k < list_rows) : (k += 1) {
                 const item = self.completion_words.items[top + k];
-                max_label = @max(max_label, buffer.utf8.displayWidth(item.text));
+                max_label = @max(max_label, @as(u32, @intCast(autil.cellWidth(win, item.label))));
+                if (item.label_detail) |d| max_detail = @max(max_detail, @as(u32, @intCast(autil.cellWidth(win, d))));
+                if (item.label_description) |d| max_desc = @max(max_desc, @as(u32, @intCast(autil.cellWidth(win, d))));
                 const icon = if (item.kind != 0) kindGlyph(item.kind) else " ";
-                max_icon = @max(max_icon, buffer.utf8.displayWidth(icon));
+                max_icon = @max(max_icon, @as(u32, @intCast(autil.cellWidth(win, icon))));
             }
-            max_label = @min(max_label, 46);
-            const inner_cells: u32 = max_icon + 1 + max_label;
-            const box_w = inner_cells + 2;
-            var start_row = cur_rect.row + c_sp.row + 1;
-            if (start_row + list_rows + 2 > height) {
-                // near the bottom: show the menu above the cursor; the
-                // saturating minus keeps short terminals from underflowing
-                // (a 4.29e9 row would draw the menu off-screen silently)
-                start_row = (cur_rect.row + c_sp.row) -| (list_rows + 2);
+            const budget: u32 = pane_width -| 4;
+            // Keep the label identifiable before spending cells on detail
+            // and description. The cap is a cell budget, not a byte count.
+            var label_w = @min(max_label, @min(@as(u32, 46), budget -| 4));
+            var detail_w = @min(max_detail, @min(@as(u32, 34), budget -| (max_icon + 1 + label_w + 2)));
+            var desc_w = @min(max_desc, @min(@as(u32, 20), budget -| (max_icon + 1 + label_w + detail_w + 2)));
+            while (max_icon + 1 + label_w + (if (detail_w > 0) 1 + detail_w else 0) +
+                (if (desc_w > 0) 1 + desc_w else 0) + 2 > pane_width and label_w > 8)
+            {
+                if (detail_w > 0) detail_w -= 1 else if (desc_w > 0) desc_w -= 1 else label_w -= 1;
             }
-            // anchor the menu at the cursor column (not pinned left)
-            var box_col = cur_rect.col + gutter + c_sp.col;
-            if (box_col + box_w > win.width) box_col = win.width -| box_w;
+            const inner_cells: u32 = max_icon + 1 + label_w +
+                (if (detail_w > 0) 1 + detail_w else 0) +
+                (if (desc_w > 0) 1 + desc_w else 0);
+            const box_w = @min(inner_cells + 2, pane_width);
+            // Joint menu/docs placement inside the focused pane. Doc rows
+            // are wrapped at a provisional width, then rebuilt at the width
+            // the planner actually granted (narrow pane/split/Agent rail).
+            var doc_rows_list = try buildCompletionDocRows(self, a, win, &self.completion_words.items[self.completion_sel], @min(@as(u32, 64), pane_width -| 4));
+            var lp = completion_layout.plan(.{
+                .pane = .{ .row = cur_rect.row, .col = cur_rect.col, .width = cur_rect.width, .height = cur_rect.height },
+                .cursor_row = cur_rect.row + c_sp.row,
+                .cursor_col = pane_left + gutter + c_sp.col,
+                .gutter = gutter,
+                .menu_width = box_w,
+                .menu_rows = list_rows,
+                .doc_width = @min(@as(u32, 64), pane_width -| 4),
+                .doc_total_rows = @intCast(doc_rows_list.len),
+            });
+            if (lp.doc.width > 2 and lp.doc.width - 2 != @min(@as(u32, 64), pane_width -| 4)) {
+                const inner_width = lp.doc.width - 2;
+                doc_rows_list = try buildCompletionDocRows(self, a, win, &self.completion_words.items[self.completion_sel], inner_width);
+                lp = completion_layout.plan(.{
+                    .pane = .{ .row = cur_rect.row, .col = cur_rect.col, .width = cur_rect.width, .height = cur_rect.height },
+                    .cursor_row = cur_rect.row + c_sp.row,
+                    .cursor_col = pane_left + gutter + c_sp.col,
+                    .gutter = gutter,
+                    .menu_width = box_w,
+                    .menu_rows = list_rows,
+                    .doc_width = inner_width,
+                    .doc_total_rows = @intCast(doc_rows_list.len),
+                });
+            }
+            const start_row = lp.menu.row;
+            const box_col = lp.menu.col;
+
             const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
             const sel_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_sel }, .fg = .{ .rgb = self.theme.fg } };
             const row_style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } };
+
             // top border ╭───╮
             {
                 var segs = std.ArrayList(vaxis.Segment).empty;
                 try segs.append(a, .{ .text = "╭", .style = border_style });
-                try segs.append(a, .{ .text = "─", .style = border_style });
-                // the remaining top edge (inner_cells - 1 cells)
-                var cx: u32 = 1;
-                while (cx < inner_cells) : (cx += 1) {
-                    try segs.append(a, .{ .text = "─", .style = border_style });
-                }
+                var cx: u32 = 0;
+                while (cx < inner_cells) : (cx += 1) try segs.append(a, .{ .text = "─", .style = border_style });
                 try segs.append(a, .{ .text = "╮", .style = border_style });
                 _ = win.print(segs.items, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(box_col), .wrap = .none });
             }
             k = 0;
             while (k < list_rows) : (k += 1) {
                 const item = self.completion_words.items[top + k];
-                const style = if (top + k == self.completion_sel) sel_style else row_style;
-                const icon = if (item.kind != 0) kindGlyph(item.kind) else " ";
-                const icon_w = buffer.utf8.displayWidth(icon);
-                const label = buffer.utf8.truncateWidth(item.text, max_label);
-                const label_w = buffer.utf8.displayWidth(label);
+                const selected = top + k == self.completion_sel;
+                const style = if (selected) sel_style else row_style;
+                const row_bg: vaxis.Color = if (selected) .{ .rgb = self.theme.bg_sel } else .{ .rgb = self.theme.bg_float };
                 var segs = std.ArrayList(vaxis.Segment).empty;
                 try segs.append(a, .{ .text = "│", .style = border_style });
-                try segs.append(a, .{ .text = icon, .style = style });
-                if (icon_w < max_icon) {
-                    const pad = try a.alloc(u8, @intCast(max_icon - icon_w));
+                const icon = if (item.kind != 0) kindGlyph(item.kind) else " ";
+                const icon_color = completion.kindColor(self.theme, item.kind);
+                try segs.append(a, .{ .text = icon, .style = .{ .fg = .{ .rgb = icon_color }, .bg = row_bg, .bold = selected } });
+                const icon_cells: u32 = @intCast(autil.cellWidth(win, icon));
+                if (icon_cells < max_icon) {
+                    const pad = try a.alloc(u8, @intCast(max_icon - icon_cells));
                     @memset(pad, ' ');
-                    try segs.append(a, .{ .text = pad, .style = style });
+                    try segs.append(a, .{ .text = pad, .style = .{ .bg = row_bg } });
                 }
-                try segs.append(a, .{ .text = " ", .style = style });
-                try segs.append(a, .{ .text = label, .style = style });
-                if (label_w < max_label) {
-                    const pad = try a.alloc(u8, @intCast(max_label - label_w));
+                try segs.append(a, .{ .text = " ", .style = .{ .bg = row_bg } });
+
+                const lab = try completionFit(a, win, item.label, label_w);
+                try segs.append(a, .{ .text = lab.slice, .style = style });
+                if (lab.cells < label_w) {
+                    const pad = try a.alloc(u8, @intCast(label_w - lab.cells));
                     @memset(pad, ' ');
-                    try segs.append(a, .{ .text = pad, .style = style });
+                    try segs.append(a, .{ .text = pad, .style = .{ .bg = row_bg } });
+                }
+                if (detail_w > 0) {
+                    try segs.append(a, .{ .text = " ", .style = .{ .bg = row_bg } });
+                    const dtext = item.label_detail orelse "";
+                    const det = try completionFit(a, win, dtext, detail_w);
+                    try segs.append(a, .{ .text = det.slice, .style = .{
+                        .fg = .{ .rgb = if (selected) self.theme.fg_dim else self.theme.fg_dim },
+                        .bg = row_bg,
+                    } });
+                    if (det.cells < detail_w) {
+                        const pad = try a.alloc(u8, @intCast(detail_w - det.cells));
+                        @memset(pad, ' ');
+                        try segs.append(a, .{ .text = pad, .style = .{ .bg = row_bg } });
+                    }
+                }
+                if (desc_w > 0) {
+                    try segs.append(a, .{ .text = " ", .style = .{ .bg = row_bg } });
+                    const dtext = item.label_description orelse "";
+                    const desc = try completionFit(a, win, dtext, desc_w);
+                    if (desc.cells < desc_w) {
+                        const pad = try a.alloc(u8, @intCast(desc_w - desc.cells));
+                        @memset(pad, ' ');
+                        try segs.append(a, .{ .text = pad, .style = .{ .bg = row_bg } });
+                    }
+                    try segs.append(a, .{ .text = desc.slice, .style = .{
+                        .fg = .{ .rgb = if (selected) self.theme.fg_dim else self.theme.fg_faint },
+                        .bg = row_bg,
+                    } });
                 }
                 try segs.append(a, .{ .text = "│", .style = border_style });
                 _ = win.print(segs.items, .{ .row_offset = @intCast(start_row + 1 + k), .col_offset = @intCast(box_col), .wrap = .none });
@@ -4029,36 +4510,56 @@ pub fn render(self: *App) !void {
                 var segs = std.ArrayList(vaxis.Segment).empty;
                 try segs.append(a, .{ .text = "╰", .style = border_style });
                 var cx: u32 = 0;
-                while (cx < inner_cells) : (cx += 1) {
-                    try segs.append(a, .{ .text = "─", .style = border_style });
-                }
+                while (cx < inner_cells) : (cx += 1) try segs.append(a, .{ .text = "─", .style = border_style });
                 try segs.append(a, .{ .text = "╯", .style = border_style });
                 _ = win.print(segs.items, .{ .row_offset = @intCast(start_row + 1 + list_rows), .col_offset = @intCast(box_col), .wrap = .none });
             }
 
-            // Documentation pane for the selected candidate. LSP servers
-            // send markdown (zls: signatures + prose); render it through
-            // the same path as hover so it gets concealed markdown markers
-            // and real tree-sitter colors inside fenced code. Below the
-            // menu when it fits, above it otherwise.
-            if (self.completion_sel < total) {
-                const sel = self.completion_words.items[self.completion_sel];
-                const doc_text: ?[]const u8 = sel.doc orelse sel.detail;
-                if (doc_text) |dt| {
-                    if (dt.len > 0) {
-                        const doc_cols: u32 = 60;
-                        var doc_lines: u32 = 1;
-                        for (dt) |c| {
-                            if (c == '\n') doc_lines += 1;
-                        }
-                        const doc_rows = @min(doc_lines, 5);
-                        var doc_row = start_row + 1 + list_rows + 1;
-                        if (doc_row + doc_rows + 1 > height) {
-                            doc_row = start_row -| (doc_rows + 1);
-                        }
-                        const doc_col = @min(box_col, win.width -| (doc_cols + 2));
-                        try self.drawRichPopup(a, win, dt, doc_row, doc_col, 5, doc_cols);
+            // Documentation pane: signature + body, wrapped and scrolled,
+            // placed by the same planner. Keeps the same bg_float surface and
+            // never overlaps the menu or leaves the focused pane.
+            if (lp.doc.width > 2 and doc_rows_list.len > 0) {
+                const doc_inner_width = lp.doc.width - 2;
+                const visible = lp.doc_visible_rows;
+                const scroll = @min(self.completion_doc_scroll, lp.scroll_max);
+                self.completion_doc_scroll = scroll;
+                const doc_border: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
+                // top border
+                {
+                    var segs = std.ArrayList(vaxis.Segment).empty;
+                    try segs.append(a, .{ .text = "╭", .style = doc_border });
+                    var cx: u32 = 0;
+                    while (cx < doc_inner_width) : (cx += 1) try segs.append(a, .{ .text = "─", .style = doc_border });
+                    try segs.append(a, .{ .text = "╮", .style = doc_border });
+                    _ = win.print(segs.items, .{ .row_offset = @intCast(lp.doc.row), .col_offset = @intCast(lp.doc.col), .wrap = .none });
+                }
+                var dr: u32 = 0;
+                while (dr < visible) : (dr += 1) {
+                    const row_segs = doc_rows_list[scroll + dr];
+                    var segs = std.ArrayList(vaxis.Segment).empty;
+                    try segs.append(a, .{ .text = "│", .style = doc_border });
+                    try segs.appendSlice(a, row_segs);
+                    try segs.append(a, .{ .text = "│", .style = doc_border });
+                    _ = win.print(segs.items, .{ .row_offset = @intCast(lp.doc.row + 1 + dr), .col_offset = @intCast(lp.doc.col), .wrap = .none });
+                }
+                // bottom border (scroll position when it overflows)
+                {
+                    const footer = if (lp.scroll_max > 0)
+                        try std.fmt.allocPrint(a, "{d}/{d}  ^F/^B", .{ scroll + 1, doc_rows_list.len })
+                    else
+                        "";
+                    var segs = std.ArrayList(vaxis.Segment).empty;
+                    try segs.append(a, .{ .text = "╰", .style = doc_border });
+                    var used: u32 = 0;
+                    if (footer.len > 0) {
+                        const fit = autil.cellFitPrefix(win, footer, doc_inner_width -| 2);
+                        try segs.append(a, .{ .text = " ", .style = doc_border });
+                        try segs.append(a, .{ .text = fit.slice, .style = doc_border });
+                        used = 1 + @as(u32, @intCast(fit.cells));
                     }
+                    while (used < doc_inner_width) : (used += 1) try segs.append(a, .{ .text = "─", .style = doc_border });
+                    try segs.append(a, .{ .text = "╯", .style = doc_border });
+                    _ = win.print(segs.items, .{ .row_offset = @intCast(lp.doc.row + lp.doc.height - 1), .col_offset = @intCast(lp.doc.col), .wrap = .none });
                 }
             }
         }
@@ -4067,11 +4568,18 @@ pub fn render(self: *App) !void {
         // prefix, shown dimmed right after the cursor (VS Code style).
         // Only when the item actually extends the typed prefix.
         if (self.state.mode == .insert and self.completion_sel < total) {
-            const item = self.completion_words.items[self.completion_sel].text;
+            const item = self.completion_words.items[self.completion_sel].insertText();
             const typed_len = self.curCursor().* - self.completion_pos;
             const ghost_line = self.cur().pt.lineOf(self.curCursor().*);
             const g_sp = self.focusedScreenPos(win, cur_rect, ghost_line, self.curCursor().*);
-            if (item.len > typed_len and typed_len > 0 and typed_len < 256 and g_sp.row < cur_rect.height) {
+            const ghost_row = cur_rect.row + g_sp.row;
+            // Horizontal separators currently overlay a leaf's edge row.
+            // A virtual suffix must not repaint that neighbouring boundary.
+            var on_separator = false;
+            for (layout.seps) |sep| {
+                if (sep.horizontal and sep.row == ghost_row) on_separator = true;
+            }
+            if (!on_separator and item.len > typed_len and typed_len > 0 and typed_len < 256 and g_sp.row < cur_rect.height) {
                 var prefix_buf: [256]u8 = undefined;
                 self.cur().pt.copyRange(self.completion_pos, prefix_buf[0..typed_len]);
                 if (std.mem.startsWith(u8, item, prefix_buf[0..typed_len])) {
@@ -4096,7 +4604,7 @@ pub fn render(self: *App) !void {
                             if (fits.len > 0) {
                                 const seg = [_]vaxis.Segment{.{
                                     .text = fits,
-                                    .style = .{ .dim = true },
+                                    .style = .{ .dim = true, .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_curline } },
                                 }};
                                 _ = win.print(&seg, .{
                                     .row_offset = @intCast(cur_rect.row + g_sp.row),
@@ -4111,6 +4619,8 @@ pub fn render(self: *App) !void {
         }
     }
 
+    const diagnostic_owns_line = try @import("diagnostics.zig").draw(self, a, win, cur_rect);
+
     // Current-line blame ghost (<leader>tb, nvim gitsigns style): the
     // blame of the CURSOR line renders as dim end-of-line virtual
     // text — "<author>, HH:MM - <summary>" — 1s after the cursor
@@ -4123,7 +4633,7 @@ pub fn render(self: *App) !void {
             self.blame_last_cursor = self.curCursor().*;
             self.blame_move_ms = now_ms;
         }
-        if (self.blame_active and self.state.mode == .normal and
+        if (!diagnostic_owns_line and self.blame_active and self.state.mode == .normal and
             self.git_blame != null and now_ms - self.blame_move_ms >= blame_hold_ms)
         {
             const fbuf = self.cur();
@@ -4182,7 +4692,10 @@ pub fn render(self: *App) !void {
                         if (fit.cells > 0) {
                             const seg = [_]vaxis.Segment{.{
                                 .text = fit.slice,
-                                .style = .{ .dim = true },
+                                .style = .{
+                                    .fg = .{ .rgb = theme.blameFg(self.theme) },
+                                    .bg = .{ .rgb = self.theme.bg_curline },
+                                },
                             }};
                             _ = win.print(&seg, .{
                                 .row_offset = @intCast(cur_rect.row + b_sp.row),
@@ -4200,7 +4713,7 @@ pub fn render(self: *App) !void {
     // cursor line (≤6 rows, ≤60 cols) showing nav_hover_text. Markdown
     // fences and inline tokens are rendered by drawRichPopup.
     if (self.nav_hover_text) |htext| {
-        if (htext.len > 0) {
+        if (htext.len > 0 and self.navHoverAlive()) {
             const h_line = self.cur().pt.lineOf(self.curCursor().*);
             var hrows: u32 = 1;
             for (htext) |c| {
@@ -4217,48 +4730,104 @@ pub fn render(self: *App) !void {
         }
     }
 
-    // Paint one status row after document overlays. Agent state reserves its
-    // right-hand slot first; left sections clip to the remainder instead of
-    // overwriting it. Hint mode keeps ownership of that slot.
+    // Paint one status row after document overlays. The pure planner owns
+    // the information priority; the renderer only measures text in cells and
+    // draws the placed segments. Agent state keeps a right-hand reservation.
     self.drawStatusChrome(win);
-    const mode_name = switch (self.state.mode) {
-        .normal => "NORMAL",
-        .insert => "INSERT",
-        .visual_char, .visual_line, .visual_block => "VISUAL",
-        .command => "COMMAND",
-    };
-    const ws_name = self.curWsName();
-    var ws_buf: [256]u8 = undefined;
-    const ws_label = std.fmt.bufPrint(&ws_buf, "[{s}]", .{ws_name}) catch ws_name;
-    const status_path = if (self.cur().path != null)
-        tabstrip.contextPath(self.cur().path, self.project_root)
-    else
-        ws_label;
-    var cursor_buf: [96]u8 = undefined;
-    const cursor_text = std.fmt.bufPrint(
-        &cursor_buf,
-        "line {d}/{d} col {d}",
-        .{ cursor_line + 1, line_count, status_col },
-    ) catch "line ?";
-    const rec: []const u8 = if (self.macro_rec) |r|
-        try std.fmt.allocPrint(a, "  recording @{c}", .{@as(u8, @intCast('a' + r))})
-    else
-        "";
-    const completion_marker: []const u8 = if (self.completion_slot != null) "  …" else "";
-
-    const status_band = chrome.bandStyle(self.theme);
-    const status_bg = status_band.bg;
-    const status_fg: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = status_bg };
-    const status_dim: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = status_bg };
-    const status_sep: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = status_bg };
-    // Quiet mode badge: accent text on the band, not a solid accent block.
-    const status_badge: vaxis.Style = .{
-        .fg = .{ .rgb = self.theme.accent },
-        .bg = status_bg,
-        .bold = true,
-    };
+    const t = self.theme;
+    const status_bg = chrome.bandStyle(t).bg;
     const status_row: u32 = height - 1;
+    const doc_col = self.lineCellCol(win, cursor_line, self.curCursor().*);
 
+    const mode_text: []const u8 = switch (self.state.mode) {
+        .normal => "[NORMAL] ",
+        .insert => "[INSERT] ",
+        .visual_char, .visual_line, .visual_block => "[VISUAL] ",
+        .command => "[COMMAND]",
+    };
+    const mode_role: statusline.Role = switch (self.state.mode) {
+        .normal => .mode_normal,
+        .insert => .mode_insert,
+        .visual_char, .visual_line, .visual_block => .mode_visual,
+        .command => .mode_command,
+    };
+
+    var pos_buf: [64]u8 = undefined;
+    // Keep the established, testable wording while sourcing the column from
+    // document cells (not `screenCellCol`, which includes inlay hints).
+    const pos_text = std.fmt.bufPrint(&pos_buf, "line {d}/{d} col {d}", .{ cursor_line + 1, line_count, doc_col }) catch "?";
+
+    var lsp_buf: [64]u8 = undefined;
+    var lsp_text: ?[]const u8 = null;
+    var lsp_connected = false;
+    if (self.lsp_client) |c| {
+        lsp_text = std.fmt.bufPrint(&lsp_buf, "[{s}]", .{lspServerName(c.lang)}) catch null;
+        lsp_connected = true;
+    } else if (self.lsp_starting) |job| {
+        lsp_text = std.fmt.bufPrint(&lsp_buf, "[{s}…]", .{lspServerName(job.lang)}) catch null;
+    }
+
+    const ft = autil.filetypeOf(self.cur().path);
+    var ft_buf: [32]u8 = undefined;
+    const ft_text: ?[]const u8 = if (ft.len > 0)
+        (std.fmt.bufPrint(&ft_buf, "{s}", .{ft}) catch null)
+    else
+        null;
+
+    // Real git counts (marked lines), not a guessed summary.
+    const diff_counts = self.git_diff.counts();
+    var diff_text: ?[]const u8 = null;
+    if (diff_counts.any()) {
+        var db: std.ArrayList(u8) = .empty;
+        if (diff_counts.added > 0) db.appendSlice(a, try std.fmt.allocPrint(a, "+{d} ", .{diff_counts.added})) catch {};
+        if (diff_counts.modified > 0) db.appendSlice(a, try std.fmt.allocPrint(a, "~{d} ", .{diff_counts.modified})) catch {};
+        if (diff_counts.removed > 0) db.appendSlice(a, try std.fmt.allocPrint(a, "-{d} ", .{diff_counts.removed})) catch {};
+        const trimmed = std.mem.trim(u8, db.items, " ");
+        if (trimmed.len > 0) diff_text = try a.dupe(u8, trimmed);
+    }
+
+    // Honest diagnostic counts: only severities the server actually sent.
+    var diag_text: ?[]const u8 = null;
+    {
+        var errs: u32 = 0;
+        var warns: u32 = 0;
+        var infos: u32 = 0;
+        var hints: u32 = 0;
+        for (self.lsp_diagnostics.items) |d| switch (d.severity) {
+            .err => errs += 1,
+            .warning => warns += 1,
+            .info => infos += 1,
+            .hint => hints += 1,
+        };
+        if (errs + warns + infos + hints > 0) {
+            var db: std.ArrayList(u8) = .empty;
+            if (errs > 0) db.appendSlice(a, try std.fmt.allocPrint(a, "E{d} ", .{errs})) catch {};
+            if (warns > 0) db.appendSlice(a, try std.fmt.allocPrint(a, "W{d} ", .{warns})) catch {};
+            if (infos > 0) db.appendSlice(a, try std.fmt.allocPrint(a, "I{d} ", .{infos})) catch {};
+            if (hints > 0) db.appendSlice(a, try std.fmt.allocPrint(a, "H{d} ", .{hints})) catch {};
+            const trimmed = std.mem.trim(u8, db.items, " ");
+            if (trimmed.len > 0) diag_text = try a.dupe(u8, trimmed);
+        }
+    }
+
+    var rec_buf: [24]u8 = undefined;
+    const rec_text: ?[]const u8 = if (self.macro_rec) |r|
+        (std.fmt.bufPrint(&rec_buf, "REC @{c}", .{@as(u8, @intCast('a' + r))}) catch null)
+    else
+        null;
+
+    var progress_buf: [32]u8 = undefined;
+    const progress_text: ?[]const u8 = blk: {
+        if (win.width < 88) break :blk null;
+        if (line_count == 0) break :blk null;
+        if (cursor_line == 0) break :blk std.fmt.bufPrint(&progress_buf, "Top/{d}", .{line_count}) catch null;
+        if (cursor_line + 1 >= line_count) break :blk std.fmt.bufPrint(&progress_buf, "Bot/{d}", .{line_count}) catch null;
+        const pct = (@as(u64, cursor_line + 1) * 100) / @as(u64, line_count);
+        break :blk std.fmt.bufPrint(&progress_buf, "{d}%/{d}", .{ pct, line_count }) catch null;
+    };
+
+    // Agent text keeps its existing responsive ladder; the planner reserves
+    // the resulting cells on the right before placing services/position.
     var ai_text: ?[]const u8 = null;
     var ai_cells: u32 = 0;
     if (!self.hints.active and self.msg == null) {
@@ -4287,79 +4856,103 @@ pub fn render(self: *App) !void {
             }
         }
     }
-    const ai_reserved = if (ai_text != null and ai_cells > 0) ai_cells + 2 else 0;
-    const left_limit = win.width -| ai_reserved;
-    var used_cells: u32 = 0;
-    const printStatus = struct {
-        fn one(win_: vaxis.Window, text: []const u8, style: vaxis.Style, row: u32, col: *u32, limit: u32) void {
-            if (col.* >= limit) return;
-            const fit = autil.cellFitPrefix(win_, text, limit - col.*);
-            if (fit.slice.len == 0) return;
-            const seg = [_]vaxis.Segment{.{ .text = fit.slice, .style = style }};
-            _ = win_.print(&seg, .{ .row_offset = @intCast(row), .col_offset = @intCast(col.*), .wrap = .none });
-            col.* += @intCast(fit.cells);
-        }
-    }.one;
 
-    // Dim brackets keep the mode readable without the "solid badge" look.
-    printStatus(win, "[", status_sep, status_row, &used_cells, left_limit);
-    printStatus(win, mode_name, status_badge, status_row, &used_cells, left_limit);
-    printStatus(win, "]", status_sep, status_row, &used_cells, left_limit);
-    printStatus(win, " │ ", status_sep, status_row, &used_cells, left_limit);
-    printStatus(win, ws_label, status_dim, status_row, &used_cells, left_limit);
-    printStatus(win, " │ ", status_sep, status_row, &used_cells, left_limit);
-    printStatus(win, cursor_text, status_fg, status_row, &used_cells, left_limit);
-    if (self.git_branch) |b| {
-        printStatus(win, " │ ", status_sep, status_row, &used_cells, left_limit);
-        printStatus(win, "⎇ ", status_band, status_row, &used_cells, left_limit);
-        printStatus(win, std.mem.trim(u8, b, " \t\r\n"), status_band, status_row, &used_cells, left_limit);
-    }
-    if (completion_marker.len > 0) printStatus(win, completion_marker, status_fg, status_row, &used_cells, left_limit);
-    if (self.msg) |m| {
-        printStatus(win, " │ ", status_sep, status_row, &used_cells, left_limit);
-        printStatus(win, m, status_fg, status_row, &used_cells, left_limit);
-    }
-    if (rec.len > 0) printStatus(win, rec, status_fg, status_row, &used_cells, left_limit);
-    // Responsive priority: the buffer strip's context row already shows the
-    // full path. On medium/narrow terminals show a suffix (basename) or drop
-    // the duplicate instead of truncating the path to a useless prefix.
-    if (win.width >= 90) {
-        printStatus(win, " │ ", status_sep, status_row, &used_cells, left_limit);
-        const path_budget = left_limit -| used_cells;
-        if (path_budget > 0) {
-            if (autil.cellWidth(win, status_path) <= path_budget) {
-                printStatus(win, status_path, status_dim, status_row, &used_cells, left_limit);
-            } else {
-                const base = std.fs.path.basename(status_path);
-                const short = try std.fmt.allocPrint(a, "{s}/{s}", .{ tabstrip.ellipsis, base });
-                if (autil.cellWidth(win, short) <= path_budget) {
-                    printStatus(win, short, status_dim, status_row, &used_cells, left_limit);
-                } else {
-                    const fit = autil.cellFitSuffix(win, status_path, path_budget);
-                    printStatus(win, fit.slice, status_dim, status_row, &used_cells, left_limit);
-                }
-            }
-        }
-    }
+    // Workspace identity is its own dimension (not a buffer tab): keep the
+    // name visible even in a single-workspace session so workspace switching
+    // is observable, but let the planner drop it on narrow rows.
+    var ws_buf: [128]u8 = undefined;
+    const ws_text: ?[]const u8 = std.fmt.bufPrint(&ws_buf, "[{s}]", .{self.curWsName()}) catch null;
 
-    if (ai_text) |text| {
-        if (ai_cells > 0 and ai_cells <= win.width) {
-            const ai_status = self.ai.threads.activeStatus();
-            const ai_style: vaxis.Style = .{
-                .fg = .{ .rgb = switch (ai_status) {
-                    .streaming => self.theme.accent,
-                    .err => self.theme.diag_error,
-                    else => self.theme.fg_dim,
-                } },
-                .bg = status_bg,
-            };
-            const ai_seg = [_]vaxis.Segment{.{ .text = text, .style = ai_style }};
-            _ = win.print(&ai_seg, .{
-                .row_offset = @intCast(status_row),
-                .col_offset = @intCast(win.width - ai_cells),
-                .wrap = .none,
+    var branch_buf: [96]u8 = undefined;
+    const branch_text: ?[]const u8 = if (self.git_branch) |b| blk: {
+        const trimmed = std.mem.trim(u8, b, " \t\r\n");
+        if (trimmed.len == 0) break :blk null;
+        break :blk std.fmt.bufPrint(&branch_buf, "⎇ {s}", .{trimmed}) catch null;
+    } else null;
+
+    const model = statusline.Model{
+        .mode = .{ .text = mode_text, .cells = @intCast(autil.cellWidth(win, mode_text)), .role = mode_role },
+        .dirty = self.cur().dirty,
+        .branch = if (branch_text) |txt| .{ .text = txt, .cells = @intCast(autil.cellWidth(win, txt)), .role = .branch } else null,
+        .diff = if (diff_text) |txt| .{ .text = txt, .cells = @intCast(autil.cellWidth(win, txt)), .role = .diff_add } else null,
+        .diagnostics = if (diag_text) |txt| .{ .text = txt, .cells = @intCast(autil.cellWidth(win, txt)), .role = .diag_error } else null,
+        .message = if (self.msg) |m| .{ .text = m, .cells = @intCast(autil.cellWidth(win, m)), .role = .message } else null,
+        .recording = if (rec_text) |txt| .{ .text = txt, .cells = @intCast(autil.cellWidth(win, txt)), .role = .recording } else null,
+        .workspace = if (ws_text) |txt| .{ .text = txt, .cells = @intCast(autil.cellWidth(win, txt)), .role = .secondary } else null,
+        .agent = if (ai_text) |txt| .{ .text = txt, .cells = ai_cells, .role = .agent } else null,
+        .lsp = if (lsp_text) |txt| .{ .text = txt, .cells = @intCast(autil.cellWidth(win, txt)), .role = .lsp } else null,
+        .filetype = if (ft_text) |txt| .{ .text = txt, .cells = @intCast(autil.cellWidth(win, txt)), .role = .filetype } else null,
+        .position = .{ .text = pos_text, .cells = @intCast(autil.cellWidth(win, pos_text)), .role = .position },
+        .progress = if (progress_text) |txt| .{ .text = txt, .cells = @intCast(autil.cellWidth(win, txt)), .role = .progress } else null,
+        .completion_marker = if (self.completion_slot != null) statusline.Item{ .text = "…", .cells = 1, .role = .muted } else null,
+    };
+    const status_plan = statusline.plan(model, win.width);
+
+    for (status_plan.slice()) |seg| {
+        if (seg.x >= win.width or seg.cells == 0) continue;
+        var style: vaxis.Style = .{ .fg = .{ .rgb = t.fg }, .bg = status_bg };
+        switch (seg.item.role) {
+            .mode_normal, .mode_insert, .mode_visual, .mode_command => {
+                const bg = switch (seg.item.role) {
+                    .mode_normal => t.accent_alt,
+                    .mode_insert => t.git_add,
+                    .mode_visual => t.keyword,
+                    .mode_command => t.accent,
+                    else => unreachable,
+                };
+                const on_light = theme.contrastRatio(bg, t.bg) >= theme.contrastRatio(bg, t.fg);
+                style = .{
+                    .fg = .{ .rgb = if (on_light) t.bg else t.fg },
+                    .bg = .{ .rgb = bg },
+                    .bold = true,
+                };
+            },
+            .separator => style = .{ .fg = .{ .rgb = t.win_sep }, .bg = status_bg },
+            .muted => style = .{ .fg = .{ .rgb = t.fg_faint }, .bg = status_bg },
+            .secondary, .branch, .filetype, .progress => style = .{ .fg = .{ .rgb = t.fg_dim }, .bg = status_bg },
+            .dirty => style = .{ .fg = .{ .rgb = t.accent }, .bg = status_bg, .bold = true },
+            .diff_add => style = .{ .fg = .{ .rgb = t.git_add }, .bg = status_bg },
+            .diff_del => style = .{ .fg = .{ .rgb = t.git_del }, .bg = status_bg },
+            .diag_error => style = .{ .fg = .{ .rgb = t.diag_error }, .bg = status_bg },
+            .diag_warn => style = .{ .fg = .{ .rgb = t.diag_warn }, .bg = status_bg },
+            .diag_info => style = .{ .fg = .{ .rgb = t.diag_info }, .bg = status_bg },
+            .lsp => style = .{ .fg = .{ .rgb = if (lsp_connected) t.accent_alt else t.fg_faint }, .bg = status_bg },
+            .position => style = .{ .fg = .{ .rgb = t.fg }, .bg = status_bg, .bold = true },
+            .message, .primary => style = .{ .fg = .{ .rgb = t.fg }, .bg = status_bg },
+            .recording => style = .{ .fg = .{ .rgb = t.diag_warn }, .bg = status_bg, .bold = true },
+            .agent => {
+                const ai_status = self.ai.threads.activeStatus();
+                style = .{
+                    .fg = .{ .rgb = switch (ai_status) {
+                        .streaming => t.accent,
+                        .err => t.diag_error,
+                        else => t.fg_dim,
+                    } },
+                    .bg = status_bg,
+                };
+            },
+        }
+        const fit = autil.cellFitPrefix(win, seg.item.text, seg.cells);
+        if (fit.slice.len == 0) continue;
+        // The mode badge owns its full reserved width so the badge shape is
+        // stable while switching modes.
+        if (seg.item.role == .mode_normal or seg.item.role == .mode_insert or
+            seg.item.role == .mode_visual or seg.item.role == .mode_command)
+        {
+            var badge = win.child(.{
+                .x_off = @intCast(seg.x),
+                .y_off = @intCast(status_row),
+                .width = @intCast(seg.cells),
+                .height = 1,
             });
+            badge.fill(.{ .style = .{ .bg = style.bg } });
         }
+        const line = [_]vaxis.Segment{.{ .text = fit.slice, .style = style }};
+        _ = win.print(&line, .{
+            .row_offset = @intCast(status_row),
+            .col_offset = @intCast(seg.x),
+            .wrap = .none,
+        });
     }
 
     // terminal focused: the widget's draw() already placed the child's
@@ -4510,7 +5103,9 @@ pub fn run(self: *App) !void {
         // immediately — otherwise the loop would block in pollEvent below
         // before the new hover window / completion menu is drawn.
         const nav_ready = self.processNav();
+        const passive_ready = self.processPassiveNav();
         const comp_ready = self.processCompletion();
+        const comp_resolved = self.processCompletionResolve();
         const fmt_ready = self.processFormat();
         const inlay_ready = self.processInlay();
         const outline_ready = self.processOutline();
@@ -4579,7 +5174,7 @@ pub fn run(self: *App) !void {
                 }
             }
         }
-        if (nav_ready or comp_ready or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready or lsp_ready or term_ready or ai_ready or ai_tools_ready or ai_terminal_ready or inline_ready) {
+        if (nav_ready or passive_ready or comp_ready or comp_resolved or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready or lsp_ready or term_ready or ai_ready or ai_tools_ready or ai_terminal_ready or inline_ready) {
             try self.render();
             last_render_ms = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
             continue;
@@ -4636,7 +5231,7 @@ pub fn run(self: *App) !void {
         // animation's last spread) and the loop would block forever
         // without ever drawing it. Force that one render.
         var poll_transition = false;
-        if (self.scopeAnimActive() or self.blameHoldActive() or self.gitHoldActive() or self.animationActive() or (term.supported and self.term_pane != null)) {
+        if (self.scopeAnimActive() or self.blameHoldActive() or self.gitHoldActive() or self.animationActive() or self.completionResolveWaiting() or (term.supported and self.term_pane != null)) {
             std.Io.sleep(self.io, .fromMilliseconds(1), .real) catch {};
             self.poll_mode_active = true;
         } else if (self.poll_mode_active) {
@@ -4655,6 +5250,11 @@ pub fn run(self: *App) !void {
         // one by one (handleKey), byte-faithful — no accumulation needed
         const term_focused = term.supported and self.term_pane != null and self.term_pane.?.focused;
         while (try self.loop.tryEvent()) |event| {
+            // One batch may click back into the editor and immediately
+            // type '('. Invalidate the OLD focus after each event, before
+            // the next event can create a valid new signature request.
+            // defer also covers paste/terminal branches that continue.
+            defer self.syncPassiveFocus();
             switch (event) {
                 .mouse => |m| {
                     // Left press = click, wheel = scroll. Motion/drag/

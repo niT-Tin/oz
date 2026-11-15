@@ -241,119 +241,359 @@ pub fn parseSignature(alloc: std.mem.Allocator, result: std.json.Value) !?[]u8 {
     return null;
 }
 
-/// A completion candidate: the text an accept would insert plus the LSP
-/// CompletionItemKind (0 = unknown / buffer-word fallback), used for the
-/// kind icon in the menu.
+/// Documentation markup kind. The editor must not treat a plaintext value as
+/// Markdown (stars/backticks stay literal); servers that return a string or
+/// `{kind:"plaintext"}` get literal rendering.
+pub const DocKind = enum { plaintext, markdown };
+
+/// Per-item asynchronous completionItem/resolve state. A late result may only
+/// update the item it was requested for.
+pub const ResolveState = enum { none, loading, ready, empty, failed };
+
+/// A completion candidate. The display label, the text accepted into the
+/// buffer, and the client-side filter key are deliberately separate: servers
+/// such as ZLS return `labelDetails` and a `filterText` that must not leak
+/// into the inserted bytes or into a label-only match.
 pub const CompletionItem = struct {
-    text: []u8, // owned
-    kind: u8,
-    /// CompletionItem.detail (owned, optional): a one-line signature hint
-    /// shown in the documentation pane when the server supplies no docs.
+    /// CompletionItem.label (owned): what the menu shows.
+    label: []u8,
+    /// Insertion text (owned, optional). null means "same as label".
+    insert_text: ?[]u8 = null,
+    /// filterText (owned, optional). null means "filter by label".
+    filter_text: ?[]u8 = null,
+    /// LSP CompletionItemKind (0 = unknown / buffer-word fallback).
+    kind: u8 = 0,
+    /// labelDetails.detail (owned, optional): e.g. "(comptime T: type)".
+    label_detail: ?[]u8 = null,
+    /// labelDetails.description (owned, optional): e.g. "type" (never
+    /// synthesized from kind or from the signature).
+    label_description: ?[]u8 = null,
+    /// CompletionItem.detail (owned, optional): full signature/header.
     detail: ?[]u8 = null,
-    /// CompletionItem.documentation (owned, optional): markdown (or plain
-    /// text) rendered by the completion documentation popup.
+    /// CompletionItem.documentation value (owned, optional).
     doc: ?[]u8 = null,
+    doc_kind: DocKind = .plaintext,
+    /// Semantic match key for preserving selection across responses. It is
+    /// not a unique handle: resolve ownership also needs generation + index.
+    item_id: u64 = 0,
+    /// Cross-refresh match excluding the edit range, whose end usually
+    /// follows the growing typed prefix. Used only when the match is unique.
+    selection_key: u64 = 0,
+    /// Raw `data` payload for completionItem/resolve (owned JSON text).
+    data_json: ?[]u8 = null,
+    deprecated: bool = false,
+    /// Resolve bookkeeping (only meaningful for the selected item).
+    resolve_requested: bool = false,
+    resolve_state: ResolveState = .none,
+
+    pub fn insertText(self: *const CompletionItem) []const u8 {
+        return self.insert_text orelse self.label;
+    }
+
+    pub fn filterText(self: *const CompletionItem) []const u8 {
+        return self.filter_text orelse self.label;
+    }
 
     pub fn deinit(self: *CompletionItem, alloc: std.mem.Allocator) void {
-        alloc.free(self.text);
-        if (self.detail) |d| alloc.free(d);
-        if (self.doc) |d| alloc.free(d);
+        alloc.free(self.label);
+        if (self.insert_text) |v| alloc.free(v);
+        if (self.filter_text) |v| alloc.free(v);
+        if (self.label_detail) |v| alloc.free(v);
+        if (self.label_description) |v| alloc.free(v);
+        if (self.detail) |v| alloc.free(v);
+        if (self.doc) |v| alloc.free(v);
+        if (self.data_json) |v| alloc.free(v);
     }
 };
 
-/// Duplicate a CompletionItem.documentation value: either a plain string or
-/// a MarkupContent object `{kind, value}`. Returns null for absent/other
-/// shapes.
-fn dupeDocumentation(alloc: std.mem.Allocator, v: std.json.Value) !?[]u8 {
+fn intOf(v: std.json.Value) ?i64 {
+    return switch (v) {
+        .integer => |n| n,
+        .number_string => |s| std.fmt.parseInt(i64, s, 10) catch null,
+        else => null,
+    };
+}
+
+fn stringField(item: std.json.Value, name: []const u8) ?[]const u8 {
+    if (item != .object) return null;
+    const v = item.object.get(name) orelse return null;
+    if (v != .string) return null;
+    return v.string;
+}
+
+/// Parse a documentation value: a plain string is literal; a MarkupContent
+/// object carries its own kind. Unknown kinds degrade to plaintext instead of
+/// being rendered as Markdown.
+fn parseDocumentation(alloc: std.mem.Allocator, v: std.json.Value, kind: *DocKind) !?[]u8 {
     switch (v) {
-        .string => |s| return try alloc.dupe(u8, s),
-        .object => |o| {
-            if (o.get("value")) |val| {
-                if (val == .string) return try alloc.dupe(u8, val.string);
-            }
+        .string => |s| {
+            kind.* = .plaintext;
+            return try alloc.dupe(u8, s);
         },
-        else => {},
+        .object => |o| {
+            const val = o.get("value") orelse return null;
+            if (val != .string) return null;
+            kind.* = .plaintext;
+            if (o.get("kind")) |k| {
+                if (k == .string and std.mem.eql(u8, k.string, "markdown")) kind.* = .markdown;
+            }
+            return try alloc.dupe(u8, val.string);
+        },
+        else => return null,
     }
-    return null;
+}
+
+const LabelDetails = struct { detail: ?[]u8 = null, description: ?[]u8 = null };
+
+fn labelDetails(alloc: std.mem.Allocator, item: std.json.Value) !LabelDetails {
+    var out = LabelDetails{};
+    if (item != .object) return out;
+    const ld = item.object.get("labelDetails") orelse return out;
+    if (ld != .object) return out;
+    errdefer {
+        if (out.detail) |v| alloc.free(v);
+        if (out.description) |v| alloc.free(v);
+    }
+    if (ld.object.get("detail")) |d| {
+        if (d == .string) out.detail = try alloc.dupe(u8, d.string);
+    }
+    if (ld.object.get("description")) |d| {
+        if (d == .string) out.description = try alloc.dupe(u8, d.string);
+    }
+    return out;
+}
+
+fn stableItemId(label: []const u8, insert_text: []const u8, detail: ?[]const u8, ld_detail: ?[]const u8, ld_desc: ?[]const u8, kind: u8, data: ?[]const u8, edit: ?[]const u8) u64 {
+    var h = std.hash.Wyhash.init(0x6f7a2d31);
+    h.update(label);
+    h.update("\x00");
+    h.update(insert_text);
+    h.update("\x00");
+    if (detail) |d| h.update(d);
+    h.update("\x00");
+    if (ld_detail) |d| h.update(d);
+    h.update("\x00");
+    if (ld_desc) |d| h.update(d);
+    var kb: [1]u8 = .{kind};
+    h.update(&kb);
+    h.update("\x00");
+    if (data) |d| h.update(d);
+    h.update("\x00");
+    if (edit) |e| h.update(e);
+    return h.final();
+}
+
+test "navigation: equal completion labels retain data and edit identities" {
+    const a = std.testing.allocator;
+    const payload =
+        \\[{"label":"duplicate","detail":"fn duplicate() void","data":{"id":"A"}},
+        \\ {"label":"duplicate","detail":"fn duplicate() void","data":{"id":"B"}},
+        \\ {"label":"duplicate","detail":"fn duplicate() void","data":{"id":"A"},"textEdit":{"newText":"duplicate","range":{"start":{"line":0,"character":1},"end":{"line":0,"character":2}}}},
+        \\ {"label":"duplicate","detail":"fn duplicate() void","data":{"id":"A"},"textEdit":{"newText":"duplicate","range":{"start":{"line":0,"character":3},"end":{"line":0,"character":4}}}}]
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, payload, .{});
+    defer parsed.deinit();
+    var items = std.ArrayList(CompletionItem).empty;
+    defer {
+        for (items.items) |*item| item.deinit(a);
+        items.deinit(a);
+    }
+    try parseCompletionItems(a, parsed.value, &items);
+    try std.testing.expectEqual(@as(usize, 4), items.items.len);
+    for (items.items, 0..) |item, i| {
+        for (items.items[i + 1 ..]) |other| try std.testing.expect(item.item_id != other.item_id);
+    }
+}
+
+fn parseOne(alloc: std.mem.Allocator, item: std.json.Value) !?CompletionItem {
+    if (item != .object) return null;
+
+    // Snippet candidates (insertTextFormat=2) embed ${n:...} placeholder
+    // syntax this editor cannot expand; inserting verbatim corrupts text.
+    // Keep the safe existing fallback: insert the plain label.
+    const is_snippet: bool = blk: {
+        const f = item.object.get("insertTextFormat") orelse break :blk false;
+        const fv = intOf(f) orelse break :blk false;
+        break :blk fv == 2;
+    };
+
+    const label_raw = stringField(item, "label");
+    var insert_raw: ?[]const u8 = null;
+    if (!is_snippet) {
+        if (item.object.get("textEdit")) |te| {
+            if (te == .object) {
+                if (te.object.get("newText")) |nt| {
+                    if (nt == .string) insert_raw = nt.string;
+                }
+            }
+        }
+        if (insert_raw == null) insert_raw = stringField(item, "insertText");
+    }
+    // A raw-array item with only textEdit still needs a display label.
+    const label_src = label_raw orelse insert_raw orelse return null;
+    if (label_src.len == 0) return null;
+
+    var kind: u8 = 0;
+    if (item.object.get("kind")) |k| {
+        if (intOf(k)) |n| {
+            if (n >= 1 and n <= 255) kind = @intCast(n);
+        }
+    }
+
+    var detail: ?[]u8 = null;
+    if (item.object.get("detail")) |d| {
+        if (d == .string) detail = try alloc.dupe(u8, d.string);
+    }
+    errdefer if (detail) |d| alloc.free(d);
+
+    var doc: ?[]u8 = null;
+    var doc_kind: DocKind = .plaintext;
+    if (item.object.get("documentation")) |d| {
+        doc = try parseDocumentation(alloc, d, &doc_kind);
+    }
+    errdefer if (doc) |d| alloc.free(d);
+
+    const ld = try labelDetails(alloc, item);
+    errdefer {
+        if (ld.detail) |d| alloc.free(d);
+        if (ld.description) |d| alloc.free(d);
+    }
+
+    var insert_copy: ?[]u8 = null;
+    // Only allocate when insertion differs from the label; the rest of the
+    // editor asks insertText() and gets the label otherwise.
+    if (insert_raw) |ins| {
+        if (!std.mem.eql(u8, ins, label_src)) insert_copy = try alloc.dupe(u8, ins);
+    }
+    errdefer if (insert_copy) |v| alloc.free(v);
+
+    var filter_copy: ?[]u8 = null;
+    if (stringField(item, "filterText")) |f| {
+        if (!std.mem.eql(u8, f, label_src)) filter_copy = try alloc.dupe(u8, f);
+    }
+    errdefer if (filter_copy) |v| alloc.free(v);
+
+    var data_json: ?[]u8 = null;
+    if (item.object.get("data")) |data| {
+        data_json = try std.json.Stringify.valueAlloc(alloc, data, .{});
+    }
+    errdefer if (data_json) |v| alloc.free(v);
+
+    var deprecated = false;
+    if (item.object.get("deprecated")) |d| {
+        if (d == .bool) deprecated = d.bool;
+    }
+    if (item.object.get("tags")) |tags| {
+        if (tags == .array) {
+            for (tags.array.items) |tag| {
+                if (intOf(tag)) |n| {
+                    if (n == 1) deprecated = true;
+                }
+            }
+        }
+    }
+
+    const label_copy = try alloc.dupe(u8, label_src);
+    errdefer alloc.free(label_copy);
+
+    // Preserve selection across refreshes without conflating equal-looking
+    // items from different symbols/edits. Resolve authorization additionally
+    // checks response generation + index; this hash is not a unique handle.
+    const edit_json = if (item.object.get("textEdit")) |edit|
+        try std.json.Stringify.valueAlloc(alloc, edit, .{})
+    else
+        null;
+    defer if (edit_json) |v| alloc.free(v);
+    const id = stableItemId(label_copy, if (insert_copy) |v| v else label_copy, detail, ld.detail, ld.description, kind, data_json, edit_json);
+    const selection_key = stableItemId(label_copy, if (insert_copy) |v| v else label_copy, detail, ld.detail, ld.description, kind, data_json, null);
+    return CompletionItem{
+        .label = label_copy,
+        .insert_text = insert_copy,
+        .filter_text = filter_copy,
+        .kind = kind,
+        .label_detail = ld.detail,
+        .label_description = ld.description,
+        .detail = detail,
+        .doc = doc,
+        .doc_kind = doc_kind,
+        .item_id = id,
+        .selection_key = selection_key,
+        .data_json = data_json,
+        .deprecated = deprecated,
+    };
+}
+
+/// Exact identities take priority; a changing replacement range may fall
+/// back to a unique semantic match. Ambiguous duplicates explicitly reset
+/// selection instead of silently choosing an equal-looking candidate.
+pub fn completionSelection(items: []const CompletionItem, previous_id: u64, previous_key: u64) ?usize {
+    return uniqueCompletionMatch(items, previous_id, "item_id") orelse
+        uniqueCompletionMatch(items, previous_key, "selection_key");
+}
+
+fn uniqueCompletionMatch(items: []const CompletionItem, key: u64, comptime field: []const u8) ?usize {
+    var found: ?usize = null;
+    for (items, 0..) |item, i| {
+        if (@field(item, field) != key) continue;
+        if (found != null) return null;
+        found = i;
+    }
+    return found;
 }
 
 /// Parse a textDocument/completion response (CompletionList | CompletionItem[])
-/// into owned items appended to `out`. The label (or insertText /
-/// textEdit.newText when present) is what an accept would insert.
+/// into owned items appended to `out`. Display, insertion and filtering are
+/// separate fields; a malformed entry is skipped rather than aborting the
+/// whole list.
 pub fn parseCompletionItems(alloc: std.mem.Allocator, result: std.json.Value, out: *std.ArrayList(CompletionItem)) !void {
-    // result may be {items:[...]} (CompletionList) or [...]
     const items: std.json.Value = if (result == .object)
         (result.object.get("items") orelse return)
     else
         result;
     if (items != .array) return;
-    for (items.array.items) |item| {
-        if (item != .object) continue;
-        // Snippet candidates (insertTextFormat=2) embed ${n:...} placeholder
-        // syntax this editor cannot expand; inserting it verbatim would
-        // corrupt the text and leave the cursor stranded mid-word (zls's
-        // standardTargetOptions is such a snippet). Fall back to the plain
-        // label so the accept inserts clean text and the cursor lands after
-        // it.
-        const is_snippet: bool = blk: {
-            const f = item.object.get("insertTextFormat") orelse break :blk false;
-            const fv: ?i64 = switch (f) {
-                .integer => |n| n,
-                .number_string => |s| std.fmt.parseInt(i64, s, 10) catch null,
-                else => null,
-            };
-            break :blk fv == 2;
-        };
-        // prefer insertText / textEdit.newText, fall back to label
-        var text: ?[]const u8 = null;
-        if (!is_snippet) {
-            if (item.object.get("textEdit")) |te| {
-                if (te == .object) {
-                    if (te.object.get("newText")) |nt| {
-                        if (nt == .string) text = nt.string;
-                    }
-                }
+    for (items.array.items) |raw| {
+        const parsed = try parseOne(alloc, raw);
+        if (parsed) |it| {
+            errdefer {
+                var tmp = it;
+                tmp.deinit(alloc);
             }
-            if (text == null) {
-                if (item.object.get("insertText")) |it| {
-                    if (it == .string) text = it.string;
-                }
-            }
+            try out.append(alloc, it);
         }
-        if (text == null) {
-            if (item.object.get("label")) |lb| {
-                if (lb == .string) text = lb.string;
-            }
-        }
-        const t = text orelse continue;
-        if (t.len == 0) continue;
-        var kind: u8 = 0;
-        if (item.object.get("kind")) |k| {
-            // zig's json parser may surface integers as .integer or
-            // .number_string depending on magnitude/source
-            const kint: ?i64 = switch (k) {
-                .integer => |n| n,
-                .number_string => |s| std.fmt.parseInt(i64, s, 10) catch null,
-                else => null,
-            };
-            if (kint) |n| {
-                if (n >= 1 and n <= 255) kind = @intCast(n);
-            }
-        }
-        var detail: ?[]u8 = null;
-        if (item.object.get("detail")) |d| {
-            if (d == .string) detail = try alloc.dupe(u8, d.string);
-        }
-        errdefer if (detail) |d| alloc.free(d);
-        var doc: ?[]u8 = null;
-        if (item.object.get("documentation")) |d| {
-            doc = try dupeDocumentation(alloc, d);
-        }
-        errdefer if (doc) |d| alloc.free(d);
-        const copy = try alloc.dupe(u8, t);
-        errdefer alloc.free(copy);
-        try out.append(alloc, .{ .text = copy, .kind = kind, .detail = detail, .doc = doc });
     }
+}
+
+/// Fields a completionItem/resolve response may refine. Ownership: strings
+/// are allocated with `alloc`.
+pub const ResolvedCompletion = struct {
+    detail: ?[]u8 = null,
+    doc: ?[]u8 = null,
+    doc_kind: DocKind = .plaintext,
+    label_detail: ?[]u8 = null,
+    label_description: ?[]u8 = null,
+
+    pub fn deinit(self: *ResolvedCompletion, alloc: std.mem.Allocator) void {
+        if (self.detail) |v| alloc.free(v);
+        if (self.doc) |v| alloc.free(v);
+        if (self.label_detail) |v| alloc.free(v);
+        if (self.label_description) |v| alloc.free(v);
+    }
+};
+
+pub fn parseCompletionResolve(alloc: std.mem.Allocator, result: std.json.Value) !ResolvedCompletion {
+    var out = ResolvedCompletion{};
+    if (result != .object) return out;
+    errdefer out.deinit(alloc);
+    if (result.object.get("detail")) |d| {
+        if (d == .string) out.detail = try alloc.dupe(u8, d.string);
+    }
+    if (result.object.get("documentation")) |d| {
+        out.doc = try parseDocumentation(alloc, d, &out.doc_kind);
+    }
+    const ld = try labelDetails(alloc, result);
+    out.label_detail = ld.detail;
+    out.label_description = ld.description;
+    return out;
 }
 
 test "navigation: textDocument/position params round-trip" {
@@ -494,9 +734,14 @@ test "navigation: completion items from CompletionList and raw array" {
     }
     try parseCompletionItems(alloc, p1.value, &out1);
     try std.testing.expectEqual(@as(usize, 2), out1.items.len);
-    try std.testing.expectEqualStrings("alpha", out1.items[0].text);
+    try std.testing.expectEqualStrings("alpha", out1.items[0].label);
+    try std.testing.expectEqualStrings("alpha", out1.items[0].insertText());
     try std.testing.expectEqual(@as(u8, 5), out1.items[0].kind); // Field
-    try std.testing.expectEqualStrings("betaFn", out1.items[1].text);
+    // Display and insertion are separate: insertText must never replace the
+    // label in the menu, and label must never be accepted when insertText is
+    // the server-provided insertion.
+    try std.testing.expectEqualStrings("beta", out1.items[1].label);
+    try std.testing.expectEqualStrings("betaFn", out1.items[1].insertText());
     try std.testing.expectEqual(@as(u8, 0), out1.items[1].kind); // no kind → 0
 
     // raw array form
@@ -510,8 +755,9 @@ test "navigation: completion items from CompletionList and raw array" {
     }
     try parseCompletionItems(alloc, p2.value, &out2);
     try std.testing.expectEqual(@as(usize, 2), out2.items.len);
-    try std.testing.expectEqualStrings("x", out2.items[0].text);
-    try std.testing.expectEqualStrings("y", out2.items[1].text);
+    try std.testing.expectEqualStrings("x", out2.items[0].label);
+    try std.testing.expectEqualStrings("y", out2.items[1].label);
+    try std.testing.expectEqualStrings("y", out2.items[1].insertText());
 }
 
 test "navigation: completion detail and documentation are parsed" {
@@ -548,7 +794,94 @@ test "navigation: snippet completion items degrade to their label" {
     try parseCompletionItems(alloc, p.value, &out);
     try std.testing.expectEqual(@as(usize, 2), out.items.len);
     // snippet with textEdit: label wins over the placeholder-laden newText
-    try std.testing.expectEqualStrings("standardTargetOptions", out.items[0].text);
+    try std.testing.expectEqualStrings("standardTargetOptions", out.items[0].label);
     // snippet without textEdit: label wins over insertText too
-    try std.testing.expectEqualStrings("plain", out.items[1].text);
+    try std.testing.expectEqualStrings("plain", out.items[1].label);
+}
+
+test "navigation: labelDetails, filterText, doc kind and stable identity are separate" {
+    const alloc = std.testing.allocator;
+    const j =
+        \\{"items":[
+        \\ {"label":"ArrayList","insertText":"ArrayList","filterText":"AL","kind":22,
+        \\  "labelDetails":{"detail":"(comptime T: type)","description":"type"},
+        \\  "detail":"fn (comptime T: type) type",
+        \\  "documentation":{"kind":"markdown","value":"**body**"},
+        \\  "data":{"kind":22}},
+        \\ {"label":"ArrayList","insertText":"ArrayList","kind":22,
+        \\  "labelDetails":{"detail":"(comptime E)","description":"type"}},
+        \\ {"label":"plain","kind":9,"tags":[1],"documentation":"literal *stars*"}
+        \\]}
+    ;
+    var p = try std.json.parseFromSlice(std.json.Value, alloc, j, .{ .allocate = .alloc_always });
+    defer p.deinit();
+    var out = std.ArrayList(CompletionItem).empty;
+    defer {
+        for (out.items) |*it| it.deinit(alloc);
+        out.deinit(alloc);
+    }
+    try parseCompletionItems(alloc, p.value, &out);
+    try std.testing.expectEqual(@as(usize, 3), out.items.len);
+
+    const a = &out.items[0];
+    try std.testing.expectEqualStrings("ArrayList", a.label);
+    try std.testing.expectEqualStrings("ArrayList", a.insertText());
+    try std.testing.expectEqualStrings("AL", a.filterText());
+    try std.testing.expectEqualStrings("(comptime T: type)", a.label_detail.?);
+    try std.testing.expectEqualStrings("type", a.label_description.?);
+    try std.testing.expectEqual(DocKind.markdown, a.doc_kind);
+    try std.testing.expectEqualStrings("**body**", a.doc.?);
+    try std.testing.expect(a.data_json != null);
+    try std.testing.expect(a.item_id != 0);
+    // Same label, different signature → distinct identity.
+    try std.testing.expect(a.item_id != out.items[1].item_id);
+
+    const plain = &out.items[2];
+    try std.testing.expectEqual(DocKind.plaintext, plain.doc_kind);
+    try std.testing.expectEqualStrings("literal *stars*", plain.doc.?);
+    try std.testing.expect(plain.deprecated);
+
+    // Resolve refines fields without changing the item's identity.
+    const before = a.item_id;
+    const rj = "{\"detail\":\"resolved fn\",\"documentation\":{\"kind\":\"markdown\",\"value\":\"RESOLVED\"},\"labelDetails\":{\"detail\":\"(T)\",\"description\":\"struct\"}}";
+    var rp = try std.json.parseFromSlice(std.json.Value, alloc, rj, .{ .allocate = .alloc_always });
+    defer rp.deinit();
+    var resolved = try parseCompletionResolve(alloc, rp.value);
+    defer resolved.deinit(alloc);
+    try std.testing.expectEqual(before, a.item_id);
+    try std.testing.expectEqualStrings("resolved fn", resolved.detail.?);
+    try std.testing.expectEqualStrings("RESOLVED", resolved.doc.?);
+    try std.testing.expectEqual(DocKind.markdown, resolved.doc_kind);
+    try std.testing.expectEqualStrings("(T)", resolved.label_detail.?);
+    try std.testing.expectEqualStrings("struct", resolved.label_description.?);
+}
+
+test "navigation: selected completion survives a growing replacement range without merging duplicates" {
+    const a = std.testing.allocator;
+    const payload =
+        \\[{"label":"dup","data":{"id":"A"},"textEdit":{"newText":"dup","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":2}}}},
+        \\ {"label":"dup","data":{"id":"B"},"textEdit":{"newText":"dup","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":2}}}}]
+    ;
+    const longer = try std.mem.replaceOwned(u8, a, payload, "\"character\":2", "\"character\":3");
+    defer a.free(longer);
+    var before_json = try std.json.parseFromSlice(std.json.Value, a, payload, .{});
+    defer before_json.deinit();
+    var after_json = try std.json.parseFromSlice(std.json.Value, a, longer, .{});
+    defer after_json.deinit();
+    var before = std.ArrayList(CompletionItem).empty;
+    var after = std.ArrayList(CompletionItem).empty;
+    defer {
+        for (before.items) |*it| it.deinit(a);
+        for (after.items) |*it| it.deinit(a);
+        before.deinit(a);
+        after.deinit(a);
+    }
+    try parseCompletionItems(a, before_json.value, &before);
+    try parseCompletionItems(a, after_json.value, &after);
+    try std.testing.expect(before.items[1].item_id != after.items[1].item_id);
+    try std.testing.expectEqual(@as(?usize, 1), completionSelection(after.items, before.items[1].item_id, before.items[1].selection_key));
+    // If neither exact nor semantic identity is unique, don't claim a match.
+    after.items[0].item_id = after.items[1].item_id;
+    after.items[0].selection_key = after.items[1].selection_key;
+    try std.testing.expect(completionSelection(after.items, before.items[1].item_id, before.items[1].selection_key) == null);
 }

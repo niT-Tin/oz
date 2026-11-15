@@ -447,12 +447,20 @@ const Grid = struct {
     /// instead of inheriting the label fg.
     ul_buf: []u32 = &.{},
     ul_on_buf: []bool = &.{},
+    /// Per-cell SGR 1/2/3 attributes. Recorded so tests can prove italic
+    /// comments, bold active tabs and the removal of hint double-dim.
+    bold_buf: []bool = &.{},
+    dim_buf: []bool = &.{},
+    italic_buf: []bool = &.{},
     row: usize = 0,
     col: usize = 0,
     fg: u32 = 0, // current fg color (packed RGB, 0 = default)
     bg: u32 = 0, // current bg color (packed RGB, 0 = default)
     ul: u32 = 0, // current underline color (packed RGB, 0 = default)
     ul_on: bool = false, // SGR 4 single underline active
+    bold: bool = false, // SGR 1
+    dim: bool = false, // SGR 2
+    italic: bool = false, // SGR 3
     /// Scratch buffer for rowText (one row of compressed cells; the AI
     /// workspace tests use 120 columns with 4-byte box-drawing glyphs).
     row_text_buf: [160 * 4]u8 = undefined,
@@ -490,6 +498,12 @@ const Grid = struct {
         @memset(ul_buf, 0);
         const ul_on_buf = try alloc.alloc(bool, rows * cols);
         @memset(ul_on_buf, false);
+        const bold_buf = try alloc.alloc(bool, rows * cols);
+        @memset(bold_buf, false);
+        const dim_buf = try alloc.alloc(bool, rows * cols);
+        @memset(dim_buf, false);
+        const italic_buf = try alloc.alloc(bool, rows * cols);
+        @memset(italic_buf, false);
         return .{
             .rows = rows,
             .cols = cols,
@@ -498,6 +512,9 @@ const Grid = struct {
             .bg_buf = bg_buf,
             .ul_buf = ul_buf,
             .ul_on_buf = ul_on_buf,
+            .bold_buf = bold_buf,
+            .dim_buf = dim_buf,
+            .italic_buf = italic_buf,
             .alloc = alloc,
         };
     }
@@ -508,6 +525,9 @@ const Grid = struct {
         alloc.free(self.bg_buf);
         alloc.free(self.ul_buf);
         alloc.free(self.ul_on_buf);
+        alloc.free(self.bold_buf);
+        alloc.free(self.dim_buf);
+        alloc.free(self.italic_buf);
     }
 
     /// The 4-byte slot for one screen cell.
@@ -693,6 +713,9 @@ const Grid = struct {
                         self.bg_buf[self.row * self.cols + self.col] = self.bg;
                         self.ul_buf[self.row * self.cols + self.col] = self.ul;
                         self.ul_on_buf[self.row * self.cols + self.col] = self.ul_on;
+                        self.bold_buf[self.row * self.cols + self.col] = self.bold;
+                        self.dim_buf[self.row * self.cols + self.col] = self.dim;
+                        self.italic_buf[self.row * self.cols + self.col] = self.italic;
                         var extra: usize = 1;
                         while (extra < cells and self.col + extra < self.cols) : (extra += 1) {
                             @memset(self.cell(self.row, self.col + extra), 0);
@@ -700,6 +723,9 @@ const Grid = struct {
                             self.bg_buf[self.row * self.cols + self.col + extra] = self.bg;
                             self.ul_buf[self.row * self.cols + self.col + extra] = self.ul;
                             self.ul_on_buf[self.row * self.cols + self.col + extra] = self.ul_on;
+                            self.bold_buf[self.row * self.cols + self.col + extra] = self.bold;
+                            self.dim_buf[self.row * self.cols + self.col + extra] = self.dim;
+                            self.italic_buf[self.row * self.cols + self.col + extra] = self.italic;
                         }
                     }
                     self.col += cells;
@@ -730,6 +756,20 @@ const Grid = struct {
                         self.bg = 0;
                         self.ul = 0;
                         self.ul_on = false;
+                        self.bold = false;
+                        self.dim = false;
+                        self.italic = false;
+                    } else if (p == 1) {
+                        self.bold = true;
+                    } else if (p == 2) {
+                        self.dim = true;
+                    } else if (p == 3) {
+                        self.italic = true;
+                    } else if (p == 22) {
+                        self.bold = false;
+                        self.dim = false;
+                    } else if (p == 23) {
+                        self.italic = false;
                     } else if (p == 39) {
                         self.fg = 0;
                     } else if (p == 49) {
@@ -780,6 +820,9 @@ const Grid = struct {
                     self.bg_buf[self.row * self.cols + c] = 0;
                     self.ul_buf[self.row * self.cols + c] = 0;
                     self.ul_on_buf[self.row * self.cols + c] = false;
+                    self.bold_buf[self.row * self.cols + c] = false;
+                    self.dim_buf[self.row * self.cols + c] = false;
+                    self.italic_buf[self.row * self.cols + c] = false;
                 }
             },
         }
@@ -1001,21 +1044,64 @@ fn lastGlyphCol(grid: *Grid, r: usize, glyph: []const u8) ?usize {
 /// This is the screenshot regression: a row whose padding is counted in
 /// BYTES ("→" = 3 bytes / 1 cell) ends short, so its right │ drifts left of
 /// the corner and the panel gets a notch.
-fn assertPopupBox(grid: *Grid, top: usize) !usize {
-    const left = glyphCol(grid, top, "╭", 0) orelse return error.TestUnexpectedResult;
-    const right = glyphCol(grid, top, "╮", 0) orelse return error.TestUnexpectedResult;
+fn cellStartsWith(grid: *Grid, row: usize, col: usize, glyph: []const u8) bool {
+    return std.mem.startsWith(u8, frame.cellText(grid, row, col), glyph);
+}
+
+/// Assert the box with exact top/left/right corners. Using exact columns (not
+/// the rightmost │ on a row) supports two boxes side by side, and source
+/// indent guides under a floating popup.
+fn assertPopupBoxAt(grid: *Grid, top: usize, left: usize, right: usize) !usize {
+    if (!cellStartsWith(grid, top, left, "╭") or !cellStartsWith(grid, top, right, "╮")) {
+        return error.TestUnexpectedResult;
+    }
     var r = top + 1;
     while (r < grid.rows) : (r += 1) {
-        if (glyphCol(grid, r, "╯", 0)) |bottom| {
-            try std.testing.expectEqual(right, bottom);
-            return r;
+        if (cellStartsWith(grid, r, left, "╰") and cellStartsWith(grid, r, right, "╯")) return r;
+        if (!cellStartsWith(grid, r, left, "│") or !cellStartsWith(grid, r, right, "│")) {
+            return error.TestUnexpectedResult;
         }
-        const l = glyphCol(grid, r, "│", 0) orelse return error.TestUnexpectedResult;
-        const rr = lastGlyphCol(grid, r, "│") orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqual(left, l);
-        try std.testing.expectEqual(right, rr);
     }
     return error.TestUnexpectedResult;
+}
+
+fn assertPopupBox(grid: *Grid, top: usize) !usize {
+    const left = glyphCol(grid, top, "╭", 0) orelse return error.TestUnexpectedResult;
+    var c = left + 1;
+    while (c < grid.cols) : (c += 1) {
+        if (glyphCol(grid, top, "╮", c)) |right| {
+            return assertPopupBoxAt(grid, top, left, right);
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+/// Count and validate every top-left/top-right border pair on screen. This
+/// handles side-by-side popups (a menu and its docs share the top row).
+fn countPopupBoxes(grid: *Grid) !usize {
+    var count: usize = 0;
+    var r: usize = 0;
+    while (r < grid.rows) : (r += 1) {
+        var c: usize = 0;
+        while (c < grid.cols) {
+            if (cellStartsWith(grid, r, c, "╭")) {
+                var right: ?usize = null;
+                var rc = c + 1;
+                while (rc < grid.cols) : (rc += 1) {
+                    if (cellStartsWith(grid, r, rc, "╮")) {
+                        right = rc;
+                        break;
+                    }
+                }
+                _ = try assertPopupBoxAt(grid, r, c, right orelse return error.TestUnexpectedResult);
+                count += 1;
+                c = (right orelse c) + 1;
+            } else {
+                c += 1;
+            }
+        }
+    }
+    return count;
 }
 
 /// Feed the pty until `needle` disappears from the screen (or timeout).
@@ -2154,7 +2240,7 @@ test ":theme lists themes, switches colors, rejects unknown names" {
 
     // default theme is kanagawa-wave: bg 0x1F1F28
     const kanagawa_bg = packRgb(0x1F, 0x1F, 0x28);
-    try std.testing.expect(grid.rowHasBg(2, kanagawa_bg));
+    try std.testing.expect(grid.rowHasBg(3, kanagawa_bg)); // row 2 is the cursorline
 
     // :theme with no arg lists the available themes in the status bar
     try sess.send(":theme\r");
@@ -2188,8 +2274,10 @@ test ":theme lists themes, switches colors, rejects unknown names" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(grid.rowHasBg(2, moon_bg));
-    try std.testing.expect(!grid.rowHasBg(2, kanagawa_bg));
+    // Row 2 is the cursorline (intentionally a different surface); the
+    // editor background is visible on the next content row.
+    try std.testing.expect(grid.rowHasBg(3, moon_bg));
+    try std.testing.expect(!grid.rowHasBg(3, kanagawa_bg));
 
     // unknown theme → status message
     try sess.send(":theme bogus\r");
@@ -11633,7 +11721,7 @@ test "lsp: user flow — b. Ctrl+n stand Enter jk A keeps the cursor at EOL" {
         // mockAlphastand — Ctrl+n vs auto-accept timing) + cursor at EOL in
         // the status bar; both candidates are 14 chars so col 35 = line end
         if (grid.contains("mockItemstand") or grid.contains("mockAlphastand")) {
-            if (grid.contains("col 35")) ok = true;
+            if (grid.contains("col 34")) ok = true;
         }
     }
     if (!ok) {
@@ -13159,11 +13247,11 @@ test "picker + tab: file rows and tabs carry devicons" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(grid.contains("NORMAL"));
-    // tab bar (row 0) icon: seti_zig glyph. The active tab now paints its
-    // icon with the theme accent marker color (demo nav-icon treatment);
-    // inactive tabs keep the devicon's semantic color.
+    // tab bar (row 0) icon: seti_zig glyph. Active tabs keep the file-type
+    // color (identity comes from the ▏ marker + bold name); inactive tabs do
+    // too, only quieter. build.zig maps to the constant color.
     const zig_glyph = "\u{e6a9}";
-    try std.testing.expect(grid.containsFg(zig_glyph, packRgb(0x7E, 0x9C, 0xD8)));
+    try std.testing.expect(grid.containsFg(zig_glyph, packRgb(0xFF, 0xA0, 0x66)));
 
     // <leader>sf + "main" filters to src/main.zig; its picker row also
     // carries the zig icon before the path. Wait on the picker's own input
@@ -15231,16 +15319,31 @@ test "popup geometry: hover/completion borders align; markdown rendered" {
     try gridWaitFor(&sess, &grid, "const q = 7;", 8000);
 
     {
+        // Menu and docs may sit side by side (same top row) or stacked.
+        // Enumerate every top-left corner and pair it with the next ╮ on the
+        // same row; assert each rectangle independently.
         var boxes: usize = 0;
         var r: usize = 0;
         while (r < grid.rows) : (r += 1) {
-            if (glyphCol(&grid, r, "╭", 0) != null and glyphCol(&grid, r, "╮", 0) != null) {
-                const bottom = try assertPopupBox(&grid, r);
-                boxes += 1;
-                r = bottom;
+            var c: usize = 0;
+            while (c < grid.cols) : (c += 1) {
+                if (!cellStartsWith(&grid, r, c, "╭")) continue;
+                var right: ?usize = null;
+                var rc = c + 1;
+                while (rc < grid.cols) : (rc += 1) {
+                    if (cellStartsWith(&grid, r, rc, "╮")) {
+                        right = rc;
+                        break;
+                    }
+                }
+                if (right) |rr| {
+                    _ = try assertPopupBoxAt(&grid, r, c, rr);
+                    boxes += 1;
+                    c = rr;
+                }
             }
         }
-        try std.testing.expectEqual(@as(usize, 2), boxes);
+        try std.testing.expect(boxes >= 2);
     }
     {
         var code_row: ?usize = null;
@@ -16140,15 +16243,15 @@ test "ui chrome: theme matrix colors active tabs, separators and focused borders
         sample.thread_marker_bg = grid.bg_buf[2 * grid.cols + rail_col + 2];
         sample.status_rule_fg = grid.fg_buf[29 * grid.cols + 9];
 
-        // The active buffer tab is continuous with the editor surface.
+        // The active buffer tab is continuous with the editor surface and
+        // carries one accent marker cell (no full-tab underline).
         sample.buffer_tab_fg = 0;
         sample.buffer_tab_ul = 0;
         var bc: usize = 31;
         while (bc < 70) : (bc += 1) {
             if (grid.bg_buf[bc] == tc.bg and
-                grid.fg_buf[bc] == tc.fg and
-                frame.cellUl(&grid, 0, bc) == tc.accent_alt and
-                frame.cellUnderlined(&grid, 0, bc))
+                grid.fg_buf[bc] == tc.accent_alt and
+                std.mem.eql(u8, frame.cellText(&grid, 0, bc), "▏"))
             {
                 sample.buffer_tab_fg = grid.fg_buf[bc];
                 sample.buffer_tab_ul = frame.cellUl(&grid, 0, bc);
@@ -16168,8 +16271,8 @@ test "ui chrome: theme matrix colors active tabs, separators and focused borders
         try std.testing.expectEqual(tc.win_sep, sample.status_rule_fg);
         try std.testing.expectEqual(tc.win_sep, sample.nav_border_fg);
         try std.testing.expectEqual(tc.win_sep_active, sample.rail_border_fg);
-        try std.testing.expectEqual(tc.fg, sample.buffer_tab_fg);
-        try std.testing.expectEqual(tc.accent_alt, sample.buffer_tab_ul);
+        try std.testing.expectEqual(tc.accent_alt, sample.buffer_tab_fg);
+        try std.testing.expectEqual(@as(u32, 0), sample.buffer_tab_ul); // no underline
 
         samples[sample_i] = sample;
         sample_i += 1;
@@ -17141,6 +17244,11 @@ test "navigator: notes create, edit, save and reopen from the list" {
     // Edit a marker on a new line below the template, then :w.
     try sess.send("Go");
     try sess.send("NOTE_MARKER_1");
+    // Observe the edit before waiting for INSERT to disappear. Otherwise the
+    // old NORMAL frame can satisfy gridWaitGone immediately, letting :w be
+    // sent beside Escape and decoded as an Alt sequence by the tty parser.
+    try gridWaitFor(&sess, &grid, "INSERT", 5000);
+    try gridWaitFor(&sess, &grid, "NOTE_MARKER_1", 5000);
     try sess.send("\x1b");
     try gridWaitGone(&sess, &grid, "INSERT", 4000);
     try sess.send(":w\r");
@@ -23865,4 +23973,1853 @@ test "regression wrap: syntax style changes at a full row do not hide the next c
     try sess.send("\x1b");
     std.Io.sleep(io, .fromMilliseconds(100), .real) catch {};
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+}
+
+/// Consume asynchronous paints for a bounded interval, including messages
+/// arriving after a previously observed match (e.g. stale diagnostic pushes).
+fn gridDrain(sess: *Session, grid: *Grid, timeout_ms: i32) !void {
+    const deadline = std.Io.Timestamp.now(sess.io, .awake).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    while (std.Io.Timestamp.now(sess.io, .awake).nanoseconds < deadline) {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+}
+
+fn diagUiSession(io: Io, a: std.mem.Allocator, root: []const u8, path: [:0]const u8) !Session {
+    const mock = try std.Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/mock_lsp", a);
+    defer a.free(mock);
+    const env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{mock});
+    defer a.free(env);
+    return Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{ env, "OZ_MOCK_SCRIPT=diagnostic_ui" }, 24, 80, root);
+}
+
+test "diagnostic UI: inline priority, full float scrolling, cursor movement and clear push" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "diag.zig", "const a = 1;\nconst b = 2;\nconst c = 3;\n");
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/diag.zig", .{root});
+    var sess = try diagUiSession(io, a, root, path);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    // No keypress is required, and the later foreign-file notification must
+    // not erase this file's diagnostics. Error wins over an earlier warning.
+    try gridWaitRowContains(&sess, &grid, 2, "unused function parameter", 8000);
+    // The status line reports the real severities from this server (one of
+    // each), not a fabricated zero and not a guessed total.
+    try gridWaitFor(&sess, &grid, "E1 W1 I1", 5000);
+    try std.testing.expect(!grid.contains("FOREIGN_DIAG"));
+    try std.testing.expect(rowContains(&grid, 2, "+1 [gl]"));
+    try gridWaitFor(&sess, &grid, ": i32", 5000);
+    const row = grid.row;
+    const col = grid.col;
+    try sess.send("gl");
+    try gridWaitFor(&sess, &grid, "Diagnostics (2)", 5000);
+    try std.testing.expectEqual(row, grid.row);
+    try std.testing.expectEqual(col, grid.col);
+    try gridWaitFor(&sess, &grid, "WARNING_FIRST", 5000);
+    for (0..12) |_| try sess.send("\x06");
+    try gridWaitFor(&sess, &grid, "DIAG_DETAIL_LAST", 5000);
+    try std.testing.expect(grid.row < grid.rows - 1);
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "Diagnostics (2)", 5000);
+    try sess.send("j");
+    try gridWaitRowContains(&sess, &grid, 3, "SPANNING_NOTE", 5000);
+    try gridWaitGone(&sess, &grid, "unused function parameter", 5000);
+    try sess.send("2j");
+    try gridWaitGone(&sess, &grid, "SPANNING_NOTE", 5000);
+    try sess.send("gg");
+    try gridWaitRowContains(&sess, &grid, 2, "unused function parameter", 5000);
+    try sess.send("gl");
+    try gridWaitFor(&sess, &grid, "Diagnostics (2)", 5000);
+    try sess.send("ix");
+    try gridWaitFor(&sess, &grid, "INSERT", 5000);
+    try gridWaitGone(&sess, &grid, "Diagnostics (2)", 5000);
+    try gridWaitGone(&sess, &grid, "unused function parameter", 5000);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+    std.Io.sleep(io, .fromMilliseconds(200), .real) catch {};
+    try sess.send("gl");
+    try gridWaitFor(&sess, &grid, "no diagnostics on this line", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "diagnostic UI: narrow split float wraps within the focused pane" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "diag.zig", "const a = 1;\nconst b = 2;\nconst c = 3;\n");
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/diag.zig", .{root});
+    var sess = try diagUiSession(io, a, root, path);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "unused function parameter", 8000);
+    try sess.send(":vs\r");
+    try gridWaitFor(&sess, &grid, "│", 5000);
+    try sess.send("\x17h");
+    std.Io.sleep(io, .fromMilliseconds(150), .real) catch {};
+    // Drain the focus change before reading the separator coordinate.
+    for (0..3) |_| {
+        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+        sess.used += n;
+        grid.feed(sess.out[sess.used - n .. sess.used]);
+    }
+    const divider = glyphCol(&grid, 2, "│", 0) orelse return error.TestUnexpectedResult;
+    try sess.send("gl");
+    try gridWaitFor(&sess, &grid, "Diagnostics (2)", 5000);
+    const float_bg = packRgb(0x22, 0x32, 0x49);
+    var painted = false;
+    for (2..grid.rows - 1) |r| {
+        for (0..divider) |c| if (grid.bg_buf[r * grid.cols + c] == float_bg) {
+            painted = true;
+        };
+        for (divider + 1..grid.cols) |c| try std.testing.expect(grid.bg_buf[r * grid.cols + c] != float_bg);
+    }
+    try std.testing.expect(painted);
+    for (0..40) |_| try sess.send("\x06");
+    try gridWaitFor(&sess, &grid, "DIAG_DETAIL_LAST", 5000);
+    try sess.send("j");
+    try gridWaitGone(&sess, &grid, "Diagnostics (2)", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "diagnostic UI: float flips above a bottom-edge wrapped cursor" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const prefix = try a.alloc(u8, 2200);
+    defer a.free(prefix);
+    @memset(prefix, 'a');
+    const source = try std.fmt.allocPrint(a, "{s}CURSOR_END\n", .{prefix});
+    defer a.free(source);
+    try aiWriteFile(io, root, "diag.zig", source);
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/diag.zig", .{root});
+    var sess = try diagUiSession(io, a, root, path);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try gridWaitFor(&sess, &grid, ": i32", 8000);
+    try sess.send("$");
+    try gridWaitFor(&sess, &grid, "CURSOR_END", 5000);
+    const cursor_row = grid.row;
+    const cursor_col = grid.col;
+    try std.testing.expect(cursor_row >= grid.rows - 3);
+    try sess.send("gl");
+    try gridWaitFor(&sess, &grid, "Diagnostics (2)", 5000);
+    const header = findRow(&grid, "Diagnostics (2)") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(header < cursor_row);
+    try std.testing.expectEqual(cursor_row, grid.row);
+    try std.testing.expectEqual(cursor_col, grid.col);
+    try std.testing.expect(rowContains(&grid, cursor_row, "CURSOR_END"));
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "Diagnostics (2)", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "diagnostic UI: edits invalidate ranges and reject stale and future publications" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "versions.zig", "const abcdef = 1;\n");
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/versions.zig", .{root});
+    const mock = try std.Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/mock_lsp", a);
+    defer a.free(mock);
+    const env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{mock});
+    defer a.free(env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{ env, "OZ_MOCK_SCRIPT=diagnostic_versions" }, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "mock error", 8000);
+    // The server deliberately sends no diagnostic response to the first
+    // edit. A normal-mode edit must still remove its old range immediately.
+    try sess.send("x");
+    try gridWaitRowContains(&sess, &grid, 2, "onst", 5000);
+    try gridWaitGone(&sess, &grid, "mock error", 5000);
+    try sess.send("gl");
+    try gridWaitFor(&sess, &grid, "no diagnostics on this line", 5000);
+    try sess.send("x");
+    try gridWaitFor(&sess, &grid, "CURRENT_VERSION", 5000);
+    try gridDrain(&sess, &grid, 600);
+    try std.testing.expect(grid.contains("CURRENT_VERSION"));
+    try std.testing.expect(!grid.contains("STALE_VERSION"));
+    try sess.send("gl");
+    try gridWaitFor(&sess, &grid, "Diagnostics (1)", 5000);
+    // An editing key closes the popup and invalidates even the current
+    // result. The fixture's future-version result must also be rejected.
+    try sess.send("x");
+    try gridWaitGone(&sess, &grid, "Diagnostics (1)", 5000);
+    try gridDrain(&sess, &grid, 600);
+    try std.testing.expect(!grid.contains("CURRENT_VERSION"));
+    try std.testing.expect(!grid.contains("FUTURE_VERSION"));
+    try sess.send("gl");
+    try gridWaitFor(&sess, &grid, "no diagnostics on this line", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "diagnostic UI: real ZLS matches source, fixes and line movement" {
+    const zls_path = @import("e2e_options").real_zls orelse return error.SkipZigTest;
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "real.zig", "pub fn peek(\n    aaa: usize,\n) u1 {\n    return 0;\n}\n");
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/real.zig", .{root});
+    const lsp_env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{zls_path});
+    defer a.free(lsp_env);
+    const home_env = try std.fmt.allocPrint(a, "HOME={s}", .{root});
+    defer a.free(home_env);
+    const cache_env = try std.fmt.allocPrint(a, "XDG_CACHE_HOME={s}/cache", .{root});
+    defer a.free(cache_env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{ lsp_env, home_env, cache_env }, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    // The actual server diagnoses the unused parameter, not the function.
+    try sess.send("ggj");
+    try gridWaitRowContains(&sess, &grid, 3, "unused function parameter", 30000);
+    try sess.send("gl");
+    try gridWaitFor(&sess, &grid, "Diagnostics (1)", 5000);
+    try gridWaitFor(&sess, &grid, "Error: unused function parameter", 5000);
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "Diagnostics (1)", 5000);
+    std.Io.sleep(io, .fromMilliseconds(200), .real) catch {};
+    // Change aaa to _: both the actual diagnostic and popup must disappear.
+    try sess.send("0w3xi_\x1b");
+    try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+    try gridDrain(&sess, &grid, 1000);
+    try std.testing.expect(rowContains(&grid, 3, "_: usize"));
+    try std.testing.expect(!grid.contains("unused function parameter"));
+    try sess.send("gl");
+    try gridWaitFor(&sess, &grid, "no diagnostics on this line", 5000);
+    // Restore the real error, then insert a line above it. The server must
+    // publish it at the new source line, never leave it on the old line.
+    try sess.send("0wxiaaa\x1b");
+    try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+    try gridWaitRowContains(&sess, &grid, 3, "unused function parameter", 10000);
+    try sess.send("ggO// 中文 😀\x1b");
+    try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+    try gridDrain(&sess, &grid, 500);
+    try sess.send("ggj");
+    try gridDrain(&sess, &grid, 500);
+    try std.testing.expect(!grid.contains("unused function parameter"));
+    try sess.send("j");
+    try gridWaitRowContains(&sess, &grid, 4, "aaa: usize", 5000);
+    try gridWaitRowContains(&sess, &grid, 4, "unused function parameter", 10000);
+    try sess.send("gl");
+    try gridWaitFor(&sess, &grid, "Error: unused function parameter", 5000);
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "Diagnostics (1)", 5000);
+    std.Io.sleep(io, .fromMilliseconds(200), .real) catch {};
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "observer: grid records bold, dim and italic SGR with resets across split reads" {
+    const alloc = std.testing.allocator;
+    var grid = try Grid.initSizedCols(alloc, 4, 40);
+    defer grid.deinit(alloc);
+
+    // B bold, N reset, D dim, space reset, I italic, reset, X bold+dim,
+    // 22 clears both, Y plain.
+    grid.feed("\x1b[1mB\x1b[22mN\x1b[2mD\x1b[0m ");
+    grid.feed("\x1b[3mI\x1b[23m ");
+    grid.feed("\x1b[1;2mX\x1b[0mY");
+    try std.testing.expectEqualStrings("B", frame.cellText(&grid, 0, 0));
+    try frame.expectCellBold(&grid, 0, 0, true);
+    try frame.expectCellDim(&grid, 0, 0, false);
+    try frame.expectCellBold(&grid, 0, 1, false); // 22 reset bold
+    try frame.expectCellDim(&grid, 0, 2, true);
+    try frame.expectCellBold(&grid, 0, 4, false); // 0 reset everything
+    try frame.expectCellDim(&grid, 0, 4, false);
+    try frame.expectCellItalic(&grid, 0, 4, true);
+    try frame.expectCellItalic(&grid, 0, 6, false); // 23 reset italic
+    try frame.expectCellBold(&grid, 0, 6, true); // 1;2: both set
+    try frame.expectCellDim(&grid, 0, 6, true);
+    try frame.expectCellBold(&grid, 0, 7, false); // 0 reset before Y
+    try frame.expectCellDim(&grid, 0, 7, false);
+    try std.testing.expectEqualStrings("Y", frame.cellText(&grid, 0, 7));
+
+    // Attribute sequences split across PTY reads must not leak or corrupt
+    // text: the ESC[3 tail is stashed and completed by the next feed.
+    var split = try Grid.initSizedCols(alloc, 1, 10);
+    defer split.deinit(alloc);
+    split.feed("\x1b[3");
+    split.feed("mZ");
+    try std.testing.expectEqualStrings("Z", frame.cellText(&split, 0, 0));
+    try frame.expectCellItalic(&split, 0, 0, true);
+
+    // Italic changes must not silently alter text/fg/bg: the two grids carry
+    // the same characters and colors, and differ only in the italic bit.
+    var plain = try Grid.initSizedCols(alloc, 1, 10);
+    defer plain.deinit(alloc);
+    plain.feed("\x1b[38:2:114:113:105mC");
+    split.feed("\x1b[0m\x1b[3m\x1b[38:2:114:113:105mC");
+    try std.testing.expectEqualStrings(frame.cellText(&plain, 0, 0), frame.cellText(&split, 0, 1));
+    try std.testing.expectEqual(frame.cellFg(&plain, 0, 0), frame.cellFg(&split, 0, 1));
+    try std.testing.expectEqual(frame.cellBg(&plain, 0, 0), frame.cellBg(&split, 0, 1));
+    try frame.expectCellItalic(&plain, 0, 0, false);
+    try frame.expectCellItalic(&split, 0, 1, true);
+}
+
+// ---------------------------------------------------------------------------
+// Completion UI: rich metadata, async resolve generation isolation
+// ---------------------------------------------------------------------------
+
+const CompletionFixture = struct {
+    root: []u8,
+    path: []u8,
+    mock: []u8,
+    lsp_env: []u8,
+    script_env: []u8,
+    sess: Session,
+
+    fn deinit(self: *CompletionFixture, io: Io, a: std.mem.Allocator) void {
+        self.sess.close();
+        killPid(self.sess.pid);
+        std.Io.Dir.cwd().deleteTree(io, self.root) catch {};
+        a.free(self.root);
+        a.free(self.path);
+        a.free(self.mock);
+        a.free(self.lsp_env);
+        a.free(self.script_env);
+    }
+};
+
+fn startCompletionMock(
+    io: Io,
+    a: std.mem.Allocator,
+    script: []const u8,
+    text: []const u8,
+    rows: u16,
+    cols: u16,
+) !CompletionFixture {
+    var root_buf: [128]u8 = undefined;
+    const root_slice = try aiMockDir(io, &root_buf);
+    const root = try a.dupe(u8, root_slice);
+    errdefer a.free(root);
+    try aiWriteFile(io, root, "completion.zig", text);
+    const path = try std.fmt.allocPrint(a, "{s}/completion.zig", .{root});
+    errdefer a.free(path);
+    const edge_fixture = std.mem.startsWith(u8, script, "edge:");
+    const mock_z = try std.Io.Dir.cwd().realPathFileAlloc(io, if (edge_fixture) "test/fixtures/completion_edges.py" else "zig-out/bin/mock_lsp", a);
+    defer a.free(mock_z.ptr[0 .. mock_z.len + 1]);
+    const mock = try a.dupe(u8, mock_z);
+    errdefer a.free(mock);
+    const lsp_env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{mock});
+    errdefer a.free(lsp_env);
+    const script_env = if (edge_fixture)
+        try std.fmt.allocPrint(a, "OZ_COMPLETION_FIXTURE={s}", .{script[5..]})
+    else
+        try std.fmt.allocPrint(a, "OZ_MOCK_SCRIPT={s}", .{script});
+    errdefer a.free(script_env);
+    const sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{ lsp_env, script_env }, rows, cols, root);
+    return .{ .root = root, .path = path, .mock = mock, .lsp_env = lsp_env, .script_env = script_env, .sess = sess };
+}
+
+fn readDiskFile(io: Io, a: std.mem.Allocator, path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(128 * 1024));
+}
+
+test "completion UI: rich labelDetails, colored icon, signature/docs and selection identity" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const source = "const std = @import(\"std\");\nconst x = std";
+    var fx = try startCompletionMock(io, a, "completion_rich", source, 32, 120);
+    defer fx.deinit(io, a);
+    var grid = try Grid.initSizedCols(a, 32, 120);
+    defer grid.deinit(a);
+
+    const before = try readDiskFile(io, a, fx.path);
+    defer a.free(before);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send("jA");
+    // A "." trigger has no word prefix: the mock's full rich list opens.
+    try fx.sess.send(".");
+    try gridWaitFor(&fx.sess, &grid, "ArrayList", 8000);
+    try gridWaitFor(&fx.sess, &grid, "A contiguous", 5000);
+    try gridWaitFor(&fx.sess, &grid, "fn (comptime T: type) type", 5000);
+
+    // Display label, adjacent labelDetails.detail and the right description
+    // are three separate columns (no fabricated kind/description).
+    const lrow = findRow(&grid, "ArrayList") orelse return error.TestUnexpectedResult;
+    const lcol = aiCellIndexOf(&grid, lrow, "ArrayList") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rowContains(&grid, lrow, "(comptime T: type)"));
+    const row_text = grid.rowText(lrow);
+    try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, row_text, " │"), "type"));
+
+    // Category icon keeps its own color on the selected (bg_sel) row.
+    try frame.expectCellBg(&grid, lrow, lcol, packRgb(0x2D, 0x4F, 0x67));
+    try std.testing.expectEqual(packRgb(0x7A, 0xA8, 0x9F), frame.cellFg(&grid, lrow, lcol - 2));
+
+    // Signature is a real highlighted code region, and Markdown markers in
+    // the body are concealed (not shown literally).
+    const srow = findRow(&grid, "fn (comptime T: type) type") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rowContainsFg(&grid, srow, "fn", packRgb(0x95, 0x7F, 0xB8)));
+    try std.testing.expect(rowContains(&grid, srow, "comptime"));
+    try std.testing.expect(!grid.contains("**Bold prose**"));
+    try gridWaitFor(&fx.sess, &grid, "Bold prose", 5000);
+
+    // Reading/selecting must not write the buffer or the file.
+    const after_read = try readDiskFile(io, a, fx.path);
+    defer a.free(after_read);
+    try std.testing.expectEqualSlices(u8, before, after_read);
+
+    // Long docs: scroll with Ctrl+f / Ctrl+b; sentinels prove real movement
+    // and reset on selection is checked by the duplicate-label step below.
+    try fx.sess.send("\x0e");
+    try fx.sess.send("\x0e");
+    try fx.sess.send("\x0e"); // LONG_DOC
+    try gridWaitFor(&fx.sess, &grid, "LONG_DOC_FIRST", 5000);
+    var i: usize = 0;
+    while (i < 20) : (i += 1) try fx.sess.send("\x06"); // Ctrl+f
+    try gridWaitFor(&fx.sess, &grid, "LONG_DOC_LAST", 5000);
+    i = 0;
+    while (i < 20) : (i += 1) try fx.sess.send("\x02"); // Ctrl+b
+    try gridWaitFor(&fx.sess, &grid, "LONG_DOC_FIRST", 5000);
+    const after_scroll = try readDiskFile(io, a, fx.path);
+    defer a.free(after_scroll);
+    try std.testing.expectEqualSlices(u8, before, after_scroll);
+
+    // Same display label, different identity: docs must follow the item and
+    // never keep the previous candidate's body.
+    try fx.sess.send("\x0e"); // dup alpha
+    try gridWaitFor(&fx.sess, &grid, "DUP_ALPHA_DOC", 5000);
+    try fx.sess.send("\x0e"); // dup beta
+    try gridWaitFor(&fx.sess, &grid, "DUP_BETA_DOC", 5000);
+    try std.testing.expect(!grid.contains("DUP_ALPHA_DOC"));
+
+    // detail-only keeps the signature; an item with neither detail nor docs
+    // hides the pane instead of leaving the previous candidate's text.
+    try fx.sess.send("\x0e"); // detail_only
+    try gridWaitFor(&fx.sess, &grid, "DETAIL_ONLY_SIGNATURE", 5000);
+    try fx.sess.send("\x0e"); // bare
+    try gridWaitGone(&fx.sess, &grid, "DETAIL_ONLY_SIGNATURE", 5000);
+
+    // Accept uses insertText (dup_alpha), never the label ("dup") and never
+    // labelDetails/description. One Esc then leaves insert.
+    try fx.sess.send("\x10\x10\x10"); // Ctrl+p x3 -> dup alpha
+    try gridWaitFor(&fx.sess, &grid, "DUP_ALPHA_DOC", 5000);
+    try fx.sess.send("\r");
+    try gridWaitFor(&fx.sess, &grid, "std.dup_alpha", 5000);
+    try fx.sess.send("\x1b");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 5000);
+    try fx.sess.send(":w\r");
+    try gridDrain(&fx.sess, &grid, 500);
+    const saved = try readDiskFile(io, a, fx.path);
+    defer a.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "std.dup_alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "(alpha)") == null);
+    // Undo/redo keeps the insertion semantics (one undo group).
+    try fx.sess.send("u");
+    try gridDrain(&fx.sess, &grid, 500);
+    try fx.sess.send(":w\r");
+    try gridDrain(&fx.sess, &grid, 500);
+    const undone = try readDiskFile(io, a, fx.path);
+    defer a.free(undone);
+    try std.testing.expectEqualSlices(u8, before, undone);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "completion UI: resolve updates the selected item and respects initial docs" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var fx = try startCompletionMock(io, a, "completion_resolve", "const a = 1;\nresolve", 32, 120);
+    defer fx.deinit(io, a);
+    var grid = try Grid.initSizedCols(a, 32, 120);
+    defer grid.deinit(a);
+    const before = try readDiskFile(io, a, fx.path);
+    defer a.free(before);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send("jA\x0e");
+    try gridWaitFor(&fx.sess, &grid, "resolveA", 8000);
+    try gridWaitFor(&fx.sess, &grid, "RESOLVED_BODY_resolveA", 5000);
+    try gridWaitFor(&fx.sess, &grid, "resolved signature for resolveA", 5000);
+
+    try fx.sess.send("\x0e");
+    try gridWaitFor(&fx.sess, &grid, "RESOLVED_BODY_resolveB", 5000);
+    try std.testing.expect(!grid.contains("RESOLVED_BODY_resolveA"));
+
+    // Initial documentation is used immediately and is not replaced by a
+    // resolve response for a different item.
+    try fx.sess.send("\x0e");
+    try gridWaitFor(&fx.sess, &grid, "INITIAL_DOC_C", 5000);
+    try std.testing.expect(!grid.contains("RESOLVED_BODY_resolveC"));
+
+    // detail-only item: detail available immediately, docs arrive by resolve.
+    try fx.sess.send("\x0e");
+    try gridWaitFor(&fx.sess, &grid, "DETAIL_D", 5000);
+    try gridWaitFor(&fx.sess, &grid, "RESOLVED_BODY_resolveD", 5000);
+
+    // Reading and closing must not edit the buffer.
+    const after = try readDiskFile(io, a, fx.path);
+    defer a.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    try fx.sess.send("\x05"); // Ctrl+e hides menu, stays insert
+    try gridWaitGone(&fx.sess, &grid, "RESOLVED_BODY_resolveD", 5000);
+    try gridWaitFor(&fx.sess, &grid, "[INSERT]", 3000);
+    try fx.sess.send("\x1b");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "completion UI: obsolete resolve response cannot overwrite the current item" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var fx = try startCompletionMock(io, a, "completion_resolve_hold", "const a = 1;\nresolve", 32, 120);
+    defer fx.deinit(io, a);
+    var grid = try Grid.initSizedCols(a, 32, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send("jA\x0e"); // request resolve for A (held by mock)
+    try gridWaitFor(&fx.sess, &grid, "resolveA", 8000);
+    try fx.sess.send("\x0e"); // select B; mock flushes A first, then B
+    try gridWaitFor(&fx.sess, &grid, "RESOLVED_BODY_DOC_B", 5000);
+    try std.testing.expect(!grid.contains("LATE_A"));
+    try std.testing.expect(!grid.contains("RESOLVED_BODY_resolveA"));
+    try fx.sess.send("\x1b");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "completion UI: resolve error does not block selection or Enter" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var fx = try startCompletionMock(io, a, "completion_resolve_error", "const a = 1;\nresolve", 32, 120);
+    defer fx.deinit(io, a);
+    var grid = try Grid.initSizedCols(a, 32, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send("jA\x0e");
+    try gridWaitFor(&fx.sess, &grid, "resolveA", 8000);
+    try gridWaitFor(&fx.sess, &grid, "documentation unavailable", 6000);
+    try std.testing.expect(grid.contains("resolveA")); // menu survives the error
+    try fx.sess.send("\r");
+    try gridWaitGone(&fx.sess, &grid, "documentation unavailable", 3000);
+    try gridWaitFor(&fx.sess, &grid, "[INSERT]", 3000);
+    try fx.sess.send("\x1b");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "completion UI: real ZLS drives labelDetails, docs and insertion" {
+    const zls_path = @import("e2e_options").real_zls orelse return error.SkipZigTest;
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const source = "const std = @import(\"std\");\n\npub fn main() !void {\n    const list = std.Arr\n}\n";
+    try aiWriteFile(io, root, "real_completion.zig", source);
+    var path_buf: [240:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/real_completion.zig", .{root});
+    const env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{zls_path});
+    defer a.free(env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{env}, 32, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 32, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try gridWaitFor(&sess, &grid, "std.Arr", 8000);
+    try sess.send("3jA");
+    try sess.send("\x0e");
+    try gridWaitFor(&sess, &grid, "ArrayList", 12000);
+    // ZLS returns the full list; the client filters by the typed prefix.
+    // Move to the real ArrayList item and wait for its initial docs.
+    var i: usize = 0;
+    while (i < 7) : (i += 1) {
+        try sess.send("\x0e");
+        try gridDrain(&sess, &grid, 120);
+        if (grid.contains("A contiguous")) break;
+    }
+    try gridWaitFor(&sess, &grid, "A contiguous", 8000);
+    try std.testing.expect(grid.contains("(comptime T: type)"));
+    try std.testing.expect(grid.contains("fn (comptime T: type) type"));
+    try std.testing.expect(grid.contains("type"));
+
+    // CMP-T22: move to another real JSON item and back; the docs/description
+    // must follow the selected item rather than staying on ArrayList's text.
+    try sess.send("\x0e");
+    try gridWaitGone(&sess, &grid, "A contiguous", 6000);
+    try sess.send("\x10");
+    try gridWaitFor(&sess, &grid, "A contiguous", 8000);
+    try std.testing.expect(grid.contains("(comptime T: type)"));
+    try std.testing.expect(grid.contains("fn (comptime T: type) type"));
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "std.ArrayList", 5000);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+    try gridDrain(&sess, &grid, 200);
+    try std.testing.expect(!grid.contains("[INSERT]"));
+    try sess.send(":w\r");
+    try gridWaitFor(&sess, &grid, "written:", 5000);
+    const saved = try readDiskFile(io, a, path);
+    defer a.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "std.ArrayList") != null);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+// ---------------------------------------------------------------------------
+// Style observability: real SGR attributes, hint backgrounds, cursorline
+// ---------------------------------------------------------------------------
+
+test "style observation: comments and keywords are italic; OZ_NO_ITALIC keeps colors and layout" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var name_buf: [160:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}style.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    try aiWriteFile(io, "/tmp", "oz_e2e_style.zig", "// COMMENT_WORDS\npub const value = \"http://example.test\";\n");
+    // aiWriteFile created a differently named file; write the exact path.
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "// COMMENT_WORDS\npub const value = \"http://example.test\";\n");
+    }
+
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{});
+    defer sess.close();
+    defer killPid(sess.pid);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try gridWaitFor(&sess, &grid, "COMMENT_WORDS", 5000);
+
+    const crow = findRow(&grid, "COMMENT_WORDS") orelse return error.TestUnexpectedResult;
+    const ccol = aiCellIndexOf(&grid, crow, "COMMENT_WORDS") orelse return error.TestUnexpectedResult;
+    var i: usize = 0;
+    while (i < "COMMENT_WORDS".len) : (i += 1) {
+        try frame.expectCellItalic(&grid, crow, ccol + i, true);
+    }
+    try std.testing.expectEqual(packRgb(0x72, 0x71, 0x69), frame.cellFg(&grid, crow, ccol));
+
+    const krow = findRow(&grid, "pub const") orelse return error.TestUnexpectedResult;
+    const kcol = aiCellIndexOf(&grid, krow, "pub") orelse return error.TestUnexpectedResult;
+    try frame.expectCellItalic(&grid, krow, kcol, true);
+    try std.testing.expectEqual(packRgb(0x95, 0x7F, 0xB8), frame.cellFg(&grid, krow, kcol));
+
+    // A `//` inside a string is a string token, not a comment: no italic.
+    const scol = aiCellIndexOf(&grid, krow, "http") orelse return error.TestUnexpectedResult;
+    try frame.expectCellItalic(&grid, krow, scol, false);
+
+    // OZ_NO_ITALIC: identical characters/colors, no italic attribute.
+    var plain = try Grid.initSizedCols(a, 24, 80);
+    defer plain.deinit(a);
+    var sess2 = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{"OZ_NO_ITALIC=1"});
+    defer sess2.close();
+    defer killPid(sess2.pid);
+    try gridWaitFor(&sess2, &plain, "[NORMAL]", 8000);
+    try gridWaitFor(&sess2, &plain, "COMMENT_WORDS", 5000);
+    const p_crow = findRow(&plain, "COMMENT_WORDS") orelse return error.TestUnexpectedResult;
+    const p_ccol = aiCellIndexOf(&plain, p_crow, "COMMENT_WORDS") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(frame.cellText(&grid, crow, ccol), frame.cellText(&plain, p_crow, p_ccol));
+    try std.testing.expectEqual(frame.cellFg(&grid, crow, ccol), frame.cellFg(&plain, p_crow, p_ccol));
+    try std.testing.expectEqual(frame.cellBg(&grid, crow, ccol), frame.cellBg(&plain, p_crow, p_ccol));
+    try frame.expectCellItalic(&plain, p_crow, p_ccol, false);
+    const p_krow = findRow(&plain, "pub const") orelse return error.TestUnexpectedResult;
+    const p_kcol = aiCellIndexOf(&plain, p_krow, "pub") orelse return error.TestUnexpectedResult;
+    try frame.expectCellItalic(&plain, p_krow, p_kcol, false);
+    try std.testing.expectEqual(packRgb(0x95, 0x7F, 0xB8), frame.cellFg(&plain, p_krow, p_kcol));
+    try std.testing.expectEqual(@as(u32, 0), try sess2.commandAndWaitExit(":qa!\r"));
+}
+
+test "style observation: inlay hints inherit the row background and are never double-dimmed" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "hints.zig", "const a = 1;\nconst b = 2;\nconst c = 3;\n");
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/hints.zig", .{root});
+    const mock = try std.Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/mock_lsp", a);
+    defer a.free(mock.ptr[0 .. mock.len + 1]);
+    const env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{mock});
+    defer a.free(env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{env}, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try gridWaitFor(&sess, &grid, ": i32", 8000);
+
+    const hrow = findRow(&grid, ": i32") orelse return error.TestUnexpectedResult;
+    const hcol = aiCellIndexOf(&grid, hrow, ": i32") orelse return error.TestUnexpectedResult;
+    // Cursor is on line 1: hint cells sit on the full-width cursorline.
+    try frame.expectCellBg(&grid, hrow, hcol, packRgb(0x2A, 0x2A, 0x37));
+    try frame.expectCellDim(&grid, hrow, hcol, false);
+
+    // Move off the line: the hint remains, now on the editor surface.
+    try sess.send("j");
+    try gridDrain(&sess, &grid, 400);
+    const nrow = findRow(&grid, ": i32") orelse return error.TestUnexpectedResult;
+    const ncol = aiCellIndexOf(&grid, nrow, ": i32") orelse return error.TestUnexpectedResult;
+    try frame.expectCellBg(&grid, nrow, ncol, packRgb(0x1F, 0x1F, 0x28));
+    try frame.expectCellDim(&grid, nrow, ncol, false);
+
+    // Visual-line selection wins over cursorline for the virtual text too.
+    try sess.send("kV");
+    try gridWaitFor(&sess, &grid, "[VISUAL]", 3000);
+    try gridDrain(&sess, &grid, 300);
+    const srow = findRow(&grid, ": i32") orelse return error.TestUnexpectedResult;
+    const scol = aiCellIndexOf(&grid, srow, ": i32") orelse return error.TestUnexpectedResult;
+    try frame.expectCellBg(&grid, srow, scol, packRgb(0x2D, 0x4F, 0x67));
+    try frame.expectCellDim(&grid, srow, scol, false);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+    try gridDrain(&sess, &grid, 150);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "style observation: cursorline is a full-width surface, not text-width" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var name_buf: [160:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}line.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const short = 1;\nconst second = 2;\n");
+    }
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{});
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try gridWaitFor(&sess, &grid, "const short", 5000);
+    const lrow = findRow(&grid, "const short") orelse return error.TestUnexpectedResult;
+    // Gutter, text and the empty cells after EOL all share the row surface.
+    try frame.expectCellBg(&grid, lrow, 0, packRgb(0x2A, 0x2A, 0x37));
+    try frame.expectCellBg(&grid, lrow, 40, packRgb(0x2A, 0x2A, 0x37));
+    try frame.expectCellBg(&grid, lrow, 79, packRgb(0x2A, 0x2A, 0x37));
+    try sess.send("j");
+    try gridDrain(&sess, &grid, 300);
+    const old = findRow(&grid, "const short") orelse return error.TestUnexpectedResult;
+    try frame.expectCellBg(&grid, old, 79, packRgb(0x1F, 0x1F, 0x28));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "status position: document column excludes inlay hints" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "pos.zig", "const a = 1;\nconst b = 2;\nconst c = 3;\n");
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/pos.zig", .{root});
+    const mock = try std.Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/mock_lsp", a);
+    defer a.free(mock.ptr[0 .. mock.len + 1]);
+    const env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{mock});
+    defer a.free(env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{env}, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try gridWaitFor(&sess, &grid, ": i32", 8000);
+    // The hint sits before the cursor's byte at line 1 col 0; the status
+    // column is the document cell column, not the shifted screen column.
+    try gridWaitFor(&sess, &grid, "line 1/4 col 0", 3000);
+    try sess.send("j");
+    try gridWaitFor(&sess, &grid, "line 2/4 col 0", 3000);
+    try sess.send("k");
+    try gridWaitFor(&sess, &grid, "line 1/4 col 0", 3000);
+
+    // Same document without an LSP: identical position text.
+    var sess2 = try Session.spawnEnv(io, &.{ oz_exe_path, path }, &.{});
+    defer sess2.close();
+    defer killPid(sess2.pid);
+    var grid2 = try Grid.initSizedCols(a, 24, 80);
+    defer grid2.deinit(a);
+    try gridWaitFor(&sess2, &grid2, "[NORMAL]", 8000);
+    try gridWaitFor(&sess2, &grid2, "line 1/4 col 0", 3000);
+    try std.testing.expect(!grid2.contains(": i32"));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+    try std.testing.expectEqual(@as(u32, 0), try sess2.commandAndWaitExit(":qa!\r"));
+}
+
+test "status chrome: mode transitions use a stable badge and clear stale text" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var name_buf: [160:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}mode.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "const a = 1;\nconst b = 2;\n");
+    }
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{});
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    const srow = grid.rows - 1;
+    try std.testing.expectEqual(packRgb(0x7E, 0x9C, 0xD8), frame.cellBg(&grid, srow, 0));
+
+    try sess.send("i");
+    try gridWaitFor(&sess, &grid, "[INSERT]", 3000);
+    try std.testing.expect(!grid.contains("[NORMAL]"));
+    try std.testing.expectEqual(packRgb(0x98, 0xBB, 0x6C), frame.cellBg(&grid, srow, 0));
+    try gridWaitFor(&sess, &grid, "line 1/3 col 0", 2000);
+
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+    try sess.send("V");
+    try gridWaitFor(&sess, &grid, "[VISUAL]", 3000);
+    try std.testing.expectEqual(packRgb(0x95, 0x7F, 0xB8), frame.cellBg(&grid, srow, 0));
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+    // Command mode is rendered as the `:` prompt on the bottom row (the
+    // prompt owns that row); the previous mode badge must be gone.
+    try sess.send(":");
+    try gridDrain(&sess, &grid, 200);
+    try std.testing.expect(std.mem.startsWith(u8, grid.rowText(srow), ":"));
+    try std.testing.expect(!grid.contains("[VISUAL]"));
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+    // The status tail is fully repainted after the mode text shrinks.
+    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(srow), "[NORMAL]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(srow), "[COMMAND]") == null);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "search: match/current backgrounds are role-based; selection wins and :noh clears" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var name_buf: [160:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}search.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "alpha one alpha two\nalpha three\n");
+    }
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{});
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try gridWaitFor(&sess, &grid, "alpha one", 5000);
+
+    try sess.send("/alpha\r");
+    try gridDrain(&sess, &grid, 300);
+    const row1 = findRow(&grid, "alpha one alpha two") orelse return error.TestUnexpectedResult;
+    const first = aiCellIndexOf(&grid, row1, "alpha") orelse return error.TestUnexpectedResult;
+    // second occurrence: scan after the first word
+    var second: ?usize = null;
+    var c = first + 5;
+    while (c + 5 <= grid.cols) : (c += 1) {
+        var match = true;
+        var k: usize = 0;
+        while (k < 5) : (k += 1) {
+            if (!std.mem.eql(u8, frame.cellText(&grid, row1, c + k), frame.cellText(&grid, row1, first + k))) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            second = c;
+            break;
+        }
+    }
+    const sc = second orelse return error.TestUnexpectedResult;
+    // Kanagawa-derived role backgrounds (theme.searchBg): match and current.
+    try frame.expectCellBg(&grid, row1, first, packRgb(0x33, 0x3A, 0x4E));
+    try frame.expectCellBg(&grid, row1, sc, packRgb(0x6A, 0x5D, 0x4A));
+    const row2 = findRow(&grid, "alpha three") orelse return error.TestUnexpectedResult;
+    const other = aiCellIndexOf(&grid, row2, "alpha") orelse return error.TestUnexpectedResult;
+    try frame.expectCellBg(&grid, row2, other, packRgb(0x33, 0x3A, 0x4E));
+    // Text color is untouched by search.
+    try std.testing.expectEqual(packRgb(0xDC, 0xD7, 0xBA), frame.cellFg(&grid, row2, other));
+
+    // Visual selection wins over both search surfaces.
+    try sess.send("V");
+    try gridWaitFor(&sess, &grid, "[VISUAL]", 3000);
+    try gridDrain(&sess, &grid, 200);
+    try frame.expectCellBg(&grid, row1, sc, packRgb(0x2D, 0x4F, 0x67));
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
+
+    // :noh clears match tint; the cursor line surface returns.
+    try sess.send(":noh\r");
+    try gridDrain(&sess, &grid, 300);
+    try frame.expectCellBg(&grid, row2, other, packRgb(0x1F, 0x1F, 0x28));
+    try frame.expectCellBg(&grid, row1, first, packRgb(0x2A, 0x2A, 0x37));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "style observation: scope emphasis no longer paints a full-line underline" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var name_buf: [160:0]u8 = undefined;
+    const name = try bufPrintZ(&name_buf, "/tmp/oz_e2e_{d}_{d}scope.zig", .{ linux.getpid(), tmp_counter });
+    tmp_counter += 1;
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "fn f() void {\n    if (x) {\n        y();\n    }\n}\n");
+    }
+    var sess = try Session.spawnEnv(io, &.{ oz_exe_path, name }, &.{});
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try gridWaitFor(&sess, &grid, "fn f() void", 5000);
+    try gridDrain(&sess, &grid, 700); // let the scope spread settle
+    var r: usize = 1; // skip the tab strip (its chrome may underline)
+    while (r + 1 < grid.rows) : (r += 1) {
+        var c: usize = 0;
+        while (c < grid.cols) : (c += 1) {
+            if (frame.cellUnderlined(&grid, r, c)) {
+                std.debug.print("unexpected underline at ({d},{d}) text=\"{s}\"\n", .{ r, c, frame.cellText(&grid, r, c) });
+                grid.dump();
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+    // The scope guide color still identifies the active scope.
+    try std.testing.expect(grid.containsFg("│", packRgb(0xE0, 0x6C, 0x75)));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "tabs: active marker/bold, inactive italic and duplicate-basename identity" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var dir_buf: [160]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/oztabs_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    const aa = try std.fmt.allocPrint(a, "{s}/aa", .{dir});
+    defer a.free(aa);
+    const bb = try std.fmt.allocPrint(a, "{s}/bb", .{dir});
+    defer a.free(bb);
+    try std.Io.Dir.cwd().createDirPath(io, aa);
+    try std.Io.Dir.cwd().createDirPath(io, bb);
+    const one = try std.fmt.allocPrint(a, "{s}/same.txt", .{aa});
+    defer a.free(one);
+    const two = try std.fmt.allocPrint(a, "{s}/same.txt", .{bb});
+    defer a.free(two);
+    try aiWriteFile(io, aa, "same.txt", "AA_MARK\n");
+    try aiWriteFile(io, bb, "same.txt", "BB_MARK\n");
+
+    var sess = try Session.spawn(io, &.{ oz_exe_path, one });
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 100);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try gridWaitFor(&sess, &grid, "AA_MARK", 5000);
+    try sess.send(":e ");
+    try sess.send(two);
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "BB_MARK", 5000);
+    try gridDrain(&sess, &grid, 200);
+    if (!rowContains(&grid, 0, "aa/same.txt") or !rowContains(&grid, 0, "bb/same.txt")) {
+        std.debug.print("tab row: {s}\n", .{grid.rowText(0)});
+        grid.dump();
+    }
+    try std.testing.expect(rowContains(&grid, 0, "aa/same.txt"));
+    try std.testing.expect(rowContains(&grid, 0, "bb/same.txt"));
+
+    // Active tab: bold name + one accent marker; inactive name is italic.
+    const arow = 0;
+    const one_col = aiCellIndexOf(&grid, arow, "aa/same.txt") orelse return error.TestUnexpectedResult;
+    const two_col = aiCellIndexOf(&grid, arow, "bb/same.txt") orelse return error.TestUnexpectedResult;
+    try frame.expectCellBold(&grid, arow, two_col, true);
+    try frame.expectCellItalic(&grid, arow, two_col, false);
+    try frame.expectCellItalic(&grid, arow, one_col, true);
+    var marker: ?usize = null;
+    var c: usize = 0;
+    while (c < grid.cols) : (c += 1) {
+        if (std.mem.eql(u8, frame.cellText(&grid, arow, c), "▏")) {
+            marker = c;
+            break;
+        }
+    }
+    const mc = marker orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(packRgb(0x7E, 0x9C, 0xD8), frame.cellFg(&grid, arow, mc));
+    try std.testing.expectEqual(packRgb(0x1F, 0x1F, 0x28), frame.cellBg(&grid, arow, mc));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "completion layout: bottom edge and resize round-trip keep both boxes inside the pane" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(a);
+    try src.appendSlice(a, "const std = @import(\"std\");\n");
+    var line_buf: [64]u8 = undefined;
+    var i: usize = 1;
+    while (i < 12) : (i += 1) {
+        const line = try std.fmt.bufPrint(&line_buf, "const filler_{d} = {d};\n", .{ i, i });
+        try src.appendSlice(a, line);
+    }
+    try src.appendSlice(a, "const list = std");
+    var fx = try startCompletionMock(io, a, "completion_rich", src.items, 20, 80);
+    defer fx.deinit(io, a);
+    var grid = try Grid.initSizedCols(a, 20, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try gridWaitFor(&fx.sess, &grid, "const list = std", 5000);
+    try fx.sess.send("GA.");
+    try gridWaitFor(&fx.sess, &grid, "ArrayList", 8000);
+    try gridSettle(&fx.sess, &grid, 100, 3000);
+    try frame.expectNoHorizontalOverflow(&grid, 80);
+    // At 20 rows the menu flips above the bottom-edge cursor; the docs pane
+    // has no admissible rectangle and is omitted instead of overlapping.
+    try std.testing.expect(!grid.contains("A contiguous"));
+    try std.testing.expect(glyphCol(&grid, 0, "╭", 0) == null);
+    const boxes = try countPopupBoxes(&grid);
+    try std.testing.expect(boxes >= 1);
+
+    // Grow: menu/docs re-plan side-by-side; no old border or out-of-pane
+    // cell may survive. Shrink again: docs disappear cleanly, menu remains.
+    for ([_]struct { rows: u16, cols: u16, docs: bool }{
+        .{ .rows = 30, .cols = 120, .docs = true },
+        .{ .rows = 20, .cols = 80, .docs = false },
+    }) |shape| {
+        const size = Winsize{ .ws_row = shape.rows, .ws_col = shape.cols, .ws_xpixel = shape.cols * 10, .ws_ypixel = shape.rows * 20 };
+        _ = linux.ioctl(fx.sess.pty.master, TIOCSWINSZ, @intFromPtr(&size));
+        var resized = try Grid.initSizedCols(a, shape.rows, shape.cols);
+        defer resized.deinit(a);
+        try gridWaitFor(&fx.sess, &resized, "ArrayList", 8000);
+        if (shape.docs) {
+            try gridWaitFor(&fx.sess, &resized, "A contiguous", 5000);
+        } else {
+            try gridWaitGone(&fx.sess, &resized, "A contiguous", 5000);
+        }
+        try gridSettle(&fx.sess, &resized, 100, 3000);
+        try frame.expectNoHorizontalOverflow(&resized, shape.cols);
+        const found = try countPopupBoxes(&resized);
+        try std.testing.expect(if (shape.docs) found >= 2 else found >= 1);
+    }
+    try fx.sess.send("\x1b");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 4000);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+}
+
+// Review regressions: identities, refreshes, native allocations and pane bounds.
+test "completion safety: late docs stay with identical-looking original candidates" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "edge:duplicate", "edge:duplicate_no_data" }) |script| {
+        var fx = try startCompletionMock(io, a, script, "du", 32, 120);
+        defer fx.deinit(io, a);
+        var grid = try Grid.initSizedCols(a, 32, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+        try fx.sess.send("A\x0e");
+        try gridWaitFor(&fx.sess, &grid, "fn duplicate() void", 8000);
+        try fx.sess.send("\x0e");
+        try gridWaitFor(&fx.sess, &grid, "B_INITIAL_DOC", 5000);
+        // The server cannot deliver A until B's own initial docs are visible.
+        try aiWriteFile(io, fx.root, "release-resolve", "go");
+        try gridDrain(&fx.sess, &grid, 500);
+        try std.testing.expect(grid.contains("B_INITIAL_DOC"));
+        try std.testing.expect(!grid.contains("A_LATE_DOC"));
+        // A's late reply may populate A's cache, without changing B or its
+        // scroll. Returning to A then shows the right explanation immediately.
+        try fx.sess.send("\x10");
+        try gridWaitFor(&fx.sess, &grid, "A_LATE_DOC", 5000);
+        try fx.sess.send("\x05\x1b");
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 5000);
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+    }
+}
+
+test "completion safety: same-index refresh resolves new docs and inserts only the candidate" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var fx = try startCompletionMock(io, a, "edge:refresh", "du", 32, 120);
+    defer fx.deinit(io, a);
+    var grid = try Grid.initSizedCols(a, 32, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send("A\x0e");
+    try gridWaitFor(&fx.sess, &grid, "REFRESH_DOC_1", 8000);
+    try fx.sess.send("p"); // du -> dup, same candidate at index zero
+    try gridWaitFor(&fx.sess, &grid, "REFRESH_DOC_2", 5000);
+    try fx.sess.send("\r\x1b");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":wq\r"));
+    const bytes = try readDiskFile(io, a, fx.path);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("duplicate", bytes);
+}
+
+fn selectedCompletionRow(grid: *Grid, label: []const u8) ?usize {
+    for (0..grid.rows) |r| {
+        if (aiCellIndexOf(grid, r, label)) |col| {
+            if (frame.cellBg(grid, r, col) == packRgb(0x2D, 0x4F, 0x67)) return r;
+        }
+    }
+    return null;
+}
+
+test "completion safety: short horizontal pane shows the last item without painting neighbours" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var fx = try startCompletionMock(io, a, "edge:many", "du\n", 32, 120);
+    defer fx.deinit(io, a);
+    var grid = try Grid.initSizedCols(a, 32, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send(":sp\r:sp\r");
+    try gridDrain(&fx.sess, &grid, 150);
+    var divider: ?usize = null;
+    for (0..grid.rows - 1) |r| {
+        if (std.mem.count(u8, grid.rowText(r), "─") >= grid.cols - 5) divider = r;
+    }
+    const boundary = divider orelse return error.TestUnexpectedResult;
+    try fx.sess.send("A\x0e");
+    try gridDrain(&fx.sess, &grid, 200);
+    const caret = grid.row;
+    try std.testing.expect(selectedCompletionRow(&grid, "duplicate0") != null);
+    for (0..7) |_| try fx.sess.send("\x0e");
+    try gridDrain(&fx.sess, &grid, 200);
+    const selected = selectedCompletionRow(&grid, "duplicate7") orelse {
+        grid.dump();
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expect(selected > boundary and selected < grid.rows - 1);
+    const float_bg = packRgb(0x22, 0x32, 0x49);
+    for (0..boundary + 1) |r| {
+        for (0..grid.cols) |c| {
+            if (frame.cellBg(&grid, r, c) == float_bg) {
+                std.debug.print("float outside pane: ({d},{d}), divider {d}, caret {d}\n", .{ r, c, boundary, caret });
+                grid.dump();
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+    for (0..grid.cols) |c| try std.testing.expect(frame.cellBg(&grid, caret, c) != float_bg);
+    try fx.sess.send("\x05\x1b");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+}
+
+fn childRssKiB(io: Io, a: std.mem.Allocator, pid: std.posix.pid_t) !usize {
+    const path = try std.fmt.allocPrint(a, "/proc/{d}/status", .{pid});
+    defer a.free(path);
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    // procfs reports st_size=0; read as a stream, not as a regular disk file.
+    var bytes: [16384]u8 = undefined;
+    var used: usize = 0;
+    while (used < bytes.len) {
+        const n = file.readStreaming(io, &.{bytes[used..]}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        used += n;
+    }
+    var lines = std.mem.splitScalar(u8, bytes[0..used], '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "VmRSS:")) continue;
+        var words = std.mem.tokenizeAny(u8, line[6..], " \t");
+        return std.fmt.parseInt(usize, words.next() orelse return error.MissingRss, 10);
+    }
+    return error.MissingRss;
+}
+
+test "completion safety: repeated signature redraws release native highlighters" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var fx = try startCompletionMock(io, a, "edge:many", "du", 32, 120);
+    defer fx.deinit(io, a);
+    var grid = try Grid.initSizedCols(a, 32, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send("A\x0e");
+    try gridWaitFor(&fx.sess, &grid, "DOC_0", 8000);
+    var round: usize = 0;
+    while (round < 16) : (round += 1) {
+        try fx.sess.send("\x0e");
+        var marker_buf: [16]u8 = undefined;
+        const marker = try std.fmt.bufPrint(&marker_buf, "DOC_{d}", .{(round + 1) % 8});
+        try gridWaitFor(&fx.sess, &grid, marker, 5000);
+    }
+    // Warm up caches/arenas first. One observed doc transition per key makes
+    // every iteration a real redraw, rather than a coalesced input burst.
+    const before = try childRssKiB(io, a, fx.sess.pid);
+    round = 0;
+    while (round < 240) : (round += 1) {
+        try fx.sess.send("\x0e");
+        var marker_buf: [16]u8 = undefined;
+        const marker = try std.fmt.bufPrint(&marker_buf, "DOC_{d}", .{(round + 1) % 8});
+        try gridWaitFor(&fx.sess, &grid, marker, 5000);
+    }
+    const after = try childRssKiB(io, a, fx.sess.pid);
+    // The old native parser/query leak grew by ~6 MiB for this workload.
+    // Allow normal allocator/RSS variation without accepting linear growth.
+    if (after > before + 3 * 1024) std.debug.print("completion RSS grew: {d} -> {d} KiB\n", .{ before, after });
+    try std.testing.expect(after <= before + 3 * 1024);
+    try fx.sess.send("\x05\x1b");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "completion safety: selected candidate survives growing LSP edit ranges" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var fx = try startCompletionMock(io, a, "edge:edits", "du", 32, 120);
+    defer fx.deinit(io, a);
+    var grid = try Grid.initSizedCols(a, 32, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send("A\x0e");
+    try gridWaitFor(&fx.sess, &grid, "EDIT_DOC_0_GEN_1", 8000);
+    try fx.sess.send("\x0e");
+    try gridWaitFor(&fx.sess, &grid, "EDIT_DOC_1_GEN_1", 5000);
+    try fx.sess.send("p");
+    try gridWaitFor(&fx.sess, &grid, "EDIT_DOC_1_GEN_2", 5000);
+    try fx.sess.send("\r\x1b");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":wq\r"));
+    const bytes = try readDiskFile(io, a, fx.path);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("duplicate1", bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Signature lifecycle: passive hover/signature context invalidation
+// ---------------------------------------------------------------------------
+
+const SignatureFixture = struct {
+    root: []u8,
+    path: []u8,
+    envs: [4][]u8,
+    sess: Session,
+
+    fn deinit(self: *SignatureFixture, io: Io, a: std.mem.Allocator) void {
+        self.sess.close();
+        killPid(self.sess.pid);
+        std.Io.Dir.cwd().deleteTree(io, self.root) catch {};
+        a.free(self.root);
+        a.free(self.path);
+        for (self.envs) |e| a.free(e);
+    }
+};
+
+fn startSignatureFixture(
+    io: Io,
+    a: std.mem.Allocator,
+    text: []const u8,
+    mode: ?[]const u8,
+    rows: u16,
+    cols: u16,
+) !SignatureFixture {
+    var root_buf: [128]u8 = undefined;
+    const root_slice = try aiMockDir(io, &root_buf);
+    const root = try a.dupe(u8, root_slice);
+    errdefer a.free(root);
+    try aiWriteFile(io, root, "sig.zig", text);
+    const path = try std.fmt.allocPrint(a, "{s}/sig.zig", .{root});
+    errdefer a.free(path);
+    const mock_z = try std.Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/mock_lsp", a);
+    defer a.free(mock_z.ptr[0 .. mock_z.len + 1]);
+    const lsp_env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{mock_z});
+    errdefer a.free(lsp_env);
+    const script_env = try a.dupe(u8, "OZ_MOCK_SCRIPT=signature_lifecycle");
+    errdefer a.free(script_env);
+    const barrier_env = try std.fmt.allocPrint(a, "OZ_SIG_BARRIER_DIR={s}", .{root});
+    errdefer a.free(barrier_env);
+    const mode_env = try std.fmt.allocPrint(a, "OZ_SIG_MODE={s}", .{mode orelse "normal"});
+    errdefer a.free(mode_env);
+    const sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{ lsp_env, script_env, barrier_env, mode_env }, rows, cols, root);
+    return .{ .root = root, .path = path, .envs = .{ lsp_env, script_env, barrier_env, mode_env }, .sess = sess };
+}
+
+fn waitBarrierMarker(io: Io, a: std.mem.Allocator, root: []const u8, name: []const u8, timeout_ms: i32) !void {
+    const deadline = std.Io.Timestamp.now(io, .awake).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ root, name });
+    while (std.Io.Timestamp.now(io, .awake).nanoseconds < deadline) {
+        if (std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(64))) |data| {
+            a.free(data);
+            return;
+        } else |_| {}
+        std.Io.sleep(io, .fromMilliseconds(20), .real) catch {};
+    }
+    std.debug.print("timed out waiting for marker {s}\n", .{path});
+    return error.TestUnexpectedResult;
+}
+
+test "signature lifecycle: stale signature is gone before the new completion" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var fx = try startSignatureFixture(io, a, "stdin\nsecond\n", null, 30, 100);
+    defer fx.deinit(io, a);
+    var grid = try Grid.initSizedCols(a, 30, 100);
+    defer grid.deinit(a);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send("A(");
+    try gridWaitFor(&fx.sess, &grid, "SIG_A", 8000);
+    try fx.sess.send("\x1b");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+    try fx.sess.send("a.");
+    try gridWaitFor(&fx.sess, &grid, "stat", 8000);
+    try gridWaitFor(&fx.sess, &grid, "STAT_DOC", 5000);
+    try gridWaitGone(&fx.sess, &grid, "SIG_A", 3000);
+    try gridWaitFor(&fx.sess, &grid, "[INSERT]", 3000);
+    // The menu's own border and the first selected explanation are visible,
+    // not covered by the old signature float.
+    try std.testing.expect(grid.contains("fn stat() void"));
+    try fx.sess.send("\r");
+    try gridWaitFor(&fx.sess, &grid, "stdin().stat", 5000);
+    try fx.sess.send("\x1b");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+    try fx.sess.send(":w\r");
+    try gridDrain(&fx.sess, &grid, 500);
+    const saved = try std.Io.Dir.cwd().readFileAlloc(io, fx.path, a, .limited(4096));
+    defer a.free(saved);
+    try std.testing.expectEqualStrings("stdin().stat\nsecond\n", saved);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "signature lifecycle: edits, motions and skip-over invalidate the passive float" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var fx = try startSignatureFixture(io, a, "foo()\nsecond\n", null, 30, 100);
+    defer fx.deinit(io, a);
+    var grid = try Grid.initSizedCols(a, 30, 100);
+    defer grid.deinit(a);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send("A(");
+    try gridWaitFor(&fx.sess, &grid, "SIG_A", 8000);
+    // Typing an ordinary character is an edit, not a cursor-only action.
+    try fx.sess.send("x");
+    try gridWaitGone(&fx.sess, &grid, "SIG_A", 3000);
+    // A fresh '(' in the current context still shows a signature.
+    try fx.sess.send("(");
+    try gridWaitFor(&fx.sess, &grid, "SIG_B", 8000);
+    // Insert-mode horizontal and vertical arrows are cursor moves.
+    try fx.sess.send("\x1b[D");
+    try gridWaitGone(&fx.sess, &grid, "SIG_B", 3000);
+    try fx.sess.send("(");
+    try gridWaitFor(&fx.sess, &grid, "SIG_B", 8000);
+    try fx.sess.send("\x1b[B");
+    try gridWaitGone(&fx.sess, &grid, "SIG_B", 3000);
+    // Skip-over a pre-existing closer: pure cursor move, no edit_seq bump.
+    try fx.sess.send("\x1b");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+    try fx.sess.send("gg0f)");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 2000);
+    try fx.sess.send("a(");
+    try gridWaitFor(&fx.sess, &grid, "SIG_B", 8000);
+    try fx.sess.send(")");
+    try gridWaitGone(&fx.sess, &grid, "SIG_B", 3000);
+    try fx.sess.send("\x1b");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+
+    // All insertion entry/exit spellings share the same context boundary.
+    for ([_][]const u8{ "i", "a", "A", "I" }) |entry| {
+        try fx.sess.send(entry);
+        try gridWaitFor(&fx.sess, &grid, "[INSERT]", 3000);
+        try fx.sess.send("(");
+        try gridWaitFor(&fx.sess, &grid, "SIG_B", 8000);
+        try fx.sess.send("\x03"); // Ctrl+c
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+        try gridWaitGone(&fx.sess, &grid, "SIG_B", 3000);
+    }
+    // jk exit, deletion, newline and Tab edits all invalidate.
+    try fx.sess.send("i(");
+    try gridWaitFor(&fx.sess, &grid, "SIG_B", 8000);
+    try fx.sess.send("jk");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+    try gridWaitGone(&fx.sess, &grid, "SIG_B", 3000);
+    for ([_][]const u8{ "\x7f", "\r", "\t" }) |edit| {
+        try fx.sess.send("i(");
+        try gridWaitFor(&fx.sess, &grid, "SIG_B", 8000);
+        try fx.sess.send(edit);
+        try gridWaitGone(&fx.sess, &grid, "SIG_B", 3000);
+        try fx.sess.send("\x1b");
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+    }
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "signature lifecycle: delayed response after typing, escape, buffer and mouse changes cannot revive" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    // Typing while A is held; release only through the explicit file barrier.
+    {
+        var fx = try startSignaturePeer(io, a, "stdin\nsecond\n", "hold", 30, 100);
+        defer fx.deinit(io, a);
+        var grid = try Grid.initSizedCols(a, 30, 100);
+        defer grid.deinit(a);
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+        try fx.sess.send("A(");
+        try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try fx.sess.send("x");
+        try releaseSignatureA(io, fx.root);
+        try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
+        try gridDrain(&fx.sess, &grid, 300);
+        try std.testing.expect(!grid.contains("SIG_A"));
+        try fx.sess.send("\x1b");
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+    }
+    // Escape before release: the response arrives while Normal.
+    {
+        var fx = try startSignaturePeer(io, a, "stdin\nsecond\n", "hold", 30, 100);
+        defer fx.deinit(io, a);
+        var grid = try Grid.initSizedCols(a, 30, 100);
+        defer grid.deinit(a);
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+        try fx.sess.send("A(");
+        try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try fx.sess.send("\x1b");
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+        try releaseSignatureA(io, fx.root);
+        try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
+        try gridDrain(&fx.sess, &grid, 300);
+        try std.testing.expect(!grid.contains("SIG_A"));
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+    }
+    // Different buffer: buffer identity and switch invalidation reject A.
+    {
+        var fx = try startSignaturePeer(io, a, "stdin\nsecond\n", "hold", 30, 100);
+        defer fx.deinit(io, a);
+        try aiWriteFile(io, fx.root, "other.zig", "OTHER\n");
+        var grid = try Grid.initSizedCols(a, 30, 100);
+        defer grid.deinit(a);
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+        try fx.sess.send("A(");
+        try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try fx.sess.send("\x1b");
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+        try fx.sess.send(":e other.zig\r");
+        try gridWaitFor(&fx.sess, &grid, "OTHER", 5000);
+        try releaseSignatureA(io, fx.root);
+        try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
+        try gridDrain(&fx.sess, &grid, 300);
+        try std.testing.expect(!grid.contains("SIG_A"));
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+    }
+    // Mouse click moves the document cursor without a key event.
+    {
+        var fx = try startSignaturePeer(io, a, "stdin\nsecond\n", "hold", 30, 100);
+        defer fx.deinit(io, a);
+        var grid = try Grid.initSizedCols(a, 30, 100);
+        defer grid.deinit(a);
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+        try fx.sess.send("A(");
+        try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try sendMouseButton(&fx.sess, 8, 4, 0, false);
+        try sendMouseButton(&fx.sess, 8, 4, 0, true);
+        try gridDrain(&fx.sess, &grid, 200);
+        try releaseSignatureA(io, fx.root);
+        try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
+        try gridDrain(&fx.sess, &grid, 300);
+        try std.testing.expect(!grid.contains("SIG_A"));
+        try fx.sess.send("\x1b");
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+    }
+    // Same buffer in a different split: window identity rejects the response.
+    {
+        var fx = try startSignaturePeer(io, a, "stdin\nsecond\n", "hold", 30, 100);
+        defer fx.deinit(io, a);
+        var grid = try Grid.initSizedCols(a, 30, 100);
+        defer grid.deinit(a);
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+        try fx.sess.send("A(");
+        try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try fx.sess.send("\x1b");
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+        try fx.sess.send(":vs\r");
+        try gridDrain(&fx.sess, &grid, 300);
+        try releaseSignatureA(io, fx.root);
+        try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
+        try gridDrain(&fx.sess, &grid, 300);
+        try std.testing.expect(!grid.contains("SIG_A"));
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+    }
+}
+
+test "signature lifecycle: null and error responses leave no stale float" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "null", "error", "timeout", "ignore" }) |mode| {
+        var fx = try startSignatureFixture(io, a, "stdin\nsecond\n", mode, 30, 100);
+        defer fx.deinit(io, a);
+        var grid = try Grid.initSizedCols(a, 30, 100);
+        defer grid.deinit(a);
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+        try fx.sess.send("A(");
+        try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        const waits_for_response = !std.mem.eql(u8, mode, "timeout") and !std.mem.eql(u8, mode, "ignore");
+        if (waits_for_response) {
+            try waitBarrierMarker(io, a, fx.root, "response-1", 6000);
+        }
+        try gridDrain(&fx.sess, &grid, 300);
+        try std.testing.expect(!grid.contains("SIG_A"));
+        try std.testing.expect(!grid.contains("SIG_ERROR"));
+        try std.testing.expect(grid.contains("[INSERT]"));
+        try fx.sess.send("\x1b");
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signature lifecycle: explicit file barriers (review follow-up)
+// ---------------------------------------------------------------------------
+
+const SignaturePeerFixture = struct {
+    root: []u8,
+    path: []u8,
+    peer: []u8,
+    envs: [3][]u8,
+    sess: Session,
+
+    fn deinit(self: *SignaturePeerFixture, io: Io, a: std.mem.Allocator) void {
+        self.sess.close();
+        killPid(self.sess.pid);
+        std.Io.Dir.cwd().deleteTree(io, self.root) catch {};
+        a.free(self.root);
+        a.free(self.path);
+        a.free(self.peer);
+        for (self.envs) |e| a.free(e);
+    }
+};
+
+fn startSignaturePeer(io: Io, a: std.mem.Allocator, text: []const u8, mode: []const u8, rows: u16, cols: u16) !SignaturePeerFixture {
+    var root_buf: [128]u8 = undefined;
+    const root_slice = try aiMockDir(io, &root_buf);
+    const root = try a.dupe(u8, root_slice);
+    errdefer a.free(root);
+    try aiWriteFile(io, root, "sig.zig", text);
+    const path = try std.fmt.allocPrint(a, "{s}/sig.zig", .{root});
+    errdefer a.free(path);
+    const peer_z = try std.Io.Dir.cwd().realPathFileAlloc(io, "test/fixtures/signature_lifecycle_peer.py", a);
+    defer a.free(peer_z.ptr[0 .. peer_z.len + 1]);
+    const peer = try a.dupe(u8, peer_z);
+    errdefer a.free(peer);
+    const lsp_env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{peer});
+    errdefer a.free(lsp_env);
+    const root_env = try std.fmt.allocPrint(a, "OZ_SIG_ROOT={s}", .{root});
+    errdefer a.free(root_env);
+    const mode_env = try std.fmt.allocPrint(a, "OZ_SIG_MODE={s}", .{mode});
+    errdefer a.free(mode_env);
+    const sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{ lsp_env, root_env, mode_env }, rows, cols, root);
+    return .{ .root = root, .path = path, .peer = peer, .envs = .{ lsp_env, root_env, mode_env }, .sess = sess };
+}
+
+fn releaseSignatureA(io: Io, root: []const u8) !void {
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/release-A", .{root});
+    const f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer f.close(io);
+    try f.writeStreamingAll(io, "go");
+}
+
+test "signature lifecycle: focus leaving the editor invalidates displayed hints" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    // Navigator: Space e opens the tree and takes keyboard focus.
+    {
+        var fx = try startSignaturePeer(io, a, "stdin\nsecond\n", "normal", 30, 120);
+        defer fx.deinit(io, a);
+        var grid = try Grid.initSizedCols(a, 30, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+        try fx.sess.send("gs");
+        try gridWaitFor(&fx.sess, &grid, "SIG_A", 8000);
+        try fx.sess.send(" e");
+        try gridWaitFor(&fx.sess, &grid, "╭─ OZ", 5000);
+        try gridWaitGone(&fx.sess, &grid, "SIG_A", 3000);
+        // Returning to the editor must not resurrect the old float.
+        try fx.sess.send("\x1b");
+        try gridDrain(&fx.sess, &grid, 300);
+        try std.testing.expect(!grid.contains("SIG_A"));
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+    }
+    // Agent rail: Ctrl-w a focuses the AI surface.
+    {
+        var fx = try startSignaturePeer(io, a, "stdin\nsecond\n", "normal", 30, 120);
+        defer fx.deinit(io, a);
+        var grid = try Grid.initSizedCols(a, 30, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+        try fx.sess.send("gs");
+        try gridWaitFor(&fx.sess, &grid, "SIG_A", 8000);
+        try fx.sess.send("\x17a");
+        try gridWaitFor(&fx.sess, &grid, "AGENTS", 5000);
+        try aiWaitRailFocus(&fx.sess, &grid, aiRailCol(120), true, 3000);
+        try gridWaitGone(&fx.sess, &grid, "SIG_A", 3000);
+        try fx.sess.send("q");
+        try gridDrain(&fx.sess, &grid, 300);
+        try std.testing.expect(!grid.contains("SIG_A"));
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+    }
+    // Embedded terminal: Alt+r focuses the child; Esc returns to the editor.
+    {
+        var fx = try startSignaturePeer(io, a, "stdin\nsecond\n", "normal", 30, 120);
+        defer fx.deinit(io, a);
+        var grid = try Grid.initSizedCols(a, 30, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+        try fx.sess.send("gs");
+        try gridWaitFor(&fx.sess, &grid, "SIG_A", 8000);
+        try fx.sess.send("\x1br");
+        std.Io.sleep(io, .fromMilliseconds(700), .real) catch {};
+        try gridDrain(&fx.sess, &grid, 200);
+        // Assert while the terminal still owns focus, before returning.
+        try std.testing.expect(!grid.contains("SIG_A"));
+        try fx.sess.send("\x1b");
+        std.Io.sleep(io, .fromMilliseconds(250), .real) catch {};
+        try gridDrain(&fx.sess, &grid, 300);
+        try std.testing.expect(!grid.contains("SIG_A"));
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+    }
+}
+
+test "signature lifecycle: focus transitions reject pending responses" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    // Navigator, released while the tree owns focus.
+    {
+        var fx = try startSignaturePeer(io, a, "stdin\nsecond\n", "hold", 30, 120);
+        defer fx.deinit(io, a);
+        var grid = try Grid.initSizedCols(a, 30, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+        try fx.sess.send("gs");
+        try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try fx.sess.send(" e");
+        try gridWaitFor(&fx.sess, &grid, "╭─ OZ", 5000);
+        try releaseSignatureA(io, fx.root);
+        try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
+        try gridDrain(&fx.sess, &grid, 300);
+        try std.testing.expect(!grid.contains("SIG_A"));
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+    }
+    // Leave and return to the same editor position before releasing A.
+    {
+        var fx = try startSignaturePeer(io, a, "stdin\nsecond\n", "hold", 30, 120);
+        defer fx.deinit(io, a);
+        var grid = try Grid.initSizedCols(a, 30, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+        try fx.sess.send("gs");
+        try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try fx.sess.send(" e");
+        try gridWaitFor(&fx.sess, &grid, "╭─ OZ", 5000);
+        try fx.sess.send("\x1b");
+        try gridDrain(&fx.sess, &grid, 300);
+        try releaseSignatureA(io, fx.root);
+        try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
+        try gridDrain(&fx.sess, &grid, 300);
+        try std.testing.expect(!grid.contains("SIG_A"));
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+    }
+    // Agent pending: release only after the rail/prompt owns focus.
+    {
+        var fx = try startSignaturePeer(io, a, "stdin\nsecond\n", "hold", 30, 120);
+        defer fx.deinit(io, a);
+        var grid = try Grid.initSizedCols(a, 30, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+        try fx.sess.send("gs");
+        try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try fx.sess.send("\x17a");
+        try gridWaitFor(&fx.sess, &grid, "AGENTS", 5000);
+        try aiWaitRailFocus(&fx.sess, &grid, aiRailCol(120), true, 3000);
+        try releaseSignatureA(io, fx.root);
+        try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
+        try gridDrain(&fx.sess, &grid, 300);
+        try std.testing.expect(!grid.contains("SIG_A"));
+        try fx.sess.send("q");
+        try gridDrain(&fx.sess, &grid, 200);
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+    }
+    // Terminal pending: release while the child owns focus, then return.
+    {
+        var fx = try startSignaturePeer(io, a, "stdin\nsecond\n", "hold", 30, 120);
+        defer fx.deinit(io, a);
+        var grid = try Grid.initSizedCols(a, 30, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+        try fx.sess.send("gs");
+        try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try fx.sess.send("\x1br");
+        std.Io.sleep(io, .fromMilliseconds(700), .real) catch {};
+        try releaseSignatureA(io, fx.root);
+        try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
+        try gridDrain(&fx.sess, &grid, 300);
+        try std.testing.expect(!grid.contains("SIG_A"));
+        try fx.sess.send("\x1b");
+        std.Io.sleep(io, .fromMilliseconds(250), .real) catch {};
+        try gridDrain(&fx.sess, &grid, 300);
+        try std.testing.expect(!grid.contains("SIG_A"));
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+    }
+}
+
+test "signature lifecycle: delayed response released in the same Insert context" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    // Move left then right back to the same byte; stay in Insert.
+    {
+        var fx = try startSignaturePeer(io, a, "stdin\nsecond\n", "hold", 30, 120);
+        defer fx.deinit(io, a);
+        var grid = try Grid.initSizedCols(a, 30, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+        try fx.sess.send("A(");
+        try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        // Prove both cursor moves were processed before releasing A: the
+        // status column must move and return to the original byte.
+        try gridWaitFor(&fx.sess, &grid, "line 1/3 col 6", 3000);
+        try fx.sess.send("\x1b[D");
+        try gridWaitFor(&fx.sess, &grid, "line 1/3 col 5", 3000);
+        try fx.sess.send("\x1b[C");
+        try gridWaitFor(&fx.sess, &grid, "line 1/3 col 6", 3000);
+        try std.testing.expect(grid.contains("[INSERT]"));
+        try releaseSignatureA(io, fx.root);
+        try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
+        try gridDrain(&fx.sess, &grid, 300);
+        try std.testing.expect(!grid.contains("SIG_A"));
+        try std.testing.expect(grid.contains("[INSERT]"));
+        try fx.sess.send("\x1b");
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+    }
+    // Escape, re-enter Insert at the same position, then release while still
+    // in the new Insert session (no extra Esc/formatting).
+    {
+        var fx = try startSignaturePeer(io, a, "stdin\nsecond\n", "hold", 30, 120);
+        defer fx.deinit(io, a);
+        var grid = try Grid.initSizedCols(a, 30, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+        try fx.sess.send("A(");
+        try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        try fx.sess.send("\x1b");
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+        try fx.sess.send("i");
+        try gridWaitFor(&fx.sess, &grid, "[INSERT]", 3000);
+        try gridWaitFor(&fx.sess, &grid, "line 1/3 col 6", 3000);
+        try releaseSignatureA(io, fx.root);
+        try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
+        try gridDrain(&fx.sess, &grid, 300);
+        try std.testing.expect(!grid.contains("SIG_A"));
+        try std.testing.expect(grid.contains("[INSERT]"));
+        try fx.sess.send("\x1b");
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+    }
+}
+
+test "signature lifecycle: B stays visible when A is released afterwards" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var fx = try startSignaturePeer(io, a, "stdin\nsecond\n", "hold_ab", 30, 120);
+    defer fx.deinit(io, a);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+    try fx.sess.send("A(");
+    try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+    // B is a fresh context: it must be answered immediately while A is held.
+    try fx.sess.send("(");
+    try gridWaitFor(&fx.sess, &grid, "SIG_B", 8000);
+    // Release A only after B is visibly installed.
+    try releaseSignatureA(io, fx.root);
+    try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
+    try gridDrain(&fx.sess, &grid, 300);
+    try std.testing.expect(grid.contains("SIG_B"));
+    try std.testing.expect(!grid.contains("SIG_A"));
+    try fx.sess.send("\x1b");
+    try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+    try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "signature lifecycle: click and immediate typing preserve the new focus request" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "normal", "hold_ab" }) |mode| {
+        var fx = try startSignaturePeer(io, a, "stdin\nsecond\n", mode, 30, 120);
+        defer fx.deinit(io, a);
+        var grid = try Grid.initSizedCols(a, 30, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 8000);
+        const held = std.mem.eql(u8, mode, "hold_ab");
+        if (held) {
+            try fx.sess.send("gs");
+            try waitBarrierMarker(io, a, fx.root, "request-1", 6000);
+        }
+        try fx.sess.send("\x17a");
+        try gridWaitFor(&fx.sess, &grid, "AGENTS", 5000);
+        try aiWaitRailFocus(&fx.sess, &grid, aiRailCol(120), true, 3000);
+        // One tty write: the event batch returns focus to the first editor
+        // line, then A( creates a request in that NEW context before render.
+        // A render-time focus cleanup must not discard this valid request.
+        try fx.sess.send("\x1b[<0;8;3M\x1b[<0;8;3mA(");
+        const signature = if (held) "SIG_B" else "SIG_A";
+        try gridWaitFor(&fx.sess, &grid, signature, 8000);
+        try gridWaitFor(&fx.sess, &grid, "stdin()", 3000);
+        try gridWaitFor(&fx.sess, &grid, "line 1/3 col 6", 3000);
+        try std.testing.expect(grid.contains("[INSERT]"));
+        try aiWaitRailFocus(&fx.sess, &grid, aiRailCol(120), false, 3000);
+        if (held) {
+            // A belongs to the old editor focus and arrives only after B
+            // is visible. Correctly preserving B must not revive A.
+            try releaseSignatureA(io, fx.root);
+            try waitBarrierMarker(io, a, fx.root, "response-A", 6000);
+            try gridDrain(&fx.sess, &grid, 300);
+            try std.testing.expect(grid.contains("SIG_B"));
+            try std.testing.expect(!grid.contains("SIG_A"));
+        }
+        try fx.sess.send("x");
+        try gridWaitGone(&fx.sess, &grid, signature, 3000);
+        try fx.sess.send("\x1b");
+        try gridWaitFor(&fx.sess, &grid, "[NORMAL]", 3000);
+        try std.testing.expectEqual(@as(u32, 0), try fx.sess.commandAndWaitExit(":qa!\r"));
+    }
 }

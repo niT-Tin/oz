@@ -205,9 +205,8 @@ pub fn curText(self: *App) ![]u8 {
 /// LSP counts characters in UTF-16 code units; `utf16Units` converts the
 /// byte column without materializing the document.
 pub fn lspPositionAt(self: *App, pt: *const buffer.PieceTable, byte: u32) lsp_types.Position {
-    const line = pt.lineOf(byte);
-    const ls = pt.lineStart(line);
-    return .{ .line = line, .character = self.utf16Units(pt, ls, byte) };
+    _ = self;
+    return @import("../lsp/position.zig").positionAt(pt, byte);
 }
 
 /// UTF-16 code units in [from, to) of `pt` (BMP chars = 1, astral = 2).
@@ -215,88 +214,34 @@ pub fn lspPositionAt(self: *App, pt: *const buffer.PieceTable, byte: u32) lsp_ty
 /// across piece boundaries for multi-byte sequences split by an edit.
 pub fn utf16Units(self: *App, pt: *const buffer.PieceTable, from: u32, to: u32) u32 {
     _ = self;
-    if (to <= from) return 0;
-    var units: u32 = 0;
-    var carry: [3]u8 = undefined; // lead bytes of a sequence split at a boundary
-    var carry_len: usize = 0;
-    var doc_off: u32 = 0;
-    var first = true;
-    for (pt.pieces.items) |p| {
-        const piece_end = doc_off + p.len;
-        if (piece_end <= from) {
-            doc_off = piece_end;
-            continue;
-        }
-        if (doc_off >= to) break;
-        const src: []const u8 = if (p.source == .origin) pt.origin else pt.add.items;
-        const skip: u32 = if (from > doc_off) from - doc_off else 0;
-        const take: u32 = @min(p.len - skip, to - doc_off);
-        const bytes = src[@as(usize, p.start) + skip .. @as(usize, p.start) + skip + take];
-        var i: usize = 0;
-        if (!first and carry_len > 0 and bytes.len > 0 and (bytes[0] & 0xC0) == 0x80) {
-            // The previous window ended mid-sequence: complete it with the
-            // continuation bytes that start this window.
-            const total: usize = std.unicode.utf8ByteSequenceLength(carry[0]) catch 0;
-            if (total > carry_len) {
-                const need = total - carry_len;
-                if (bytes.len >= need) {
-                    units += if (total == 4) 2 else 1;
-                    i = need;
-                } else {
-                    // Still split (tiny pieces): carry everything over.
-                    @memcpy(carry[carry_len .. carry_len + bytes.len], bytes);
-                    carry_len += bytes.len;
-                    doc_off = piece_end;
-                    first = false;
-                    continue;
-                }
-            }
-        }
-        carry_len = 0;
-        while (i < bytes.len) {
-            const b = bytes[i];
-            if (b < 0x80) {
-                units += 1;
-                i += 1;
-                continue;
-            }
-            const seq_len: usize = std.unicode.utf8ByteSequenceLength(b) catch 1;
-            if (i + seq_len > bytes.len) {
-                const left = bytes.len - i;
-                @memcpy(carry[0..left], bytes[i..]);
-                carry_len = left;
-                break;
-            }
-            units += if (seq_len == 4) 2 else 1;
-            i += seq_len;
-        }
-        doc_off = piece_end;
-        first = false;
-    }
-    return units;
+    return @import("../lsp/position.zig").utf16Units(pt, from, to);
 }
 
 /// Free every diagnostic message and empty the list. Messages are dupe'd
 /// in parseDiagnostics — a bare clearRetainingCapacity() leaks them.
 pub fn clearDiagnostics(self: *App) void {
+    self.diag_float_active = false;
     for (self.lsp_diagnostics.items) |*d| self.alloc.free(d.message);
     self.lsp_diagnostics.clearRetainingCapacity();
 }
 
 /// LSP notification handler (main thread, called from drain each frame).
 pub fn lspHandler(self: *App, client: *lsp.Client, msg: *json_rpc.Message) void {
-    _ = client;
     const method = msg.method orelse return;
     if (std.mem.eql(u8, method, "textDocument/publishDiagnostics")) {
         if (msg.params) |params| {
             // Parse diagnostics for the CURRENT file into lsp_diagnostics
             // (sorted by line). Diagnostics for other documents are
             // dropped — the editor tracks one buffer at a time.
-            self.clearDiagnostics();
-            self.diag_dirty = true;
             const path = self.cur().path orelse return;
             const uri = lsp_types.pathToFileUri(self.alloc, path) catch return;
             defer self.alloc.free(uri);
+            if (params != .object) return;
+            const incoming = params.object.get("uri") orelse return;
+            if (incoming != .string or !std.mem.eql(u8, incoming.string, uri)) return;
+            if (!lsp_diag.matchesVersion(params, client.documentVersion(uri))) return;
+            self.clearDiagnostics();
+            self.diag_dirty = true;
             lsp_diag.parseDiagnostics(self.alloc, params, uri, &self.lsp_diagnostics) catch {};
             lsp_diag.sortByLine(self.lsp_diagnostics.items);
         }
@@ -309,6 +254,15 @@ pub fn lspHandler(self: *App, client: *lsp.Client, msg: *json_rpc.Message) void 
 pub fn markDirtyBase(self: *App) void {
     self.cur().dirty = true;
     self.edit_seq += 1;
+    // A text edit ends the old passive hint context (displayed text and any
+    // pending hover/signature response). This is the common edit entry, so
+    // normal-mode operators, undo/redo, paste, formatting and completion
+    // acceptance are all covered without a per-key patch.
+    self.invalidatePassiveHints();
+    // Diagnostic ranges refer to the pre-edit text. Hide them until the
+    // server analyzes the new document instead of attaching them to new code.
+    self.clearDiagnostics();
+    self.diag_dirty = true;
     // Any edit drops this buffer's fold set (all folds re-open): edit
     // line shifts would otherwise leave the closed-fold start lines
     // pointing at stale text, and shifting ranges per edit is not worth
@@ -354,6 +308,9 @@ pub fn markDirtyRange(self: *App, start: lsp_types.Position, end: lsp_types.Posi
 
 /// Full-text didChange for the current buffer (see markDirty).
 pub fn syncLspFull(self: *App) void {
+    // Agent/external edits can sync without markDirtyBase.
+    self.clearDiagnostics();
+    self.diag_dirty = true;
     if (self.lsp_client) |c| {
         const text = self.curText() catch return;
         defer self.alloc.free(text);

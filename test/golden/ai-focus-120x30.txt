@@ -2,14 +2,14 @@
 # name: ai-focus-120x30
 # size: 30 rows x 120 cols
 size 30 120
-row 00 |          󰈙 fixture.txt                                             │  AGENTS  1                                      +|
+row 00 |        ▏ 󰈙 fixture.txt                                             │  AGENTS  1                                      +|
 bg 00 1f1f28*28 2a2a37*39 1f1f28*1 2a2a37*52
-fg 00 -*2 727169*1 -*1 727169*6 7e9cd8*1 -*1 dcd7ba*11 -*45 e6c384*1 -*1 e6c384*7 dcd7ba*2 727169*1 -*38 e6c384*1 -*1
-row 01 |        /tmp/oz_golden_ai-focus-120x3…  L1:C0  Ask agent  <leader>i │ main|
+fg 00 727169*1 -*1 727169*1 -*1 727169*4 7e9cd8*1 -*1 727169*1 -*1 dcd7ba*11 -*45 e6c384*1 -*1 e6c384*7 dcd7ba*2 727169*1 -*38 e6c384*1 -*1
+row 01 |        oz_golden_ai-focus-120x30/fix…  L1:C0  Ask agent  <leader>i │ main|
 bg 01 1f1f28*120
 fg 01 -*8 727169*30 -*2 dcd7ba*27 -*1 e6c384*1 -*1 54546d*4 -*46
 row 02 |  OZ  │ 1 alpha line one                                            │ > thread 1                                   idle|
-bg 02 1f1f28*8 2a2a37*16 1f1f28*46 284159*49 1f1f28*1
+bg 02 1f1f28*8 2a2a37*59 1f1f28*3 284159*49 1f1f28*1
 fg 02 -*2 e6c384*2 -*2 54546d*1 -*1 dcd7ba*2 -*58 e6c384*1 -*1 7e9cd8*1 -*1 dcd7ba*8 54546d*39 -*1
 row 03 |──────│ 1 beta line two                                             │|
 bg 03 1f1f28*8 242430*2 1f1f28*110
@@ -89,6 +89,6 @@ fg 27 -*6 54546d*1 -*1 727169*1 -*59 e6c384*1 -*1 54546d*8 727169*41 -*1
 row 28 |      │ ~                                                           │ ❯ Message thread 1…                    Enter send|
 bg 28 1f1f28*68 2a2a37*52
 fg 28 -*6 54546d*1 -*1 727169*1 -*59 e6c384*1 -*1 e6c384*2 54546d*17 -*20 54546d*10 -*1
-row 29 |[NORMAL] │ [main] │ line 1/4 col 0 │ /tmp/oz_golden_ai-focus-120x30/fixture.txt       agent thread 1 · mock-model · idle|
-bg 29 2a2a37*120
-fg 29 54546d*1 e6c384*6 54546d*4 727169*6 54546d*3 dcd7ba*14 54546d*3 727169*83
+row 29 |[NORMAL]  │ [main]                                          txt line 1/4 col 0 Top/4  agent thread 1 · mock-model · idle|
+bg 29 7e9cd8*9 2a2a37*111
+fg 29 1f1f28*9 54546d*3 727169*51 54546d*1 dcd7ba*14 54546d*1 727169*41

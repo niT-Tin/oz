@@ -81,12 +81,27 @@ pub fn mutedSelectionColor(t: theme.Theme) vaxis.Color {
     return .{ .rgb = out };
 }
 
-/// Active buffer tab: continuous with the editor surface, as in the approved
-/// demo. Bold + underline preserve the state without relying on color.
+/// Active buffer tab: continuous with the editor surface. Identity is a
+/// one-cell leading marker plus bold name; no full-tab underline (the marker
+/// is the single lightweight emphasis, so the reading surface stays calm).
 pub fn activeSurfaceTabStyle(t: theme.Theme) vaxis.Style {
     var style = activeTabStyle(t);
     style.bg = .{ .rgb = t.bg };
+    style.ul = .default;
+    style.ul_style = .off;
     return style;
+}
+
+/// One-cell marker at the active tab's left padding.
+pub fn activeSurfaceTabCellStyle(t: theme.Theme) vaxis.Style {
+    return .{ .fg = .{ .rgb = t.accent_alt }, .bg = .{ .rgb = t.bg }, .bold = true };
+}
+
+/// Inactive tab name: theme-defined italic (if any) and secondary color on
+/// the quiet strip surface.
+pub fn inactiveTabNameStyle(t: theme.Theme, bg: vaxis.Color) vaxis.Style {
+    const g = theme.glyph(t, .inactive_tab);
+    return .{ .fg = .{ .rgb = t.fg_dim }, .bg = bg, .italic = g.italic };
 }
 
 /// `>` marker / active file icon inside a navigator or workbox tab.
@@ -243,9 +258,10 @@ test "chrome: surface band card and diff roles stay semantic in every theme" {
 
         const active_buffer = activeSurfaceTabStyle(t);
         try expectRgb(active_buffer.bg, t.bg);
-        try expectRgb(active_buffer.ul, t.accent_alt);
+        try std.testing.expectEqual(vaxis.Style.Underline.off, active_buffer.ul_style);
         try std.testing.expect(active_buffer.bold);
         try expectRgb(activeSurfaceTabMarkerStyle(t).bg, t.bg);
+        try expectRgb(activeSurfaceTabCellStyle(t).fg, t.accent_alt);
 
         const card_bg = vaxis.Color{ .rgb = t.bg_alt };
         try expectRgb(diffStyle(t, .context, card_bg).fg, t.fg_dim);

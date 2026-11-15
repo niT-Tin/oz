@@ -10,9 +10,45 @@ const std = @import("std");
 /// themes drop into `.rgb =` fields without conversion.
 pub const Rgb = [3]u8;
 
+/// Optional glyph attributes for one semantic text role. The renderer merges
+/// these with the role's foreground/background; terminal fonts that lack a
+/// real italic simply render the same shape, so no layout depends on it.
+pub const Glyph = struct {
+    bold: bool = false,
+    italic: bool = false,
+    dim: bool = false,
+};
+
+/// Per-theme typographic emphasis. These are deliberately small, semantic
+/// switches (not a configuration language): a theme decides how comments,
+/// keywords and inactive tabs read, while every widget asks for the role.
+pub const Glyphs = struct {
+    /// Comments are the quiet prose of source; most themes set them italic.
+    comment: Glyph = .{ .italic = true },
+    /// Control-flow and declaration keywords. Kanagawa opts into italic.
+    keyword: Glyph = .{},
+    /// Statement-like tokens (booleans, operators in some palettes).
+    statement: Glyph = .{ .bold = true },
+    /// Inactive buffer tabs: readable, but behind the active surface.
+    inactive_tab: Glyph = .{ .italic = true },
+};
+
+/// Semantic background layer for row composition. Virtual text inherits the
+/// layer that is actually painted instead of forcing the editor background.
+pub const BgLayer = enum { editor, band, card, float };
+
+/// Search emphasis is deliberately separate from selection: a selection must
+/// win, and a current hit is stronger than the other matches on screen.
+pub const SearchKind = enum { none, match, current };
+
 /// Semantic color slots used across the UI.
 pub const Theme = struct {
     name: []const u8,
+    /// Typographic emphasis for semantic roles (see Glyphs).
+    glyphs: Glyphs = .{},
+    /// Runtime preference: false strips italic from every Glyph. Colors and
+    /// layout stay identical, so a terminal without italics remains usable.
+    italics: bool = true,
     // background shades
     bg: Rgb, // editor background (main text area)
     bg_alt: Rgb, // gutter / inactive line numbers (distinct from bg_curline
@@ -85,6 +121,9 @@ const onedark_rainbow = [7]Rgb{
 /// kanagawa-wave — the user's nvim colorscheme.
 const kanagawa_wave = Theme{
     .name = "kanagawa-wave",
+    // Kanagawa's nvim defaults: commentStyle/keywordStyle = italic,
+    // statementStyle = bold (the other themes keep their own defaults).
+    .glyphs = .{ .comment = .{ .italic = true }, .keyword = .{ .italic = true }, .statement = .{ .bold = true } },
     .bg = rgb(0x1F, 0x1F, 0x28), // sumiInk3
     .bg_alt = rgb(0x24, 0x24, 0x30), // between sumiInk3 and sumiInk4
     .bg_float = rgb(0x22, 0x32, 0x49), // waveBlue1
@@ -895,6 +934,115 @@ const flexoki_light = Theme{
     .git_del = rgb(0xAF, 0x30, 0x29), // red-600 (re)
 };
 
+/// Copy with italics enabled/disabled. `:theme` and loadTheme apply the
+/// process preference here so switching themes never re-enables italics.
+pub fn withItalics(t: Theme, enabled: bool) Theme {
+    var out = t;
+    out.italics = enabled;
+    return out;
+}
+
+/// Effective glyph for a role: the theme's setting minus italics when the
+/// user/terminal opted out. Colors are unaffected.
+pub fn glyph(t: Theme, comptime role: enum { comment, keyword, statement, inactive_tab }) Glyph {
+    var g = switch (role) {
+        .comment => t.glyphs.comment,
+        .keyword => t.glyphs.keyword,
+        .statement => t.glyphs.statement,
+        .inactive_tab => t.glyphs.inactive_tab,
+    };
+    if (!t.italics) g.italic = false;
+    return g;
+}
+
+fn blend(a: Rgb, b: Rgb, pct: u16) Rgb {
+    var out: Rgb = undefined;
+    inline for (0..3) |i| {
+        out[i] = @intCast((@as(u16, a[i]) * (100 - pct) + @as(u16, b[i]) * pct) / 100);
+    }
+    return out;
+}
+
+/// Search backgrounds are derived from the palette (no extra per-theme
+/// literals): a weak wash for ordinary hits and a stronger one for the hit
+/// under the cursor. They never reuse `bg_sel`, so selection stays distinct.
+pub fn searchBg(t: Theme, kind: SearchKind) ?Rgb {
+    return switch (kind) {
+        .none => null,
+        .match => blend(t.bg, t.accent_alt, 22),
+        .current => blend(t.bg, t.accent, 38),
+    };
+}
+
+/// Compose one row background with the documented precedence:
+/// selection > current search > search > cursorline > base surface.
+pub fn composeRowBg(t: Theme, base: BgLayer, cursorline: bool, selected: bool, search: SearchKind) Rgb {
+    if (selected) return t.bg_sel;
+    if (searchBg(t, search)) |bg| return bg;
+    if (cursorline and base == .editor) return t.bg_curline;
+    return switch (base) {
+        .editor => t.bg,
+        .band => t.bg_status,
+        .card => t.bg_alt,
+        .float => t.bg_float,
+    };
+}
+
+/// Virtual text foregrounds: a dedicated quiet role rather than relying on
+/// terminal SGR dim (whose contrast is terminal-dependent).
+pub fn hintFg(t: Theme) Rgb {
+    return legibleVirtual(t, t.fg_dim);
+}
+
+pub fn blameFg(t: Theme) Rgb {
+    return legibleVirtual(t, t.fg_dim);
+}
+
+/// Virtual text is smaller/quieter than source, but must stay identifiable.
+/// Blend the palette's muted role toward the main foreground until it clears
+/// 3:1 against every surface it can land on (editor, cursorline, selection,
+/// float). This keeps each theme's hue rather than hardcoding a grey.
+fn legibleVirtual(t: Theme, start: Rgb) Rgb {
+    const surfaces = [_]Rgb{ t.bg, t.bg_curline, t.bg_sel, t.bg_float };
+    var out = start;
+    var pct: u16 = 0;
+    while (true) {
+        var ok = true;
+        for (surfaces) |bg| {
+            if (contrastRatio(out, bg) < 3.0) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok or pct >= 100) return out;
+        pct += 5;
+        out = blend(start, t.fg, pct);
+    }
+}
+
+/// WCAG relative luminance / contrast, used by the theme coverage tests and
+/// by reviewers choosing accessible variants. sRGB, no alpha.
+pub fn contrastRatio(a: Rgb, b: Rgb) f64 {
+    const la = luminance(a);
+    const lb = luminance(b);
+    if (la < lb) return (lb + 0.05) / (la + 0.05);
+    return (la + 0.05) / (lb + 0.05);
+}
+
+fn luminance(c: Rgb) f64 {
+    var out: f64 = 0;
+    inline for (0..3) |i| {
+        const v: f64 = @as(f64, @floatFromInt(c[i])) / 255.0;
+        const lin = if (v <= 0.03928) v / 12.92 else std.math.pow(f64, (v + 0.055) / 1.055, 2.4);
+        out += lin * switch (i) {
+            0 => 0.2126,
+            1 => 0.7152,
+            else => 0.0722,
+        };
+    }
+    return out;
+}
+
 pub const themes = [_]Theme{
     kanagawa_wave,
     catppuccin_macchiato,
@@ -957,4 +1105,83 @@ pub fn ansi16(t: Theme) [16]Rgb {
         t.constructor, // 14 bright cyan
         t.fg, // 15 bright white
     };
+}
+
+// ---------------------------------------------------------------------------
+// Tests: theme role coverage, glyph semantics and row-background precedence
+// ---------------------------------------------------------------------------
+
+test "themes: every palette initializes readable roles and semantic glyphs" {
+    const t = std.testing;
+    var light_seen = false;
+    for (themes) |palette| {
+        try t.expect(palette.name.len > 0);
+        try t.expect(palette.name.len > 0);
+        // Primary reading text and the status band must stay readable. This
+        // is the documented 4.5:1 target; secondary virtual text has the 3:1
+        // target (Kanagawa's comment is intentionally the theme's own value).
+        try t.expect(contrastRatio(palette.fg, palette.bg) >= 4.5);
+        try t.expect(contrastRatio(palette.fg, palette.bg_status) >= 4.5);
+        try t.expect(contrastRatio(hintFg(palette), palette.bg) >= 3.0);
+        try t.expect(contrastRatio(blameFg(palette), palette.bg) >= 3.0);
+        try t.expect(contrastRatio(hintFg(palette), palette.bg_curline) >= 3.0);
+        try t.expect(contrastRatio(hintFg(palette), palette.bg_sel) >= 3.0);
+        const bg_lum = luminance(palette.bg);
+        const fg_lum = luminance(palette.fg);
+        if (bg_lum > fg_lum) light_seen = true;
+        // Every role has a concrete, in-gamut value and the glyph settings
+        // are usable even when italics are disabled.
+        const no_italic = withItalics(palette, false);
+        try t.expect(!glyph(no_italic, .comment).italic);
+        try t.expect(!glyph(no_italic, .keyword).italic);
+        try t.expect(!glyph(no_italic, .inactive_tab).italic);
+        const base = composeRowBg(palette, .editor, false, false, .none);
+        try t.expectEqual(palette.bg, base);
+        try t.expectEqual(palette.bg_curline, composeRowBg(palette, .editor, true, false, .none));
+        try t.expectEqual(palette.bg_sel, composeRowBg(palette, .editor, true, true, .current));
+        try t.expect(searchBg(palette, .match) != null);
+    }
+    try t.expect(light_seen); // at least one light theme exists
+}
+
+test "themes: kanagawa comment/keyword italic and OZ_NO_ITALIC fallback" {
+    const t = std.testing;
+    const pal = byName("kanagawa-wave").?;
+    try t.expect(glyph(pal, .comment).italic);
+    try t.expect(glyph(pal, .keyword).italic);
+    try t.expect(glyph(pal, .statement).bold);
+    const plain = withItalics(pal, false);
+    try t.expect(!glyph(plain, .comment).italic);
+    try t.expect(!glyph(plain, .keyword).italic);
+    try t.expectEqual(pal.comment, plain.comment); // colors unchanged
+    try t.expectEqual(pal.fg, plain.fg);
+}
+
+test "themes: flexoki-light is a real light palette with readable text" {
+    const t = std.testing;
+    const pal = byName("flexoki-light").?;
+    try t.expect(luminance(pal.bg) > luminance(pal.fg));
+    try t.expect(contrastRatio(pal.fg, pal.bg) >= 4.5);
+    try t.expect(contrastRatio(pal.fg, pal.bg_status) >= 4.5);
+    try t.expect(glyph(pal, .comment).italic);
+}
+
+test "themes: row background composition never lets search/cursorline hide selection" {
+    const t = std.testing;
+    const pal = byName("tokyonight-moon").?;
+    try t.expectEqual(pal.bg_sel, composeRowBg(pal, .editor, true, true, .current));
+    try t.expectEqual(searchBg(pal, .current).?, composeRowBg(pal, .editor, true, false, .current));
+    try t.expectEqual(searchBg(pal, .match).?, composeRowBg(pal, .editor, true, false, .match));
+    try t.expectEqual(pal.bg_curline, composeRowBg(pal, .editor, true, false, .none));
+    try t.expectEqual(pal.bg_float, composeRowBg(pal, .float, true, false, .none));
+    try t.expect(!std.mem.eql(u8, &searchBg(pal, .match).?, &pal.bg_sel));
+    try t.expect(!std.mem.eql(u8, &searchBg(pal, .match).?, &searchBg(pal, .current).?));
+}
+
+test "themes: byName accepts unique prefixes and rejects ambiguity" {
+    const t = std.testing;
+    try t.expectEqualStrings("kanagawa-wave", byName("kanagawa-w").?.name);
+    try t.expectEqualStrings("flexoki-light", byName("FLEXOKI-L").?.name);
+    try t.expect(byName("kanagawa") == null); // wave + dragon
+    try t.expect(byName("not-a-theme") == null);
 }

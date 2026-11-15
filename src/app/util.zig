@@ -185,8 +185,14 @@ pub fn isFenceLine(line: []const u8) ?[]const u8 {
 pub fn syntaxStyle(style: syntax.Style, t: theme.Theme) vaxis.Style {
     return switch (style) {
         .default => .{ .fg = .{ .rgb = t.fg } },
-        .comment => .{ .fg = .{ .rgb = t.comment } },
-        .keyword => .{ .fg = .{ .rgb = t.keyword } }, // gold
+        .comment => blk: {
+            const g = theme.glyph(t, .comment);
+            break :blk .{ .fg = .{ .rgb = t.comment }, .italic = g.italic, .bold = g.bold };
+        },
+        .keyword => blk: {
+            const g = theme.glyph(t, .keyword);
+            break :blk .{ .fg = .{ .rgb = t.keyword }, .italic = g.italic, .bold = g.bold };
+        },
         .string => .{ .fg = .{ .rgb = t.string } }, // green
         .number => .{ .fg = .{ .rgb = t.number } },
         .constant => .{ .fg = .{ .rgb = t.constant } },
@@ -217,7 +223,7 @@ pub fn syntaxStyle(style: syntax.Style, t: theme.Theme) vaxis.Style {
         // rainbow brackets: bracketN -> rainbow[N] (ordinal offset from
         // bracket0, exactly the bracket depth % 7 the highlighter assigned)
         .bracket0, .bracket1, .bracket2, .bracket3, .bracket4, .bracket5, .bracket6 => blk: {
-            const idx: usize = @as(usize, @intFromEnum(style)) - @as(usize, @intFromEnum(syntax.Style.bracket0));
+            const idx: usize = @as(usize, @backingInt(style)) - @as(usize, @backingInt(syntax.Style.bracket0));
             break :blk .{ .fg = .{ .rgb = t.rainbow[idx] } };
         },
     };

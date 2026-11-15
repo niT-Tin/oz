@@ -2,14 +2,14 @@
 # name: ai-dock-100x30
 # size: 30 rows x 100 cols
 size 30 100
-row 00 |  󰈙 fixture.txt                                                   │  AGENTS  1                    +|
+row 00 |▏ 󰈙 fixture.txt                                                   │  AGENTS  1                    +|
 bg 00 1f1f28*20 2a2a37*45 1f1f28*1 2a2a37*34
-fg 00 -*2 7e9cd8*1 -*1 dcd7ba*11 -*50 727169*1 e6c384*1 -*1 e6c384*7 dcd7ba*2 727169*1 -*20 e6c384*1 -*1
-row 01 |/tmp/oz_golden_ai-dock-100x30/fixtu…  L1:C0  Ask agent  <leader>i │ main|
+fg 00 7e9cd8*1 -*1 727169*1 -*1 dcd7ba*11 -*50 727169*1 e6c384*1 -*1 e6c384*7 dcd7ba*2 727169*1 -*20 e6c384*1 -*1
+row 01 |oz_golden_ai-dock-100x30/fixture.txt  L1:C0  Ask agent  <leader>i │ main|
 bg 01 1f1f28*100
 fg 01 727169*36 -*2 dcd7ba*27 -*1 e6c384*1 -*1 54546d*4 -*28
 row 02 |1 alpha line one                                                  │ > thread 1                 idle|
-bg 02 2a2a37*16 1f1f28*52 284159*31 1f1f28*1
+bg 02 2a2a37*65 1f1f28*3 284159*31 1f1f28*1
 fg 02 dcd7ba*2 -*64 e6c384*1 -*1 7e9cd8*1 -*1 dcd7ba*8 54546d*21 -*1
 row 03 |1 beta line two                                                   │|
 bg 03 242430*2 1f1f28*98
@@ -89,6 +89,6 @@ fg 27 727169*1 -*65 e6c384*1 -*1 54546d*8 727169*23 -*1
 row 28 |~                                                                 │ ❯ Message thread 1…  Enter send|
 bg 28 1f1f28*66 2a2a37*34
 fg 28 727169*1 -*65 e6c384*1 -*1 e6c384*2 54546d*17 -*2 54546d*10 -*1
-row 29 |[NORMAL] │ [main] │ line 1/4 col 0 │ …/fixture.txt                      thread 1 · mock-model · idle|
-bg 29 2a2a37*100
-fg 29 54546d*1 e6c384*6 54546d*4 727169*6 54546d*3 dcd7ba*14 54546d*3 727169*63
+row 29 |[NORMAL]  │ [main]                            txt line 1/4 col 0 Top/4  thread 1 · mock-model · idle|
+bg 29 7e9cd8*9 2a2a37*91
+fg 29 1f1f28*9 54546d*3 727169*37 54546d*1 dcd7ba*14 54546d*1 727169*35

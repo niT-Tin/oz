@@ -71,6 +71,43 @@ pub const max_blame_lines: u32 = 40000;
 /// LSP navigation request kinds (K / gd / gD / gr / gI / gs).
 pub const NavAction = enum { none, hover, definition, declaration, references, implementation, signature };
 
+/// Identity of one passive hint context. Movement back to the same byte,
+/// or re-entering insert at the same position, must not revive an old
+/// request: `epoch` records every intermediate invalidation, while the
+/// remaining fields reject results that arrive after an observable context
+/// change even if some future call site forgot to bump the epoch.
+pub const PassiveFocus = struct { focus: u8, ai_focus: u8, agent_focus: bool, terminal_focus: bool };
+
+pub const PassiveNavContext = struct {
+    epoch: u64,
+    buffer_hash: u64,
+    has_path: bool,
+    window: usize,
+    cursor: u32,
+    edit_seq: u64,
+    insert_session: u64,
+    mode: u8,
+    focus: u8,
+    ai_focus: u8,
+    agent_focus: bool,
+    terminal_focus: bool,
+
+    pub fn matches(self: PassiveNavContext, other: PassiveNavContext) bool {
+        return self.epoch == other.epoch and
+            self.buffer_hash == other.buffer_hash and
+            self.has_path == other.has_path and
+            self.window == other.window and
+            self.cursor == other.cursor and
+            self.edit_seq == other.edit_seq and
+            self.insert_session == other.insert_session and
+            self.mode == other.mode and
+            self.focus == other.focus and
+            self.ai_focus == other.ai_focus and
+            self.agent_focus == other.agent_focus and
+            self.terminal_focus == other.terminal_focus;
+    }
+};
+
 /// An inlay hint: dim label shown inline at (line, character).
 pub const InlayHint = struct { line: u32, character: u32, label: []const u8 };
 
@@ -296,6 +333,9 @@ pub const App = struct {
     env_map: *std.process.Environ.Map,
     /// Active color theme (persisted to ~/.cache/oz/theme, switchable at runtime).
     theme: theme.Theme,
+    /// OZ_NO_ITALIC=1 keeps the palette but strips italic glyphs (fonts or
+    /// terminals without a real italic variant still get a usable editor).
+    italics_enabled: bool = true,
     /// Theme when the theme picker opened — Esc restores it (no allocation;
     /// value copy, nothing to free in deinit).
     theme_saved: ?theme.Theme = null,
@@ -347,6 +387,8 @@ pub const App = struct {
     cmdline_kind: enum { ex, search_fwd, search_bwd } = .ex,
     /// Last executed search query (owned) and its direction — for n/N.
     last_search: ?[]u8 = null,
+    /// `/`/`?` highlights matches until `:noh`; selections still win.
+    search_hl_active: bool = false,
     last_search_bwd: bool = false,
     /// The command-name match list from the last Tab (owned), so repeated
     /// Tabs cycle the ORIGINAL matches even after the line becomes a full
@@ -500,6 +542,11 @@ pub const App = struct {
     preview_hl: ?syntax.Highlighter = null,
 
     // M2 diagnostics list overlay (<leader>sd)
+    diag_float_active: bool = false,
+    diag_float_cursor: u32 = 0,
+    diag_float_buf: usize = 0,
+    diag_float_window: usize = 0,
+    diag_float_scroll: usize = 0,
     diag_list_active: bool = false,
     diag_list_sel: usize = 0,
     diag_list_top: usize = 0,
@@ -508,6 +555,29 @@ pub const App = struct {
     // at a time; the response lands in nav_slot and processNav() consumes it.
     nav_slot: ?std.json.Value = null,
     nav_action: NavAction = .none,
+    /// Passive hover/signature request slot, separate from explicit
+    /// definition/reference navigation so invalidating a float can never
+    /// cancel gd/gr.
+    passive_slot: ?std.json.Value = null,
+    passive_ctx: ?PassiveNavContext = null,
+    passive_action: NavAction = .none,
+    /// Monotonic invalidation generation for passive hints. Incremented on
+    /// every cursor/edit/session/ownership change; a response may only be
+    /// installed when its captured epoch still equals this value.
+    passive_epoch: u64 = 0,
+    /// Incremented only when a passive request is issued. The input guard
+    /// uses it to distinguish "this key moved the cursor" from "this key
+    /// created the new request at the final cursor".
+    passive_request_serial: u64 = 0,
+    /// Context that produced the currently displayed float, or null when
+    /// nothing is displayed.
+    nav_hover_ctx: ?PassiveNavContext = null,
+    /// Focus tuple observed after the previous frame; render-time sync turns
+    /// any keyboard/mouse/terminal focus transition into one epoch bump, so
+    /// focus changes cannot be missed by individual entry points.
+    passive_focus_seen: ?PassiveFocus = null,
+    /// Insert-session generation (incremented by beginInsertSession).
+    insert_session: u64 = 0,
     /// Owned hover/signature text shown in a floating window (or null).
     nav_hover_text: ?[]u8 = null,
     /// Owned location list for gr/gI (uri strings owned per item).
@@ -605,6 +675,28 @@ pub const App = struct {
     /// LSP textDocument/completion response slot (filled by drain); consumed
     /// by processCompletion. Local word completion is the fallback.
     completion_slot: ?std.json.Value = null,
+    /// Asynchronous completionItem/resolve response and the identity it was
+    /// requested for. A late result may only update that item in the same
+    /// completion session; closing/reopening the menu invalidates it.
+    completion_resolve_slot: ?std.json.Value = null,
+    completion_resolve_item_id: u64 = 0,
+    completion_resolve_session: u64 = 0,
+    completion_resolve_generation: u64 = 0,
+    completion_resolve_index: usize = 0,
+    completion_resolve_seq: u64 = 0,
+    completion_resolve_buf: usize = 0,
+    completion_resolve_started_ms: i64 = 0,
+    /// Monotonic completion session. Incremented when a menu session ends or
+    /// a fresh one starts; resolve results from an older session are dropped.
+    completion_session: u64 = 0,
+    /// A new candidate array invalidates every resolve for the old array,
+    /// even if its display fields or semantic identity happen to match.
+    completion_generation: u64 = 0,
+    /// Buffer index at request time (belt-and-braces against cross-buffer
+    /// responses if a close path is missed).
+    completion_req_buf: usize = 0,
+    /// First visible display line of the documentation pane (wrapped rows).
+    completion_doc_scroll: u32 = 0,
     /// LSP textDocument/formatting response slot (TextEdit[]).
     format_slot: ?std.json.Value = null,
     /// LSP textDocument/inlayHint response slot.
@@ -1413,7 +1505,8 @@ pub const App = struct {
             .io = init.io,
             .alloc = init.gpa,
             .env_map = init.environ_map,
-            .theme = theme.default,
+            .theme = theme.withItalics(theme.default, !std.mem.eql(u8, init.environ_map.get("OZ_NO_ITALIC") orelse "", "1")),
+            .italics_enabled = !std.mem.eql(u8, init.environ_map.get("OZ_NO_ITALIC") orelse "", "1"),
             .vx = vx,
             .tty = tty,
             .tty_buffer = tty_buffer,
@@ -1555,10 +1648,12 @@ pub const App = struct {
         for (self.lsp_diagnostics.items) |*d| self.alloc.free(d.message);
         self.lsp_diagnostics.deinit(self.alloc);
         if (self.nav_slot) |*v| json_rpc.freeValue(self.alloc, v);
+        if (self.passive_slot) |*v| json_rpc.freeValue(self.alloc, v);
         if (self.nav_hover_text) |t| self.alloc.free(t);
         for (self.nav_locations.items) |*l| self.alloc.free(l.uri);
         self.nav_locations.deinit(self.alloc);
         if (self.completion_slot) |*v| json_rpc.freeValue(self.alloc, v);
+        if (self.completion_resolve_slot) |*v| json_rpc.freeValue(self.alloc, v);
         if (self.format_slot) |*v| json_rpc.freeValue(self.alloc, v);
         if (self.format_request) |*r| r.deinit(self.alloc);
         if (self.inlay_slot) |*v| json_rpc.freeValue(self.alloc, v);
@@ -1636,6 +1731,11 @@ pub const App = struct {
     // ---- navigation → src/app/navigation.zig ----
     pub const requestNav = @import("app/navigation.zig").requestNav;
     pub const processNav = @import("app/navigation.zig").processNav;
+    pub const processPassiveNav = @import("app/navigation.zig").processPassiveNav;
+    pub const passiveContext = @import("app/navigation.zig").passiveContext;
+    pub const invalidatePassiveHints = @import("app/navigation.zig").invalidatePassiveHints;
+    pub const navHoverAlive = @import("app/navigation.zig").navHoverAlive;
+    pub const syncPassiveFocus = @import("app/navigation.zig").syncPassiveFocus;
     pub const clearNavOverlays = @import("app/navigation.zig").clearNavOverlays;
     pub const clearHover = @import("app/navigation.zig").clearHover;
     pub const jumpToLocation = @import("app/navigation.zig").jumpToLocation;
@@ -1753,6 +1853,12 @@ pub const App = struct {
     pub const isCompletionTriggerText = @import("app/completion.zig").isCompletionTriggerText;
     pub const maybeAutoComplete = @import("app/completion.zig").maybeAutoComplete;
     pub const processCompletion = @import("app/completion.zig").processCompletion;
+    pub const processCompletionResolve = @import("app/completion.zig").processCompletionResolve;
+    pub const maybeResolveCompletion = @import("app/completion.zig").maybeResolveCompletion;
+    pub const moveCompletion = @import("app/completion.zig").moveCompletion;
+    pub const scrollCompletionDocs = @import("app/completion.zig").scrollCompletionDocs;
+    pub const completionDocsVisible = @import("app/completion.zig").completionDocsVisible;
+    pub const completionResolveWaiting = @import("app/completion.zig").completionResolveWaiting;
     // ---- block_insert → src/app/block_insert.zig ----
     pub const charBoundaryForward = @import("app/block_insert.zig").charBoundaryForward;
     pub const charLenAt = @import("app/block_insert.zig").charLenAt;

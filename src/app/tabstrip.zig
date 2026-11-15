@@ -43,6 +43,20 @@ pub fn contextPath(path: ?[]const u8, project_root: ?[]const u8) []const u8 {
     return p[root.len + 1 ..];
 }
 
+/// Tab display name. Normally the basename; when another open buffer has
+/// the same basename, the last two path components disambiguate
+/// (`src/main.zig` vs `test/main.zig`) without spending a context row on a
+/// full absolute path.
+pub fn displayName(path: ?[]const u8, duplicate: bool) []const u8 {
+    const p = path orelse return "[No Name]";
+    const base = std.fs.path.basename(p);
+    if (!duplicate or base.len == p.len) return base;
+    const parent = std.fs.path.dirname(p) orelse return base;
+    const parent_base = std.fs.path.basename(parent);
+    if (parent_base.len == 0 or parent.len == 0) return base;
+    return p[parent.len - parent_base.len ..];
+}
+
 /// Split of a truncated filename's name region: keep a readable prefix and a
 /// recognizable extension/suffix, separated by one ellipsis cell. Middle
 /// truncation is deliberate — a file named `very_long_feature.zig` should
@@ -390,4 +404,13 @@ test "tabstrip: editor context uses real paths without false root matches" {
     try std.testing.expectEqualStrings("/work/oz", contextPath("/work/oz", "/work/oz"));
     try std.testing.expectEqualStrings("src\\app.zig", contextPath("C:\\work\\oz\\src\\app.zig", "C:\\work\\oz"));
     try std.testing.expect(std.mem.indexOf(u8, ask_agent_hint, "<leader>i") != null);
+}
+
+test "tabstrip: duplicate basenames get a shortest useful parent fragment" {
+    const t = std.testing;
+    try t.expectEqualStrings("main.zig", displayName("/a/src/main.zig", false));
+    try t.expectEqualStrings("src/main.zig", displayName("/a/src/main.zig", true));
+    try t.expectEqualStrings("test/main.zig", displayName("/a/test/main.zig", true));
+    try t.expectEqualStrings("main.zig", displayName("main.zig", true));
+    try t.expectEqualStrings("[No Name]", displayName(null, false));
 }

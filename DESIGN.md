@@ -1623,3 +1623,31 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 The client advertises no terminal or filesystem capabilities. Agents own their tool implementations and model/context budgets. Unknown requests receive JSON-RPC method-not-found, unknown notifications are ignored, and foreign-session message updates are discarded. Tool lifecycle updates are transcript text, never oz tool-loop requests. Permission requests show serialized tool details and wait for a human one-shot decision. Only allow_once/reject_once options are selected; absent matching options or invalid sessions produce rejection/cancellation. Oversized permission details are denied. No always-allow policy is inferred.
 
 External writes are already committed by the harness. After a turn, clean open buffers in the visible workspace refresh as undoable replacements and synchronize LSP; dirty buffers and their save baselines are preserved. Retargeted/deleted paths produce a conflict note. ACP is separate from inline replacement generation, which directs users to the Agent panel. Sessions/transcripts are currently in memory only: no loadSession, backend history replay, model selector, or MCP configuration UI is claimed. Commands are explicitly configured by the user's environment, never loaded from repository-local settings.
+
+
+### Current-line diagnostics
+
+`app/diagnostics.zig` renders the focused normal-mode line's highest-severity LSP
+message after the visible source text, clipped at the pane/Agent boundary. The
+severity mark and color are paired, extra diagnostics are counted, and `[gl]`
+opens the complete messages. A diagnostic takes priority over blame virtual text.
+Insert, visual, command and other focused/modal UI suppress the virtual text.
+
+`gl` opens a separate, grapheme-wrapped diagnostic float. It stays inside the
+focused editor pane, chooses above/below based on available rows and never
+covers the cursor row or status bar. Ctrl+f/Ctrl+b scroll by three rows, Esc closes,
+and other keys close the float then retain their ordinary meaning. Cursor,
+buffer/window/focus changes and accepted diagnostic replacements dismiss it.
+Messages remain literal text; control bytes are replaced for display.
+
+The current-line summary honors LSP end-exclusive ranges and prioritizes errors
+before warnings/info/hints. Unrelated publishDiagnostics URIs are filtered before
+clearing the active file's diagnostics, so background-file pushes cannot erase
+its gutter or inline messages. No extra diagnostic requests or idle timer are
+needed: the existing LSP notification wake repaints the UI.
+
+Edits immediately clear pre-edit diagnostic ranges. Publications carrying a
+document version must match the client's latest sent version before replacing
+the current list (including empty lists). The client advertises version support;
+missing/null versions remain accepted for servers such as ZLS, whose
+unversioned publications cannot be reliably dated by the client.

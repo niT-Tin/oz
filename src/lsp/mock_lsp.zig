@@ -48,6 +48,10 @@ pub const Script = enum {
     /// publishDiagnostics (the error is gone). Regression coverage for
     /// "a diagnostics push must repaint without a keypress".
     clear_on_change,
+    /// Mixed-severity, multiline/CJK diagnostics plus an unrelated URI push.
+    diagnostic_ui,
+    /// First edit gets no reply; later edits publish current then stale data.
+    diagnostic_versions,
     /// Phantom-'j' detector: after EVERY didChange, inspect the latest
     /// recorded document text — if it starts with 'j' push an error
     /// diagnostic at line 0 ("phantom j"), else push an empty list.
@@ -80,6 +84,18 @@ pub const Script = enum {
     /// items with detail + markdown documentation and a wide label. Used by
     /// the popup-geometry/markdown e2e tests.
     rich,
+    /// Rich completion-only fixture: labelDetails (detail + description),
+    /// display label != insertText, markdown/plaintext docs, a long
+    /// scrollable body, duplicate labels and detail-only/no-docs items.
+    completion_rich,
+    /// Initial items without docs; completionProvider.resolveProvider=true.
+    /// Resolve refines detail/documentation for the selected item.
+    completion_resolve,
+    /// Like completion_resolve, but A's response is held until B is
+    /// requested, then emitted first (out-of-order/obsolete response).
+    completion_resolve_hold,
+    /// Resolve returns a JSON-RPC error; the menu must remain usable.
+    completion_resolve_error,
     /// Hold formatting until another URI is didOpen'd. Rename returns two
     /// URI-keyed changes with b.zig first, deliberately unlike request order.
     edit_safety,
@@ -87,21 +103,35 @@ pub const Script = enum {
     edit_safety_documents,
     /// Rename returns real b.zig while hover observes the opened symlink.
     edit_safety_alias,
+    /// Controlled signature/completion lifecycle fixture. The first
+    /// signatureHelp request can be held until another message arrives;
+    /// markers (OZ_SIG_BARRIER_DIR/request-N, response-N) give tests a
+    /// protocol barrier instead of sleeping.
+    signature_lifecycle,
 
     pub fn parse(name: []const u8) ?Script {
         if (std.mem.eql(u8, name, "hello")) return .hello;
         if (std.mem.eql(u8, name, "silent")) return .silent;
         if (std.mem.eql(u8, name, "clear_on_change")) return .clear_on_change;
+        if (std.mem.eql(u8, name, "diagnostic_ui")) return .diagnostic_ui;
+        if (std.mem.eql(u8, name, "diagnostic_versions")) return .diagnostic_versions;
         if (std.mem.eql(u8, name, "jk_sync")) return .jk_sync;
         if (std.mem.eql(u8, name, "inlay_range")) return .inlay_range;
         if (std.mem.eql(u8, name, "inlay_eol")) return .inlay_eol;
         if (std.mem.eql(u8, name, "rich")) return .rich;
+        if (std.mem.eql(u8, name, "completion_rich")) return .completion_rich;
+        if (std.mem.eql(u8, name, "completion_resolve")) return .completion_resolve;
+        if (std.mem.eql(u8, name, "completion_resolve_hold")) return .completion_resolve_hold;
+        if (std.mem.eql(u8, name, "completion_resolve_error")) return .completion_resolve_error;
         if (std.mem.eql(u8, name, "edit_safety")) return .edit_safety;
         if (std.mem.eql(u8, name, "edit_safety_documents")) return .edit_safety_documents;
         if (std.mem.eql(u8, name, "edit_safety_alias")) return .edit_safety_alias;
+        if (std.mem.eql(u8, name, "signature_lifecycle")) return .signature_lifecycle;
         return null;
     }
 };
+
+pub const SignatureMode = enum { normal, null_result, error_result, ignore, timeout };
 
 /// Per-connection state carried across messages. Owns everything it records;
 /// call `deinit` when the connection ends.
@@ -110,6 +140,8 @@ pub const State = struct {
     initialized: bool = false,
     /// true after an `exit` notification; the server loop stops.
     exit_requested: bool = false,
+    /// Held completionItem/resolve request id (completion_resolve_hold).
+    held_resolve_id: ?u64 = null,
     /// URIs seen in textDocument/didOpen, in arrival order (owned).
     opened: std.ArrayList([]u8) = .empty,
     /// textDocument/didChange records: uri + the latest full text (owned).
@@ -123,6 +155,9 @@ pub const State = struct {
     inlay_answered: bool = false,
     /// Complete owned response held until didOpen of another document.
     pending_format: ?struct { body: []u8, uri: []u8 } = null,
+    signature_mode: SignatureMode = .normal,
+    signature_requests: u32 = 0,
+    signature_responses: u32 = 0,
 
     pub const ChangeRecord = struct {
         uri: []u8,
@@ -189,7 +224,7 @@ pub fn handleMessage(
         const a = arena.allocator();
 
         if (std.mem.eql(u8, method, "initialize")) {
-            try pushResponse(alloc, &out, id, try buildInitializeResult(a));
+            try pushResponse(alloc, &out, id, try buildInitializeResult(a, script));
         } else if (std.mem.eql(u8, method, "textDocument/completion")) {
             // echo the typed prefix in the labels ("mockItemmo") so tests can
             // verify the client filters suggestions as the user types
@@ -232,7 +267,43 @@ pub fn handleMessage(
                 }
             }
             const prefix = completionPrefix(a, state, uri, line, col);
-            try pushResponse(alloc, &out, id, try buildCompletionResult(a, prefix, script));
+            const result = if (script == .completion_rich)
+                try buildRichCompletionResult(a, prefix)
+            else if (script == .signature_lifecycle)
+                try buildLifecycleCompletionResult(a)
+            else if (script == .completion_resolve or script == .completion_resolve_hold or script == .completion_resolve_error)
+                try buildResolveCompletionResult(a, prefix, script)
+            else
+                try buildCompletionResult(a, prefix, script);
+            try pushResponse(alloc, &out, id, result);
+        } else if (std.mem.eql(u8, method, "completionItem/resolve")) {
+            if (script == .completion_resolve_error) {
+                const body = try json_rpc.encodeError(alloc, id, -32603, "resolve failed");
+                errdefer alloc.free(body);
+                try out.frames.append(alloc, body);
+            } else if (script == .completion_resolve_hold) {
+                const label = if (msg.params) |p|
+                    if (p == .object) if (p.object.get("label")) |l| if (l == .string) l.string else "" else "" else ""
+                else
+                    "";
+                // A is held; B flushes A first, then answers B. The client
+                // must discard A (its slot was replaced) and keep B.
+                if (std.mem.indexOf(u8, label, "resolveA") != null) {
+                    state.held_resolve_id = id;
+                } else {
+                    if (state.held_resolve_id) |held| {
+                        try pushResponse(alloc, &out, held, try buildResolvedItem(a, "resolveA", "LATE_A"));
+                        state.held_resolve_id = null;
+                    }
+                    try pushResponse(alloc, &out, id, try buildResolvedItem(a, label, "DOC_B"));
+                }
+            } else {
+                const label = if (msg.params) |p|
+                    if (p == .object) if (p.object.get("label")) |l| if (l == .string) l.string else "" else "" else ""
+                else
+                    "";
+                try pushResponse(alloc, &out, id, try buildResolvedItem(a, label, label));
+            }
         } else if (std.mem.eql(u8, method, "textDocument/hover")) {
             const result = if (script == .edit_safety or script == .edit_safety_documents or script == .edit_safety_alias)
                 try buildSafetyHover(a, state, msg.params, if (script == .edit_safety_alias) "linked-b.zig" else "b.zig")
@@ -257,7 +328,29 @@ pub fn handleMessage(
             try locs.append(l2);
             try pushResponse(alloc, &out, id, .{ .array = locs });
         } else if (std.mem.eql(u8, method, "textDocument/signatureHelp")) {
-            try pushResponse(alloc, &out, id, try buildSignatureResult(a));
+            if (script == .signature_lifecycle) {
+                state.signature_requests += 1;
+                switch (state.signature_mode) {
+                    .ignore, .timeout => {},
+                    .null_result => {
+                        try pushResponse(alloc, &out, id, .null);
+                        state.signature_responses += 1;
+                    },
+                    .error_result => {
+                        const body = try json_rpc.encodeError(alloc, id, -32603, "signature failed SIG_ERROR");
+                        errdefer alloc.free(body);
+                        try out.frames.append(alloc, body);
+                        state.signature_responses += 1;
+                    },
+                    .normal => {
+                        const label = if (state.signature_requests == 1) "SIG_A" else "SIG_B";
+                        try pushResponse(alloc, &out, id, try buildSignatureLabel(a, label));
+                        state.signature_responses += 1;
+                    },
+                }
+            } else {
+                try pushResponse(alloc, &out, id, try buildSignatureResult(a));
+            }
         } else if (std.mem.eql(u8, method, "textDocument/formatting")) {
             if (script == .edit_safety or script == .edit_safety_documents or script == .edit_safety_alias) {
                 const uri = requestDocumentUri(msg.params) orelse return error.MissingDocumentUri;
@@ -322,22 +415,58 @@ pub fn handleMessage(
         // Push diagnostics for the JUST-opened document (uri matches what the
         // client filters on) — pushing at `initialized` races didOpen and the
         // client would drop the diagnostics as belonging to another file.
-        if (script == .hello or script == .clear_on_change) {
+        if (script == .hello or script == .clear_on_change or script == .diagnostic_ui or script == .diagnostic_versions) {
             const uri = if (state.opened.items.len > 0) state.opened.items[state.opened.items.len - 1] else default_uri;
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
             const a = arena.allocator();
-            const params = try buildDiagnosticsParams(a, uri, "mock error");
+            var params = if (script == .diagnostic_ui) try buildDetailedDiagnostics(a, uri) else try buildDiagnosticsParams(a, uri, "mock error");
+            if (script == .diagnostic_versions) try params.object.put(a, "version", msg.params.?.object.get("textDocument").?.object.get("version").?);
             const body = try json_rpc.encodeNotification(alloc, "textDocument/publishDiagnostics", params);
             errdefer alloc.free(body);
             try out.frames.append(alloc, body);
+            if (script == .diagnostic_ui) {
+                const other = try buildDiagnosticsParams(a, "file:///tmp/oz-unrelated-diagnostic.zig", "FOREIGN_DIAG");
+                try out.frames.append(alloc, try json_rpc.encodeNotification(alloc, "textDocument/publishDiagnostics", other));
+            }
         }
     } else if (std.mem.eql(u8, method, "textDocument/didChange")) {
         try recordDidChange(alloc, state, msg.params);
+        if (script == .diagnostic_versions and state.changed.items.len >= 3) {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const td = msg.params.?.object.get("textDocument").?;
+            const uri = td.object.get("uri").?.string;
+            const v = td.object.get("version").?;
+            const version: i64 = switch (v) {
+                .integer => |n| n,
+                .number_string => |s| try std.fmt.parseInt(i64, s, 10),
+                else => return error.InvalidVersion,
+            };
+            // After the second edit publish a valid result, then a late old
+            // result and a late old clear. Neither may replace the valid one.
+            // After later edits publish only an invalid future version.
+            if (state.changed.items.len == 3) {
+                var current = try buildDiagnosticsParams(a, uri, "CURRENT_VERSION");
+                try current.object.put(a, "version", .{ .integer = version });
+                try out.frames.append(alloc, try json_rpc.encodeNotification(alloc, "textDocument/publishDiagnostics", current));
+                var stale = try buildDiagnosticsParams(a, uri, "STALE_VERSION");
+                try stale.object.put(a, "version", .{ .integer = version - 1 });
+                try out.frames.append(alloc, try json_rpc.encodeNotification(alloc, "textDocument/publishDiagnostics", stale));
+                var empty = try buildEmptyDiagnosticsParams(a, uri);
+                try empty.object.put(a, "version", .{ .integer = version - 1 });
+                try out.frames.append(alloc, try json_rpc.encodeNotification(alloc, "textDocument/publishDiagnostics", empty));
+            } else {
+                var future = try buildDiagnosticsParams(a, uri, "FUTURE_VERSION");
+                try future.object.put(a, "version", .{ .integer = version + 1 });
+                try out.frames.append(alloc, try json_rpc.encodeNotification(alloc, "textDocument/publishDiagnostics", future));
+            }
+        }
         // clear_on_change: the edit fixed the document — push an empty
         // diagnostics list so the client must clear the gutter mark (and
         // repaint without waiting for another keypress).
-        if (script == .clear_on_change and !state.clear_pushed) {
+        if ((script == .clear_on_change or script == .diagnostic_ui) and !state.clear_pushed) {
             state.clear_pushed = true;
             const uri = if (state.opened.items.len > 0) state.opened.items[state.opened.items.len - 1] else default_uri;
             var arena = std.heap.ArenaAllocator.init(alloc);
@@ -516,7 +645,7 @@ fn pushResponse(alloc: std.mem.Allocator, out: *Outcome, id: u64, result: std.js
     try out.frames.append(alloc, body);
 }
 
-fn buildInitializeResult(a: std.mem.Allocator) !std.json.Value {
+fn buildInitializeResult(a: std.mem.Allocator, script: Script) !std.json.Value {
     var caps = try std.json.ObjectMap.init(a, &.{}, &.{});
     // 2 == Incremental text sync.
     try caps.put(a, "textDocumentSync", .{ .integer = 2 });
@@ -525,6 +654,9 @@ fn buildInitializeResult(a: std.mem.Allocator) !std.json.Value {
     var triggers = std.json.Array.init(a);
     try triggers.append(.{ .string = "." });
     try comp.put(a, "triggerCharacters", .{ .array = triggers });
+    const resolve_script = script == .completion_resolve or
+        script == .completion_resolve_hold or script == .completion_resolve_error;
+    try comp.put(a, "resolveProvider", .{ .bool = resolve_script });
     try caps.put(a, "completionProvider", .{ .object = comp });
 
     try caps.put(a, "hoverProvider", .{ .bool = true });
@@ -568,6 +700,102 @@ fn completionPrefix(a: std.mem.Allocator, state: *State, uri: ?[]const u8, line:
         return a.dupe(u8, text[end .. pos + @min(col, @as(u32, @intCast(line_len)))]) catch "";
     }
     return a.dupe(u8, "") catch return "";
+}
+
+fn richCompletionItem(
+    a: std.mem.Allocator,
+    label: []const u8,
+    kind: i64,
+    insert_text: ?[]const u8,
+    ld_detail: ?[]const u8,
+    ld_desc: ?[]const u8,
+    detail: ?[]const u8,
+    doc_kind: ?[]const u8,
+    doc_value: ?[]const u8,
+) !std.json.Value {
+    var item = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try item.put(a, "label", .{ .string = label });
+    try item.put(a, "kind", .{ .integer = kind });
+    if (insert_text) |t| try item.put(a, "insertText", .{ .string = t });
+    if (ld_detail != null or ld_desc != null) {
+        var ld = try std.json.ObjectMap.init(a, &.{}, &.{});
+        if (ld_detail) |t| try ld.put(a, "detail", .{ .string = t });
+        if (ld_desc) |t| try ld.put(a, "description", .{ .string = t });
+        try item.put(a, "labelDetails", .{ .object = ld });
+    }
+    if (detail) |t| try item.put(a, "detail", .{ .string = t });
+    if (doc_value) |v| {
+        if (doc_kind) |k| {
+            var doc = try std.json.ObjectMap.init(a, &.{}, &.{});
+            try doc.put(a, "kind", .{ .string = k });
+            try doc.put(a, "value", .{ .string = v });
+            try item.put(a, "documentation", .{ .object = doc });
+        } else {
+            try item.put(a, "documentation", .{ .string = v });
+        }
+    }
+    return .{ .object = item };
+}
+
+fn buildRichCompletionResult(a: std.mem.Allocator, prefix: []const u8) !std.json.Value {
+    _ = prefix;
+    var items = std.json.Array.init(a);
+    try items.append(try richCompletionItem(a, "ArrayList", 22, "ArrayList", "(comptime T: type)", "type", "fn (comptime T: type) type", "markdown", "A contiguous, growable list of items in memory.\n\n**Bold prose** and `inline code`.\n\n```zig\nvar list = std.ArrayList(u8).init(alloc);\n```\nShort doc end."));
+    try items.append(try richCompletionItem(a, "HashMap", 22, "HashMap", "(comptime K: type, comptime V: type)", "type", "fn (comptime K: type, comptime V: type) type", "markdown", "Duplicates ArrayList's line but not its documentation.\n```zig\nconst map = std.AutoHashMap(u32, []const u8).init(alloc);\n```"));
+    try items.append(try richCompletionItem(a, "makeThing", 3, "makeThing", "(count: usize)", "fn", "fn makeThing(count: usize) Thing", "plaintext", "PLAIN_DOC *stars stay literal* and `ticks stay literal`."));
+    // Long, scrollable docs with CJK/emoji and a fenced block.
+    var long = std.ArrayList(u8).empty;
+    try long.appendSlice(a, "LONG_DOC_FIRST\n");
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        try long.appendSlice(a, try std.fmt.allocPrint(a, "line {d}: 文档内容 🙂 keeps wrapping and scrolling until the end.\n", .{i}));
+    }
+    try long.appendSlice(a, "```zig\nconst sentinel = 42;\n```\nLONG_DOC_LAST");
+    try items.append(try richCompletionItem(a, "LONG_DOC", 9, "LONG_DOC", null, "std", "pub const LONG_DOC", "markdown", long.items));
+    // Same display label, different identity/documentation.
+    try items.append(try richCompletionItem(a, "dup", 6, "dup_alpha", "(alpha)", "A", "detail alpha", "markdown", "DUP_ALPHA_DOC"));
+    try items.append(try richCompletionItem(a, "dup", 6, "dup_beta", "(beta)", "B", "detail beta", "markdown", "DUP_BETA_DOC"));
+    try items.append(try richCompletionItem(a, "detail_only", 6, "detail_only", null, null, "DETAIL_ONLY_SIGNATURE", null, null));
+    try items.append(try richCompletionItem(a, "bare", 6, "bare", null, null, null, null, null));
+    try items.append(try richCompletionItem(a, "array_list", 9, "array_list", null, null, "pub const array_list", null, null));
+    var result = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try result.put(a, "items", .{ .array = items });
+    return .{ .object = result };
+}
+
+fn buildResolveCompletionResult(a: std.mem.Allocator, prefix: []const u8, script: Script) !std.json.Value {
+    _ = prefix;
+    _ = script;
+    var items = std.json.Array.init(a);
+    const specs = [_]struct { label: []const u8, kind: i64, doc: ?[]const u8 }{
+        .{ .label = "resolveA", .kind = 3, .doc = null },
+        .{ .label = "resolveB", .kind = 3, .doc = null },
+        .{ .label = "resolveC_has_docs", .kind = 6, .doc = "INITIAL_DOC_C" },
+        .{ .label = "resolveD_detail", .kind = 6, .doc = null },
+    };
+    for (specs) |sp| {
+        var item = try std.json.ObjectMap.init(a, &.{}, &.{});
+        try item.put(a, "label", .{ .string = sp.label });
+        try item.put(a, "kind", .{ .integer = sp.kind });
+        try item.put(a, "insertText", .{ .string = sp.label });
+        if (std.mem.eql(u8, sp.label, "resolveD_detail")) {
+            try item.put(a, "detail", .{ .string = "DETAIL_D" });
+        }
+        if (sp.doc) |d| try item.put(a, "documentation", .{ .string = d });
+        var data = try std.json.ObjectMap.init(a, &.{}, &.{});
+        try data.put(a, "slot", .{ .string = sp.label });
+        try item.put(a, "data", .{ .object = data });
+        try items.append(.{ .object = item });
+    }
+    var result = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try result.put(a, "items", .{ .array = items });
+    return .{ .object = result };
+}
+
+fn buildResolvedItem(a: std.mem.Allocator, label: []const u8, sentinel: []const u8) !std.json.Value {
+    const detail = try std.fmt.allocPrint(a, "resolved signature for {s}", .{label});
+    const doc = try std.fmt.allocPrint(a, "RESOLVED_BODY_{s}", .{sentinel});
+    return richCompletionItem(a, label, 3, label, "(resolved: usize)", "resolved", detail, "markdown", doc);
 }
 
 fn buildCompletionResult(a: std.mem.Allocator, prefix: []const u8, script: Script) !std.json.Value {
@@ -954,6 +1182,27 @@ fn buildDiagnosticsParams(a: std.mem.Allocator, uri: []const u8, message: []cons
     return .{ .object = params };
 }
 
+fn buildDetailedDiagnostics(a: std.mem.Allocator, uri: []const u8) !std.json.Value {
+    var params = try buildDiagnosticsParams(a, uri, "WARNING_FIRST");
+    const ds = &params.object.getPtr("diagnostics").?.array;
+    try ds.items[0].object.put(a, "severity", .{ .integer = 2 });
+    var message: std.ArrayList(u8) = .empty;
+    try message.appendSlice(a, "unused function parameter\n");
+    for (0..24) |i| try message.appendSlice(a, try std.fmt.allocPrint(a, "细节 {d}: 参数没有被使用，请移除参数或显式忽略它。\n", .{i}));
+    try message.appendSlice(a, "DIAG_DETAIL_LAST");
+    const second = try buildDiagnosticsParams(a, uri, try message.toOwnedSlice(a));
+    try ds.append(second.object.get("diagnostics").?.array.items[0]);
+    const third = try buildDiagnosticsParams(a, uri, "SPANNING_NOTE");
+    var info = third.object.get("diagnostics").?.array.items[0];
+    try info.object.put(a, "severity", .{ .integer = 3 });
+    const range = info.object.getPtr("range").?;
+    try range.object.getPtr("start").?.object.put(a, "line", .{ .integer = 1 });
+    try range.object.getPtr("end").?.object.put(a, "line", .{ .integer = 3 });
+    try range.object.getPtr("end").?.object.put(a, "character", .{ .integer = 0 });
+    try ds.append(info);
+    return params;
+}
+
 /// publishDiagnostics params with an empty list: "all problems fixed".
 fn buildEmptyDiagnosticsParams(a: std.mem.Allocator, uri: []const u8) !std.json.Value {
     const diags = std.json.Array.init(a);
@@ -1179,6 +1428,14 @@ fn printUsage(io: std.Io) void {
 // Entry point
 // ---------------------------------------------------------------------------
 
+fn writeBarrier(io: anytype, dir: []const u8, name: []const u8) void {
+    var path_buf: [1024]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name }) catch return;
+    const file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true }) catch return;
+    defer file.close(io);
+    file.writeStreamingAll(io, "1") catch {};
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
@@ -1221,6 +1478,14 @@ pub fn main(init: std.process.Init) !void {
 
     var state = State{};
     defer state.deinit(gpa);
+    if (script == .signature_lifecycle) {
+        if (init.environ_map.get("OZ_SIG_MODE")) |mode| {
+            if (std.mem.eql(u8, mode, "null")) state.signature_mode = .null_result else if (std.mem.eql(u8, mode, "error")) state.signature_mode = .error_result else if (std.mem.eql(u8, mode, "ignore")) state.signature_mode = .ignore else if (std.mem.eql(u8, mode, "timeout")) state.signature_mode = .timeout;
+        }
+    }
+    const barrier_dir = init.environ_map.get("OZ_SIG_BARRIER_DIR");
+    var seen_requests: u32 = 0;
+    var seen_responses: u32 = 0;
 
     const stdin = std.Io.File.stdin();
     const stdout = std.Io.File.stdout();
@@ -1250,6 +1515,16 @@ pub fn main(init: std.process.Init) !void {
         }
 
         var outcome = try handleMessage(gpa, script, &state, &msg);
+        if (script == .signature_lifecycle) {
+            if (state.signature_requests != seen_requests) {
+                seen_requests = state.signature_requests;
+                if (barrier_dir) |dir| {
+                    var name_buf: [64]u8 = undefined;
+                    const name = std.fmt.bufPrint(&name_buf, "request-{d}", .{seen_requests}) catch "";
+                    if (name.len > 0) writeBarrier(io, dir, name);
+                }
+            }
+        }
         for (outcome.frames.items) |frame| {
             writeFrameToFile(stdout, io, frame) catch |e| {
                 logVerbose(io, verbose, "mock_lsp: stdout write failed: {s}\n", .{@errorName(e)});
@@ -1259,6 +1534,14 @@ pub fn main(init: std.process.Init) !void {
             logVerbose(io, verbose, "mock_lsp: sent frame ({d} bytes)\n", .{frame.len});
         }
         outcome.deinit(gpa); // frees every frame (no per-frame free above)
+        if (script == .signature_lifecycle and state.signature_responses != seen_responses) {
+            seen_responses = state.signature_responses;
+            if (barrier_dir) |dir| {
+                var name_buf: [64]u8 = undefined;
+                const name = std.fmt.bufPrint(&name_buf, "response-{d}", .{seen_responses}) catch "";
+                if (name.len > 0) writeBarrier(io, dir, name);
+            }
+        }
 
         if (!running or state.exit_requested) break;
     }
@@ -1297,6 +1580,32 @@ fn buildLocationValue(a: std.mem.Allocator, state: *State, line: u32, col: u32) 
 
 fn buildLocationResult(a: std.mem.Allocator, state: *State, line: u32, col: u32) !std.json.Value {
     return buildLocationValue(a, state, line, col);
+}
+
+fn buildSignatureLabel(a: std.mem.Allocator, label: []const u8) !std.json.Value {
+    var sig = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try sig.put(a, "label", .{ .string = label });
+    var sigs = std.json.Array.init(a);
+    try sigs.append(.{ .object = sig });
+    var result = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try result.put(a, "signatures", .{ .array = sigs });
+    return .{ .object = result };
+}
+
+fn buildLifecycleCompletionResult(a: std.mem.Allocator) !std.json.Value {
+    const specs = [_]struct { label: []const u8, detail: []const u8, doc: []const u8, kind: i64 }{
+        .{ .label = "stat", .detail = "fn stat() void", .doc = "STAT_DOC", .kind = 3 },
+        .{ .label = "close", .detail = "fn close() void", .doc = "CLOSE_DOC", .kind = 3 },
+        .{ .label = "sync", .detail = "fn sync() void", .doc = "SYNC_DOC", .kind = 3 },
+        .{ .label = "isTty", .detail = "fn isTty() bool", .doc = "ISTTY_DOC", .kind = 3 },
+    };
+    var items = std.json.Array.init(a);
+    for (specs) |spec| {
+        try items.append(try richCompletionItem(a, spec.label, spec.kind, null, null, null, spec.detail, "markdown", spec.doc));
+    }
+    var result = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try result.put(a, "items", .{ .array = items });
+    return .{ .object = result };
 }
 
 fn buildSignatureResult(a: std.mem.Allocator) !std.json.Value {

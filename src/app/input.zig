@@ -17,6 +17,24 @@ const isWordByte = App.isWordByte;
 // ---- input ----
 
 pub fn handleKey(self: *App, key: vaxis.Key) !void {
+    // One key may move the cursor, edit text, enter/leave a session, and
+    // issue a fresh signature request. Capture the passive context once and
+    // invalidate after the key only when the key did not create its own new
+    // passive request. This centralizes the paths that do not call
+    // markDirty/clearHover (a/A/I, skip-over, Alt-b/f, mode changes).
+    const before_ctx = self.passiveContext();
+    const before_serial = self.passive_request_serial;
+    defer {
+        if (self.passive_request_serial == before_serial and
+            !before_ctx.matches(self.passiveContext()))
+        {
+            self.invalidatePassiveHints();
+        }
+    }
+    try handleKeyInner(self, key);
+}
+
+fn handleKeyInner(self: *App, key: vaxis.Key) !void {
     // Keyboard hints (M2.6a): while the overlay is active it owns every key
     // — label characters, Backspace and Esc. Routed before terminal/macro/
     // AI/picker/editor handling so label chars can never leak into a
@@ -96,6 +114,8 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
         try self.handlePickerKey(key);
         return;
     }
+
+    if (@import("diagnostics.zig").floatKey(self, key)) return;
 
     // Diagnostics list overlay (<leader>sd)
     if (self.diag_list_active) {
@@ -320,6 +340,18 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
             self.closeCompletion();
             return;
         }
+        // Ctrl+f / Ctrl+b scroll the completion documentation pane while it
+        // has content. They never move the cursor or the candidate selection;
+        // with no docs they fall through to their ordinary insert-mode fate.
+        if (self.completion_active and key.mods.ctrl and !key.mods.alt and !key.mods.super and
+            (key.codepoint == 'f' or key.codepoint == 'b'))
+        {
+            if (self.completionDocsVisible()) {
+                self.scrollCompletionDocs(if (key.codepoint == 'f') 3 else -3);
+                return;
+            }
+        }
+
         // Ctrl+n: next candidate when the menu is open; otherwise collect
         // candidates and open the menu — but only when the cursor is
         // inside a word. Without a word prefix the key is swallowed.
@@ -327,8 +359,7 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
         // Ctrl+n to multi-cursor .mc_add instead.)
         if (self.state.mode == .insert and key.codepoint == 'n' and key.mods.ctrl and !key.mods.alt and !key.mods.super) {
             if (self.completion_active) {
-                const n = self.completion_words.items.len;
-                if (n > 0) self.completion_sel = (self.completion_sel + 1) % n;
+                self.moveCompletion(1);
             } else {
                 try self.startCompletion();
             }
@@ -339,13 +370,11 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
             if ((key.codepoint == 'p' and key.mods.ctrl and !key.mods.alt and !key.mods.super) or
                 key.codepoint == vaxis.Key.up)
             {
-                const n = self.completion_words.items.len;
-                if (n > 0) self.completion_sel = (self.completion_sel + n - 1) % n;
+                self.moveCompletion(-1);
                 return;
             }
             if (key.codepoint == vaxis.Key.down) {
-                const n = self.completion_words.items.len;
-                if (n > 0) self.completion_sel = (self.completion_sel + 1) % n;
+                self.moveCompletion(1);
                 return;
             }
             // Enter accepts the selected word (replaces the typed prefix).
@@ -597,6 +626,8 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
 }
 
 pub fn exitInsert(self: *App) void {
+    self.insert_session +%= 1;
+    self.invalidatePassiveHints();
     self.state.mode = .normal;
     self.cur().history.endGroup();
     self.in_insert = false;

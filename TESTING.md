@@ -712,3 +712,60 @@ block yank/count put, short/empty destination lines and grouped undo/redo.
 A local wl-copy/wl-paste fixture starts with stale clipboard bytes and models
 wl-paste's default appended newline; no desktop clipboard is needed.
 `app/wrap.zig` and `app/mouse.zig` additionally check cell layout and its inverse.
+
+
+Diagnostic UI regressions: `zig build e2e -Dtest-filter='diagnostic UI:'`.
+The mock LSP fixture sends a warning before an error on the same line,
+multiline/CJK details, an end-exclusive spanning range and a foreign URI push.
+PTY tests cover automatic inline messages, full float scrolling, insert/move/clear
+lifecycle, cursor preservation, split-pane clipping and bottom-edge placement.
+Pure diagnostics tests cover severity ordering, counts and range boundaries.
+Edits immediately invalidate old ranges; the version fixture withholds its
+first reply, then sends a current result followed by stale errors/clears and
+a future-version result. Only a matching document version may be installed.
+
+Real ZLS diagnostic verification (opt-in, no remote models or credentials):
+
+```sh
+zig build e2e -Dtest-filter='diagnostic UI: real ZLS' -Dreal-zls=/absolute/path/to/zls
+```
+
+This drives the actual oz PTY and the installed server: an unused `aaa: usize`
+parameter produces `unused function parameter` on its source line and in `gl`;
+renaming it to `_` clears the error, restoring it brings the error back, and
+inserting a CJK/emoji comment above moves the message to the new line. The test
+uses an isolated temporary home/cache and is skipped without `-Dreal-zls`.
+Messages and ranges come from the server. Line-end text selects the highest
+severity on the current line; `gl` lists every diagnostic covering that line.
+When a server omits the optional diagnostic version (including the tested ZLS),
+oz accepts its publications; the protocol then cannot identify a late result
+computed against old text. Explicitly versioned stale results are rejected.
+Pure position tests additionally check later-line ASCII columns, CJK, astral and
+combining characters and UTF-8 sequences split across piece-table pieces. This
+regresses an incorrect slice upper bound that sent later-line edits to the
+wrong server column even while the editor's visible text looked correct.
+
+Completion review regressions: `zig build e2e -Dtest-filter='completion safety:'`.
+The local Python peer `test/fixtures/completion_edges.py` requires no network
+or credentials. A file barrier releases a delayed resolve only after another
+same-label/same-signature item is selected, including a case with no opaque
+data to distinguish the items. The tests also refresh the same index while
+typing, verify the next resolved explanation, and check exact accepted bytes.
+Short horizontal panes must keep the selected last item visible without
+painting neighbouring panes, split separators or the caret row.
+
+The Linux native-memory regression warms the real editor, observes 240 distinct
+signature redraws, and limits RSS growth to 3 MiB. It covers tree-sitter native
+allocations that the Zig testing allocator cannot see; the missing-cleanup
+control grows by about 6 MiB and fails this check. Pure completion layout tests
+cover tiny/narrow panes, the caret, and outer border rectangles; navigation
+tests distinguish completion identities with different data or edit ranges.
+
+Real ZLS diagnostics and completion:
+
+```sh
+zig build e2e -Dtest-filter='real ZLS' -Dreal-zls=/absolute/path/to/zls
+```
+
+Both are opt-in and are skipped in the default deterministic suite when no
+server path is supplied.

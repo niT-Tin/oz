@@ -327,6 +327,8 @@ pub fn mcDeleteWordBefore(self: *App) !void {
 /// drop the extra cursors and leave a single main cursor (the block's
 /// anchor-line cursor) in normal mode.
 pub fn exitMcInsert(self: *App) void {
+    self.insert_session +%= 1;
+    self.invalidatePassiveHints();
     self.mcSyncCursor();
     self.mc.clear();
     self.mc_active = false;

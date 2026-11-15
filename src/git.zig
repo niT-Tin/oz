@@ -226,6 +226,33 @@ pub const FileDiff = struct {
         return null;
     }
 
+    pub const Counts = struct {
+        added: u32 = 0,
+        modified: u32 = 0,
+        removed: u32 = 0,
+
+        pub fn any(self: Counts) bool {
+            return self.added > 0 or self.modified > 0 or self.removed > 0;
+        }
+    };
+
+    /// Real marked-line counts for the status line: runs, not bytes and not
+    /// a guessed `git diff --stat`. A pure deletion is represented by its
+    /// adjacent marker run (one removed line), so it counts as one removed.
+    pub fn counts(self: *const FileDiff) Counts {
+        var out = Counts{};
+        for (self.hunks.items) |*h| {
+            for (h.runs) |r| {
+                switch (r.kind) {
+                    .added => out.added += r.count,
+                    .modified => out.modified += r.count,
+                    .removed_above, .removed_below => out.removed += 1,
+                }
+            }
+        }
+        return out;
+    }
+
     /// Index of the first hunk whose marked region starts at/after `line`,
     /// or null when there is none. Used by ]c/[c navigation.
     pub fn hunkAtOrAfter(self: *const FileDiff, line: u32) ?usize {
@@ -878,7 +905,6 @@ test "blame: short hashes and missing headers survive" {
     try testing.expectEqualStrings("", b.entries.items[0].summary);
 }
 
-
 // ---- live-shift tests: the display marks must stay glued to their lines
 // while the user edits (the async refresh later replaces them exactly). ----
 
@@ -1069,4 +1095,22 @@ test "diff: two pure removals sharing one context line do not double-mark it" {
         try testing.expect(r.start >= prev_end);
         prev_end = r.end();
     }
+}
+
+test "git: FileDiff.counts reports marked lines, not hunk count" {
+    const t = std.testing;
+    const a = std.testing.allocator;
+    var d = FileDiff{};
+    defer d.deinit(a);
+    const runs = try a.dupe(MarkRun, &.{
+        .{ .start = 1, .count = 2, .kind = .added },
+        .{ .start = 5, .count = 3, .kind = .modified },
+        .{ .start = 9, .count = 1, .kind = .removed_below },
+    });
+    try d.hunks.append(a, .{ .start_line = 1, .end_line = 10, .runs = runs, .patch = try a.alloc(u8, 0) });
+    const c = d.counts();
+    try t.expectEqual(@as(u32, 2), c.added);
+    try t.expectEqual(@as(u32, 3), c.modified);
+    try t.expectEqual(@as(u32, 1), c.removed);
+    try t.expect(c.any());
 }

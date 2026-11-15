@@ -21,3 +21,7 @@ zig-pkg/
 .dsh-vision-toolkit/
 .tmp/
 docs/aegis/
+
+# Local UI audit and agent handoff (not for publication yet)
+/docs/local-ui-audit/
+/.gitnexus/

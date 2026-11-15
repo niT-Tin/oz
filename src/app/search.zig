@@ -154,6 +154,7 @@ pub fn searchOnce(self: *App, query: []const u8, backward: bool) !void {
     }
     if (hit) |h| {
         self.curCursor().* = h;
+        self.search_hl_active = true;
         self.clearHover();
     } else {
         try self.setMsg(try std.fmt.allocPrint(self.alloc, "pattern not found: {s}", .{query}));

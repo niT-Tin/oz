@@ -35,8 +35,10 @@ pub const lsp_types = @import("lsp/types.zig");
 pub const lsp_client = @import("lsp/client.zig");
 pub const lsp_mock = @import("lsp/mock_lsp.zig");
 pub const lsp_diagnostics = @import("lsp/diagnostics.zig");
+pub const lsp_position = @import("lsp/position.zig");
 pub const lsp_navigation = @import("lsp/navigation.zig");
 pub const lsp_workspace_edit = @import("lsp/workspace_edit.zig");
+pub const theme = @import("theme.zig");
 pub const icons = @import("icons.zig");
 pub const git = @import("git.zig");
 pub const term = @import("term.zig");
@@ -51,6 +53,9 @@ pub const app_mouse = @import("app/mouse.zig");
 pub const app_tabstrip = @import("app/tabstrip.zig");
 // §18.12 time-based animation primitives (pure; render.zig/ai.zig own the use)
 pub const app_animation = @import("app/animation.zig");
+// Status-line model/planner (pure; render.zig owns drawing)
+pub const app_statusline = @import("app/statusline.zig");
+pub const app_completion_layout = @import("app/completion_layout.zig");
 // M2b1 navigator tabs + note store (pure; app/notes.zig is e2e-tested)
 pub const app_navigator = @import("app/navigator.zig");
 pub const app_note_store = @import("app/note_store.zig");

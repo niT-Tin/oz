@@ -133,6 +133,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    const e2e_options = b.addOptions();
+    e2e_options.addOption(?[]const u8, "real_zls", b.option([]const u8, "real-zls", "Absolute ZLS path for the opt-in real diagnostic PTY test"));
+    e2e.root_module.addOptions("e2e_options", e2e_options);
     const run_e2e = b.addRunArtifact(e2e);
     run_e2e.has_side_effects = true;
     const e2e_step = b.step("e2e", "Run end-to-end tests (L3, spawn oz in a pty)");
