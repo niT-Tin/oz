@@ -98,11 +98,10 @@ pub fn handleCommandKey(self: *App, key: vaxis.Key) !void {
         else => {},
     }
     // Tab: complete the command name (":w" → ":write") or, after
-    // ":e " / ":edit ", the file path.
+    // a file-taking edit/split command, the file path.
     if (key.codepoint == vaxis.Key.tab) {
         const line = self.cmdline.items;
-        const is_path_ctx = (line.len >= 2 and (std.mem.eql(u8, line[0..2], "e ") or
-            (line.len >= 5 and std.mem.eql(u8, line[0..5], "edit "))));
+        const is_path_ctx = editor.ex_command.fileArgStart(line) != null;
         if (is_path_ctx) {
             try self.completeCommandPath();
         } else {
@@ -169,17 +168,11 @@ pub fn completeCommandName(self: *App) !void {
     }
 }
 
-/// Tab in command mode: complete the path prefix after ":e ".
+/// Tab in command mode: complete file arguments without changing the command.
 /// Cycles through matches on repeated Tab.
 pub fn completeCommandPath(self: *App) !void {
     const line = self.cmdline.items;
-    // find the token after "e " / "edit " (the leading ':' isn't stored)
-    var skip: usize = 0;
-    if (line.len >= 2 and std.mem.eql(u8, line[0..2], "e ")) {
-        skip = 2;
-    } else if (line.len >= 5 and std.mem.eql(u8, line[0..5], "edit ")) {
-        skip = 5;
-    } else return;
+    const skip = editor.ex_command.fileArgStart(line) orelse return;
     const prefix = line[skip..];
 
     var matches = std.ArrayList([]const u8).empty;
@@ -209,12 +202,12 @@ pub fn completeCommandPath(self: *App) !void {
     const chosen = matches.items[self.cmd_complete_idx % matches.items.len];
     self.cmd_complete_idx += 1;
 
-    // rebuild "e <chosen>" preserving the user's command form (e/edit)
+    // Keep :sp/:vs (and aliases) intact; the command line may reallocate.
+    const command_prefix = try self.alloc.dupe(u8, line[0..skip]);
+    defer self.alloc.free(command_prefix);
     self.clearCmdCompleteNames();
-    const cmd = if (line.len >= 5 and std.mem.eql(u8, line[0..5], "edit ")) "edit" else "e";
     self.cmdline.clearRetainingCapacity();
-    try self.cmdline.appendSlice(self.alloc, cmd);
-    try self.cmdline.appendSlice(self.alloc, " ");
+    try self.cmdline.appendSlice(self.alloc, command_prefix);
     try self.cmdline.appendSlice(self.alloc, chosen);
 }
 
@@ -260,13 +253,13 @@ pub fn execCommand(self: *App, cmd: editor.ex_command.Command) !void {
         },
         .quit_all => @import("buffers.zig").requestQuit(self, false),
         .quit_all_force => @import("buffers.zig").requestQuit(self, true),
-        .vsplit => try self.splitWindow(.vertical),
-        .split => try self.splitWindow(.horizontal),
+        .vsplit => |path| try self.splitFileWindow(.vertical, path),
+        .split => |path| try self.splitFileWindow(.horizontal, path),
         .write_quit => {
             // only quit when the write actually succeeded
             if (try self.writeBuffer()) self.closeWindow();
         },
-        .edit => |path| try self.openFile(path),
+        .edit => |path| try self.openInCurrentWindow(path),
         .write_quit_force => {
             if (try self.writeBufferForce(true)) self.closeWindow();
         },

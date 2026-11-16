@@ -71,7 +71,11 @@ pub fn tabLayerCount(self: *App, a: std.mem.Allocator) u32 {
     // whose rightmost pane ends at or before this pane's column start
     var order: std.ArrayList(usize) = .empty;
     defer order.deinit(a);
-    for (0..leaves.len) |i| order.append(a, i) catch return 1;
+    // An invisible leaf owns no columns and cannot overlap another tab row.
+    // Repeated splitting of a one-cell pane must not grow phantom headers.
+    for (leaves, 0..) |lr, i| {
+        if (lr.width > 0) order.append(a, i) catch return 1;
+    }
     std.mem.sort(usize, order.items, TabSort{ .leaves = leaves }, TabSort.lt);
     var layer_end: std.ArrayList(u32) = .empty;
     defer layer_end.deinit(a);
@@ -3656,7 +3660,9 @@ pub fn render(self: *App) !void {
             const leaves = tab_layout.leaves;
             const pane_layer = a.alloc(u32, leaves.len) catch return;
             var order: std.ArrayList(usize) = .empty;
-            for (0..leaves.len) |i| order.append(a, i) catch return;
+            for (leaves, 0..) |lr, i| {
+                if (lr.width > 0) order.append(a, i) catch return;
+            }
             std.mem.sort(usize, order.items, TabSort{ .leaves = leaves }, TabSort.lt);
             var layer_end: std.ArrayList(u32) = .empty;
             var layers: u32 = 0;

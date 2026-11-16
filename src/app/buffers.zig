@@ -88,7 +88,7 @@ pub fn switchBuffer(self: *App, delta: i32) !void {
 }
 
 /// <leader>bh/bl workspace model: with a split open, a buffer opened
-/// from outside (:e, file tree, pickers, gd/gr into another file) lands
+/// from navigation (file tree, pickers, gd/gr into another file) lands
 /// in the LEFT window — the panes then hold distinct buffers by default
 /// and bh/bl shuttles them. A buffer already shown in a window is
 /// focused THERE instead (never duplicate it into both panes).
@@ -120,126 +120,134 @@ pub fn loadPieceTable(self: *App, file: std.Io.File, size: u64) !buffer.PieceTab
     return buffer.PieceTable.initOwned(self.alloc, bytes);
 }
 
+const OpenTarget = enum { navigation, current_window };
+
 /// Open `path` in a new buffer unless it is already open (then switch).
 /// The stored path is ABSOLUTE (like the CLI arg path): LSP uri building,
 /// filetype detection and recent-file dedupe all assume absolute paths, so
 /// a relative path here (file tree, :e, picker) would silently kill LSP
 /// for the opened file.
+/// Navigation may re-use an existing pane; Ex commands own their current pane.
 pub fn openInBuffer(self: *App, path: []const u8) !void {
+    _ = try openInBufferAt(self, path, .navigation);
+}
+
+pub fn openInCurrentWindow(self: *App, path: []const u8) !void {
+    _ = try openInBufferAt(self, path, .current_window);
+}
+
+/// Failed opens must not leave a duplicate pane or steal the original focus.
+pub fn splitFileWindow(self: *App, dir: App.SplitDir, path: ?[]const u8) !void {
+    const original = self.current_win;
+    try self.splitWindow(dir);
+    if (path) |p| {
+        var opened = false;
+        defer if (!opened) {
+            self.closeWindow();
+            self.switchWindowTo(original);
+        };
+        opened = try openInBufferAt(self, p, .current_window);
+    }
+}
+
+fn openInBufferAt(self: *App, path: []const u8, target: OpenTarget) !bool {
     const abs = try self.absolutePath(path);
     defer self.alloc.free(abs);
     for (self.buffers.items, 0..) |*buf, i| {
         if (buf.path) |p| {
             if (std.mem.eql(u8, p, abs)) {
-                self.targetWindowForOpen(i);
+                if (target == .navigation) self.targetWindowForOpen(i);
                 self.switchTo(i);
-                return;
+                return true;
             }
         }
     }
-    // Anti-double-open ACROSS workspaces: each workspace keeps its own
-    // buffer list, so without this the same file could be loaded as two
-    // independent piece tables editing one on-disk file (undo history,
-    // dirty flag and the single LSP document copy would diverge). Scanned
-    // after absolutePath (every stored path is absolute) and before any
-    // load; the current workspace was checked above.
+    // One document per workspace: Ex routing must not bypass this guard.
     for (self.workspaces.items, 0..) |ws, i| {
         if (i == self.current_ws) continue;
         for (ws.buffers.items) |buf| {
             if (buf.path) |p| {
                 if (std.mem.eql(u8, p, abs)) {
                     try self.setMsg(try std.fmt.allocPrint(self.alloc, "已在 workspace '{s}' 中打开", .{ws.name}));
-                    return;
+                    return false;
                 }
             }
         }
     }
-    // load the file
-    var file = std.Io.Dir.cwd().openFile(self.io, abs, .{ .mode = .read_only }) catch |e| {
-        try self.setMsg(try std.fmt.allocPrint(self.alloc, "E484: cannot open {s}: {s}", .{ abs, @errorName(e) }));
-        return;
-    };
-    defer file.close(self.io);
-    const size = (try file.stat(self.io)).size;
-    // u32-addressed piece table: refuse >= 4 GiB instead of panicking on
-    // the @intCast below (see main()'s CLI open for the same guard).
+    var file: ?std.Io.File = null;
+    if (std.Io.Dir.cwd().openFile(self.io, abs, .{ .mode = .read_only })) |opened| {
+        file = opened;
+    } else |err| {
+        if (!(err == error.FileNotFound and target == .current_window)) {
+            try self.setMsg(try std.fmt.allocPrint(self.alloc, "E484: cannot open {s}: {s}", .{ abs, @errorName(err) }));
+            return false;
+        }
+    }
+    defer if (file) |f| f.close(self.io);
+    var size: u64 = 0;
+    if (file) |f| {
+        const stat = try f.stat(self.io);
+        if (stat.kind != .file) {
+            try self.setMsg(try std.fmt.allocPrint(self.alloc, "E17: {s} is not a regular file", .{abs}));
+            return false;
+        }
+        size = stat.size;
+    }
     if (size >= std.math.maxInt(u32)) {
         try self.setMsg(try self.alloc.dupe(u8, "file too large (>4GiB)"));
-        return;
+        return false;
     }
+    var loaded = if (file) |f| try self.loadPieceTable(f, size) else try buffer.PieceTable.init(self.alloc, "");
+    var own_loaded = true;
+    defer if (own_loaded) loaded.deinit();
+    const new_path = try self.alloc.dupe(u8, abs);
+    defer if (own_loaded) self.alloc.free(new_path);
+    var disk = disk_file.Baseline.init(self.alloc, self.io, abs, if (file != null) loaded.origin else null) catch |err| {
+        try self.setMsg(try std.fmt.allocPrint(self.alloc, "E484: cannot open {s}: {s}", .{ abs, @errorName(err) }));
+        return false;
+    };
+    defer if (own_loaded) disk.deinit(self.alloc);
 
-    // vim semantics: opening the first file REPLACES the startup's unnamed
-    // empty buffer instead of appending a second one — `:e foo` in a fresh
-    // editor loads foo into the [No Name] buffer, so no orphan [No Name]
-    // tab lingers after the first open. Same replacement main()'s CLI open
-    // path does (main.zig): swap the piece table + path of the CURRENT
-    // buffer. Only a pristine scratch buffer qualifies (no path, empty,
-    // unmodified); a dirty or non-empty one is real content and the file
-    // opens as a NEW buffer below.
-    if (self.cur().path == null and self.cur().pt.len() == 0 and !self.cur().dirty) {
-        const idx = self.windows.items[self.current_win].buf;
-        const buf = &self.buffers.items[idx];
-        // load BEFORE swapping so a load failure leaves the scratch buffer
-        // intact (deinit-then-assign would strand a dead piece table)
-        var new_pt = try self.loadPieceTable(file, size);
-        var own_loaded = true;
-        errdefer if (own_loaded) new_pt.deinit();
-        const new_path = try self.alloc.dupe(u8, abs);
-        errdefer if (own_loaded) self.alloc.free(new_path);
-        const disk = try disk_file.Baseline.init(self.alloc, self.io, abs, new_pt.origin);
+    const old_index = self.windows.items[self.current_win].buf;
+    var reuse_scratch = self.cur().path == null and self.cur().pt.len() == 0 and !self.cur().dirty;
+    for (self.windows.items, 0..) |w, wi| {
+        if (wi != self.current_win and w.buf == old_index) reuse_scratch = false;
+    }
+    // Only an unshared pristine startup scratch may be replaced in place.
+    // A split's sibling must retain its unnamed document and view.
+    var index: usize = undefined;
+    if (reuse_scratch) {
+        index = old_index;
+        const buf = &self.buffers.items[index];
         buf.pt.deinit();
-        buf.pt = new_pt;
         buf.history.deinit();
-        buf.history = buffer.History.init(self.alloc);
+        if (buf.disk) |*old_disk| old_disk.deinit(self.alloc);
         self.clearSpanCache(buf);
-        // Saved positions described the replaced scratch document.
         buf.views.clear();
+        buf.pt = loaded;
         buf.path = new_path;
         buf.disk = disk;
-        own_loaded = false;
-        // Notes live in the global data dir: they are project-independent,
-        // so opening one must not root the workspace's tree/picker there.
-        if (!self.notesIsPath(abs)) self.setProjectRoot(abs);
-        try self.addRecent(abs);
-        // the buffer's tab stays in this pane; it is already the current
-        // buffer, so just re-run the per-buffer activation (LSP attach,
-        // inlay/diagnostic invalidation, git status) exactly like switchTo.
-        self.ensureLsp();
-        self.state.mode = .normal;
-        self.visual_anchor = null;
-        self.in_insert = false;
-        self.insert_goal_col = null;
-        self.curCursor().* = 0;
-        self.curViewTop().* = 0;
-        self.invalidateInlayHints();
-        self.clearDiagnostics();
-        self.clearHover();
-        self.nav_list_active = false;
-        self.freeGrepPreview();
-        self.closeCompletion();
-        self.closeGitPreview();
-        self.scheduleGitStatus();
-        return;
+        buf.history = buffer.History.init(self.alloc);
+        const w = &self.windows.items[self.current_win];
+        w.cursor = 0;
+        w.view_top = 0;
+        w.view_wrap = 0;
+        w.view_pinned = false;
+    } else {
+        try self.buffers.append(self.alloc, .{
+            .pt = loaded,
+            .history = buffer.History.init(self.alloc),
+            .path = new_path,
+            .disk = disk,
+        });
+        index = self.buffers.items.len - 1;
     }
-
-    var new_pt = try self.loadPieceTable(file, size);
-    var own_loaded = true;
-    errdefer if (own_loaded) new_pt.deinit();
-    const new_path = try self.alloc.dupe(u8, abs);
-    errdefer if (own_loaded) self.alloc.free(new_path);
-    var disk = try disk_file.Baseline.init(self.alloc, self.io, abs, new_pt.origin);
-    errdefer if (own_loaded) disk.deinit(self.alloc);
-    try self.buffers.append(self.alloc, .{
-        .pt = new_pt,
-        .history = buffer.History.init(self.alloc),
-        .path = new_path,
-        .disk = disk,
-    });
     own_loaded = false;
     if (!self.notesIsPath(abs)) self.setProjectRoot(abs);
     try self.addRecent(abs);
-    self.targetWindowForOpen(null);
-    self.switchTo(self.buffers.items.len - 1);
+    if (target == .navigation and !reuse_scratch) self.targetWindowForOpen(null);
+    self.switchTo(index);
+    return true;
 }
 
 /// Drop the LSP client and all LSP-derived state. `died` reports whether

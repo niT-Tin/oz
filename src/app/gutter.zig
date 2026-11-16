@@ -19,8 +19,8 @@ pub fn forLineCount(line_count: u32) Layout {
 
 /// Keep at least one source cell in every nonempty pane. Full numbers are
 /// never truncated: narrow panes drop signs/padding, then hide numbers.
-/// A blank gutter remains when possible because vertical separators overlay
-/// the first cell of a right-hand pane.
+/// A blank gutter remains when possible; separators own separate cells in
+/// the window layout and never overwrite the numeric field.
 pub fn forPane(line_count: u32, pane_width: u32) Layout {
     const full = forLineCount(line_count);
     if (pane_width > full.width) return full;

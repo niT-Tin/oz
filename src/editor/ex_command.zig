@@ -19,10 +19,10 @@ pub const Command = union(enum) {
     quit_all,
     /// :qa! — explicitly discard every workspace's unsaved changes.
     quit_all_force,
-    /// :vs — vertical split (side-by-side windows).
-    vsplit,
-    /// :sp — horizontal split (stacked windows).
-    split,
+    /// :vs [file] — vertical split, optionally opening a file in the new pane.
+    vsplit: ?[]const u8,
+    /// :sp [file] — horizontal split, optionally opening a file in the new pane.
+    split: ?[]const u8,
     /// :e <file> — open file (replacing the current buffer).
     edit: []const u8,
     /// :bn / :bp / :bd / :ls — buffer management (M0: single buffer).
@@ -63,6 +63,24 @@ fn trim(s: []const u8) []const u8 {
     var end: usize = s.len;
     while (end > start and (s[end - 1] == ' ' or s[end - 1] == '\t')) : (end -= 1) {}
     return s[start..end];
+}
+
+/// Start of a file argument, preserving the exact command/whitespace prefix.
+/// Used by command-mode Tab completion as well as the parser's file commands.
+pub fn fileArgStart(line: []const u8) ?usize {
+    var start: usize = 0;
+    while (start < line.len and (line[start] == ' ' or line[start] == '\t')) : (start += 1) {}
+    var end = start;
+    while (end < line.len and line[end] != ' ' and line[end] != '\t') : (end += 1) {}
+    if (end == line.len) return null;
+    const word = line[start..end];
+    const commands = [_][]const u8{ "e", "edit", "sp", "split", "vs", "vsplit", "new", "vnew" };
+    for (commands) |cmd| {
+        if (!std.mem.eql(u8, word, cmd)) continue;
+        while (end < line.len and (line[end] == ' ' or line[end] == '\t')) : (end += 1) {}
+        return end;
+    }
+    return null;
 }
 
 /// Parse a command line (without the leading ':').
@@ -111,9 +129,9 @@ pub fn parse(line: []const u8) Command {
     if (std.mem.eql(u8, word, "qa") or std.mem.eql(u8, word, "qall")) return .quit_all;
     if (std.mem.eql(u8, word, "qa!") or std.mem.eql(u8, word, "qall!")) return .quit_all_force;
     if (std.mem.eql(u8, word, "vs") or std.mem.eql(u8, word, "vsplit") or
-        std.mem.eql(u8, word, "vnew")) return .vsplit;
+        std.mem.eql(u8, word, "vnew")) return .{ .vsplit = if (args.len > 0) args else null };
     if (std.mem.eql(u8, word, "sp") or std.mem.eql(u8, word, "split") or
-        std.mem.eql(u8, word, "new")) return .split;
+        std.mem.eql(u8, word, "new")) return .{ .split = if (args.len > 0) args else null };
     if (std.mem.eql(u8, word, "wq") or std.mem.eql(u8, word, "x")) {
         return if (args.len == 0) .write_quit else .unknown;
     }
@@ -319,4 +337,25 @@ test "parse: buffers, noh, set, unknown" {
     try std.testing.expect(parse("foobar") == .unknown);
     try std.testing.expect(parse("w extra") == .unknown);
     try std.testing.expect(parse("q extra") == .unknown);
+}
+
+test "parse: split file arguments preserve aliases, whitespace and Unicode" {
+    for ([_][]const u8{ "sp", "split", "new" }) |cmd| {
+        const input = try std.fmt.allocPrint(std.testing.allocator, " {s}\t  folder/新 文件.md  ", .{cmd});
+        defer std.testing.allocator.free(input);
+        const parsed = parse(input);
+        try std.testing.expect(parsed == .split);
+        try std.testing.expectEqualStrings("folder/新 文件.md", parsed.split.?);
+        try std.testing.expectEqualStrings("folder/新 文件.md  ", input[fileArgStart(input).?..]);
+    }
+    for ([_][]const u8{ "vs", "vsplit", "vnew" }) |cmd| {
+        const input = try std.fmt.allocPrint(std.testing.allocator, "{s} file.txt", .{cmd});
+        defer std.testing.allocator.free(input);
+        try std.testing.expectEqualStrings("file.txt", parse(input).vsplit.?);
+    }
+    try std.testing.expect(parse("sp ").split == null);
+    try std.testing.expect(parse("vs\t").vsplit == null);
+    try std.testing.expect(fileArgStart("split") == null);
+    try std.testing.expect(fileArgStart("write other.txt") == null);
+    try std.testing.expectEqual(@as(?usize, 3), fileArgStart("e  "));
 }

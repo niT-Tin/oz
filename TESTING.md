@@ -877,3 +877,44 @@ diagnostics remain below the visible terminal after Esc returns focus to the
 editor, while an explicitly opened `gl` float retains its modal layer above
 the terminal. Existing split/Agent blame clipping and diagnostic tests remain
 unchanged. No golden frames are regenerated for this fix.
+
+### Split rectangles and explicit Ex file destinations (#44, #45)
+
+The `split geometry` unit property checks that both panes and their optional
+separator partition the full extent, including 0/1/2-cell and maximum extents.
+`parse: split file arguments` checks aliases, empty arguments, whitespace and
+Unicode paths; file-argument completion shares the same command vocabulary.
+
+The ten `split file state` PTY cases cover file-tree opens with two/three-digit
+relative numbers, focus changes, horizontal/nested first rows, `:sp file`,
+`:vs file`, focused-pane `:e`, new files saved only on `:w`, dirty source text,
+Tab completion without rewriting the command, bad-path rollback, dangling
+symlink preservation, an external file appearing before save, shared unnamed
+scratch buffers, and nested panes reusing a document without stealing focus.
+Gutter assertions inspect rendered cells and derive pane boundaries from the
+actual separator, rather than assuming source/gutter widths. Temporary roots
+include a monotonic timestamp so a crashed earlier PTY run cannot collide with
+another PID namespace reusing the same process id.
+
+The old Ex-routing test is intentionally updated: `:e` now follows the focused
+pane instead of always choosing the first leaf. It still checks both pane
+contents, tab ownership, close behavior and absence of duplicate tabs. Its
+fixture is wider so active/hidden labels fit after the divider gets its own
+cell; separate 80-column cases exercise the smaller panes. Buffer-move and LSP
+focus tests explicitly select the left pane before `:e` so their original
+retargeting/move assertions remain intact. The horizontal test now requires
+`topline` on the lower pane's first row (the old expectation accepted the
+separator hiding it). The mouse test measures the right-hand source from the
+rendered cells rather than assuming half-screen plus a fixed gutter offset.
+The tiny-pane click regression explicitly focuses the leftmost pane before
+opening its other document, and checks its one-cell panes after reserving
+the divider cells; its saved-file and mouse-focus assertions remain intact.
+Zero-width leaves are excluded from tab layers so repeated one-cell splits
+cannot add phantom header rows and shift every pane's content.
+Directional navigation skips invisible leaves, preventing a zero-distance
+focus loop between zero-width siblings; the tiny-pane test traverses back
+to the visible left pane before checking the one-cell mouse target.
+The invisible-editor/AI-cursor regression now reaches its zero-width focused
+pane by shrinking a one-cell pane, preserving the original cursor hide/show
+assertions without depending on that fixed navigation loop.
+No golden frames or verifier rules are changed.

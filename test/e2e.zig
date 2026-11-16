@@ -1433,7 +1433,7 @@ test "mouse: split pane focuses and places cursor; separator/status are no-ops; 
     try gridWaitFor(&sess, &grid, "NORMAL", 8000);
     try gridWaitFor(&sess, &grid, "line1", 5000);
 
-    // :vs — vertical split (left 0..49, separator col 50, right 50..99).
+    // :vs — vertical split (left 0..49, separator col 50, right 51..99).
     try sess.send(":vs\r");
     var waited: i32 = 0;
     while (waited < 5000) : (waited += 100) {
@@ -1453,8 +1453,8 @@ test "mouse: split pane focuses and places cursor; separator/status are no-ops; 
     try mouseClickAt(&sess, source_col + 2, 4);
     try gridWaitFor(&sess, &grid, "line 3/9 col 2", 5000);
 
-    // Equal-width split: the right source starts one half-screen later.
-    const right_text_col = grid.cols / 2 + source_col + 1;
+    // Measure the actual right-hand source; its separator owns a cell too.
+    const right_text_col = (glyphCol(&grid, 6, "l", grid.cols / 2) orelse return error.TestUnexpectedResult) + 1;
     try mouseClickAt(&sess, right_text_col, 6);
     try gridWaitFor(&sess, &grid, "line 5/9 col 1", 5000);
 
@@ -9896,7 +9896,7 @@ test "windows: :sp splits stacked; each window scrolls independently" {
     }
     try gridSettle(&sess, &grid, 120, 3000);
     const top_here = rowContains(&grid, 3, "topline");
-    const bottom_here = rowContains(&grid, 14, "second");
+    const bottom_here = rowContains(&grid, 14, "topline");
     if (!top_here or !bottom_here) {
         std.debug.print("after :sp:\n", .{});
         grid.dump();
@@ -10115,7 +10115,7 @@ test "TMP: split/close cycles + Ctrl-w navigation" {
     try std.testing.expect(std.mem.indexOf(u8, all, "leaked") == null);
 }
 
-test "windows: :vs keeps the old window left; :e lands in the left window when split" {
+test "windows: :vs keeps the old window left; :e follows the focused window" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
@@ -10143,11 +10143,12 @@ test "windows: :vs keeps the old window left; :e lands in the left window when s
         try f.writeStreamingAll(io, content);
     }
 
-    var sess = try Session.spawn(io, &.{ oz_exe_path, na });
+    // Two hidden/active tab labels must fit: this case tests ownership, not overflow.
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, na }, null, 24, 120, dir);
     defer sess.close();
     defer killPid(sess.pid);
 
-    var grid = try Grid.init(alloc);
+    var grid = try Grid.initSizedCols(alloc, 24, 120);
     defer grid.deinit(alloc);
     var waited: i32 = 0;
     while (!grid.contains("NORMAL")) {
@@ -10211,8 +10212,8 @@ test "windows: :vs keeps the old window left; :e lands in the left window when s
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
         const row = grid.rowText(2);
-        const left_b = std.mem.indexOf(u8, row[0..40], "BBB") != null;
-        const right_a = std.mem.indexOf(u8, row[40..80], "AAA") != null;
+        const left_b = std.mem.indexOf(u8, row[0..60], "BBB") != null;
+        const right_a = std.mem.indexOf(u8, row[60..120], "AAA") != null;
         swapped = left_b and right_a;
     }
     if (!swapped) {
@@ -10228,8 +10229,8 @@ test "windows: :vs keeps the old window left; :e lands in the left window when s
     }
     try std.testing.expect(try waitTabs(&sess, &grid, &.{"b.txt"}, &.{"a.txt"}));
 
-    // Ctrl-w l → RIGHT window; :e c.txt STILL lands in the LEFT window (the
-    // open-in-left default), focus follows it; the right half keeps AAA
+    // Ctrl-w l → RIGHT window; :e c.txt replaces only that pane.
+    // The unfocused left pane must retain BBB.
     try sess.send("\x17l");
     waited = 0;
     while (true) {
@@ -10247,8 +10248,8 @@ test "windows: :vs keeps the old window left; :e lands in the left window when s
     try sess.send(nc);
     try sess.send("\r");
     waited = 0;
-    var left_c = false;
-    while (!left_c) {
+    var right_c = false;
+    while (!right_c) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -10258,27 +10259,26 @@ test "windows: :vs keeps the old window left; :e lands in the left window when s
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
         const row = grid.rowText(2);
-        left_c = std.mem.indexOf(u8, row[0..40], "CCC") != null and std.mem.indexOf(u8, row[40..80], "AAA") != null;
+        right_c = std.mem.indexOf(u8, row[0..60], "BBB") != null and std.mem.indexOf(u8, row[60..120], "CCC") != null;
     }
-    if (!left_c) {
+    if (!right_c) {
         std.debug.print("after Ctrl-w l + :e c.txt:\n", .{});
         grid.dump();
     }
-    try std.testing.expect(left_c);
-    // split tab bar: CCC (left pane) AND hidden BBB (last shown in the
-    // left pane) keep tabs in the LEFT zone; AAA's tab stays in the RIGHT
-    // zone — each exactly once
-    if (!(try waitTabs(&sess, &grid, &.{ "c.txt", "b.txt" }, &.{"a.txt"}))) {
+    try std.testing.expect(right_c);
+    // BBB stays left; CCC and the right pane's hidden AAA stay right.
+    // Every buffer tab still appears exactly once.
+    if (!(try waitTabs(&sess, &grid, &.{"b.txt"}, &.{ "c.txt", "a.txt" }))) {
         std.debug.print("tab bar after Ctrl-w l + :e c.txt:\n", .{});
         grid.dump();
     }
-    try std.testing.expect(try waitTabs(&sess, &grid, &.{ "c.txt", "b.txt" }, &.{"a.txt"}));
+    try std.testing.expect(try waitTabs(&sess, &grid, &.{"b.txt"}, &.{ "c.txt", "a.txt" }));
 
-    // :q closes the focused (left) window → only AAA (right) remains
+    // :q closes the focused right window; the left pane still shows BBB.
     try sess.send(":q!\r");
     waited = 0;
-    var only_a = false;
-    while (!only_a) {
+    var only_b = false;
+    while (!only_b) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -10288,11 +10288,11 @@ test "windows: :vs keeps the old window left; :e lands in the left window when s
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
         const row = grid.rowText(2);
-        const has_a = std.mem.indexOf(u8, row, "AAA") != null;
+        const has_b = std.mem.indexOf(u8, row, "BBB") != null;
         const has_c = std.mem.indexOf(u8, row, "CCC") != null;
-        only_a = has_a and !has_c;
+        only_b = has_b and !has_c;
     }
-    try std.testing.expect(only_a);
+    try std.testing.expect(only_b);
     // back to a single window: the tab bar lists every buffer exactly once
     // (BBB/CCC re-homed to the surviving pane when their window closed)
     try std.testing.expectEqual(@as(usize, 1), countInRow(&grid, 0, "a.txt"));
@@ -10369,8 +10369,8 @@ test "windows: <leader>bh/bl move the buffer to the left/right window; last buff
         }
     };
 
-    // :vs → both halves show WAA; :e b.txt LANDS IN THE LEFT window (the
-    // open-in-left default: panes hold distinct buffers, focus follows)
+    // :vs → both halves show WAA; explicitly select the left pane
+    // before :e so buffer-move assertions keep testing distinct panes.
     try sess.send(":vs\r");
     try std.testing.expect(try Wait.panes(&sess, &grid, "WAA", "WAA"));
     // the new (focused) pane is the last to show the shared buffer: its
@@ -10380,6 +10380,7 @@ test "windows: <leader>bh/bl move the buffer to the left/right window; last buff
         grid.dump();
     }
     try std.testing.expect(try waitTabs(&sess, &grid, &.{}, &.{"bha.txt"}));
+    try sess.send("\x17h");
     try sess.send(":e ");
     try sess.send(nb);
     try sess.send("\r");
@@ -12687,7 +12688,7 @@ test "lsp: inlay hints cover the whole viewport in a tall window" {
 // the previous window's file: didChange edits from the focused window
 // reach the WRONG document on the server, whose copy of the edited file
 // goes stale — so its inlay hints (and hover/diagnostics) silently refer
-// to old text. Flow: :vs → :e B (lands LEFT) → Ctrl-w l (right = A) →
+// to old text. Flow: :vs → Ctrl-w h → :e B (LEFT) → Ctrl-w l (right = A) →
 // edit A → Ctrl-w h (left = B) → <leader>ti. The mock echoes its
 // recorded text: a didChange that wrongly targeted B leaves B's copy
 // corrupted with A's edit (": b0 = 0;x") while the correct flow leaves
@@ -12776,8 +12777,9 @@ test "lsp: Ctrl-w focus switch retargets the client to the window's buffer" {
     }
     try std.testing.expect(split);
 
-    // :e B — lands in the LEFT window (firstLeaf) and retargets the client
-    // to B (switchTo → ensureLsp). The right window keeps showing A.
+    // Explicitly choose LEFT, then :e B retargets the client there.
+    // The subsequent Ctrl-w l must still retarget back to A.
+    try sess.send("\x17h");
     try sess.send(":e ");
     try sess.send(name_b);
     try sess.send("\r");
@@ -12858,7 +12860,7 @@ test "lsp: Ctrl-w focus switch retargets the client to the window's buffer" {
 // to whichever buffer was FOCUSED when they were fetched — so a split
 // window showing a DIFFERENT buffer must never splice them into its own
 // text (same line numbers, but the labels and byte columns describe the
-// OTHER document). Flow: :vs → :e R (lands LEFT, focused; hints load for
+// OTHER document). Flow: :vs → Ctrl-w h → :e R (LEFT, focused; hints load for
 // R) → the RIGHT window (still showing L) must render NO R hints; then
 // Ctrl-w l (RIGHT = L focused; hints load for L) → the LEFT window
 // (still showing R) must render NO L hints. The mock's `inlay_range`
@@ -12950,9 +12952,9 @@ test "lsp: split windows with different buffers never splice foreign inlay hints
     }
     try std.testing.expect(split);
 
-    // :e R — lands in the LEFT window (firstLeaf) and retargets the LSP
-    // client to R. The LEFT window is focused, so R's hints load there;
-    // the RIGHT window still shows L.
+    // Explicitly choose LEFT before :e R; the RIGHT pane retains L.
+    // Focus switching must still replace all document-specific hints.
+    try sess.send("\x17h");
     try sess.send(":e ");
     try sess.send(name_r);
     try sess.send("\r");
@@ -30000,19 +30002,19 @@ test "gutter: tiny split fallbacks keep source visible and the one-cell editor c
         const first_source: usize = if (deep) 8 else 4;
         try sess.send(":vs\r:vs\r:vs\r:vs\rrA");
         try gutterWaitCell(&sess, &grid, 2, first_source, "A");
-        // Right-most leaf widths are 3, then 2, then 1. A deep file hides
-        // its five-digit numbers, keeping a separator pad in a 3-cell pane.
-        try gutterWaitCell(&sess, &grid, 2, if (deep) 38 else 39, "A");
+        // The right-most one-cell source stays visible after further splits;
+        // independent dividers never occupy that source cell.
+        try gutterWaitCell(&sess, &grid, 2, 39, "A");
         try sess.send(":vs\rrB");
         try gutterWaitCell(&sess, &grid, 2, first_source, "B");
         try gutterWaitCell(&sess, &grid, 2, 39, "B");
         try sess.send(":vs\rrC");
         try gutterWaitCell(&sess, &grid, 2, first_source, "C");
         try gutterWaitCell(&sess, &grid, 2, 39, "C");
-        // Opening another buffer deliberately focuses a different (leftmost)
-        // editor. A click on the one-cell source must reclaim keyboard focus,
+        // Explicitly choose the leftmost editor before opening another buffer.
+        // A click on the one-cell source must reclaim keyboard focus,
         // even though a historical separator occupied that exact same cell.
-        const command = try std.fmt.allocPrint(a, ":e {s}\r", .{other});
+        const command = try std.fmt.allocPrint(a, "\x17h\x17h\x17h\x17h\x17h\x17h:e {s}\r", .{other});
         defer a.free(command);
         try sess.send(command);
         try gridWaitFor(&sess, &grid, "OTHER_BUFFER", 5000);
@@ -30045,15 +30047,23 @@ test "gutter: an invisible editor leaf must not hide the visible AI prompt curso
     defer a.free(file);
     const home = try std.fmt.allocPrint(a, "HOME={s}", .{root});
     defer a.free(home);
-    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, file }, &.{home}, 24, 40, root);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, file }, &.{home}, 24, 48, root);
     defer sess.close();
     defer killPid(sess.pid);
-    var grid = try Grid.initSizedCols(a, 24, 40);
+    var grid = try Grid.initSizedCols(a, 24, 48);
     defer grid.deinit(a);
     try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
-    // A seventh split creates a zero-width neighbor. Ctrl-w h chooses it
-    // at the same column (geometric distance zero), then rZ proves dispatch.
-    try sess.send(":vs\r:vs\r:vs\r:vs\r:vs\r:vs\r:vs\r\x17hrZ");
+    // Focus the left one-cell sibling, then shrink it to zero width. Normal
+    // navigation now skips invisible panes, so enter this state by resize
+    // rather than relying on the old zero-distance Ctrl-w h focus loop.
+    try sess.send(":vs\r:vs\r:vs\r:vs\r:vs\r\x17hrY");
+    try gutterWaitCell(&sess, &grid, 2, 46, "Y");
+    const size = Winsize{ .ws_row = 24, .ws_col = 40, .ws_xpixel = 0, .ws_ypixel = 0 };
+    _ = linux.ioctl(sess.pty.master, TIOCSWINSZ, @intFromPtr(&size));
+    grid.deinit(a);
+    grid = try Grid.initSizedCols(a, 24, 40);
+    try gutterWaitCell(&sess, &grid, 2, 4, "Y");
+    try sess.send("rZ");
     try gridWaitFor(&sess, &grid, "Z", 5000);
     const source_z = aiFindCellFrom(&grid, "Z", 0).?;
     try std.testing.expectEqual(@as(usize, 4), source_z.col);
@@ -30693,4 +30703,353 @@ test "terminal blame layering: inline diagnostics stay below terminals but gl re
     try gridWaitGone(&sess, &grid, "Diagnostics (2)", 5000);
     try expectTerminalCoversBlame(&grid, box, label.row, diag_fg);
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q!\r"));
+}
+
+// Issues #44/#45: pane geometry and explicit Ex file destinations.
+fn splitStateDir(io: Io, buf: []u8) ![]const u8 {
+    const stamp = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    const root = try std.fmt.bufPrint(buf, "/tmp/oz_split_state_{d}_{d}_{d}", .{ linux.getpid(), tmp_counter, stamp });
+    tmp_counter += 1;
+    try std.Io.Dir.cwd().createDir(io, root, .default_dir);
+    return root;
+}
+
+fn splitStateRows(io: Io, a: std.mem.Allocator, root: []const u8, name: []const u8, prefix: []const u8, count: usize) !void {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(a);
+    for (0..count) |i| {
+        const row = try std.fmt.allocPrint(a, "{s}{d}\n", .{ prefix, i });
+        defer a.free(row);
+        try text.appendSlice(a, row);
+    }
+    try writeTestFile(io, root, name, text.items);
+}
+
+fn splitStateNumbers(grid: *Grid, prefix: []const u8, cursor_line: usize) !void {
+    var checked: usize = 0;
+    for (2..grid.rows - 1) |r| {
+        const row = grid.rowText(r);
+        const at = std.mem.indexOf(u8, row, prefix) orelse continue;
+        const marker_col = aiCellIndexOf(grid, r, prefix) orelse return error.TestUnexpectedResult;
+        var pane_col: usize = 0;
+        for (0..marker_col) |col| {
+            if (std.mem.eql(u8, frame.cellText(grid, r, col), "│")) pane_col = col + 1;
+        }
+        var end = at + prefix.len;
+        while (end < row.len and std.ascii.isDigit(row[end])) : (end += 1) {}
+        const index = try std.fmt.parseInt(usize, row[at + prefix.len .. end], 10);
+        var digits: [16]u8 = undefined;
+        var n: usize = 0;
+        for (row[grid.rowByteOf(r, pane_col)..at]) |c| {
+            if (std.ascii.isDigit(c)) {
+                digits[n] = c;
+                n += 1;
+            }
+        }
+        const relative = if (index == cursor_line) index + 1 else if (index > cursor_line) index - cursor_line else cursor_line - index;
+        var expected: [16]u8 = undefined;
+        const want = try std.fmt.bufPrint(&expected, "{d}", .{relative});
+        if (!std.mem.eql(u8, want, digits[0..n])) {
+            std.debug.print("pane gutter: {s}{d} expected '{s}', got '{s}'\n", .{ prefix, index, want, digits[0..n] });
+            grid.dump();
+        }
+        try std.testing.expectEqualStrings(want, digits[0..n]);
+        checked += 1;
+    }
+    try std.testing.expect(checked >= 11);
+}
+
+fn splitStateCount(grid: *Grid, needle: []const u8) usize {
+    var n: usize = 0;
+    for (2..grid.rows - 1) |r| n += countInRow(grid, r, needle);
+    return n;
+}
+
+test "split file state: tree open preserves complete relative numbers in both panes" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const root = try splitStateDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try splitStateRows(io, a, root, "a.txt", "A_ROW_", 31);
+    try splitStateRows(io, a, root, "b.txt", "B_ROW_", 130);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "a.txt" }, null, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "A_ROW_0", 5000);
+    try sess.send(":vs\r");
+    try gridSettle(&sess, &grid, 80, 3000);
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "Files", 5000);
+    try selectTreeEntryByName(&sess, &grid, "b.txt");
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "B_ROW_0", 5000);
+    try gridSettle(&sess, &grid, 80, 3000);
+    try splitStateNumbers(&grid, "A_ROW_", 0);
+    try splitStateNumbers(&grid, "B_ROW_", 0);
+    try sess.send("\x17l:13\r");
+    try gridWaitFor(&sess, &grid, "line 13/", 5000);
+    try gridSettle(&sess, &grid, 80, 3000);
+    try splitStateNumbers(&grid, "A_ROW_", 12);
+    try splitStateNumbers(&grid, "B_ROW_", 0);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "split file state: horizontal and nested separators never cover the first source row" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const root = try splitStateDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "a.txt", "FIRST_SOURCE_ROW\nsecond\nthird\n");
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "a.txt" }, null, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "FIRST_SOURCE_ROW", 5000);
+    try sess.send(":sp\r");
+    try gridWaitFor(&sess, &grid, "────", 5000);
+    try gridSettle(&sess, &grid, 80, 3000);
+    try std.testing.expectEqual(@as(usize, 2), splitStateCount(&grid, "FIRST_SOURCE_ROW"));
+    try sess.send(":vs\r");
+    try gridSettle(&sess, &grid, 80, 3000);
+    try std.testing.expectEqual(@as(usize, 3), splitStateCount(&grid, "FIRST_SOURCE_ROW"));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+fn splitStateExCase(command: []const u8) !void {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const root = try splitStateDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "a.txt", "BASIC_A\n");
+    try writeTestFile(io, root, "b.txt", "TARGET_B\n");
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "a.txt" }, null, 30, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "BASIC_A", 5000);
+    try sess.send("iDIRTY_");
+    try gridWaitFor(&sess, &grid, "INSERT", 5000);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+    if (std.mem.eql(u8, command, "e")) {
+        try sess.send(":vs\r");
+        try gridSettle(&sess, &grid, 80, 3000);
+    }
+    const keys = try std.fmt.allocPrint(a, ":{s} b.txt\r", .{command});
+    defer a.free(keys);
+    try sess.send(keys);
+    try gridWaitFor(&sess, &grid, "TARGET_B", 5000);
+    try gridSettle(&sess, &grid, 80, 3000);
+    const target = termFindText(&grid, "TARGET_B") orelse return error.TestUnexpectedResult;
+    if (std.mem.eql(u8, command, "sp")) {
+        var divider: ?usize = null;
+        for (2..grid.rows - 1) |r| {
+            if (std.mem.indexOf(u8, grid.rowText(r), "────") != null) {
+                divider = r;
+                break;
+            }
+        }
+        try std.testing.expect(target.row > (divider orelse return error.TestUnexpectedResult));
+    } else try std.testing.expect(target.col > grid.cols / 2);
+    try std.testing.expect(grid.contains("DIRTY_BASIC_A"));
+    try sess.send(":e draft 中.md\r");
+    try gridWaitFor(&sess, &grid, "md line 1/1", 5000);
+    const draft = try std.fmt.allocPrint(a, "{s}/draft 中.md", .{root});
+    defer a.free(draft);
+    try std.testing.expect(!pathExists(io, draft));
+    try sess.send("iDRAFT_PAYLOAD");
+    try gridWaitFor(&sess, &grid, "INSERT", 5000);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+    try sess.send(":w\r");
+    try gridWaitFor(&sess, &grid, "written", 5000);
+    try erWaitSavedBytes(&sess, &grid, a, draft, "DRAFT_PAYLOAD");
+    const a_path = try std.fmt.allocPrint(a, "{s}/a.txt", .{root});
+    defer a.free(a_path);
+    const bytes = try absFileText(io, a, a_path);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("BASIC_A\n", bytes);
+    try sess.send(":e a.txt\r");
+    try gridWaitFor(&sess, &grid, "DIRTY_BASIC_A", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "split file state: sp file opens the new pane and new file buffers remain unwritten until w" {
+    try splitStateExCase("sp");
+}
+test "split file state: vs file opens the new pane and preserves unsaved source" {
+    try splitStateExCase("vs");
+}
+test "split file state: e file targets the focused right pane and supports missing files" {
+    try splitStateExCase("e");
+}
+
+test "split file state: filename Tab completion preserves each split command" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const root = try splitStateDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "a.txt", "ORIGINAL_PANE\n");
+    try writeTestFile(io, root, "complete-target.txt", "COMPLETED_TARGET\n");
+    for ([_][]const u8{ "sp", "split", "vs", "vsplit" }) |cmd| {
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "a.txt" }, null, 30, 120, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 30, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "ORIGINAL_PANE", 5000);
+        const keys = try std.fmt.allocPrint(a, ":{s} complete-t\t", .{cmd});
+        defer a.free(keys);
+        try sess.send(keys);
+        const completed = try std.fmt.allocPrint(a, ":{s} complete-target.txt", .{cmd});
+        defer a.free(completed);
+        try gridWaitFor(&sess, &grid, completed, 5000);
+        try sess.send("\r");
+        try gridWaitFor(&sess, &grid, "COMPLETED_TARGET", 5000);
+        try std.testing.expect(grid.contains("ORIGINAL_PANE"));
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+    }
+}
+
+test "split file state: invalid file arguments restore the pane layout and cursor" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const root = try splitStateDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "a.txt", "UNCHANGED_SOURCE\n");
+    const folder = try std.fmt.allocPrint(a, "{s}/folder", .{root});
+    defer a.free(folder);
+    try std.Io.Dir.cwd().createDir(io, folder, .default_dir);
+    const link = try std.fmt.allocPrint(a, "{s}/dangling.txt", .{root});
+    defer a.free(link);
+    try std.Io.Dir.cwd().symLink(io, "missing-target.txt", link, .{});
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "a.txt" }, null, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "UNCHANGED_SOURCE", 5000);
+    try sess.send("$");
+    try gridSettle(&sess, &grid, 80, 3000);
+    const before_row = grid.row;
+    const before_col = grid.col;
+    for ([_][]const u8{ "sp", "vs" }) |cmd| {
+        for ([_][]const u8{ "folder", "a.txt/child", "dangling.txt" }) |name| {
+            const keys = try std.fmt.allocPrint(a, ":{s} {s}\r", .{ cmd, name });
+            defer a.free(keys);
+            try sess.send(keys);
+            try gridWaitFor(&sess, &grid, if (std.mem.eql(u8, name, "folder")) "E17:" else "E484:", 5000);
+            try gridSettle(&sess, &grid, 80, 3000);
+            try std.testing.expectEqual(@as(usize, 1), splitStateCount(&grid, "UNCHANGED_SOURCE"));
+            try std.testing.expectEqual(before_row, grid.row);
+            try std.testing.expectEqual(before_col, grid.col);
+        }
+    }
+    try std.testing.expectEqual(std.Io.File.Kind.sym_link, (try std.Io.Dir.cwd().statFile(io, link, .{ .follow_symlinks = false })).kind);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "split file state: a new file buffer refuses an external file appearing before save" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const root = try splitStateDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "a.txt", "ORIGINAL_SOURCE\n");
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "a.txt" }, null, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "ORIGINAL_SOURCE", 5000);
+    try sess.send(":sp fresh.txt\r");
+    try gridWaitFor(&sess, &grid, "txt line 1/1", 5000);
+    try sess.send("iLOCAL_DRAFT");
+    try gridWaitFor(&sess, &grid, "INSERT", 5000);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+    try writeTestFile(io, root, "fresh.txt", "EXTERNAL_BYTES");
+    try sess.send(":w\r");
+    try gridWaitFor(&sess, &grid, "E13:", 5000);
+    try std.testing.expect(grid.contains("LOCAL_DRAFT"));
+    const path = try std.fmt.allocPrint(a, "{s}/fresh.txt", .{root});
+    defer a.free(path);
+    const bytes = try absFileText(io, a, path);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("EXTERNAL_BYTES", bytes);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "split file state: splitting an unnamed scratch does not name the sibling buffer" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const root = try splitStateDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var sess = try Session.spawnEnvSizeCwd(io, &.{oz_exe_path}, null, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "Find File", 5000);
+    try sess.send(":sp new.txt\r");
+    try gridWaitFor(&sess, &grid, "txt line 1/1", 5000);
+    try sess.send("iONLY_NEW_FILE");
+    try gridWaitFor(&sess, &grid, "INSERT", 5000);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+    try sess.send(":w\r");
+    try gridWaitFor(&sess, &grid, "written:", 5000);
+    try sess.send("\x17k:w\r");
+    try gridWaitFor(&sess, &grid, "E32:", 5000);
+    try sess.send(":e new.txt\r");
+    try gridSettle(&sess, &grid, 80, 3000);
+    try std.testing.expectEqual(@as(usize, 2), splitStateCount(&grid, "ONLY_NEW_FILE"));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "split file state: nested Ex destinations share existing buffers without stealing focus" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const root = try splitStateDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    for ([_][]const u8{ "a.txt", "b.txt", "c.txt" }, [_][]const u8{ "A_UNIQUE\n", "B_UNIQUE\n", "C_UNIQUE\n" }) |name, bytes| try writeTestFile(io, root, name, bytes);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "a.txt" }, null, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "A_UNIQUE", 5000);
+    try sess.send(":vs b.txt\r");
+    try gridWaitFor(&sess, &grid, "B_UNIQUE", 5000);
+    try sess.send(":sp c.txt\r");
+    try gridWaitFor(&sess, &grid, "C_UNIQUE", 5000);
+    const target = termFindText(&grid, "C_UNIQUE") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(target.col > 60 and target.row > 3);
+    try sess.send(":e a.txt\r");
+    try gridWaitGone(&sess, &grid, "C_UNIQUE", 5000);
+    try gridSettle(&sess, &grid, 80, 3000);
+    try std.testing.expectEqual(@as(usize, 2), splitStateCount(&grid, "A_UNIQUE"));
+    try std.testing.expect(grid.row > 3 and grid.col > 60);
+    try sess.send("iZ");
+    try gridWaitFor(&sess, &grid, "INSERT", 5000);
+    try gridSettle(&sess, &grid, 80, 3000);
+    try std.testing.expectEqual(@as(usize, 2), splitStateCount(&grid, "ZA_UNIQUE"));
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+    try sess.send(":e c.txt\r");
+    try gridWaitFor(&sess, &grid, "C_UNIQUE", 5000);
+    try std.testing.expect(grid.row > 3 and grid.col > 60);
+    try std.testing.expect(grid.contains("B_UNIQUE"));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
 }
