@@ -4088,6 +4088,53 @@ test "grep picker: fixed-size panel with split syntax preview" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+/// Navigate using the actual highlighted filename, not the repository's
+/// directory/file count. Await each selection change before sending another j.
+fn selectTreeEntryByName(sess: *Session, grid: *Grid, name: []const u8) !void {
+    try sess.send("gg");
+    try gridSettle(sess, grid, 50, 3000);
+    for (0..200) |_| {
+        for (navBodyRow()..grid.rows - 1) |row| {
+            if (aiCellIndexOf(grid, row, name)) |col| {
+                if (aiCellBg(grid, row, col) != navSelectedBg()) continue;
+                const rendered = grid.rowText(row);
+                const at = std.mem.indexOf(u8, rendered, name) orelse continue;
+                const end = at + name.len;
+                // Reject earlier-sorting lookalikes such as 00-README.md
+                // and README.md.bak rather than accepting a substring.
+                if ((at == 0 or rendered[at - 1] == ' ') and
+                    (end == rendered.len or rendered[end] == ' ')) return;
+            }
+        }
+        const before_row = grid.row;
+        var before_text: [1024]u8 = undefined;
+        const text = grid.rowText(before_row);
+        std.debug.assert(text.len <= before_text.len);
+        @memcpy(before_text[0..text.len], text);
+        const before_len = text.len;
+        try sess.send("j");
+        const deadline = std.Io.Timestamp.now(sess.io, .awake).nanoseconds + 3000 * std.time.ns_per_ms;
+        var changed = false;
+        while (std.Io.Timestamp.now(sess.io, .awake).nanoseconds < deadline) {
+            const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
+            if (n == 0) continue;
+            sess.used += n;
+            grid.feed(sess.out[sess.used - n .. sess.used]);
+            if (grid.row != before_row or !std.mem.eql(u8, before_text[0..before_len], grid.rowText(before_row))) {
+                changed = true;
+                break;
+            }
+        }
+        if (!changed) break;
+        // A cursor-addressing command can occur in the middle of a frame;
+        // drain its remainder before inspecting the selected label.
+        try gridSettle(sess, grid, 50, 3000);
+    }
+    std.debug.print("file tree entry not selected: {s}\n", .{name});
+    grid.dump();
+    return error.TestUnexpectedResult;
+}
+
 test "file tree: <leader>e shows files, Enter opens one" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -4121,12 +4168,11 @@ test "file tree: <leader>e shows files, Enter opens one" {
     }
     try std.testing.expect(grid.contains("NORMAL"));
 
-    // <leader>e opens the tree; title + an early entry appear. The tree is
-    // now a real directory tree: first level is dirs-first sorted (docs/,
-    // src/, test/), so the first row is a directory, not DESIGN.md.
+    // <leader>e opens the tree. Directories precede files regardless of
+    // additional repository entries; choose docs by name before expanding.
     try sess.send(" e");
     waited = 0;
-    while (!grid.contains("Files") or !grid.contains("build.zig")) {
+    while (!grid.contains("Files")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -4137,13 +4183,11 @@ test "file tree: <leader>e shows files, Enter opens one" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(grid.contains("Files"));
-    try std.testing.expect(grid.contains("build.zig"));
-    // dirs come first: the first content row is a directory with the
-    // closed folder glyph; "docs" is the first sorted first-level dir.
-    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(navBodyRow()), "docs") != null);
+    try std.testing.expect(rowContains(&grid, navBodyRow(), "\u{f07b}"));
     // nvim/snacks geometry: border, one padding cell (the cursor sits here),
     // then the tree branch and the icon — cursor and glyph never share a cell.
     try std.testing.expect(std.mem.startsWith(u8, grid.rowText(navBodyRow()), "│ ├╴"));
+    try selectTreeEntryByName(&sess, &grid, "docs");
 
     // Enter on the selected directory (docs) expands it — its only child
     // (workspace-plan) appears, and the folder glyph flips open
@@ -4177,11 +4221,11 @@ test "file tree: <leader>e shows files, Enter opens one" {
     }
     try std.testing.expect(!grid.contains("workspace-plan"));
 
-    // j × 5 → DESIGN.md (first-level file); Enter opens it but KEEPS the
+    // Select DESIGN.md by name; Enter opens it but KEEPS the
     // tree open — only <space>e (toggle) or Esc close it; focus returns to
     // the buffer so typing edits the file.
-    // dirs-first first level: docs, patches, src, test, tools, DESIGN.md.
-    try sess.send("jjjjj\r");
+    try selectTreeEntryByName(&sess, &grid, "DESIGN.md");
+    try sess.send("\r");
     waited = 0;
     while (!grid.contains("# oz") or !grid.contains("NORMAL")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
@@ -4194,6 +4238,7 @@ test "file tree: <leader>e shows files, Enter opens one" {
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
     try std.testing.expect(grid.contains("# oz")); // DESIGN.md header (ASCII part)
+    try std.testing.expect(rowContains(&grid, 0, "DESIGN.md"));
     try std.testing.expect(navCompactRailVisible(&grid)); // rail stays after Enter
 
     // <space>e toggles the tree closed (and is the only toggle)
@@ -8367,12 +8412,11 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
     // build.zig is highlighted (gold keyword) before any switch
     try std.testing.expect(grid.containsFg("const", packRgb(149, 127, 184)));
 
-    // <leader>e: the tree's first level is dirs-first (docs/ src/ test/),
-    // so row 2 (row 0 = tab bar, row 1 = sidebar title/border) is a
-    // directory, not the alphabetical first file.
+    // <leader>e opens the tree; file selection must not depend on the
+    // number of directories or files preceding the target.
     try sess.send(" e");
     waited = 0;
-    while (std.mem.indexOf(u8, grid.rowText(navBodyRow()), "docs") == null) {
+    while (!grid.contains("Files")) {
         const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
         if (n == 0) {
             waited += 200;
@@ -8382,14 +8426,12 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
         sess.used += n;
         grid.feed(sess.out[sess.used - n .. sess.used]);
     }
-    try std.testing.expect(std.mem.indexOf(u8, grid.rowText(navBodyRow()), "docs") != null);
+    try std.testing.expect(grid.contains("Files"));
 
-    // j × 7 → README.md. Current first level (dirs first, then uppercase
-    // names before lowercase in byte order): docs, patches, src, test,
-    // tools, DESIGN.md, LICENSE, README.md. Enter opens it. The tree STAYS
-    // open (only <space>e / Esc close it) — the buffer tab shows README.md
-    // (row 0, now NOT covered by the sidebar).
-    try sess.send("jjjjjjj\r");
+    // New top-level entries (for example CHANGELOG.md) must not change
+    // the target. Enter is still the action that actually opens the file.
+    try selectTreeEntryByName(&sess, &grid, "README.md");
+    try sess.send("\r");
     waited = 0;
     while (std.mem.indexOf(u8, grid.rowText(1), "README.md") == null and
         std.mem.indexOf(u8, grid.rowText(navBodyRow()), "README.md") == null)
@@ -8406,95 +8448,17 @@ test "filetree: zig -> md -> zig buffer switch keeps keyword highlighting" {
     try std.testing.expect(std.mem.indexOf(u8, grid.rowText(0), "README.md") != null);
     try std.testing.expect(navCompactRailVisible(&grid)); // the rail did not close
 
-    // The tree is still open with focus on the buffer (Enter moves focus).
-    // Ctrl-w h → sidebar focus (the tree is the leftmost pane; h moves left
-    // from the buffer into it); the selection is still on README.md's row.
-    // kkkkk → src, l expands it, j → buffer, l expands it, jj → ops.zig,
-    // then Enter opens it (zig → md → zig, the chain that rebuilds the
-    // highlighter via ensureSyntax).
+    // Return keyboard focus to the tree, then identify each real child
+    // by its selected cell. Added directories cannot shift these targets.
     try sess.send("\x17h");
-    waited = 0;
-    while (true) {
-        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 200);
-        if (n == 0) {
-            waited += 200;
-            if (waited >= 2000) break;
-            continue;
-        }
-        sess.used += n;
-        grid.feed(sess.out[sess.used - n .. sess.used]);
-        break;
-    }
-    try sess.send("kkkkk");
-    while (true) {
-        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
-        if (n == 0) break;
-        sess.used += n;
-        grid.feed(sess.out[sess.used - n .. sess.used]);
-    }
+    try gridSettle(&sess, &grid, 50, 3000);
+    try selectTreeEntryByName(&sess, &grid, "src");
     try sess.send("l");
-    while (true) {
-        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
-        if (n == 0) break;
-        sess.used += n;
-        grid.feed(sess.out[sess.used - n .. sess.used]);
-    }
-    try sess.send("j");
-    while (true) {
-        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
-        if (n == 0) break;
-        sess.used += n;
-        grid.feed(sess.out[sess.used - n .. sess.used]);
-    }
-    // src's first child is now ai; step over it and app to buffer
-    try sess.send("j");
-    while (true) {
-        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
-        if (n == 0) break;
-        sess.used += n;
-        grid.feed(sess.out[sess.used - n .. sess.used]);
-    }
-    try sess.send("j");
-    while (true) {
-        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
-        if (n == 0) break;
-        sess.used += n;
-        grid.feed(sess.out[sess.used - n .. sess.used]);
-    }
+    try gridSettle(&sess, &grid, 50, 3000);
+    try selectTreeEntryByName(&sess, &grid, "buffer");
     try sess.send("l");
-    while (true) {
-        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
-        if (n == 0) break;
-        sess.used += n;
-        grid.feed(sess.out[sess.used - n .. sess.used]);
-    }
-    const sel_bg = packRgb(45, 79, 103);
-    var ops_selected = false;
-    var tries: usize = 0;
-    while (!ops_selected and tries < 30) : (tries += 1) {
-        var rr: usize = 1;
-        while (rr < grid.rows) : (rr += 1) {
-            if (grid.rowHasBg(rr, sel_bg) and std.mem.indexOf(u8, grid.rowText(rr), "ops.zig") != null) {
-                ops_selected = true;
-                break;
-            }
-        }
-        if (ops_selected) break;
-        try sess.send("j");
-        // drain the render for this keypress so the grid is current before
-        // the next check (one j at a time so we never overshoot)
-        while (true) {
-            const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 50);
-            if (n == 0) break;
-            sess.used += n;
-            grid.feed(sess.out[sess.used - n .. sess.used]);
-        }
-    }
-    if (!ops_selected) {
-        std.debug.print("ops.zig not selected in the file tree:\n", .{});
-        grid.dump();
-    }
-    try std.testing.expect(ops_selected);
+    try gridSettle(&sess, &grid, 50, 3000);
+    try selectTreeEntryByName(&sess, &grid, "ops.zig");
 
     try sess.send("\r");
     waited = 0;
