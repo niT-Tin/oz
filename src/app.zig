@@ -22,6 +22,7 @@ const term = @import("term.zig");
 
 const autil = @import("app/util.zig");
 const app_view = @import("app/view_state.zig");
+const split_layout = @import("app/split_layout.zig");
 const git_job = @import("app/git_job.zig");
 const app_ai = @import("app/ai.zig");
 const app_hints = @import("app/hints.zig");
@@ -1364,8 +1365,8 @@ pub const App = struct {
     };
 
     /// One window separator line (vim statusline semantics): the boundary
-    /// between two panes, drawn OVER the leaf buffers so the layout math is
-    /// untouched. Horizontal splits get a full "─" row at `row`; vertical
+    /// between two panes, owning cells excluded from both leaf rectangles.
+    /// Horizontal splits get a full "─" row at `row`; vertical
     /// splits a "│" column at `col`. `len` is the extent in the separator's
     /// own direction (cells). `active` marks the separators adjacent to the
     /// focused window (the path from the root to the current leaf), drawn
@@ -1407,8 +1408,9 @@ pub const App = struct {
             .leaf => |i| try out.append(a, .{ .win = i, .row = rect.row, .col = rect.col, .height = rect.height, .width = rect.width }),
             .split => |*s| switch (s.dir) {
                 .horizontal => {
-                    const h1 = rect.height / 2;
-                    try seps.append(a, .{
+                    const axis = split_layout.divide(rect.height);
+                    const h1 = axis.first;
+                    if (axis.separator > 0) try seps.append(a, .{
                         .row = rect.row + h1,
                         .col = rect.col,
                         .len = rect.width,
@@ -1416,11 +1418,12 @@ pub const App = struct {
                         .active = self.subTreeHasLeaf(node, self.current_win),
                     });
                     try self.layoutNode(a, s.a, .{ .win = 0, .row = rect.row, .col = rect.col, .height = h1, .width = rect.width }, out, seps);
-                    try self.layoutNode(a, s.b, .{ .win = 0, .row = rect.row + h1, .col = rect.col, .height = rect.height - h1, .width = rect.width }, out, seps);
+                    try self.layoutNode(a, s.b, .{ .win = 0, .row = rect.row + h1 + axis.separator, .col = rect.col, .height = axis.second, .width = rect.width }, out, seps);
                 },
                 .vertical => {
-                    const w1 = rect.width / 2;
-                    try seps.append(a, .{
+                    const axis = split_layout.divide(rect.width);
+                    const w1 = axis.first;
+                    if (axis.separator > 0) try seps.append(a, .{
                         .row = rect.row,
                         .col = rect.col + w1,
                         .len = rect.height,
@@ -1428,7 +1431,7 @@ pub const App = struct {
                         .active = self.subTreeHasLeaf(node, self.current_win),
                     });
                     try self.layoutNode(a, s.a, .{ .win = 0, .row = rect.row, .col = rect.col, .height = rect.height, .width = w1 }, out, seps);
-                    try self.layoutNode(a, s.b, .{ .win = 0, .row = rect.row, .col = rect.col + w1, .height = rect.height, .width = rect.width - w1 }, out, seps);
+                    try self.layoutNode(a, s.b, .{ .win = 0, .row = rect.row, .col = rect.col + w1 + axis.separator, .height = rect.height, .width = axis.second }, out, seps);
                 },
             },
         }
@@ -1541,6 +1544,10 @@ pub const App = struct {
         var best_score: i64 = std.math.maxInt(i64);
         for (leaves) |lr| {
             if (lr.win == self.current_win) continue;
+            // Invisible leaves have no focusable cells. In particular,
+            // several zero-width siblings share an edge and would trap
+            // directional navigation bouncing between those siblings.
+            if (lr.width == 0 or lr.height == 0) continue;
             const in_dir = switch (dir) {
                 .left => lr.col + lr.width <= cr.col,
                 .right => lr.col >= cr.col + cr.width,
@@ -1919,6 +1926,8 @@ pub const App = struct {
     pub const targetWindowForOpen = @import("app/buffers.zig").targetWindowForOpen;
     pub const loadPieceTable = @import("app/buffers.zig").loadPieceTable;
     pub const openInBuffer = @import("app/buffers.zig").openInBuffer;
+    pub const openInCurrentWindow = @import("app/buffers.zig").openInCurrentWindow;
+    pub const splitFileWindow = @import("app/buffers.zig").splitFileWindow;
     pub const teardownLsp = @import("app/buffers.zig").teardownLsp;
     pub const closeBufferAt = @import("app/buffers.zig").closeBufferAt;
     pub const closeCurrentBuffer = @import("app/buffers.zig").closeCurrentBuffer;

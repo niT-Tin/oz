@@ -9,7 +9,9 @@ const App = app_mod.App;
 // ---- dashboard ----
 
 pub fn isDashboard(self: *App) bool {
-    return self.cur().path == null and self.cur().pt.len() == 0 and
+    // An empty split is still an editor pane; a full-screen dashboard
+    // would hide its siblings and swallow their ordinary editor commands.
+    return self.windows.items.len == 1 and self.cur().path == null and self.cur().pt.len() == 0 and
         self.state.mode == .normal and !self.picker_active and !self.em_active;
 }
 
