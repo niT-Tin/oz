@@ -22,6 +22,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Test release notes extraction
+        run: ./.scripts/test-release-notes.sh
+
       - name: Cache Zig toolchain
         uses: actions/cache@v4
         with:

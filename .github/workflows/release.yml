@@ -36,6 +36,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Validate release notes
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: ./.scripts/extract-release-notes.sh "$RELEASE_TAG" > "$RUNNER_TEMP/release-notes.md"
+
       - name: Cache Zig toolchain
         uses: actions/cache@v4
         with:
@@ -110,6 +115,13 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare release notes
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: ./.scripts/extract-release-notes.sh "$RELEASE_TAG" > release-notes.md
+
       - name: Collect artifacts
         uses: actions/download-artifact@v4
         with:
@@ -120,4 +132,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: assets/*
-          generate_release_notes: true
+          body_path: release-notes.md
+          generate_release_notes: false
