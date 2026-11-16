@@ -855,3 +855,25 @@ parameter name is marked, fixes remove its underline and inserted lines move
 the range. `gl` still opens full details; its key hint is omitted from the
 default inline message. The PTY observer records SGR 4 subparameters and SGR 58
 colors separately, including resets and sequences split across reads.
+
+### Terminal / editor virtual-text layering (#42)
+
+`terminal blame layering` drives real Git repositories and real PTYs. Its
+cached-data matrix covers floating, bottom and right terminal layouts at
+80 and 40 columns, focused and unfocused terminals, the exposed part of a
+blame label outside the terminal, and restoration after hiding the terminal.
+Assertions inspect terminal cells and border glyphs, including blame colors;
+a missing full author string alone is not accepted as proof of occlusion.
+
+The late-result case intercepts the real `git blame` command with a temporary
+wrapper. A started barrier proves the request is blocked; the terminal is
+opened and CursorHold expires before the test releases Git. A completed
+barrier plus the newly visible author prefix outside the float proves that
+the response was actually consumed. The test then checks hide/reopen and a
+resize from 80 to 40 columns. Failure cleanup releases the wrapper as well.
+
+A wrapped diagnostic line also intersects the terminal's top border. Inline
+diagnostics remain below the visible terminal after Esc returns focus to the
+editor, while an explicitly opened `gl` float retains its modal layer above
+the terminal. Existing split/Agent blame clipping and diagnostic tests remain
+unchanged. No golden frames are regenerated for this fix.

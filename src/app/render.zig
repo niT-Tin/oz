@@ -3979,6 +3979,99 @@ pub fn render(self: *App) !void {
         }
     }
 
+    // Current-line virtual text is part of the editor surface. Paint it
+    // before terminal frames/content and other overlays, including when
+    // asynchronous blame finishes while a terminal is already visible.
+    const diagnostic_owns_line = try @import("diagnostics.zig").draw(self, a, win, cur_rect, .inline_text);
+
+    // Current-line blame ghost (<leader>tb, nvim gitsigns style): the
+    // blame of the CURSOR line renders as dim end-of-line virtual
+    // text — "<author>, HH:MM - <summary>" — 1s after the cursor
+    // settles (CursorHold), hidden again while it moves. Mirrors the
+    // nvim config: current_line_blame virt_text at eol, formatter
+    // '<author>, <author_time:%R> - <summary>'.
+    {
+        const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
+        if (self.curCursor().* != self.blame_last_cursor) {
+            self.blame_last_cursor = self.curCursor().*;
+            self.blame_move_ms = now_ms;
+        }
+        if (!diagnostic_owns_line and self.blame_active and self.state.mode == .normal and
+            self.git_blame != null and now_ms - self.blame_move_ms >= blame_hold_ms)
+        {
+            const fbuf = self.cur();
+            const blame_line = fbuf.pt.lineOf(self.curCursor().*);
+            if (self.git_blame_path) |bp| {
+                if (fbuf.path == null or !std.mem.eql(u8, bp, fbuf.path.?)) {
+                    // cached blame is for another file — no ghost
+                } else if (self.git_blame.?.at(blame_line)) |e| {
+                    // The label is rebuilt only when the blame LINE or the
+                    // blame DATA changed (the entry pointer identifies both:
+                    // entries live in git_blame's own array, replaced on
+                    // refresh) — the ghost repaints every idle frame.
+                    var label: []const u8 = undefined;
+                    if (self.blame_ghost_label) |*g| {
+                        if (g.line == blame_line and g.entry == e) {
+                            label = g.label;
+                        } else {
+                            self.alloc.free(g.label);
+                            self.blame_ghost_label = null;
+                        }
+                    }
+                    if (self.blame_ghost_label == null) {
+                        var hm_buf: [5]u8 = undefined;
+                        const hm = formatHm(&hm_buf, e.author_time);
+                        const lbl = try std.fmt.allocPrint(self.alloc, " {s}, {s} - {s}", .{ e.author, hm, e.summary });
+                        self.blame_ghost_label = .{ .line = blame_line, .entry = e, .label = lbl };
+                        label = lbl;
+                    }
+                    const line_end = fbuf.pt.lineStart(blame_line) + fbuf.pt.lineLen(blame_line);
+                    // the ghost follows the line END — on a soft-wrapped
+                    // line that's the last chunk's row, not the first
+                    const b_sp = self.focusedScreenPos(win, cur_rect, blame_line, line_end);
+                    var start_col = cur_rect.col + gutter + b_sp.col;
+                    // a closed fold's " … N lines" marker also renders after
+                    // the text — shift the ghost past it
+                    if (foldAt(fbuf, blame_line)) |f| {
+                        const marker = try std.fmt.allocPrint(a, " … {d} lines", .{f.hiddenCount()});
+                        start_col += self.textWidth(win, marker);
+                    }
+                    // the ghost must stay inside THIS pane: win.width is
+                    // the whole screen, and a split's neighbor owns the
+                    // columns past the pane's right edge. With the Agent
+                    // Rail open (docked OR drawer) the ghost is also clipped
+                    // one cell before the rail border, so a long blame never
+                    // touches/enters the agent column and a one-cell gap
+                    // keeps the rail's left rule readable.
+                    const pane_end = cur_rect.col + cur_rect.width;
+                    var ghost_end = pane_end;
+                    if (self.ai.rail_open) {
+                        const lay = self.aiLayout();
+                        const rail_limit = lay.rail_col -| lay.rail_gutter;
+                        if (rail_limit < ghost_end) ghost_end = rail_limit;
+                    }
+                    if (b_sp.row < cur_rect.height and start_col < ghost_end) {
+                        const fit = autil.cellFitPrefix(win, label, ghost_end - start_col);
+                        if (fit.cells > 0) {
+                            const seg = [_]vaxis.Segment{.{
+                                .text = fit.slice,
+                                .style = .{
+                                    .fg = .{ .rgb = theme.blameFg(self.theme) },
+                                    .bg = .{ .rgb = self.theme.bg_curline },
+                                },
+                            }};
+                            _ = win.print(&seg, .{
+                                .row_offset = @intCast(cur_rect.row + b_sp.row),
+                                .col_offset = @intCast(start_col),
+                                .wrap = .none,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // embedded terminal overlay: drawn after the panes so it covers
     // them; the modal overlays below float above it
     if (term.supported) try self.drawTerm(a, win);
@@ -4866,95 +4959,8 @@ pub fn render(self: *App) !void {
         }
     }
 
-    const diagnostic_owns_line = try @import("diagnostics.zig").draw(self, a, win, cur_rect);
-
-    // Current-line blame ghost (<leader>tb, nvim gitsigns style): the
-    // blame of the CURSOR line renders as dim end-of-line virtual
-    // text — "<author>, HH:MM - <summary>" — 1s after the cursor
-    // settles (CursorHold), hidden again while it moves. Mirrors the
-    // nvim config: current_line_blame virt_text at eol, formatter
-    // '<author>, <author_time:%R> - <summary>'.
-    {
-        const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
-        if (self.curCursor().* != self.blame_last_cursor) {
-            self.blame_last_cursor = self.curCursor().*;
-            self.blame_move_ms = now_ms;
-        }
-        if (!diagnostic_owns_line and self.blame_active and self.state.mode == .normal and
-            self.git_blame != null and now_ms - self.blame_move_ms >= blame_hold_ms)
-        {
-            const fbuf = self.cur();
-            const blame_line = fbuf.pt.lineOf(self.curCursor().*);
-            if (self.git_blame_path) |bp| {
-                if (fbuf.path == null or !std.mem.eql(u8, bp, fbuf.path.?)) {
-                    // cached blame is for another file — no ghost
-                } else if (self.git_blame.?.at(blame_line)) |e| {
-                    // The label is rebuilt only when the blame LINE or the
-                    // blame DATA changed (the entry pointer identifies both:
-                    // entries live in git_blame's own array, replaced on
-                    // refresh) — the ghost repaints every idle frame.
-                    var label: []const u8 = undefined;
-                    if (self.blame_ghost_label) |*g| {
-                        if (g.line == blame_line and g.entry == e) {
-                            label = g.label;
-                        } else {
-                            self.alloc.free(g.label);
-                            self.blame_ghost_label = null;
-                        }
-                    }
-                    if (self.blame_ghost_label == null) {
-                        var hm_buf: [5]u8 = undefined;
-                        const hm = formatHm(&hm_buf, e.author_time);
-                        const lbl = try std.fmt.allocPrint(self.alloc, " {s}, {s} - {s}", .{ e.author, hm, e.summary });
-                        self.blame_ghost_label = .{ .line = blame_line, .entry = e, .label = lbl };
-                        label = lbl;
-                    }
-                    const line_end = fbuf.pt.lineStart(blame_line) + fbuf.pt.lineLen(blame_line);
-                    // the ghost follows the line END — on a soft-wrapped
-                    // line that's the last chunk's row, not the first
-                    const b_sp = self.focusedScreenPos(win, cur_rect, blame_line, line_end);
-                    var start_col = cur_rect.col + gutter + b_sp.col;
-                    // a closed fold's " … N lines" marker also renders after
-                    // the text — shift the ghost past it
-                    if (foldAt(fbuf, blame_line)) |f| {
-                        const marker = try std.fmt.allocPrint(a, " … {d} lines", .{f.hiddenCount()});
-                        start_col += self.textWidth(win, marker);
-                    }
-                    // the ghost must stay inside THIS pane: win.width is
-                    // the whole screen, and a split's neighbor owns the
-                    // columns past the pane's right edge. With the Agent
-                    // Rail open (docked OR drawer) the ghost is also clipped
-                    // one cell before the rail border, so a long blame never
-                    // touches/enters the agent column and a one-cell gap
-                    // keeps the rail's left rule readable.
-                    const pane_end = cur_rect.col + cur_rect.width;
-                    var ghost_end = pane_end;
-                    if (self.ai.rail_open) {
-                        const lay = self.aiLayout();
-                        const rail_limit = lay.rail_col -| lay.rail_gutter;
-                        if (rail_limit < ghost_end) ghost_end = rail_limit;
-                    }
-                    if (b_sp.row < cur_rect.height and start_col < ghost_end) {
-                        const fit = autil.cellFitPrefix(win, label, ghost_end - start_col);
-                        if (fit.cells > 0) {
-                            const seg = [_]vaxis.Segment{.{
-                                .text = fit.slice,
-                                .style = .{
-                                    .fg = .{ .rgb = theme.blameFg(self.theme) },
-                                    .bg = .{ .rgb = self.theme.bg_curline },
-                                },
-                            }};
-                            _ = win.print(&seg, .{
-                                .row_offset = @intCast(cur_rect.row + b_sp.row),
-                                .col_offset = @intCast(start_col),
-                                .wrap = .none,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Explicit diagnostic floats are modal and stay above terminal surfaces.
+    _ = try @import("diagnostics.zig").draw(self, a, win, cur_rect, .floating);
 
     // Explicit K documentation owns a pane-bounded, scrollable rich-text
     // viewport. Automatic signatures retain their short passive window.
