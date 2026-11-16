@@ -187,9 +187,12 @@ fn framedRule(a: std.mem.Allocator, win: vaxis.Window, label: []const u8, width:
     return bytes.toOwnedSlice(a);
 }
 
+/// Inline text is an editor decoration; an explicitly opened float is modal.
+pub const Layer = enum { inline_text, floating };
+
 /// Returns true when diagnostics own the cursor line's virtual-text slot,
-/// so blame text cannot overlap the message. Neither mode moves the cursor.
-pub fn draw(self: *App, a: std.mem.Allocator, win: vaxis.Window, rect: App.LeafRect) !bool {
+/// so blame text cannot overlap the message. Neither layer moves the cursor.
+pub fn draw(self: *App, a: std.mem.Allocator, win: vaxis.Window, rect: App.LeafRect, layer: Layer) !bool {
     const busy = self.state.mode != .normal or self.focus != .buffer or self.hints.active or
         self.picker_active or self.diag_list_active or self.nav_list_active or self.nav_hover_text != null or
         self.git_preview != null or self.em_active or self.inlinePromptOpen() or
@@ -217,6 +220,7 @@ pub fn draw(self: *App, a: std.mem.Allocator, win: vaxis.Window, rect: App.LeafR
     }
     if (pane_end <= rect.col + 4 or rect.height == 0) return true;
     if (self.diag_float_active) {
+        if (layer != .floating) return true;
         const columns: u32 = @min(72, pane_end - rect.col - 2);
         var rows: std.ArrayList(FloatRow) = .empty;
         for (self.lsp_diagnostics.items) |d| {
@@ -254,6 +258,7 @@ pub fn draw(self: *App, a: std.mem.Allocator, win: vaxis.Window, rect: App.LeafR
         try popupLine(win, a, y + height - 1, x, try framedRule(a, win, footer, columns + 2, "╰", "╯"), columns + 2, border);
         return true;
     }
+    if (layer != .inline_text) return true;
     const end = self.cur().pt.lineStart(line) + self.cur().pt.lineTextLen(line);
     const point = self.focusedScreenPos(win, rect, line, end);
     // An exactly full row has no room; never paint on the next source line.

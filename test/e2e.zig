@@ -30463,3 +30463,234 @@ test "hover documentation: real ZLS includes declaration comments and reaches th
     try std.testing.expect(grid.contains("REAL_HOVER_DOC_LAST"));
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
 }
+
+// Issue #42: editor virtual text belongs below every terminal surface.
+const terminal_blame_author = "OZ_BLAME_LAYER_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+fn terminalBlameRepo(io: Io, alloc: std.mem.Allocator, root: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q", "-b", "main" },
+        &.{ "git", "config", "user.email", "e2e@test" },
+        &.{ "git", "config", "user.name", terminal_blame_author },
+    }) |argv| alloc.free(try runCmdCapture(io, alloc, argv, root));
+    var lines: [60]u8 = undefined;
+    for (0..30) |i| @memcpy(lines[i * 2 ..][0..2], "x\n");
+    try writeTestFile(io, root, "a.txt", &lines);
+    alloc.free(try runCmdCapture(io, alloc, &.{ "git", "add", "a.txt" }, root));
+    alloc.free(try runCmdCapture(io, alloc, &.{ "git", "commit", "-qm", "terminal overlay" }, root));
+}
+
+fn expectTerminalCoversBlame(grid: *Grid, box: frame.Rect, row: usize, blame_fg: u32) !void {
+    try std.testing.expect(row >= box.top and row <= box.bottom);
+    for (box.left..box.right + 1) |col| {
+        const text = frame.cellText(grid, row, col);
+        if (text.len != 0 and !std.mem.eql(u8, text, " ") and frame.cellFg(grid, row, col) == blame_fg) {
+            std.debug.print("blame overwrote terminal cell row={d} col={d}: '{s}'\n", .{ row, col, text });
+            grid.dump();
+            return error.TestUnexpectedResult;
+        }
+    }
+    // The right border is part of the covered area, not only PTY text.
+    const right_border: []const u8 = if (row == box.top) "╮" else if (row == box.bottom) "╯" else "│";
+    try std.testing.expectEqualStrings(right_border, frame.cellText(grid, row, box.right));
+}
+
+test "terminal blame layering: cached blame stays below all layouts and an unfocused terminal" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var root_buf: [180]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/oz_terminal_blame_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try terminalBlameRepo(io, alloc, root);
+    const Case = struct { key: []const u8, kind: TermBoxKind, file: []const u8 };
+    const cases = [_]Case{
+        .{ .key = "\x1br", .kind = .floating, .file = "a.txt:9" },
+        .{ .key = "\x1bw", .kind = .bottom, .file = "a.txt:18" },
+        .{ .key = "\x1be", .kind = .right, .file = "a.txt:9" },
+    };
+    const accent = packRgb(0xE6, 0xC3, 0x84);
+    for ([_]u16{ 80, 40 }) |cols| {
+        for (cases) |case| {
+            var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, case.file }, null, 24, cols, root);
+            defer sess.close();
+            defer killPid(sess.pid);
+            var grid = try Grid.initSizedCols(alloc, 24, cols);
+            defer grid.deinit(alloc);
+            try gridWaitFor(&sess, &grid, "OZ_BLAME_LAYER", 10000);
+            const ghost = termFindText(&grid, "OZ_BLAME_LAYER") orelse return error.TestUnexpectedResult;
+            const blame_fg = frame.cellFg(&grid, ghost.row, ghost.col);
+            try sess.send(case.key);
+            const inner_w: usize = switch (case.kind) {
+                .floating => if (cols == 80) 62 else 38,
+                .bottom => cols - 2,
+                .right => if (cols == 80) 30 else 28,
+            };
+            const inner_h: usize = switch (case.kind) {
+                .floating => 10,
+                .bottom => 6,
+                .right => 19,
+            };
+            const box = try termWaitBoxInner(&sess, &grid, inner_w, inner_h, 10000);
+            _ = try uiPump(&sess, &grid, 700);
+            try sess.send("printf 'TERM_%s\\n' BLAME_READY\r");
+            try gridWaitFor(&sess, &grid, "TERM_BLAME_READY", 10000);
+            _ = try uiPump(&sess, &grid, 1200);
+            try expectTerminalCoversBlame(&grid, box, ghost.row, blame_fg);
+            // Editor decorations OUTSIDE the terminal must not be disabled.
+            if (ghost.col < box.left) {
+                try std.testing.expectEqual(blame_fg, frame.cellFg(&grid, ghost.row, ghost.col));
+                try std.testing.expectEqualStrings("O", frame.cellText(&grid, ghost.row, ghost.col));
+            }
+            try sess.send("\x1b");
+            try termWaitFocus(&sess, &grid, box, accent, false, 5000);
+            _ = try uiPump(&sess, &grid, 1200);
+            try expectTerminalCoversBlame(&grid, box, ghost.row, blame_fg);
+            // The first layout key re-focuses a visible persistent session.
+            try sess.send(case.key);
+            try termWaitFocus(&sess, &grid, box, accent, true, 5000);
+            try sess.send(case.key);
+            try gridWaitGone(&sess, &grid, "oz terminal", 5000);
+            try gridWaitFor(&sess, &grid, "OZ_BLAME_LAYER", 5000);
+            try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q!\r"));
+        }
+    }
+}
+
+test "terminal blame layering: a gated late result cannot paint over a float or its resize" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var root_buf: [180]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/oz_terminal_blame_late_{d}", .{linux.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try terminalBlameRepo(io, alloc, root);
+    const real_git_out = try runCmdCapture(io, alloc, &.{ "/bin/sh", "-c", "command -v git" }, root);
+    defer alloc.free(real_git_out);
+    const bin = try std.fmt.allocPrint(alloc, "{s}/bin", .{root});
+    defer alloc.free(bin);
+    try std.Io.Dir.cwd().createDir(io, bin, .default_dir);
+    try writeTestFile(io, bin, "git",
+        \\#!/bin/sh
+        \\if [ "$1" = blame ]; then
+        \\  : > "$OZ_BLAME_GATE/blame-started"
+        \\  while [ ! -f "$OZ_BLAME_GATE/blame-release" ]; do sleep 0.02; done
+        \\  "$OZ_BLAME_REAL_GIT" "$@"
+        \\  result=$?
+        \\  : > "$OZ_BLAME_GATE/blame-done"
+        \\  exit "$result"
+        \\fi
+        \\exec "$OZ_BLAME_REAL_GIT" "$@"
+        \\
+    );
+    alloc.free(try runCmdCapture(io, alloc, &.{ "chmod", "+x", "git" }, bin));
+    const path_env = try std.fmt.allocPrint(alloc, "PATH={s}:/usr/bin:/bin:/usr/local/bin", .{bin});
+    defer alloc.free(path_env);
+    const gate_env = try std.fmt.allocPrint(alloc, "OZ_BLAME_GATE={s}", .{root});
+    defer alloc.free(gate_env);
+    const real_git_env = try std.fmt.allocPrint(alloc, "OZ_BLAME_REAL_GIT={s}", .{std.mem.trim(u8, real_git_out, "\r\n")});
+    defer alloc.free(real_git_env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "a.txt:9" }, &.{ path_env, gate_env, real_git_env }, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    // Release the child even if an assertion fails before the normal release.
+    defer writeTestFile(io, root, "blame-release", "") catch {};
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "NORMAL", 10000);
+    try std.testing.expect(try erWaitBarrier(io, root, "blame-started", 10000));
+    const row = grid.row;
+    try std.testing.expect(!grid.contains("OZ_BLAME"));
+    try sess.send("\x1br");
+    var box = try termWaitLayout(&sess, &grid, .floating, 10000);
+    _ = try uiPump(&sess, &grid, 700);
+    try sess.send("printf 'TERM_%s\\n' LATE_READY\r");
+    try gridWaitFor(&sess, &grid, "TERM_LATE_READY", 10000);
+    _ = try uiPump(&sess, &grid, 1200);
+    const done_path = try std.fmt.allocPrint(alloc, "{s}/blame-done", .{root});
+    defer alloc.free(done_path);
+    try std.testing.expect(!pathExists(io, done_path));
+    // The terminal is visible and CursorHold has elapsed BEFORE Git returns.
+    try writeTestFile(io, root, "blame-release", "");
+    try std.testing.expect(try erWaitBarrier(io, root, "blame-done", 10000));
+    // The float leaves exactly the author's first letter exposed on this row.
+    try gridWaitRowContains(&sess, &grid, row, "x O", 5000);
+    try std.testing.expectEqualStrings("O", frame.cellText(&grid, row, box.left - 1));
+    const blame_fg = frame.cellFg(&grid, row, box.left - 1);
+    _ = try uiPump(&sess, &grid, 1200);
+    try expectTerminalCoversBlame(&grid, box, row, blame_fg);
+    const accent = packRgb(0xE6, 0xC3, 0x84);
+    try sess.send("\x1b");
+    try termWaitFocus(&sess, &grid, box, accent, false, 5000);
+    try expectTerminalCoversBlame(&grid, box, row, blame_fg);
+    try sess.send("\x1br");
+    try termWaitFocus(&sess, &grid, box, accent, true, 5000);
+    try sess.send("\x1br");
+    try gridWaitGone(&sess, &grid, "oz terminal", 5000);
+    try gridWaitFor(&sess, &grid, "OZ_BLAME_LAYER", 5000);
+    try sess.send("\x1br");
+    box = try termWaitLayout(&sess, &grid, .floating, 10000);
+    _ = try uiPump(&sess, &grid, 700);
+    try expectTerminalCoversBlame(&grid, box, row, blame_fg);
+    const size = Winsize{ .ws_row = 24, .ws_col = 40, .ws_xpixel = 400, .ws_ypixel = 480 };
+    _ = linux.ioctl(sess.pty.master, TIOCSWINSZ, @intFromPtr(&size));
+    var narrow = try Grid.initSizedCols(alloc, 24, 40);
+    defer narrow.deinit(alloc);
+    box = try termWaitBoxInner(&sess, &narrow, 38, 10, 10000);
+    _ = try uiPump(&sess, &narrow, 1200);
+    try expectTerminalCoversBlame(&narrow, box, row, blame_fg);
+    try sess.send("\x1b");
+    try termWaitFocus(&sess, &narrow, box, accent, false, 5000);
+    try sess.send("\x1br");
+    try termWaitFocus(&sess, &narrow, box, accent, true, 5000);
+    try sess.send("\x1br");
+    try gridWaitGone(&sess, &narrow, "oz terminal", 5000);
+    try gridWaitFor(&sess, &narrow, "OZ_BLAME_LAYER", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q!\r"));
+}
+
+test "terminal blame layering: inline diagnostics stay below terminals but gl remains modal" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var line: [230]u8 = undefined;
+    @memset(&line, 'a');
+    const prefix = "const a = 1; // ";
+    @memcpy(line[0..prefix.len], prefix);
+    const content = try std.fmt.allocPrint(alloc, "{s}\nconst b = 2;\nconst c = 3;\n", .{line});
+    defer alloc.free(content);
+    try aiWriteFile(io, root, "diag.zig", content);
+    var path_buf: [220:0]u8 = undefined;
+    const path = try bufPrintZ(&path_buf, "{s}/diag.zig", .{root});
+    var sess = try diagUiSession(io, alloc, root, path);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "unused function parameter", 10000);
+    const label = termFindText(&grid, "unused function parameter") orelse return error.TestUnexpectedResult;
+    const diag_fg = frame.cellFg(&grid, label.row, label.col);
+    try sess.send("\x1br");
+    const box = try termWaitLayout(&sess, &grid, .floating, 10000);
+    _ = try uiPump(&sess, &grid, 700);
+    try sess.send("printf 'TERM_%s\\n' DIAG_READY\r");
+    try gridWaitFor(&sess, &grid, "TERM_DIAG_READY", 10000);
+    const accent = packRgb(0xE6, 0xC3, 0x84);
+    try sess.send("\x1b");
+    try termWaitFocus(&sess, &grid, box, accent, false, 5000);
+    _ = try uiPump(&sess, &grid, 300);
+    try expectTerminalCoversBlame(&grid, box, label.row, diag_fg);
+    // An intentional diagnostic popup retains its original foreground layer.
+    try sess.send("gl");
+    try gridWaitFor(&sess, &grid, "Diagnostics (2)", 5000);
+    const popup = frame.findBoxByTitle(&grid, "Diagnostics (2)") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(popup.intersects(box));
+    try gridWaitFor(&sess, &grid, "WARNING_FIRST", 5000);
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "Diagnostics (2)", 5000);
+    try expectTerminalCoversBlame(&grid, box, label.row, diag_fg);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q!\r"));
+}
