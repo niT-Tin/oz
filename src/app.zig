@@ -402,6 +402,8 @@ pub const App = struct {
     /// (Up/Down) or vice versa, or a Tab after an Up would jump to a
     /// random history entry.
     cmd_complete_idx: usize = 0,
+    /// The cached match list is shared by command and filesystem completion.
+    cmd_complete_is_path: bool = false,
     /// What the cmdline collects: an ex command (':') or a buffer search
     /// ('/' forward, '?' backward). Same widget; Enter dispatches differently.
     cmdline_kind: enum { ex, search_fwd, search_bwd } = .ex,
@@ -410,10 +412,8 @@ pub const App = struct {
     /// `/`/`?` highlights matches until `:noh`; selections still win.
     search_hl_active: bool = false,
     last_search_bwd: bool = false,
-    /// The command-name match list from the last Tab (owned), so repeated
-    /// Tabs cycle the ORIGINAL matches even after the line becomes a full
-    /// command name (":b" Tab → bnext, Tab → bprev, …). Cleared on any
-    /// command-line entry/exit and on path completion.
+    /// Owned Ex command/path matches from the first Tab. Repeated Tabs
+    /// cycle the original set; edits, history and mode changes invalidate it.
     cmd_complete_names: std.ArrayList([]const u8) = .empty,
     prev_insert_key: ?vaxis.Key = null,
     msg: ?[]u8 = null, // transient status message (owned)
@@ -1362,6 +1362,8 @@ pub const App = struct {
         col: u32,
         height: u32,
         width: u32,
+        /// Header cells are owned by this pane, immediately above its body.
+        header_rows: u32 = 0,
     };
 
     /// One window separator line (vim statusline semantics): the boundary
@@ -1400,6 +1402,12 @@ pub const App = struct {
             .height = content_rows,
             .width = total_width,
         }, &leaves, &seps);
+        for (leaves.items) |*leaf| {
+            const chrome_rows = split_layout.headerRows(leaf.height, leaf.width);
+            leaf.row += chrome_rows;
+            leaf.height -= chrome_rows;
+            leaf.header_rows = chrome_rows;
+        }
         return .{ .leaves = try leaves.toOwnedSlice(a), .seps = try seps.toOwnedSlice(a) };
     }
 
@@ -2145,6 +2153,7 @@ pub const App = struct {
     pub const toggleAiFocus = app_ai.toggleAiFocus;
     pub const clearAgentFocus = app_ai.clearAgentFocus;
     pub const focusAiRail = app_ai.focusAiRail;
+    pub const prepareAiRail = app_ai.prepareAiRail;
     pub const aiNewThread = app_ai.aiNewThread;
     pub const aiSelectThread = app_ai.aiSelectThread;
     pub const aiFocusPrompt = app_ai.aiFocusPrompt;
@@ -2221,7 +2230,6 @@ pub const App = struct {
     pub const AgentTerminalSession = app_agent_terminal.Session;
     // ---- render → src/app/render.zig ----
     pub const tabBarRows = @import("app/render.zig").tabBarRows;
-    pub const tabLayerCount = @import("app/render.zig").tabLayerCount;
     pub const contentTop = @import("app/render.zig").contentTop;
     pub const navigatorMode = @import("app/render.zig").navigatorMode;
     pub const contentCol = @import("app/render.zig").contentCol;

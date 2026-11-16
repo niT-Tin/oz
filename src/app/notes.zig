@@ -324,6 +324,7 @@ pub fn navigatorAttachSelectedThread(self: *App) !void {
     const n = self.ai.threads.items.items.len;
     if (n == 0) return;
     self.navigator_peek = false;
+    self.prepareAiRail();
     self.ai.rail_open = true;
     self.ai.rail_pending_leader = false;
     self.aiSelectThread(@min(self.ai.thread_cursor, n - 1));
@@ -334,6 +335,7 @@ pub fn navigatorAttachSelectedThread(self: *App) !void {
 pub fn navigatorNewThread(self: *App) !void {
     try self.ensureAi();
     self.navigator_peek = false;
+    self.prepareAiRail();
     self.ai.rail_open = true;
     self.ai.rail_pending_leader = false;
     try self.aiNewThread();

@@ -1,6 +1,6 @@
 //! Pure buffer-strip geometry and editor-context path semantics.
 //!
-//! Every tab has two cells of outer padding, a devicon, a filename, a
+//! Every tab has one cell of outer padding, a devicon, a filename, a
 //! reserved dirty marker, a close `×`, and a one-cell separator. The final
 //! strip row is an editor context bar; it is not part of the tab hit geometry.
 //!
@@ -15,10 +15,10 @@
 const std = @import("std");
 
 /// Smallest body width: fixed chrome plus a readable filename region.
-pub const min_body: u32 = 20;
+pub const min_body: u32 = 14;
 pub const max_body: u32 = 26;
-pub const pad_left: u32 = 2;
-pub const pad_right: u32 = 2;
+pub const pad_left: u32 = 1;
+pub const pad_right: u32 = 1;
 pub const icon_cells: u32 = 1;
 pub const gap_cells: u32 = 1;
 pub const dirty_cells: u32 = 1;
@@ -281,12 +281,12 @@ test "tabstrip: geometry pins icon/name/dirty/close columns" {
     const s = p.slots[0];
     try std.testing.expectEqual(@as(u32, 0), s.x);
     try std.testing.expectEqual(pad_left, s.name_x - icon_cells - gap_cells);
-    try std.testing.expectEqual(@as(u32, 2), s.name_x - 2);
+    try std.testing.expectEqual(@as(u32, 3), s.name_x);
     try std.testing.expectEqual(min_body, s.width);
     // Name region: body minus fixed chrome; short names are padded.
     try std.testing.expectEqual(@as(u32, min_name_cells), s.name_alloc);
     try std.testing.expect(!s.truncated);
-    // `×` is the cell before the two-cell right padding.
+    // `×` is the cell before the one-cell right padding.
     try std.testing.expectEqual(s.width - pad_right - close_cells, s.close_x);
     try std.testing.expect(s.close_x + close_cells + pad_right == s.width);
     // The dirty column sits immediately before the gap + close group.

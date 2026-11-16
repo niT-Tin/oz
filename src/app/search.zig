@@ -326,14 +326,17 @@ pub fn lineHints(self: *App, a: std.mem.Allocator, line: u32) ![]InlayHint {
 /// path. Returns a heap copy; the caller owns it. Falls back to a plain
 /// dupe on failure so file opening never breaks on a resolution error.
 pub fn absolutePath(self: *App, path: []const u8) ![]u8 {
-    if (path.len > 0 and path[0] == '/') return self.alloc.dupe(u8, path);
+    const expanded = try @import("path_completion.zig").homeExpansion(self.alloc, path, self.env_map.get("HOME"));
+    defer if (expanded) |p| self.alloc.free(p);
+    const input = expanded orelse path;
+    if (input.len > 0 and input[0] == '/') return self.alloc.dupe(u8, input);
     var cwd_buf: [4096:0]u8 = undefined;
     // libc getcwd — portable (the binary links libc). A raw
     // std.os.linux.getcwd issues the LINUX syscall number: on macOS that
     // number maps to an unrelated syscall, so the buffer stays garbage
     // with no NUL and the resolved path is thousands of bogus bytes
     // (createFile then failed with NameTooLong on :w).
-    if (std.c.getcwd(&cwd_buf, cwd_buf.len) == null) return self.alloc.dupe(u8, path);
+    if (std.c.getcwd(&cwd_buf, cwd_buf.len) == null) return self.alloc.dupe(u8, input);
     // getcwd NUL-terminates on success; trim to the C-string length
     // before joining so no \0 lands inside the path (an embedded NUL
     // later fails as BadPathName on createFile/write — openat just
@@ -341,8 +344,8 @@ pub fn absolutePath(self: *App, path: []const u8) ![]u8 {
     // is silently corrupt).
     var n: usize = 0;
     while (n < cwd_buf.len and cwd_buf[n] != 0) : (n += 1) {}
-    return std.Io.Dir.path.resolve(self.alloc, &.{ cwd_buf[0..n], path }) catch
-        self.alloc.dupe(u8, path);
+    return std.Io.Dir.path.resolve(self.alloc, &.{ cwd_buf[0..n], input }) catch
+        self.alloc.dupe(u8, input);
 }
 
 /// :w — write the current buffer. Returns false (with a status message)

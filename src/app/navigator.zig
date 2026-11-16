@@ -18,8 +18,8 @@ pub const count: usize = @typeInfo(Tab).@"enum".field_names.len;
 
 pub const all = [_]Tab{ .files, .notes, .agents };
 
-/// The full 30-cell navigator needs room for the brand header, three
-/// icon+label tabs and the editor beside a docked Agent Rail. Below this
+/// The full 30-cell navigator fits three icon+label tabs and leaves room
+/// for the editor. Navigator and the coding Agent share the auxiliary slot. Below this
 /// width the navigator collapses to an icon rail + peek overlay (the
 /// approved demo's narrow layout).
 pub const full_min_cols: u32 = 90;
@@ -35,9 +35,8 @@ pub const compact_width: u32 = 7;
 /// Blank column between the navigator and editor content in both modes.
 pub const gutter: u32 = 1;
 
-/// Rows above the first content row in full/peek mode: branded top border,
-/// workspace/branch line, tab strip and the closing rule.
-pub const full_header_rows: u32 = 4;
+/// One mode strip above the full/peek navigator body.
+pub const full_header_rows: u32 = 1;
 
 /// Compact rail rows: OZ (row 0), hairline (row 1), then one two-row button
 /// per tab starting at `compact_first_tab_row`.

@@ -28,6 +28,13 @@ pub fn handleCommandKey(self: *App, key: vaxis.Key) !void {
         self.clearCmdCompleteNames();
         return;
     }
+    // Any edit/history selection starts a new completion session. Repeated
+    // Tabs alone retain the original candidates, even after a full filename.
+    if (key.codepoint != vaxis.Key.tab and
+        (key.text != null or key.codepoint == vaxis.Key.backspace or
+            key.codepoint == vaxis.Key.up or key.codepoint == vaxis.Key.down or
+            (key.codepoint == 'w' and key.mods.ctrl)))
+        self.clearCmdCompleteNames();
     switch (key.codepoint) {
         vaxis.Key.enter => {
             const from_visual = self.visual_anchor != null;
@@ -100,6 +107,7 @@ pub fn handleCommandKey(self: *App, key: vaxis.Key) !void {
     // Tab: complete the command name (":w" → ":write") or, after
     // a file-taking edit/split command, the file path.
     if (key.codepoint == vaxis.Key.tab) {
+        if (self.cmdline_kind != .ex or self.pending_rename or self.pending_ws_rename) return;
         const line = self.cmdline.items;
         const is_path_ctx = editor.ex_command.fileArgStart(line) != null;
         if (is_path_ctx) {
@@ -128,11 +136,14 @@ pub fn handleCommandKey(self: *App, key: vaxis.Key) !void {
 /// ORIGINAL match list (stored, since the line becomes a full command
 /// name after the first Tab), advancing the completion cursor.
 pub fn completeCommandName(self: *App) !void {
+    if (self.cmd_complete_is_path) self.clearCmdCompleteNames();
     const line = self.cmdline.items;
     // the command token is up to the first space (or the whole line)
-    var split: usize = 0;
-    while (split < line.len and line[split] != ' ') : (split += 1) {}
-    const prefix = line[0..split];
+    var start: usize = 0;
+    while (start < line.len and (line[start] == ' ' or line[start] == '\t')) : (start += 1) {}
+    var split = start;
+    while (split < line.len and line[split] != ' ' and line[split] != '\t') : (split += 1) {}
+    const prefix = line[start..split];
     if (prefix.len == 0) return;
 
     // first Tab: compute the match list for the typed prefix; later Tabs
@@ -143,7 +154,7 @@ pub fn completeCommandName(self: *App) !void {
             "write",   "quit",       "quitall", "wq",    "edit",
             "vsplit",  "split",      "bnext",   "bprev", "buffers",
             "bdelete", "nohlsearch", "set",     "theme", "colorscheme",
-            "noh",     "help",
+            "noh",     "help",       "new",     "vnew",
         };
         for (commands) |c| {
             if (std.mem.startsWith(u8, c, prefix)) {
@@ -159,62 +170,78 @@ pub fn completeCommandName(self: *App) !void {
     const chosen = matches[self.cmd_complete_idx % matches.len];
     self.cmd_complete_idx += 1;
 
-    // replace the command token with the full name
+    // Prefix/arguments borrow cmdline storage, which replacement may grow
+    // or overwrite. Keep them before touching it (e.g. :vsp file<Tab>).
+    const lead = try self.alloc.dupe(u8, line[0..start]);
+    defer self.alloc.free(lead);
+    const suffix = try self.alloc.dupe(u8, line[split..]);
+    defer self.alloc.free(suffix);
     self.cmdline.shrinkRetainingCapacity(0);
+    try self.cmdline.appendSlice(self.alloc, lead);
     try self.cmdline.appendSlice(self.alloc, chosen);
-    // keep any existing argument (e.g. ":set " arg)
-    if (split < line.len) {
-        try self.cmdline.appendSlice(self.alloc, line[split..]);
-    }
+    try self.cmdline.appendSlice(self.alloc, suffix);
 }
 
 /// Tab in command mode: complete file arguments without changing the command.
 /// Cycles through matches on repeated Tab.
 pub fn completeCommandPath(self: *App) !void {
+    const paths = @import("path_completion.zig");
     const line = self.cmdline.items;
     const skip = editor.ex_command.fileArgStart(line) orelse return;
     const prefix = line[skip..];
-
-    var matches = std.ArrayList([]const u8).empty;
-    defer {
-        for (matches.items) |m| self.alloc.free(m);
-        matches.deinit(self.alloc);
-    }
-    var root = try std.Io.Dir.cwd().openDir(self.io, ".", .{ .iterate = true });
-    defer root.close(self.io);
-    var files = std.ArrayList([]u8).empty;
-    defer {
-        for (files.items) |f| self.alloc.free(f);
-        files.deinit(self.alloc);
-    }
-    try self.walkInto(root, "", &files);
-    for (files.items) |f| {
-        if (std.mem.startsWith(u8, f, prefix)) {
-            const c = try self.alloc.dupe(u8, f);
-            try matches.append(self.alloc, c);
+    const descend = self.cmd_complete_is_path and self.cmd_complete_names.items.len == 1 and
+        std.mem.endsWith(u8, prefix, "/") and std.mem.eql(u8, prefix, self.cmd_complete_names.items[0]);
+    if (!self.cmd_complete_is_path or self.cmd_complete_names.items.len == 0 or descend) {
+        self.clearCmdCompleteNames();
+        self.cmd_complete_is_path = true;
+        const parts = paths.split(prefix);
+        const directory = try self.absolutePath(if (parts.directory.len == 0) "." else parts.directory);
+        defer self.alloc.free(directory);
+        var dir = std.Io.Dir.cwd().openDir(self.io, directory, .{ .iterate = true }) catch return;
+        defer dir.close(self.io);
+        var iterator = dir.iterate();
+        while (try iterator.next(self.io)) |entry| {
+            if (!std.mem.startsWith(u8, entry.name, parts.name)) continue;
+            if (std.mem.startsWith(u8, entry.name, ".") and !std.mem.startsWith(u8, parts.name, ".")) continue;
+            var kind = entry.kind;
+            if (kind == .sym_link) {
+                if (dir.statFile(self.io, entry.name, .{})) |stat| {
+                    kind = stat.kind;
+                } else |_| {}
+            }
+            if (kind != .file and kind != .directory and kind != .sym_link) continue;
+            const candidate = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+                parts.directory, entry.name, if (kind == .directory) "/" else "",
+            });
+            errdefer self.alloc.free(candidate);
+            try self.cmd_complete_names.append(self.alloc, candidate);
         }
+        std.mem.sort([]const u8, self.cmd_complete_names.items, {}, paths.lessThan);
     }
-    if (matches.items.len == 0) return;
+    const matches = self.cmd_complete_names.items;
+    if (matches.len == 0) return;
 
     // cycle: self.cmd_complete_idx is the completion cursor
     // cycle through the matches: the FIRST Tab picks the first match,
     // further Tabs advance (the cursor is reset on command-line entry)
-    const chosen = matches.items[self.cmd_complete_idx % matches.items.len];
+    const chosen = matches[self.cmd_complete_idx % matches.len];
     self.cmd_complete_idx += 1;
 
     // Keep :sp/:vs (and aliases) intact; the command line may reallocate.
     const command_prefix = try self.alloc.dupe(u8, line[0..skip]);
     defer self.alloc.free(command_prefix);
-    self.clearCmdCompleteNames();
     self.cmdline.clearRetainingCapacity();
     try self.cmdline.appendSlice(self.alloc, command_prefix);
+    if (skip > 0 and command_prefix[skip - 1] != ' ' and command_prefix[skip - 1] != '\t') try self.cmdline.append(self.alloc, ' ');
     try self.cmdline.appendSlice(self.alloc, chosen);
 }
 
-/// Drop the stored command-name completion matches (owned strings).
+/// Drop the stored Ex completion matches (owned strings).
 pub fn clearCmdCompleteNames(self: *App) void {
     for (self.cmd_complete_names.items) |n| self.alloc.free(n);
     self.cmd_complete_names.clearRetainingCapacity();
+    self.cmd_complete_is_path = false;
+    self.cmd_complete_idx = 0;
 }
 
 pub fn pushHistory(self: *App, line: []const u8) !void {

@@ -104,7 +104,7 @@ fn add(p: *Plan, it: Item, x: u32, cells: u32) void {
 }
 
 fn sep() Item {
-    return .{ .text = " │ ", .cells = 3, .role = .separator };
+    return .{ .text = "  ", .cells = 2, .role = .separator };
 }
 
 fn thinSep() Item {

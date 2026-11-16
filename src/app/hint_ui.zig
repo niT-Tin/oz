@@ -151,7 +151,16 @@ pub fn execHintAction(self: *App, action: hints.Action) !void {
             // editor shows that buffer.
             self.navigator_peek = false;
             self.focus = .buffer;
+            self.ai.focus = .editor;
             self.switchTo(idx);
+        },
+        .pane_buffer_select => |target| {
+            if (target.win >= self.windows.items.len or target.buffer >= self.buffers.items.len) return;
+            self.navigator_peek = false;
+            self.focus = .buffer;
+            self.ai.focus = .editor;
+            self.switchWindowTo(target.win);
+            self.switchTo(target.buffer);
         },
         .buffer_close => |idx| {
             if (idx >= self.buffers.items.len) return;
@@ -165,6 +174,7 @@ pub fn execHintAction(self: *App, action: hints.Action) !void {
             // Same attach path as Enter in the thread list. A target may be
             // drawn on the navigator's Agents tab with the rail closed, so
             // make the rail visible before focusing its prompt.
+            self.prepareAiRail();
             self.ai.rail_open = true;
             self.ai.rail_pending_leader = false;
             self.aiSelectThread(idx);
