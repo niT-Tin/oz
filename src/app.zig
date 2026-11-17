@@ -886,7 +886,6 @@ pub const App = struct {
     /// M3b1 staged agent edits: one pending diff, thread-scoped.
     agent_edit: app_agent_edit.Session = .{},
     /// M3b3 staged `terminal` approval + running job (session-wide, one).
-    agent_terminal: app_agent_terminal.Session = .{},
 
     // ---- M2.6a keyboard hints (<leader>j) ----
     /// Modal target-selection state (DESIGN.md §19). Pure value: fixed
@@ -1714,7 +1713,6 @@ pub const App = struct {
         self.deinitAi();
         self.deinitInline();
         self.deinitAgentEdit();
-        self.deinitAgentTerminal();
         var image_it = self.markdown_images.iterator();
         while (image_it.next()) |entry| {
             switch (entry.value_ptr.*) {

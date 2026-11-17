@@ -17467,7 +17467,7 @@ test "ui chrome: theme matrix colors active tabs, separators and focused borders
     }
 }
 
-test "ai workspace: thread B streams while A is frozen; transcripts never mix" {
+test "ai workspace: threads stream in parallel; transcripts never mix" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
@@ -17484,13 +17484,14 @@ test "ai workspace: thread B streams while A is frozen; transcripts never mix" {
     var dir_buf: [128]u8 = undefined;
     const dir = try aiMockDir(io, &dir_buf);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
-    // Slow "A" stream: enough events that switching away interrupts it.
+    // Slow A keeps reading its open inode while B starts with a replacement fixture.
     var stream_a = std.ArrayList(u8).empty;
     defer stream_a.deinit(alloc);
     var ai: usize = 0;
     while (ai < 300) : (ai += 1) {
         try stream_a.appendSlice(alloc, "data: {\"choices\":[{\"delta\":{\"content\":\"AAA-\"}}]}\n\n");
     }
+    try stream_a.appendSlice(alloc, "data: [DONE]\n\n");
     try aiWriteFile(io, dir, "stream.sse", stream_a.items);
     const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
     defer alloc.free(mock_env);
@@ -17512,17 +17513,17 @@ test "ai workspace: thread B streams while A is frozen; transcripts never mix" {
     defer alloc.free(req_a);
     try std.testing.expect(std.mem.indexOf(u8, req_a, "alpha") != null);
 
-    // New thread: switching away cancels A. The rail shows thread 2 and A's
-    // status is frozen as cancelled.
+    // New thread leaves A running, with an independent transcript.
     try sess.send("\t");
     try sess.send("n");
     try gridWaitFor(&sess, &grid, "thread 2", 3000);
-    try gridWaitFor(&sess, &grid, "cancelled", 4000);
-    std.Io.sleep(io, std.Io.Duration.fromNanoseconds(300 * std.time.ns_per_ms), .real) catch {};
-
-    // Let A's worker finish before replacing the mock stream (a truncate
-    // while the cancelled worker still reads would race the test seam).
-    try aiWriteFile(io, dir, "stream.sse", "data: {\"choices\":[{\"delta\":{\"content\":\"banana\"}}]}\n\ndata: [DONE]\n\n");
+    // Atomically replace, never truncate the file A is still reading.
+    try aiWriteFile(io, dir, "next.sse", "data: {\"choices\":[{\"delta\":{\"content\":\"banana\"}}]}\n\ndata: [DONE]\n\n");
+    const old_path = try std.fmt.allocPrint(alloc, "{s}/next.sse", .{dir});
+    defer alloc.free(old_path);
+    const new_path = try std.fmt.allocPrint(alloc, "{s}/stream.sse", .{dir});
+    defer alloc.free(new_path);
+    try std.Io.Dir.renameAbsolute(old_path, new_path, io);
     try sess.send("beta\r");
     try gridWaitFor(&sess, &grid, "banana", 8000);
     try gridWaitFor(&sess, &grid, "idle", 4000);
@@ -17535,29 +17536,13 @@ test "ai workspace: thread B streams while A is frozen; transcripts never mix" {
     // B's transcript has no A reply cells.
     try std.testing.expectEqual(@as(usize, 0), aiCountRailChar(&grid, 'A'));
 
-    // Switching back to A shows the frozen transcript and no B reply.
-    try sess.send("\t");
-    try sess.send("k");
-    try sess.send("\r");
-    // "thread 1 · cancelled" is unique to the workbox header (the thread
-    // rail renders the same title and status in separate columns), so this
-    // also waits for the switched-to frame to arrive.
-    try gridWaitFor(&sess, &grid, "thread 1 · cancelled", 4000);
-    try std.testing.expect(aiRowContains(&grid, aiWorkboxHeaderRow(&grid), "thread 1"));
+    // A remains live and eventually completes. No B reply enters A.
+    try sess.send("\x1b[5;5~");
+    try gridWaitRowContains(&sess, &grid, aiWorkboxHeaderRow(&grid), "thread 1", 4000);
     try gridWaitGone(&sess, &grid, "banana", 4000);
-    try gridWaitFor(&sess, &grid, "cancelled", 3000);
-    const frozen = aiCountRailChar(&grid, 'A');
-    try std.testing.expect(frozen > 0);
-    // No late cancelled-stream deltas may land after the switch.
-    var ticks: usize = 0;
-    while (ticks < 6) : (ticks += 1) {
-        const n = try readAvailable(sess.pty.master, sess.out[sess.used..], 100);
-        if (n > 0) {
-            sess.used += n;
-            grid.feed(sess.out[sess.used - n .. sess.used]);
-        }
-    }
-    try std.testing.expectEqual(frozen, aiCountRailChar(&grid, 'A'));
+    try gridWaitFor(&sess, &grid, "complete", 12000);
+    try std.testing.expect(aiCountRailChar(&grid, 'A') > 0);
+    try std.testing.expect(!grid.contains("cancelled"));
 
     // And back to B: A's reply text is gone, B's is present.
     try sess.send("\t");
@@ -20490,7 +20475,7 @@ test "terminal: Ctrl+c kills a running command and sends no follow-up" {
     try aiQuit(&sess);
 }
 
-test "terminal: thread switch kills a running command; no result crosses threads" {
+test "terminal: thread switch preserves a running command; no result crosses threads" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
@@ -20508,20 +20493,18 @@ test "terminal: thread switch kills a running command; no result crosses threads
     }
     var late_buf: [220:0]u8 = undefined;
     const late = try bufPrintZ(&late_buf, "{s}/switch_late.txt", .{root});
-    var req2_buf: [260]u8 = undefined;
-    const req2_path = try std.fmt.bufPrint(&req2_buf, "{s}/request-2.json", .{root});
 
     var dir_buf: [128]u8 = undefined;
     const dir = try aiMockDir(io, &dir_buf);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
-    const args = try aiTerminalArgs(alloc, "(sleep 1; printf LATE > switch_late.txt) & wait", 10000);
+    const args = try aiTerminalArgs(alloc, "printf ready > started; while [ ! -e release ]; do sleep 0.02; done; printf LATE > switch_late.txt; printf BACKGROUND_TERMINAL_RESULT", 10000);
     defer alloc.free(args);
     const round1 = try aiToolCallsSse(alloc, &.{
         .{ .id = "call_term_switch", .name = "terminal", .args = args },
     });
     defer alloc.free(round1);
     try aiWriteFile(io, dir, "stream-1.sse", round1);
-    const round2 = try aiTextSse(alloc, "SWITCH_FOLLOWUP_SHOULD_NOT_APPEAR");
+    const round2 = try aiTextSse(alloc, "SWITCH_FOLLOWUP_DONE");
     defer alloc.free(round2);
     try aiWriteFile(io, dir, "stream-2.sse", round2);
     const mock_env = try std.fmt.allocPrint(alloc, "OZ_AI_MOCK_DIR={s}", .{dir});
@@ -20541,6 +20524,7 @@ test "terminal: thread switch kills a running command; no result crosses threads
     try gridWaitFor(&sess, &grid, "[a] allow", 10000);
     try sess.send("a");
     try gridWaitFor(&sess, &grid, "terminal · running", 5000);
+    try waitBarrierMarker(io, alloc, root, "started", 5000);
     try sess.send("n");
     try gridWaitFor(&sess, &grid, "thread 2", 5000);
     // Thread 2's Terminal tab is empty, not the other thread's result.
@@ -20549,20 +20533,24 @@ test "terminal: thread switch kills a running command; no result crosses threads
     try sess.send("r");
     try gridWaitFor(&sess, &grid, "no pending terminal command", 5000);
     try std.testing.expect(!grid.contains("running…"));
-    std.Io.sleep(io, .fromMilliseconds(1300), .real) catch {};
     try std.testing.expect(!aiFileExists(io, late));
-    try std.testing.expect(!pathExists(io, req2_path));
+    try aiWriteFile(io, root, "release", "go");
+    try waitBarrierMarker(io, alloc, root, "switch_late.txt", 5000);
+    try gridSettle(&sess, &grid, 80, 1000);
+    try std.testing.expect(!grid.contains("BACKGROUND_TERMINAL_RESULT"));
+    try std.testing.expect(!grid.contains("SWITCH_FOLLOWUP_DONE"));
 
-    // Back to thread 1: the frozen card says cancelled, and no follow-up ran.
+    // Only A receives its real terminal result and follow-up.
     try sess.send("k");
     try sess.send("\r");
     try gridWaitFor(&sess, &grid, "thread 1", 5000);
     // Selecting a thread focuses its prompt/Chat; re-open the Terminal tab.
     try sess.send("\t");
     try sess.send("r");
-    try gridWaitFor(&sess, &grid, "terminal · cancelled", 5000);
-    try gridWaitFor(&sess, &grid, "cancelled · command stopped", 5000);
-    try std.testing.expect(!grid.contains("SWITCH_FOLLOWUP_SHOULD_NOT_APPEAR"));
+    try gridWaitFor(&sess, &grid, "BACKGROUND_TERMINAL_RESULT", 5000);
+    try std.testing.expect(!grid.contains("cancelled"));
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "SWITCH_FOLLOWUP_DONE", 6000);
 
     try sess.send("\x1b");
     try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
@@ -32107,4 +32095,478 @@ test "agent workflow: floating terminal covers Agent cells and pointer hits foll
         try gridWaitFor(&sess, &grid, "AGENTS", 4000);
         try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
     }
+}
+
+test "agent workflow: local model commands route each thread independently and preserve drafts" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "source.txt", "THREAD_CONFIG_BODY\n");
+    try aiWriteFile(io, root, "stream.sse", "data: {\"choices\":[{\"delta\":{\"content\":\"CONFIG_RESPONSE\"}}]}\n\ndata: [DONE]\n\n");
+    const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+    defer a.free(home);
+    const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+    defer a.free(env);
+    const mock_env = try std.fmt.allocPrint(a, "OZ_AI_MOCK_DIR={s}", .{root});
+    defer a.free(mock_env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{ env, mock_env, "OZ_AI_MODEL=model-default" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send(" a/model model-alpha\r");
+    try gridWaitFor(&sess, &grid, "model: model-alpha", 4000);
+    const unexpected = aiReadFile(io, a, root, "request.json");
+    if (unexpected) |bytes| {
+        a.free(bytes);
+        return error.TestUnexpectedResult;
+    } else |err| try std.testing.expectEqual(error.FileNotFound, err);
+    try sess.send("first message\r");
+    try gridWaitFor(&sess, &grid, "CONFIG_RESPONSE", 5000);
+    try gridWaitFor(&sess, &grid, "complete", 5000);
+    const first = try aiReadFile(io, a, root, "request.json");
+    defer a.free(first);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"model\":\"model-alpha\"") != null);
+    try sess.send("DRAFT_A\x0e/model model-beta\r");
+    try gridWaitFor(&sess, &grid, "model: model-beta", 4000);
+    try sess.send("second message\r");
+    try gridWaitFor(&sess, &grid, "CONFIG_RESPONSE", 5000);
+    try gridWaitFor(&sess, &grid, "complete", 5000);
+    const second = try aiReadFile(io, a, root, "request.json");
+    defer a.free(second);
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"model\":\"model-beta\"") != null);
+    try sess.send("DRAFT_B\x1b[5;5~"); // Ctrl-PageUp: previous thread.
+    try gridWaitFor(&sess, &grid, "DRAFT_A", 4000);
+    try gridWaitFor(&sess, &grid, "model-alpha", 4000);
+    try sess.send("\x1b[6;5~");
+    try gridWaitFor(&sess, &grid, "DRAFT_B", 4000);
+    try gridWaitFor(&sess, &grid, "model-beta", 4000);
+    try sess.send("\x17h");
+    try gridSettle(&sess, &grid, 80, 1000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "agent workflow: per-thread ACP sessions survive switches and backend replacement closes only its own client" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "source.txt", "ACP_PROFILE_BODY\n");
+    try aiWriteFile(io, root, "stream.sse", "data: {\"choices\":[{\"delta\":{\"content\":\"NATIVE_PROFILE_RESPONSE\"}}]}\n\ndata: [DONE]\n\n");
+    const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+    defer a.free(home);
+    const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+    defer a.free(env);
+    const mock_env = try std.fmt.allocPrint(a, "OZ_AI_MOCK_DIR={s}", .{root});
+    defer a.free(mock_env);
+    var script_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    const script_len = try std.Io.Dir.cwd().realPathFile(io, "test/fixtures/acp_agent.py", &script_buf);
+    const json = try std.json.Stringify.valueAlloc(a, &[_][]const u8{ "python3", script_buf[0..script_len], "normal" }, .{});
+    defer a.free(json);
+    const command = try std.fmt.allocPrint(a, "/agent acp {s}\r", .{json});
+    defer a.free(command);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{ env, mock_env, "OZ_AI_MODEL=native-model" }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send(" a");
+    try sess.send(command);
+    try gridWaitFor(&sess, &grid, "agent: acp", 4000);
+    try sess.send("one\r");
+    try gridWaitFor(&sess, &grid, "ACP_REPLY_1", 5000);
+    try gridWaitFor(&sess, &grid, "complete", 5000);
+    try sess.send("\x0e");
+    try sess.send(command);
+    try gridWaitFor(&sess, &grid, "agent: acp", 4000);
+    try sess.send("two\r");
+    try gridWaitFor(&sess, &grid, "ACP_REPLY_1", 5000);
+    try gridWaitFor(&sess, &grid, "complete", 5000);
+    try std.testing.expect(!grid.contains("ACP_REPLY_2"));
+    try sess.send("/thread 1\rthree\r");
+    try gridWaitFor(&sess, &grid, "ACP_REPLY_2", 5000);
+    try gridWaitFor(&sess, &grid, "complete", 5000);
+    try sess.send("/agent builtin\r");
+    try gridWaitFor(&sess, &grid, "agent: builtin", 4000);
+    try sess.send("native\r");
+    try gridWaitFor(&sess, &grid, "NATIVE_PROFILE_RESPONSE", 5000);
+    try gridWaitFor(&sess, &grid, "complete", 5000);
+    try sess.send("/thread 2\rfour\r");
+    try gridWaitRowContains(&sess, &grid, aiWorkboxHeaderRow(&grid), "thread 2", 4000);
+    try gridWaitGone(&sess, &grid, "NATIVE_PROFILE_RESPONSE", 4000);
+    try gridWaitFor(&sess, &grid, "ACP_REPLY_2", 5000);
+    try gridWaitFor(&sess, &grid, "complete", 5000);
+    try std.testing.expect(!grid.contains("NATIVE_PROFILE_RESPONSE"));
+    try sess.send("\x17h");
+    try gridSettle(&sess, &grid, 80, 1000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "agent workflow: barrier-controlled ACP A finishes after B without mixing or cancelling background work" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "source.txt", "BACKGROUND_BARRIER_BODY\n");
+    const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+    defer a.free(home);
+    const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+    defer a.free(env);
+    var script_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    const script_len = try std.Io.Dir.cwd().realPathFile(io, "test/fixtures/acp_agent.py", &script_buf);
+    const script = script_buf[0..script_len];
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{env}, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send(" a");
+    for ([_][]const u8{ "A", "B" }) |label| {
+        if (std.mem.eql(u8, label, "B")) try sess.send("\x0e");
+        const argv = try std.json.Stringify.valueAlloc(a, &[_][]const u8{ "python3", script, "barrier", root, label }, .{});
+        defer a.free(argv);
+        const command = try std.fmt.allocPrint(a, "/agent acp {s}\r", .{argv});
+        defer a.free(command);
+        try sess.send(command);
+        try gridWaitFor(&sess, &grid, "agent: acp", 4000);
+        try sess.send("start\r");
+        const ready = try std.fmt.allocPrint(a, "{s}-ready-1", .{label});
+        defer a.free(ready);
+        try waitBarrierMarker(io, a, root, ready, 6000);
+        if (std.mem.eql(u8, label, "A")) {
+            try gridWaitFor(&sess, &grid, "START_A_1", 4000);
+            // A is definitely still blocked when B starts. A local attempt
+            // to replace its backend must leave its ACP process/session alive.
+            try sess.send("/agent builtin\r");
+            try gridWaitFor(&sess, &grid, "current thread is busy", 4000);
+        }
+    }
+    try waitBarrierMarker(io, a, root, "B-done-1", 6000);
+    try gridWaitFor(&sess, &grid, "FINISH_B_1", 4000);
+    try std.testing.expect(!grid.contains("FINISH_A_1"));
+    // Release A only after B's real terminal response, not after a sleep.
+    try aiWriteFile(io, root, "release-A-1", "release\n");
+    try waitBarrierMarker(io, a, root, "A-done-1", 6000);
+    try gridSettle(&sess, &grid, 80, 1000);
+    try std.testing.expect(aiRowContains(&grid, aiWorkboxHeaderRow(&grid), "thread 2"));
+    try std.testing.expect(!grid.contains("FINISH_A_1"));
+    try sess.send("\x1b[5;5~");
+    try gridWaitRowContains(&sess, &grid, aiWorkboxHeaderRow(&grid), "thread 1", 4000);
+    try gridWaitFor(&sess, &grid, "FINISH_A_1", 4000);
+    try std.testing.expect(!grid.contains("FINISH_B_1"));
+    try std.testing.expect(!grid.contains("cancelled"));
+    try sess.send("\x1b[6;5~");
+    try gridWaitFor(&sess, &grid, "FINISH_B_1", 4000);
+    try std.testing.expect(!grid.contains("FINISH_A_1"));
+    try sess.send("\x17h");
+    try gridSettle(&sess, &grid, 80, 1000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "agent workflow: auto reads run without focus stealing; writes still need review and new threads default manual" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "source.txt", "AUTO_WORKFLOW_BODY\n");
+    const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+    defer a.free(home);
+    const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+    defer a.free(env);
+    const mock = try std.fmt.allocPrint(a, "OZ_AI_MOCK_DIR={s}", .{root});
+    defer a.free(mock);
+    const read_args = try aiTerminalArgs(a, "pwd", 4000);
+    defer a.free(read_args);
+    const read = try aiToolCallsSse(a, &.{.{ .id = "read1", .name = "terminal", .args = read_args }});
+    defer a.free(read);
+    try aiWriteFile(io, root, "stream-1.sse", read);
+    const followup = try aiTextSse(a, "READ_FOLLOWUP_DONE");
+    defer a.free(followup);
+    try aiWriteFile(io, root, "stream-2.sse", followup);
+    const write_args = try aiTerminalArgs(a, "printf overwritten > source.txt", 4000);
+    defer a.free(write_args);
+    const write = try aiToolCallsSse(a, &.{.{ .id = "write1", .name = "terminal", .args = write_args }});
+    defer a.free(write);
+    try aiWriteFile(io, root, "stream-3.sse", write);
+    try aiWriteFile(io, root, "stream-4.sse", followup);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{ env, mock }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send(" a/auto\r");
+    try gridWaitFor(&sess, &grid, "approvals: auto", 4000);
+    try sess.send("read current directory\r");
+    try gridWaitFor(&sess, &grid, "READ_FOLLOWUP_DONE", 6000);
+    try gridWaitFor(&sess, &grid, "complete", 4000);
+    try std.testing.expect(!grid.contains("[a] allow"));
+    try sess.send("DRAFT_AFTER_AUTO");
+    try gridWaitFor(&sess, &grid, "DRAFT_AFTER_AUTO", 4000); // still prompt, no forced Terminal tab
+    try sess.send("\x0echeck manual default\r");
+    try gridWaitRowContains(&sess, &grid, aiWorkboxHeaderRow(&grid), "thread 2", 4000);
+    try gridWaitFor(&sess, &grid, "terminal · approval required", 6000);
+    try gridWaitFor(&sess, &grid, "[a] allow", 4000);
+    try sess.send("r");
+    try gridWaitFor(&sess, &grid, "terminal · rejected", 4000);
+    try sess.send("c");
+    try gridWaitFor(&sess, &grid, "READ_FOLLOWUP_DONE", 6000);
+    try sess.send("\x1b[5;5~");
+    try gridWaitFor(&sess, &grid, "DRAFT_AFTER_AUTO", 4000);
+    for (0..16) |_| try sess.send("\x7f");
+    try sess.send("please overwrite\r");
+    try gridWaitFor(&sess, &grid, "terminal · approval required", 6000);
+    try gridWaitFor(&sess, &grid, "printf overwritten > source.txt", 4000);
+    const before = try aiReadFile(io, a, root, "source.txt");
+    defer a.free(before);
+    try std.testing.expectEqualStrings("AUTO_WORKFLOW_BODY\n", before);
+    try sess.send("r");
+    try gridWaitFor(&sess, &grid, "terminal · rejected", 4000);
+    const after = try aiReadFile(io, a, root, "source.txt");
+    defer a.free(after);
+    try std.testing.expectEqualStrings(before, after);
+    // /manual is local even after an automatic task; no provider call.
+    try sess.send("\x1b[5;5~\x1b[6;5~/manual\r");
+    try gridWaitFor(&sess, &grid, "approvals: manual", 4000);
+    try sess.send("\x17h");
+    try gridSettle(&sess, &grid, 80, 1000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "agent workflow: ACP auto read permits once; writes and disguised reads require an explained decision" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "permission-read", "permission-write", "permission-disguised", "permission" }) |mode| {
+        var root_buf: [128]u8 = undefined;
+        const root = try aiMockDir(io, &root_buf);
+        defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        try writeTestFile(io, root, "source.txt", "ACP_APPROVAL_BODY\n");
+        const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+        defer a.free(home);
+        const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+        defer a.free(env);
+        var script_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+        const script_len = try std.Io.Dir.cwd().realPathFile(io, "test/fixtures/acp_agent.py", &script_buf);
+        const argv = try std.json.Stringify.valueAlloc(a, &[_][]const u8{ "python3", script_buf[0..script_len], mode }, .{});
+        defer a.free(argv);
+        const command = try std.fmt.allocPrint(a, "/agent acp {s}\r", .{argv});
+        defer a.free(command);
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{env}, 30, 120, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 30, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try sess.send(" a");
+        try sess.send(command);
+        try gridWaitFor(&sess, &grid, "agent: acp", 4000);
+        try sess.send("/auto\r");
+        try gridWaitFor(&sess, &grid, "approvals: auto", 4000);
+        try sess.send("run\r");
+        const read = std.mem.eql(u8, mode, "permission-read");
+        if (!read) {
+            try gridWaitFor(&sess, &grid, "ACP permission", 5000);
+            try gridWaitFor(&sess, &grid, "Workspace:", 4000);
+            if (!std.mem.eql(u8, mode, "permission")) try gridWaitFor(&sess, &grid, "rm source.txt", 4000);
+            try std.testing.expect(!grid.contains("PERMISSION_yes"));
+            // a/r must not swallow letters inside a slash command.
+            try sess.send("/manual\r");
+            try gridWaitFor(&sess, &grid, "approvals: manual", 4000);
+            try std.testing.expect(!grid.contains("PERMISSION_yes"));
+            try sess.send("r");
+        }
+        try gridWaitFor(&sess, &grid, if (read) "PERMISSION_yes" else "PERMISSION_no", 5000);
+        try gridWaitFor(&sess, &grid, "ACP_REPLY_1", 5000);
+        const text = try aiReadFile(io, a, root, "source.txt");
+        defer a.free(text);
+        try std.testing.expectEqualStrings("ACP_APPROVAL_BODY\n", text);
+        try sess.send("\x17h");
+        try gridSettle(&sess, &grid, 80, 1000);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+    }
+}
+
+test "agent workflow: per-thread terminal jobs overlap; completion and cancellation stay with their owner" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |cancel_a| {
+        var root_buf: [128]u8 = undefined;
+        const root = try aiMockDir(io, &root_buf);
+        defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        try writeTestFile(io, root, "source.txt", "TERMINAL_PARALLEL_BODY\n");
+        const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+        defer a.free(home);
+        const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+        defer a.free(env);
+        const mock = try std.fmt.allocPrint(a, "OZ_AI_MOCK_DIR={s}", .{root});
+        defer a.free(mock);
+        const args_a = try aiTerminalArgs(a, "printf READY > A-ready; while [ ! -e release-A ]; do sleep 0.02; done; printf DONE > A-done; printf OWNER_A_RESULT", 10000);
+        defer a.free(args_a);
+        const call_a = try aiToolCallsSse(a, &.{.{ .id = "A", .name = "terminal", .args = args_a }});
+        defer a.free(call_a);
+        try aiWriteFile(io, root, "stream-1.sse", call_a);
+        const followup = try aiTextSse(a, "OWNER_FOLLOWUP_DONE");
+        defer a.free(followup);
+        try aiWriteFile(io, root, "stream-2.sse", followup);
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{ env, mock }, 30, 120, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 30, 120);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try sess.send(" astart A\r");
+        try gridWaitFor(&sess, &grid, "[a] allow", 6000);
+        // Keep A pending while B obtains a distinct approval slot.
+        try sess.send("\x0e");
+        try gridWaitRowContains(&sess, &grid, aiWorkboxHeaderRow(&grid), "thread 2", 4000);
+        const args_b = try aiTerminalArgs(a, "printf READY > B-ready; while [ ! -e release-B ]; do sleep 0.02; done; printf DONE > B-done; printf OWNER_B_RESULT", 10000);
+        defer a.free(args_b);
+        const call_b = try aiToolCallsSse(a, &.{.{ .id = "B", .name = "terminal", .args = args_b }});
+        defer a.free(call_b);
+        try aiWriteFile(io, root, "next.sse", call_b);
+        const next = try std.fmt.allocPrint(a, "{s}/next.sse", .{root});
+        defer a.free(next);
+        const target = try std.fmt.allocPrint(a, "{s}/stream-1.sse", .{root});
+        defer a.free(target);
+        try std.Io.Dir.renameAbsolute(next, target, io);
+        try sess.send("start B\r");
+        try gridWaitFor(&sess, &grid, "B-ready", 6000); // displayed command is B's, still not executed
+        try gridWaitFor(&sess, &grid, "[a] allow", 4000);
+        try std.testing.expect(!grid.contains("another terminal command"));
+        try sess.send("a");
+        try waitBarrierMarker(io, a, root, "B-ready", 5000);
+        try sess.send("\x1b[5;5~\tr");
+        try gridWaitFor(&sess, &grid, "A-ready", 4000);
+        try gridWaitFor(&sess, &grid, "[a] allow", 4000);
+        try sess.send("a");
+        try waitBarrierMarker(io, a, root, "A-ready", 5000);
+        // Both real process groups are now blocked at independent barriers.
+        try aiWriteFile(io, root, "release-B", "go");
+        try waitBarrierMarker(io, a, root, "B-done", 5000);
+        try sess.send("\x1b[6;5~\tr");
+        try gridWaitFor(&sess, &grid, "OWNER_B_RESULT", 5000);
+        try std.testing.expect(!grid.contains("OWNER_A_RESULT"));
+        try sess.send("\x1b[5;5~\tr");
+        try gridWaitFor(&sess, &grid, "terminal · running", 4000);
+        if (cancel_a) {
+            try sess.send("\x03");
+            try gridWaitFor(&sess, &grid, "cancelled · command stopped", 4000);
+        }
+        try aiWriteFile(io, root, "release-A", "go");
+        if (cancel_a) {
+            // A was cancelled before release. B's completed result survives.
+            try sess.send("\x1b[6;5~\tr");
+            try gridWaitFor(&sess, &grid, "OWNER_B_RESULT", 5000);
+            try gridSettle(&sess, &grid, 150, 1200);
+            const late = try std.fmt.allocPrint(a, "{s}/A-done", .{root});
+            defer a.free(late);
+            try std.testing.expect(!pathExists(io, late));
+            try std.testing.expect(!grid.contains("OWNER_A_RESULT"));
+        } else {
+            try waitBarrierMarker(io, a, root, "A-done", 5000);
+            try gridWaitFor(&sess, &grid, "OWNER_A_RESULT", 5000);
+            try std.testing.expect(!grid.contains("OWNER_B_RESULT"));
+            try std.testing.expect(!grid.contains("cancelled"));
+        }
+        try sess.send("\x17h");
+        try gridSettle(&sess, &grid, 80, 1000);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+    }
+}
+
+test "agent workflow: ACP pending approval and auto trust do not cross threads" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "source.txt", "ACP_INDEPENDENT_APPROVAL_BODY\n");
+    const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+    defer a.free(home);
+    const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+    defer a.free(env);
+    var script_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    const script_len = try std.Io.Dir.cwd().realPathFile(io, "test/fixtures/acp_agent.py", &script_buf);
+    const argv = try std.json.Stringify.valueAlloc(a, &[_][]const u8{ "python3", script_buf[0..script_len], "permission-read" }, .{});
+    defer a.free(argv);
+    const backend = try std.fmt.allocPrint(a, "OZ_ACP_COMMAND={s}", .{argv});
+    defer a.free(backend);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{ env, backend }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send(" aread A\r");
+    try gridWaitFor(&sess, &grid, "ACP permission", 5000);
+    try sess.send("\x0e/auto\r");
+    try gridWaitRowContains(&sess, &grid, aiWorkboxHeaderRow(&grid), "thread 2", 4000);
+    try gridWaitFor(&sess, &grid, "approvals: auto", 4000);
+    try sess.send("read B\r");
+    try gridWaitFor(&sess, &grid, "PERMISSION_yes", 5000);
+    try gridWaitFor(&sess, &grid, "complete", 5000);
+    try sess.send("\x1b[5;5~");
+    try gridWaitRowContains(&sess, &grid, aiWorkboxHeaderRow(&grid), "thread 1", 4000);
+    try gridWaitFor(&sess, &grid, "ACP permission", 4000);
+    try std.testing.expect(!grid.contains("PERMISSION_yes"));
+    try sess.send("r");
+    try gridWaitFor(&sess, &grid, "PERMISSION_no", 5000);
+    try gridWaitFor(&sess, &grid, "complete", 5000);
+    try sess.send("\x1b[6;5~");
+    try gridWaitRowContains(&sess, &grid, aiWorkboxHeaderRow(&grid), "thread 2", 4000);
+    try gridWaitFor(&sess, &grid, "PERMISSION_yes", 4000);
+    try std.testing.expect(!grid.contains("PERMISSION_no"));
+    try sess.send("\x17h");
+    try gridSettle(&sess, &grid, 80, 1000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "agent workflow: native file edits always require review in auto mode" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "source.txt", "AUTO_EDIT_ORIGINAL\n");
+    const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+    defer a.free(home);
+    const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+    defer a.free(env);
+    const mock = try std.fmt.allocPrint(a, "OZ_AI_MOCK_DIR={s}", .{root});
+    defer a.free(mock);
+    const call = try aiToolCallsSse(a, &.{.{ .id = "edit1", .name = "edit_file", .args = "{\"path\":\"source.txt\",\"old_string\":\"AUTO_EDIT_ORIGINAL\",\"new_string\":\"AUTO_EDIT_OVERWRITE\"}" }});
+    defer a.free(call);
+    try aiWriteFile(io, root, "stream-1.sse", call);
+    const followup = try aiTextSse(a, "EDIT_AWAITS_REVIEW");
+    defer a.free(followup);
+    try aiWriteFile(io, root, "stream-2.sse", followup);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{ env, mock }, 30, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send(" a/auto\r");
+    try gridWaitFor(&sess, &grid, "approvals: auto", 4000);
+    try sess.send("change file\r");
+    try gridWaitFor(&sess, &grid, "[a] approve", 6000);
+    const before = try aiReadFile(io, a, root, "source.txt");
+    defer a.free(before);
+    try std.testing.expectEqualStrings("AUTO_EDIT_ORIGINAL\n", before);
+    try sess.send("r");
+    try gridWaitFor(&sess, &grid, "rejected", 4000);
+    try sess.send("\x17h:w\r");
+    try gridWaitFor(&sess, &grid, "written:", 4000);
+    const after = try aiReadFile(io, a, root, "source.txt");
+    defer a.free(after);
+    try std.testing.expectEqualStrings(before, after); // buffer wasn't silently edited either
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
 }

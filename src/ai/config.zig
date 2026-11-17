@@ -27,6 +27,23 @@ pub const Config = struct {
     /// `<dir>/stream.sse` (see client.zig).
     mock_dir: ?[]u8 = null,
 
+    pub fn clone(self: *const Config, a: std.mem.Allocator) !Config {
+        const base = try a.dupe(u8, self.base_url);
+        errdefer a.free(base);
+        const model = try a.dupe(u8, self.model);
+        errdefer a.free(model);
+        const system = try a.dupe(u8, self.system);
+        errdefer a.free(system);
+        const key = if (self.api_key) |v| try a.dupe(u8, v) else null;
+        errdefer if (key) |v| a.free(v);
+        const command = if (self.acp_command) |v| try a.dupe(u8, v) else null;
+        errdefer if (command) |v| a.free(v);
+        const cwd = if (self.acp_cwd) |v| try a.dupe(u8, v) else null;
+        errdefer if (cwd) |v| a.free(v);
+        const mock = if (self.mock_dir) |v| try a.dupe(u8, v) else null;
+        return .{ .base_url = base, .model = model, .system = system, .api_key = key, .acp_command = command, .acp_cwd = cwd, .mock_dir = mock, .tool_limits = self.tool_limits, .context_tokens = self.context_tokens };
+    }
+
     pub fn deinit(self: *Config, alloc: std.mem.Allocator) void {
         if (self.acp_command) |v| alloc.free(v);
         if (self.acp_cwd) |v| alloc.free(v);
@@ -38,6 +55,44 @@ pub const Config = struct {
         self.* = undefined;
     }
 };
+
+/// Local thread profile selection. Environment remains a set of defaults;
+/// switching a thread never mutates it or another thread's owned config.
+pub fn forAgent(a: std.mem.Allocator, env: anytype, name: []const u8, argument: []const u8) !Config {
+    if (std.mem.eql(u8, name, "default")) {
+        if (argument.len != 0) return error.UnexpectedAgentArgument;
+        return fromEnv(a, env);
+    }
+    const View = struct {
+        original: @TypeOf(env),
+        pub fn get(self: @This(), key: []const u8) ?[]const u8 {
+            if (std.mem.startsWith(u8, key, "OZ_ACP_")) return null;
+            return self.original.get(key);
+        }
+    };
+    var cfg = try fromEnv(a, View{ .original = env });
+    errdefer cfg.deinit(a);
+    if (std.mem.eql(u8, name, "builtin")) {
+        if (argument.len != 0) return error.UnexpectedAgentArgument;
+        return cfg;
+    }
+    const custom = std.mem.eql(u8, name, "acp");
+    const command = if (custom) argument else try acp.preset(name);
+    try acp.validateCommand(a, command);
+    cfg.acp_command = try a.dupe(u8, command);
+    const model = try a.dupe(u8, if (custom) "ACP" else name);
+    a.free(cfg.model);
+    cfg.model = model;
+    const cwd = if (!custom and argument.len > 0) argument else nonEmpty(env, "OZ_ACP_CWD");
+    if (cwd) |v| cfg.acp_cwd = try a.dupe(u8, v);
+    return cfg;
+}
+
+pub fn validModelName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 256 or !std.unicode.utf8ValidateSlice(name)) return false;
+    for (name) |byte| if (byte <= 0x20 or byte == 0x7f) return false;
+    return true;
+}
 
 /// Parse configuration from any map-like object with `get(key) ?[]const u8`
 /// (`std.process.Environ.Map`, `std.StringHashMap([]const u8)`, …).
@@ -190,4 +245,34 @@ test "config: ACP presets, argv override and cwd" {
     try std.testing.expectEqualStrings("/tmp/dsh source", cfg.acp_cwd.?);
     try env.put("OZ_ACP_COMMAND", "[]");
     try std.testing.expectError(error.InvalidAcpCommand, fromEnv(a, env));
+}
+
+test "thread profiles: independent owned defaults, native models and ACP commands" {
+    const a = std.testing.allocator;
+    var env = std.StringHashMap([]const u8).init(a);
+    defer env.deinit();
+    try env.put("OZ_AI_MODEL", "native-default");
+    try env.put("OZ_AI_BASE_URL", "http://provider.invalid/v1");
+    try env.put("OZ_AI_API_KEY", "fixture-key");
+    try env.put("OZ_ACP_AGENT", "kimi");
+    var defaults = try fromEnv(a, &env);
+    defer defaults.deinit(a);
+    var copy = try defaults.clone(a);
+    defer copy.deinit(a);
+    try std.testing.expect(copy.model.ptr != defaults.model.ptr);
+    try std.testing.expect(copy.api_key.?.ptr != defaults.api_key.?.ptr);
+    var native = try forAgent(a, &env, "builtin", "");
+    defer native.deinit(a);
+    try std.testing.expect(native.acp_command == null);
+    try std.testing.expectEqualStrings("native-default", native.model);
+    try std.testing.expectEqualStrings("kimi", defaults.model);
+    for ([_][]const u8{ "codex", "kimi", "deepseek" }) |name| {
+        var cfg = try forAgent(a, &env, name, "/tmp/harness source");
+        defer cfg.deinit(a);
+        try std.testing.expectEqualStrings(try acp.preset(name), cfg.acp_command.?);
+        try std.testing.expectEqualStrings(name, cfg.model);
+        try std.testing.expectEqualStrings("/tmp/harness source", cfg.acp_cwd.?);
+    }
+    try std.testing.expectError(error.InvalidAcpAgent, forAgent(a, &env, "unknown", ""));
+    try std.testing.expectError(error.InvalidAcpCommand, forAgent(a, &env, "acp", "[]"));
 }

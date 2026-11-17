@@ -24,6 +24,7 @@ const app_agent_edit = @import("agent_edit_ui.zig");
 const app_agent_terminal = @import("agent_terminal.zig");
 const terminal_tool = @import("../ai/terminal_tool.zig");
 const term = @import("../term.zig");
+const permissions = @import("../ai/permissions.zig");
 
 pub const Status = ws.Status;
 pub const Role = ws.Role;
@@ -39,6 +40,8 @@ pub const ToolThreadState = struct {
     /// Captured when a user turn starts. Follow-ups keep using the same
     /// workspace root even if the visible workspace switched meanwhile.
     acp_permission: ?[]u8 = null,
+    terminal: app_agent_terminal.Session = .{},
+    approval_mode: permissions.Mode = .manual,
     root: ?[]u8 = null,
     /// Tool batches started in this user turn (agent.max_tool_rounds).
     rounds: u16 = 0,
@@ -91,6 +94,7 @@ pub const ChartCache = struct {
 /// persisted to disk.
 pub const Session = struct {
     config: ?ai.config.Config = null,
+    thread_configs: std.ArrayList(?ai.config.Config) = .empty,
     threads: ws.Threads = .{},
     /// One transport client per thread (parallel to `threads.items`); a
     /// thread's own client is what keeps late deltas out of another thread's
@@ -127,8 +131,25 @@ pub const Session = struct {
 fn syncAiSidecars(self: *App) !void {
     const n = self.ai.threads.items.items.len;
     while (self.ai.clients.items.len < n) try self.ai.clients.append(self.alloc, null);
+    while (self.ai.thread_configs.items.len < n) try self.ai.thread_configs.append(self.alloc, null);
     while (self.ai.tool_states.items.len < n) try self.ai.tool_states.append(self.alloc, .{});
     while (self.ai.tool_jobs.items.len < n) try self.ai.tool_jobs.append(self.alloc, null);
+}
+
+/// Reserve all parallel storage before publishing a new thread. An allocation
+/// failure cannot leave half-created sidecars pointing at somebody else's job.
+fn createAiThread(self: *App) !usize {
+    try syncAiSidecars(self);
+    try self.ai.clients.ensureUnusedCapacity(self.alloc, 1);
+    try self.ai.thread_configs.ensureUnusedCapacity(self.alloc, 1);
+    try self.ai.tool_states.ensureUnusedCapacity(self.alloc, 1);
+    try self.ai.tool_jobs.ensureUnusedCapacity(self.alloc, 1);
+    const idx = try self.ai.threads.create(self.alloc);
+    self.ai.clients.appendAssumeCapacity(null);
+    self.ai.thread_configs.appendAssumeCapacity(null);
+    self.ai.tool_states.appendAssumeCapacity(.{});
+    self.ai.tool_jobs.appendAssumeCapacity(null);
+    return idx;
 }
 
 fn toolState(self: *App, idx: usize) ?*ToolThreadState {
@@ -207,7 +228,7 @@ fn resetToolTurn(self: *App, idx: usize) void {
     const st = toolState(self, idx) orelse return;
     st.rounds = 0;
     st.calls = 0;
-    st.limits = if (self.ai.config) |cfg| cfg.tool_limits else .{};
+    st.limits = if (threadConfig(self, idx)) |cfg| cfg.tool_limits else .{};
     st.active = false;
     st.stream_done = false;
     st.pending_followup = false;
@@ -224,19 +245,10 @@ fn resetToolTurn(self: *App, idx: usize) void {
 pub fn ensureAi(self: *App) !void {
     try syncAiSidecars(self);
     if (self.ai.threads.items.items.len == 0) {
-        try self.ai.clients.append(self.alloc, null);
-        errdefer _ = self.ai.clients.pop();
-        try self.ai.tool_states.append(self.alloc, .{});
-        errdefer _ = self.ai.tool_states.pop();
-        try self.ai.tool_jobs.append(self.alloc, null);
-        const idx = self.ai.threads.create(self.alloc) catch |e| {
-            _ = self.ai.tool_jobs.pop();
-            return e;
-        };
+        const idx = try createAiThread(self);
         self.ai.threads.active = idx;
         self.ai.thread_cursor = idx;
         self.ai.thread_top = 0;
-        try syncAiSidecars(self);
     }
     if (self.ai.thread_cursor >= self.ai.threads.items.items.len) {
         self.ai.thread_cursor = self.ai.threads.items.items.len - 1;
@@ -390,25 +402,13 @@ fn aiLeaveRail(self: *App) void {
     }
 }
 
-/// Append a new thread, cancel the previously active stream (switching
-/// policy), and attach to the new thread's prompt.
+/// Append an independent thread and attach to its prompt.
 pub fn aiNewThread(self: *App) !void {
     try ensureAi(self);
     self.navigator_peek = false;
-    try self.ai.clients.append(self.alloc, null);
-    errdefer _ = self.ai.clients.pop();
-    try self.ai.tool_states.append(self.alloc, .{});
-    errdefer _ = self.ai.tool_states.pop();
-    try self.ai.tool_jobs.append(self.alloc, null);
-    const idx = self.ai.threads.create(self.alloc) catch |e| {
-        _ = self.ai.tool_jobs.pop();
-        return e;
-    };
-    const res = self.ai.threads.select(idx);
-    if (res.cancelled) cancelClient(self, res.prev);
-    // M3b3: a pending approval survives (hidden); a running command is killed
-    // when its thread is left, so no result lands in an unwatched thread.
-    app_agent_terminal.leaveThread(self, res.prev);
+    const idx = try createAiThread(self);
+    _ = self.ai.threads.select(idx);
+    // Switching changes the visible draft, not background work.
     self.ai.thread_cursor = idx;
     self.ai.tab = .chat;
     self.ai.focus = .prompt;
@@ -425,9 +425,7 @@ fn selectThreadAtCursor(self: *App) void {
 pub fn aiSelectThread(self: *App, idx: usize) void {
     if (idx >= self.ai.threads.items.items.len) return;
     self.navigator_peek = false;
-    const res = self.ai.threads.select(idx);
-    if (res.cancelled) cancelClient(self, res.prev);
-    app_agent_terminal.leaveThread(self, res.prev);
+    _ = self.ai.threads.select(idx);
     self.ai.thread_cursor = idx;
     self.ai.focus = .prompt;
     self.ai.tab = .chat;
@@ -541,6 +539,7 @@ pub fn aiStreaming(self: *App) bool {
 }
 
 pub fn deinitAi(self: *App) void {
+    app_agent_terminal.deinitAgentTerminal(self);
     for (self.ai.clients.items) |maybe| {
         if (maybe) |c| c.requestCancel();
     }
@@ -564,13 +563,157 @@ pub fn deinitAi(self: *App) void {
     self.ai.tool_states.deinit(self.alloc);
     self.ai.tool_jobs.deinit(self.alloc);
     self.ai.threads.deinit(self.alloc);
+    for (self.ai.thread_configs.items) |*slot| if (slot.*) |*cfg| cfg.deinit(self.alloc);
+    self.ai.thread_configs.deinit(self.alloc);
     if (self.ai.config) |*cfg| cfg.deinit(self.alloc);
     self.ai.config = null;
+}
+
+fn threadConfig(self: *App, idx: usize) ?*const ai.config.Config {
+    if (idx < self.ai.thread_configs.items.len) {
+        if (self.ai.thread_configs.items[idx]) |*cfg| return cfg;
+    }
+    if (self.ai.config) |*cfg| return cfg;
+    return null;
+}
+
+fn ensureThreadConfig(self: *App, idx: usize) !*ai.config.Config {
+    try aiLoadConfig(self);
+    try syncAiSidecars(self);
+    if (idx >= self.ai.thread_configs.items.len) return error.IndexOutOfRange;
+    const slot = &self.ai.thread_configs.items[idx];
+    if (slot.* == null) slot.* = try self.ai.config.?.clone(self.alloc);
+    return &slot.*.?;
+}
+
+fn configChangeBusy(self: *App, idx: usize) bool {
+    const t = &self.ai.threads.items.items[idx];
+    if (t.status == .streaming) return true;
+    if (idx < self.ai.clients.items.len) if (self.ai.clients.items[idx]) |c| {
+        if (c.isRunning() or c.hasEvents()) return true;
+    };
+    if (toolState(self, idx)) |st| if (st.active or st.pending_followup or st.acp_permission != null) return true;
+    if (app_agent_terminal.blocksFollowup(self, idx)) return true;
+    if (self.agent_edit.pending) |pending| if (pending.thread_index == idx) return true;
+    return false;
+}
+
+fn dropThreadClient(self: *App, idx: usize) void {
+    if (self.ai.clients.items[idx]) |client| {
+        client.deinit();
+        self.alloc.destroy(client);
+        self.ai.clients.items[idx] = null;
+    }
+}
+
+fn localNote(self: *App, idx: usize, comptime fmt: []const u8, args: anytype) !void {
+    const text = try std.fmt.allocPrint(self.alloc, fmt, args);
+    defer self.alloc.free(text);
+    setToolNote(self, idx, text);
+    self.ai.tab = .chat;
+    self.ai.threads.items.items[idx].auto_scroll = true;
+}
+
+fn handleLocalCommand(self: *App, idx: usize) !bool {
+    const input = std.mem.trim(u8, self.ai.threads.items.items[idx].input.items, " \t\r\n");
+    if (input.len == 0 or input[0] != '/') return false;
+    const owned = try self.alloc.dupe(u8, input);
+    defer self.alloc.free(owned);
+    // Clear before an action that can append/reallocate the thread list.
+    self.ai.threads.items.items[idx].input.clearRetainingCapacity();
+    const end = std.mem.indexOfAny(u8, owned, " \t") orelse owned.len;
+    const command = owned[1..end];
+    const argument = std.mem.trim(u8, owned[end..], " \t");
+    if (std.mem.eql(u8, command, "threads")) {
+        self.ai.threads_expanded = true;
+        self.ai.focus = .rail;
+        self.ai.thread_cursor = idx;
+        ensureThreadVisible(self);
+    } else if (std.mem.eql(u8, command, "thread")) {
+        const n = self.ai.threads.items.items.len;
+        var target: ?usize = null;
+        if (std.mem.eql(u8, argument, "next")) target = (idx + 1) % n else if (std.mem.eql(u8, argument, "prev")) target = (idx + n - 1) % n else {
+            const id = std.fmt.parseInt(u64, argument, 10) catch 0;
+            for (self.ai.threads.items.items, 0..) |t, i| if (t.id == id) {
+                target = i;
+                break;
+            };
+        }
+        if (target) |i| self.aiSelectThread(i) else try localNote(self, idx, "thread: use an existing id, next or prev", .{});
+    } else if (std.mem.eql(u8, command, "new")) {
+        try self.aiNewThread();
+        if (argument.len > 0) try selectAgentProfile(self, self.ai.threads.active, argument);
+    } else if (std.mem.eql(u8, command, "model")) {
+        if (configChangeBusy(self, idx)) {
+            try localNote(self, idx, "model: current thread is busy; stop or resolve its pending review first", .{});
+        } else {
+            const cfg = try ensureThreadConfig(self, idx);
+            if (cfg.acp_command != null) {
+                try localNote(self, idx, "model: ACP models are configured by the selected harness; /agent selects a backend", .{});
+            } else if (argument.len == 0) {
+                try localNote(self, idx, "model: {s}", .{cfg.model});
+            } else if (!ai.config.validModelName(argument)) {
+                try localNote(self, idx, "model: expected a single model id (max 256 bytes)", .{});
+            } else {
+                const model = try self.alloc.dupe(u8, argument);
+                self.alloc.free(cfg.model);
+                cfg.model = model;
+                try localNote(self, idx, "model: {s}", .{cfg.model});
+            }
+        }
+    } else if (std.mem.eql(u8, command, "auto") or std.mem.eql(u8, command, "manual")) {
+        const state = toolState(self, idx) orelse return true;
+        state.approval_mode = if (std.mem.eql(u8, command, "auto")) .auto else .manual;
+        try localNote(self, idx, "approvals: {s}; edits, deletes, overwrites and unknown commands require review", .{@tagName(state.approval_mode)});
+        if (state.approval_mode == .auto) {
+            if (state.acp_permission) |raw| {
+                if (permissions.readOnlyAcp(self.alloc, raw)) {
+                    decideAcpPermission(self, true);
+                }
+            }
+            if (!app_agent_terminal.runningFor(self, idx)) {
+                if (app_agent_terminal.visiblePending(self)) |pending| {
+                    if (permissions.readOnlyCommand(pending.command)) resolveTerminalDecision(self, app_agent_terminal.allowForThread(self, idx));
+                }
+            }
+        }
+    } else if (std.mem.eql(u8, command, "agent")) {
+        try selectAgentProfile(self, idx, argument);
+    } else {
+        try localNote(self, idx, "commands: /auto; /manual; /agent builtin|codex|kimi|deepseek|default; /agent acp <JSON argv>; /model <id>; /new; /thread <id>|next|prev; /threads; Ctrl-PageUp/Down", .{});
+    }
+    return true;
+}
+
+fn selectAgentProfile(self: *App, idx: usize, argument: []const u8) !void {
+    if (argument.len == 0) return localNote(self, idx, "agent: builtin, codex, kimi, deepseek, default, or acp <JSON argv>", .{});
+    if (configChangeBusy(self, idx)) return localNote(self, idx, "agent: current thread is busy; stop or resolve its pending review first", .{});
+    const end = std.mem.indexOfAny(u8, argument, " \t") orelse argument.len;
+    const name = argument[0..end];
+    const rest = std.mem.trim(u8, argument[end..], " \t");
+    var next_cfg = ai.config.forAgent(self.alloc, self.env_map, name, rest) catch |err| {
+        try localNote(self, idx, "agent: {s}; configuration unchanged", .{@errorName(err)});
+        return;
+    };
+    syncAiSidecars(self) catch |err| {
+        next_cfg.deinit(self.alloc);
+        return err;
+    };
+    dropThreadClient(self, idx); // an idle old ACP connection cannot survive a backend switch
+    if (self.ai.thread_configs.items[idx]) |*old| old.deinit(self.alloc);
+    self.ai.thread_configs.items[idx] = next_cfg;
+    try localNote(self, idx, "agent: {s} · {s}", .{ name, next_cfg.model });
 }
 
 // ---- input ----
 
 pub fn handleAiKey(self: *App, key: vaxis.Key) !void {
+    if (ai.panel.threadStep(key)) |step| {
+        self.pending_window = false;
+        const n = self.ai.threads.items.items.len;
+        if (n > 0) self.aiSelectThread(if (step < 0) (self.ai.threads.active + n - 1) % n else (self.ai.threads.active + 1) % n);
+        return;
+    }
     // Terminal layouts are global controls, also reachable from a prompt.
     if (term.supported and key.mods.alt and !key.mods.ctrl and !key.mods.super) switch (key.codepoint) {
         'r' => return self.toggleTerm(.floating),
@@ -600,7 +743,7 @@ pub fn handleAiKey(self: *App, key: vaxis.Key) !void {
         return;
     }
     if (toolState(self, self.ai.threads.active)) |st| {
-        if (st.acp_permission != null and !key.mods.ctrl and !key.mods.alt and !key.mods.super and (key.codepoint == 'a' or key.codepoint == 'r')) {
+        if (st.acp_permission != null and self.ai.threads.activeThread().input.items.len == 0 and !key.mods.ctrl and !key.mods.alt and !key.mods.super and (key.codepoint == 'a' or key.codepoint == 'r')) {
             decideAcpPermission(self, key.codepoint == 'a');
             return;
         }
@@ -706,7 +849,7 @@ fn handleAgentTerminalKey(self: *App, key: vaxis.Key) !bool {
         return true;
     }
     if (!pending) return false;
-    if (app_agent_terminal.anyJob(self)) return false; // running: only Ctrl+c/cancel
+    if (app_agent_terminal.runningFor(self, self.ai.threads.active)) return false; // running: only Ctrl+c/cancel
     if (key.codepoint == vaxis.Key.enter or key.codepoint == 'a') {
         aiAgentTerminalAllow(self);
         return true;
@@ -804,7 +947,7 @@ fn buildThreadBody(
     include_tools: bool,
     extra_user: ?[]const u8,
 ) !RequestPlan {
-    const cfg = &(self.ai.config orelse return error.ConfigUnavailable);
+    const cfg = try ensureThreadConfig(self, idx);
     const t = &self.ai.threads.items.items[idx];
     const req_msgs = try turn.buildMessages(self.alloc, t.messages.items, extra_user);
     defer self.alloc.free(req_msgs);
@@ -833,17 +976,12 @@ fn ensureThreadClient(self: *App, idx: usize) !*ai.client.Client {
 }
 
 /// Start one stream for `idx`. The caller has already appended any user /
-/// assistant messages; this only cancels other live work, starts the
-/// worker, and flips the thread to streaming.
+/// assistant messages; this starts its independent
+/// worker and flips this thread to streaming.
 fn startThreadRequest(self: *App, idx: usize, plan: *RequestPlan) !void {
-    const cfg = &(self.ai.config orelse return error.ConfigUnavailable);
-    // Exactly one live stream/agent loop at a time (defensive invariant).
-    for (self.ai.threads.items.items, 0..) |_, oi| {
-        if (oi == idx) continue;
-        const streaming = self.ai.threads.cancel(oi);
-        const tool_live = if (toolState(self, oi)) |st| st.active or st.pending_followup else false;
-        if (streaming or tool_live) cancelClient(self, oi);
-    }
+    const cfg = try ensureThreadConfig(self, idx);
+    // Each thread owns its transport and generation; another thread's
+    // stream/tool loop continues while this request starts.
     const client = try ensureThreadClient(self, idx);
     const st_acp = toolState(self, idx);
     const thread_messages = self.ai.threads.items.items[idx].messages.items;
@@ -926,8 +1064,8 @@ fn setStatusMsg(self: *App, text: []const u8) void {
     self.setMsg(copy) catch self.alloc.free(copy);
 }
 
-/// Hint/mouse/keyboard Allow for a staged terminal command. Never called
-/// from the tool protocol path: only an explicit human action reaches this.
+/// Resolve the active thread's ACP review. Automatic decisions use the
+/// same single-use transport reply after conservative classification.
 fn decideAcpPermission(self: *App, allow: bool) void {
     const idx = self.ai.threads.active;
     const st = toolState(self, idx) orelse return;
@@ -1044,13 +1182,14 @@ pub fn aiSend(self: *App) !void {
     if (self.ai.threads.items.items.len == 0) return;
     const idx = self.ai.threads.active;
     const t = &self.ai.threads.items.items[idx];
+    if (try handleLocalCommand(self, idx)) return;
     if (t.status == .streaming) return;
     const prompt = std.mem.trim(u8, t.input.items, " \t\r\n");
     if (prompt.len == 0) return;
     // M3b3: a terminal approval pauses the conversation until the human
     // allows/denies it (or Ctrl+c cancels). Starting a new turn here would
     // race the decision's follow-up.
-    if (app_agent_terminal.anyPending(self) or app_agent_terminal.anyJob(self)) {
+    if (app_agent_terminal.blocksFollowup(self, idx)) {
         setStatusMsg(self, "resolve the pending terminal command first");
         return;
     }
@@ -1351,11 +1490,17 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
                 freed[i] = true;
             },
             .terminal => {
-                // M3b3: stage for explicit per-command human approval, never
-                // execute on receipt. `stageToolCall` only validates and opens
-                // the Terminal review surface; the process is spawned by
-                // `aiAgentTerminalAllow` after a human allows it.
-                const result = app_agent_terminal.stageToolCall(self, idx, msg_index, call);
+                // Manual is the default. /auto admits only classified reads
+                // through the same staged, generation-checked execution path.
+                var automatic = false;
+                if (st.?.approval_mode == .auto) {
+                    var terminal_args = terminal_tool.parseArgs(self.alloc, call.arguments_json) catch null;
+                    if (terminal_args) |*a| {
+                        automatic = permissions.readOnlyCommand(a.command);
+                        a.deinit(self.alloc);
+                    }
+                }
+                const result = app_agent_terminal.stageToolCallReviewed(self, idx, msg_index, call, !automatic);
                 switch (result) {
                     .staged => |staged| {
                         const text = std.fmt.allocPrint(
@@ -1380,6 +1525,10 @@ fn aiHandleToolCalls(self: *App, idx: usize, calls: []ai.tools.ToolCall) void {
                         // No automatic follow-up: the human decision path
                         // (`drainTerminal`/`aiAgentTerminalDeny`) resumes it.
                         st.?.pending_followup = false;
+                        if (automatic) {
+                            setToolNote(self, idx, "auto-approved read-only terminal command; see Terminal for full command and workspace");
+                            resolveTerminalDecision(self, app_agent_terminal.allowForThread(self, idx));
+                        }
                     },
                     .busy => {
                         const text = "error: another terminal command is already pending; not executed";
@@ -1511,7 +1660,7 @@ fn tryUnsupportedToolText(alloc: std.mem.Allocator, name: []const u8) ?[]u8 {
 }
 
 /// Consume finished tool workers. Results apply only to the exact thread and
-/// loop generation that spawned them; anything else (cancel, thread switch,
+/// loop generation that spawned them; anything else (cancel, generation mismatch,
 /// a stopped loop) is freed without touching a transcript.
 pub fn drainToolJobs(self: *App) !bool {
     var changed = false;
@@ -1598,7 +1747,13 @@ pub fn drainAi(self: *App) !bool {
                     }
                     if (toolState(self, idx)) |st| {
                         if (st.acp_permission) |v| self.alloc.free(v);
-                        st.acp_permission = title;
+                        if (st.approval_mode == .auto and permissions.readOnlyAcp(self.alloc, title)) {
+                            client.decidePermission(true);
+                            self.alloc.free(title);
+                            st.acp_permission = null;
+                            setToolNote(self, idx, "auto-approved read-only ACP operation");
+                        } else st.acp_permission = title;
+                        t.auto_scroll = true;
                     } else self.alloc.free(title);
                 },
                 .phase => |phase| {
@@ -1649,7 +1804,7 @@ pub fn drainAi(self: *App) !bool {
             // can reuse the client immediately (no Busy race).
             t.request.finish(self.nowMs());
             client.joinAfterTerminal();
-            if (self.ai.config) |cfg| if (cfg.acp_command != null) {
+            if (threadConfig(self, idx)) |cfg| if (cfg.acp_command != null) {
                 if (toolState(self, idx)) |state| if (state.acp_permission) |v| {
                     self.alloc.free(v);
                     state.acp_permission = null;
@@ -1694,7 +1849,7 @@ pub fn drainAi(self: *App) !bool {
 pub fn aiStatusText(self: *App, a: std.mem.Allocator) !?[]const u8 {
     if (self.ai.threads.items.items.len == 0) return null;
     const t = self.ai.threads.activeThreadConst();
-    const model: []const u8 = if (self.ai.config) |cfg| cfg.model else ai.config.default_model;
+    const model: []const u8 = if (threadConfig(self, self.ai.threads.active)) |cfg| cfg.model else ai.config.default_model;
     return @as(?[]const u8, try std.fmt.allocPrint(a, "agent {s} · {s} · {s}", .{ t.title, model, aiStatusLabelFor(self, self.ai.threads.active) }));
 }
 
@@ -1703,7 +1858,7 @@ pub fn aiStatusText(self: *App, a: std.mem.Allocator) !?[]const u8 {
 pub fn aiStatusTextCompact(self: *App, a: std.mem.Allocator) !?[]const u8 {
     if (self.ai.threads.items.items.len == 0) return null;
     const t = self.ai.threads.activeThreadConst();
-    const model: []const u8 = if (self.ai.config) |cfg| cfg.model else ai.config.default_model;
+    const model: []const u8 = if (threadConfig(self, self.ai.threads.active)) |cfg| cfg.model else ai.config.default_model;
     return @as(?[]const u8, try std.fmt.allocPrint(a, "{s} · {s} · {s}", .{ t.title, model, aiStatusLabelFor(self, self.ai.threads.active) }));
 }
 
@@ -2281,6 +2436,8 @@ fn aiStatusLabelFor(self: *App, idx: usize) []const u8 {
     if (idx < self.ai.threads.items.items.len) {
         if (app_agent_terminal.statusLabelFor(self, idx)) |label| return label;
         if (toolState(self, idx)) |st| {
+            if (st.acp_permission != null) return "approval…";
+            if (self.agent_edit.pending) |p| if (p.thread_index == idx) return "approval…";
             if (st.active or st.pending_followup) return "tools…";
         }
         const t = &self.ai.threads.items.items[idx];
@@ -2471,6 +2628,18 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         const count = try std.fmt.allocPrint(a, "{d}", .{self.ai.threads.items.items.len});
         try segs.append(a, .{ .text = count, .style = header_dim_style });
         var used: u32 = buffer.utf8.displayWidth(heading) + 2 + @as(u32, @intCast(count.len));
+        var reviews: usize = 0;
+        var completed: usize = 0;
+        for (self.ai.threads.items.items, 0..) |thread, idx| {
+            if (std.mem.eql(u8, aiStatusLabelFor(self, idx), "approval…")) reviews += 1;
+            if (thread.unread_done and std.mem.eql(u8, aiStatusLabelFor(self, idx), "done")) completed += 1;
+        }
+        if (reviews > 0 or completed > 0) {
+            const badge = try std.fmt.allocPrint(a, " · review {d} done {d}", .{ reviews, completed });
+            const fit = autil.cellFitPrefix(win, badge, content_w -| used);
+            try segs.append(a, .{ .text = fit.slice, .style = header_dim_style });
+            used += @intCast(fit.cells);
+        }
         // right-aligned "+" affordance (n / + also work from the rail).
         if (content_w >= used + 2) {
             try segs.append(a, .{ .text = try spaces(a, content_w - used - 1), .style = .{ .bg = header_bg } });
@@ -2587,7 +2756,11 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         const active_status_label = aiStatusLabelFor(self, active_idx);
         try segs.append(a, .{ .text = active_status_label, .style = styleOn(railStatusStyle(st, active.status, self.frame_now_ms), st.band_bg) });
         var used: u32 = @intCast(autil.cellWidth(win, active.title) + 3 + autil.cellWidth(win, active_status_label));
-        const model: []const u8 = if (self.ai.config) |cfg| cfg.model else ai.config.default_model;
+        const model: []const u8 = if (threadConfig(self, self.ai.threads.active)) |cfg| cfg.model else ai.config.default_model;
+        if (toolState(self, active_idx)) |state| if (state.approval_mode == .auto and content_w >= used + 7) {
+            try segs.append(a, .{ .text = " · auto", .style = styleOn(st.dim, st.band_bg) });
+            used += 7;
+        };
         const mw = autil.cellWidth(win, model);
         if (content_w >= used + mw + 2) {
             const fit = autil.cellFitSuffix(win, model, content_w -| used -| 1);
@@ -3071,7 +3244,7 @@ fn drawTerminalTab(
     const last = app_agent_terminal.lastCard(self, self.ai.threads.active);
 
     if (pending) |p| {
-        const running = self.agent_terminal.job != null;
+        const running = app_agent_terminal.runningFor(self, self.ai.threads.active);
         lines_bg = st.card_bg;
         if (y < bottom) {
             const icon = if (running) animation.spinnerGlyph(self.frame_now_ms) else "!";
@@ -3195,7 +3368,7 @@ fn drawTerminalTab(
         const line_count: u32 = @intCast(lines.items.len);
         const max_top = line_count -| visible;
         app_agent_terminal.setMaxScroll(self, max_top);
-        const top = @min(self.agent_terminal.scroll, max_top);
+        const top = @min(app_agent_terminal.scrollTop(self), max_top);
         var i: u32 = 0;
         while (i < visible and top + i < line_count) : (i += 1) {
             try drawRailTextRow(self, win, a, y + i, x, w, border_style, lines_bg, lines.items[top + i], styleOn(st.base, lines_bg));
@@ -3330,7 +3503,7 @@ fn appendRequestTelemetryRows(
     try appendWrappedPlain(a, rows, content_w, first, first_style);
 
     if (req.usage) |usage| {
-        const second = if (self.ai.config) |cfg| blk: {
+        const second = if (threadConfig(self, self.ai.threads.active)) |cfg| blk: {
             if (cfg.context_tokens) |limit| {
                 const percent = (@as(u128, usage.total_tokens) * 100) / limit;
                 break :blk try std.fmt.allocPrint(a, "ctx {d}% · in {d} · out {d}", .{
@@ -3377,7 +3550,7 @@ fn drawChatBody(
     }
     var card_rows: std.ArrayList(CardRow) = .empty;
     defer card_rows.deinit(self.alloc);
-    const model: []const u8 = if (self.ai.config) |cfg| cfg.model else ai.config.default_model;
+    const model: []const u8 = if (threadConfig(self, self.ai.threads.active)) |cfg| cfg.model else ai.config.default_model;
 
     for (active.messages.items, 0..) |msg, mi| {
         if (msg.role == .tool) {
@@ -3400,7 +3573,8 @@ fn drawChatBody(
     }
     if (toolState(self, self.ai.threads.active)) |tool_state| {
         if (tool_state.acp_permission) |title| {
-            const notice = try std.fmt.allocPrint(a, "ACP permission: {s} · a allow once / r reject / Ctrl+c cancel", .{title});
+            const details = try permissions.describeAcp(a, title, tool_state.root orelse "unknown");
+            const notice = try std.fmt.allocPrint(a, "ACP permission\n{s}\na allow once / r reject / Ctrl+c cancel", .{details});
             try appendWrappedPlain(a, &rows, content_w, notice, st.error_style);
         }
         if (tool_state.note) |note| {
