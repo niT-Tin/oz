@@ -869,9 +869,9 @@ Narrow drawer 必须有焦点隔离，不能挤压编辑器到不可用宽度；
 
 - `src/ai/workspace.zig: Threads` 持有 session 级 `items` / `active` / `next_number`；`src/app/ai.zig: Session` 另持有一一对应的 `clients`。线程标题由 `next_number` 生成（`thread 1`、`thread 2`…）。
 - 每个线程独立保存 messages、prompt draft、status、error、scroll/auto-scroll、view 尺寸和 cancel_requested；client 与线程索引一一对应。
-- 切换（`select`）离开一个 `streaming` 线程时：该线程 `status = cancelled`、`cancel_requested = true`，App 调 `client.requestCancel()`；transcript 冻结。迟到的 delta 在 `drainAi` 中按线程丢弃（`cancel_requested` 时直接 free，不写入任何 transcript），`applyDelta` 也拒绝非 streaming/已取消线程。
-- 同一时刻最多一个 streaming 线程：新建线程、Ctrl+n、以及 aiSend 的防御性循环都会取消其他 live stream。
-- 切回已取消线程显示冻结的 transcript（含 `[stream cancelled]` 标记），不会被后续事件修改；各线程的请求体只包含自己的 messages（验证见 e2e `thread B streams while A is frozen`）。
+- 切换（`select`）只改变可见线程，原线程继续运行；只有显式 Ctrl+c 会取消当前线程，按 generation 丢弃取消后的迟到事件。
+- 各线程独立拥有 transport、配置、工具循环、终端进程与审批状态，可以同时 streaming；新建线程与切换不取消任何其他任务。
+- 切回已取消线程显示冻结的 transcript（含 `[stream cancelled]` 标记），不会被后续事件修改；各线程的请求体只包含自己的 messages（验证见 e2e `threads stream in parallel` 和屏障控制的 ACP A 晚于 B 测试）。
 - 关闭 rail 不删除线程、不取消流；workspace 切换也不动 `App.ai`；不落盘。
 
 **范围与限制**
@@ -1431,16 +1431,16 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 
 **范围与策略**
 
-- 新增 `terminal` agent tool：让模型请求**一条**非交互 shell 命令，但**绝不自动执行**。每个命令先在 App 层 stage 为 pending approval；只有人工 Allow 后才 spawn。它不是通用 shell UI，也不是第二个编辑器终端：无 PTY、无按键转发、无 scrollback；既有 `Alt+r` 终端（`src/term.zig`/`src/app/terminal.zig`）完全不改。
-- 一个 session 同时最多一个 terminal approval/命令（比“每 thread 一个”更严格）；第二个 `terminal` 调用得到真实错误卡片/`role:"tool"` 结果，不排队。
+- 新增 `terminal` agent tool：让模型请求**一条**非交互 shell 命令。默认人工 Allow；线程显式 `/auto` 后，仅已知只读命令走同一 Allow 路径自动获准。每个命令先在 App 层 stage。它不是通用 shell UI，也不是第二个编辑器终端：无 PTY、无按键转发、无 scrollback；既有 `Alt+r` 终端（`src/term.zig`/`src/app/terminal.zig`）完全不改。
+- 每线程同时最多一个 terminal approval/命令；同一线程的第二个 terminal 调用得到真实 busy，不排队，其他线程保有独立槽位。
 - pending approval 按 thread 隔离并跨线程切换保留（隐藏、无进程）；运行中的命令在离开其 thread / Ctrl+c 时被真实 kill，结果丢弃（避免未观察 thread 的后台惊喜）。文件 review（`agent_edit`）仍是独立槽位，互不清除。
-- 只有人工动作能触发执行：`stageToolCall` 不 spawn，`Job.start` 只被 `allow` 调用；模型 follow-up 文本、工具协议本身都不会执行命令。pending 期间该 thread 的自动 follow-up 被挂起（`maybeFollowup` 检测 pending/job，settle 到 idle），Allow/Deny 后才带上真实结果恢复 loop，因此模型看到的是最终输出/exit code，而不是“staged”。
+- `stageToolCall` 不 spawn，`Job.start` 只被 generation 检查后的 Allow 路径调用；manual 需人工动作，auto 需通过保守只读分类。pending 期间该 thread 的自动 follow-up 被挂起（`maybeFollowup` 检测 pending/job，settle 到 idle），Allow/Deny 后才带上真实结果恢复 loop，因此模型看到的是最终输出/exit code，而不是“staged”。
 - 文件 diff/审批与 terminal 审批可共存；terminal 的 Allow 不阻塞已 staged 的文件 review，文件 review 的后续本地决定仍不回写模型 transcript（§20.9 的既有限制）。
 
 **工具协议（`src/ai/tools.zig`）**
 
 - `definitions` 增加 `terminal`，严格 schema：`{ command: string, timeout_ms?: integer 100..10000 }`，`required: ["command"]`，`additionalProperties: false`；description 明确“以用户权限在 workspace root 运行、运行前必须人工批准、无沙箱/无网络隔离、输出 64 KiB / 时间 100–10000 ms”。`tools` 与 `tool_choice:"auto"` 不变。
-- `tools.Permission`：terminal 恒为 `confirm`；`Policy` 删除 `allow_terminal`，不存在任何 auto-allow 开关。未知工具仍 `deny`。
+- `tools.Permission`：terminal 恒为 `confirm`；`Policy` 删除 `allow_terminal`，App 层单独处理线程 opt-in 的只读自动审批。未知工具仍 `deny`。
 - `src/ai/tool_exec.zig` 仍把 `terminal` 返回 `unsupported`（防御性），read-only executor 没有任何 shell/spawn 路径；正常执行只走 App 的 dedicated job。
 
 **Staging 与校验（`src/app/agent_terminal.zig` + `src/ai/terminal_tool.zig`）**
@@ -1456,15 +1456,15 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 - 输出：poll(2) 循环读 stdout/stderr，最多保存 64 KiB **合并**输出（另计 dropped bytes）；超过上限继续读并丢弃，子进程不会因管道满而阻塞。逐次 poll 不阻塞 UI；worker 线程独立。
 - 时间：`timeout_ms` 100–10000（默认 5000）；watchdog 线程 5 ms 粒度检查 deadline/cancel，到点/取消向 `-pid` 发 SIGKILL，杀掉整个进程组；worker wait 返回后 join watchdog。spawn 失败/read 失败/nonzero/signal 都产生真实 `.err` 结果，不伪造成功。
 - 结果文本含 `error: exit code N` / `exit: 0` / `signal` / `timeout; process group killed` + `duration` + 可选 `output_truncated: N bytes dropped` + `---` + bounded output；经 `tools.buildToolResultContent` 再套 64 KiB/UTF-8 协议上限。卡片的展示文本是 status + 截断标记 + 首行 excerpt。
-- timeout/cancel 后结果仍回到模型（timeout 是 error result，模型可恢复）；用户显式 Ctrl+c / 切线程导致的 cancel 不发 follow-up（与既有取消语义一致，transcript 冻结）。
+- timeout/cancel 后结果仍回到模型（timeout 是 error result，模型可恢复）；用户显式 Ctrl+c 导致的 cancel 不发 follow-up（与既有取消语义一致，transcript 冻结）。
 
 **决策与线程策略**
 
 - Deny（Terminal tab `r`/`d`、hint/mouse）：不 spawn，卡片 `rejected`，metrics `denied`，`role:"tool"` 结果更新为 `denied: user rejected the command; not executed`，随后恢复 follow-up。文件/进程均未改变。
 - Allow（`a`/Enter、hint/mouse）：spawn；卡片 `running`；完成后 `ok`/`error`，记录真实 duration；恢复 follow-up。spawn 前若 thread 已取消/失败则不执行，卡片 `cancelled`。
 - Ctrl+c：`cancelForThread` 将 pending/running 命令标记 `cancelled`、清 pending、requestCancel（真实 kill）；线程标 cancelled，无 follow-up。`deinitAi`/`App.destroy` 会 join job，避免进程泄漏。
-- 线程切换：pending approval 保留（隐藏）；running 命令 kill、卡片 `cancelled`、结果丢弃。回到原 thread 后 badge/tab 重新可见。terminal 状态在 thread list/workbench header 显示 `approval…` / `terminal…`（不是 `idle`）。
-- pending/running 期间 `aiSend` 拒绝新 prompt（`resolve the pending terminal command first`），因为该 turn 的 follow-up 尚未完成；切线程仍允许（pending 隐藏保留）。
+- 线程切换保留该线程 pending approval 与 running 命令；回到原 thread 后可继续审批或查看真实结果。Terminal 状态按线程显示 `approval…` / `terminal…`，后台任务完成显示 `done`；顶部汇总 review/done 数量。
+- 当前线程 pending/running 期间 `aiSend` 拒绝新 prompt（`resolve the pending terminal command first`），因为该 turn 的 follow-up 尚未完成；切线程仍允许（pending 隐藏保留）。
 
 **UI（`src/app/ai.zig`）**
 
@@ -1651,3 +1651,14 @@ document version must match the client's latest sent version before replacing
 the current list (including empty lists). The client advertises version support;
 missing/null versions remain accepted for servers such as ZLS, whose
 unversioned publications cannot be reliably dated by the client.
+
+
+### 22.3 每线程 Agent 工作流（2026-11-17）
+
+- `<Space>a` 打开后，`Ctrl-w h/j/k/l/w` 回到编辑区，草稿保留；`Ctrl-w a` 回线程列表。`Ctrl-PageUp/Down` 从输入框或列表切换线程；`Ctrl-n` 新建。切换不取消，Ctrl+c 只取消当前线程。
+- 本地命令在发送模型前解析：`/threads` 展开列表；`/thread <id>|next|prev`；`/new [backend]`；`/agent builtin|codex|kimi|deepseek|default`；`/agent acp <JSON argv>`；`/model <native-model-id>`。环境变量仍提供默认值，线程覆盖互相独立；新建线程使用默认配置。ACP 启动命令可带工作目录（preset 后的余下文本），ACP 的模型由该 harness 配置，不冒充支持通用动态模型协商。运行/待审批期间拒绝替换后端配置；空闲替换仅释放当前线程的旧连接。
+- 每线程初始为 manual；`/auto` 只自动批准明确只读操作，`/manual` 恢复逐次审批。自动允许的 shell 命令限定 `pwd/ls/cat/head/tail/wc/rg`；替换、重定向、复合 shell、脚本、rg 外部 helper、未知命令均需手动决定。不是 shell 沙箱。编辑、patch、删除、覆盖始终保留审核；新线程不继承 auto。切换 auto 时已挂起的明确只读审批也会应用同一规则。
+- ACP 只发送 `allow_once`；按 kind 加 rawInput 判断，kind=read 却携带删除命令不会获准。未知输入需人工决定。审批展示 Action、Kind、captured Workspace 和原始参数，a/r 单次决策；输入非空时 a/r 属于草稿，不会吞掉 `/manual` 等命令。
+- Terminal 按线程拥有 pending、job、generation 与滚动状态。自动允许仍经过 staging 和同一 Allow 路径，有可检查的卡片、完整命令和工作目录；不会抢焦点。后台 edit review 不会切走当前线程；原有跨文件事务仍一次只审核一组 diff，后来的编辑请求会明确报 busy，不会覆盖旧 review。
+- 浮动终端在 Agent 面板之后绘制，覆盖区域的鼠标事件优先交给浮动终端；普通底部/右侧终端保持布局语义。
+- 新行为由 `agent workflow:` PTY、纯 `auto policy:` / `threads parallel:` 测试覆盖。并行测试使用文件屏障，明确 B 已完成后才允许 A 返回；取消测试检查实际磁盘副作用，不能只根据屏幕上出现 cancelled 推断进程停止。

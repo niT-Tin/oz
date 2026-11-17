@@ -15,8 +15,8 @@
 //!     auto-allows writes or terminal access by default.
 //!
 //! `terminal` is advertised with a strict schema, but this module never runs
-//! anything: the App stages it for explicit human approval (M3b3). Its
-//! permission is always `confirm` — there is no policy switch that can
+//! anything: the App stages it for approval (manual by default). Its
+//! permission is always `confirm` — only the host may
 //! auto-allow shell execution. Content deltas are not accumulated here; the
 //! existing `openai.parseDelta`/client path already owns that stream. The
 //! accumulator only records whether text was seen alongside tool calls.
@@ -214,7 +214,7 @@ pub const definitions = [_]Definition{
     .{
         .kind = .terminal,
         .name = "terminal",
-        .description = "Run ONE shell command with the user's own permissions in the workspace root. Requires explicit user approval before it runs; never executes automatically. Not sandboxed and not network-restricted. Combined output is capped at 64 KiB and runtime at 100-10000 ms (process group killed on timeout).",
+        .description = "Run ONE shell command with the user's own permissions in the workspace root. Requires host approval before it runs; manual review is the default, opt-in auto mode admits only known read-only commands. Not sandboxed and not network-restricted. Combined output is capped at 64 KiB and runtime at 100-10000 ms (process group killed on timeout).",
         .parameters_json = terminal_parameters,
     },
 };
@@ -842,7 +842,7 @@ pub fn decideWith(policy: Policy, tool_name: []const u8, arguments_json: []const
         .read_file, .list_directory, .grep => if (policy.allow_reads) .allow else .confirm,
         .edit_file, .apply_patch => if (policy.allow_writes) .allow else .confirm,
         // No policy switch can auto-allow shell execution: terminal is
-        // confirm (human allow) or deny (unknown names) only.
+        // confirm (host review) or deny (unknown names) only.
         .terminal => .confirm,
     };
 }

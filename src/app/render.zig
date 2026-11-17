@@ -3523,11 +3523,11 @@ pub fn render(self: *App) !void {
         // (rendered after that loop) would never draw over it — draw it
         // here too, or <leader>e on the dashboard shows a stale screen
         if (self.filetree_active) try renderNavigator(self, a, win, height);
-        if (term.supported) try self.drawTerm(a, win);
         // <leader>a works on the dashboard too: draw the rail last (it
         // places the cursor only when the rail/prompt owns focus; otherwise
         // the dashboard's recent-row cursor stays visible).
         if (self.ai.rail_open) try self.drawAiRail(a, win);
+        if (term.supported) try self.drawTerm(a, win);
         // M2b2 inline prompt floats above the rail; hint labels remain the
         // topmost overlay below.
         if (self.inlinePromptOpen()) try self.drawInlinePrompt(a, win);
@@ -3758,14 +3758,12 @@ pub fn render(self: *App) !void {
         }
     }
 
-    // embedded terminal overlay: drawn after the panes so it covers
-    // them; the modal overlays below float above it
-    if (term.supported) try self.drawTerm(a, win);
-
-    // Agent Rail / drawer (M2a): drawn after the editor panes and terminal
-    // so it covers exactly its reserved cells. Pickers/hovers below are
+    // Pane surfaces first; the terminal then covers their shared rectangle.
+    // Global modal overlays below retain their matching input priority.
+    // Agent Rail / drawer (M2a): above editor panes, below terminal content. Pickers/hovers below are
     // genuine modal overlays and may draw above it.
     if (self.ai.rail_open) try self.drawAiRail(a, win);
+    if (term.supported) try self.drawTerm(a, win);
 
     // Inline edit prompt (M2b2): a compact centered float above the rail and
     // editor, below the hint overlay. It owns a beam cursor while open.

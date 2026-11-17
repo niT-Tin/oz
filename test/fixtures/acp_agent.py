@@ -51,9 +51,34 @@ for line in sys.stdin:
         elif mode == 'oversized':
             sys.stdout.write('x' * (8 * 1024 * 1024 + 1) + '\n')
             sys.stdout.flush()
-        elif mode == 'permission':
+        elif mode == 'barrier':
+            from pathlib import Path
+            root = Path(sys.argv[2])
+            label = sys.argv[3]
+            update('START_' + label + '_' + str(turn))
+            (root / (label + '-ready-' + str(turn))).write_text('ready\n')
+            if label == 'A':
+                release = root / ('release-A-' + str(turn))
+                deadline = time.monotonic() + 25
+                while not release.exists():
+                    if time.monotonic() > deadline:
+                        raise RuntimeError('fixture release barrier timed out')
+                    time.sleep(.01)
+            update('FINISH_' + label + '_' + str(turn))
+            result(rid, {'stopReason': 'end_turn'})
+            (root / (label + '-done-' + str(turn))).write_text('done\n')
+        elif mode.startswith('permission'):
             pending = rid
-            send({'jsonrpc': '2.0', 'id': 'permission/string-id', 'method': 'session/request_permission', 'params': {'sessionId': 's1', 'toolCall': {'title': 'fixture command'}, 'options': [{'optionId': 'yes', 'kind': 'allow_once'}, {'optionId': 'no', 'kind': 'reject_once'}]}})
+            call = {'title': 'fixture command'}
+            if mode != 'permission':
+                call = {'title': 'Inspect source' if mode == 'permission-read' else 'Change source',
+                        'kind': 'read' if mode in ('permission-read', 'permission-disguised') else 'edit',
+                        'rawInput': {'path': 'source.txt'} if mode == 'permission-read' else {'command': 'rm source.txt'}}
+            if mode == 'permission-missing-input':
+                call = {'title': 'Unspecified action', 'kind': 'read'}
+            elif mode == 'permission-top-command':
+                call = {'title': 'Read source', 'kind': 'read', 'rawInput': {'path': 'source.txt'}, 'command': 'rm source.txt'}
+            send({'jsonrpc': '2.0', 'id': 'permission/string-id' , 'method': 'session/request_permission', 'params': {'sessionId': 's1', 'toolCall': call, 'options': [{'optionId': 'yes', 'kind': 'allow_once'}, {'optionId': 'no', 'kind': 'reject_once'}]}})
         else:
             if mode == 'edit':
                 from pathlib import Path

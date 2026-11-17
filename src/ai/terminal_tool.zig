@@ -10,16 +10,16 @@
 //!     command/timeout, bounds and escapes display text, accumulates bounded
 //!     output, and formats a truthful tool result. `app/terminal_job.zig`
 //!     owns the real POSIX spawn/kill/read loop; `app/agent_terminal.zig`
-//!     owns staging and the explicit human approval.
+//!     owns per-thread staging and approval.
 //!
 //! ## Security posture (documented, not a sandbox)
 //!
 //! The command is executed **verbatim** with the user's permissions once a
-//! human explicitly allows it. There is no sandbox, no seccomp, no container,
+//! human allows it or the thread opts into conservative read-only auto approval. There is no sandbox, no seccomp, no container,
 //! no network restriction and no shell-injection mitigation: shell syntax is
 //! the point of the tool. The guarantees are bounded, not hermetic:
 //!
-//!   - no automatic execution — approval is explicit for every command;
+//!   - manual by default; unknown or mutating commands always require review;
 //!   - a bounded environment (`env_allowlist`) instead of the full process
 //!     environment;
 //!   - cwd fixed to the thread's captured workspace root;

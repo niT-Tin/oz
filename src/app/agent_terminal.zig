@@ -1,32 +1,7 @@
-//! `terminal` tool staging and explicit approval (M3b3) — App-facing half.
-//!
-//! Flow (one command at a time, session-wide):
-//!
-//!   streamed `terminal` call
-//!     -> `stageToolCall` validates command/timeout and stages a Pending
-//!        (no process; card `approval required`; rail switches to Terminal)
-//!     -> human presses/hints/clicks Allow   -> Job.start (`/bin/sh -c`)
-//!     -> human presses/hints/clicks Deny    -> card `rejected`, no process
-//!     -> Ctrl+c / thread switch while running -> process group killed
-//!     -> command finishes -> `drain` fills the card/result and the App
-//!        resumes the model follow-up with the real output/exit status.
-//!
-//! There is no automatic execution path: `stageToolCall` never spawns, and
-//! `terminal_job.Job.start` is reachable only from `allow`. The executor in
-//! `ai/tool_exec.zig` remains read-only and never sees this tool.
-//!
-//! Policy decisions (documented in DESIGN §20.12):
-//!   - At most one terminal approval/command exists per session (stricter
-//!     than per thread). A second terminal call is refused with a real error.
-//!   - A pending *approval* is thread-scoped and survives a thread switch
-//!     (hidden, no process spawned). It blocks new user turns until resolved.
-//!   - A *running* command is killed when its thread is left, and on Ctrl+c;
-//!     its result is discarded and the card becomes `cancelled`. This avoids
-//!     completed background surprises in a thread the user did not watch.
-//!   - File reviews (`agent_edit`) are independent and keep their own slot;
-//!     a pending terminal does not clear or cancel a staged diff.
-//!   - No sandbox is claimed: the command runs with the user's permissions in
-//!     the captured workspace root with a filtered environment and empty stdin.
+//! Per-thread terminal approval and process ownership. Switching threads keeps
+//! jobs running; only explicit cancellation or shutdown kills the owner job.
+//! Manual approval is the default. Auto approval uses the same generation-
+//! checked execution path after conservative classification by the caller.
 const std = @import("std");
 
 const app_mod = @import("../app.zig");
@@ -91,43 +66,49 @@ pub const Session = struct {
     max_scroll: u32 = 0,
 };
 
+fn stateFor(self: *App, idx: usize) ?*Session {
+    if (idx >= self.ai.tool_states.items.len) return null;
+    return &self.ai.tool_states.items[idx].terminal;
+}
+
 pub fn deinitAgentTerminal(self: *App) void {
-    if (self.agent_terminal.job) |job| {
-        job.requestCancel();
-        job.deinit();
-        self.agent_terminal.job = null;
+    for (self.ai.tool_states.items, 0..) |_, idx| {
+        const state = stateFor(self, idx).?;
+        if (state.job) |job| {
+            job.requestCancel();
+            job.deinit();
+        }
+        if (state.pending) |*p| p.deinit(self.alloc);
+        state.* = .{};
     }
-    if (self.agent_terminal.pending) |*p| p.deinit(self.alloc);
-    self.agent_terminal.pending = null;
-    self.agent_terminal.scroll = 0;
-    self.agent_terminal.max_scroll = 0;
 }
-
 pub fn pendingVisible(self: *App) bool {
-    const p = if (self.agent_terminal.pending) |*pp| pp else return false;
-    return p.thread_index == self.ai.threads.active;
+    const state = stateFor(self, self.ai.threads.active) orelse return false;
+    return state.pending != null;
 }
-
-/// Visible badge count for the Terminal tab (0/1). No fabricated count.
 pub fn pendingCount(self: *App) u32 {
     return if (pendingVisible(self)) 1 else 0;
 }
-
 pub fn anyPending(self: *App) bool {
-    return self.agent_terminal.pending != null;
+    for (self.ai.tool_states.items) |*st| if (st.terminal.pending != null) return true;
+    return false;
 }
-
 pub fn anyJob(self: *App) bool {
-    return self.agent_terminal.job != null;
+    for (self.ai.tool_states.items) |*st| if (st.terminal.job != null) return true;
+    return false;
 }
-
-/// Thread-list/workbox status override while a terminal command awaits or
-/// runs. Returns null when this thread has no terminal state.
+pub fn runningFor(self: *App, idx: usize) bool {
+    const state = stateFor(self, idx) orelse return false;
+    return state.job != null;
+}
+pub fn scrollTop(self: *App) u32 {
+    const state = stateFor(self, self.ai.threads.active) orelse return 0;
+    return state.scroll;
+}
 pub fn statusLabelFor(self: *App, idx: usize) ?[]const u8 {
-    if (self.agent_terminal.job != null and self.agent_terminal.job_thread == idx) return "terminal…";
-    if (self.agent_terminal.pending) |p| {
-        if (p.thread_index == idx) return "approval…";
-    }
+    const state = stateFor(self, idx) orelse return null;
+    if (state.job != null) return "terminal…";
+    if (state.pending != null) return "approval…";
     return null;
 }
 
@@ -167,7 +148,12 @@ pub fn stageToolCall(
     card_index: usize,
     call: ai.tools.ToolCall,
 ) StageResult {
-    if (self.agent_terminal.pending != null or self.agent_terminal.job != null) return .busy;
+    return stageToolCallReviewed(self, thread_index, card_index, call, true);
+}
+
+pub fn stageToolCallReviewed(self: *App, thread_index: usize, card_index: usize, call: ai.tools.ToolCall, show_review: bool) StageResult {
+    const state = stateFor(self, thread_index) orelse return .oom;
+    if (state.pending != null or state.job != null) return .busy;
 
     if (thread_index >= self.ai.tool_states.items.len) {
         return failFmt(self.alloc, "workspace root unavailable", .{});
@@ -204,7 +190,7 @@ pub fn stageToolCall(
         return .oom;
     };
 
-    self.agent_terminal.pending = .{
+    state.pending = .{
         .thread_index = thread_index,
         .card_index = card_index,
         .command = command,
@@ -213,9 +199,9 @@ pub fn stageToolCall(
         .root = root_copy,
         .generation = st.generation,
     };
-    self.agent_terminal.scroll = 0;
-    self.agent_terminal.max_scroll = 0;
-    openSurface(self);
+    state.scroll = 0;
+    state.max_scroll = 0;
+    if (show_review and thread_index == self.ai.threads.active) openSurface(self);
     return .{ .staged = .{ .timeout_ms = timeout_ms } };
 }
 
@@ -291,33 +277,35 @@ fn recordDenied(self: *App, thread_index: usize) void {
     );
 }
 
-fn clearPending(self: *App) void {
-    if (self.agent_terminal.pending) |*p| p.deinit(self.alloc);
-    self.agent_terminal.pending = null;
-    self.agent_terminal.scroll = 0;
-    self.agent_terminal.max_scroll = 0;
+fn clearPending(self: *App, idx: usize) void {
+    const state = stateFor(self, idx) orelse return;
+    if (state.pending) |*p| p.deinit(self.alloc);
+    state.pending = null;
+    state.scroll = 0;
+    state.max_scroll = 0;
 }
 
 /// Explicit Allow: spawn the approved command in a background job. Every
 /// failure path produces a real error card and resumes the loop so the model
 /// can recover; nothing is faked as success.
 pub fn allow(self: *App) Decision {
-    const p = if (self.agent_terminal.pending) |*pp| pp else return .none;
-    if (!pendingVisible(self)) {
-        msg(self, "terminal: switch to its thread first");
-        return .none;
-    }
-    if (self.agent_terminal.job != null) return .none;
+    return allowForThread(self, self.ai.threads.active);
+}
+
+pub fn allowForThread(self: *App, idx: usize) Decision {
+    const state = stateFor(self, idx) orelse return .none;
+    const p = if (state.pending) |*pp| pp else return .none;
+    if (state.job != null) return .none;
     const thread_index = p.thread_index;
     const card_index = p.card_index;
     const generation = p.generation;
     if (thread_index >= self.ai.threads.items.items.len) return .none;
     const t = &self.ai.threads.items.items[thread_index];
-    if (t.cancel_requested or t.status == .err) {
+    if (t.cancel_requested or t.status == .err or self.ai.tool_states.items[thread_index].generation != generation) {
         // The turn was cancelled/failed; never start a process from a stale
         // approval surface.
         setCard(self, thread_index, card_index, .cancelled, "cancelled · not executed", "cancelled: not executed", 0);
-        clearPending(self);
+        clearPending(self, thread_index);
         return .none;
     }
 
@@ -325,7 +313,7 @@ pub fn allow(self: *App) Decision {
         const text = "error: terminal execution is not supported on this platform";
         setCard(self, thread_index, card_index, .err, text, text, 0);
         recordExecution(self, thread_index, .err, 0);
-        clearPending(self);
+        clearPending(self, thread_index);
         return .{ .followup = thread_index };
     }
 
@@ -348,13 +336,13 @@ pub fn allow(self: *App) Decision {
         const shown = text orelse "error: terminal execution failed to start";
         setCard(self, thread_index, card_index, .err, shown, shown, 0);
         recordExecution(self, thread_index, .err, 0);
-        clearPending(self);
+        clearPending(self, thread_index);
         return .{ .followup = thread_index };
     };
 
-    self.agent_terminal.job = job;
-    self.agent_terminal.job_thread = thread_index;
-    self.agent_terminal.job_generation = generation;
+    state.job = job;
+    state.job_thread = thread_index;
+    state.job_generation = generation;
 
     // Keep it visible as `running`; the real exit code/duration/output
     // replace this in `drain`.
@@ -366,19 +354,16 @@ fn failAllowOom(self: *App, thread_index: usize, card_index: usize) Decision {
     const text = "error: out of memory";
     setCard(self, thread_index, card_index, .err, text, text, 0);
     recordExecution(self, thread_index, .err, 0);
-    clearPending(self);
+    clearPending(self, thread_index);
     return .{ .followup = thread_index };
 }
 
 /// Explicit Deny: no process is spawned. The model receives a truthful
 /// denied/not-executed tool result once the loop resumes.
 pub fn deny(self: *App) Decision {
-    const p = if (self.agent_terminal.pending) |*pp| pp else return .none;
-    if (!pendingVisible(self)) {
-        msg(self, "terminal: switch to its thread first");
-        return .none;
-    }
-    if (self.agent_terminal.job != null) return .none; // already running
+    const state = stateFor(self, self.ai.threads.active) orelse return .none;
+    const p = if (state.pending) |*pp| pp else return .none;
+    if (state.job != null) return .none; // already running
     const thread_index = p.thread_index;
     const card_index = p.card_index;
     setCard(
@@ -391,7 +376,7 @@ pub fn deny(self: *App) Decision {
         0,
     );
     recordDenied(self, thread_index);
-    clearPending(self);
+    clearPending(self, thread_index);
     msg(self, "terminal command denied");
     return .{ .followup = thread_index };
 }
@@ -400,10 +385,11 @@ pub fn deny(self: *App) Decision {
 /// Kills a running command (real process-group kill) and freezes the card as
 /// cancelled; no follow-up is sent because the turn itself is cancelled.
 pub fn cancelForThread(self: *App, thread_index: usize) bool {
-    const p = if (self.agent_terminal.pending) |*pp| pp else return false;
+    const state = stateFor(self, thread_index) orelse return false;
+    const p = if (state.pending) |*pp| pp else return false;
     if (p.thread_index != thread_index) return false;
     const card_index = p.card_index;
-    if (self.agent_terminal.job) |job| {
+    if (state.job) |job| {
         job.requestCancel();
         setCard(self, thread_index, card_index, .cancelled, "cancelled · command stopped", "cancelled: not executed", 0);
     } else {
@@ -417,46 +403,31 @@ pub fn cancelForThread(self: *App, thread_index: usize) bool {
         t.cancel_requested = true;
         t.status = .cancelled;
     }
-    clearPending(self);
+    clearPending(self, thread_index);
     return true;
 }
 
-/// Leaving a thread: a running command is killed (and its result discarded);
-/// a not-yet-approved command is preserved hidden for that thread.
-pub fn leaveThread(self: *App, prev_index: usize) void {
-    const p = if (self.agent_terminal.pending) |*pp| pp else return;
-    if (p.thread_index != prev_index) return;
-    if (self.agent_terminal.job == null) return; // pending approval survives
-    self.agent_terminal.job.?.requestCancel();
-    setCard(self, prev_index, p.card_index, .cancelled, "cancelled · command stopped", "cancelled: not executed", 0);
-    if (prev_index < self.ai.tool_states.items.len) {
-        self.ai.tool_states.items[prev_index].pending_followup = false;
-    }
-    clearPending(self);
-}
-
 pub fn scrollBy(self: *App, delta: i64) void {
-    const max = self.agent_terminal.max_scroll;
-    var top: i64 = @intCast(@min(self.agent_terminal.scroll, max));
+    const state = stateFor(self, self.ai.threads.active) orelse return;
+    const max = state.max_scroll;
+    var top: i64 = @intCast(@min(state.scroll, max));
     top += delta;
     if (top < 0) top = 0;
     if (top > max) top = @intCast(max);
-    self.agent_terminal.scroll = @intCast(top);
+    state.scroll = @intCast(top);
 }
 
 pub fn setMaxScroll(self: *App, max: u32) void {
-    self.agent_terminal.max_scroll = max;
-    if (self.agent_terminal.scroll > max) self.agent_terminal.scroll = max;
+    const state = stateFor(self, self.ai.threads.active) orelse return;
+    state.max_scroll = max;
+    if (state.scroll > max) state.scroll = max;
 }
 
 /// Whether an awaiting/running terminal command in `idx` must pause that
 /// thread's automatic model follow-up until a human decides.
 pub fn blocksFollowup(self: *App, idx: usize) bool {
-    if (self.agent_terminal.pending) |p| {
-        if (p.thread_index == idx) return true;
-    }
-    if (self.agent_terminal.job != null and self.agent_terminal.job_thread == idx) return true;
-    return false;
+    const state = stateFor(self, idx) orelse return false;
+    return state.pending != null or state.job != null;
 }
 
 pub const DrainResult = struct {
@@ -470,34 +441,42 @@ pub const DrainResult = struct {
 /// approval and loop generation still match; otherwise the result is freed
 /// without touching any transcript.
 pub fn drain(self: *App) DrainResult {
-    const job = self.agent_terminal.job orelse return .{};
+    for (self.ai.tool_states.items, 0..) |_, idx| {
+        const result = drainThread(self, idx);
+        if (result.changed) return result;
+    }
+    return .{};
+}
+fn drainThread(self: *App, idx: usize) DrainResult {
+    const state = stateFor(self, idx) orelse return .{};
+    const job = state.job orelse return .{};
     if (!job.isDone()) return .{};
-    const job_thread = self.agent_terminal.job_thread;
-    const job_generation = self.agent_terminal.job_generation;
+    const job_thread = state.job_thread;
+    const job_generation = state.job_generation;
 
     var result = job.takeResult();
     job.deinit();
-    self.agent_terminal.job = null;
+    state.job = null;
     defer result.deinit(self.alloc);
 
-    const p = if (self.agent_terminal.pending) |*pp| pp else {
-        // Cancelled/left thread: result already discarded by policy.
+    const p = if (state.pending) |*pp| pp else {
+        // Explicitly cancelled: result already discarded by policy.
         return .{ .changed = true };
     };
     if (p.thread_index != job_thread or job_generation != p.generation) {
         // The approval was superseded (e.g. cancelClient bumped generation).
         // Do not apply a stale result; freeze the card truthfully.
         setCard(self, p.thread_index, p.card_index, .cancelled, "cancelled · result discarded", "cancelled: result discarded", 0);
-        clearPending(self);
+        clearPending(self, idx);
         return .{ .changed = true };
     }
     if (job_thread >= self.ai.threads.items.items.len or job_thread >= self.ai.tool_states.items.len) {
-        clearPending(self);
+        clearPending(self, idx);
         return .{ .changed = true };
     }
     const t = &self.ai.threads.items.items[job_thread];
     if (t.cancel_requested) {
-        clearPending(self);
+        clearPending(self, idx);
         return .{ .changed = true };
     }
 
@@ -506,7 +485,7 @@ pub fn drain(self: *App) DrainResult {
 
     if (result.status == .cancelled) {
         setCard(self, thread_index, card_index, .cancelled, "cancelled · command stopped", "cancelled: not executed", 0);
-        clearPending(self);
+        clearPending(self, idx);
         return .{ .changed = true };
     }
 
@@ -514,12 +493,12 @@ pub fn drain(self: *App) DrainResult {
     // output + truncation marker), then reuse the protocol's 64 KiB/UTF-8
     // bound. The card text is a separate, shorter excerpt.
     const content = terminal_tool.buildResultContent(self.alloc, result.meta, result.output) catch {
-        clearPending(self);
+        clearPending(self, idx);
         return .{ .changed = true };
     };
     defer self.alloc.free(content);
     const api = ai.tools.buildToolResultContent(self.alloc, .{ .output = content }, .{}) catch {
-        clearPending(self);
+        clearPending(self, idx);
         return .{ .changed = true };
     };
     defer self.alloc.free(api);
@@ -541,7 +520,7 @@ pub fn drain(self: *App) DrainResult {
         result.meta.duration_ms,
     );
     recordExecution(self, thread_index, if (ok) .ok else .err, result.meta.duration_ms);
-    clearPending(self);
+    clearPending(self, idx);
     return .{ .changed = true, .resume_thread = thread_index };
 }
 
@@ -602,6 +581,7 @@ pub fn lastCard(self: *App, thread_index: usize) ?*const ws.Message {
 
 /// The visible pending approval, if any (Terminal tab rendering).
 pub fn visiblePending(self: *App) ?*const Pending {
-    if (!pendingVisible(self)) return null;
-    return &self.agent_terminal.pending.?;
+    const state = stateFor(self, self.ai.threads.active) orelse return null;
+    if (state.pending == null) return null;
+    return &state.pending.?;
 }
