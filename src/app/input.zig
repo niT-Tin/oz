@@ -268,9 +268,9 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
             !key.mods.ctrl and !key.mods.alt and !key.mods.super and
             key.codepoint != vaxis.Key.escape)
         {
-            const ch = key.text.?[0];
+            const text = key.text.?;
             self.pending_replace = null;
-            try self.replaceCharsAtCursor(ch, pr.count);
+            try self.replaceCharsAtCursor(text, pr.count);
             return;
         }
         // Esc / anything else cancels the pending replace

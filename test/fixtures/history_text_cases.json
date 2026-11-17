@@ -1,0 +1,346 @@
+[
+  {
+    "issue": 13,
+    "label": "forward till Unicode",
+    "suffix": ".txt",
+    "text": "a中🙂_tail\n",
+    "keys": "ldt_",
+    "want": "a_tail\n"
+  },
+  {
+    "issue": 13,
+    "label": "forward change till Unicode",
+    "suffix": ".txt",
+    "text": "a中🙂_tail\n",
+    "keys": "lct_X\u0003",
+    "want": "aX_tail\n"
+  },
+  {
+    "issue": 13,
+    "label": "counted forward till",
+    "suffix": ".txt",
+    "text": "a_b_c_d\n",
+    "keys": "d2t_",
+    "want": "_c_d\n"
+  },
+  {
+    "issue": 13,
+    "label": "backward till remains exclusive",
+    "suffix": ".txt",
+    "text": "abc_def\n",
+    "keys": "$dT_",
+    "want": "abc_f\n"
+  },
+  {
+    "issue": 13,
+    "label": "counted backward till",
+    "suffix": ".txt",
+    "text": "one_two_three_four\n",
+    "keys": "$d2T_",
+    "want": "one_two_r\n"
+  },
+  {
+    "issue": 13,
+    "label": "absent till target changes nothing",
+    "suffix": ".txt",
+    "text": "abc中🙂\n",
+    "keys": "ldt_",
+    "want": "abc中🙂\n"
+  },
+  {
+    "issue": 17,
+    "label": "space after nested close",
+    "suffix": ".txt",
+    "text": "foo(a (b) c )\n",
+    "keys": "f)ldi(",
+    "want": "foo()\n"
+  },
+  {
+    "issue": 17,
+    "label": "empty space group before sibling",
+    "suffix": ".txt",
+    "text": "foo( ) + bar( keep )\n",
+    "keys": "f(ldi(",
+    "want": "foo() + bar( keep )\n"
+  },
+  {
+    "issue": 17,
+    "label": "change outer content after nested pair",
+    "suffix": ".txt",
+    "text": "for (args.next() != null ) |arg| {\n",
+    "keys": "f)lci(X\u0003",
+    "want": "for (X) |arg| {\n"
+  },
+  {
+    "issue": 17,
+    "label": "bracket match crosses lines",
+    "suffix": ".txt",
+    "text": "foo(\n  nested(a),\n  中\n) tail\n",
+    "keys": "jj0ldi(",
+    "want": "foo(\n) tail\n"
+  },
+  {
+    "issue": 17,
+    "label": "delimiter-only lines",
+    "suffix": ".txt",
+    "text": "foo(\n  a\n) tail\n",
+    "keys": "j0di(",
+    "want": "foo(\n) tail\n"
+  },
+  {
+    "issue": 17,
+    "label": "closer indentation",
+    "suffix": ".txt",
+    "text": "foo(\n  a\n  ) tail\n",
+    "keys": "j0di(",
+    "want": "foo(\n  ) tail\n"
+  },
+  {
+    "issue": 17,
+    "label": "inline opening",
+    "suffix": ".txt",
+    "text": "foo(a,\n  b\n) tail\n",
+    "keys": "j0di(",
+    "want": "foo(\n) tail\n"
+  },
+  {
+    "issue": 17,
+    "label": "inline closing",
+    "suffix": ".txt",
+    "text": "foo(\n  a) tail\n",
+    "keys": "j0di(",
+    "want": "foo(\n) tail\n"
+  },
+  {
+    "issue": 17,
+    "label": "opening trailing spaces",
+    "suffix": ".txt",
+    "text": "foo(  \n  a\n) tail\n",
+    "keys": "j0di(",
+    "want": "foo(\n) tail\n"
+  },
+  {
+    "issue": 17,
+    "label": "empty multiline",
+    "suffix": ".txt",
+    "text": "foo(\n) tail\n",
+    "keys": "di(",
+    "want": "foo(\n) tail\n"
+  },
+  {
+    "issue": 17,
+    "label": "change delimiter lines",
+    "suffix": ".txt",
+    "text": "foo(\n  a\n) tail\n",
+    "keys": "j0ci(X\u0003",
+    "want": "foo(\n  X\n) tail\n"
+  },
+  {
+    "issue": 17,
+    "label": "change indented closer",
+    "suffix": ".txt",
+    "text": "foo(\n  a\n  ) tail\n",
+    "keys": "j0ci(X\u0003",
+    "want": "foo(\n  X\n  ) tail\n"
+  },
+  {
+    "issue": 17,
+    "label": "change inline opening",
+    "suffix": ".txt",
+    "text": "foo(a,\n  b\n) tail\n",
+    "keys": "j0ci(X\u0003",
+    "want": "foo(X\n) tail\n"
+  },
+  {
+    "issue": 17,
+    "label": "braces lines",
+    "suffix": ".txt",
+    "text": "fn f() {\n  a;\n}\n",
+    "keys": "j0di{",
+    "want": "fn f() {\n}\n"
+  },
+  {
+    "issue": 17,
+    "label": "change braces lines",
+    "suffix": ".txt",
+    "text": "fn f() {\n  a;\n}\n",
+    "keys": "j0ci{X\u0003",
+    "want": "fn f() {\n  X\n}\n"
+  },
+  {
+    "issue": 17,
+    "label": "CRLF delimiter lines",
+    "suffix": ".txt",
+    "text": "foo(\r\n  a\r\n  ) tail\r\n",
+    "keys": "j0di(",
+    "want": "foo(\r\n  ) tail\r\n"
+  },
+  {
+    "issue": 17,
+    "label": "delete keeps closer cursor",
+    "suffix": ".txt",
+    "text": "foo(\n  a\n  ) end\n",
+    "keys": "j0di(x",
+    "want": "foo(\n   end\n"
+  },
+  {
+    "issue": 17,
+    "label": "linewise inner register paste",
+    "suffix": ".txt",
+    "text": "foo(\n  a\n  ) end\n",
+    "keys": "j0di(p",
+    "want": "foo(\n  ) end\n  a\n"
+  },
+  {
+    "issue": 17,
+    "label": "multiline inner yank paste",
+    "suffix": ".txt",
+    "text": "foo(\n  a\n  ) end\n",
+    "keys": "j0yi(p",
+    "want": "foo(\n  a\n  a\n  ) end\n"
+  },
+  {
+    "issue": 17,
+    "label": "change undo restores all source bytes",
+    "suffix": ".txt",
+    "text": "foo(\n  a\n  ) end\n",
+    "keys": "j0ci(X\u0003u",
+    "want": "foo(\n  a\n  ) end\n"
+  },
+  {
+    "issue": 17,
+    "label": "change redo restores body indentation",
+    "suffix": ".txt",
+    "text": "foo(\n  a\n  ) end\n",
+    "keys": "j0ci(X\u0003u\u0012",
+    "want": "foo(\n  X\n  ) end\n"
+  },
+  {
+    "issue": 17,
+    "label": "inline opener retains opener cursor",
+    "suffix": ".txt",
+    "text": "foo(a,\n  b\n) end\n",
+    "keys": "j0di(x",
+    "want": "foo\n) end\n"
+  },
+  {
+    "issue": 17,
+    "label": "empty block delete leaves delimiters apart",
+    "suffix": ".txt",
+    "text": "foo(\n)\n",
+    "keys": "di(",
+    "want": "foo(\n)\n"
+  },
+  {
+    "issue": 17,
+    "label": "empty block change uses existing body gap",
+    "suffix": ".txt",
+    "text": "foo(\n)\n",
+    "keys": "ci(X\u0003",
+    "want": "foo(\nX)\n"
+  },
+  {
+    "issue": 17,
+    "label": "multiline square bracket",
+    "suffix": ".txt",
+    "text": "a[\n old\n] tail\n",
+    "keys": "j0di[",
+    "want": "a[\n] tail\n"
+  },
+  {
+    "issue": 17,
+    "label": "CRLF inner register paste",
+    "suffix": ".txt",
+    "text": "foo(\r\n  a\r\n  ) end\r\n",
+    "keys": "j0di(p",
+    "want": "foo(\r\n  ) end\r\n  a\r\n"
+  },
+  {
+    "issue": 59,
+    "label": "replace Chinese with ASCII",
+    "suffix": ".txt",
+    "text": "中文😀x\n",
+    "keys": "rX",
+    "want": "X文😀x\n"
+  },
+  {
+    "issue": 59,
+    "label": "replace ASCII with Chinese",
+    "suffix": ".txt",
+    "text": "abcd\n",
+    "keys": "r文",
+    "want": "文bcd\n"
+  },
+  {
+    "issue": 59,
+    "label": "count replaces Unicode scalars",
+    "suffix": ".txt",
+    "text": "中文😀x\n",
+    "keys": "2r语",
+    "want": "语语😀x\n"
+  },
+  {
+    "issue": 59,
+    "label": "count replaces with emoji",
+    "suffix": ".txt",
+    "text": "中文😀x\n",
+    "keys": "3r🙂",
+    "want": "🙂🙂🙂x\n"
+  },
+  {
+    "issue": 59,
+    "label": "count cannot cross LF",
+    "suffix": ".txt",
+    "text": "a\nb\n",
+    "keys": "2rX",
+    "want": "a\nb\n"
+  },
+  {
+    "issue": 59,
+    "label": "count cannot cross CRLF",
+    "suffix": ".txt",
+    "text": "abc\r\nDEF\r\n",
+    "keys": "2l2rX",
+    "want": "abc\r\nDEF\r\n"
+  },
+  {
+    "issue": 59,
+    "label": "count past EOF is atomic",
+    "suffix": ".txt",
+    "text": "abc",
+    "keys": "5rQ",
+    "want": "abc"
+  },
+  {
+    "issue": 59,
+    "label": "replace Unicode undo",
+    "suffix": ".txt",
+    "text": "中文😀x\n",
+    "keys": "3r🙂u",
+    "want": "中文😀x\n"
+  },
+  {
+    "issue": 59,
+    "label": "replace Unicode redo",
+    "suffix": ".txt",
+    "text": "中文😀x\n",
+    "keys": "3r🙂u\u0012",
+    "want": "🙂🙂🙂x\n"
+  },
+  {
+    "issue": 59,
+    "label": "replace keeps last replacement cursor",
+    "suffix": ".txt",
+    "text": "中文😀x\n",
+    "keys": "2r语x",
+    "want": "语😀x\n"
+  },
+  {
+    "issue": 59,
+    "label": "combining cluster is one replacement",
+    "suffix": ".txt",
+    "text": "éx\n",
+    "keys": "rX",
+    "want": "Xx\n"
+  }
+]

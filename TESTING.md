@@ -18,7 +18,7 @@ zig build e2e -Dtest-filter="golden"
 ```
 
 Current counts after the 2026-11-17 search, Zig-highlight and Agent workflow fixes:
-**807 unit tests** and **408 e2e cases** (404 default passes and
+**809 unit tests** and **413 e2e cases** (409 default passes and
 four opt-in real-ZLS cases that skip unless `-Dreal-zls` is supplied).
 `tools/verify.sh` covers diff check,
 all unit tests and all e2e tests (including Agent-focus, `terminal:` and
@@ -1040,3 +1040,61 @@ update only their estimated-context token count (1095/1096→1107); geometry, co
 and assertions remain unchanged. Active native file review retains the settled
 transport's idle signal; inactive threads show approval status, and review
 counts cover both.
+
+
+## Historical issue re-audit (2026-11-18)
+
+The audit maps all 33 historical issues to production code and executable
+regressions, including closed issues. #1 is a split tracker; #10 is the still
+unadopted focus-frame design demo in draft PR #27 and is not counted as a
+verified production fix. The other 31 historical functional issues are
+covered by the normal full suite and the additional `history audit:` cases.
+Local per-issue review notes and raw logs remain ignored.
+
+Two failures were demonstrated before their fixes:
+
+- #17's original single-line whitespace case worked, but multiline `di(`/
+  `ci(`/`yi(` joined delimiter lines. Operator planning now preserves the
+  delimiter newline/indentation, the correct register type, CRLF and one
+  undo group. The mathematical text-object range used by selection/surround
+  retains its existing contract. Regression checks include paste, cursor
+  landing, undo/redo, nested and empty blocks.
+- #59: Normal `r` truncated a Unicode key to its first byte, refused a
+  multibyte source character and could count across a newline. The complete
+  same-line grapheme span is now preflighted before one transaction. Missing
+  characters abort the entire command; typed graphemes, LSP/inlay offsets,
+  undo/redo and the last replacement's cursor remain consistent.
+
+Run `zig build e2e -Dtest-filter="history audit:"` for five PTY groups:
+independent text expectations, interrupted input captures, per-window dirty
+buffer reuse, quoted/hidden path completion, and real source edits with inlay
+hints at 40/120 columns. The tests check saved bytes rather than deriving a
+cursor oracle from ANSI drawing commands. Existing assertions/goldens and
+`tools/verify.sh` are unchanged.
+
+`test/fixtures/history_text_cases.json` contains 43 independent expectations
+for #13/#17/#59. Optionally run `python .scripts/check-history-oracle.py` with
+nvim installed: it starts nvim with `-u NONE -i NONE`, preserves EOF policy
+with `nofixeol`, and checks every fixture without writing new expectations.
+Oz's configured Ctrl-c insert exit is mapped to Esc for these text-only
+comparisons. Auto-pairing and other project-specific UI behavior use explicit
+product assertions instead of assuming nvim without plugins has those features.
+The normal suite does not require nvim. Real-ZLS tests remain opt-in and
+explicitly skip when no ZLS binary is supplied.
+
+
+### Proposed autonomous trial runner
+
+The committed replay data and independent oracle are the initial reusable
+parts; an LLM planner/continuous runner is not implemented by this PR.
+A practical next step is a bounded task runner: isolated project/HOME,
+fixture LSP/clipboard/Agent/terminal backends, and explicit key/paste/resize/
+wait/capture operations. Feed new editor states back into task selection.
+Use saved bytes, undo round-trips, pane ownership, terminal cell geometry,
+and independent reference expectations as objective checks. Use model visual
+judgment to produce labeled usability candidates for human review. Require
+fresh-process reproduction and shrink failing traces before proposing an
+issue or regression; race reports should use barriers and repeated trials.
+PR runs can replay stable seeds; longer exploration should be opt-in and
+bounded by elapsed time/actions/model budget. Report reproducible findings,
+unique state coverage and regressions produced, rather than raw keystrokes.

@@ -117,3 +117,7 @@ pub const app_wrap = @import("app/wrap.zig");
 pub const editor_path_completion = @import("editor/path_completion.zig");
 
 pub const app_hover_layout = @import("app/hover_layout.zig");
+
+pub const text_object_edit = @import("editor/text_object_edit.zig");
+
+pub const replace_plan = @import("editor/replace_plan.zig");

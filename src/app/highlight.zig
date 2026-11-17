@@ -1,6 +1,8 @@
 //! highlight — App method group split out of src/main.zig (physical move).
 
 const std = @import("std");
+const replace_plan = @import("../editor/replace_plan.zig");
+const text_object_edit = @import("../editor/text_object_edit.zig");
 const edit_range = @import("../editor/edit_range.zig");
 const indent_mod = @import("../editor/indent.zig");
 const editor = @import("../editor/root.zig");
@@ -260,6 +262,41 @@ pub fn execOpMotion(self: *App, m: editor.OpMotion) !void {
     // follows vim (2ciw = two words, 2i( = second nesting level)
     if (m.text_object) |kind| {
         const rng = editor.TextObject.range(&self.cur().pt, kind, self.curCursor().*, m.count);
+        const block_plan = if (m.op == .delete or m.op == .change or m.op == .yank)
+            try text_object_edit.plan(self.alloc, &self.cur().pt, kind, rng, m.op == .change)
+        else
+            null;
+        if (block_plan) |plan| {
+            defer plan.deinit(self.alloc);
+            // Empty multiline interiors keep their delimiter newline; c enters
+            // Insert at the empty body instead of joining both delimiter lines.
+            if (plan.register.start == plan.register.end) {
+                if (m.op == .change) {
+                    self.curCursor().* = plan.register.start;
+                    try self.applyOpRange(m.op, plan.register.start, plan.register.end, false, false);
+                }
+                return;
+            }
+            try self.setRegister(plan.register.start, plan.register.end, plan.linewise);
+            if (m.op == .yank) {
+                try self.setMsg(try std.fmt.allocPrint(self.alloc, "yanked {d} bytes", .{plan.register.end - plan.register.start}));
+                return;
+            }
+            const start_pos = self.lspPositionAt(&self.cur().pt, plan.edit.start);
+            const end_pos = self.lspPositionAt(&self.cur().pt, plan.edit.end);
+            const offsets = captureInlayOffsetsForReplace(self, plan.edit.start, plan.edit.end - plan.edit.start, @intCast(plan.replacement.len));
+            defer if (offsets) |value| self.alloc.free(value);
+            self.cur().history.beginGroup();
+            try self.recordEdit(plan.edit.start, plan.edit.end - plan.edit.start, plan.replacement);
+            self.curCursor().* = @min(plan.cursor, self.cur().pt.len());
+            if (m.op == .change) {
+                self.state.mode = .insert;
+                self.in_insert = true;
+            } else self.cur().history.endGroup();
+            self.markDirtyRange(start_pos, end_pos, plan.replacement);
+            if (offsets) |value| applyInlayOffsetsAfterHistory(self, value);
+            return;
+        }
         try self.applyOpRange(m.op, rng.start, rng.end, false, false);
         return;
     }
@@ -1072,27 +1109,31 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
     }
 }
 
-/// r{char}: replace the character under the cursor with `ch` (a single
-/// byte; multi-byte replacements keep the original sequence length).
-/// Like vim, the cursor stays on the replaced char (it does not move).
-/// r{char} with a vim count (3rx): replace `count` characters under the
-/// cursor with `ch`, one undo group. The cursor stays on the LAST
-/// replaced character (vim r: 3rx leaves it on the third replacement).
-pub fn replaceCharsAtCursor(self: *App, ch: u8, count: u32) !void {
+/// r{char}: replace a complete typed grapheme, atomically, within this line.
+/// A count past EOL is a no-op; the cursor stays on the final replacement.
+pub fn replaceCharsAtCursor(self: *App, text: []const u8, count: u32) !void {
     const pt = &self.cur().pt;
-    self.cur().history.beginGroup();
-    var c = self.curCursor().*;
-    var i: u32 = 0;
-    while (i < @max(count, 1)) : (i += 1) {
-        if (c >= pt.len()) break;
-        const seq = self.charLenAt(pt, c);
-        if (seq != 1) break; // only replace single-byte chars
-        if (pt.byteAt(c) != ch) {
-            try self.recordEdit(c, 1, &.{ch});
-        }
-        c += 1;
+    const start = edit_range.charStart(pt, self.curCursor().*);
+    const line = pt.lineOf(start);
+    const end = pt.lineStart(line) + pt.lineTextLen(line);
+    if (start >= end) return;
+    const source = try self.alloc.alloc(u8, end - start);
+    defer self.alloc.free(source);
+    pt.copyRange(start, source);
+    const plan = (try replace_plan.plan(self.alloc, source, text, count)) orelse return;
+    defer plan.deinit(self.alloc);
+    if (std.mem.eql(u8, source[0..plan.before_len], plan.text)) {
+        self.curCursor().* = start + plan.cursor_off;
+        return;
     }
+    const from = self.lspPositionAt(pt, start);
+    const to = self.lspPositionAt(pt, start + plan.before_len);
+    const offsets = captureInlayOffsetsForReplace(self, start, plan.before_len, @intCast(plan.text.len));
+    defer if (offsets) |value| self.alloc.free(value);
+    self.cur().history.beginGroup();
+    try self.recordEdit(start, plan.before_len, plan.text);
     self.cur().history.endGroup();
-    self.curCursor().* = c -| 1;
-    self.markDirty();
+    self.curCursor().* = start + plan.cursor_off;
+    self.markDirtyRange(from, to, plan.text);
+    if (offsets) |value| applyInlayOffsetsAfterHistory(self, value);
 }
