@@ -126,6 +126,7 @@ pub const ActionId = enum {
     search_backward, // ?
     search_next, // n — repeat last search in the same direction
     search_prev, // N — repeat last search in the opposite direction
+    search_clear, // <leader>h — :noh (keep last search for n/N)
     normal_mode, // esc / ctrl-c
     insert_exit, // jk special-cased by Mode
     flip_visual, // visual 'o': swap anchor and cursor
@@ -141,9 +142,9 @@ pub const ActionId = enum {
     // M3 git
     hunk_next, // ]c — next git hunk
     hunk_prev, // [c — previous git hunk
-    hunk_stage, // <leader>hs — stage the hunk under the cursor
-    hunk_reset, // <leader>hr — reset the hunk under the cursor
-    hunk_preview, // <leader>hp — preview the hunk under the cursor (float)
+    hunk_stage, // <leader>gs — stage the hunk under the cursor
+    hunk_reset, // <leader>gr — reset the hunk under the cursor
+    hunk_preview, // <leader>gp — preview the hunk under the cursor (float)
     blame_toggle, // <leader>tb — toggle inline blame
     git_lazygit, // <leader>lg — launch lazygit in the embedded terminal
     // M3b embedded terminal layouts

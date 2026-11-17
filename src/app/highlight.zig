@@ -768,6 +768,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
         .diagnostic_prev => self.gotoDiagnostic(false),
         .search_next => try self.repeatSearch(false),
         .search_prev => try self.repeatSearch(true),
+        .search_clear => try self.execCommand(.noh),
         .diagnostic_line => self.showLineDiagnostics(),
         .diagnostics_list => self.toggleDiagnosticsList(),
         .hover => try self.requestNav("textDocument/hover", .hover),

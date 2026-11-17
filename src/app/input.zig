@@ -144,7 +144,7 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
     if (self.nav_list_active) {
         if (self.navListKey(key)) return;
     }
-    // Hunk preview float (<leader>hp): Esc/Enter/q close, j/k scroll
+    // Hunk preview float (<leader>gp): Esc/Enter/q close, j/k scroll
     if (self.git_preview != null) {
         if (self.gitPreviewKey(key)) return;
     }
@@ -652,6 +652,8 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
             self.cmd_complete_idx = 0;
             self.clearCmdCompleteNames();
             self.cmdline_kind = .ex;
+            self.cmd_register_pending = false;
+            self.search_origin = null;
             try self.setMsg(try self.alloc.dupe(u8, ""));
             // From visual mode vim auto-types :'<,'>; :s then applies to
             // the selection (the anchor survives until Enter).
@@ -667,6 +669,7 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
             self.cmd_complete_idx = 0;
             self.clearCmdCompleteNames();
             self.cmdline_kind = if (dir == .forward) .search_fwd else .search_bwd;
+            self.beginSearch();
             try self.setMsg(try self.alloc.dupe(u8, ""));
         },
         .to_normal => {

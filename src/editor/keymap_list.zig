@@ -121,6 +121,8 @@ pub const entries: []const Entry = &.{
     .{ .keys = "n", .desc = "下一个搜索匹配", .group = "搜索" },
     .{ .keys = "N", .desc = "上一个搜索匹配", .group = "搜索" },
     .{ .keys = ":s", .desc = "行内替换 :s/模式/替换/g（:%s 全文件）", .group = "搜索" },
+    .{ .keys = "space h", .desc = "清除搜索高亮（:noh，保留 n/N）", .group = "搜索" },
+    .{ .keys = "Ctrl-r \"", .desc = "命令/搜索栏粘贴编辑器寄存器", .group = "搜索" },
     .{ .keys = ":noh", .desc = "清除搜索高亮", .group = "搜索" },
 
     // ---- Leader ----
@@ -150,9 +152,9 @@ pub const entries: []const Entry = &.{
 
     // ---- Git ----
     .{ .keys = "]c [c", .desc = "下一个 / 上一个 Git hunk", .group = "Git" },
-    .{ .keys = "space hs", .desc = "Stage 当前 hunk", .group = "Git" },
-    .{ .keys = "space hr", .desc = "Reset 当前 hunk", .group = "Git" },
-    .{ .keys = "space hp", .desc = "预览当前 hunk 的 diff", .group = "Git" },
+    .{ .keys = "space gs", .desc = "Stage 当前 hunk", .group = "Git" },
+    .{ .keys = "space gr", .desc = "Reset 当前 hunk", .group = "Git" },
+    .{ .keys = "space gp", .desc = "预览当前 hunk 的 diff", .group = "Git" },
     .{ .keys = "space tb", .desc = "行内 blame 开关", .group = "Git" },
     .{ .keys = "space lg", .desc = "内嵌浮动终端启动 lazygit", .group = "Git" },
 

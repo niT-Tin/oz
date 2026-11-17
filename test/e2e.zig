@@ -14135,8 +14135,8 @@ test "git: gutter signs, ]c hunk jump, hunk stage/reset, blame ghost, branch" {
     defer alloc.free(needle3);
     try std.testing.expect(try Wait.until(&sess, &grid, needle3));
 
-    // <leader>hs stages the hunk under the cursor (whole @@ block)
-    try sess.send(" hs");
+    // <leader>gs stages the hunk under the cursor (whole @@ block)
+    try sess.send(" gs");
     var staged = try runCmdCapture(io, alloc, &.{ "git", "diff", "--cached", "--", "a.txt" }, dir);
     defer alloc.free(staged);
     var waited: i32 = 0;
@@ -14155,8 +14155,8 @@ test "git: gutter signs, ]c hunk jump, hunk stage/reset, blame ghost, branch" {
     defer alloc.free(needle17);
     try std.testing.expect(try Wait.until(&sess, &grid, needle17));
 
-    // <leader>hr resets that hunk: NEW leaves the working tree
-    try sess.send(" hr");
+    // <leader>gr resets that hunk: NEW leaves the working tree
+    try sess.send(" gr");
     var work_diff = try runCmdCapture(io, alloc, &.{ "git", "diff", "--", "a.txt" }, dir);
     defer alloc.free(work_diff);
     waited = 0;
@@ -31569,4 +31569,457 @@ test "opaque background: blame inherits cursor surface through wrapping moves an
             try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
         }
     }
+}
+
+// Search workflow assertions use the real command-line input route and ANSI
+// cell colors; saved-byte checks catch commands/pastes leaking into the buffer.
+test "search workflow: yank register and Ctrl-v paste into the search prompt" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const source = "needle first\nneedle second\n";
+    try writeTestFile(io, root, "source.txt", source);
+    const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+    defer a.free(home);
+    const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+    defer a.free(env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{env}, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("yiw/\x12\"");
+    try gridWaitRowContains(&sess, &grid, 23, "/needle", 4000);
+    try sess.send("\r");
+    try gridWaitPosition(&sess, &grid, 2, 0, 4000);
+    try gridWaitRowContains(&sess, &grid, 23, "[2/2]", 4000);
+    try sess.send("/\x16");
+    try gridWaitRowContains(&sess, &grid, 23, "/needle", 4000);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try aiReadFile(io, a, root, "source.txt");
+    defer a.free(saved);
+    try std.testing.expectEqualStrings(source, saved);
+}
+
+test "search workflow: bracketed and OSC clipboard paste stay atomic in command mode" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const source = "needle first\nneedle second\n";
+    try writeTestFile(io, root, "source.txt", source);
+    try writeTestFile(io, root, "target space.txt", "TARGET_COMMAND_PASTE\n");
+    const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+    defer a.free(home);
+    const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+    defer a.free(env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{env}, 24, 100, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 100);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("/\x1b[200~needle\x1b[201~");
+    try gridWaitRowContains(&sess, &grid, 23, "/needle", 4000);
+    try sess.send("\r");
+    try gridWaitPosition(&sess, &grid, 2, 0, 4000);
+    // A multiline paste is input data, never Enter/Esc or Ex commands.
+    try sess.send("/\x1b[200~needle\r\n:qa!\r\n\x1b[201~");
+    try gridWaitRowContains(&sess, &grid, 23, "/needle :qa!", 4000);
+    try std.testing.expect(try sess.tryWaitExit() == null);
+    try sess.send("\x1b");
+    try gridWaitRowContains(&sess, &grid, 23, "[NORMAL]", 4000);
+    try sess.send("/");
+    // OSC52 clipboard reply carrying base64("needle").
+    try sess.send("\x1b]52;c;bmVlZGxl\x1b\\");
+    try gridWaitRowContains(&sess, &grid, 23, "/needle", 4000);
+    try sess.send("\x1b");
+    try gridWaitRowContains(&sess, &grid, 23, "[NORMAL]", 4000);
+    try sess.send(":e \x1b[200~target space.txt\x1b[201~\r");
+    try gridWaitFor(&sess, &grid, "TARGET_COMMAND_PASTE", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+    const saved = try aiReadFile(io, a, root, "source.txt");
+    defer a.free(saved);
+    try std.testing.expectEqualStrings(source, saved);
+}
+
+test "search workflow: incremental colors update and Escape restores origin and previous search" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    for ([_]u16{ 80, 120 }) |cols| {
+        var root_buf: [128]u8 = undefined;
+        const root = try aiMockDir(io, &root_buf);
+        defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        try writeTestFile(io, root, "source.txt", "alpha one alpha two\nbeta\nalpha three\n");
+        const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+        defer a.free(home);
+        const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+        defer a.free(env);
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{env}, 24, cols, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 24, cols);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        const first = aiFindCell(&grid, "alpha one").?;
+        const second = aiFindCell(&grid, "alpha two").?;
+        try sess.send("/alph");
+        try gridWaitRowContains(&sess, &grid, 23, "/alph", 4000);
+        try gridSettle(&sess, &grid, 40, 1000);
+        try frame.expectCellBg(&grid, first.row, first.col, packRgb(0x33, 0x3a, 0x4e));
+        try frame.expectCellBg(&grid, second.row, second.col, packRgb(0x6a, 0x5d, 0x4a));
+        try gridWaitRowContains(&sess, &grid, 23, "[2/3]", 4000);
+        try sess.send("z");
+        try gridWaitRowContains(&sess, &grid, 23, "[0/0]", 4000);
+        try frame.expectCellBg(&grid, first.row, first.col, packRgb(0x2a, 0x2a, 0x37));
+        try sess.send("\x7f");
+        try gridWaitRowContains(&sess, &grid, 23, "/alph", 4000);
+        try gridSettle(&sess, &grid, 40, 1000);
+        try frame.expectCellBg(&grid, second.row, second.col, packRgb(0x6a, 0x5d, 0x4a));
+        try sess.send("a\r");
+        try gridWaitPosition(&sess, &grid, 1, 10, 4000);
+        try gridWaitRowContains(&sess, &grid, 23, "[2/3]", 4000);
+        try sess.send("/beta");
+        try gridWaitRowContains(&sess, &grid, 23, "/beta", 4000);
+        try sess.send("\x1b");
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+        try gridWaitPosition(&sess, &grid, 1, 10, 4000);
+        try gridWaitRowContains(&sess, &grid, 23, "[2/3]", 4000);
+        try sess.send("n");
+        try gridWaitPosition(&sess, &grid, 3, 0, 4000);
+        try gridWaitRowContains(&sess, &grid, 23, "[3/3]", 4000);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+    }
+}
+
+test "search workflow: counts wrap both ways and Space-h clears without eating the next key" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "source.txt", "alpha alpha\nalpha third\n");
+    const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+    defer a.free(home);
+    const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+    defer a.free(env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{env}, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("/alpha\r");
+    try gridWaitPosition(&sess, &grid, 1, 6, 4000);
+    try gridWaitRowContains(&sess, &grid, 23, "[2/3]", 4000);
+    try sess.send("n");
+    try gridWaitPosition(&sess, &grid, 2, 0, 4000);
+    try gridWaitRowContains(&sess, &grid, 23, "[3/3]", 4000);
+    try sess.send("n");
+    try gridWaitPosition(&sess, &grid, 1, 0, 4000);
+    try gridWaitRowContains(&sess, &grid, 23, "[1/3]", 4000);
+    try sess.send("N");
+    try gridWaitPosition(&sess, &grid, 2, 0, 4000);
+    try gridWaitRowContains(&sess, &grid, 23, "[3/3]", 4000);
+    try sess.send(" h");
+    try gridWaitGone(&sess, &grid, "[3/3]", 4000);
+    const match = aiFindCell(&grid, "alpha third").?;
+    try frame.expectCellBg(&grid, match.row, match.col, packRgb(0x2a, 0x2a, 0x37));
+    try sess.send("k");
+    try gridWaitPosition(&sess, &grid, 1, 0, 4000);
+    try sess.send("n");
+    try gridWaitPosition(&sess, &grid, 1, 6, 4000);
+    try gridWaitRowContains(&sess, &grid, 23, "[2/3]", 4000);
+    try sess.send(":noh\r");
+    try gridWaitGone(&sess, &grid, "[2/3]", 4000);
+    try sess.send("/\r"); // Empty Enter repeats the remembered query.
+    try gridWaitPosition(&sess, &grid, 2, 0, 4000);
+    try gridWaitRowContains(&sess, &grid, 23, "[3/3]", 4000);
+    try sess.send("?alpha\r");
+    try gridWaitPosition(&sess, &grid, 1, 6, 4000);
+    try gridWaitRowContains(&sess, &grid, 23, "[2/3]", 4000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "highlight stability: typing slice brackets preserves untouched function parameter and bracket colors" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const source =
+        \\const std = @import("std");
+        \\const Stdio = struct {
+        \\    pub fn read_lines(self: *Stdio, allocator: std.mem.Allocator) ![][]u8 {
+        \\        var lines: std.ArrayList()
+        \\        while (try self.reader().takeDelimiter('\n')) |line| {}
+        \\    }
+        \\};
+        \\pub fn main(init: std.process.Init) !void {
+        \\    const result = count_lines(init.io);
+        \\    std.debug.print("{d}\n", .{result});
+        \\}
+        \\pub fn count_lines(reader: Io.File.Reader) !usize {
+        \\    var total: usize = 0;
+        \\    while (try reader.takeDelimiter('\n')) |_| { total += 1; }
+        \\    return total;
+        \\}
+        \\
+    ;
+    try writeTestFile(io, root, "source.zig", source);
+    const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+    defer a.free(home);
+    const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+    defer a.free(env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.zig" }, &.{env}, 24, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try gridWaitFor(&sess, &grid, "count_lines(reader", 5000);
+    const needles = [_][]const u8{ "allocator: std", "main(init", "init: std", "count_lines(init", "print(\"", "reader: Io", "!void {" };
+    var colors: [needles.len]u32 = undefined;
+    for (needles, 0..) |needle, i| {
+        const hit = aiFindCell(&grid, needle).?;
+        colors[i] = frame.cellFg(&grid, hit.row, hit.col + (if (i + 1 == needles.len) @as(usize, 6) else 0));
+    }
+    try std.testing.expect(colors[1] != colors[2]); // function != parameter
+    try sess.send(":4\r$i");
+    try gridWaitFor(&sess, &grid, "[INSERT]", 4000);
+    for ([_][]const u8{ "[", "]u8", ") = .empty;" }) |keys| {
+        try sess.send(keys);
+        try gridSettle(&sess, &grid, 100, 2000);
+        for (needles, colors, 0..) |needle, color, i| {
+            const hit = aiFindCell(&grid, needle) orelse return error.TestUnexpectedResult;
+            const col = hit.col + (if (i + 1 == needles.len) @as(usize, 6) else 0);
+            if (frame.cellFg(&grid, hit.row, col) != color) std.debug.print("unchanged '{s}' changed color after '{s}'\n", .{ needle, keys });
+            try frame.expectRegionFg(&grid, .{ .top = hit.row, .bottom = hit.row, .left = col, .right = col }, color);
+        }
+    }
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "search workflow: UTF-8 editing history and Ctrl-c restore a scrolled search origin" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var source = std.ArrayList(u8).empty;
+    defer source.deinit(a);
+    try source.appendSlice(a, "ORIGIN 中文 中文\n");
+    for (0..45) |_| try source.appendSlice(a, "padding\n");
+    try source.appendSlice(a, "FAR_TARGET\n");
+    try writeTestFile(io, root, "source.txt", source.items);
+    const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+    defer a.free(home);
+    const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+    defer a.free(env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{env}, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("/中文");
+    try gridWaitRowContains(&sess, &grid, 23, "/中文", 4000);
+    try gridWaitRowContains(&sess, &grid, 23, "[1/2]", 4000);
+    try sess.send("\x7f");
+    try gridWaitRowContains(&sess, &grid, 23, "/中", 4000);
+    try gridWaitRowContains(&sess, &grid, 23, "[1/2]", 4000);
+    try sess.send("文\r");
+    try gridWaitPosition(&sess, &grid, 1, 7, 4000);
+    try sess.send("/FAR_TARGET");
+    try gridWaitFor(&sess, &grid, "FAR_TARGET", 4000);
+    try std.testing.expect(!grid.contains("ORIGIN"));
+    try sess.send("\x03");
+    try gridWaitPosition(&sess, &grid, 1, 7, 4000);
+    try gridWaitFor(&sess, &grid, "ORIGIN", 4000);
+    try gridWaitRowContains(&sess, &grid, 23, "[1/2]", 4000);
+    try sess.send("n");
+    try gridWaitPosition(&sess, &grid, 1, 12, 4000);
+    try gridWaitRowContains(&sess, &grid, 23, "[2/2]", 4000);
+    try sess.send("/\x1b[A"); // Search history selection also previews.
+    try gridWaitRowContains(&sess, &grid, 23, "/中文", 4000);
+    try gridWaitRowContains(&sess, &grid, 23, "[1/2]", 4000);
+    try sess.send("\r");
+    try gridWaitPosition(&sess, &grid, 1, 7, 4000);
+    // A query wider than the terminal keeps the input cursor visible and
+    // reserves a separate, non-overlapping count at the right.
+    try sess.send("/");
+    for (0..100) |_| try sess.send("中");
+    try gridWaitRowContains(&sess, &grid, 23, "[0/0]", 5000);
+    try gridSettle(&sess, &grid, 80, 1000);
+    try std.testing.expectEqual(@as(usize, 23), grid.row);
+    try std.testing.expect(grid.col < 74);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try aiReadFile(io, a, root, "source.txt");
+    defer a.free(saved);
+    try std.testing.expectEqualStrings(source.items, saved);
+}
+
+test "search workflow: revision counts follow edits undo and independent split buffers" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "a.txt", "alpha alpha\n");
+    try writeTestFile(io, root, "b.txt", "alpha only\n");
+    const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+    defer a.free(home);
+    const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+    defer a.free(env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "a.txt" }, &.{env}, 24, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("/alpha\r");
+    try gridWaitRowContains(&sess, &grid, 23, "[2/2]", 4000);
+    try sess.send("x");
+    try gridWaitFor(&sess, &grid, "alpha lpha", 4000);
+    try gridWaitRowContains(&sess, &grid, 23, "[0/1]", 4000);
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "alpha alpha", 4000);
+    try gridWaitRowContains(&sess, &grid, 23, "[2/2]", 4000);
+    try sess.send(":vs b.txt\r");
+    try gridWaitFor(&sess, &grid, "alpha only", 4000);
+    try gridWaitRowContains(&sess, &grid, 23, "[1/1]", 4000);
+    try sess.send("nN");
+    try gridWaitRowContains(&sess, &grid, 23, "[1/1]", 4000);
+    try sess.send("\x17h");
+    try gridWaitPosition(&sess, &grid, 1, 6, 4000);
+    try gridWaitRowContains(&sess, &grid, 23, "[2/2]", 4000);
+    try sess.send("\x17l/missing\r");
+    try gridWaitRowContains(&sess, &grid, 23, "[0/0]", 4000);
+    try gridWaitFor(&sess, &grid, "pattern not found", 4000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "search workflow: highlights and counts include matches after the old 128-per-line limit" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var source = std.ArrayList(u8).empty;
+    defer source.deinit(a);
+    for (0..140) |_| try source.appendSlice(a, "x ");
+    try source.appendSlice(a, "END\n");
+    try writeTestFile(io, root, "source.txt", source.items);
+    const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+    defer a.free(home);
+    const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+    defer a.free(env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{env}, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("$?x\r");
+    try gridWaitPosition(&sess, &grid, 1, 278, 4000);
+    try gridWaitRowContains(&sess, &grid, 23, "[140/140]", 4000);
+    const last = aiFindCell(&grid, "x END").?;
+    try frame.expectCellBg(&grid, last.row, last.col, packRgb(0x6a, 0x5d, 0x4a));
+    try sess.send(" h");
+    try gridWaitGone(&sess, &grid, "[140/140]", 4000);
+    try frame.expectCellBg(&grid, last.row, last.col, packRgb(0x2a, 0x2a, 0x37));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "search workflow: linewise internal register stays distinct from an external clipboard" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "wl-copy", "#!/bin/sh\n/bin/cat > \"$OZ_TEST_CLIPBOARD\"\n");
+    try aiWriteFile(io, root, "wl-paste", "#!/bin/sh\n/bin/cat \"$OZ_TEST_CLIPBOARD\"\n");
+    for ([_][]const u8{ "wl-copy", "wl-paste" }) |name| {
+        const path = try std.fs.path.join(a, &.{ root, name });
+        defer a.free(path);
+        const f = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer f.close(io);
+        try f.setPermissions(io, std.Io.File.Permissions.fromMode(0o755));
+    }
+    const source = "alpha\nalpha\nbeta\n";
+    try writeTestFile(io, root, "source.txt", source);
+    try aiWriteFile(io, root, "clipboard", "old external text");
+    const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+    defer a.free(home);
+    const home_env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+    defer a.free(home_env);
+    const path_env = try std.fmt.allocPrint(a, "PATH={s}:/usr/bin:/bin", .{root});
+    defer a.free(path_env);
+    const clip_env = try std.fmt.allocPrint(a, "OZ_TEST_CLIPBOARD={s}/clipboard", .{root});
+    defer a.free(clip_env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{ home_env, path_env, clip_env, "WAYLAND_DISPLAY=oz-fixture" }, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("yy/");
+    // Wait for actual command mode; a slash also occurs in Normal's
+    // line 1/4 metadata and would let this write race the preceding yy.
+    try gridWaitGone(&sess, &grid, "[NORMAL]", 4000);
+    const yanked = try aiReadFile(io, a, root, "clipboard");
+    defer a.free(yanked);
+    try std.testing.expectEqualStrings("alpha\n", yanked);
+    try aiWriteFile(io, root, "clipboard", "beta\n");
+    try sess.send("\x12\"");
+    try gridWaitRowContains(&sess, &grid, 23, "/alpha", 4000);
+    try gridWaitRowContains(&sess, &grid, 23, "[2/2]", 4000);
+    try sess.send("\r/\x16");
+    try gridWaitRowContains(&sess, &grid, 23, "/beta", 4000);
+    try gridWaitRowContains(&sess, &grid, 23, "[1/1]", 4000);
+    try sess.send("\r/\x12+");
+    try gridWaitRowContains(&sess, &grid, 23, "/beta", 4000);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try aiReadFile(io, a, root, "source.txt");
+    defer a.free(saved);
+    try std.testing.expectEqualStrings(source, saved);
+}
+
+test "search workflow: literal text after expanded tabs and wide glyphs receives the correct colors" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "source.txt", "中\tneedle needle\n");
+    const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+    defer a.free(home);
+    const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+    defer a.free(env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{env}, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+    try sess.send("/needle");
+    try gridWaitRowContains(&sess, &grid, 23, "[1/2]", 4000);
+    const first = aiFindCell(&grid, "needle needle").?;
+    try frame.expectCellBg(&grid, first.row, first.col, packRgb(0x6a, 0x5d, 0x4a));
+    try frame.expectCellBg(&grid, first.row, first.col + 7, packRgb(0x33, 0x3a, 0x4e));
+    try sess.send("\r");
+    try gridWaitRowContains(&sess, &grid, 23, "[1/2]", 4000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
 }

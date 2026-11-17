@@ -156,8 +156,11 @@ const ByteRange = struct {
 /// while the text is syntactically broken. Identifiers render as variables,
 /// everything else stays default. `start_byte` anchors the slice back into
 /// the document so emitted spans use absolute byte offsets.
-fn fallbackLex(text: []const u8, start_byte: u32, arena: std.mem.Allocator, out: *std.ArrayList(Span)) !void {
+fn fallbackLex(text: []const u8, start_byte: u32, arena: std.mem.Allocator, out: *std.ArrayList(Span), zig: bool) !void {
     var i: usize = 0;
+    var parens: usize = 0;
+    var parameters: ?usize = null;
+    var pending_fn = false;
     while (i < text.len) {
         const c = text[i];
         // line comment // … or # … (zig/python/bash)
@@ -211,13 +214,67 @@ fn fallbackLex(text: []const u8, start_byte: u32, arena: std.mem.Allocator, out:
         if (isIdentStart(c)) {
             var j = i;
             while (j < text.len and isIdentCont(text[j])) j += 1;
-            const style: Style = if (isFallbackKeyword(text[i..j])) .keyword else .variable;
+            const word = text[i..j];
+            var after = j;
+            while (after < text.len and std.ascii.isWhitespace(text[after])) after += 1;
+            const next = if (after < text.len) text[after] else 0;
+            var before = i;
+            while (before > 0 and std.ascii.isWhitespace(text[before - 1])) before -= 1;
+            const prev = if (before > 0) text[before - 1] else 0;
+            const style: Style = if (!zig)
+                (if (isFallbackKeyword(word)) .keyword else .variable)
+            else if (std.mem.eql(u8, word, "true") or std.mem.eql(u8, word, "false"))
+                .boolean
+            else if (isZigPrimitive(word))
+                .type
+            else if (std.mem.eql(u8, word, "null") or std.mem.eql(u8, word, "undefined") or std.mem.eql(u8, word, "unreachable"))
+                .constant
+            else if (isFallbackKeyword(word))
+                .keyword
+            else if (next == '(')
+                .function
+            else if (next == ':' and parameters != null)
+                .parameter
+            else if (prev == '.')
+                .property
+            else if (word[0] >= 'A' and word[0] <= 'Z')
+                .type
+            else
+                .variable;
+            if (zig and std.mem.eql(u8, word, "fn")) pending_fn = true;
             try out.append(arena, .{ .start = start_byte + @as(u32, @intCast(i)), .end = start_byte + @as(u32, @intCast(j)), .style = style });
             i = j;
             continue;
         }
+        if (zig) switch (c) {
+            '(' => {
+                parens += 1;
+                if (pending_fn) {
+                    parameters = parens;
+                    pending_fn = false;
+                }
+            },
+            ')' => {
+                if (parameters == parens) parameters = null;
+                parens -|= 1;
+            },
+            '{', ';' => {
+                pending_fn = false;
+                parameters = null;
+            },
+            else => {},
+        };
         i += 1;
     }
+}
+
+fn isZigPrimitive(word: []const u8) bool {
+    for ([_][]const u8{ "void", "bool", "type", "anytype", "anyopaque", "anyerror", "noreturn", "usize", "isize", "comptime_int", "comptime_float" }) |name| {
+        if (std.mem.eql(u8, word, name)) return true;
+    }
+    if (word.len < 2 or (word[0] != 'u' and word[0] != 'i' and word[0] != 'f')) return false;
+    for (word[1..]) |b| if (b < '0' or b > '9') return false;
+    return true;
 }
 
 fn isIdentStart(c: u8) bool {
@@ -382,6 +439,10 @@ fn matchPredicates(self: *Highlighter, match: treez.Query.Match, text: []const u
             }
         }
         i += 1; // skip .done
+        // #set! attaches query metadata (e.g. Zig string priority 95),
+        // not a predicate requiring a capture. Rejecting it silently
+        // removed valid strings, which only reappeared in ERROR fallback.
+        if (std.mem.eql(u8, op, "set!")) continue;
         const cid = cap_id orelse return false;
         // the captured node's text within the document
         var value: ?[]const u8 = null;
@@ -563,6 +624,11 @@ pub const Highlighter = struct {
     /// points corrupt tree-sitter's internal position metadata and can drift
     /// the highlight spans after a burst of edits.
     prev_text: std.ArrayList(u8) = .empty,
+    /// Zig delimiter colors follow lexical nesting, not the parser's
+    /// recovery-wrapper depth. Cached once per text edit, never per frame.
+    zig_brackets: std.ArrayList(struct { byte: u32, style: Style }) = .empty,
+    zig_brackets_valid: bool = false,
+    is_injection: bool = false,
     /// Byte offset of every line start in prev_text (line_starts[0] == 0),
     /// kept in sync by reparse/reparseEdit. Turns the row/col lookup
     /// tree.edit() needs into a binary search — the naive alternative
@@ -652,6 +718,7 @@ pub const Highlighter = struct {
         if (self.inj_cursor) |c| c.destroy();
         if (self.inj_query) |q| q.destroy();
         self.prev_text.deinit(self.allocator);
+        self.zig_brackets.deinit(self.allocator);
         self.line_starts.deinit(self.allocator);
         if (self.tree) |t| t.destroy();
         if (self.cursor) |c| c.destroy();
@@ -687,6 +754,7 @@ pub const Highlighter = struct {
     /// multi-edit fallback). One pass over `text`; per-edit updates use the
     /// incremental path in reparseEdit instead.
     fn setPrevText(self: *Highlighter, text: []const u8) !void {
+        self.zig_brackets_valid = false;
         self.prev_text.clearRetainingCapacity();
         try self.prev_text.appendSlice(self.allocator, text);
         self.line_starts.clearRetainingCapacity();
@@ -736,6 +804,7 @@ pub const Highlighter = struct {
         if (self.tree) |old| old.destroy();
         self.tree = new_tree;
         if (!patched) try self.setPrevText(text);
+        self.zig_brackets_valid = false;
         // Injection children: keep their trees incrementally VALID (same
         // InputEdit + text patch) but don't parse yet — the actual child
         // parse happens lazily in ensureInjections, scoped to the visible
@@ -969,6 +1038,7 @@ pub const Highlighter = struct {
     /// block tree got (reparseEdit patches child trees in lockstep), so the
     /// incremental parse is always valid.
     fn syncRanges(self: *Highlighter, ranges: []const treez.Range, text: []const u8) !void {
+        self.is_injection = true;
         _ = ts_parser_set_included_ranges(self.parser, ranges.ptr, @intCast(ranges.len));
         if (self.tree == null) try self.setPrevText(text);
         const new_tree = self.parser.parseString(self.tree, text) catch {
@@ -978,6 +1048,60 @@ pub const Highlighter = struct {
         };
         if (self.tree) |old| old.destroy();
         self.tree = new_tree;
+    }
+
+    fn ensureZigBrackets(self: *Highlighter) !void {
+        if (self.zig_brackets_valid or self.is_injection or !std.mem.eql(u8, self.lang_name, "zig")) return;
+        self.zig_brackets.clearRetainingCapacity();
+        // Sentinel in unused capacity avoids copying the document for the
+        // compiler lexer. It skips comments, strings and multiline strings.
+        try self.prev_text.ensureUnusedCapacity(self.allocator, 1);
+        self.prev_text.unusedCapacitySlice()[0] = 0;
+        const text = self.prev_text.items.ptr[0..self.prev_text.items.len :0];
+        var lexer = std.zig.Tokenizer.init(text);
+        var stack = std.ArrayList(std.zig.Token.Tag).empty;
+        defer stack.deinit(self.allocator);
+        while (true) {
+            const token = lexer.next();
+            var depth: usize = stack.items.len;
+            switch (token.tag) {
+                .eof => break,
+                .l_paren, .l_brace, .l_bracket => try stack.append(self.allocator, token.tag),
+                .r_paren, .r_brace, .r_bracket => {
+                    const open: std.zig.Token.Tag = switch (token.tag) {
+                        .r_paren => .l_paren,
+                        .r_brace => .l_brace,
+                        else => .l_bracket,
+                    };
+                    var i = stack.items.len;
+                    while (i > 0) {
+                        i -= 1;
+                        if (stack.items[i] == open) {
+                            depth = i;
+                            stack.shrinkRetainingCapacity(i);
+                            break;
+                        }
+                    }
+                },
+                .pipe => {}, // payload |name| captures, not bitwise operators
+                else => continue,
+            }
+            // Retain the existing top-level Zig palette phase (fn f()).
+            try self.zig_brackets.append(self.allocator, .{ .byte = @intCast(token.loc.start), .style = bracketStyle(@intCast(3 + depth)) });
+        }
+        self.zig_brackets_valid = true;
+    }
+
+    fn zigBracketStyle(self: *const Highlighter, byte: u32) ?Style {
+        if (!self.zig_brackets_valid or self.is_injection) return null;
+        var lo: usize = 0;
+        var hi = self.zig_brackets.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.zig_brackets.items[mid].byte < byte) lo = mid + 1 else hi = mid;
+        }
+        if (lo < self.zig_brackets.items.len and self.zig_brackets.items[lo].byte == byte) return self.zig_brackets.items[lo].style;
+        return null;
     }
 
     /// Run the highlight query over [start_byte, end_byte) and append spans
@@ -991,6 +1115,7 @@ pub const Highlighter = struct {
     /// steps ≈ 7ms/frame on token-dense code, the dominant frame cost.
     pub fn spansInRange(self: *Highlighter, start_byte: u32, end_byte: u32, arena: std.mem.Allocator, out: *std.ArrayList(Span)) !void {
         if (self.tree == null) return;
+        try self.ensureZigBrackets();
         const text = self.prev_text.items;
         try self.ensureInjections(start_byte, end_byte);
         // one walk over the visible subtree: ERROR ranges (for the fallback
@@ -1018,6 +1143,53 @@ pub const Highlighter = struct {
             try child.walkVisible(start_byte, end_byte, arena, &cerrs, &cdepths);
             try child.queryInto(start_byte, end_byte, arena, out, &cdepths);
         }
+        // tree-sitter's error recovery can swallow whole regions (e.g. typing
+        // "1;j" — a syntax error — makes the ERROR node cover "const y" on the
+        // NEXT line, so the keyword loses its capture). Fall back to a cheap
+        // per-line lexer INSIDE ERROR nodes so keywords/strings/comments/numbers
+        // keep their colors while the text is syntactically broken. The lexer
+        // runs only on ERROR ranges intersecting the visible range, so the
+        // O(visible) contract holds.
+        // Recovery is a lower-priority layer. Preserve specific query
+        // captures (parameters, calls, types, strings, etc.) even when a
+        // surrounding ERROR node expands while typing an incomplete type.
+        // Generic @variable is deliberately not coverage: the lexer can
+        // recover a swallowed keyword that the parser called an identifier.
+        var covered = std.ArrayList(Span).empty;
+        defer covered.deinit(arena);
+        for (out.items) |sp| {
+            // Zig recovery can misparse a function parameter as a block
+            // label. The lexical function-header context can repair that.
+            if (sp.style == .variable or (sp.style == .label and std.mem.eql(u8, self.lang_name, "zig"))) continue;
+            try covered.append(arena, sp);
+        }
+        std.mem.sort(Span, covered.items, {}, lessThan);
+        var fallback = std.ArrayList(Span).empty;
+        defer fallback.deinit(arena);
+        for (errs.items) |r| {
+            if (r.end <= r.start) continue;
+            if (r.end > text.len) continue;
+            // an ERROR node can span to the end of the file (unclosed
+            // string/comment while typing); the fallback lexer must run only
+            // on the visible slice, or every frame costs O(file)
+            const lo = @max(r.start, start_byte);
+            const hi = @min(r.end, end_byte);
+            if (hi <= lo) continue;
+            try fallbackLex(text[lo..hi], lo, arena, &fallback, std.mem.eql(u8, self.lang_name, "zig"));
+        }
+        var ci: usize = 0;
+        for (fallback.items) |sp| {
+            var pos = sp.start;
+            while (ci < covered.items.len and covered.items[ci].end <= pos) ci += 1;
+            var c = ci;
+            while (c < covered.items.len and covered.items[c].start < sp.end) : (c += 1) {
+                const cover = covered.items[c];
+                if (cover.start > pos) try out.append(arena, .{ .start = pos, .end = @min(cover.start, sp.end), .style = sp.style });
+                pos = @max(pos, cover.end);
+                if (pos >= sp.end) break;
+            }
+            if (pos < sp.end) try out.append(arena, .{ .start = pos, .end = sp.end, .style = sp.style });
+        }
         // Same byte range can be captured by several patterns (the catch-all
         // `(identifier) @variable` plus the specific one). Our query files
         // list the specific captures AFTER the catch-all, so the LAST
@@ -1034,6 +1206,8 @@ pub const Highlighter = struct {
                 const sp = out.items[i];
                 const key = Key{ .start = sp.start, .end = sp.end };
                 if (seen.get(key)) |idx| {
+                    // A generic fallback must not erase a real block label.
+                    if (out.items[idx].style == .label and sp.style == .variable) continue;
                     out.items[idx] = sp; // later capture wins
                 } else {
                     seen.put(key, write) catch {};
@@ -1042,24 +1216,6 @@ pub const Highlighter = struct {
                 }
             }
             out.shrinkRetainingCapacity(write);
-        }
-        // tree-sitter's error recovery can swallow whole regions (e.g. typing
-        // "1;j" — a syntax error — makes the ERROR node cover "const y" on the
-        // NEXT line, so the keyword loses its capture). Fall back to a cheap
-        // per-line lexer INSIDE ERROR nodes so keywords/strings/comments/numbers
-        // keep their colors while the text is syntactically broken. The lexer
-        // runs only on ERROR ranges intersecting the visible range, so the
-        // O(visible) contract holds.
-        for (errs.items) |r| {
-            if (r.end <= r.start) continue;
-            if (r.end > text.len) continue;
-            // an ERROR node can span to the end of the file (unclosed
-            // string/comment while typing); the fallback lexer must run only
-            // on the visible slice, or every frame costs O(file)
-            const lo = @max(r.start, start_byte);
-            const hi = @min(r.end, end_byte);
-            if (hi <= lo) continue;
-            try fallbackLex(text[lo..hi], lo, arena, out);
         }
         std.mem.sort(Span, out.items, {}, lessThan);
     }
@@ -1071,6 +1227,7 @@ pub const Highlighter = struct {
     /// over their own tree and query.
     fn queryInto(self: *Highlighter, start_byte: u32, end_byte: u32, arena: std.mem.Allocator, out: *std.ArrayList(Span), depths: *const std.AutoHashMap(*const anyopaque, u32)) !void {
         const tree = self.tree orelse return;
+        try self.ensureZigBrackets();
         const text = self.prev_text.items;
         const cursor = if (self.cursor) |c| c else blk: {
             self.cursor = try treez.Query.Cursor.create();
@@ -1092,7 +1249,7 @@ pub const Highlighter = struct {
             // instead of the plain .punctuation that captureStyle() would
             // fold them to (it collapses dotted suffixes onto the base).
             const style: Style = if (isBracketCapture(name))
-                bracketStyle(depthOf(cap.node, depths))
+                self.zigBracketStyle(cap.node.getStartByte()) orelse bracketStyle(depthOf(cap.node, depths))
             else
                 captureStyle(name);
             if (style == .default) continue;
@@ -2105,4 +2262,84 @@ test "scopeAt: nested call/initializer wrappers are transparent (build.zig case)
     const in_imports = std.mem.indexOf(u8, src, ".{ .name").?;
     const sc2 = hl.scopeAt(@intCast(in_imports)).?;
     try std.testing.expectEqual(@as(u32, 12), sc2.indent_col);
+}
+
+test "highlight stability: incomplete slice argument must not override recovered captures" {
+    const a = std.testing.allocator;
+    const tail =
+        \\)
+        \\        while (try self.reader().takeDelimiter('\n')) |line| {}
+        \\    }
+        \\};
+        \\pub fn main(init: std.process.Init) !void {
+        \\    const result = count_lines(init.io);
+        \\    std.debug.print("{d}\n", .{result});
+        \\}
+        \\pub fn count_lines(reader: Io.File.Reader) !usize {
+        \\    var total: usize = 0;
+        \\    while (try reader.takeDelimiter('\n')) |_| { total += 1; }
+        \\    return total;
+        \\}
+        \\
+    ;
+    for ([_][]const u8{ "", "[", "[]", "[]u8" }) |arg| {
+        const src = try std.fmt.allocPrint(a, "const std = @import(\"std\");\nconst Stdio = struct {{\n    pub fn read_lines(self: *Stdio, allocator: std.mem.Allocator) ![][]u8 {{\n        var lines: std.ArrayList({s}{s}", .{ arg, tail });
+        defer a.free(src);
+        var hl = try Highlighter.init(a, "zig");
+        defer hl.deinit();
+        try hl.reparse(src);
+        var spans = std.ArrayList(Span).empty;
+        defer spans.deinit(a);
+        try hl.spansInRange(0, @intCast(src.len), a, &spans);
+        for ([_]struct { needle: []const u8, expected: Style }{
+            .{ .needle = "allocator: std", .expected = .parameter },
+            .{ .needle = "main(init", .expected = .function },
+            .{ .needle = "init: std", .expected = .parameter },
+            .{ .needle = "count_lines(init", .expected = .function },
+            .{ .needle = "print(\"", .expected = .function },
+            .{ .needle = "reader: Io", .expected = .parameter },
+        }) |check| {
+            const pos: u32 = @intCast(std.mem.indexOf(u8, src, check.needle).?);
+            const actual = spanAt(spans.items, pos);
+            if (actual != check.expected) std.debug.print("slice arg '{s}': '{s}' expected {s}, got {any}\n", .{ arg, check.needle, @tagName(check.expected), actual });
+            try std.testing.expectEqual(check.expected, actual);
+        }
+    }
+}
+
+test "highlight stability: lexical bracket pairs ignore quotes comments and incomplete inner delimiters" {
+    const a = std.testing.allocator;
+    var hl = try Highlighter.init(a, "zig");
+    defer hl.deinit();
+    const prefix = "fn edit() void {\n    call(";
+    const suffix = ")\n}\nfn untouched(value: u8) void {\n    const s = \"[(}]\"; // {[\n    _ = value;\n}\n";
+    var previous: []const u8 = "";
+    for ([_][]const u8{ "", "[", "[]", "[]u8", "u8", "" }) |argument| {
+        const text = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ prefix, argument, suffix });
+        defer a.free(text);
+        if (hl.tree == null) {
+            try hl.reparse(text);
+        } else {
+            try hl.reparseEdit(@intCast(prefix.len), @intCast(prefix.len + previous.len), @intCast(prefix.len + argument.len), text);
+        }
+        previous = argument;
+        var spans = std.ArrayList(Span).empty;
+        defer spans.deinit(a);
+        try hl.spansInRange(0, @intCast(text.len), a, &spans);
+        const body = std.mem.indexOf(u8, text, "void {\n    const s").? + 5;
+        try std.testing.expectEqual(Style.bracket3, spanAt(spans.items, @intCast(body)).?);
+        const close: u32 = @intCast(text.len - 2);
+        try std.testing.expectEqual(Style.bracket3, spanAt(spans.items, close).?);
+        const cache = hl.zig_brackets.items.ptr;
+        spans.clearRetainingCapacity();
+        try hl.spansInRange(@intCast(body), @intCast(text.len), a, &spans);
+        try std.testing.expectEqual(cache, hl.zig_brackets.items.ptr);
+        // Unlike frozen old spans, changing code to a string must recolor it.
+        const quoted = std.mem.indexOf(u8, text, "[(}]").?;
+        if (spanAt(spans.items, @intCast(quoted)) != .string) {
+            std.debug.print("argument={s} quoted={d} body={d}\n", .{ argument, quoted, body });
+            dumpSpans(text, spans.items);
+        }
+        try std.testing.expectEqual(@as(?Style, .string), spanAt(spans.items, @intCast(quoted)));
+    }
 }

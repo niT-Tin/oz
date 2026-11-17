@@ -35,6 +35,7 @@ pub const Role = enum {
     progress,
     message,
     recording,
+    search,
     agent,
 };
 
@@ -54,6 +55,7 @@ pub const Model = struct {
     diagnostics: ?Item = null,
     message: ?Item = null,
     recording: ?Item = null,
+    search: ?Item = null,
     /// Workspace identity (only when the caller has more than one). It is a
     /// different dimension from the buffer list and the focused window.
     workspace: ?Item = null,
@@ -168,12 +170,13 @@ pub fn plan(m: Model, width: u32) Plan {
     out.mode_cells = mode_cells;
     var x: u32 = mode_cells;
 
-    const left_order = [_]enum { recording, dirty, workspace, branch, diff, diagnostics }{
-        .recording, .dirty, .workspace, .branch, .diff, .diagnostics,
+    const left_order = [_]enum { recording, dirty, search, workspace, branch, diff, diagnostics }{
+        .recording, .dirty, .search, .workspace, .branch, .diff, .diagnostics,
     };
     for (left_order) |kind| {
         const item_opt: ?Item = switch (kind) {
             .recording => m.recording,
+            .search => m.search,
             .dirty => if (m.dirty) Item{ .text = "●", .cells = 1, .role = .dirty } else null,
             .workspace => if (width >= 56) m.workspace else null,
             .branch => if (width >= 60) m.branch else null,
@@ -373,4 +376,25 @@ test "statusline: workspace identity is placed before message and branch" {
     try t.expect(ws.x > p.mode_cells);
     const msg = p.findRole(.message) orelse return error.TestUnexpectedResult;
     try t.expect(msg.x > ws.x + ws.cells);
+}
+
+test "statusline: search count survives optional metadata and stays within narrow rows" {
+    var m = baseModel();
+    m.search = item("[12/1234]", 9, .search);
+    m.branch = item("a-very-long-branch-name", 23, .branch);
+    m.workspace = item("[large-workspace]", 17, .secondary);
+    m.diagnostics = item("E99 W99", 7, .diag_error);
+    m.message = item("an intentionally long error message while searching", 51, .message);
+    for ([_]u32{ 40, 60, 80, 120 }) |width| {
+        const p = plan(m, width);
+        const count = p.findRole(.search) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("[12/1234]", count.item.text);
+        try std.testing.expect(count.x + count.cells <= width);
+        for (p.slice(), 0..) |seg, i| {
+            try std.testing.expect(seg.x + seg.cells <= width);
+            for (p.slice()[i + 1 ..]) |other| {
+                try std.testing.expect(seg.x + seg.cells <= other.x or other.x + other.cells <= seg.x);
+            }
+        }
+    }
 }

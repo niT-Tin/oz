@@ -424,7 +424,7 @@ renderFrame:
 | 编辑 | 文本对象 `ciw`/`ci(`/`ci"`、surround `ys`/`cs`/`ds`、注释 `gcc`/`gc`、对齐 `ga`、多光标 `<C-n>`、`:s` 替换预览、`.` 重复上一步 |
 | 构建/运行/测试 | `<M-r>` 浮动终端（保持项目 cwd、可复用会话）、`:term`；输出直接看，不切窗口 |
 | 修错 | `]d`/`[d` 诊断跳转、`<leader>sd` 诊断列表、`gl` 行内诊断、`<leader>rn` 重命名、`<leader>lf` 格式化 |
-| Git 日常 | gutter diff 符号、`]c`/`[c` hunk 跳转、`<leader>hs` stage / `<leader>hr` reset / `<leader>hp` 预览、`<leader>lg` lazygit（commit/branch/stash） |
+| Git 日常 | gutter diff 符号、`]c`/`[c` hunk 跳转、`<leader>gs` stage / `<leader>gr` reset / `<leader>gp` 预览、`<leader>lg` lazygit（commit/branch/stash） |
 | 收尾 | `:w`、`:q`/`:wq` |
 
 ### 8.2 效率原则（约束实现）

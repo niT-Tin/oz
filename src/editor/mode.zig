@@ -216,8 +216,8 @@ pub const State = struct {
     pending_leader_r: bool = false,
     pending_leader_l: bool = false,
     pending_leader_t: bool = false,
-    /// <leader>h seen (git hunk family, M3a), awaiting s/r/p
-    pending_leader_h: bool = false,
+    /// <leader>g seen (git hunk family, M3a), awaiting s/r/p
+    pending_leader_git: bool = false,
     /// <leader> tab seen (workspace family, M5), awaiting n/./r/d/x/[ /]
     pending_leader_tab: bool = false,
     /// surround sequence (ys/ds/cs) in progress
@@ -374,18 +374,18 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         }
     }
 
-    // 0a3) <leader>h pending (git hunk family, M3a): hs — stage, hr — reset,
-    //     hp — preview.
-    if (state.pending_leader_h) {
-        state.pending_leader_h = false;
+    // 0a3) <leader>g pending (git hunk family, M3a): gs — stage, gr — reset,
+    //     gp — preview.
+    if (state.pending_leader_git) {
+        state.pending_leader_git = false;
         if (isEscape(key)) {
             resetPending(state);
             return .pending;
         }
         switch (key.codepoint) {
-            's' => return emitAction(state, .hunk_stage), // <leader>hs stage
-            'r' => return emitAction(state, .hunk_reset), // <leader>hr reset
-            'p' => return emitAction(state, .hunk_preview), // <leader>hp preview
+            's' => return emitAction(state, .hunk_stage), // <leader>gs stage
+            'r' => return emitAction(state, .hunk_reset), // <leader>gr reset
+            'p' => return emitAction(state, .hunk_preview), // <leader>gp preview
             else => {
                 resetPending(state);
                 return .pending;
@@ -541,8 +541,9 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
             'a' => return emitAction(state, .ai_toggle), // <leader>a AI chat
             'i' => return emitAction(state, .inline_edit), // <leader>i inline edit
             'j' => return emitAction(state, .hint_mode), // <leader>j hint mode
-            'h' => {
-                state.pending_leader_h = true; // <leader>h — git hunk family
+            'h' => return emitAction(state, .search_clear), // immediate :noh
+            'g' => {
+                state.pending_leader_git = true; // <leader>g — git hunk family
                 return .pending;
             },
             else => {
@@ -888,7 +889,7 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
             state.mode = .command;
             break :blk Result{ .search_mode = .backward };
         },
-        .search_next, .search_prev => emitAction(state, action),
+        .search_next, .search_prev, .search_clear => emitAction(state, action),
         // Esc with nothing pending: swallow
         .normal_mode => blk: {
             resetPending(state);
@@ -1295,14 +1296,14 @@ fn countValue(state: *const State) u32 {
     return if (v == 0) 1 else v;
 }
 /// True while a `<leader>` sequence is awaiting its next key (including the
-/// `s`/`b`/`r`/`l`/`t`/`h`/TAB sub-families). Key routers that run BEFORE the
+/// `s`/`b`/`r`/`l`/`t`/`g`/TAB sub-families). Key routers that run BEFORE the
 /// mode state machine (the file tree) must let the sequence finish instead of
 /// consuming its tail — otherwise `<leader>j` from the tree would move the
 /// tree selection and leave a dangling leader prefix.
 pub fn leaderPending(state: *const State) bool {
     return state.pending_leader or state.pending_leader_s or state.pending_leader_b or
         state.pending_leader_r or state.pending_leader_l or state.pending_leader_t or
-        state.pending_leader_h or state.pending_leader_tab;
+        state.pending_leader_git or state.pending_leader_tab;
 }
 
 /// True when no count/operator/prefix sequence is pending — the next key
@@ -1316,7 +1317,7 @@ pub fn idle(state: *const State) bool {
         state.pending_text_object == null and !state.pending_leader and
         !state.pending_leader_s and !state.pending_leader_b and
         !state.pending_leader_r and !state.pending_leader_l and
-        !state.pending_leader_t and !state.pending_leader_h and
+        !state.pending_leader_t and !state.pending_leader_git and
         !state.pending_leader_tab and state.pending_surround == null and
         !state.pending_gc and state.pending_align == null and
         state.pending_macro == null and state.count_len == 0;
@@ -1334,7 +1335,7 @@ fn resetPending(state: *State) void {
     state.pending_leader_r = false;
     state.pending_leader_l = false;
     state.pending_leader_t = false;
-    state.pending_leader_h = false;
+    state.pending_leader_git = false;
     state.pending_leader_tab = false;
     state.pending_surround = null;
     state.pending_align = null;
@@ -2367,4 +2368,26 @@ test "macro: q as an operator argument does not arm the register sequence" {
     // while a sequence is pending (f awaiting its target), not idle
     _ = handle(&s, press('f'), Keymaps.normal);
     try testing.expect(!idle(&s));
+}
+
+test "search keys: Space-h completes immediately and Git actions moved to Space-g" {
+    const t = std.testing;
+    var state = State{};
+    try t.expect(handle(&state, .{ .codepoint = ' ' }, Keymaps.normal) == .pending);
+    const clear = handle(&state, .{ .codepoint = 'h' }, Keymaps.normal);
+    try t.expectEqual(KeyEvent.ActionId.search_clear, clear.action.action);
+    try t.expect(idle(&state));
+    const move = handle(&state, .{ .codepoint = 'j' }, Keymaps.normal);
+    try t.expectEqual(Motion.Motion.down, move.motion.motion);
+    for ([_]u8{ 's', 'r', 'p' }, [_]KeyEvent.ActionId{ .hunk_stage, .hunk_reset, .hunk_preview }) |tail, action| {
+        _ = handle(&state, .{ .codepoint = ' ' }, Keymaps.normal);
+        _ = handle(&state, .{ .codepoint = 'g' }, Keymaps.normal);
+        try t.expect(leaderPending(&state));
+        try t.expectEqual(action, handle(&state, .{ .codepoint = tail }, Keymaps.normal).action.action);
+        try t.expect(idle(&state));
+    }
+    _ = handle(&state, .{ .codepoint = ' ' }, Keymaps.normal);
+    _ = handle(&state, .{ .codepoint = 'g' }, Keymaps.normal);
+    _ = handle(&state, .{ .codepoint = vaxis.Key.escape }, Keymaps.normal);
+    try t.expect(idle(&state));
 }

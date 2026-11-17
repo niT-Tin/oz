@@ -12,9 +12,36 @@ const autil = @import("util.zig");
 // ---- command line (':') ----
 
 pub fn handleCommandKey(self: *App, key: vaxis.Key) !void {
+    try commandKey(self, key);
+    try self.previewSearch();
+}
+
+/// Paste is data, never keystrokes: trim a linewise register's terminator,
+/// fold embedded CR/LF into spaces and discard control codes. In particular
+/// pasted Enter/Esc must not execute an Ex command or leave the prompt.
+pub fn pasteCommandText(self: *App, input: []const u8) !void {
+    self.clearCmdCompleteNames();
+    self.cmd_register_pending = false;
+    self.cmd_hist_idx = null;
+    const text = std.mem.trimEnd(u8, input, "\r\n");
+    for (text, 0..) |byte, i| {
+        if (byte == '\r' or byte == '\n') {
+            if (byte == '\n' and i > 0 and text[i - 1] == '\r') continue;
+            try self.cmdline.append(self.alloc, ' ');
+        } else if (byte >= 0x20 and byte != 0x7f or byte == '\t') {
+            try self.cmdline.append(self.alloc, byte);
+        }
+    }
+    try self.previewSearch();
+}
+
+fn commandKey(self: *App, key: vaxis.Key) !void {
     if (self.pending_filetree_create != null) return @import("filetree.zig").filetreeCreateKey(self, key);
     // cancel
     if (key.codepoint == vaxis.Key.escape or (key.codepoint == 'c' and key.mods.ctrl)) {
+        if (self.cmdline_kind != .ex) self.restoreSearchOrigin();
+        self.search_origin = null;
+        self.cmd_register_pending = false;
         self.state.mode = .normal;
         // Esc cancelling ':' from visual mode must drop the anchor too
         // (it was kept so :'<,'>s could resolve the range on Enter).
@@ -26,6 +53,32 @@ pub fn handleCommandKey(self: *App, key: vaxis.Key) !void {
         self.cmd_hist_idx = null;
         self.cmd_complete_idx = 0;
         self.clearCmdCompleteNames();
+        return;
+    }
+    if (self.cmd_register_pending) {
+        self.cmd_register_pending = false;
+        switch (key.codepoint) {
+            '"' => if (self.yank_buffer) |text| try self.pasteCommandText(text),
+            '+', '*' => {
+                if (self.readSystemClipboard()) |text| {
+                    defer self.alloc.free(text);
+                    try self.pasteCommandText(text);
+                } else if (self.yank_buffer) |text| try self.pasteCommandText(text);
+            },
+            '/' => if (self.last_search) |text| try self.pasteCommandText(text),
+            else => {},
+        }
+        return;
+    }
+    if (key.codepoint == 'r' and key.mods.ctrl) {
+        self.cmd_register_pending = true;
+        return;
+    }
+    if (key.codepoint == 'v' and key.mods.ctrl) {
+        if (self.readSystemClipboard()) |text| {
+            defer self.alloc.free(text);
+            try self.pasteCommandText(text);
+        } else if (self.yank_buffer) |text| try self.pasteCommandText(text);
         return;
     }
     // Any edit/history selection starts a new completion session. Repeated
@@ -61,6 +114,9 @@ pub fn handleCommandKey(self: *App, key: vaxis.Key) !void {
                 // n/N. The text borrows the cmdline buffer — execSearch
                 // dupes what it keeps.
                 const bwd = self.cmdline_kind == .search_bwd;
+                self.restoreSearchOrigin();
+                self.search_origin = null;
+                self.cmd_register_pending = false;
                 self.state.mode = .normal;
                 self.cmdline_kind = .ex;
                 self.cmd_hist_idx = null;
@@ -84,7 +140,12 @@ pub fn handleCommandKey(self: *App, key: vaxis.Key) !void {
             self.cmdline.clearRetainingCapacity();
         },
         vaxis.Key.backspace => {
-            if (self.cmdline.items.len > 0) _ = self.cmdline.pop();
+            var len = self.cmdline.items.len;
+            if (len > 0) {
+                len -= 1;
+                while (len > 0 and self.cmdline.items[len] & 0xc0 == 0x80) len -= 1;
+                self.cmdline.shrinkRetainingCapacity(len);
+            }
         },
         vaxis.Key.up => {
             self.cmd_hist_idx = if (self.cmd_hist_idx) |i|
