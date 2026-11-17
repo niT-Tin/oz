@@ -163,6 +163,11 @@ pub const entries: []const Entry = &.{
     .{ .keys = "alt-w", .desc = "开关底部水平终端 (30% 高)", .group = "终端" },
     .{ .keys = "alt-e", .desc = "开关右侧垂直终端 (40% 宽)", .group = "终端" },
 
+    // ---- Agent ----
+    .{ .keys = "ctrl-pageup ctrl-pagedown", .desc = "Agent 内切换线程，后台任务继续运行", .group = "Agent" },
+    .{ .keys = "/auto /manual", .desc = "Agent 输入框：当前线程只读自动审批 / 手动审批", .group = "Agent" },
+    .{ .keys = "/agent /model /new /threads", .desc = "Agent 输入框：选择后端、模型、新建、浏览线程", .group = "Agent" },
+
     // ---- 窗口 ----
     .{ .keys = "ctrl-w h l", .desc = "窗口焦点向左/右（有文件树时切换树焦点）", .group = "窗口" },
     .{ .keys = "ctrl-w j k", .desc = "窗口焦点向下/上", .group = "窗口" },

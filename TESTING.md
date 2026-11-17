@@ -17,8 +17,8 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-Current counts after the 2026-11-17 search and Zig-highlight fixes:
-**802 unit tests** and **398 e2e cases** (394 default passes and
+Current counts after the 2026-11-17 search, Zig-highlight and Agent workflow fixes:
+**807 unit tests** and **408 e2e cases** (404 default passes and
 four opt-in real-ZLS cases that skip unless `-Dreal-zls` is supplied).
 `tools/verify.sh` covers diff check,
 all unit tests and all e2e tests (including Agent-focus, `terminal:` and
@@ -1013,3 +1013,30 @@ not contribute delimiters. Injected fence languages keep their included-range
 parser behavior. Existing assertions and verifier rules are retained; no
 golden is silently regenerated. Local audit/video frames and logs remain
 ignored, and build output is not installed into `~/.local/bin`.
+
+
+## Per-thread Agent workflows
+
+`zig build e2e -Dtest-filter="agent workflow:"` exercises Ctrl-w focus/draft
+preservation and floating-terminal border + pointer ownership at 80/120 columns;
+independent native model request bodies and persistent ACP sessions; backend
+replacement refusing busy threads and replacing only the idle owner; automatic
+read-only approval, manual write/edit refusal, explained ACP decisions, and
+independent approval/trust per thread. The policy unit group is
+`zig build test -Dtest-filter="auto policy:"`.
+
+Parallel ACP and terminal cases use filesystem barriers, not guessed response
+latencies: both workers reach a ready marker; B completes before A is released.
+Assertions cover transcript separation, unchanged active thread, independent
+pending terminal slots, real disk side effects and owner-only cancellation.
+The native SSE parallel test atomically replaces its fixture inode so A keeps
+reading its original stream while B opens its own. Existing explicit-cancel,
+timeout, output-bound, file-review and golden tests remain enabled. All test
+harnesses run locally without authenticated provider calls.
+
+Agent workflow golden review: the terminal tool schema now describes host
+approval and opt-in read-only auto mode. Four AI golden frames intentionally
+update only their estimated-context token count (1095/1096→1107); geometry, colors
+and assertions remain unchanged. Active native file review retains the settled
+transport's idle signal; inactive threads show approval status, and review
+counts cover both.

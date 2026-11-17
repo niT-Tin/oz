@@ -331,6 +331,7 @@ pub const Thread = struct {
     messages: std.ArrayList(Message) = .empty,
     input: std.ArrayList(u8) = .empty,
     status: Status = .idle,
+    unread_done: bool = false,
     error_text: ?[]u8 = null,
     /// Last request's transport phase, timing and token/context accounting.
     request: RequestTelemetry = .{},
@@ -342,7 +343,7 @@ pub const Thread = struct {
     /// Last rendered transcript geometry (for scroll bounds).
     total_rows: u32 = 0,
     view_rows: u32 = 0,
-    /// Set on cancel / switching away: late worker events must not touch
+    /// Set on explicit cancel: late worker events must not touch
     /// this thread's conversation.
     cancel_requested: bool = false,
 
@@ -355,6 +356,7 @@ pub const Thread = struct {
     }
 
     pub fn statusLabel(self: *const Thread) []const u8 {
+        if (self.status == .idle and self.unread_done) return "done";
         return switch (self.status) {
             .idle => "idle",
             .streaming => "streaming…",
@@ -367,8 +369,8 @@ pub const Thread = struct {
 pub const SelectResult = struct {
     /// Index that was active before the switch.
     prev: usize,
-    /// True when the previous thread was streaming and has now been
-    /// cancelled. The caller must also signal its transport client.
+    /// Kept for callers that previously signalled cancel on selection.
+    /// Selection now always returns false; explicit cancel owns shutdown.
     cancelled: bool,
 };
 
@@ -393,24 +395,14 @@ pub const Threads = struct {
         return self.items.items.len - 1;
     }
 
-    /// Switch the active thread. Switching away from a streaming thread
-    /// cancels it (status cancelled, transcript frozen). One streaming
-    /// thread at a time is therefore enforced by construction.
+    /// Selection changes the view, never the lifetime of another thread.
+    /// Explicit cancel is the only operation that freezes late responses.
     pub fn select(self: *Threads, idx: usize) SelectResult {
         std.debug.assert(idx < self.items.items.len);
         const prev = self.active;
-        if (prev == idx) return .{ .prev = prev, .cancelled = false };
-        var cancelled = false;
-        if (prev < self.items.items.len) {
-            const old = &self.items.items[prev];
-            if (old.status == .streaming) {
-                old.cancel_requested = true;
-                old.status = .cancelled;
-                cancelled = true;
-            }
-        }
         self.active = idx;
-        return .{ .prev = prev, .cancelled = cancelled };
+        self.items.items[idx].unread_done = false;
+        return .{ .prev = prev, .cancelled = false };
     }
 
     pub fn activeThread(self: *Threads) *Thread {
@@ -578,7 +570,7 @@ pub const Threads = struct {
         msg.tool_status = status;
     }
 
-    /// Freeze every running tool card as cancelled (Ctrl+c / thread switch).
+    /// Freeze every running tool card as cancelled (explicit Ctrl+c).
     /// No result may later overwrite them because the app invalidates the
     /// job generation first.
     pub fn cancelRunningTools(self: *Threads, idx: usize) void {
@@ -618,6 +610,7 @@ pub const Threads = struct {
             t.error_text = null;
         }
         t.status = .streaming;
+        t.unread_done = false;
         t.cancel_requested = false;
         t.scroll = 0;
         t.auto_scroll = true;
@@ -627,7 +620,10 @@ pub const Threads = struct {
 
     pub fn finish(self: *Threads, idx: usize) void {
         const t = &self.items.items[idx];
-        if (t.status == .streaming) t.status = .idle;
+        if (t.status == .streaming) {
+            t.status = .idle;
+            t.unread_done = idx != self.active;
+        }
     }
 
     pub fn fail(self: *Threads, alloc: std.mem.Allocator, idx: usize, text: []const u8) void {
@@ -637,7 +633,7 @@ pub const Threads = struct {
         t.status = .err;
     }
 
-    /// Ctrl+c / switching away. Returns true when a live stream was marked
+    /// Explicit Ctrl+c. Returns true when a live stream was marked
     /// cancelled (the caller then asks the transport to stop).
     pub fn cancel(self: *Threads, idx: usize) bool {
         const t = &self.items.items[idx];
@@ -867,7 +863,7 @@ test "threads: transcripts are isolated and active status follows the active thr
     try std.testing.expectEqual(Status.err, ts.activeStatus());
 }
 
-test "threads: switching away cancels streaming and freezes the transcript" {
+test "threads: background selection preserves streams and explicit cancel freezes the transcript" {
     const alloc = std.testing.allocator;
     var ts: Threads = .{};
     defer ts.deinit(alloc);
@@ -880,9 +876,12 @@ test "threads: switching away cancels streaming and freezes the transcript" {
     try std.testing.expect(try ts.applyDelta(alloc, a, "AAA"));
     try std.testing.expectEqual(Status.streaming, ts.activeStatus());
 
-    // Switch to B: A is cancelled and marked so late events are dropped.
+    // Switch to B: A stays live. Explicit cancel then freezes only A.
     const r = ts.select(b);
-    try std.testing.expect(r.cancelled);
+    try std.testing.expect(!r.cancelled);
+    try std.testing.expectEqual(Status.streaming, ts.items.items[a].status);
+    try std.testing.expectEqual(@as(usize, 1), ts.streamingCount());
+    try std.testing.expect(ts.cancel(a));
     try std.testing.expectEqual(@as(usize, 1), ts.active);
     try std.testing.expectEqual(Status.cancelled, ts.items.items[a].status);
     try std.testing.expect(ts.items.items[a].cancel_requested);
@@ -905,8 +904,9 @@ test "threads: switching away cancels streaming and freezes the transcript" {
 
     // Switching back shows A's frozen transcript with cancelled status.
     const back = ts.select(a);
-    try std.testing.expect(back.cancelled); // B was streaming, so this cancels B
-    try std.testing.expectEqual(Status.cancelled, ts.items.items[b].status);
+    try std.testing.expect(!back.cancelled);
+    try std.testing.expectEqual(Status.streaming, ts.items.items[b].status);
+    try std.testing.expect(!ts.items.items[b].cancel_requested);
     try std.testing.expectEqual(Status.cancelled, ts.activeStatus());
     try std.testing.expectEqualStrings("AAA", ts.items.items[a].messages.items[1].text);
     try std.testing.expectEqual(@as(usize, 2), ts.items.items[a].messages.items.len);
@@ -1161,4 +1161,29 @@ test "threads: cancelling tool cards is display-only and idempotent" {
     ts.cancelRunningTools(0);
     try std.testing.expectEqual(ToolStatus.cancelled, ts.items.items[0].messages.items[1].tool_status);
     try std.testing.expectEqual(ToolStatus.ok, ts.items.items[0].messages.items[2].tool_status);
+}
+
+test "threads parallel: selecting B preserves A and explicit cancel only freezes its owner" {
+    const a = std.testing.allocator;
+    var threads = Threads{};
+    defer threads.deinit(a);
+    const first = try threads.create(a);
+    const second = try threads.create(a);
+    try threads.appendUser(a, first, "A", "A");
+    try threads.beginAssistant(a, first);
+    threads.markStreaming(a, first);
+    try std.testing.expect(try threads.applyDelta(a, first, "A_START"));
+    try std.testing.expect(!threads.select(second).cancelled);
+    try std.testing.expectEqual(Status.streaming, threads.items.items[first].status);
+    try threads.appendUser(a, second, "B", "B");
+    try threads.beginAssistant(a, second);
+    threads.markStreaming(a, second);
+    try std.testing.expectEqual(@as(usize, 2), threads.streamingCount());
+    try std.testing.expect(try threads.applyDelta(a, first, "_FINISH"));
+    try std.testing.expect(threads.cancel(second));
+    try std.testing.expect(!try threads.applyDelta(a, second, "LATE_B"));
+    threads.finish(first);
+    try std.testing.expectEqualStrings("A_START_FINISH", threads.items.items[first].messages.items[1].text);
+    try std.testing.expectEqualStrings("", threads.items.items[second].messages.items[1].text);
+    try std.testing.expectEqual(Status.cancelled, threads.items.items[second].status);
 }

@@ -524,6 +524,7 @@ fn loadTargetText(self: *App, canonical: []const u8, rel: []const u8) TextOutcom
 }
 
 fn openReviewSurface(self: *App) void {
+    if (self.agent_edit.pending) |p| if (p.thread_index != self.ai.threads.active) return;
     // Show the review surface exactly like the inline assistant: rail open,
     // Changes tab, badge 1. The buffer and the file remain untouched.
     self.ensureAi() catch {};

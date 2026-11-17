@@ -7,6 +7,15 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 
+pub fn threadStep(key: vaxis.Key) ?i8 {
+    if (!key.mods.ctrl or key.mods.alt or key.mods.super or key.mods.shift) return null;
+    return switch (key.codepoint) {
+        vaxis.Key.page_up => -1,
+        vaxis.Key.page_down => 1,
+        else => null,
+    };
+}
+
 pub const Action = enum {
     close, // Esc -> editor focus (narrow drawer closes)
     send, // Enter
@@ -67,6 +76,7 @@ pub const RailAction = enum {
 pub fn classifyRail(key: vaxis.Key) RailAction {
     if (key.mods.ctrl and !key.mods.alt and !key.mods.super) {
         if (key.codepoint == 'c') return .cancel;
+        if (key.codepoint == 'n') return .new_thread;
         return .ignore;
     }
     if (key.mods.alt or key.mods.super) return .ignore;
@@ -127,4 +137,12 @@ test "rail keys: threads, tabs, new thread, focus exit" {
     try std.testing.expectEqual(RailAction.tab_prev, classifyRail(.{ .codepoint = vaxis.Key.tab, .mods = .{ .shift = true } }));
     try std.testing.expectEqual(RailAction.ignore, classifyRail(.{ .codepoint = 'x', .text = "x" }));
     try std.testing.expectEqual(RailAction.ignore, classifyRail(.{ .codepoint = 'j', .mods = .{ .ctrl = true } }));
+}
+
+test "agent thread shortcuts: only unmodified Ctrl-PageUp/Down select threads" {
+    try std.testing.expectEqual(RailAction.new_thread, classifyRail(.{ .codepoint = 'n', .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(@as(?i8, -1), threadStep(.{ .codepoint = vaxis.Key.page_up, .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(@as(?i8, 1), threadStep(.{ .codepoint = vaxis.Key.page_down, .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(@as(?i8, null), threadStep(.{ .codepoint = vaxis.Key.page_up }));
+    try std.testing.expectEqual(@as(?i8, null), threadStep(.{ .codepoint = vaxis.Key.page_down, .mods = .{ .ctrl = true, .alt = true } }));
 }

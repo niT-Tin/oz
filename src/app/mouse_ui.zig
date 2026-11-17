@@ -237,11 +237,9 @@ fn handleLeftClick(self: *App, col: u32, row: u32) !bool {
     }
     const in_rail = railContains(self, col, row);
 
-    // Z-order: the terminal overlay is drawn above the panes/filetree but
-    // BELOW the AI rail, so a point covered by the rail belongs to the rail.
-    // Elsewhere a terminal hit focuses the child; any other click returns
-    // keyboard focus to the editor.
-    if (!in_rail and terminalContains(self, col, row)) {
+    // The terminal covers Agent as well as editor cells. Pointer ownership
+    // must follow that paint order, even over an underlying Agent button.
+    if (terminalContains(self, col, row)) {
         if (self.term_pane) |*tp| tp.focused = true;
         // A terminal click takes over the keyboard; an AI prompt must not
         // resume owning keys when the terminal loses focus later.
@@ -341,7 +339,7 @@ fn handleWheel(self: *App, col: u32, row: u32, dir: i64) !bool {
     // and program-mouse-reporting children consume the event without local
     // scrolling (the child owns the screen/pointer; we do not forward mouse
     // events yet).
-    if (!in_rail and terminalContains(self, col, row)) {
+    if (terminalContains(self, col, row)) {
         if (self.term_pane) |*tp| {
             if (dir < 0) {
                 _ = tp.t.wheelUp(wheel_lines);

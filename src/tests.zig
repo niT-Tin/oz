@@ -88,6 +88,7 @@ pub const ai_telemetry = @import("ai/telemetry.zig");
 pub const ai_context = @import("ai/context.zig");
 pub const ai_config = @import("ai/config.zig");
 pub const ai_client = @import("ai/client.zig");
+pub const ai_permissions = @import("ai/permissions.zig");
 pub const ai_panel = @import("ai/panel.zig");
 pub const ai_workspace = @import("ai/workspace.zig");
 // M3 tool protocol (pure; no execution or App wiring)
