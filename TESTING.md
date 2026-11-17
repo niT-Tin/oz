@@ -17,8 +17,8 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-Current counts after the 2026-11-17 Dashboard background fix:
-**794 unit tests** and **388 e2e cases** (384 default passes and
+Current counts after the 2026-11-17 search and Zig-highlight fixes:
+**802 unit tests** and **398 e2e cases** (394 default passes and
 four opt-in real-ZLS cases that skip unless `-Dreal-zls` is supplied).
 `tools/verify.sh` covers diff check,
 all unit tests and all e2e tests (including Agent-focus, `terminal:` and
@@ -977,3 +977,39 @@ and trailing space, its removal from the old row after movement, and its
 background in a newly focused vertical split. Blame already sets an explicit
 background; this fix changes Dashboard styles only. No golden is updated and
 no existing assertion or verifier rule is weakened.
+
+## Incremental search and Zig highlight stability
+
+`zig build e2e -Dtest-filter="search workflow:"` runs nine real PTY cases:
+internal charwise/linewise yanks via Ctrl-r quote, native clipboard via Ctrl-v
+and Ctrl-r plus, bracketed/OSC52 paste into search and Ex paths, multiline
+paste as data, live match/current colors, Enter without a second jump,
+Esc/Ctrl-c rollback of cursor/viewport/old query, UTF-8 Backspace, history,
+long wide-character input clipping, n/N direction and wrap, empty Enter,
+no/single matches, edit/undo invalidation, separate split buffers, and more
+than 128 matches on one wrapped line. Source-slice identity avoids treating
+virtual inlay labels as matches, and Tab/CJK cases check actual painted
+coordinates after expansion. Saved-byte assertions detect pasted
+commands leaking into the document. The native clipboard case waits for an
+actual command-mode frame and verifies yy's clipboard write before simulating
+an external copy; a slash in `line 1/4` is not an input-ready signal.
+
+The pure `search index:` tests compare a streaming piece-table matcher with
+an independent contiguous-byte oracle across fragmented pieces, every cursor
+position, Unicode, long patterns, non-overlap and cache invalidation. The
+`search keys:` and `statusline:` tests pin immediate Space-h (no dangling
+prefix), migrated Space-gs/gr/gp actions and count priority/non-overlap.
+Existing real-Git stage/reset assertions now use the approved migrated keys.
+
+`highlight stability:` tests replay the user's incomplete ArrayList slice
+arguments in full and incremental parses and in a real editor. Unedited
+functions, parameters, calls and braces retain their colors through `[]`,
+`[]u8` and completion of the declaration. Error fallback fills gaps under
+specific captures; lexical function context repairs Zig parameter/label
+mis-recovery. Query `#set!` metadata no longer filters out full string spans.
+Zig rainbow colors use compiler-tokenized delimiter nesting (retaining the
+existing top-level palette phase), cached per edit; strings and comments do
+not contribute delimiters. Injected fence languages keep their included-range
+parser behavior. Existing assertions and verifier rules are retained; no
+golden is silently regenerated. Local audit/video frames and logs remain
+ignored, and build output is not installed into `~/.local/bin`.

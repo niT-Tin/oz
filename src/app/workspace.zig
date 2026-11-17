@@ -34,6 +34,7 @@ const Workspace = App.Workspace;
 /// teardown — deleting a workspace / clearing the session deinits each
 /// stored buffer exactly once through this single path.
 pub fn deinitBuffer(self: *App, buf: *Buffer) void {
+    buf.search_index.deinit(self.alloc);
     buf.history.deinit();
     buf.pt.deinit();
     if (buf.disk) |*disk| disk.deinit(self.alloc);

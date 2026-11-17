@@ -1452,16 +1452,16 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
                 // skips 0-width chars) and their drawn width matches
                 // lineCellCol/textWidth — otherwise the cursor column and
                 // the visible line disagree on tab-containing files.
-                var expanded = std.ArrayList(u8).empty;
-                for (seg_text) |b| {
-                    if (b == '\t') {
-                        var k: u32 = 0;
-                        while (k < tab_width) : (k += 1) try expanded.append(a, ' ');
-                    } else {
-                        try expanded.append(a, b);
-                    }
+                var from: usize = 0;
+                for (seg_text, 0..) |b, i| {
+                    if (b != '\t') continue;
+                    if (i > from) try segs.append(a, .{ .text = seg_text[from..i], .style = style });
+                    const spaces = try a.alloc(u8, tab_width);
+                    @memset(spaces, ' ');
+                    try segs.append(a, .{ .text = spaces, .style = style });
+                    from = i + 1;
                 }
-                try segs.append(a, .{ .text = expanded.items, .style = style });
+                if (from < seg_text.len) try segs.append(a, .{ .text = seg_text[from..], .style = style });
             } else {
                 try segs.append(a, .{ .text = seg_text, .style = style });
             }
@@ -1524,12 +1524,9 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
             }
         }
 
-        if (self.search_hl_active and self.last_search != null) {
-            const cursor_off: u32 = if (line == cursor_line and self.curCursor().* >= line_start)
-                self.curCursor().* - line_start
-            else
-                0;
-            try applySearchHighlight(self, a, &segs, text[0..n], cursor_off, line == cursor_line);
+        if (self.activeSearchQuery()) |query| {
+            try buf.search_index.ensure(self.alloc, &buf.pt, buf.history.revision, query);
+            try applySearchHighlight(self, a, &segs, text[0..n], &buf.search_index, line_start, if (is_focused) w.cursor else null);
         }
 
         // Soft wrap: split the content segments (everything past the two
@@ -3258,48 +3255,35 @@ fn buildRichDocRows(
 /// cursorline/band surfaces. Segments that are not verbatim slices of the
 /// line (expanded tabs, concealed markdown, virtual text) are left alone:
 /// highlight is visual only and never changes bytes or columns.
-fn applySearchHighlight(self: *App, a: std.mem.Allocator, segs: *std.ArrayList(vaxis.Segment), text: []const u8, cursor_off: u32, cursor_line: bool) !void {
-    if (!self.search_hl_active) return;
-    const q = self.last_search orelse return;
-    if (q.len == 0 or text.len < q.len) return;
-    const Range = struct { start: usize, end: usize };
-    var ranges: [128]Range = undefined;
-    var n: usize = 0;
-    var from: usize = 0;
-    while (from + q.len <= text.len and n < ranges.len) {
-        const idx = std.mem.indexOfPos(u8, text, from, q) orelse break;
-        ranges[n] = .{ .start = idx, .end = idx + q.len };
-        n += 1;
-        from = idx + q.len;
-    }
-    if (n == 0) return;
-    var current: ?Range = null;
-    if (cursor_line) {
-        for (ranges[0..n]) |r| {
-            if (cursor_off >= r.start and cursor_off < r.end) {
-                current = r;
-                break;
-            }
-        }
-    }
+fn applySearchHighlight(self: *App, a: std.mem.Allocator, segs: *std.ArrayList(vaxis.Segment), text: []const u8, index: *const @import("../editor/search.zig").Index, line_start: u32, cursor: ?u32) !void {
+    const q = index.query orelse return;
+    if (q.len == 0) return;
+    var first = index.lowerBound(line_start);
+    if (first > 0 and @as(u64, index.starts.items[first - 1]) + q.len > line_start) first -= 1;
+    const last = index.lowerBound(line_start + @as(u32, @intCast(text.len)));
+    const hits = index.starts.items[first..last];
+    if (hits.len == 0) return;
     const sel_bg = self.theme.bg_sel;
     const match_bg = theme.searchBg(self.theme, .match).?;
     const current_bg = theme.searchBg(self.theme, .current).?;
     var out = std.ArrayList(vaxis.Segment).empty;
-    // The first two segments are gutter number + separator: never tint them.
     var si: usize = 0;
     while (si < segs.items.len and si < 2) : (si += 1) try out.append(a, segs.items[si]);
-    var scan: usize = 0;
+    var ri: usize = 0;
     while (si < segs.items.len) : (si += 1) {
         const seg = segs.items[si];
         if (seg.text.len == 0) continue;
-        const at = std.mem.indexOfPos(u8, text, scan, seg.text) orelse {
+        // Only borrowed source slices have document coordinates. Searching
+        // for equal bytes would mistake an inlay label for later source text.
+        const base = @intFromPtr(text.ptr);
+        const ptr = @intFromPtr(seg.text.ptr);
+        if (ptr < base or ptr - base > text.len or seg.text.len > text.len - (ptr - base)) {
             try out.append(a, seg);
             continue;
-        };
-        scan = at + seg.text.len;
+        }
+        const at = ptr - base;
         const keep_sel = switch (seg.style.bg) {
-            .rgb => |rgb| rgb[0] == sel_bg[0] and rgb[1] == sel_bg[1] and rgb[2] == sel_bg[2],
+            .rgb => |rgb| std.mem.eql(u8, &rgb, &sel_bg),
             else => false,
         };
         if (keep_sel) {
@@ -3309,26 +3293,20 @@ fn applySearchHighlight(self: *App, a: std.mem.Allocator, segs: *std.ArrayList(v
         var pos = at;
         const end = at + seg.text.len;
         while (pos < end) {
+            const abs = @as(u64, line_start) + pos;
+            while (ri < hits.len and @as(u64, hits[ri]) + q.len <= abs) ri += 1;
             var next = end;
-            var bg: ?theme.Rgb = null;
-            for (ranges[0..n]) |r| {
-                if (r.end <= pos) continue;
-                if (r.start >= next) {
-                    if (next == end and r.start < next) next = r.start;
-                    continue;
-                }
-                if (r.start > pos and r.start < next) next = r.start;
-                if (pos >= r.start and pos < r.end) {
-                    bg = if (current != null and current.?.start == r.start and current.?.end == r.end)
-                        current_bg
-                    else
-                        match_bg;
-                    if (r.end <= next) next = r.end;
+            var style = seg.style;
+            if (ri < hits.len) {
+                const hit = hits[ri];
+                if (abs < hit) {
+                    next = @min(next, hit - line_start);
+                } else {
+                    next = @min(next, @as(usize, hit) + q.len - line_start);
+                    const current = if (cursor) |c| c >= hit and @as(u64, c) < @as(u64, hit) + q.len else false;
+                    style.bg = .{ .rgb = if (current) current_bg else match_bg };
                 }
             }
-            if (next <= pos) next = pos + 1;
-            var style = seg.style;
-            if (bg) |c| style.bg = .{ .rgb = c };
             try out.append(a, .{ .text = seg.text[pos - at .. next - at], .style = style });
             pos = next;
         }
@@ -4188,15 +4166,27 @@ pub fn render(self: *App) !void {
             .search_fwd => "/",
             .search_bwd => "?",
         };
-        const prompt = try std.fmt.allocPrint(a, "{s}{s}", .{ prompt_char, self.cmdline.items });
+        const count = if (self.cmdline_kind != .ex) try self.searchCountText(a) else null;
+        const count_w: u32 = if (count) |txt| @intCast(txt.len + 1) else 0;
+        const show_count = count != null and win.width >= count_w + 3;
+        const input_w = win.width -| (if (show_count) count_w else 0);
+        const fit = autil.cellFitSuffix(win, self.cmdline.items, input_w -| 2);
+        const prompt = try std.fmt.allocPrint(a, "{s}{s}", .{ prompt_char, fit.slice });
         const cmd_seg = [_]vaxis.Segment{.{
             .text = prompt,
             .style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = .{ .rgb = self.theme.bg_status } },
         }};
         _ = win.print(&cmd_seg, .{ .row_offset = @intCast(height - 1), .wrap = .none });
+        if (show_count) {
+            _ = win.print(&.{.{ .text = count.?, .style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_status } } }}, .{
+                .row_offset = @intCast(height - 1),
+                .col_offset = @intCast(win.width - count_w + 1),
+                .wrap = .none,
+            });
+        }
         self.vx.screen.cursor = .{
             .row = @intCast(height - 1),
-            .col = @intCast(1 + self.cmdline.items.len),
+            .col = @intCast(@min(1 + fit.cells, win.width -| 1)),
         };
         self.vx.screen.cursor_vis = true;
         self.vx.screen.cursor_shape = .block;
@@ -4334,7 +4324,7 @@ pub fn render(self: *App) !void {
         }
     }
 
-    // Hunk preview float (<leader>hp): the hunk's raw patch in a
+    // Hunk preview float (<leader>gp): the hunk's raw patch in a
     // floating window — same visual language as the pickers. '+' lines
     // green, '-' lines red, hunk headers accent, context dim.
     if (self.git_preview) |*pv| {
@@ -4841,7 +4831,9 @@ pub fn render(self: *App) !void {
         break :blk std.fmt.bufPrint(&branch_buf, "⎇ {s}", .{trimmed}) catch null;
     } else null;
 
+    const search_count = try self.searchCountText(a);
     const model = statusline.Model{
+        .search = if (search_count) |txt| .{ .text = txt, .cells = @intCast(txt.len), .role = .search } else null,
         .mode = .{ .text = mode_text, .cells = @intCast(autil.cellWidth(win, mode_text)), .role = mode_role },
         .dirty = self.cur().dirty,
         .branch = if (branch_text) |txt| .{ .text = txt, .cells = @intCast(autil.cellWidth(win, txt)), .role = .branch } else null,
@@ -4889,6 +4881,7 @@ pub fn render(self: *App) !void {
             .diag_info => style = .{ .fg = .{ .rgb = t.diag_info }, .bg = status_bg },
             .lsp => style = .{ .fg = .{ .rgb = if (lsp_connected) t.accent_alt else t.fg_faint }, .bg = status_bg },
             .position => style = .{ .fg = .{ .rgb = t.fg }, .bg = status_bg, .bold = true },
+            .search => style = .{ .fg = .{ .rgb = t.accent }, .bg = status_bg },
             .message, .primary => style = .{ .fg = .{ .rgb = t.fg }, .bg = status_bg },
             .recording => style = .{ .fg = .{ .rgb = t.diag_warn }, .bg = status_bg, .bold = true },
             .agent => {
@@ -5288,7 +5281,8 @@ pub fn run(self: *App) !void {
                         // normal mode: insert the paste at the cursor as one
                         // undo group (before, the paste was dropped here)
                         .normal => try self.pasteText(self.paste_buf.items),
-                        // command/visual: drop, as before
+                        .command => try self.pasteCommandText(self.paste_buf.items),
+                        // Visual replacement uses its own explicit operator.
                         else => {},
                     }
                 },
@@ -5310,6 +5304,8 @@ pub fn run(self: *App) !void {
                         try self.inlinePaste(text);
                     } else if (self.ai.rail_open and self.ai.focus != .editor) {
                         try self.aiPaste(text);
+                    } else if (self.state.mode == .command) {
+                        try self.pasteCommandText(text);
                     } else if (self.state.mode == .insert) {
                         if (self.mc_active) try self.mcInsertText(text) else try self.insertText(text);
                     }

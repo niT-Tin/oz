@@ -21,7 +21,7 @@ const gitPreviewLineCount = git_job.gitPreviewLineCount;
 const Buffer = App.Buffer;
 const lspWake = App.lspWake;
 
-/// Hunk preview float (<leader>hp): the raw patch text of the hunk under
+/// Hunk preview float (<leader>gp): the raw patch text of the hunk under
 /// the cursor, shown in a floating window until Esc/Enter/q.
 pub const GitPreview = struct {
     text: []u8, // owned (patch)
@@ -372,7 +372,7 @@ pub fn gotoHunk(self: *App, forward: bool) void {
     self.curViewTop().* = line;
 }
 
-/// <leader>hs / <leader>hr — stage / reset the hunk under the cursor.
+/// <leader>gs / <leader>gr — stage / reset the hunk under the cursor.
 pub fn applyHunk(self: *App, op: GitApplyOp) void {
     const path = self.cur().path orelse return;
     if (self.cur().dirty) {
@@ -396,7 +396,7 @@ pub fn applyHunk(self: *App, op: GitApplyOp) void {
     self.spawnGitJob(.apply, path, start, op) catch {};
 }
 
-/// <leader>hp — show the hunk under the cursor in a floating window.
+/// <leader>gp — show the hunk under the cursor in a floating window.
 pub fn previewHunk(self: *App) void {
     const path = self.cur().path orelse return;
     if (self.cur().dirty) {
@@ -480,6 +480,7 @@ pub fn clearBlameGhostLabel(self: *App) void {
 /// the cache key would otherwise collide across files (a fresh history
 /// starts at revision 0 with an identical byte range).
 pub fn clearSpanCache(self: *App, buf: *Buffer) void {
+    buf.search_index.valid = false;
     if (buf.span_cache) |*sc| self.alloc.free(sc.spans);
     buf.span_cache = null;
 }

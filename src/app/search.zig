@@ -2,7 +2,6 @@
 
 const std = @import("std");
 const vaxis = @import("vaxis");
-const buffer = @import("../buffer/root.zig");
 
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
@@ -14,19 +13,62 @@ const InlayHint = app_mod.InlayHint;
 
 // ---- buffer search (/ ? n N) ----
 
-/// Execute a '/' / '?' search: plain substring (no regex, like :s), from
-/// just after (forward) or before (backward) the cursor, wrapping around
-/// the buffer edges like vim. The query is remembered for n/N.
-pub fn execSearch(self: *App, query: []const u8, backward: bool) !void {
-    if (query.len == 0) return;
-    // remember for n/N (dupes — `query` borrows the cmdline buffer)
-    if (self.last_search) |q| self.alloc.free(q);
-    self.last_search = try self.alloc.dupe(u8, query);
-    self.last_search_bwd = backward;
-    try self.searchOnce(query, backward);
+/// Last confirmed query is never changed by a preview. Each buffer owns its
+/// revision-keyed index, so splits/workspaces cannot borrow another file's hits.
+pub fn activeSearchQuery(self: *App) ?[]const u8 {
+    if (self.state.mode == .command and self.cmdline_kind != .ex)
+        return if (self.cmdline.items.len > 0) self.cmdline.items else null;
+    return if (self.search_hl_active) self.last_search else null;
 }
 
-/// n / N: repeat the remembered search; `flip` inverts the direction.
+pub fn beginSearch(self: *App) void {
+    const w = &self.windows.items[self.current_win];
+    self.cmd_register_pending = false;
+    self.search_origin = .{
+        .workspace = self.current_ws,
+        .win_id = w.id,
+        .buf = w.buf,
+        .view = .{ .cursor = w.cursor, .view_top = w.view_top, .view_wrap = w.view_wrap, .view_pinned = w.view_pinned },
+    };
+}
+
+pub fn restoreSearchOrigin(self: *App) void {
+    const origin = self.search_origin orelse return;
+    const w = &self.windows.items[self.current_win];
+    if (self.current_ws != origin.workspace or w.id != origin.win_id or w.buf != origin.buf) return;
+    const snap = @import("view_state.zig").clamp(&self.cur().pt, origin.view);
+    w.cursor = snap.cursor;
+    w.view_top = snap.view_top;
+    w.view_wrap = snap.view_wrap;
+    w.view_pinned = snap.view_pinned;
+}
+
+pub fn previewSearch(self: *App) !void {
+    if (self.state.mode != .command or self.cmdline_kind == .ex) return;
+    self.restoreSearchOrigin();
+    const query = self.activeSearchQuery() orelse return;
+    const buf = self.cur();
+    try buf.search_index.ensure(self.alloc, &buf.pt, buf.history.revision, query);
+    if (buf.search_index.next(self.curCursor().*, self.cmdline_kind == .search_bwd)) |hit| {
+        self.curCursor().* = hit;
+        self.clearHover();
+    }
+}
+
+/// Enter confirms from the original anchor, not the preview cursor; otherwise
+/// it would skip the match already shown. Empty Enter repeats the last query.
+pub fn execSearch(self: *App, input: []const u8, backward: bool) !void {
+    const query = if (input.len > 0) input else self.last_search orelse {
+        try self.setMsg(try self.alloc.dupe(u8, "no previous search"));
+        return;
+    };
+    const owned = try self.alloc.dupe(u8, query); // input may alias last_search
+    if (self.last_search) |old| self.alloc.free(old);
+    self.last_search = owned;
+    self.last_search_bwd = backward;
+    try self.searchOnce(owned, backward);
+}
+
 pub fn repeatSearch(self: *App, flip: bool) !void {
     const q = self.last_search orelse {
         try self.setMsg(try self.alloc.dupe(u8, "no previous search"));
@@ -35,133 +77,24 @@ pub fn repeatSearch(self: *App, flip: bool) !void {
     try self.searchOnce(q, self.last_search_bwd != flip);
 }
 
-/// Search `query` in the document byte range [start, end) of `pt`,
-/// iterating pieces in document order with NO full-document copy. Returns
-/// the absolute offset of the first (want_last = false) or last
-/// (want_last = true) match STARTING inside the range, or null.
-///
-/// A match may straddle a piece boundary, so a window of the last
-/// (query.len - 1) stream bytes is carried between pieces (stack buffer)
-/// and searched together with the next piece's head. Null when the query
-/// is empty or longer than the window cap (caller falls back to the
-/// full-text path for absurdly long patterns).
-pub fn findInPieces(
-    pt: *const buffer.PieceTable,
-    start: u32,
-    end: u32,
-    query: []const u8,
-    want_last: bool,
-) ?u32 {
-    const qlen = query.len;
-    if (qlen == 0 or end <= start or end - start < qlen) return null;
-    const need: usize = qlen - 1;
-    const max_win = 255;
-    if (need > max_win) return null; // absurd pattern; caller falls back
-    var tail: [max_win]u8 = undefined;
-    var tail_len: usize = 0;
-    var concat: [2 * max_win]u8 = undefined;
-    var result: ?u32 = null;
-    var doc_off: u32 = 0;
-    for (pt.pieces.items) |p| {
-        const piece_end = doc_off + p.len;
-        if (piece_end <= start) {
-            doc_off = piece_end;
-            continue;
-        }
-        if (doc_off >= end) break;
-        const src: []const u8 = if (p.source == .origin) pt.origin else pt.add.items;
-        const skip: u32 = if (start > doc_off) start - doc_off else 0;
-        const take: u32 = @min(p.len - skip, end - doc_off);
-        const bytes = src[@as(usize, p.start) + skip .. @as(usize, p.start) + skip + take];
-        if (bytes.len == 0) {
-            doc_off = piece_end;
-            continue;
-        }
-        // Boundary window: a match can start in the carried tail and
-        // extend into this piece — search tail ++ head together.
-        if (tail_len > 0) {
-            const head: usize = @min(bytes.len, need);
-            @memcpy(concat[0..tail_len], tail[0..tail_len]);
-            @memcpy(concat[tail_len .. tail_len + head], bytes[0..head]);
-            if (std.mem.indexOf(u8, concat[0 .. tail_len + head], query)) |k| {
-                const abs = doc_off - @as(u32, @intCast(tail_len)) + @as(u32, @intCast(k));
-                if (!want_last) return abs;
-                if (result == null or abs > result.?) result = abs;
-            }
-        }
-        if (std.mem.indexOf(u8, bytes, query)) |k| {
-            const abs = doc_off + skip + @as(u32, @intCast(k));
-            if (!want_last) return abs;
-            if (result == null or abs > result.?) result = abs;
-        }
-        // Carry the last `need` stream bytes for the next boundary.
-        if (bytes.len >= need) {
-            @memcpy(tail[0..need], bytes[bytes.len - need ..]);
-            tail_len = need;
-        } else if (need > 0) {
-            if (tail_len + bytes.len > need) {
-                const drop = tail_len + bytes.len - need;
-                std.mem.copyForwards(u8, tail[0 .. tail_len - drop], tail[drop..tail_len]);
-                tail_len -= drop;
-            }
-            @memcpy(tail[tail_len .. tail_len + bytes.len], bytes);
-            tail_len += bytes.len;
-        }
-        doc_off = piece_end;
-    }
-    return result;
-}
-
 pub fn searchOnce(self: *App, query: []const u8, backward: bool) !void {
-    const len = self.cur().pt.len();
-    if (len == 0) return;
-    const cursor = self.curCursor().*;
-    var hit: ?u32 = null;
-    if (query.len - 1 > 255) {
-        // Pathological pattern length: the piece-walker's boundary window
-        // caps at 255 bytes, so fall back to the (rare) full-text path.
-        const text = try self.curText();
-        defer self.alloc.free(text);
-        if (backward) {
-            if (std.mem.lastIndexOf(u8, text[0..@min(cursor, len)], query)) |i| {
-                hit = @intCast(i);
-            } else {
-                const from = @min(cursor + 1, len);
-                if (std.mem.lastIndexOf(u8, text[from..], query)) |i| hit = @intCast(from + i);
-            }
-        } else {
-            const from = @min(cursor + 1, len);
-            if (std.mem.indexOf(u8, text[from..], query)) |i| {
-                hit = @intCast(from + i);
-            } else {
-                if (std.mem.indexOf(u8, text[0..from], query)) |i| hit = @intCast(i);
-            }
-        }
-    } else {
-        const pt = &self.cur().pt;
-        if (backward) {
-            // last match starting before the cursor, else wrap to the end
-            hit = findInPieces(pt, 0, @min(cursor, len), query, true);
-            if (hit == null) {
-                const from = @min(cursor + 1, len);
-                hit = findInPieces(pt, from, len, query, true);
-            }
-        } else {
-            // first match starting after the cursor, else wrap to the top
-            const from = @min(cursor + 1, len);
-            hit = findInPieces(pt, from, len, query, false);
-            if (hit == null) {
-                hit = findInPieces(pt, 0, from, query, false);
-            }
-        }
-    }
-    if (hit) |h| {
-        self.curCursor().* = h;
-        self.search_hl_active = true;
+    const buf = self.cur();
+    try buf.search_index.ensure(self.alloc, &buf.pt, buf.history.revision, query);
+    self.search_hl_active = true;
+    if (buf.search_index.next(self.curCursor().*, backward)) |hit| {
+        self.curCursor().* = hit;
         self.clearHover();
+        try self.setMsg(try self.alloc.dupe(u8, ""));
     } else {
         try self.setMsg(try std.fmt.allocPrint(self.alloc, "pattern not found: {s}", .{query}));
     }
+}
+
+pub fn searchCountText(self: *App, a: std.mem.Allocator) !?[]const u8 {
+    const query = self.activeSearchQuery() orelse return null;
+    const buf = self.cur();
+    try buf.search_index.ensure(self.alloc, &buf.pt, buf.history.revision, query);
+    return try std.fmt.allocPrint(a, "[{d}/{d}]", .{ buf.search_index.ordinal(self.curCursor().*), buf.search_index.starts.items.len });
 }
 
 /// Leading spaces/tabs of `line` (owned copy) — used to auto-indent new

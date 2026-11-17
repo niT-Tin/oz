@@ -196,6 +196,7 @@ pub const App = struct {
     pub const Buffer = struct {
         pt: buffer.PieceTable,
         history: buffer.History,
+        search_index: @import("editor/search.zig").Index = .{},
         path: ?[]u8 = null,
         disk: ?@import("buffer/file.zig").Baseline = null,
         dirty: bool = false,
@@ -407,6 +408,13 @@ pub const App = struct {
     /// What the cmdline collects: an ex command (':') or a buffer search
     /// ('/' forward, '?' backward). Same widget; Enter dispatches differently.
     cmdline_kind: enum { ex, search_fwd, search_bwd } = .ex,
+    cmd_register_pending: bool = false,
+    search_origin: ?struct {
+        workspace: usize,
+        win_id: u64,
+        buf: usize,
+        view: @import("app/view_state.zig").Snapshot,
+    } = null,
     /// Last executed search query (owned) and its direction — for n/N.
     last_search: ?[]u8 = null,
     /// `/`/`?` highlights matches until `:noh`; selections still win.
@@ -667,9 +675,9 @@ pub const App = struct {
     blame_move_ms: i64 = 0,
     /// Cached current-line blame ghost label (see BlameGhostLabel).
     blame_ghost_label: ?BlameGhostLabel = null,
-    /// Hunk preview float (<leader>hp); owned patch text.
+    /// Hunk preview float (<leader>gp); owned patch text.
     git_preview: ?GitPreview = null,
-    /// <leader>hp hit while the diff was stale: show the preview when the
+    /// <leader>gp hit while the diff was stale: show the preview when the
     /// status job lands.
     git_preview_pending: bool = false,
     /// A non-status job (blame/apply) requested while another job was
@@ -1954,6 +1962,7 @@ pub const App = struct {
     pub const curWsName = @import("app/workspace.zig").curWsName;
     // ---- cmdline → src/app/cmdline.zig ----
     pub const handleCommandKey = @import("app/cmdline.zig").handleCommandKey;
+    pub const pasteCommandText = @import("app/cmdline.zig").pasteCommandText;
     pub const completeCommandName = @import("app/cmdline.zig").completeCommandName;
     pub const completeCommandPath = @import("app/cmdline.zig").completeCommandPath;
     pub const clearCmdCompleteNames = @import("app/cmdline.zig").clearCmdCompleteNames;
@@ -1969,8 +1978,12 @@ pub const App = struct {
     // ---- search → src/app/search.zig ----
     pub const execSearch = @import("app/search.zig").execSearch;
     pub const repeatSearch = @import("app/search.zig").repeatSearch;
-    pub const findInPieces = @import("app/search.zig").findInPieces;
     pub const searchOnce = @import("app/search.zig").searchOnce;
+    pub const beginSearch = @import("app/search.zig").beginSearch;
+    pub const restoreSearchOrigin = @import("app/search.zig").restoreSearchOrigin;
+    pub const previewSearch = @import("app/search.zig").previewSearch;
+    pub const activeSearchQuery = @import("app/search.zig").activeSearchQuery;
+    pub const searchCountText = @import("app/search.zig").searchCountText;
     pub const leadingIndent = @import("app/search.zig").leadingIndent;
     pub const invalidateInlayHints = @import("app/search.zig").invalidateInlayHints;
     pub const adjustInlayHintsInsert = @import("app/search.zig").adjustInlayHintsInsert;

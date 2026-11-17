@@ -17,6 +17,7 @@ pub const logging = @import("logging.zig");
 pub const key_event = @import("editor/key_event.zig");
 pub const keymaps = @import("editor/keymaps.zig");
 pub const mode = @import("editor/mode.zig");
+pub const search = @import("editor/search.zig");
 pub const motion = @import("editor/motion.zig");
 pub const edit_range = @import("editor/edit_range.zig");
 pub const line_open = @import("editor/line_open.zig");
