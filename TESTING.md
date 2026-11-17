@@ -17,8 +17,8 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-Current counts after the 2026-11-16 horizontal-layout and Ex-completion
-changes: **794 unit tests** and **386 e2e cases** (382 default passes and
+Current counts after the 2026-11-17 Dashboard background fix:
+**794 unit tests** and **388 e2e cases** (384 default passes and
 four opt-in real-ZLS cases that skip unless `-Dreal-zls` is supplied).
 `tools/verify.sh` covers diff check,
 all unit tests and all e2e tests (including Agent-focus, `terminal:` and
@@ -959,3 +959,21 @@ rail. The verifier, fixtures, ANSI parser, pass/fail interpretation and
 protected-path policy retain their existing behavior. Local audit documents,
 raw red/green logs and preview captures remain ignored. Pending README,
 guide and screenshot work is excluded from the change and SHA-256 checked.
+
+## Dashboard background and blame opacity
+
+`zig build e2e -Dtest-filter="opaque background:"` exercises the actual PTY
+output at 80 and 120 columns in Kanagawa Wave, Catppuccin Mocha and Flexoki
+Light. The Dashboard case checks every body cell's RGB background, including
+logo/menu glyphs, file icons, CJK paths, blank cells and old/new selection
+rows after j/k; it also checks the selected filename foreground and an empty
+recent list. SGR default background is recorded separately from these
+nonblack theme colors, so a preceding base fill cannot hide a later Segment
+overwriting its cell style with a transparent terminal default.
+
+The blame control case uses a real committed Git fixture with CJK, a tab and
+a wrapped line. It checks the themed cursor-line background across the ghost
+and trailing space, its removal from the old row after movement, and its
+background in a newly focused vertical split. Blame already sets an explicit
+background; this fix changes Dashboard styles only. No golden is updated and
+no existing assertion or verifier rule is weakened.

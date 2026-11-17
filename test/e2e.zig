@@ -31424,3 +31424,149 @@ test "horizontal layout: workspace switches retain each navigator intent beside 
     try std.testing.expect(grid.contains("Files"));
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
 }
+
+// SGR default background (0 in Grid) exposes the terminal/desktop on
+// transparent terminals. Check the RGB on glyphs as well as blank cells:
+// a base fill does not make a later Segment inherit its background.
+fn expectDashboardSurface(grid: *Grid, tc: ThemeStyleCase, selected: ?[]const u8) !void {
+    const hit = if (selected) |name| aiFindCell(grid, name) orelse return error.TestUnexpectedResult else null;
+    var selected_end: usize = 0;
+    if (hit) |h| {
+        selected_end = grid.cols;
+        while (selected_end > h.col and std.mem.trim(u8, frame.cellText(grid, h.row, selected_end - 1), " ").len == 0) selected_end -= 1;
+    }
+    for (1..grid.rows - 1) |r| {
+        for (0..grid.cols) |c| {
+            const selected_cell = if (hit) |h| r == h.row and c >= h.col - 4 and c < selected_end else false;
+            try frame.expectCellBg(grid, r, c, if (selected_cell) tc.bg_sel else tc.bg);
+        }
+    }
+    if (hit) |h| try frame.expectRegionFg(grid, .{ .top = h.row, .bottom = h.row, .left = h.col, .right = selected_end - 1 }, tc.fg);
+}
+
+fn backgroundTestHome(io: Io, a: std.mem.Allocator, root: []const u8, theme_name: []const u8) ![]u8 {
+    const home = try std.fs.path.join(a, &.{ root, "home" });
+    errdefer a.free(home);
+    const cache = try std.fs.path.join(a, &.{ home, ".cache", "oz" });
+    defer a.free(cache);
+    try std.Io.Dir.cwd().createDirPath(io, cache);
+    try writeTestFile(io, cache, "theme", theme_name);
+    return home;
+}
+
+test "opaque background: Dashboard glyphs and recent selections use themed surfaces" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    for (theme_style_cases) |tc| {
+        for ([_]u16{ 80, 120 }) |cols| {
+            var root_buf: [128]u8 = undefined;
+            const root = try aiMockDir(io, &root_buf);
+            defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+            const home = try backgroundTestHome(io, a, root, tc.name);
+            defer a.free(home);
+            const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+            defer a.free(env);
+            const cache = try std.fs.path.join(a, &.{ home, ".cache", "oz" });
+            defer a.free(cache);
+            const names = [_][]const u8{ "first.zig", "second.rs", "中文.md" };
+            var paths: [3][]u8 = undefined;
+            var paths_len: usize = 0;
+            defer for (paths[0..paths_len]) |p| a.free(p);
+            var recent = std.ArrayList(u8).empty;
+            defer recent.deinit(a);
+            for (names, 0..) |name, i| {
+                paths[i] = try std.fs.path.join(a, &.{ root, name });
+                paths_len += 1;
+                try writeTestFile(io, root, name, "BACKGROUND_RECENT_BODY\n");
+                try recent.appendSlice(a, paths[i]);
+                try recent.append(a, '\n');
+            }
+            try writeTestFile(io, cache, "recent", recent.items);
+            {
+                var sess = try Session.spawnEnvSizeCwd(io, &.{oz_exe_path}, &.{env}, 24, cols, root);
+                defer sess.close();
+                defer killPid(sess.pid);
+                var grid = try Grid.initSizedCols(a, 24, cols);
+                defer grid.deinit(a);
+                try gridWaitFor(&sess, &grid, paths[2], 8000);
+                try gridSettle(&sess, &grid, 50, 2000);
+                try expectDashboardSurface(&grid, tc, paths[0]);
+                for ([_]usize{ 1, 2, 1, 0 }, [_][]const u8{ "j", "j", "k", "k" }) |selection, key| {
+                    try sess.send(key);
+                    const row = aiFindCell(&grid, paths[selection]).?.row;
+                    try gridWaitRowContains(&sess, &grid, row, "▸", 4000);
+                    try gridSettle(&sess, &grid, 50, 2000);
+                    try expectDashboardSurface(&grid, tc, paths[selection]);
+                }
+                try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit("q"));
+            }
+            try writeTestFile(io, cache, "recent", "");
+            {
+                var sess = try Session.spawnEnvSizeCwd(io, &.{oz_exe_path}, &.{env}, 24, cols, root);
+                defer sess.close();
+                defer killPid(sess.pid);
+                var grid = try Grid.initSizedCols(a, 24, cols);
+                defer grid.deinit(a);
+                try gridWaitFor(&sess, &grid, "Recent:", 8000);
+                try gridSettle(&sess, &grid, 50, 2000);
+                try expectDashboardSurface(&grid, tc, null);
+                try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit("q"));
+            }
+        }
+    }
+}
+
+test "opaque background: blame inherits cursor surface through wrapping moves and splits" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const cursor_bgs = [_]u32{ packRgb(0x2a, 0x2a, 0x37), packRgb(0x18, 0x18, 0x25), packRgb(0xe6, 0xe4, 0xd9) };
+    for (theme_style_cases, cursor_bgs) |tc, cursor_bg| {
+        var root_buf: [128]u8 = undefined;
+        const root = try aiMockDir(io, &root_buf);
+        defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        _ = try runCmdCapture(io, a, &.{ "git", "init", "-q", "-b", "main" }, root);
+        _ = try runCmdCapture(io, a, &.{ "git", "config", "user.email", "test@oz.invalid" }, root);
+        _ = try runCmdCapture(io, a, &.{ "git", "config", "user.name", "BG_MARK" }, root);
+        var source = std.ArrayList(u8).empty;
+        defer source.deinit(a);
+        try source.appendSlice(a, "中\t");
+        for (0..18) |_| try source.appendSlice(a, "wrap ");
+        try source.appendSlice(a, "END_A\nSECOND_LINE\n");
+        try writeTestFile(io, root, "source.txt", source.items);
+        _ = try runCmdCapture(io, a, &.{ "git", "add", "source.txt" }, root);
+        _ = try runCmdCapture(io, a, &.{ "git", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-qm", "background fixture" }, root);
+        const head = try runCmdCapture(io, a, &.{ "git", "rev-parse", "HEAD" }, root);
+        defer a.free(head);
+        try std.testing.expect(head.len >= 40);
+        const home = try backgroundTestHome(io, a, root, tc.name);
+        defer a.free(home);
+        const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+        defer a.free(env);
+        for ([_]u16{ 80, 120 }) |cols| {
+            var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{env}, 30, cols, root);
+            defer sess.close();
+            defer killPid(sess.pid);
+            var grid = try Grid.initSizedCols(a, 30, cols);
+            defer grid.deinit(a);
+            try gridWaitFor(&sess, &grid, "BG_MARK", 10000);
+            try gridSettle(&sess, &grid, 50, 2000);
+            const before = aiFindCell(&grid, "BG_MARK").?;
+            try frame.expectRegionBg(&grid, .{ .top = before.row, .bottom = before.row, .left = before.col - 1, .right = grid.cols - 1 }, cursor_bg);
+            try sess.send("j");
+            try gridWaitPosition(&sess, &grid, 2, 0, 5000);
+            try gridWaitFor(&sess, &grid, "BG_MARK", 10000);
+            try gridSettle(&sess, &grid, 50, 2000);
+            const moved = aiFindCell(&grid, "BG_MARK").?;
+            try std.testing.expect(moved.row != before.row);
+            try frame.expectRegionBg(&grid, .{ .top = moved.row, .bottom = moved.row, .left = moved.col - 1, .right = grid.cols - 1 }, cursor_bg);
+            try frame.expectRegionBg(&grid, .{ .top = before.row, .bottom = before.row, .left = before.col - 1, .right = grid.cols - 1 }, tc.bg);
+            try sess.send(":vs\r");
+            try gridSettle(&sess, &grid, 100, 2000);
+            try gridWaitFor(&sess, &grid, "BG_MARK", 10000);
+            const split = aiFindCell(&grid, "BG_MARK").?;
+            try std.testing.expect(split.col > grid.cols / 2);
+            try frame.expectRegionBg(&grid, .{ .top = split.row, .bottom = split.row, .left = split.col - 1, .right = grid.cols - 1 }, cursor_bg);
+            try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+        }
+    }
+}
