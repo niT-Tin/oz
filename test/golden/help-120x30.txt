@@ -2,24 +2,24 @@
 # name: help-120x30
 # size: 30 rows x 120 cols
 size 30 120
-row 00 |▏ 󰈙 fixture.txt|
-bg 00 1f1f28*20 2a2a37*100
-fg 00 7e9cd8*1 -*1 727169*1 -*1 dcd7ba*11 -*105
-row 01 |oz_golden_help-120x30/fixture.txt                                                            L1:C0  Ask agent  <leader>i|
-bg 01 1f1f28*120
-fg 01 727169*33 -*60 dcd7ba*27
-row 02 |1   alpha line one|
-bg 02 2a2a37*120
-fg 02 dcd7ba*4 -*116
-row 03 |1   beta line two|
+row 00 | ▏󰈙 fixture.txt|
+bg 00 2a2a37*1 1f1f28*18 2a2a37*101
+fg 00 -*1 7e9cd8*1 727169*1 -*1 dcd7ba*11 -*105
+row 01 |1   alpha line one|
+bg 01 2a2a37*120
+fg 01 dcd7ba*4 -*116
+row 02 |1   beta line two|
+bg 02 242430*4 1f1f28*116
+fg 02 54546d*4 -*116
+row 03 |2   gamma line three|
 bg 03 242430*4 1f1f28*116
 fg 03 54546d*4 -*116
-row 04 |2   gamma line three|
+row 04 |3|
 bg 04 242430*4 1f1f28*116
 fg 04 54546d*4 -*116
-row 05 |3                                  ╭ Keymaps ───────────────────────────────────────╮|
-bg 05 242430*4 1f1f28*31 223249*50 1f1f28*35
-fg 05 54546d*4 -*31 54546d*1 e6c384*9 54546d*40 -*35
+row 05 |~                                  ╭ Keymaps ───────────────────────────────────────╮|
+bg 05 1f1f28*35 223249*50 1f1f28*35
+fg 05 727169*1 -*34 54546d*1 e6c384*9 54546d*40 -*35
 row 06 |~                                  │❯                                               │|
 bg 06 1f1f28*35 223249*50 1f1f28*35
 fg 06 727169*1 -*34 54546d*1 e6c384*2 dcd7ba*46 54546d*1 -*35

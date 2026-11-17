@@ -527,6 +527,7 @@ fn openReviewSurface(self: *App) void {
     // Show the review surface exactly like the inline assistant: rail open,
     // Changes tab, badge 1. The buffer and the file remain untouched.
     self.ensureAi() catch {};
+    self.prepareAiRail();
     self.ai.rail_open = true;
     self.ai.tab = .changes;
     self.ai.focus = .rail;

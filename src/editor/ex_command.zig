@@ -72,7 +72,6 @@ pub fn fileArgStart(line: []const u8) ?usize {
     while (start < line.len and (line[start] == ' ' or line[start] == '\t')) : (start += 1) {}
     var end = start;
     while (end < line.len and line[end] != ' ' and line[end] != '\t') : (end += 1) {}
-    if (end == line.len) return null;
     const word = line[start..end];
     const commands = [_][]const u8{ "e", "edit", "sp", "split", "vs", "vsplit", "new", "vnew" };
     for (commands) |cmd| {
@@ -126,8 +125,8 @@ pub fn parse(line: []const u8) Command {
         return if (args.len == 0) .quit else .unknown;
     }
     if (std.mem.eql(u8, word, "q!") or std.mem.eql(u8, word, "quit!")) return .quit_force;
-    if (std.mem.eql(u8, word, "qa") or std.mem.eql(u8, word, "qall")) return .quit_all;
-    if (std.mem.eql(u8, word, "qa!") or std.mem.eql(u8, word, "qall!")) return .quit_all_force;
+    if (std.mem.eql(u8, word, "qa") or std.mem.eql(u8, word, "qall") or std.mem.eql(u8, word, "quitall")) return .quit_all;
+    if (std.mem.eql(u8, word, "qa!") or std.mem.eql(u8, word, "qall!") or std.mem.eql(u8, word, "quitall!")) return .quit_all_force;
     if (std.mem.eql(u8, word, "vs") or std.mem.eql(u8, word, "vsplit") or
         std.mem.eql(u8, word, "vnew")) return .{ .vsplit = if (args.len > 0) args else null };
     if (std.mem.eql(u8, word, "sp") or std.mem.eql(u8, word, "split") or
@@ -237,6 +236,8 @@ test "parse: write/quit family" {
     try std.testing.expect(parse("qa") == .quit_all);
     try std.testing.expect(parse("qall!") == .quit_all_force);
     try std.testing.expect(parse("qa!") == .quit_all_force);
+    try std.testing.expect(parse("quitall") == .quit_all);
+    try std.testing.expect(parse("quitall!") == .quit_all_force);
     try std.testing.expect(parse("vs") == .vsplit);
     try std.testing.expect(parse("vsplit") == .vsplit);
     try std.testing.expect(parse("sp") == .split);
@@ -355,7 +356,10 @@ test "parse: split file arguments preserve aliases, whitespace and Unicode" {
     }
     try std.testing.expect(parse("sp ").split == null);
     try std.testing.expect(parse("vs\t").vsplit == null);
-    try std.testing.expect(fileArgStart("split") == null);
+    try std.testing.expectEqual(@as(?usize, 5), fileArgStart("split"));
+    try std.testing.expectEqual(@as(?usize, 2), fileArgStart("vs"));
+    try std.testing.expect(fileArgStart("v") == null);
+    try std.testing.expect(fileArgStart("vsp") == null);
     try std.testing.expect(fileArgStart("write other.txt") == null);
     try std.testing.expectEqual(@as(?usize, 3), fileArgStart("e  "));
 }

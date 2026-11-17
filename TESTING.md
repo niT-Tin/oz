@@ -17,10 +17,10 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-Current counts after the 2026-11-15 editing-reliability fixes and the
-scope-range emphasis regression: **740 unit tests** and **319 e2e tests** in
-the default filters (the three opt-in real-ZLS tests skip unless
-`-Dreal-zls` is supplied). `tools/verify.sh` covers diff check,
+Current counts after the 2026-11-16 horizontal-layout and Ex-completion
+changes: **794 unit tests** and **386 e2e cases** (382 default passes and
+four opt-in real-ZLS cases that skip unless `-Dreal-zls` is supplied).
+`tools/verify.sh` covers diff check,
 all unit tests and all e2e tests (including Agent-focus, `terminal:` and
 multi-file `approval:`). `tools/verify.sh`
 writes `.verify/unit.log`, `.verify/e2e.log`, and
@@ -198,9 +198,9 @@ at 120x30 dock and 80x24 drawer plus the scenario matrix and Agent-focus test:
 
 - the rail header band (`AGENTS  1`), quiet band transitions, space-separated
   workbox tabs and the active tab's `>` marker + `bg_sel`/accent style;
-- the Navigator's branded border, real `workspace / branch`, Nerd Font
-  Files/Notes/Agents icons, active underline, and the full 30-cell or compact
-  7-cell geometry; Agent-focus uses that compact rail at 120 columns;
+- the Navigator's one-row Files/Notes/Agents strip, real counts, active
+  underline, open left edge and shared right divider; workspace/branch are
+  checked in the status row. Agent-focus uses the compact icon rail;
 - the one-cell blank rail gutter in dock and drawer modes, and the single-row
   status band with workspace/mode/cursor/path and right-aligned AI status;
 - the theme matrix (`ui chrome: theme matrix ...`): three real starts with a
@@ -219,16 +219,14 @@ not embed a different PID or temporary path.
 The current strip is covered by the `ui buffer strip:` tests at 120x30,
 100x30 and 80x24 plus one split test:
 
-- row 0 is the label row and row 1 is the editor context row (real path,
-  cursor and `<leader>i` hint); the first content line is row 2 (single
-  window) or row 3 (two stacked label layers);
-- five real files prove the 20–26 cell tab width, `×` close cell,
-  middle-ellipsis, and that `gT` moves the editor-surface active body and its
-  text underline without depending on a full-width accent rule;
-- hint mode reads labels from the drawn frame and activates the close label
-  through the existing `closeBufferAt` path;
-- the split test asserts two label rows, one shared context row, active
-  emphasis on the focused pane, content below all three rows, and no overflow.
+- each pane owns a single local label row; source starts at row 1 in a
+  single window, and stacked splits draw labels immediately above each body;
+- five real files prove the 14–26 cell tab width, one-cell outer padding,
+  `×` close cell, middle ellipsis, and visible active marker;
+- hint mode reads labels from the drawn frame and activates close through
+  the existing dirty-buffer guard. Clean process exit is asserted;
+- split tests retain independent buffers and viewports, non-overlapping
+  separator cells, and header clicks that first focus the owning pane.
 
 Motion is covered by pure unit tests (`src/app/animation.zig`) and two pty
 tests:
@@ -918,3 +916,46 @@ The invisible-editor/AI-cursor regression now reaches its zero-width focused
 pane by shrinking a one-cell pane, preserving the original cursor hide/show
 assertions without depending on that fixed navigation loop.
 No golden frames or verifier rules are changed.
+
+
+## Horizontal layout and Ex path completion (2026-11-16)
+
+The approved v3 horizontal layout removes the global path/Ask-agent row and
+stacked global Tab layers. `layoutWindows` partitions each pane into its
+local header and body, retaining a source row even at tiny sizes. Tests
+update physical cell expectations for the reclaimed row, without dropping
+editing, saved-byte, viewport, selection, inlay, delayed-response or mouse
+assertions. Position assertions now check both numbers in the same status
+frame; an adversarial oracle regression rejects col 1 matching col 10 and
+line 1 matching line 11.
+
+`horizontal layout:` covers vertical/horizontal local headers, alignment of
+the first filename with source, selecting a tab in an unfocused pane before
+editing, mutually exclusive Navigator/Agent surfaces, stable workbox tabs
+on mouse focus, retained drafts and repeated Agent-focus transitions. A
+workspace-switch regression checks each workspace's suspended navigator
+intent while the Agent itself remains global. `split geometry:` sweeps zero,
+one-row and normal panes; `ai workspace: collapsed thread browser` checks
+that reclaimed browser rows enlarge the body without moving the composer.
+
+`command paths:` covers full aliases versus incomplete commands, repeated
+Tab cycling, preserved typed arguments, relative/absolute/home directory
+completion, spaces and Unicode, descending into a unique directory, edits
+invalidating old candidates, no-match input preservation, and real Ex
+execution retaining the sibling pane. Prefix/home tests use the testing
+allocator. Direct split/open safety regressions remain in `split file state:`.
+
+The scenario matrix now asserts that opening Agent suspends the Navigator,
+rather than requiring both auxiliary columns. Navigator checks replace the
+removed closed rectangle with its continuous shared divider and actual
+content. Explicit Ctrl-w a / prompt Tab reveals threads; ordinary workbox
+clicks keep the same tab row. Terminal tests verify their larger real PTY
+size after global header removal and wait for an actual editor-focus frame
+before issuing editor commands outside the float.
+
+Five representative goldens are deliberately regenerated and reviewed for
+local headers, source row gain, single status metadata and collapsed coding
+rail. The verifier, fixtures, ANSI parser, pass/fail interpretation and
+protected-path policy retain their existing behavior. Local audit documents,
+raw red/green logs and preview captures remain ignored. Pending README,
+guide and screenshot work is excluded from the change and SHA-256 checked.

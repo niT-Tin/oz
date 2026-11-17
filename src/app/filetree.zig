@@ -115,6 +115,13 @@ pub fn toggleFiletree(self: *App) !void {
         self.focus = .buffer;
         return;
     }
+    // Auxiliary surfaces share a width budget. Opening Files explicitly
+    // replaces the coding rail while keeping its threads and draft alive.
+    self.ai.rail_open = false;
+    self.ai.threads_expanded = false;
+    self.ai.focus = .editor;
+    self.ai.rail_restore_navigator = false;
+    self.clearAgentFocus(false);
     self.filetree_top = 0;
     self.filetree_sel = 0;
     // <leader>e is the canonical Files entry; the tab strip can switch to

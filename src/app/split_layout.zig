@@ -13,6 +13,21 @@ pub fn divide(total: u32) Extents {
     return .{ .first = first, .separator = gap, .second = total - first - gap };
 }
 
+/// A header never consumes the final usable source row. Invisible panes
+/// have no header, and a one-row pane keeps its source/cursor accessible.
+pub fn headerRows(height: u32, width: u32) u32 {
+    return if (height >= 2 and width > 0) 1 else 0;
+}
+
+test "split geometry: local headers leave source cells in every visible pane" {
+    for (0..81) |h| for (0..121) |w| {
+        const n = headerRows(@intCast(h), @intCast(w));
+        try std.testing.expect(n <= 1 and n <= h);
+        if (h > 0 and w > 0) try std.testing.expect(h - n > 0);
+        if (h >= 2 and w > 0) try std.testing.expectEqual(@as(u32, 1), n);
+    };
+}
+
 test "split geometry: panes and separator partition even tiny and maximum extents" {
     for (0..201) |n| try expectPartition(@intCast(n));
     try expectPartition(std.math.maxInt(u32));

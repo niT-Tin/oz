@@ -223,6 +223,7 @@ fn openSurface(self: *App) void {
     // Same modal transition as a staged edit, but on the Terminal tab: the
     // review surface is a bounded approval panel, never an interactive shell.
     self.ensureAi() catch {};
+    self.prepareAiRail();
     self.ai.rail_open = true;
     self.ai.tab = .terminal;
     self.ai.focus = .rail;

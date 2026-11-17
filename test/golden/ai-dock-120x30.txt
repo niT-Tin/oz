@@ -2,69 +2,69 @@
 # name: ai-dock-120x30
 # size: 30 rows x 120 cols
 size 30 120
-row 00 |▏ 󰈙 fixture.txt                                                                   │  AGENTS  1                        +|
-bg 00 1f1f28*20 2a2a37*61 1f1f28*1 2a2a37*38
-fg 00 7e9cd8*1 -*1 727169*1 -*1 dcd7ba*11 -*66 727169*1 e6c384*1 -*1 e6c384*7 dcd7ba*2 727169*1 -*24 e6c384*1 -*1
-row 01 |oz_golden_ai-dock-120x30/fixture.txt                  L1:C0  Ask agent  <leader>i │ main|
-bg 01 1f1f28*120
-fg 01 727169*36 -*18 dcd7ba*27 -*1 e6c384*1 -*1 54546d*4 -*32
-row 02 |1   alpha line one                                                                │ > thread 1                     idle|
-bg 02 2a2a37*81 1f1f28*3 284159*35 1f1f28*1
-fg 02 dcd7ba*4 -*78 e6c384*1 -*1 7e9cd8*1 -*1 dcd7ba*8 54546d*25 -*1
-row 03 |1   beta line two                                                                 │|
-bg 03 242430*4 1f1f28*116
-fg 03 54546d*4 -*78 e6c384*1 -*37
-row 04 |2   gamma line three                                                              │|
+row 00 | ▏󰈙 fixture.txt                                                                   │  AGENTS  1                        +|
+bg 00 2a2a37*1 1f1f28*18 2a2a37*62 1f1f28*1 2a2a37*38
+fg 00 -*1 7e9cd8*1 727169*1 -*1 dcd7ba*11 -*66 727169*1 e6c384*1 -*1 e6c384*7 dcd7ba*2 727169*1 -*24 e6c384*1 -*1
+row 01 |1   alpha line one                                                                │|
+bg 01 2a2a37*81 1f1f28*39
+fg 01 dcd7ba*4 -*78 e6c384*1 -*37
+row 02 |1   beta line two                                                                 │ thread 1 · idle          mock-model|
+bg 02 242430*4 1f1f28*78 2a2a37*38
+fg 02 54546d*4 -*78 e6c384*1 -*1 dcd7ba*8 727169*7 54546d*20 -*1
+row 03 |2   gamma line three                                                              │ >chat  changes 0  tools  terminal|
+bg 03 242430*4 1f1f28*78 2a2a37*2 284159*5 2a2a37*31
+fg 03 54546d*4 -*78 e6c384*1 -*1 7e9cd8*1 dcd7ba*4 -*2 727169*9 -*2 727169*5 -*2 727169*8 -*3
+row 04 |3                                                                                 │|
 bg 04 242430*4 1f1f28*116
 fg 04 54546d*4 -*78 e6c384*1 -*37
-row 05 |3                                                                                 │|
-bg 05 242430*4 1f1f28*116
-fg 05 54546d*4 -*78 e6c384*1 -*37
-row 06 |~                                                                                 │|
+row 05 |~                                                                                 │ YOU|
+bg 05 1f1f28*120
+fg 05 727169*1 -*81 e6c384*1 -*1 e6c384*3 -*33
+row 06 |~                                                                                 │ hello|
 bg 06 1f1f28*120
-fg 06 727169*1 -*81 e6c384*1 -*37
+fg 06 727169*1 -*81 e6c384*1 -*1 dcd7ba*5 -*31
 row 07 |~                                                                                 │|
 bg 07 1f1f28*120
 fg 07 727169*1 -*81 e6c384*1 -*37
-row 08 |~                                                                                 │|
+row 08 |~                                                                                 │ AI · mock-model|
 bg 08 1f1f28*120
-fg 08 727169*1 -*81 e6c384*1 -*37
-row 09 |~                                                                                 │|
+fg 08 727169*1 -*81 e6c384*1 -*1 957fb8*15 -*21
+row 09 |~                                                                                 │ mock reply|
 bg 09 1f1f28*120
-fg 09 727169*1 -*81 e6c384*1 -*37
-row 10 |~                                                                                 │ thread 1 · idle          mock-model|
-bg 10 1f1f28*82 2a2a37*38
-fg 10 727169*1 -*81 e6c384*1 -*1 dcd7ba*8 727169*7 54546d*20 -*1
-row 11 |~                                                                                 │ >chat  changes 0  tools  terminal|
-bg 11 1f1f28*82 2a2a37*2 284159*5 2a2a37*31
-fg 11 727169*1 -*81 e6c384*1 -*1 7e9cd8*1 dcd7ba*4 -*2 727169*9 -*2 727169*5 -*2 727169*8 -*3
-row 12 |~                                                                                 │|
+fg 09 727169*1 -*81 e6c384*1 -*1 dcd7ba*10 -*26
+row 10 |~                                                                                 │|
+bg 10 1f1f28*120
+fg 10 727169*1 -*81 e6c384*1 -*37
+row 11 |~                                                                                 │ complete · <1s · no usage|
+bg 11 1f1f28*120
+fg 11 727169*1 -*81 e6c384*1 -*1 54546d*25 -*11
+row 12 |~                                                                                 │ ctx ~1095 tokens · estimate|
 bg 12 1f1f28*120
-fg 12 727169*1 -*81 e6c384*1 -*37
-row 13 |~                                                                                 │ YOU|
+fg 12 727169*1 -*81 e6c384*1 -*1 54546d*27 -*9
+row 13 |~                                                                                 │|
 bg 13 1f1f28*120
-fg 13 727169*1 -*81 e6c384*1 -*1 e6c384*3 -*33
-row 14 |~                                                                                 │ hello|
+fg 13 727169*1 -*81 e6c384*1 -*37
+row 14 |~                                                                                 │|
 bg 14 1f1f28*120
-fg 14 727169*1 -*81 e6c384*1 -*1 dcd7ba*5 -*31
+fg 14 727169*1 -*81 e6c384*1 -*37
 row 15 |~                                                                                 │|
 bg 15 1f1f28*120
 fg 15 727169*1 -*81 e6c384*1 -*37
-row 16 |~                                                                                 │ AI · mock-model|
+row 16 |~                                                                                 │|
 bg 16 1f1f28*120
-fg 16 727169*1 -*81 e6c384*1 -*1 957fb8*15 -*21
-row 17 |~                                                                                 │ mock reply|
+fg 16 727169*1 -*81 e6c384*1 -*37
+row 17 |~                                                                                 │|
 bg 17 1f1f28*120
-fg 17 727169*1 -*81 e6c384*1 -*1 dcd7ba*10 -*26
+fg 17 727169*1 -*81 e6c384*1 -*37
 row 18 |~                                                                                 │|
 bg 18 1f1f28*120
 fg 18 727169*1 -*81 e6c384*1 -*37
-row 19 |~                                                                                 │ complete · <1s · no usage|
+row 19 |~                                                                                 │|
 bg 19 1f1f28*120
-fg 19 727169*1 -*81 e6c384*1 -*1 54546d*25 -*11
-row 20 |~                                                                                 │ ctx ~1095 tokens · estimate|
+fg 19 727169*1 -*81 e6c384*1 -*37
+row 20 |~                                                                                 │|
 bg 20 1f1f28*120
-fg 20 727169*1 -*81 e6c384*1 -*1 54546d*27 -*9
+fg 20 727169*1 -*81 e6c384*1 -*37
 row 21 |~                                                                                 │|
 bg 21 1f1f28*120
 fg 21 727169*1 -*81 e6c384*1 -*37
@@ -89,6 +89,6 @@ fg 27 727169*1 -*81 e6c384*1 -*1 54546d*8 727169*27 -*1
 row 28 |~                                                                                 │ ❯ Message thread 1…      Enter send|
 bg 28 1f1f28*82 2a2a37*38
 fg 28 727169*1 -*81 e6c384*1 -*1 e6c384*2 54546d*17 -*6 54546d*10 -*1
-row 29 |[NORMAL]  │ [main]                                          txt line 1/4 col 0 Top/4  agent thread 1 · mock-model · idle|
+row 29 |[NORMAL]   [main]                                             txt line 1/4 col 0 Top  agent thread 1 · mock-model · idle|
 bg 29 7e9cd8*9 2a2a37*111
-fg 29 1f1f28*9 54546d*3 727169*51 54546d*1 dcd7ba*14 54546d*1 727169*41
+fg 29 1f1f28*9 54546d*2 727169*54 54546d*1 dcd7ba*14 54546d*1 727169*39

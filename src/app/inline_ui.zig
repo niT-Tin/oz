@@ -357,6 +357,7 @@ fn completeInline(self: *App) !void {
     self.focus = .buffer;
     // Show the review surface: open the rail if needed, Changes tab, badge 1.
     self.ensureAi() catch {};
+    self.prepareAiRail();
     self.ai.rail_open = true;
     self.ai.tab = .changes;
     self.ai.focus = .rail;

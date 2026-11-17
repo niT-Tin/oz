@@ -303,7 +303,7 @@ fn handleLeftClick(self: *App, col: u32, row: u32) !bool {
 /// prompt) and approvals keep their own focus policy.
 fn hintActionFocusesEditor(action: hints.Action) bool {
     return switch (action) {
-        .buffer_select, .buffer_close, .filetree_select, .filetree_activate, .navigator_tab, .navigator_peek_close, .note_open => true,
+        .buffer_select, .pane_buffer_select, .buffer_close, .filetree_select, .filetree_activate, .navigator_tab, .navigator_peek_close, .note_open => true,
         else => false,
     };
 }

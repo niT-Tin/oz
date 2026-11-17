@@ -53,6 +53,7 @@ pub const app_hints = @import("app/hints.zig");
 // feat/mouse: pure hit-testing / scroll clamp / cell→byte mapping
 pub const app_mouse = @import("app/mouse.zig");
 pub const app_split_layout = @import("app/split_layout.zig");
+pub const app_path_completion = @import("app/path_completion.zig");
 // §18.11 buffer-strip geometry (pure; render.zig owns the drawing)
 pub const app_tabstrip = @import("app/tabstrip.zig");
 // §18.12 time-based animation primitives (pure; render.zig/ai.zig own the use)

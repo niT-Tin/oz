@@ -136,6 +136,9 @@ pub const Action = union(enum) {
     filetree_activate: usize,
     /// Switch to the buffer in this slot (same as clicking / `[b`).
     buffer_select: usize,
+    /// A local pane header selects within its owning window, even when a
+    /// different pane currently has keyboard focus.
+    pane_buffer_select: struct { win: usize, buffer: usize },
     /// Close the buffer at this slot via the SAME path as `:bd` /
     /// `<leader>bk` (`closeBufferAt`). The last remaining buffer is never
     /// registered: closing it is a no-op, so no dead target exists.

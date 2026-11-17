@@ -74,6 +74,10 @@ fn closeTransientUi(self: *App) void {
 /// switchTo's cleanup (buffers.zig) plus teardownLsp and the scope
 /// animation/cache reset.
 fn afterWsActivate(self: *App) void {
+    if (self.ai.rail_open and !self.ai.agent_focus) {
+        self.ai.rail_restore_navigator = false;
+        self.prepareAiRail();
+    }
     // Compact navigator invariant: owning the keyboard also shows the peek.
     // Workspace slots store focus/filetree_active, so returning to a
     // workspace that was navigating its tree restores the visible drawer.
@@ -135,7 +139,8 @@ pub fn wsSwitchTo(self: *App, idx: usize) void {
 fn storeFiletree(self: *App, ws: *Workspace) void {
     ws.filetree_root = self.filetree_root;
     ws.filetree_rows = self.filetree_rows;
-    ws.filetree_active = self.filetree_active;
+    ws.filetree_active = self.filetree_active or
+        (self.ai.rail_open and !self.ai.agent_focus and self.ai.rail_restore_navigator);
     ws.filetree_sel = self.filetree_sel;
     ws.filetree_top = self.filetree_top;
     ws.focus = self.focus;

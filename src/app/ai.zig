@@ -101,6 +101,9 @@ pub const Session = struct {
     tool_jobs: std.ArrayList(?*tool_job.Job) = .empty,
     chart_cache: ChartCache = .{},
     rail_open: bool = false,
+    threads_expanded: bool = false,
+    /// A temporarily hidden navigator returns when the coding rail closes.
+    rail_restore_navigator: bool = false,
     agent_focus: bool = false,
     rail_width: ?u32 = null,
     focus_rail_width: ?u32 = null,
@@ -239,9 +242,16 @@ pub fn ensureAi(self: *App) !void {
     }
 }
 
+fn railMetrics(self: *App, rows: u32) ws.Metrics {
+    return if (self.ai.threads_expanded or self.ai.agent_focus)
+        ws.metrics(rows, self.ai.tab)
+    else
+        ws.compactMetrics(rows, self.ai.tab);
+}
+
 fn threadVisibleRows(self: *App) u32 {
     const rows = self.vx.window().height -| app_mod.status_row_count;
-    return ws.metrics(rows, self.ai.tab).thread_rows;
+    return railMetrics(self, rows).thread_rows;
 }
 
 fn ensureThreadVisible(self: *App) void {
@@ -282,9 +292,16 @@ pub fn toggleAiFocus(self: *App) !void {
     self.ai.rail_pending_leader = false;
     if (self.ai.agent_focus) {
         clearAgentFocus(self, true);
+        self.ai.threads_expanded = false;
+        prepareAiRail(self);
     } else {
-        self.ai.focus_restore_filetree = self.filetree_active;
+        const was_navigator = self.filetree_active;
+        const restore_navigator = self.ai.rail_restore_navigator;
         if (!self.filetree_active) try self.toggleFiletree();
+        // toggleFiletree is also a user entry that resets auxiliary intent;
+        // this automatic icon rail must preserve the coding-mode snapshot.
+        self.ai.focus_restore_filetree = was_navigator;
+        self.ai.rail_restore_navigator = restore_navigator;
         self.ai.agent_focus = true;
         self.focus = .buffer;
     }
@@ -296,6 +313,20 @@ pub fn toggleAiFocus(self: *App) !void {
     aiLoadConfig(self) catch {};
 }
 
+pub fn prepareAiRail(self: *App) void {
+    if (!self.ai.rail_open) self.ai.threads_expanded = false;
+    if (self.ai.agent_focus) return;
+    if (self.filetree_active) self.ai.rail_restore_navigator = true;
+    self.filetree_active = false;
+    self.navigator_peek = false;
+    self.focus = .buffer;
+}
+
+fn restoreNavigator(self: *App) void {
+    if (self.ai.rail_restore_navigator) self.filetree_active = true;
+    self.ai.rail_restore_navigator = false;
+}
+
 /// `<leader>a`: toggle the rail. Opening focuses the prompt; closing returns
 /// focus to the editor. See `ai.workspace.toggleRail` for the policy.
 pub fn toggleAiPanel(self: *App) !void {
@@ -304,6 +335,8 @@ pub fn toggleAiPanel(self: *App) !void {
     self.ai.rail_open = state.open;
     self.ai.focus = state.focus;
     if (state.open) {
+        self.ai.threads_expanded = false;
+        prepareAiRail(self);
         try ensureAi(self);
         self.ai.tab = .chat;
         self.ai.thread_cursor = self.ai.threads.active;
@@ -321,6 +354,7 @@ pub fn toggleAiPanel(self: *App) !void {
         }
     } else {
         clearAgentFocus(self, true);
+        restoreNavigator(self);
     }
 }
 
@@ -328,8 +362,10 @@ pub fn toggleAiPanel(self: *App) !void {
 /// list. Opens the rail when closed.
 pub fn focusAiRail(self: *App) !void {
     try ensureAi(self);
+    prepareAiRail(self);
     self.navigator_peek = false;
     self.ai.rail_pending_leader = false;
+    self.ai.threads_expanded = true;
     const state = ws.focusRail();
     self.ai.rail_open = state.open;
     self.ai.focus = state.focus;
@@ -341,12 +377,16 @@ pub fn focusAiRail(self: *App) !void {
 /// Esc / q from the rail or prompt. Wide mode keeps the rail visible and
 /// returns keys to the editor; the narrow drawer closes.
 fn aiLeaveRail(self: *App) void {
+    self.ai.threads_expanded = false;
     self.ai.rail_pending_leader = false;
     const narrow = aiLayout(self).mode == .drawer;
     const state = ws.leaveRail(self.ai.rail_open, self.ai.focus, narrow);
     self.ai.rail_open = state.open;
     self.ai.focus = state.focus;
-    if (!state.open) clearAgentFocus(self, true);
+    if (!state.open) {
+        clearAgentFocus(self, true);
+        restoreNavigator(self);
+    }
 }
 
 /// Append a new thread, cancel the previously active stream (switching
@@ -398,6 +438,7 @@ pub fn aiSelectThread(self: *App, idx: usize) void {
 /// attaches to the active thread and moves keyboard focus to its input row.
 pub fn aiFocusPrompt(self: *App) !void {
     try ensureAi(self);
+    prepareAiRail(self);
     self.navigator_peek = false;
     self.ai.rail_open = true;
     self.ai.focus = .prompt;
@@ -425,6 +466,7 @@ pub fn aiToggleToolCard(self: *App, msg_index: usize) void {
 
 fn moveThreadCursor(self: *App, delta: i32) void {
     if (self.ai.threads.items.items.len == 0) return;
+    self.ai.threads_expanded = true;
     var idx: i32 = @intCast(@min(self.ai.thread_cursor, self.ai.threads.items.items.len - 1));
     idx += delta;
     if (idx < 0) idx = 0;
@@ -564,6 +606,7 @@ fn handleAiPromptKey(self: *App, key: vaxis.Key) !void {
         .cancel => aiCancel(self),
         .new_thread => try aiNewThread(self),
         .focus_rail => {
+            self.ai.threads_expanded = true;
             self.ai.focus = ws.fromPromptTab();
             self.ai.thread_cursor = self.ai.threads.active;
             ensureThreadVisible(self);
@@ -2343,7 +2386,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
     // slots are palette-derived; the focused border is distinctly colored
     // in every theme.
     const border_style = chrome.panelBorderStyle(t, focused, rail_bg);
-    const m = ws.metrics(rail_rows, self.ai.tab);
+    const m = railMetrics(self, rail_rows);
     // Mouse-only wheel regions: the thread list and the workbox body scroll
     // the state the keyboard j/k (and aiScroll) already owns. Tabs/prompt
     // rows keep their click targets; the wheel never steals terminal input.
@@ -2430,8 +2473,9 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         try drawRailRow(win, a, m.header_row, x, w, "│", header_border_style, header_bg, segs.items, used);
     }
 
-    // ---- workspace group ----
-    {
+    // Expanded thread browsing keeps its workspace group; ordinary coding
+    // uses the header and current conversation, without an empty list.
+    if (m.thread_rows > 0) {
         var segs = std.ArrayList(vaxis.Segment).empty;
         const ws_fit = autil.cellFitPrefix(win, self.curWsName(), content_w);
         try segs.append(a, .{ .text = ws_fit.slice, .style = st.faint });
@@ -2441,7 +2485,9 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
     if (self.ai.thread_cursor >= self.ai.threads.items.items.len) {
         self.ai.thread_cursor = self.ai.threads.items.items.len - 1;
     }
-    if (self.ai.threads.items.items.len <= m.thread_rows) {
+    if (m.thread_rows == 0) {
+        // Hidden list state remains intact until Ctrl-w a expands it.
+    } else if (self.ai.threads.items.items.len <= m.thread_rows) {
         self.ai.thread_top = 0;
     } else {
         const n = self.ai.threads.items.items.len;

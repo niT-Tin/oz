@@ -120,6 +120,37 @@ pub const Metrics = struct {
     prompt_row: ?u32 = null,
 };
 
+/// Coding mode gives the conversation the space otherwise occupied by the
+/// thread browser. Ctrl-w a still exposes the full list using metrics().
+pub fn compactMetrics(rail_rows: u32, tab: WorkboxTab) Metrics {
+    var out = metrics(rail_rows, tab);
+    if (rail_rows < 9) return out;
+    const reclaimed = out.body_top - 5;
+    out.group_row = 1;
+    out.thread_top = 1;
+    out.thread_rows = 0;
+    out.divider_row = 1;
+    out.workbox_header_row = 2;
+    out.tabs_row = 3;
+    out.tabs_sep_row = 4;
+    out.body_top = 5;
+    out.body_rows += reclaimed;
+    return out;
+}
+
+test "ai workspace: collapsed thread browser gives rows to the body and preserves composer" {
+    for (9..161) |rows| for ([_]WorkboxTab{ .chat, .changes, .tools, .terminal }) |tab| {
+        const full = metrics(@intCast(rows), tab);
+        const compact = compactMetrics(@intCast(rows), tab);
+        try std.testing.expectEqual(@as(u32, 0), compact.thread_rows);
+        try std.testing.expectEqual(full.context_row, compact.context_row);
+        try std.testing.expectEqual(full.prompt_row, compact.prompt_row);
+        try std.testing.expectEqual(full.body_top + full.body_rows, compact.body_top + compact.body_rows);
+        try std.testing.expect(compact.body_rows > full.body_rows);
+        try std.testing.expect(compact.tabs_row < compact.body_top);
+    };
+}
+
 pub fn metrics(rail_rows: u32, tab: WorkboxTab) Metrics {
     if (rail_rows == 0) return .{};
     if (rail_rows < 9) {
