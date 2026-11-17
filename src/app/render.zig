@@ -3435,10 +3435,12 @@ pub fn render(self: *App) !void {
     // subtitle, a centered key menu, then the recent-files list (j/k/Enter).
     if (self.isDashboard()) {
         const t = self.theme;
-        const faint: vaxis.Style = .{ .fg = .{ .rgb = t.fg_faint } };
-        const logo_style: vaxis.Style = .{ .fg = .{ .rgb = t.accent }, .bold = true };
-        const key_style: vaxis.Style = .{ .fg = .{ .rgb = t.accent }, .bold = true };
-        const label_style: vaxis.Style = .{ .fg = .{ .rgb = t.fg } };
+        // Segment styles replace the cell's style; a default background
+        // would punch transparent holes through the themed base fill.
+        const faint: vaxis.Style = .{ .fg = .{ .rgb = t.fg_faint }, .bg = .{ .rgb = t.bg } };
+        const logo_style: vaxis.Style = .{ .fg = .{ .rgb = t.accent }, .bg = .{ .rgb = t.bg }, .bold = true };
+        const key_style: vaxis.Style = .{ .fg = .{ .rgb = t.accent }, .bg = .{ .rgb = t.bg }, .bold = true };
+        const label_style: vaxis.Style = .{ .fg = .{ .rgb = t.fg }, .bg = .{ .rgb = t.bg } };
         // content area between the sidebar and the right edge
         const area_col: u32 = self.contentCol();
         const area_w: u32 = self.aiEditorWidth() -| area_col;
@@ -3520,8 +3522,8 @@ pub fn render(self: *App) !void {
         while (ri < recents_n) : (ri += 1) {
             const fname = self.recent_files.items[ri];
             const sel = (ri == self.recent_sel);
-            const bg: vaxis.Color = if (sel) .{ .rgb = t.bg_sel } else .default;
-            const fg: vaxis.Color = if (sel) .default else .{ .rgb = t.function };
+            const bg: vaxis.Color = .{ .rgb = if (sel) t.bg_sel else t.bg };
+            const fg: vaxis.Color = .{ .rgb = if (sel) t.fg else t.function };
             const icon = icons.forPath(fname, false);
             const segs = [_]vaxis.Segment{
                 .{ .text = if (sel) "▸ " else "  ", .style = .{ .fg = .{ .rgb = t.accent }, .bg = bg } },
