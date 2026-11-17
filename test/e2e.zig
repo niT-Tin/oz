@@ -32344,7 +32344,7 @@ test "agent workflow: auto reads run without focus stealing; writes still need r
 test "agent workflow: ACP auto read permits once; writes and disguised reads require an explained decision" {
     const io = std.testing.io;
     const a = std.testing.allocator;
-    for ([_][]const u8{ "permission-read", "permission-write", "permission-disguised", "permission" }) |mode| {
+    for ([_][]const u8{ "permission-read", "permission-write", "permission-disguised", "permission", "permission-missing-input", "permission-top-command" }) |mode| {
         var root_buf: [128]u8 = undefined;
         const root = try aiMockDir(io, &root_buf);
         defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
@@ -32375,7 +32375,7 @@ test "agent workflow: ACP auto read permits once; writes and disguised reads req
         if (!read) {
             try gridWaitFor(&sess, &grid, "ACP permission", 5000);
             try gridWaitFor(&sess, &grid, "Workspace:", 4000);
-            if (!std.mem.eql(u8, mode, "permission")) try gridWaitFor(&sess, &grid, "rm source.txt", 4000);
+            if (!std.mem.eql(u8, mode, "permission") and !std.mem.eql(u8, mode, "permission-missing-input")) try gridWaitFor(&sess, &grid, "rm source.txt", 4000);
             try std.testing.expect(!grid.contains("PERMISSION_yes"));
             // a/r must not swallow letters inside a slash command.
             try sess.send("/manual\r");

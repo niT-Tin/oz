@@ -38,7 +38,7 @@ fg 10 727169*1 -*81 e6c384*1 -*37
 row 11 |~                                                                                 │ complete · <1s · no usage|
 bg 11 1f1f28*120
 fg 11 727169*1 -*81 e6c384*1 -*1 54546d*25 -*11
-row 12 |~                                                                                 │ ctx ~1095 tokens · estimate|
+row 12 |~                                                                                 │ ctx ~1107 tokens · estimate|
 bg 12 1f1f28*120
 fg 12 727169*1 -*81 e6c384*1 -*1 54546d*27 -*9
 row 13 |~                                                                                 │|

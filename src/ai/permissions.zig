@@ -70,12 +70,29 @@ pub fn readOnlyAcp(alloc: std.mem.Allocator, raw: []const u8) bool {
     var parsed = std.json.parseFromSlice(V, alloc, raw, .{}) catch return false;
     defer parsed.deinit();
     const v = parsed.value;
+    if (v != .object) return false;
+    // Trust only the ACP descriptor shape. A non-standard top-level
+    // command/script may contradict kind=read and must be reviewed.
+    var descriptor = v.object.iterator();
+    while (descriptor.next()) |entry| {
+        var known = false;
+        for ([_][]const u8{ "toolCallId", "title", "kind", "status", "content", "locations", "rawInput", "rawOutput", "_meta" }) |allowed| {
+            if (std.mem.eql(u8, entry.key_ptr.*, allowed)) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) return false;
+    }
+    const content = field(v, "content");
+    if (content == .array) for (content.array.items) |part| {
+        if (eq(field(part, "type"), "diff")) return false;
+    };
     const kind = field(v, "kind");
     const read = eq(kind, "read") or eq(kind, "search");
     if (!read and !eq(kind, "execute")) return false;
     const input = field(v, "rawInput");
-    if (input == .null) return read;
-    if (input != .object) return false;
+    if (input != .object or input.object.count() == 0) return false;
     if (input.object.get("command")) |cmd| {
         // Extra script/argv/etc fields might execute a different operation.
         if (input.object.count() != 1 or cmd != .string) return false;
@@ -112,7 +129,16 @@ pub fn describeAcp(alloc: std.mem.Allocator, raw: []const u8, root: []const u8) 
     defer alloc.free(kind);
     const cwd = try @import("terminal_tool.zig").escapeCommand(alloc, root);
     defer alloc.free(cwd);
-    return std.fmt.allocPrint(alloc, "Action: {s}\nKind: {s}\nWorkspace: {s}\nDetails: {s}", .{ title, kind, cwd, raw });
+    const input = field(v, "rawInput");
+    var command = str(field(input, "command"));
+    if (command.len == 0) command = str(field(v, "command"));
+    var path = str(field(input, "path"));
+    if (path.len == 0) path = str(field(input, "file_path"));
+    if (path.len == 0) path = str(field(input, "filePath"));
+    const escaped = try @import("terminal_tool.zig").escapeCommand(alloc, if (command.len > 0) command else path);
+    defer alloc.free(escaped);
+    const label = if (command.len > 0) "Command: " else if (path.len > 0) "Path: " else "";
+    return std.fmt.allocPrint(alloc, "Action: {s}\nKind: {s}\nWorkspace: {s}\n{s}{s}{s}Details: {s}", .{ title, kind, cwd, label, escaped, if (label.len > 0) "\n" else "", raw });
 }
 
 test "auto policy: read-only allowlist rejects shell execution and write disguises" {
@@ -130,6 +156,14 @@ test "auto policy: ACP reads accept bounded known input; kind alone cannot hide 
         \\{"kind":"execute","rawInput":{"command":"pwd"}}
     }) |raw| try std.testing.expect(readOnlyAcp(a, raw));
     for ([_][]const u8{
+        \\{"kind":"read","rawInput":{"path":"source.txt"},"command":"rm source.txt"}
+        ,
+        \\{"kind":"read","title":"unknown action"}
+        ,
+        \\{"kind":"read","rawInput":{}}
+        ,
+        \\{"kind":"read","rawInput":{"path":"source.txt"},"content":[{"type":"diff","oldText":"old","newText":"new"}]}
+        ,
         \\{"kind":"read","rawInput":{"command":"rm README.md"}}
         ,
         \\{"kind":"read","rawInput":{"path":"a","newText":"overwrite"}}
@@ -143,4 +177,8 @@ test "auto policy: ACP reads accept bounded known input; kind alone cannot hide 
         "null",
         "{broken",
     }) |raw| try std.testing.expect(!readOnlyAcp(a, raw));
+    const details = try describeAcp(a, "{\"kind\":\"read\",\"command\":\"rm source.txt\"}", "/workspace");
+    defer a.free(details);
+    try std.testing.expect(std.mem.indexOf(u8, details, "Command: rm source.txt\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, details, "Workspace: /workspace") != null);
 }

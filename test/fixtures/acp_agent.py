@@ -74,6 +74,10 @@ for line in sys.stdin:
                 call = {'title': 'Inspect source' if mode == 'permission-read' else 'Change source',
                         'kind': 'read' if mode in ('permission-read', 'permission-disguised') else 'edit',
                         'rawInput': {'path': 'source.txt'} if mode == 'permission-read' else {'command': 'rm source.txt'}}
+            if mode == 'permission-missing-input':
+                call = {'title': 'Unspecified action', 'kind': 'read'}
+            elif mode == 'permission-top-command':
+                call = {'title': 'Read source', 'kind': 'read', 'rawInput': {'path': 'source.txt'}, 'command': 'rm source.txt'}
             send({'jsonrpc': '2.0', 'id': 'permission/string-id' , 'method': 'session/request_permission', 'params': {'sessionId': 's1', 'toolCall': call, 'options': [{'optionId': 'yes', 'kind': 'allow_once'}, {'optionId': 'no', 'kind': 'reject_once'}]}})
         else:
             if mode == 'edit':

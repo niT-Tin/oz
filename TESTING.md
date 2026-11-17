@@ -1033,3 +1033,10 @@ The native SSE parallel test atomically replaces its fixture inode so A keeps
 reading its original stream while B opens its own. Existing explicit-cancel,
 timeout, output-bound, file-review and golden tests remain enabled. All test
 harnesses run locally without authenticated provider calls.
+
+Agent workflow golden review: the terminal tool schema now describes host
+approval and opt-in read-only auto mode. Four AI golden frames intentionally
+update only their estimated-context token count (1095/1096→1107); geometry, colors
+and assertions remain unchanged. Active native file review retains the settled
+transport's idle signal; inactive threads show approval status, and review
+counts cover both.

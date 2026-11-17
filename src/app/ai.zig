@@ -2437,7 +2437,7 @@ fn aiStatusLabelFor(self: *App, idx: usize) []const u8 {
         if (app_agent_terminal.statusLabelFor(self, idx)) |label| return label;
         if (toolState(self, idx)) |st| {
             if (st.acp_permission != null) return "approval…";
-            if (self.agent_edit.pending) |p| if (p.thread_index == idx) return "approval…";
+            if (self.agent_edit.pending) |p| if (p.thread_index == idx and idx != self.ai.threads.active) return "approval…";
             if (st.active or st.pending_followup) return "tools…";
         }
         const t = &self.ai.threads.items.items[idx];
@@ -2631,7 +2631,8 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         var reviews: usize = 0;
         var completed: usize = 0;
         for (self.ai.threads.items.items, 0..) |thread, idx| {
-            if (std.mem.eql(u8, aiStatusLabelFor(self, idx), "approval…")) reviews += 1;
+            const pending_edit = if (self.agent_edit.pending) |p| p.thread_index == idx else false;
+            if (pending_edit or std.mem.eql(u8, aiStatusLabelFor(self, idx), "approval…")) reviews += 1;
             if (thread.unread_done and std.mem.eql(u8, aiStatusLabelFor(self, idx), "done")) completed += 1;
         }
         if (reviews > 0 or completed > 0) {
