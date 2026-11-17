@@ -32570,3 +32570,144 @@ test "agent workflow: native file edits always require review in auto mode" {
     try std.testing.expectEqualStrings(before, after); // buffer wasn't silently edited either
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
 }
+
+// Independent nvim -u NONE text-operation expectations, expanded from #13/#17.
+// The saved-byte oracle intentionally does not infer a caret from ANSI writes.
+test "history audit: Unicode replacement counted till and multiline objects match independent Vim output" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const Case = struct { issue: u32, label: []const u8, suffix: []const u8, text: []const u8, keys: []const u8, want: []const u8 };
+    var cases = try std.json.parseFromSlice([]Case, a, @embedFile("fixtures/history_text_cases.json"), .{});
+    defer cases.deinit();
+    for (cases.value) |c| try erEditorFileCase(io, a, c.label, c.suffix, c.text, c.keys, c.want);
+}
+
+test "history audit: quote pairing and interrupted key captures retain literal text" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const Case = struct { label: []const u8, text: []const u8, keys: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .label = "first apostrophe at an empty gap pairs", .text = "\n", .keys = "i'", .want = "''\n" },
+        .{ .label = "Kitty replacement keeps associated combining text", .text = "ab\n", .keys = "r\x1b[101;1;101:769u", .want = "e\xcc\x81b\n" },
+        .{ .label = "replace complete emoji ZWJ source", .text = "👩‍💻x\n", .keys = "rX", .want = "Xx\n" },
+        .{ .label = "skip exactly one paired closer", .text = "\"\"tail\n", .keys = "li\"X", .want = "\"\"Xtail\n" },
+        .{ .label = "Unicode punctuation closes once", .text = "中。\n", .keys = "A\"\"", .want = "中。\"\"\n" },
+        .{ .label = "jk interrupted inside paired quotes", .text = "\n", .keys = "i\"j\x1b[Ck", .want = "\"j\"k\n" },
+        .{ .label = "jk deletion before k preserves old j", .text = "ajj\n", .keys = "Aj\x7fk", .want = "ajjk\n" },
+        .{ .label = "bracketed paste breaks jk recognition", .text = "ajj\n", .keys = "Aj\x1b[200~X\x1b[201~k", .want = "ajjjXk\n" },
+    };
+    for (cases) |c| try erEditorFileCase(io, a, c.label, ".txt", c.text, c.keys, c.want);
+}
+
+test "history audit: Unicode buffer views survive dirty reuse through both split destinations" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    for ([_]u16{ 40, 120 }) |cols| {
+        var root_buf: [128]u8 = undefined;
+        const root = try aiMockDir(io, &root_buf);
+        defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        try writeTestFile(io, root, "a.txt", "A0\nA1\n中🙂A2\nA3\n");
+        try writeTestFile(io, root, "b.txt", "B0\n");
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "a.txt" }, &.{}, 26, cols, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 26, cols);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try sess.send("jj0ll:vs b.txt\r");
+        try gridWaitFor(&sess, &grid, "B0", 4000);
+        try sess.send("rR");
+        try gridWaitFor(&sess, &grid, "R0", 4000);
+        try sess.send(":e a.txt\rrX");
+        try gridWaitFor(&sess, &grid, "中🙂X2", 4000);
+        try sess.send("\x17h:e b.txt\r");
+        try gridWaitFor(&sess, &grid, "R0", 4000);
+        try sess.send(":bp\rrL");
+        try gridWaitFor(&sess, &grid, "中🙂L2", 4000);
+        try sess.send(":w\r:e b.txt\r:w\r");
+        try gridWaitFor(&sess, &grid, "written:", 4000);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+        const first = try aiReadFile(io, a, root, "a.txt");
+        defer a.free(first);
+        const second = try aiReadFile(io, a, root, "b.txt");
+        defer a.free(second);
+        try std.testing.expectEqualStrings("A0\nA1\n中🙂L2\nA3\n", first);
+        try std.testing.expectEqualStrings("R0\n", second);
+    }
+}
+
+test "history audit: quoted path directories and hidden names keep delimiters and exact bytes" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |directory| {
+        var root_buf: [128]u8 = undefined;
+        const root = try aiMockDir(io, &root_buf);
+        defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        const docs = try std.fs.path.join(a, &.{ root, "Docs" });
+        defer a.free(docs);
+        try std.Io.Dir.cwd().createDirPath(io, docs);
+        try writeTestFile(io, docs, "文 件.txt", "TARGET\n");
+        try writeTestFile(io, root, ".hidden目标", "HIDDEN\n");
+        try writeTestFile(io, root, "editor.md", "\n");
+        const home = try std.fmt.allocPrint(a, "HOME={s}", .{root});
+        defer a.free(home);
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "editor.md" }, &.{home}, 26, 80, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 26, 80);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try sess.send(if (directory) "i`~/Do" else "i`~/.hid");
+        try gridWaitFor(&sess, &grid, if (directory) "Docs/" else ".hidden目标", 5000);
+        try sess.send("\r");
+        if (directory) {
+            try gridWaitFor(&sess, &grid, "文 件.txt", 5000);
+            try sess.send("\r");
+        }
+        try sess.send("\x03");
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+        const text = try aiReadFile(io, a, root, "editor.md");
+        defer a.free(text);
+        try std.testing.expectEqualStrings(if (directory) "`~/Docs/文 件.txt`\n" else "`~/.hidden目标`\n", text);
+    }
+}
+
+test "history audit: inlay indentation remains virtual during Unicode edits and undo in narrow panes" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const source = "fn hints() void {\n    call(\n        u8,\n        expected_value,\n\t\tactual_value,\n    );\n    mid_value,\n    zero_value,\n    pair_value,\n    \"中文😀\", next_value,\n}\n";
+    const want = "fn hints() void {\n    call(\n        Z8,\n        expected_value,\n\t\tQctual_value,\n    );\n    mid_value,\n    zero_value,\n    pair_value,\n    \"X文😀\", next_value,\n}\n";
+    for ([_]u16{ 40, 120 }) |cols| {
+        var path_buf: [192:0]u8 = undefined;
+        const path = try erFixture(io, &path_buf, ".zig", source);
+        defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        const oz = try erAbs(io, a, oz_exe_path);
+        defer a.free(oz);
+        const mock = try erAbs(io, a, "zig-out/bin/mock_lsp");
+        defer a.free(mock);
+        const env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{mock});
+        defer a.free(env);
+        var sess = try Session.spawnEnvSize(io, &.{ oz, path }, &.{ env, "OZ_MOCK_SCRIPT=inlay_indent" }, 30, cols);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 30, cols);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "NEXT: ", 8000);
+        try sess.send("ggjj^rZjj^rQ");
+        try gridWaitFor(&sess, &grid, "Qctual_value", 4000);
+        try sess.send("u");
+        try gridWaitFor(&sess, &grid, "actual_value", 4000);
+        try sess.send("\x12");
+        try gridWaitFor(&sess, &grid, "Qctual_value", 4000);
+        try sess.send("gg9j^");
+        try gridWaitPosition(&sess, &grid, 10, 4, 4000);
+        try sess.send("l");
+        try gridWaitPosition(&sess, &grid, 10, 5, 4000);
+        try sess.send("rX");
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+        const text = try erRead(io, a, path);
+        defer a.free(text);
+        try std.testing.expectEqualStrings(want, text);
+    }
+}
