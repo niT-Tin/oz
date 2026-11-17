@@ -159,6 +159,9 @@ pub fn drawTerm(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
     if (!term.supported) return;
     if (self.term_pane) |*tp| {
         if (!tp.visible) return;
+        const saved_cursor = self.vx.screen.cursor;
+        const saved_visible = self.vx.screen.cursor_vis;
+        const saved_shape = self.vx.screen.cursor_shape;
         const r = self.termRect(a);
         const inner = term.frameInnerRect(r);
         if (r.w == 0 or r.h == 0) return;
@@ -173,7 +176,11 @@ pub fn drawTerm(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         });
         try tp.t.draw(sub);
         restyleTerm(sub, self.theme);
-        if (!tp.focused) sub.hideCursor();
+        if (!tp.focused) {
+            self.vx.screen.cursor = saved_cursor;
+            self.vx.screen.cursor_vis = saved_visible;
+            self.vx.screen.cursor_shape = saved_shape;
+        }
     }
 }
 

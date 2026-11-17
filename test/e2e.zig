@@ -32023,3 +32023,88 @@ test "search workflow: literal text after expanded tabs and wide glyphs receives
     try gridWaitRowContains(&sess, &grid, 23, "[1/2]", 4000);
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
 }
+
+test "agent workflow: Ctrl-w leaves prompt or rail without consuming editor input or losing drafts" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    for ([_]u16{ 80, 120 }) |cols| {
+        for ([_]bool{ false, true }) |rail| {
+            var root_buf: [128]u8 = undefined;
+            const root = try aiMockDir(io, &root_buf);
+            defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+            try writeTestFile(io, root, "source.txt", "BUFFER_ALPHA\n");
+            const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+            defer a.free(home);
+            const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+            defer a.free(env);
+            var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{env}, 30, cols, root);
+            defer sess.close();
+            defer killPid(sess.pid);
+            var grid = try Grid.initSizedCols(a, 30, cols);
+            defer grid.deinit(a);
+            try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+            try sess.send(" aRETAIN_DRAFT");
+            try gridWaitFor(&sess, &grid, "RETAIN_DRAFT", 4000);
+            if (rail) {
+                try sess.send("\t");
+                try aiWaitRailFocus(&sess, &grid, aiRailCol(cols), true, 4000);
+            }
+            try sess.send("\x17hiEDIT");
+            try gridWaitFor(&sess, &grid, "EDITBUFFER_ALPHA", 4000);
+            try sess.send("\x1b");
+            try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+            try sess.send("\x17a\r");
+            try gridWaitFor(&sess, &grid, "RETAIN_DRAFT", 4000);
+            try sess.send("\x17w");
+            try gridSettle(&sess, &grid, 80, 1000);
+            try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+            const saved = try aiReadFile(io, a, root, "source.txt");
+            defer a.free(saved);
+            try std.testing.expectEqualStrings("EDITBUFFER_ALPHA\n", saved);
+        }
+    }
+}
+
+test "agent workflow: floating terminal covers Agent cells and pointer hits follow its layer" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    for ([_]u16{ 120, 80 }) |cols| {
+        var root_buf: [128]u8 = undefined;
+        const root = try aiMockDir(io, &root_buf);
+        defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        try writeTestFile(io, root, "source.txt", "TERMINAL_UNDERLAY\n");
+        const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+        defer a.free(home);
+        const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+        defer a.free(env);
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{ env, "SHELL=/bin/sh" }, 30, cols, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 30, cols);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try sess.send(" aDRAFT_UNDER_TERMINAL");
+        try gridWaitFor(&sess, &grid, "DRAFT_UNDER_TERMINAL", 4000);
+        if (cols == 120) {
+            try sess.send("\x1b");
+            try gridSettle(&sess, &grid, 80, 1000);
+        }
+        try sess.send("\x1br");
+        const box = try termWaitBox(&sess, &grid, 8000);
+        try std.testing.expect(box.right > aiRailCol(cols));
+        // The right rule lies inside the Agent area: it must be complete.
+        try std.testing.expectEqualStrings("╮", frame.cellText(&grid, box.top, box.right));
+        try std.testing.expectEqualStrings("╯", frame.cellText(&grid, box.bottom, box.right));
+        // Esc leaves the terminal visible; clicking the covered Agent region
+        // must focus the terminal, not an underlying thread/prompt target.
+        try sess.send("\x1b");
+        try gridSettle(&sess, &grid, 80, 1000);
+        try mouseClickAt(&sess, box.right - 2, box.top + 2);
+        try sess.send("printf 'LAYER%s\\n' _POINTER_OK\r");
+        try gridWaitFor(&sess, &grid, "LAYER_POINTER_OK", 5000);
+        try sess.send("\x1br");
+        try gridWaitGone(&sess, &grid, "oz terminal", 4000);
+        try gridWaitFor(&sess, &grid, "AGENTS", 4000);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+    }
+}

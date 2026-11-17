@@ -23,6 +23,7 @@ const tool_job = @import("tool_job.zig");
 const app_agent_edit = @import("agent_edit_ui.zig");
 const app_agent_terminal = @import("agent_terminal.zig");
 const terminal_tool = @import("../ai/terminal_tool.zig");
+const term = @import("../term.zig");
 
 pub const Status = ws.Status;
 pub const Role = ws.Role;
@@ -570,12 +571,26 @@ pub fn deinitAi(self: *App) void {
 // ---- input ----
 
 pub fn handleAiKey(self: *App, key: vaxis.Key) !void {
+    // Terminal layouts are global controls, also reachable from a prompt.
+    if (term.supported and key.mods.alt and !key.mods.ctrl and !key.mods.super) switch (key.codepoint) {
+        'r' => return self.toggleTerm(.floating),
+        'w' => return self.toggleTerm(.bottom),
+        'e' => return self.toggleTerm(.right),
+        else => {},
+    };
     if (self.pending_window) {
         self.pending_window = false;
         switch (key.codepoint) {
             '<' => self.resizeAiRail(-4),
             '>' => self.resizeAiRail(4),
             '=' => self.resizeAiRail(null),
+            'h', 'j', 'k', 'l', 'w' => {
+                aiLeaveRail(self);
+                self.focus = .buffer;
+                self.navigator_peek = false;
+            },
+            'a' => try self.focusAiRail(),
+            'A' => try self.toggleAiFocus(),
             else => {},
         }
         return;

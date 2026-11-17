@@ -218,6 +218,11 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
             // the wider Agent-focus layout without replacing either binding.
             'a' => try self.focusAiRail(),
             'A' => try self.toggleAiFocus(),
+            'w' => if (self.ai.rail_open) {
+                try self.focusAiRail();
+            } else if (self.windows.items.len > 1) {
+                self.switchWindowTo((self.current_win + 1) % self.windows.items.len);
+            },
             '<' => self.resizeAiRail(-4),
             '>' => self.resizeAiRail(4),
             '=' => self.resizeAiRail(null),
