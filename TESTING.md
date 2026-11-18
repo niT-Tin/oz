@@ -17,8 +17,8 @@ zig build e2e -Dtest-filter="navigator"
 zig build e2e -Dtest-filter="golden"
 ```
 
-Current counts after the 2026-11-17 search, Zig-highlight and Agent workflow fixes:
-**809 unit tests** and **413 e2e cases** (409 default passes and
+Current counts after the search, Zig-highlight, Agent workflow and picker permission fixes:
+**810 unit tests** and **416 e2e cases** (412 default passes and
 four opt-in real-ZLS cases that skip unless `-Dreal-zls` is supplied).
 `tools/verify.sh` covers diff check,
 all unit tests and all e2e tests (including Agent-focus, `terminal:` and
@@ -32,6 +32,14 @@ fails. `.verify/` is git-ignored.
 CI (`.github/workflows/ci.yml`) runs the same script on pull requests and on
 pushes to `master`, uploads `.verify/` even on failure, and is authoritative.
 `release.yml` remains tag-only and is not involved.
+
+`picker permissions:` regressions use real mode-000/read-denied directories
+and first assert that opening them fails with `AccessDenied`. Dashboard `f`
+must still find and edit readable siblings at 40/120 columns, while a denied
+root reports an in-app error and can be retried after restoring permissions.
+Changing roots after a failed scan cannot mix cached relative paths. The
+enumerator also checks every allocation failure for cleanup, retaining
+hidden/build-directory filters and avoiding symlink traversal.
 
 Zig test steps use `has_side_effects = true`, so `zig build test` and
 `zig build e2e` always execute the freshly built test binary instead of

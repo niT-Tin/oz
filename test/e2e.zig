@@ -16393,6 +16393,152 @@ test "dashboard: snacks-style layout and menu keys" {
     try std.testing.expectEqual(@as(u32, 0), code);
 }
 
+test "picker permissions: Dashboard f skips denied subtrees and opens readable siblings" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    for ([_]u16{ 40, 120 }) |cols| {
+        var root_buf: [128]u8 = undefined;
+        const root = try aiMockDir(io, &root_buf);
+        defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+        defer dir.close(io);
+        try dir.createDirPath(io, "nested/locked");
+        try writeTestFile(io, root, "good.txt", "PICKER_READABLE_SIBLING\n");
+        try writeTestFile(io, root, "nested/leaf.txt", "PICKER_NESTED_SIBLING\n");
+        try writeTestFile(io, root, "nested/locked/secret.txt", "MUST_NOT_BE_LISTED\n");
+        var denied = try dir.openDir(io, "nested/locked", .{ .iterate = true });
+        defer denied.close(io);
+        try denied.setPermissions(io, std.Io.File.Permissions.fromMode(if (cols == 40) 0 else 0o111));
+        defer denied.setPermissions(io, std.Io.File.Permissions.fromMode(0o700)) catch {};
+        // Prove the fixture really denies directory reads; a privileged
+        // environment must not silently turn this into a happy-path test.
+        try std.testing.expectError(error.AccessDenied, dir.openDir(io, "nested/locked", .{ .iterate = true }));
+        try dir.symLink(io, ".", "loop", .{ .is_directory = true });
+
+        var sess = try Session.spawnEnvSizeCwd(io, &.{oz_exe_path}, null, 24, cols, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(alloc, 24, cols);
+        defer grid.deinit(alloc);
+        try gridWaitFor(&sess, &grid, "Find File", 5000);
+        try sess.send("f");
+        try gridWaitFor(&sess, &grid, "╭ Files ", 5000);
+        try gridWaitFor(&sess, &grid, "good.txt", 3000);
+        try std.testing.expect(grid.contains("nested/leaf.txt"));
+        try std.testing.expect(!grid.contains("secret.txt"));
+        try sess.send("leaf");
+        try gridSettle(&sess, &grid, 100, 2000);
+        try sess.send("\r");
+        try gridWaitFor(&sess, &grid, "PICKER_NESTED_SIBLING", 5000);
+        try sess.send("A!\x03");
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+        const saved = try dir.readFileAlloc(io, "nested/leaf.txt", alloc, .limited(1024));
+        defer alloc.free(saved);
+        try std.testing.expectEqualStrings("PICKER_NESTED_SIBLING!\n", saved);
+    }
+}
+
+test "picker permissions: denied root reports on Dashboard and retries after permissions return" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try writeTestFile(io, root, "retry.txt", "PICKER_RETRY_CONTENT\n");
+    var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer dir.close(io);
+    defer dir.setPermissions(io, std.Io.File.Permissions.fromMode(0o700)) catch {};
+    var sess = try Session.spawnCwd(io, &.{oz_exe_path}, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "Find File", 5000);
+    try dir.setPermissions(io, std.Io.File.Permissions.fromMode(0));
+    try std.testing.expectError(error.AccessDenied, std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }));
+    try sess.send("f");
+    try gridWaitFor(&sess, &grid, "cannot search files", 5000);
+    try std.testing.expect(grid.contains("AccessDenied"));
+    try std.testing.expect(grid.contains("Find File"));
+    try std.testing.expect(!grid.contains("╭ Files "));
+    try dir.setPermissions(io, std.Io.File.Permissions.fromMode(0o700));
+    try sess.send("f");
+    try gridWaitFor(&sess, &grid, "╭ Files ", 5000);
+    try gridWaitFor(&sess, &grid, "retry.txt", 3000);
+    try std.testing.expect(!grid.contains("cannot search files"));
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "PICKER_RETRY_CONTENT", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q\r"));
+}
+
+test "picker permissions: failed root change keeps cached paths bound to their workspace" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer dir.close(io);
+    try dir.createDirPath(io, "first");
+    try dir.createDirPath(io, "second");
+    try writeTestFile(io, root, "first/only_a.txt", "PICKER_FIRST_WORKSPACE\n");
+    try writeTestFile(io, root, "second/only_b.txt", "PICKER_SECOND_WORKSPACE\n");
+    var second = try dir.openDir(io, "second", .{ .iterate = true });
+    defer second.close(io);
+    defer second.setPermissions(io, std.Io.File.Permissions.fromMode(0o700)) catch {};
+    const first_root = try std.fmt.allocPrint(alloc, "{s}/first", .{root});
+    defer alloc.free(first_root);
+    const second_command = try std.fmt.allocPrint(alloc, ":e {s}/second/only_b.txt\r", .{root});
+    defer alloc.free(second_command);
+    // CLI startup intentionally searches cwd, not the argument's parent.
+    var sess = try Session.spawnCwd(io, &.{ oz_exe_path, "only_a.txt" }, first_root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "PICKER_FIRST_WORKSPACE", 5000);
+    // Prepare both workspace roots before filling the shared picker cache.
+    // Re-selecting an existing buffer does not change a workspace's root.
+    try sess.send(" \tn");
+    try gridWaitFor(&sess, &grid, "Find File", 5000);
+    try sess.send(second_command);
+    try gridWaitFor(&sess, &grid, "PICKER_SECOND_WORKSPACE", 5000);
+    try sess.send(" \t[");
+    try gridWaitFor(&sess, &grid, "PICKER_FIRST_WORKSPACE", 5000);
+    try sess.send(" sf");
+    try gridWaitFor(&sess, &grid, "╭ Files ", 5000);
+    try gridWaitFor(&sess, &grid, "only_a.txt", 3000);
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "╭ Files ", 3000);
+    try sess.send(" \t]");
+    try gridWaitFor(&sess, &grid, "PICKER_SECOND_WORKSPACE", 5000);
+    try second.setPermissions(io, std.Io.File.Permissions.fromMode(0));
+    try sess.send(" sf");
+    try gridWaitFor(&sess, &grid, "cannot search files", 5000);
+    try std.testing.expect(!grid.contains("╭ Files "));
+    try std.testing.expect(grid.contains("PICKER_SECOND_WORKSPACE"));
+    try second.setPermissions(io, std.Io.File.Permissions.fromMode(0o700));
+    try sess.send(" sf");
+    try gridWaitFor(&sess, &grid, "╭ Files ", 5000);
+    try gridWaitFor(&sess, &grid, "only_b.txt", 3000);
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "╭ Files ", 3000);
+    try sess.send(" \t[");
+    try gridWaitFor(&sess, &grid, "PICKER_FIRST_WORKSPACE", 5000);
+    try sess.send(" sf");
+    try gridWaitFor(&sess, &grid, "╭ Files ", 5000);
+    try sess.send("only_b");
+    try gridSettle(&sess, &grid, 100, 2000);
+    try sess.send("\r"); // no match must not open a cached path from second
+    try gridSettle(&sess, &grid, 100, 2000);
+    if (!grid.contains("╭ Files ")) grid.dump();
+    try std.testing.expect(grid.contains("╭ Files "));
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "╭ Files ", 3000);
+    try std.testing.expect(grid.contains("PICKER_FIRST_WORKSPACE"));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q\r"));
+}
+
 test "popup geometry: hover/completion borders align; markdown rendered" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
