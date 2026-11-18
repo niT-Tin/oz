@@ -75,7 +75,7 @@ pub const ActionId = enum {
     change_line, // S — change the whole line (= cc)
     replace_char, // r — replace the char under the cursor
     toggle_case, // ~ — toggle the case of the char under the cursor
-    join_lines, // J — join the current line with the next
+    join_lines, // [count]J — join count lines (at least two)
     indent_line, // >> — indent the current line
     dedent_line, // << — dedent the current line
     undo, // u

@@ -1014,43 +1014,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             self.cur().history.endGroup();
             self.markDirty();
         },
-        .join_lines => {
-            // J: join the current line with the next: remove the whole
-            // terminator (`\n` or `\r\n` — removing only the `\n` would
-            // leave a stray `\r` in the text), trim the next line's leading
-            // whitespace to one space (vim joins with a single space when
-            // the first line is non-empty).
-            const pt = &self.cur().pt;
-            const line = pt.lineOf(self.curCursor().*);
-            if (line + 1 >= pt.lineCount()) return;
-            const line_start = pt.lineStart(line);
-            const cur_text_len = pt.lineTextLen(line);
-            const term_start = line_start + cur_text_len;
-            const next_start = pt.lineStart(line + 1);
-            const next_len = pt.lineTextLen(line + 1);
-            const term_len = next_start - term_start;
-            var next_indent: u32 = 0;
-            while (next_indent < next_len) : (next_indent += 1) {
-                const b = pt.byteAt(next_start + next_indent);
-                if (b != ' ' and b != '\t') break;
-            }
-            self.cur().history.beginGroup();
-            // remove the terminator; the next line now starts at term_start
-            try self.recordEdit(term_start, term_len, "");
-            // collapse leading whitespace of the next line
-            if (next_indent > 0) {
-                try self.recordEdit(term_start, next_indent, "");
-            }
-            // join with a single space unless the first line is empty.
-            // The next line's first char now sits at term_start; inserting
-            // BEFORE it glues the lines.
-            if (cur_text_len > 0) {
-                try self.recordEdit(term_start, 0, " ");
-            }
-            self.cur().history.endGroup();
-            self.curCursor().* = @min(self.curCursor().*, pt.len());
-            self.markDirty();
-        },
+        .join_lines => try joinLines(self, count),
         .indent_line, .dedent_line => {
             // >> / <<: add / remove one indent unit (4 spaces, matching
             // the insert-mode tab) at the start of each line the count
@@ -1107,6 +1071,63 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
         .fold_toggle, .fold_open, .fold_close, .fold_open_all, .fold_close_all => try self.execFold(action),
         else => {},
     }
+}
+
+fn joinNeedsSpace(left: ?u8, right: u8) bool {
+    const prev = left orelse return false;
+    return prev != ' ' and prev != '\t' and right != ')';
+}
+
+/// Normal [count]J counts the current line. A final LF terminates the
+/// last file line; the empty display row after it is not another join target.
+fn joinLines(self: *App, count: u32) !void {
+    const pt = &self.cur().pt;
+    if (pt.len() == 0) return;
+    const first = pt.lineOf(self.curCursor().*);
+    const last = @min(first +| (@max(count, 2) - 1), pt.lineOf(pt.len() - 1));
+    if (last <= first) return;
+
+    const first_start = pt.lineStart(first);
+    const start = first_start + pt.lineTextLen(first);
+    const last_start = pt.lineStart(last);
+    const last_end = last_start + pt.lineTextLen(last);
+    var end = last_start;
+    while (end < last_end and (pt.byteAt(end) == ' ' or pt.byteAt(end) == '\t')) end += 1;
+
+    // Copy only the span being replaced. Strip intermediate indentation in
+    // place: each inserted space fits in the preceding removed terminator.
+    const span = try self.alloc.alloc(u8, end - start);
+    defer self.alloc.free(span);
+    pt.copyRange(start, span);
+    var middle = span[pt.lineStart(first + 1) - start .. last_start - start];
+    var left: ?u8 = if (start > first_start) pt.byteAt(start - 1) else null;
+    var used: usize = 0;
+    while (std.mem.indexOfScalar(u8, middle, '\n')) |lf| {
+        const raw = middle[0..lf];
+        middle = middle[lf + 1 ..];
+        const body = std.mem.trimStart(u8, std.mem.cutSuffix(u8, raw, "\r") orelse raw, " \t");
+        if (body.len == 0) continue;
+        if (joinNeedsSpace(left, body[0])) {
+            span[used] = ' ';
+            used += 1;
+        }
+        @memmove(span[used..][0..body.len], body);
+        used += body.len;
+        left = span[used - 1];
+    }
+    const seam = start + @as(u32, @intCast(used));
+    if (end < last_end and joinNeedsSpace(left, pt.byteAt(end))) {
+        span[used] = ' ';
+        used += 1;
+    }
+    const from = self.lspPositionAt(pt, start);
+    const to = self.lspPositionAt(pt, end);
+    const offsets = captureInlayOffsetsForReplace(self, start, end - start, @intCast(used));
+    defer if (offsets) |value| self.alloc.free(value);
+    try self.recordEdit(start, end - start, span[0..used]);
+    self.curCursor().* = if (end == last_end and seam > first_start) edit_range.charStart(pt, seam - 1) else seam;
+    self.markDirtyRange(from, to, span[0..used]);
+    if (offsets) |value| applyInlayOffsetsAfterHistory(self, value);
 }
 
 /// r{char}: replace a complete typed grapheme, atomically, within this line.

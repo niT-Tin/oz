@@ -3735,6 +3735,24 @@ test "vim editing keys: x X D C S r ~ J >>" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+test "Normal counted J: inclusive range, separators, cursor, undo and repeat" {
+    const cases = [_]struct { initial: []const u8, keys: []const u8, want: []const u8 }{
+        .{ .initial = "1\n2\n3\n4", .keys = "4J", .want = "1 2 3 4" },
+        .{ .initial = "a\nb\nc\n", .keys = "J", .want = "a b\nc\n" },
+        .{ .initial = "a\nb\nc\n", .keys = "1J", .want = "a b\nc\n" },
+        .{ .initial = "a\nb\nc\n", .keys = "2J", .want = "a b\nc\n" },
+        .{ .initial = "keep\n1\n2\n3\n4\n5\n", .keys = "j4J", .want = "keep\n1 2 3 4\n5\n" },
+        .{ .initial = "a\r\n\tb \r\n  中\r\nd\r\n", .keys = "999999999J", .want = "a b 中 d\r\n" },
+        .{ .initial = "a\n", .keys = "4J", .want = "a\n" },
+        .{ .initial = "a\n\n\tb\n  )\n", .keys = "4J", .want = "a b)\n" },
+        .{ .initial = "a\nb\nc\nd\n", .keys = "4Jx", .want = "a b cd\n" },
+        .{ .initial = "1\n  2\n3\n4\n", .keys = "4Ju", .want = "1\n  2\n3\n4\n" },
+        .{ .initial = "1\n  2\n3\n4\n", .keys = "4Ju\x12", .want = "1 2 3 4\n" },
+        .{ .initial = "1\n2\n3\n4\n5\n6\n7\n8\n", .keys = "4Jj.", .want = "1 2 3 4\n5 6 7 8\n" },
+    };
+    for (cases) |case| try erEditorFileCase(std.testing.io, std.testing.allocator, "counted J", ".txt", case.initial, case.keys, case.want);
+}
+
 test "dashboard shows recent files; Enter reopens" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
