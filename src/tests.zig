@@ -55,6 +55,7 @@ pub const app_hints = @import("app/hints.zig");
 pub const app_mouse = @import("app/mouse.zig");
 pub const app_split_layout = @import("app/split_layout.zig");
 pub const app_path_completion = @import("app/path_completion.zig");
+pub const app_picker_files = @import("app/picker_files.zig");
 // §18.11 buffer-strip geometry (pure; render.zig owns the drawing)
 pub const app_tabstrip = @import("app/tabstrip.zig");
 // §18.12 time-based animation primitives (pure; render.zig/ai.zig own the use)

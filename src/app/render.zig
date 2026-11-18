@@ -3531,8 +3531,15 @@ pub fn render(self: *App) !void {
         // M2b2 inline prompt floats above the rail; hint labels remain the
         // topmost overlay below.
         if (self.inlinePromptOpen()) try self.drawInlinePrompt(a, win);
-        // The dashboard has no status text, but keeps the same bottom band.
+        // Dashboard actions can fail (e.g. an unreadable search root).
+        // Keep their message visible without replacing the welcome screen.
         self.drawStatusChrome(win);
+        if (self.msg) |message| {
+            if (height > status_row_count) {
+                const segs = [_]vaxis.Segment{.{ .text = message, .style = chrome.bandStyle(t) }};
+                _ = win.print(&segs, .{ .row_offset = @intCast(height - 1), .wrap = .none });
+            }
+        }
         // M2.6a: labels + status indicator are the topmost layer, and must be
         // drawn after rail/filetree/dashboard before the frame is flushed.
         try self.drawHintOverlay(a, win);

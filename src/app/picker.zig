@@ -11,6 +11,7 @@ const keymap_list = @import("../editor/keymap_list.zig");
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const autil = @import("util.zig");
+const picker_files = @import("picker_files.zig");
 
 pub const GrepResult = struct { path: []u8, line: u32, text: []u8 };
 
@@ -27,19 +28,31 @@ pub fn openPicker(self: *App) !void {
         self.picker_root == null or
         !std.mem.eql(u8, self.picker_root.?, root_dir))
     {
-        for (self.picker_files.items) |f| self.alloc.free(f);
-        self.picker_files.clearRetainingCapacity();
-        var dir = try std.Io.Dir.cwd().openDir(self.io, root_dir, .{ .iterate = true });
-        defer dir.close(self.io);
-        try self.walkDir(dir, "");
+        // Build separately: a failed root scan must neither expose a partial
+        // list nor relabel another workspace's cached paths with this root.
+        var files = picker_files.collect(self.alloc, self.io, root_dir) catch |err| {
+            switch (err) {
+                error.OutOfMemory, error.Canceled => return err,
+                else => {},
+            }
+            try self.setMsg(try std.fmt.allocPrint(self.alloc, "cannot search files ({s}): {s}", .{ @errorName(err), root_dir }));
+            return;
+        };
+        errdefer picker_files.deinit(self.alloc, &files);
+        const root_copy = try self.alloc.dupe(u8, root_dir);
+        picker_files.deinit(self.alloc, &self.picker_files);
+        self.picker_files = files;
         if (self.picker_root) |p| self.alloc.free(p);
-        self.picker_root = try self.alloc.dupe(u8, root_dir);
+        self.picker_root = root_copy;
     }
+    self.picker_mode = .files;
     self.picker_input.clearRetainingCapacity();
     self.picker_sel = 0;
     self.picker_top = 0;
     try self.pickerRefilter();
     self.picker_active = true;
+    if (self.msg) |m| self.alloc.free(m);
+    self.msg = null;
 }
 
 /// Absolute path for a fuzzy-file picker entry `rel` (relative to
@@ -50,32 +63,6 @@ fn resolvePickerPath(self: *App, rel: []const u8) ![]u8 {
             self.alloc.dupe(u8, rel);
     }
     return self.alloc.dupe(u8, rel);
-}
-
-pub fn walkDir(self: *App, dir: std.Io.Dir, prefix: []const u8) !void {
-    try self.walkInto(dir, prefix, &self.picker_files);
-}
-
-pub fn walkInto(self: *App, dir: std.Io.Dir, prefix: []const u8, out: *std.ArrayList([]u8)) !void {
-    var it = dir.iterate();
-    while (try it.next(self.io)) |entry| {
-        const name = entry.name;
-        if (name.len == 0 or name[0] == '.') continue;
-        if (std.mem.eql(u8, name, "zig-out") or std.mem.eql(u8, name, "zig-pkg") or std.mem.eql(u8, name, "node_modules")) continue;
-        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ prefix, name });
-        switch (entry.kind) {
-            .directory => {
-                var sub = try dir.openDir(self.io, name, .{ .iterate = true });
-                defer sub.close(self.io);
-                const sub_prefix = try std.fmt.allocPrint(self.alloc, "{s}/", .{path});
-                try self.walkInto(sub, sub_prefix, out);
-                self.alloc.free(sub_prefix);
-                self.alloc.free(path);
-            },
-            .file => try out.append(self.alloc, path),
-            else => self.alloc.free(path),
-        }
-    }
 }
 
 pub fn openBufferPicker(self: *App) !void {

@@ -2122,8 +2122,6 @@ pub const App = struct {
     pub const syncLspFull = @import("app/lsp.zig").syncLspFull;
     // ---- picker → src/app/picker.zig ----
     pub const openPicker = @import("app/picker.zig").openPicker;
-    pub const walkDir = @import("app/picker.zig").walkDir;
-    pub const walkInto = @import("app/picker.zig").walkInto;
     pub const openBufferPicker = @import("app/picker.zig").openBufferPicker;
     pub const openRecentPicker = @import("app/picker.zig").openRecentPicker;
     pub const openKeymapPicker = @import("app/picker.zig").openKeymapPicker;
