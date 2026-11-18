@@ -1,0 +1,58 @@
+name: website
+
+on:
+  push:
+    branches: [master]
+    paths: ['website/**', '.github/workflows/pages.yml']
+  pull_request:
+    paths: ['website/**', '.github/workflows/pages.yml']
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'production' }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check site source
+        run: |
+          node --check website/site.js
+          python3 website/check.py
+      - name: Package public files with current release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)
+          python3 website/build.py --version "$version"
+          python3 website/check.py .verify/website
+      - name: Upload site
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: .verify/website
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master' || github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
