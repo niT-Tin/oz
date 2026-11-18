@@ -2,115 +2,118 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#f5f3ed">
-  <meta name="description" content="oz is a terminal text editor written in Zig. Vim-style editing, LSP, Git and your existing AI coding agents, together in one terminal.">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#121417">
+  <meta name="description" content="A Vim-style terminal editor written in Zig. Explore oz, connect a coding agent and download it for Linux or macOS.">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="oz — Code in focus. Agents in reach.">
-  <meta property="og:description" content="A terminal text editor with Vim-style editing, LSP, Git and an ACP client for your coding agents. Open source. Linux & macOS.">
+  <meta property="og:title" content="oz — terminal text editor">
+  <meta property="og:description" content="Vim keys, language servers and your coding agents. Built in Zig for Linux and macOS.">
   <meta property="og:url" content="https://nit-tin.github.io/oz/">
   <meta property="og:image" content="https://nit-tin.github.io/oz/assets/editor.png">
   <meta name="twitter:card" content="summary_large_image">
   <link rel="canonical" href="https://nit-tin.github.io/oz/">
   <link rel="icon" href="./favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./style.css">
   <link rel="preload" href="./assets/fonts/DMSans.woff2" as="font" type="font/woff2" crossorigin>
-  <title>oz — Code in focus. Agents in reach.</title>
+  <link rel="stylesheet" href="./style.css">
   <script src="./site.js" defer></script>
+  <title>oz — terminal text editor</title>
 </head>
 <body>
   <a class="skip-link" href="#main" data-i18n="skip">Skip to content</a>
-  <header class="site-header shell">
-    <a class="wordmark" href="#" aria-label="oz home">oz<span aria-hidden="true">_</span></a>
-    <nav class="primary-nav" aria-label="Main navigation">
-      <a href="#inside" data-i18n="nav.inside">Inside oz</a>
-      <a href="#agents" data-i18n="nav.agents">Your agents</a>
-      <a href="#download" data-i18n="nav.download">Get started</a>
+  <header class="shell mast">
+    <a href="#" class="brand" aria-label="oz"><b aria-hidden="true">oz</b><i aria-hidden="true"></i></a>
+    <nav aria-label="Main navigation">
+      <a href="#inside" data-i18n="nav.inside">Editor</a>
+      <a href="#agents" data-i18n="nav.agents">Agents</a>
+      <a href="#download" data-i18n="nav.download">Install</a>
     </nav>
-    <div class="header-actions">
-      <a class="language-link" href="?lang=zh" data-language-switch lang="zh-CN">中文</a>
-      <a class="github-link" href="https://github.com/niT-Tin/oz">GitHub <span aria-hidden="true">↗</span></a>
+    <div class="external">
+      <a href="?lang=zh" data-language-switch lang="zh-CN">中文</a>
+      <a href="https://github.com/niT-Tin/oz">GitHub ↗</a>
     </div>
   </header>
 
   <main id="main">
-    <section class="hero shell" aria-labelledby="hero-title">
-      <div class="eyebrow"><span class="live-dot" aria-hidden="true"></span><span data-i18n="hero.eyebrow">A terminal text editor, written in Zig</span></div>
-      <div class="hero-grid">
-        <h1 id="hero-title"><span data-i18n="hero.line1">Code in focus.</span><br><em data-i18n="hero.line2">Agents in reach.</em></h1>
-        <div class="hero-aside">
-          <p data-i18n="hero.description">Vim-style editing, thoughtful code intelligence and your coding agents. A working day, all in one terminal.</p>
-          <a class="button button-primary" href="#download"><span data-i18n="hero.cta">Make yourself at home</span><span aria-hidden="true">↗</span></a>
-          <p class="hero-meta"><span data-i18n="hero.platforms">Linux & macOS</span><span aria-hidden="true">/</span><span>MIT</span><span aria-hidden="true">/</span><a data-release-version href="https://github.com/niT-Tin/oz/releases/latest">v0.4.0</a></p>
+    <section class="sky" aria-labelledby="hero-title">
+      <div class="sky-art" aria-hidden="true"></div>
+      <div class="shell sky-inner">
+        <h1 id="hero-title"><span data-i18n="hero.first">Edit in the</span><br><em data-i18n="hero.last">terminal.</em></h1>
+        <p data-i18n="hero.body">oz is a modal editor written in Zig. Navigate with Vim keys, follow symbols with LSP and bring your own coding agent.</p>
+        <div class="hero-links">
+          <a class="button primary" href="#download"><span data-i18n="hero.download">Download oz</span> <span aria-hidden="true">↓</span></a>
+          <a class="version" data-release-version href="https://github.com/niT-Tin/oz/releases/latest">v0.4.0</a>
+          <span class="platforms">Linux / macOS</span>
         </div>
       </div>
+    </section>
 
-      <div class="showcase" id="showcase">
-        <div class="showcase-toolbar">
-          <span class="micro-label showcase-label" data-i18n="showcase.label">A closer look</span>
-          <div class="tabs screenshot-tabs" role="tablist" aria-label="Editor screenshots">
-            <button id="shot-editor" type="button" role="tab" aria-selected="true" aria-controls="screenshot-panel" data-shot="editor" data-i18n="showcase.editor">The editor</button>
-            <button id="shot-completion" type="button" role="tab" aria-selected="false" aria-controls="screenshot-panel" tabindex="-1" data-shot="completion" data-i18n="showcase.completion">Code intelligence</button>
-            <button id="shot-agent" type="button" role="tab" aria-selected="false" aria-controls="screenshot-panel" tabindex="-1" data-shot="agent" data-i18n="showcase.agent">Agents alongside</button>
+    <section class="shell tour" id="inside" aria-labelledby="inside-title">
+      <div class="tour-menu">
+        <h2 id="inside-title" data-i18n="tour.title">Inside oz</h2>
+        <div class="shot-tabs" role="tablist" aria-label="Editor screenshots">
+          <button type="button" role="tab" id="shot-editor" data-shot="editor" aria-controls="screenshot-panel" aria-selected="true"><span data-i18n="showcase.editor">File tree</span><kbd>Space e</kbd></button>
+          <button type="button" role="tab" id="shot-completion" data-shot="completion" aria-controls="screenshot-panel" aria-selected="false" tabindex="-1"><span data-i18n="showcase.completion">Completion</span><kbd>Ctrl n</kbd></button>
+          <button type="button" role="tab" id="shot-agent" data-shot="agent" aria-controls="screenshot-panel" aria-selected="false" tabindex="-1"><span data-i18n="showcase.agent">Agent panel</span><kbd>Space a</kbd></button>
+        </div>
+        <p id="screenshot-caption" data-i18n="shot.editor">Browse the project while editing oz’s own chart renderer.</p>
+      </div>
+      <div id="screenshot-panel" role="tabpanel" aria-labelledby="shot-editor">
+        <div class="window-bar"><span class="prompt-mark" aria-hidden="true">❯</span> oz src/chart.zig
+          <button type="button" class="enlarge" data-open-screenshot aria-haspopup="dialog"><span data-i18n="showcase.enlarge">Full size</span> ⤢</button>
+        </div>
+        <img id="screenshot" src="./assets/editor.png" width="1400" height="825" alt="oz editing src/chart.zig with its project tree open." fetchpriority="high">
+      </div>
+    </section>
+
+    <div class="manual">
+      <div class="shell setup">
+        <section id="download" aria-labelledby="download-title">
+          <h2 id="download-title" data-i18n="download.title">Install oz</h2>
+          <p data-i18n="download.intro">Choose your build, extract the archive and open a file.</p>
+          <div class="download-picker">
+            <label class="sr-only" for="platform" data-i18n="download.platform">Operating system and architecture</label>
+            <select id="platform">
+              <option value="" data-i18n="download.choose">Select platform</option>
+              <option value="aarch64-macos">macOS · Apple silicon</option>
+              <option value="x86_64-macos">macOS · Intel</option>
+              <option value="x86_64-linux">Linux · x86_64</option>
+              <option value="aarch64-linux">Linux · arm64</option>
+            </select>
+            <a class="button ink" id="download-link" href="https://github.com/niT-Tin/oz/releases/latest"><span id="download-label" data-i18n="download.browse">All downloads</span> ↓</a>
           </div>
-          <span class="showcase-size micro-label" aria-hidden="true">120 × 32</span>
-        </div>
-        <div id="screenshot-panel" role="tabpanel" aria-labelledby="shot-editor">
-          <button class="screenshot-open" type="button" data-open-screenshot aria-haspopup="dialog" aria-label="Enlarge the editor screenshot">
-            <img id="screenshot" src="./assets/editor.png" width="1680" height="1056" fetchpriority="high" alt="oz editing Zig code, with syntax highlighting, a file navigator and status bar.">
-            <span class="enlarge"><span aria-hidden="true">↗</span> <span data-i18n="showcase.enlarge">Take a closer look</span></span>
-          </button>
-        </div>
-      </div>
-      <div class="showcase-caption"><p id="screenshot-caption" data-i18n="shot.editor">Real code. Real editor. A little room to think.</p><a href="https://github.com/niT-Tin/oz#readme"><span data-i18n="showcase.docs">Explore the documentation</span> <span aria-hidden="true">↗</span></a></div>
-    </section>
-
-    <section class="inside shell section" id="inside" aria-labelledby="inside-title">
-      <div class="section-heading"><span class="eyebrow" data-i18n="inside.eyebrow">01 / The everyday essentials</span><h2 id="inside-title" data-i18n="inside.title">Familiar hands.<br>A complete workspace.</h2><p data-i18n="inside.intro">The things you reach for, close at hand. The rest, out of your way.</p></div>
-      <div class="feature-list">
-        <article class="feature"><span class="feature-index" aria-hidden="true">01</span><div><h3 data-i18n="feature.edit.title">Keep your muscle memory.</h3><p data-i18n="feature.edit.body">Motions, text objects, Visual Block, macros and splits. Edit with the language your hands already know.</p></div><div class="key-cluster" aria-label="Vim movement keys"><kbd>h</kbd><kbd>j</kbd><kbd>k</kbd><kbd>l</kbd></div></article>
-        <article class="feature"><span class="feature-index" aria-hidden="true">02</span><div><h3 data-i18n="feature.code.title">A little more understanding.</h3><p data-i18n="feature.code.body">LSP completion, documentation, signature help and diagnostic underlines, with tree-sitter syntax highlighting.</p></div><div class="feature-note"><kbd>K</kbd><span data-i18n="feature.code.note">Read the docs</span></div></article>
-        <article class="feature"><span class="feature-index" aria-hidden="true">03</span><div><h3 data-i18n="feature.project.title">Let the project stay together.</h3><p data-i18n="feature.project.body">A file navigator, fuzzy search, project grep, independent workspaces, Git hunks and a terminal that stays with you.</p></div><div class="feature-note"><kbd>Space</kbd><kbd>sf</kbd><span data-i18n="feature.project.note">Find your next file</span></div></article>
-      </div>
-    </section>
-
-    <section class="agents-section" id="agents" aria-labelledby="agents-title">
-      <div class="agents-inner shell">
-        <div class="agents-copy"><span class="eyebrow" data-i18n="agents.eyebrow">02 / Bring your own agent</span><h2 id="agents-title"><span data-i18n="agents.line1">Your agent.</span><br><em data-i18n="agents.line2">Your workflow.</em></h2><p data-i18n="agents.body">Connect the harness you already use through ACP. Keep its models and tools, with conversation and tool activity right beside your code.</p><a class="text-link" href="https://github.com/niT-Tin/oz#readme"><span data-i18n="agents.docs">Read the setup guide</span> <span aria-hidden="true">↗</span></a></div>
-        <div class="agent-example">
-          <div class="tabs agent-tabs" role="tablist" aria-label="ACP agent presets">
-            <button type="button" id="preset-codex" role="tab" aria-selected="true" aria-controls="agent-code-panel" data-agent="codex">Codex</button>
-            <button type="button" id="preset-kimi" role="tab" aria-selected="false" aria-controls="agent-code-panel" tabindex="-1" data-agent="kimi">Kimi Code</button>
-            <button type="button" id="preset-deepseek" role="tab" aria-selected="false" aria-controls="agent-code-panel" tabindex="-1" data-agent="deepseek">DeepSeek Harness</button>
-          </div>
-          <div class="code-panel" id="agent-code-panel" role="tabpanel" aria-labelledby="preset-codex"><div class="code-label"><span class="micro-label" data-i18n="agents.command">Launch oz with your harness</span><button type="button" class="copy-button" data-copy="agent-command" data-i18n="copy">Copy</button></div><pre><code id="agent-command">OZ_ACP_AGENT=codex oz src/main.zig</code></pre><div class="code-footnote"><span class="prompt-mark" aria-hidden="true">❯</span><span data-i18n="agents.key">Then press</span><kbd>Space</kbd><kbd>a</kbd></div></div>
-          <p class="agent-prerequisite" id="agent-prerequisite" data-i18n="agent.codex">Install and authenticate Codex first. This preset connects through the Codex ACP adapter and requires Node.js / npx.</p>
-          <p class="agent-custom" data-i18n="agents.custom">Custom ACP commands and OpenAI-compatible APIs work here, too.</p>
-        </div>
-      </div>
-    </section>
-
-    <section class="download section shell" id="download" aria-labelledby="download-title">
-      <div class="section-heading"><span class="eyebrow" data-i18n="download.eyebrow">03 / A place to start</span><h2 id="download-title" data-i18n="download.title">Your terminal.<br>Meet your editor.</h2><p data-i18n="download.intro">Download a build, extract it, and open a file. No Zig installation needed.</p></div>
-      <div class="download-content">
-        <div class="download-picker"><label for="platform" class="micro-label" data-i18n="download.platform">Your platform</label><select id="platform"><option value="" data-i18n="download.choose">Choose a platform</option><option value="aarch64-macos">macOS · Apple silicon (arm64)</option><option value="x86_64-macos">macOS · Intel (x86_64)</option><option value="x86_64-linux">Linux · x86_64</option><option value="aarch64-linux">Linux · arm64</option></select><a class="button button-primary download-button" id="download-link" href="https://github.com/niT-Tin/oz/releases/latest"><span id="download-label" data-i18n="download.browse">View all downloads</span><span aria-hidden="true">↓</span></a></div>
-        <div class="run-command"><div class="code-label"><span class="micro-label" data-i18n="download.run">After extracting, open a file</span><button class="copy-button" type="button" data-copy="run-command" data-i18n="copy">Copy</button></div><pre><code id="run-command">./oz src/main.zig</code></pre></div>
-        <p class="download-note" data-i18n="download.note">Use a true-color terminal and a Nerd Font for icons. Install a language server for your language; project grep uses ripgrep.</p>
-        <div class="download-links"><a href="https://github.com/niT-Tin/oz/releases/latest"><span data-i18n="download.releases">Release notes & checksums</span> ↗</a><a href="https://github.com/niT-Tin/oz/blob/master/LICENSE"><span data-i18n="download.license">MIT licensed</span> ↗</a></div>
-        <details class="source-build"><summary><span data-i18n="download.source">Prefer to build from source?</span><span aria-hidden="true">+</span></summary><p data-i18n="download.zig">The CI toolchain is Zig 0.17.0.</p><div class="code-label"><span class="micro-label">sh</span><button class="copy-button" type="button" data-copy="source-command" data-i18n="copy">Copy</button></div><pre><code id="source-command">git clone https://github.com/niT-Tin/oz.git
+          <div class="command"><pre><code id="run-command">./oz src/main.zig</code></pre><button type="button" data-copy="run-command" data-i18n="copy">Copy</button></div>
+          <details class="source-build">
+            <summary data-i18n="download.source">Build from source</summary>
+            <p data-i18n="download.zig">Use Zig 0.17.0, the version used for release builds.</p>
+            <div class="command"><pre><code id="source-command">git clone https://github.com/niT-Tin/oz.git
 cd oz
 ./.scripts/bootstrap-deps.sh
 zig build -Doptimize=ReleaseFast -Dstrip
-./zig-out/bin/oz</code></pre></details>
+./zig-out/bin/oz</code></pre><button type="button" data-copy="source-command" data-i18n="copy">Copy</button></div>
+          </details>
+        </section>
+        <section id="agents" aria-labelledby="agents-title">
+          <h2 id="agents-title" data-i18n="agents.title">Connect an agent</h2>
+          <p data-i18n="agents.intro">Start oz with an ACP preset. Open the panel with Space a.</p>
+          <div class="agent-tabs" role="tablist" aria-label="Agent presets">
+            <button type="button" id="preset-codex" data-agent="codex" role="tab" aria-selected="true" aria-controls="agent-code-panel">Codex</button>
+            <button type="button" id="preset-kimi" data-agent="kimi" role="tab" aria-selected="false" tabindex="-1" aria-controls="agent-code-panel">Kimi Code</button>
+            <button type="button" id="preset-deepseek" data-agent="deepseek" role="tab" aria-selected="false" tabindex="-1" aria-controls="agent-code-panel">DeepSeek Harness</button>
+          </div>
+          <div id="agent-code-panel" role="tabpanel" aria-labelledby="preset-codex">
+            <div class="command"><pre><code id="agent-command">OZ_ACP_AGENT=codex oz src/main.zig</code></pre><button type="button" data-copy="agent-command" data-i18n="copy">Copy</button></div>
+            <p id="agent-prerequisite" data-i18n="agent.codex">Install and sign in to Codex first. The ACP adapter runs via npx.</p>
+          </div>
+        </section>
       </div>
-    </section>
-
-    <section class="closing shell"><p data-i18n="closing">A personal project, built for real working days.<br>Still growing. Always open source.</p><a class="text-link" href="https://github.com/niT-Tin/oz/issues"><span data-i18n="closing.contribute">Help shape what comes next</span> <span aria-hidden="true">↗</span></a></section>
+    </div>
   </main>
-  <footer class="site-footer shell"><a class="wordmark" href="#" aria-label="oz home">oz<span aria-hidden="true">_</span></a><span class="footer-note" data-i18n="footer">Made with Zig. Made to be used.</span><div><a href="https://github.com/niT-Tin/oz">GitHub</a><a href="https://github.com/niT-Tin/oz/issues" data-i18n="footer.issues">Issues</a><span>© niT-Tin</span></div></footer>
-  <div class="toast" id="feedback" role="status" aria-live="polite"></div>
-
-  <dialog id="screenshot-dialog" aria-labelledby="dialog-title"><div class="dialog-toolbar"><h2 id="dialog-title" data-i18n="dialog.title">A closer look at oz</h2><button type="button" class="dialog-close" data-i18n="dialog.close">Close</button></div><div class="zoom-stage" tabindex="0" role="region" aria-label="Full-size screenshot"><img id="zoom-image" src="./assets/editor.png" width="1680" height="1056" alt="oz editor screenshot, full size."></div><p class="dialog-hint" data-i18n="dialog.hint">Scroll to explore the full image. Press Esc to close.</p></dialog>
-  <noscript><div class="noscript-note">JavaScript is optional. <a href="https://github.com/niT-Tin/oz/releases/latest">Download oz</a> or <a href="./assets/completion.png">view completion</a> / <a href="./assets/agent.png">Agent screenshots</a>. 中文介绍见 <a href="https://github.com/niT-Tin/oz/blob/master/README.zh-CN.md">中文 README</a>。</div></noscript>
+  <footer class="shell footer"><a class="brand" href="#" aria-label="oz"><b aria-hidden="true">oz</b><i aria-hidden="true"></i></a><a href="https://github.com/niT-Tin/oz/issues" data-i18n="footer.issues">Issues</a><a href="https://github.com/niT-Tin/oz/releases" data-i18n="footer.releases">Releases</a><a href="https://github.com/niT-Tin/oz/blob/master/LICENSE">MIT</a></footer>
+  <div id="feedback" class="toast" role="status" aria-live="polite"></div>
+  <dialog id="screenshot-dialog" aria-labelledby="dialog-title">
+    <div class="dialog-toolbar"><h2 id="dialog-title" data-i18n="dialog.title">Editor screenshot</h2><button type="button" class="dialog-close" data-i18n="dialog.close">Close</button></div>
+    <div class="zoom-stage" tabindex="0" role="region" aria-labelledby="dialog-title"><img id="zoom-image" src="./assets/editor.png" width="1400" height="825" alt="oz editing its chart renderer."></div>
+  </dialog>
+  <noscript><p class="noscript-note"><a href="https://github.com/niT-Tin/oz/releases/latest">Downloads</a> · <a href="./assets/completion.png">Completion screenshot</a> · <a href="./assets/agent.png">Agent screenshot</a> · <a href="https://github.com/niT-Tin/oz/blob/master/README.zh-CN.md">中文介绍</a></p></noscript>
 </body>
 </html>
