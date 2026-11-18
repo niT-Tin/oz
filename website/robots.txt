@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://nit-tin.github.io/oz/sitemap.xml
