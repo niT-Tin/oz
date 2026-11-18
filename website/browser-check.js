@@ -16,7 +16,7 @@ async ({ page, context }) => {
       await visit(`?lang=${lang}`);
       check(await noOverflow(), `No page overflow at ${width}px / ${lang}`);
       check(await page.locator('html').getAttribute('lang') === (lang === 'zh' ? 'zh-CN' : 'en'), `Locale at ${width}px / ${lang}`);
-      check(await page.locator('#screenshot').evaluate((img) => img.complete && img.naturalWidth === 1680), `Actual screenshot loads at ${width}px / ${lang}`);
+      check(await page.locator('#screenshot').evaluate((img) => img.complete && img.naturalWidth === Number(img.getAttribute('width')) && img.naturalHeight === Number(img.getAttribute('height'))), `Actual screenshot loads at ${width}px / ${lang}`);
       await page.evaluate(() => { document.documentElement.style.fontSize = '200%'; });
       check(await noOverflow(), `200% text stays inside the page at ${width}px / ${lang}`);
       await page.evaluate(() => { document.documentElement.style.removeProperty('font-size'); });
@@ -25,6 +25,9 @@ async ({ page, context }) => {
   await visit();
   await page.locator('.skip-link').focus();
   check(await page.locator('.skip-link').evaluate((node) => node.getBoundingClientRect().top >= 0), 'Skip link becomes visible on keyboard focus');
+  await page.locator('#shot-editor').focus();
+  await page.keyboard.press('ArrowDown');
+  check(await page.locator('#shot-completion').getAttribute('aria-selected') === 'true', 'Vertical screenshot tabs accept ArrowDown');
   await page.locator('#shot-completion').click();
   check((await page.locator('#screenshot').getAttribute('src')).endsWith('completion.png'), 'Completion tab shows its actual image');
   await page.locator('#shot-completion').press('End');
@@ -34,7 +37,7 @@ async ({ page, context }) => {
   check(await page.locator('#shot-agent').getAttribute('aria-selected') === 'true', 'Screenshot tabs wrap with ArrowLeft');
   await page.locator('[data-language-switch]').click();
   check(await page.locator('#shot-agent').getAttribute('aria-selected') === 'true', 'Locale switch preserves selected screenshot');
-  check((await page.locator('#screenshot-caption').innerText()).includes('尚未发送提示词'), 'Agent screenshot description remains honest and translated');
+  check((await page.locator('#screenshot-caption').innerText()).includes('尚未发送'), 'Agent screenshot description remains honest and translated');
 
   await page.locator('#preset-codex').focus();
   await page.locator('#preset-codex').press('End');

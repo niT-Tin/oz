@@ -1,9 +1,11 @@
 # oz introduction site
 
 A buildless English/Chinese site for GitHub Pages at
-<https://nit-tin.github.io/oz/>. Product screenshots are copies of the current
-README captures: real oz, with an idle Agent panel rather than simulated
-model output. The original documentation and screenshot files are not changed.
+<https://nit-tin.github.io/oz/>. The README and the gallery use the same PNGs in `website/assets/`.
+All three frames show oz editing its own `src/chart.zig` in a 100 × 25 PTY:
+the file tree at the `Options` declaration, ZLS completion for `std.Array`
+and an unsent prompt in a Codex thread. The masthead landscape is artwork
+typeset on a fixed character grid.
 
 ## Preview and checks
 
@@ -47,6 +49,6 @@ Development scripts, local audit logs, editor code and repository settings
 are excluded. No Node dependencies, visitor API requests, analytics,
 third-party scripts or remote font services are used.
 
-Instrument Serif and DM Sans are self-hosted in WOFF2 format. Their SIL Open
-Font License notices are included beside the font files. The site code is
+DM Sans is self-hosted in WOFF2 format. Its SIL Open Font License is
+included beside the font file. The site code is
 covered by the repository's MIT license.

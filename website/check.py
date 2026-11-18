@@ -54,9 +54,9 @@ def check(root):
     assert not re.search(r"font-size:[^;}]*vw", css), "Font size must respect text scaling"
     for name in ("editor", "completion", "agent"):
         assert (root / "assets" / f"{name}.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
-    for name in ("DMSans", "InstrumentSerif"):
-        assert (root / "assets/fonts" / f"{name}.woff2").read_bytes().startswith(b"wOF2")
-        assert (root / "assets/fonts" / f"{name}-OFL.txt").is_file()
+    font = root / "assets/fonts/DMSans.woff2"
+    assert font.read_bytes().startswith(b"wOF2")
+    assert font.with_name("DMSans-OFL.txt").is_file()
     if (root / ".nojekyll").exists():
         for private in ("README.md", "build.py", "check.py", "browser-check.js", "__pycache__"):
             assert not (root / private).exists(), f"Development file in public artifact: {private}"
