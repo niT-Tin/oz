@@ -308,20 +308,21 @@ pub fn closeBufferAtForce(self: *App, buf_idx: usize, force: bool) void {
     self.inlay_inflight = false;
     var buf = self.buffers.orderedRemove(buf_idx);
     self.deinitBuffer(&buf);
-    if (self.current >= self.buffers.items.len) self.current = self.buffers.items.len - 1;
-    if (buf_idx < self.current) self.current -= 1;
+    const focused = self.windows.items[self.current_win].buf;
+    const survivor = if (focused > buf_idx) focused - 1 else @min(focused, self.buffers.items.len - 1);
     // point every window at the surviving buffer, fixing up shifted indices
     for (self.windows.items) |*w| {
         if (w.buf > buf_idx) {
             w.buf -= 1;
             w.cursor = @min(w.cursor, self.buffers.items[w.buf].pt.len());
         } else if (w.buf == buf_idx) {
-            w.buf = self.current;
+            w.buf = survivor;
             // the pane did not choose this buffer: install its own saved
             // position there (or the top), not the closed buffer's cursor
             self.restoreWindowView(w);
         }
     }
+    self.current = self.windows.items[self.current_win].buf;
     self.winTreeSanity();
     // tab ownership: a displayed buffer owns its displaying pane
     for (self.windows.items, 0..) |w, wi| {
@@ -345,8 +346,6 @@ pub fn closeCurrentBuffer(self: *App) void {
 pub fn closeCurrentBufferForce(self: *App, force: bool) void {
     const buf = self.windows.items[self.current_win].buf;
     closeBufferAtForce(self, buf, force);
-    self.windows.items[self.current_win].buf = self.current;
-    self.windows.items[self.current_win].cursor = @min(self.windows.items[self.current_win].cursor, self.cur().pt.len());
 }
 
 /// Every exit destroys every workspace, including hidden buffers. Keep the

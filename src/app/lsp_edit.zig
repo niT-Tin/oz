@@ -143,6 +143,7 @@ const EditPlan = struct {
     /// Borrows the prepared undo group's owned after bytes (which move into
     /// the buffer history on commit), and stays valid through LSP sync.
     text: []const u8,
+    before: []const u8,
     buffer_index: ?usize,
     prepared: workspace_edit.Prepared,
     new_buffer: ?App.Buffer = null,
@@ -232,6 +233,26 @@ fn planDocument(self: *App, doc: workspace_edit.Document) !?EditPlan {
         break :blk text;
     };
     defer self.alloc.free(old);
+    if (self.lsp_client) |client| {
+        if (index) |i| {
+            const b = &self.buffers.items[i];
+            if (!client.isDocOpen(buffer_uri)) {
+                // A fresh server calculated this unversioned edit against
+                // disk. Unsaved changes in a hidden buffer may shift even
+                // ranges that are still in bounds. Publish the real buffer
+                // and refuse the whole response; a retry has new coordinates.
+                const disk = try @import("lsp.zig").readSyncBaseline(self, buffer_path);
+                defer self.alloc.free(disk);
+                if (!std.mem.eql(u8, old, disk)) {
+                    if (client.text_sync.open_close or client.text_sync.change != .none) {
+                        try client.syncDocument(buffer_uri, disk, old);
+                        b.lsp_synced_rev = b.history.revision;
+                    }
+                    return error.StaleDocumentVersion;
+                }
+            }
+        }
+    }
     const new = try workspace_edit.replacement(self.alloc, old, doc.edits);
     defer self.alloc.free(new);
     if (std.mem.eql(u8, old, new)) return null;
@@ -255,7 +276,7 @@ fn planDocument(self: *App, doc: workspace_edit.Document) !?EditPlan {
     if (planned_folds.items.len > 0) try fold.reanchor(self.alloc, &planned_folds, &prepared.pt);
     own_uri = false;
     own_path = false;
-    return .{ .path = path, .buffer_uri = buffer_uri, .text = prepared.group.edits.items[0].after, .buffer_index = index, .prepared = prepared, .new_buffer = new_buffer, .folds = planned_folds };
+    return .{ .path = path, .buffer_uri = buffer_uri, .text = prepared.group.edits.items[0].after, .before = prepared.group.edits.items[0].before, .buffer_index = index, .prepared = prepared, .new_buffer = new_buffer, .folds = planned_folds };
 }
 
 fn applyEditResponse(self: *App, result: std.json.Value) !void {
@@ -327,7 +348,7 @@ fn applyEditResponse(self: *App, result: std.json.Value) !void {
         for (plans.items) |p| {
             // Use the buffer identity for both existing and newly installed
             // buffers. A response URI is not a reason to open a second copy.
-            client.syncDocument(p.buffer_uri, p.text) catch {
+            client.syncDocument(p.buffer_uri, p.before, p.text) catch {
                 // Applied text stays intact, but no later request may use a
                 // server whose hidden-document coordinates are now stale.
                 self.teardownLsp(false);

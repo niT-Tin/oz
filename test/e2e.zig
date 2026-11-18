@@ -1366,6 +1366,39 @@ test "mouse: buffer tab click switches, close × closes, at 80/100/120" {
     }
 }
 
+test "mouse: closing the first tab preserves the active buffer for the next gt" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "a.txt", "b.txt", "c.txt" }, [_][]const u8{ "BODY_A\n", "BODY_B\n", "BODY_C\n" }) |name, data|
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = data });
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &dir_buf);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "a.txt" }, &.{}, 24, 120, dir_buf[0..dir_len]);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 120);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "BODY_A", 5000);
+    for ([_][]const u8{ ":e b.txt\r", ":e c.txt\r" }, [_][]const u8{ "BODY_B", "BODY_C" }) |cmd, marker| {
+        try sess.send(cmd);
+        try gridWaitFor(&sess, &grid, marker, 5000);
+    }
+    const first_close = glyphCol(&grid, 0, "×", 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(grid.contains("a.txt"));
+    try mouseClickAt(&sess, first_close, 0);
+    try gridWaitGone(&sess, &grid, "a.txt", 5000);
+    try std.testing.expect(grid.contains("BODY_C"));
+    try sess.send("gt");
+    try gridWaitFor(&sess, &grid, "BODY_B", 5000);
+    try sess.send("rX");
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try tmp.dir.readFileAlloc(io, "b.txt", alloc, .limited(1024));
+    defer alloc.free(saved);
+    try std.testing.expectEqualStrings("XODY_B\n", saved);
+}
+
 test "mouse: navigator tabs, filetree row, notes row, wheel move/clamp" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -3735,6 +3768,32 @@ test "vim editing keys: x X D C S r ~ J >>" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+test "operator parsing: counts and dot after yanks change the expected file bytes" {
+    const lines = "1\n2\n3\n4\n5\n6\n7\n8\n";
+    const words = "one two three four five six seven eight\n";
+    const cases = [_]struct { text: []const u8, keys: []const u8, want: []const u8 }{
+        .{ .text = lines, .keys = "2d3d", .want = "7\n8\n" },
+        .{ .text = lines, .keys = "6dd", .want = "7\n8\n" },
+        .{ .text = lines, .keys = "d6d", .want = "7\n8\n" },
+        .{ .text = words, .keys = "2d3w", .want = "seven eight\n" },
+        .{ .text = "a b c d e f g h i j\n", .keys = "2d2w.", .want = "i j\n" },
+        .{ .text = "abc def\n", .keys = "w2d0", .want = "def\n" },
+        .{ .text = "aXb\n", .keys = "d2fX", .want = "aXb\n" },
+        .{ .text = "aXbXcXdXeXfZ\n", .keys = "2d3fX", .want = "aXbXcXdXeXfZ\n" },
+        .{ .text = "aXbXcXdXeXfXgZ\n", .keys = "2d3fX", .want = "gZ\n" },
+        .{ .text = lines, .keys = "dddfZ.", .want = "3\n4\n5\n6\n7\n8\n" },
+        .{ .text = lines, .keys = "dddtZ.", .want = "3\n4\n5\n6\n7\n8\n" },
+        .{ .text = lines, .keys = "dddFZ.", .want = "3\n4\n5\n6\n7\n8\n" },
+        .{ .text = lines, .keys = "dddTZ.", .want = "3\n4\n5\n6\n7\n8\n" },
+        .{ .text = lines, .keys = "dd2d3fZ.", .want = "3\n4\n5\n6\n7\n8\n" },
+        .{ .text = lines, .keys = "ddyy.", .want = "3\n4\n5\n6\n7\n8\n" },
+        .{ .text = lines, .keys = "ddyw.", .want = "3\n4\n5\n6\n7\n8\n" },
+        .{ .text = lines, .keys = "ddyiw.", .want = "3\n4\n5\n6\n7\n8\n" },
+        .{ .text = lines, .keys = "ddVy.", .want = "3\n4\n5\n6\n7\n8\n" },
+    };
+    for (cases) |case| try erEditorFileCase(std.testing.io, std.testing.allocator, "operator counts and yank repeat", ".txt", case.text, case.keys, case.want);
+}
+
 test "Normal counted J: inclusive range, separators, cursor, undo and repeat" {
     const cases = [_]struct { initial: []const u8, keys: []const u8, want: []const u8 }{
         .{ .initial = "1\n2\n3\n4", .keys = "4J", .want = "1 2 3 4" },
@@ -3746,6 +3805,10 @@ test "Normal counted J: inclusive range, separators, cursor, undo and repeat" {
         .{ .initial = "a\n", .keys = "4J", .want = "a\n" },
         .{ .initial = "a\n\n\tb\n  )\n", .keys = "4J", .want = "a b)\n" },
         .{ .initial = "a\nb\nc\nd\n", .keys = "4Jx", .want = "a b cd\n" },
+        .{ .initial = "Ae\u{0301}\n\nZ\n", .keys = "JrX", .want = "AX\nZ\n" },
+        .{ .initial = "Ae\u{0301}\n\nZ\n", .keys = "Jx", .want = "A\nZ\n" },
+        .{ .initial = "A\r\ne\u{0301}\r\n \t\r\nZ\r\n", .keys = "3JrX", .want = "A X\r\nZ\r\n" },
+        .{ .initial = "A👩🏽‍🚀\n\nend\n", .keys = "Jx", .want = "A\nend\n" },
         .{ .initial = "1\n  2\n3\n4\n", .keys = "4Ju", .want = "1\n  2\n3\n4\n" },
         .{ .initial = "1\n  2\n3\n4\n", .keys = "4Ju\x12", .want = "1 2 3 4\n" },
         .{ .initial = "1\n2\n3\n4\n5\n6\n7\n8\n", .keys = "4Jj.", .want = "1 2 3 4\n5 6 7 8\n" },
@@ -10744,6 +10807,182 @@ test "lsp: smoke with real gopls (no crash on start/didChange)" {
     try std.testing.expect(ok);
     const exit_code = try sess.commandAndWaitExit(":qa!\r");
     try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+/// A strict peer: apply UTF-16 ranges to its own document, reject the wrong
+/// wire shape, and report its state on hover (an ordered writer-queue barrier).
+const syncModePeer =
+    \\#!/usr/bin/env python3
+    \\import json, sys, time
+    \\from pathlib import Path
+    \\cap = json.loads(Path('cap.json').read_text())
+    \\mode = cap.get('change', 0) if isinstance(cap, dict) else cap
+    \\hidden = Path('b.zig').is_file()
+    \\original = Path('b.zig' if hidden else 'a.zig').read_bytes().decode()
+    \\doc, opens, edits, valid = original, 0, 0, True
+    \\def offset(pos):
+    \\    lines = doc.split('\n')
+    \\    i, col = pos['line'], pos['character']
+    \\    tail = lines[i].encode('utf-16-le')
+    \\    assert col * 2 <= len(tail)
+    \\    return sum(len(s) + 1 for s in lines[:i]) + len(tail[:col*2].decode('utf-16-le'))
+    \\def send(rid, result):
+    \\    data = json.dumps(dict(jsonrpc='2.0', id=rid, result=result)).encode()
+    \\    sys.stdout.buffer.write(b'Content-Length: %d\r\n\r\n'%len(data) + data)
+    \\    sys.stdout.buffer.flush()
+    \\while True:
+    \\    header = sys.stdin.buffer.readline()
+    \\    if not header: break
+    \\    length = int(header.split(b':')[1])
+    \\    while sys.stdin.buffer.readline().strip(): pass
+    \\    msg = json.loads(sys.stdin.buffer.read(length))
+    \\    m, p = msg.get('method'), msg.get('params', {})
+    \\    if m == 'initialize':
+    \\        if Path('hold-init').is_file():
+    \\            Path('initializing').touch()
+    \\            while not Path('release-init').is_file(): time.sleep(.01)
+    \\        send(msg['id'], {'capabilities': {'textDocumentSync':cap, 'hoverProvider':True, 'renameProvider':True}})
+    \\    elif m == 'textDocument/didOpen':
+    \\        opens += 1
+    \\        doc = p['textDocument']['text']
+    \\    elif m == 'textDocument/didChange':
+    \\        if hidden and p['textDocument']['uri'] != Path('b.zig').resolve().as_uri(): continue
+    \\        for c in p['contentChanges']:
+    \\            edits += 1
+    \\            valid &= mode != 0 and (mode == 2) == ('range' in c)
+    \\            if 'range' in c:
+    \\                r = c['range']
+    \\                doc = doc[:offset(r['start'])] + c['text'] + doc[offset(r['end']):]
+    \\            else: doc = c['text']
+    \\    elif m == 'textDocument/rename' and hidden:
+    \\        p0 = doc.index('foo')
+    \\        def edit(start, end, text):
+    \\            return {'range':{'start':{'line':0,'character':start},'end':{'line':0,'character':end}},'newText':text}
+    \\        send(msg['id'], {'changes':{p['textDocument']['uri']:[edit(0,3,'APPLIED')],Path('b.zig').resolve().as_uri():[edit(p0,p0+3,'NEW')]}})
+    \\    elif m == 'textDocument/hover' and hidden:
+    \\        send(msg['id'], {'contents': 'HIDDEN=%s=%d' % (doc, edits)})
+    \\    elif m == 'textDocument/hover':
+    \\        state = 'original' if doc == original else 'edited' if doc in (original[1:], original[:-1]) else 'wrong'
+    \\        send(msg['id'], {'contents': 'WIRE-%s-%d-%d-%s' % (valid, opens, edits, state)})
+    \\    elif 'id' in msg: send(msg['id'], None)
+;
+
+test "LSP sync negotiation: server mirror matches edits and undo in each mode" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const cases = [_]struct { cap: []const u8, opens: u8, sync: bool, early: bool = false }{
+        .{ .cap = "1", .opens = 1, .sync = true },
+        .{ .cap = "{\"openClose\":true,\"change\":1}", .opens = 1, .sync = true },
+        .{ .cap = "2", .opens = 1, .sync = true },
+        .{ .cap = "{\"openClose\":true,\"change\":0}", .opens = 1, .sync = false },
+        .{ .cap = "0", .opens = 0, .sync = false },
+        .{ .cap = "{\"openClose\":false,\"change\":2}", .opens = 0, .sync = true, .early = true },
+        .{ .cap = "{\"change\":1}", .opens = 0, .sync = true, .early = true },
+    };
+    for (cases) |case| {
+        var root_buf: [128]u8 = undefined;
+        const root = try aiMockDir(io, &root_buf);
+        defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        try aiWriteFile(io, root, "a.zig", "abc😀\n尾é");
+        try aiWriteFile(io, root, "cap.json", case.cap);
+        if (case.early) try aiWriteFile(io, root, "hold-init", "");
+        try aiWriteFile(io, root, "sync.py", syncModePeer);
+        const peer = try std.fmt.allocPrint(a, "{s}/sync.py", .{root});
+        defer a.free(peer);
+        const file = try std.Io.Dir.cwd().openFile(io, peer, .{});
+        defer file.close(io);
+        try file.setPermissions(io, std.Io.File.Permissions.fromMode(0o755));
+        const env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{peer});
+        defer a.free(env);
+        const oz = try erAbs(io, a, oz_exe_path);
+        defer a.free(oz);
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz, "a.zig" }, &.{env}, 24, 100, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 24, 100);
+        defer grid.deinit(a);
+        if (case.early) {
+            // Remove the last UTF-16 unit before the asynchronous handshake
+            // completes; the peer still owns the original, longer disk text.
+            try waitBarrierMarker(io, a, root, "initializing", 5000);
+            try gridWaitFor(&sess, &grid, "[NORMAL]", 5000);
+            try sess.send("G$xgg");
+            try gridWaitGone(&sess, &grid, "尾é", 3000);
+            try aiWriteFile(io, root, "release-init", "");
+        }
+        try gridWaitFor(&sess, &grid, "[zls]", 8000);
+        var label: [64]u8 = undefined;
+        try sess.send(if (case.early) "K" else "xK");
+        try gridWaitFor(&sess, &grid, try std.fmt.bufPrint(&label, "WIRE-True-{d}-{d}-{s}", .{
+            case.opens, @intFromBool(case.sync), if (case.sync) "edited" else "original",
+        }), 5000);
+        // Move to dismiss the first hover so even the None case must receive
+        // a fresh response before passing the second assertion.
+        try sess.send("l");
+        try gridWaitGone(&sess, &grid, "WIRE-True", 3000);
+        try sess.send("uK");
+        try gridWaitFor(&sess, &grid, try std.fmt.bufPrint(&label, "WIRE-True-{d}-{d}-original", .{
+            case.opens, @as(u8, if (case.sync) 2 else 0),
+        }), 5000);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q!\r"));
+    }
+}
+
+test "LSP hidden dirty document: restart then rename refreshes the mirror before retry" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "a.zig", "aaa");
+    try aiWriteFile(io, root, "b.zig", "abc-foo!");
+    try aiWriteFile(io, root, "inter.txt", "INTERMEDIATE");
+    try aiWriteFile(io, root, "cap.json", "{\"openClose\":false,\"change\":2}");
+    try aiWriteFile(io, root, "sync.py", syncModePeer);
+    const peer = try std.fs.path.join(a, &.{ root, "sync.py" });
+    defer a.free(peer);
+    const file = try std.Io.Dir.cwd().openFile(io, peer, .{});
+    defer file.close(io);
+    try file.setPermissions(io, std.Io.File.Permissions.fromMode(0o755));
+    const env = try std.fmt.allocPrint(a, "OZ_LSP_CMD={s}", .{peer});
+    defer a.free(env);
+    const oz = try erAbs(io, a, oz_exe_path);
+    defer a.free(oz);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz, "b.zig" }, &.{env}, 24, 100, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 100);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[zls]", 5000);
+    try sess.send("x");
+    try gridWaitGone(&sess, &grid, "abc-foo!", 5000);
+    try gridWaitFor(&sess, &grid, "bc-foo!", 5000);
+    try sess.send(":e inter.txt\r");
+    try gridWaitFor(&sess, &grid, "INTERMEDIATE", 5000);
+    try sess.send(":e a.zig\r");
+    try gridWaitFor(&sess, &grid, "[zls]", 5000);
+    try sess.send("K");
+    // The new server has only the disk version of hidden B.
+    try gridWaitFor(&sess, &grid, "HIDDEN=abc-foo!=0", 5000);
+    try sess.send("l rn\r");
+    try gridWaitFor(&sess, &grid, "StaleDocumentVersion", 5000);
+    try std.testing.expect(!grid.contains("APPLIED"));
+    try sess.send("K");
+    try gridWaitFor(&sess, &grid, "HIDDEN=bc-foo!=1", 5000);
+    try sess.send("l rn\r");
+    try gridWaitFor(&sess, &grid, "APPLIED", 5000);
+    try sess.send("K");
+    // The second rename targets [3,6) in B instead of its old disk [4,7).
+    try gridWaitFor(&sess, &grid, "HIDDEN=bc-NEW!=2", 5000);
+    try sess.send(":e b.zig\r");
+    try gridWaitFor(&sess, &grid, "bc-NEW!", 5000);
+    const target = try std.fs.path.join(a, &.{ root, "b.zig" });
+    defer a.free(target);
+    try expectLspDisk(io, a, target, "abc-foo!");
+    try sess.send(":w\r");
+    try gridWaitFor(&sess, &grid, "written:", 5000);
+    try expectLspDisk(io, a, target, "bc-NEW!");
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
 }
 
 test "lsp: mock server handshake + didChange round-trip (OZ_LSP_CMD)" {
@@ -24629,6 +24868,68 @@ test "file safety: atomic replacement refuses normal save and permits explicit f
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
 }
 
+test "undo save point: quit respects undo, redo and equal-length divergent branches" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { keys: []const u8, current: []const u8, saved: []const u8, dirty: bool }{
+        .{ .keys = "xu", .current = "abc", .saved = "abc\n", .dirty = false },
+        .{ .keys = "rX:w\rrYu", .current = "Xbc", .saved = "Xbc\n", .dirty = false },
+        .{ .keys = "rX:w\ru\x12", .current = "Xbc", .saved = "Xbc\n", .dirty = false },
+        .{ .keys = "rX:w\ru", .current = "abc", .saved = "Xbc\n", .dirty = true },
+        .{ .keys = "rX:w\rurY", .current = "Ybc", .saved = "Xbc\n", .dirty = true },
+    };
+    for (cases) |case| {
+        var name_buf: [192:0]u8 = undefined;
+        const path = try erFixture(io, &name_buf, ".txt", "abc\n");
+        defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        var sess = try erStart(io, alloc, path, 24, 80);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(alloc, 24, 80);
+        defer grid.deinit(alloc);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try sess.send(case.keys);
+        try gridDrain(&sess, &grid, 200);
+        try std.testing.expect(grid.contains(case.current));
+        if (case.dirty) {
+            try sess.send(":q\r");
+            try gridWaitFor(&sess, &grid, "E37", 4000);
+            try std.testing.expect(try sess.tryWaitExit() == null);
+            try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q!\r"));
+        } else {
+            try expectNoDirtyMarker(&grid);
+            try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q\r"));
+        }
+        try expectLspDisk(io, alloc, path, case.saved);
+    }
+}
+
+test "undo save point: undo to the initial empty scratch or new file allows a normal quit" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var name_buf: [192:0]u8 = undefined;
+    const missing = try erFixture(io, &name_buf, ".txt", "");
+    try std.Io.Dir.cwd().deleteFile(io, missing);
+    defer std.Io.Dir.cwd().deleteFile(io, missing) catch {};
+    for ([_]bool{ false, true }) |named| {
+        var sess = if (named) try erStart(io, alloc, missing, 24, 80) else try Session.spawn(io, &.{oz_exe_path});
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(alloc, 24, 80);
+        defer grid.deinit(alloc);
+        try gridWaitFor(&sess, &grid, if (named) "[NORMAL]" else "New File", 8000);
+        try sess.send(if (named) "iNEW" else "nNEW");
+        try gridWaitFor(&sess, &grid, "NEW", 4000);
+        try sess.send("\x1b");
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 4000);
+        try sess.send("u");
+        try gridDrain(&sess, &grid, 200);
+        try expectNoDirtyMarker(&grid);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q\r"));
+    }
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, missing, .{}));
+}
+
 test "safety: quit write-quit and delete protect hidden dirty buffers and workspaces" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -25623,8 +25924,10 @@ test "diagnostic UI: real ZLS matches source, fixes and line movement" {
     defer grid.deinit(a);
     try gridWaitFor(&sess, &grid, "NORMAL", 8000);
     // The actual server diagnoses the unused parameter, not the function.
+    try gridWaitFor(&sess, &grid, "aaa: usize", 5000);
+    const parameter_row = (aiFindCellFrom(&grid, "aaa: usize", 0) orelse return error.TestUnexpectedResult).row;
     try sess.send("ggj");
-    try gridWaitRowContains(&sess, &grid, 3, "unused function parameter", 30000);
+    try gridWaitRowContains(&sess, &grid, parameter_row, "unused function parameter", 30000);
     try expectDiagnosticUnderline(&grid, "aaa", 3, packRgb(0xE8, 0x24, 0x24));
     const parameter = aiFindCellFrom(&grid, "aaa: usize", 0).?;
     try std.testing.expectEqual(@as(u8, 0), frame.cellUnderlineStyle(&grid, parameter.row, parameter.col + 3));
@@ -25645,7 +25948,7 @@ test "diagnostic UI: real ZLS matches source, fixes and line movement" {
     try sess.send("0w3xi_\x1b");
     try gridWaitFor(&sess, &grid, "NORMAL", 5000);
     try gridDrain(&sess, &grid, 1000);
-    try std.testing.expect(rowContains(&grid, 3, "_: usize"));
+    try std.testing.expect(rowContains(&grid, parameter_row, "_: usize"));
     try std.testing.expect(!grid.contains("unused function parameter"));
     const ignored_parameter = aiFindCellFrom(&grid, "_: usize", 0).?;
     try std.testing.expectEqual(@as(u8, 0), frame.cellUnderlineStyle(&grid, ignored_parameter.row, ignored_parameter.col));
@@ -25655,7 +25958,7 @@ test "diagnostic UI: real ZLS matches source, fixes and line movement" {
     // publish it at the new source line, never leave it on the old line.
     try sess.send("0wxiaaa\x1b");
     try gridWaitFor(&sess, &grid, "NORMAL", 5000);
-    try gridWaitRowContains(&sess, &grid, 3, "unused function parameter", 10000);
+    try gridWaitRowContains(&sess, &grid, parameter_row, "unused function parameter", 10000);
     try sess.send("ggO// 中文 😀\x1b");
     try gridWaitFor(&sess, &grid, "NORMAL", 5000);
     try gridDrain(&sess, &grid, 500);
@@ -25663,8 +25966,8 @@ test "diagnostic UI: real ZLS matches source, fixes and line movement" {
     try gridDrain(&sess, &grid, 500);
     try std.testing.expect(!grid.contains("unused function parameter"));
     try sess.send("j");
-    try gridWaitRowContains(&sess, &grid, 4, "aaa: usize", 5000);
-    try gridWaitRowContains(&sess, &grid, 4, "unused function parameter", 10000);
+    try gridWaitRowContains(&sess, &grid, parameter_row + 1, "aaa: usize", 5000);
+    try gridWaitRowContains(&sess, &grid, parameter_row + 1, "unused function parameter", 10000);
     try expectDiagnosticUnderline(&grid, "aaa", 3, packRgb(0xE8, 0x24, 0x24));
     try sess.send("gl");
     try gridWaitFor(&sess, &grid, "Error: unused function parameter", 5000);

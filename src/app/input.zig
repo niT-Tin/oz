@@ -646,7 +646,14 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
             }
             self.curCursor().* = new_cursor;
         },
-        .op_motion => |m| try self.execOpMotion(m),
+        .op_motion => |m| {
+            const revision = self.cur().history.revision;
+            try self.execOpMotion(m);
+            // A failed motion leaves the previous edit available for '.'.
+            // Changing an empty range can still start an insertion.
+            if (self.cur().history.revision != revision or (m.op == .change and self.in_insert))
+                self.state.rememberOperator(m);
+        },
         .surround => |s| try self.execSurround(s),
         .align_lines => |a| try self.execAlign(a),
         .macro => |m| try self.execMacro(m),

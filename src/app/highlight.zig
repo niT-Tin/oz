@@ -242,7 +242,7 @@ pub fn execOpMotion(self: *App, m: editor.OpMotion) !void {
         const line = self.cur().pt.lineOf(self.curCursor().*);
         const n = @max(m.count, 1);
         const start_line = @min(line, self.cur().pt.lineCount() - 1);
-        const end_line = @min(start_line + n - 1, self.cur().pt.lineCount() - 1);
+        const end_line = @min(start_line +| (n - 1), self.cur().pt.lineCount() - 1);
         const start = self.cur().pt.lineStart(start_line);
         var end = self.cur().pt.lineStart(end_line) + self.cur().pt.lineLen(end_line);
         // dd/yy take the trailing newline (the line is gone from the
@@ -342,17 +342,17 @@ pub fn execOpMotion(self: *App, m: editor.OpMotion) !void {
     // include the full character at the sorted right endpoint, including
     // multibyte characters and backward inclusive find motions.
     //
-    // Forward t needs its own resolution: Motion.target cannot distinguish
-    // "target not found" from "target adjacent" — both land on the cursor —
-    // yet vim aborts the whole operator only for the former (dtZ is a no-op,
-    // while dtu deletes the character under the cursor). tillTarget reports
-    // the miss explicitly; the inclusive flag (set by Mode for t only)
-    // covers the landing character on a hit.
-    const target_pos = if (m.motion == .till)
-        editor.Motion.tillTarget(&self.cur().pt, self.curCursor().*, m.args.ch, 1, m.count) orelse return
-    else
-        editor.Motion.target(&self.cur().pt, m.motion, m.args, self.curCursor().*, m.count);
-    const range = edit_range.characterwise(&self.cur().pt, self.curCursor().*, target_pos, m.inclusive);
+    // Find/till operators require the count-th match. A miss aborts the
+    // entire edit; using the cursor as a fallback would delete a character
+    // for an inclusive motion, or enter Insert for a change with no target.
+    const pt = &self.cur().pt;
+    const from = self.curCursor().*;
+    const target_pos = switch (m.motion) {
+        .find, .find_back => editor.Motion.findTarget(pt, from, m.args.ch, if (m.motion == .find) 1 else -1, m.count) orelse return,
+        .till, .till_back => editor.Motion.tillTarget(pt, from, m.args.ch, if (m.motion == .till) 1 else -1, m.count) orelse return,
+        else => editor.Motion.target(pt, m.motion, m.args, from, m.count),
+    };
+    const range = edit_range.characterwise(pt, from, target_pos, m.inclusive);
     try self.applyOpRange(m.op, range.start, range.end, false, false);
 }
 
@@ -844,36 +844,21 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
         .paste => try self.pasteBuffer(false, count),
         .paste_before => try self.pasteBuffer(true, count),
         .delete_char => {
-            // x: vim dl — delete `count` characters under the cursor. At
-            // the end of a line the newline is deleted (joining the next
-            // line), like vim; at EOF nothing happens. One undo group.
-            // The deleted text fills the unnamed register (charwise) —
-            // vim's xp char-swap depends on it. Capture BEFORE deleting:
-            // setRegister reads the live piece table.
+            // x deletes whole graphemes in one edit. Capture the same byte
+            // range in the unnamed register before changing the piece table.
             const c0 = self.curCursor().*;
             var reg_end = c0;
-            var i: u32 = 0;
-            while (i < @max(count, 1)) : (i += 1) {
-                if (reg_end >= self.cur().pt.len()) break;
-                const seq = self.charLenAt(&self.cur().pt, reg_end);
-                reg_end = @min(reg_end + seq, self.cur().pt.len());
+            var clusters = edit_range.graphemes(&self.cur().pt, c0, self.cur().pt.len());
+            for (0..@max(count, 1)) |_| {
+                const cluster = clusters.nextGrapheme() orelse break;
+                reg_end = @intCast(cluster.end);
             }
-            if (reg_end > c0) try self.setRegister(c0, reg_end, false);
+            if (reg_end == c0) return;
+            try self.setRegister(c0, reg_end, false);
             // LSP range in the PRE-EDIT document: [c0, reg_end).
             const start_pos = self.lspPositionAt(&self.cur().pt, c0);
             const end_pos = self.lspPositionAt(&self.cur().pt, reg_end);
-            self.cur().history.beginGroup();
-            i = 0;
-            while (i < @max(count, 1)) : (i += 1) {
-                const c = self.curCursor().*;
-                if (c >= self.cur().pt.len()) break;
-                const pt = &self.cur().pt;
-                const seq = self.charLenAt(pt, c);
-                const end = @min(c + seq, pt.len());
-                if (end <= c) break;
-                try self.recordEdit(c, end - c, "");
-            }
-            self.cur().history.endGroup();
+            try self.recordEdit(c0, reg_end - c0, "");
             self.markDirtyRange(start_pos, end_pos, "");
         },
         .delete_char_before => {
@@ -1125,7 +1110,12 @@ fn joinLines(self: *App, count: u32) !void {
     const offsets = captureInlayOffsetsForReplace(self, start, end - start, @intCast(used));
     defer if (offsets) |value| self.alloc.free(value);
     try self.recordEdit(start, end - start, span[0..used]);
-    self.curCursor().* = if (end == last_end and seam > first_start) edit_range.charStart(pt, seam - 1) else seam;
+    var cursor = seam;
+    if (end == last_end and seam > first_start) {
+        var clusters = edit_range.graphemes(pt, first_start, seam);
+        while (clusters.nextGrapheme()) |cluster| cursor = @intCast(cluster.start);
+    }
+    self.curCursor().* = cursor;
     self.markDirtyRange(from, to, span[0..used]);
     if (offsets) |value| applyInlayOffsetsAfterHistory(self, value);
 }

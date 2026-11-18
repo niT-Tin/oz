@@ -50,13 +50,10 @@ pub fn ensureLsp(self: *App) void {
                 // needs no re-open and no full-text copy: just retarget.
                 const buf = &self.buffers.items[self.current];
                 if (c.isDocOpen(uri) and buf.lsp_synced_rev == buf.history.revision) {
-                    c.retarget(uri) catch {};
+                    c.retarget(uri) catch self.teardownLsp(false);
                     return;
                 }
-                const text = self.curText() catch return;
-                defer self.alloc.free(text);
-                c.switchDocument(uri, text) catch {};
-                buf.lsp_synced_rev = buf.history.revision;
+                syncCurrentDocument(self, c, uri) catch self.teardownLsp(false);
             }
             return;
         }
@@ -172,15 +169,36 @@ pub fn finishLspStart(self: *App) bool {
     client.wake_ctx = self;
     client.wake_fn = lspWake;
     self.lsp_client = client;
-    // Open with the CURRENT text — edits made during the handshake must
-    // not be lost.
-    const text = self.curText() catch return true;
-    defer self.alloc.free(text);
-    client.openDocument(text) catch return true;
-    // The didOpen carried the current text: the server's copy of this
-    // buffer is now current (same contract as the switchDocument path).
-    self.cur().lsp_synced_rev = self.cur().history.revision;
+    syncCurrentDocument(self, client, cur_uri.?) catch self.teardownLsp(false);
     return true;
+}
+
+/// An unseen document on the server starts at disk contents. A new path
+/// without a file has an empty baseline.
+pub fn readSyncBaseline(self: *App, path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(self.io, path, self.alloc, .limited(std.math.maxInt(u32))) catch |err| switch (err) {
+        error.FileNotFound => self.alloc.alloc(u8, 0),
+        else => return err,
+    };
+}
+
+fn syncCurrentDocument(self: *App, client: *lsp.Client, uri: []const u8) !void {
+    const sync = client.text_sync;
+    const buf = self.cur();
+    if (sync.change != .none or sync.open_close) {
+        const text = try self.curText();
+        defer self.alloc.free(text);
+        if (!sync.open_close and buf.dirty and !client.isDocOpen(uri)) {
+            // Without didOpen the server starts from disk. A dirty buffer
+            // (including typing during initialize) already differs. Only an
+            // incremental server needs the original EOF to replace it.
+            const disk = if (sync.change == .incremental) try readSyncBaseline(self, buf.path.?) else null;
+            defer if (disk) |bytes| self.alloc.free(bytes);
+            try client.syncDocument(uri, disk orelse "", text);
+        } else try client.syncDocument(uri, null, text);
+    }
+    if (!std.mem.eql(u8, client.uri, uri)) try client.retarget(uri);
+    buf.lsp_synced_rev = buf.history.revision;
 }
 
 /// Called from the LSP reader thread when a message arrives: post a
@@ -303,6 +321,11 @@ fn markDirtyBaseImpl(self: *App, invalidate_inlays: bool) void {
 /// hints during the request, which is exactly the layout jump this avoids.
 pub fn markDirtyHistory(self: *App) void {
     markDirtyBasePreserveInlays(self);
+    const buf = self.cur();
+    // An unnamed scratch buffer starts empty. A named buffer's baseline
+    // follows successful writes (including Agent writes) independently
+    // of the undo branch and of subsequent external changes on disk.
+    buf.dirty = if (buf.disk) |*disk| !disk.matchesBuffer(&buf.pt) else buf.pt.len() != 0;
     // Forget the covered band: the run loop's band check then issues the
     // refresh for the post-undo viewport. The old hints stay visible.
     self.inlay_view_top = null;
@@ -317,10 +340,10 @@ pub fn markDirty(self: *App) void {
     self.syncLspFull();
 }
 
-/// Mark the current buffer dirty and push an INCREMENTAL didChange to the
-/// LSP server: `text` replaced [start, end) of the PRE-EDIT document
+/// Mark the current buffer dirty and sync it in the server's negotiated
+/// format. Incremental servers use the recorded edit: `text` replaced [start, end) of the PRE-EDIT document
 /// (`start`/`end` are LSP positions computed before the edit was applied).
-/// The per-keystroke path — no full-document copy.
+/// Incremental keystrokes avoid a full-document copy.
 pub fn markDirtyRange(self: *App, start: lsp_types.Position, end: lsp_types.Position, text: []const u8) void {
     // The edit shifts line positions: keep the displayed git marks glued to
     // their content lines (shifted along) instead of leaving them stale at
@@ -328,9 +351,11 @@ pub fn markDirtyRange(self: *App, start: lsp_types.Position, end: lsp_types.Posi
     self.gitShiftForEdit(start, end, text);
     self.markDirtyBase();
     if (self.lsp_client) |c| {
-        c.didChange(.{ .start = start, .end = end }, text) catch {
-            return;
-        };
+        switch (c.text_sync.change) {
+            .none => return,
+            .full => return self.syncLspFull(),
+            .incremental => c.didChange(.{ .start = start, .end = end }, text) catch return self.syncLspFull(),
+        }
         self.cur().lsp_synced_rev = self.cur().history.revision;
     }
 }
@@ -341,11 +366,10 @@ pub fn syncLspFull(self: *App) void {
     self.clearDiagnostics();
     self.diag_dirty = true;
     if (self.lsp_client) |c| {
-        const text = self.curText() catch return;
+        if (c.text_sync.change == .none) return;
+        const text = self.curText() catch return self.teardownLsp(false);
         defer self.alloc.free(text);
-        c.didChange(null, text) catch {
-            return;
-        };
+        c.didChange(null, text) catch return self.teardownLsp(false);
         self.cur().lsp_synced_rev = self.cur().history.revision;
     }
 }

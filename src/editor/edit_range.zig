@@ -5,6 +5,45 @@ const utf8 = @import("../buffer/utf8.zig");
 
 pub const Range = struct { start: u32, end: u32 };
 
+// Feed the same Unicode segmenter as the renderer directly from the piece
+// table. Its offsets stay in document coordinates, even across piece splits.
+const CodePoints = struct {
+    pt: *const PieceTable,
+    i: usize,
+    end: u32,
+
+    pub fn next(self: *CodePoints) ?u21 {
+        if (self.i >= self.end) return null;
+        const pos: u32 = @intCast(self.i);
+        var bytes: [4]u8 = undefined;
+        bytes[0] = self.pt.byteAt(pos);
+        const len = @min(self.end - pos, std.unicode.utf8ByteSequenceLength(bytes[0]) catch 1);
+        for (1..len) |j| bytes[j] = self.pt.byteAt(pos + @as(u32, @intCast(j)));
+        const decoded = utf8.decodeAt(bytes[0..len], 0);
+        self.i += decoded.len;
+        return decoded.cp;
+    }
+};
+
+const Graphemes = @import("vaxis").uucode.grapheme.Iterator(CodePoints);
+
+pub fn graphemes(pt: *const PieceTable, start: u32, end: u32) Graphemes {
+    return .init(.{ .pt = pt, .i = start, .end = end });
+}
+
+test "grapheme spans use document offsets across piece boundaries" {
+    var pt = try PieceTable.init(std.testing.allocator, "Ae\x81\xffZ");
+    defer pt.deinit();
+    // Even the two bytes encoding U+0301 live in different pieces.
+    _ = try pt.replace(2, 0, "\xcc");
+    var clusters = graphemes(&pt, 1, 5);
+    const combined = clusters.nextGrapheme().?;
+    try std.testing.expectEqual(@as(usize, 1), combined.start);
+    try std.testing.expectEqual(@as(usize, 4), combined.end);
+    try std.testing.expectEqual(@as(usize, 5), clusters.nextGrapheme().?.end);
+    try std.testing.expect(clusters.nextGrapheme() == null);
+}
+
 /// Snap an interior byte of a valid UTF-8 sequence back to its lead byte.
 /// Invalid bytes remain independently addressable, as in the motion layer.
 pub fn charStart(pt: *const PieceTable, pos_in: u32) u32 {
