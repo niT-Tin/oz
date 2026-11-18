@@ -27,7 +27,7 @@ def build(output, version=None):
     shutil.copytree(SITE / "assets", output / "assets")
     if version:
         path = output / "index.html"
-        text, count = re.subn(r'(data-release-version[^>]*>)v[\w.-]+', rf'\g<1>{version}', path.read_text())
+        text, count = re.subn(r'(data-release-version[^>]*>)[^<]*(?=</a>)', rf'\g<1>{version}', path.read_text())
         if count != 1:
             raise ValueError("Release badge must appear exactly once")
         path.write_text(text)

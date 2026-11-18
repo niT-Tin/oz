@@ -8,17 +8,18 @@ on:
     paths: ['website/**', '.github/workflows/pages.yml']
   release:
     types: [published]
+  # Releases created by GITHUB_TOKEN do not trigger the release event.
+  workflow_run:
+    workflows: [release]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: pages-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'production' }}
-  cancel-in-progress: true
-
 jobs:
   build:
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -33,7 +34,7 @@ jobs:
           set -euo pipefail
           version=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)
           python3 website/build.py --version "$version"
-          python3 website/check.py .verify/website
+          python3 website/check.py .verify/website "$version"
       - name: Upload site
         uses: actions/upload-pages-artifact@v4
         with:
@@ -42,6 +43,9 @@ jobs:
   deploy:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master' || github.event_name == 'release'
     needs: build
+    concurrency:
+      group: pages-production
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: read

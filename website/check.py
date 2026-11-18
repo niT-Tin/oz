@@ -18,10 +18,13 @@ class Document(HTMLParser):
         self.elements.append((tag, dict(attrs)))
 
 
-def check(root):
+def check(root, expected_version=None):
     root = root.resolve()
     html = (root / "index.html").read_text()
     doc = Document(html)
+    if expected_version is not None:
+        badges = re.findall(r'<a\b[^>]*\bdata-release-version\b[^>]*>([^<]*)</a>', html)
+        assert badges == [expected_version], f"Expected release badge {expected_version}, got {badges}"
     ids = Counter(attrs["id"] for _, attrs in doc.elements if "id" in attrs)
     assert all(count == 1 for count in ids.values()), "Duplicate HTML id"
     assert '<html lang="en">' in html and "<noscript>" in html
@@ -69,4 +72,5 @@ def check(root):
 
 
 if __name__ == "__main__":
-    check(Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent)
+    check(Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent,
+          sys.argv[2] if len(sys.argv) > 2 else None)

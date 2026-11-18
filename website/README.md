@@ -40,8 +40,8 @@ verified by a static scanner.
 The repository's Settings → Pages source is **GitHub Actions**.
 `.github/workflows/pages.yml` checks and packages this directory, then uses
 the official GitHub Pages actions. PRs validate and upload an artifact;
-only `master` or a published release deploys to production. A manual run
-from `master` can redeploy. The release badge is filled from the latest
+the site deploys from `master`, after the release workflow succeeds, or on
+a published release event. A manual run from `master` can redeploy. The release badge is filled from the latest
 published release, and archive links use `/releases/latest/download/`.
 
 Only the explicit public file list and `assets/` go into the artifact.
