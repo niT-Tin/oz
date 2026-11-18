@@ -6,7 +6,7 @@
 //!
 //! Design notes:
 //! - one Client per filetype (the App owns the current one); buffer switches
-//!   didClose + didOpen, and the App replaces the client when the filetype
+//!   retarget an already tracked document, and the App replaces the client when the filetype
 //!   changes.
 //! - the queue moves RAW frame content across threads (duped bytes); parsing
 //!   happens on the main thread in `drain`, so no JSON value is shared
@@ -18,6 +18,51 @@ const std = @import("std");
 const json_rpc = @import("../util/json_rpc.zig");
 const server_config = @import("server_config.zig");
 const types = @import("types.zig");
+
+const origin = types.Position{ .line = 0, .character = 0 };
+
+pub const TextSync = struct {
+    open_close: bool = false,
+    change: enum { none, full, incremental } = .none,
+
+    fn fromCapability(cap: ?std.json.Value) TextSync {
+        const value = cap orelse return .{};
+        const kind = if (value == .object) value.object.get("change") else value;
+        const number: i64 = if (kind) |v| switch (v) {
+            .integer => |n| n,
+            .number_string => |s| std.fmt.parseInt(i64, s, 10) catch 0,
+            else => 0,
+        } else 0;
+        const open_close = if (value == .object) blk: {
+            const flag = value.object.get("openClose") orelse break :blk false;
+            break :blk flag == .bool and flag.bool;
+        } else number == 1 or number == 2;
+        return .{ .open_close = open_close, .change = switch (number) {
+            1 => .full,
+            2 => .incremental,
+            else => .none,
+        } };
+    }
+};
+
+const SyncedDocument = struct {
+    version: ?i32 = null,
+    end: types.Position = origin,
+};
+
+/// An incremental server needs a pre-edit EOF even when the editor knows
+/// only the new snapshot (e.g. undo). Maintain it from edit coordinates so
+/// ordinary keystrokes never walk the whole document.
+fn endAfterEdit(old_end: types.Position, range: types.Range, inserted: []const u8) !types.Position {
+    if (range.end.line > old_end.line or (range.end.line == old_end.line and range.end.character > old_end.character))
+        return error.InvalidDocumentRange;
+    const breaks: u32 = @intCast(std.mem.count(u8, inserted, "\n"));
+    const line = range.start.line + breaks + (old_end.line - range.end.line);
+    if (range.end.line < old_end.line) return .{ .line = line, .character = old_end.character };
+    const last = if (std.mem.lastIndexOfScalar(u8, inserted, '\n')) |nl| inserted[nl + 1 ..] else inserted;
+    const units: u32 = @intCast(try std.unicode.calcUtf16LeLen(last));
+    return .{ .line = line, .character = (if (breaks == 0) range.start.character else 0) + units + (old_end.character - range.end.character) };
+}
 
 /// Thread-safe FIFO of raw JSON-RPC frame contents (owned bytes). Uses the
 /// io-aware primitives from std.Io (Zig 0.16 moved Mutex/Condition there).
@@ -70,7 +115,7 @@ const Queue = struct {
 /// every retarget/switchDocument.
 const OutFrame = union(enum) {
     raw: []u8,
-    did_change: struct { uri: []u8, text: []u8, version: i32 },
+    did_change: struct { uri: []u8, text: []u8, version: i32, range: ?types.Range = null },
 
     fn deinit(self: OutFrame, alloc: std.mem.Allocator) void {
         switch (self) {
@@ -103,6 +148,8 @@ const OutQueue = struct {
                 if (std.mem.eql(u8, previous.uri, frame.did_change.uri)) {
                     self.items.items[i].deinit(alloc);
                     self.items.items[i] = frame;
+                    // A coalesced snapshot replaces the oldest queued pre-image.
+                    self.items.items[i].did_change.range = previous.range;
                     self.cond.signal(self.io);
                     return;
                 }
@@ -162,6 +209,7 @@ pub const Client = struct {
     /// Whether the server advertised inlayHintProvider (from initialize).
     /// When false the editor skips inlayHint requests entirely.
     caps_inlay: bool = false,
+    text_sync: TextSync = .{},
     /// Completion trigger characters declared by the server (e.g. "." for
     /// member access) — auto-suggest fires on these too, like blink.cmp's
     /// show_on_trigger_character. Owned strings; empty when undeclared.
@@ -180,13 +228,10 @@ pub const Client = struct {
     /// dupe) that deinit must free; OZ_LSP_CMD's entry is a borrowed env slice.
     argv_override_first_owned: bool = false,
 
-    /// Documents currently open in the server (uri hash → last sent version). didOpen
-    /// inserts, didClose removes. Buffer switches do NOT close the previous
-    /// document (LSP servers track several), so switching back to an open,
-    /// unchanged document costs nothing — the App checks `isDocOpen` and
-    /// skips the re-open (and its full-text copy) entirely. Lazily
-    /// initialized (hand-built test Clients skip it).
-    open_docs: ?std.AutoHashMap(u64, i32) = null,
+    /// Per-URI editor opens, versions actually sent, and the server's UTF-16
+    /// EOF for incremental snapshots. A server can opt out of open/close
+    /// notifications while still requesting changes.
+    open_docs: ?std.AutoHashMap(u64, SyncedDocument) = null,
 
     thread: ?std.Thread = null,
     /// Writer thread: post-handshake frames (didChange, requests) are QUEUED
@@ -410,6 +455,7 @@ pub const Client = struct {
             if (res == .object) {
                 if (res.object.get("capabilities")) |caps| {
                     if (caps == .object) {
+                        self.text_sync = TextSync.fromCapability(caps.object.get("textDocumentSync"));
                         if (caps.object.get("inlayHintProvider")) |p| {
                             // servers declare it as `true` or as an object
                             // {resolveProvider: bool}
@@ -478,7 +524,7 @@ pub const Client = struct {
     ) !*Client {
         const self = try connect(alloc, io, env_map, lang, uri, null);
         errdefer self.deinit();
-        try self.didOpen(text);
+        try self.openDocument(text);
         return self;
     }
 
@@ -534,58 +580,7 @@ pub const Client = struct {
     // ---- params lifetime ----
     // json_rpc.freeValue frees every key/string it finds, but this module's
     // manually built params use comptime literal keys — freeing those crashes.
-    // These per-shape helpers free the dupe'd strings and deinit the maps.
-
-    fn freeDidOpenParams(self: *Client, v: *std.json.Value) void {
-        const params = &v.object;
-        var td = params.get("textDocument").?;
-        self.alloc.free(td.object.get("uri").?.string);
-        self.alloc.free(td.object.get("languageId").?.string);
-        self.alloc.free(td.object.get("text").?.string);
-        td.object.deinit(self.alloc);
-        params.deinit(self.alloc);
-    }
-
-    fn freeDidChangeParams(self: *Client, v: *std.json.Value) void {
-        const params = &v.object;
-        var td = params.get("textDocument").?;
-        self.alloc.free(td.object.get("uri").?.string);
-        td.object.deinit(self.alloc);
-        var changes = params.get("contentChanges").?;
-        const change = &changes.array.items[0].object;
-        self.alloc.free(change.get("text").?.string);
-        // An incremental change carries a nested {start, end} range object;
-        // ObjectMap.deinit does not recurse, so free its maps here.
-        if (change.get("range")) |rv| {
-            if (rv == .object) {
-                var r = rv;
-                if (r.object.get("start")) |sv| {
-                    if (sv == .object) {
-                        var s = sv;
-                        s.object.deinit(self.alloc);
-                    }
-                }
-                if (r.object.get("end")) |ev| {
-                    if (ev == .object) {
-                        var e = ev;
-                        e.object.deinit(self.alloc);
-                    }
-                }
-                r.object.deinit(self.alloc);
-            }
-        }
-        change.deinit(self.alloc);
-        changes.array.deinit();
-        params.deinit(self.alloc);
-    }
-
-    fn freeDidCloseParams(self: *Client, v: *std.json.Value) void {
-        const params = &v.object;
-        var td = params.get("textDocument").?;
-        self.alloc.free(td.object.get("uri").?.string);
-        td.object.deinit(self.alloc);
-        params.deinit(self.alloc);
-    }
+    // Free the strings and maps that the initialize request owns.
 
     fn freeInitParams(self: *Client, v: *std.json.Value) void {
         var cap = &v.object;
@@ -628,16 +623,14 @@ pub const Client = struct {
     }
 
     /// Lazily-created set of documents the server has open.
-    fn docs(self: *Client) *std.AutoHashMap(u64, i32) {
+    fn docs(self: *Client) *std.AutoHashMap(u64, SyncedDocument) {
         if (self.open_docs == null) {
-            self.open_docs = std.AutoHashMap(u64, i32).init(self.alloc);
+            self.open_docs = std.AutoHashMap(u64, SyncedDocument).init(self.alloc);
         }
         return &self.open_docs.?;
     }
 
-    /// Whether the server currently has `uri` open (a didOpen was sent and no
-    /// didClose since). The App uses this to skip re-opening a document whose
-    /// server copy is still current.
+    /// Whether this client has established a synchronization baseline for this URI.
     pub fn isDocOpen(self: *const Client, uri: []const u8) bool {
         const d = self.open_docs orelse return false;
         return d.contains(hashUri(uri));
@@ -645,7 +638,7 @@ pub const Client = struct {
 
     pub fn documentVersion(self: *const Client, uri: []const u8) ?i32 {
         const d = self.open_docs orelse return null;
-        return d.get(hashUri(uri));
+        return (d.get(hashUri(uri)) orelse return null).version;
     }
 
     fn didOpen(self: *Client, text: []const u8) !void {
@@ -653,9 +646,15 @@ pub const Client = struct {
     }
 
     fn didOpenDocument(self: *Client, uri: []const u8, text: []const u8) !void {
-        // notify serializes synchronously; an arena owns only the JSON maps,
-        // while URI/text remain borrowed until that serialization completes.
-        // There is one cleanup path even when encoding or writing fails.
+        const documents = self.docs();
+        try documents.ensureUnusedCapacity(1);
+        var state = SyncedDocument{};
+        if (self.text_sync.change == .incremental)
+            state.end = try endAfterEdit(origin, .{ .start = origin, .end = origin }, text);
+        if (!self.text_sync.open_close) {
+            documents.putAssumeCapacity(hashUri(uri), state);
+            return;
+        }
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -668,81 +667,78 @@ pub const Client = struct {
         var params = try std.json.ObjectMap.init(a, &.{}, &.{});
         try params.put(a, "textDocument", .{ .object = td });
         try self.notify("textDocument/didOpen", .{ .object = params });
-        self.docs().put(hashUri(uri), self.version) catch {};
+        state.version = self.version;
+        documents.putAssumeCapacity(hashUri(uri), state);
     }
 
-    /// Send a textDocument/didChange. `range` non-null sends an incremental
-    /// change ({range, text}: the bytes [range.start, range.end) of the
-    /// PRE-CHANGE document were replaced by `text`) — the per-keystroke path;
-    /// null sends a full-document replacement (the fallback for edits whose
-    /// range is not tracked: undo/redo, multi-cursor ops, paste, …).
+    /// A non-null range describes a small incremental edit. With a null
+    /// range the caller supplies the complete new document; even this
+    /// snapshot uses a replacement range when the server is incremental.
     pub fn didChange(self: *Client, range: ?types.Range, text: []const u8) !void {
         try self.didChangeDocument(self.uri, range, text);
     }
 
     /// Synchronize a hidden edited document without retargeting the focused
     /// document. Requests sent next must see every edit in a workspace set.
-    pub fn syncDocument(self: *Client, uri: []const u8, text: []const u8) !void {
-        if (self.isDocOpen(uri)) {
-            try self.didChangeDocument(uri, null, text);
-        } else try self.didOpenDocument(uri, text);
+    pub fn syncDocument(self: *Client, uri: []const u8, before: ?[]const u8, text: []const u8) !void {
+        if (!self.text_sync.open_close and self.text_sync.change == .none) return;
+        if (!self.isDocOpen(uri)) {
+            if (self.text_sync.open_close or before == null)
+                return self.didOpenDocument(uri, text);
+            // An edit to a previously hidden file. With open/close disabled,
+            // change coordinates still refer to the original disk contents.
+            try self.didOpenDocument(uri, before.?);
+            errdefer _ = self.docs().remove(hashUri(uri));
+            return self.didChangeDocument(uri, null, text);
+        }
+        try self.didChangeDocument(uri, null, text);
     }
 
     fn didChangeDocument(self: *Client, uri: []const u8, range: ?types.Range, text: []const u8) !void {
-        self.version += 1;
+        if (self.text_sync.change == .none) return;
+        const state = self.docs().getPtr(hashUri(uri)) orelse return error.DocumentNotOpen;
+        var wire_range = range;
+        var new_end = origin;
+        switch (self.text_sync.change) {
+            .none => unreachable,
+            .full => if (range != null) return error.FullDocumentRequired,
+            .incremental => {
+                wire_range = range orelse types.Range{ .start = origin, .end = state.end };
+                new_end = try endAfterEdit(state.end, wire_range.?, text);
+            },
+        }
+        const version = self.version + 1;
         if (self.writer != null and range == null) {
-            // Capture the URI and bytes before the writer runs; focus and
-            // other document versions may change while the frame is queued.
+            // Capture the URI, old range and bytes before focus can change.
             const uri_copy = try self.alloc.dupe(u8, uri);
             errdefer self.alloc.free(uri_copy);
             const copy = try self.alloc.dupe(u8, text);
             errdefer self.alloc.free(copy);
-            try self.out.push(self.alloc, .{ .did_change = .{ .uri = uri_copy, .text = copy, .version = self.version } });
-            self.docs().put(hashUri(uri), self.version) catch {};
+            try self.out.push(self.alloc, .{ .did_change = .{ .uri = uri_copy, .text = copy, .version = version, .range = wire_range } });
+        } else {
+            const content = try self.encodeDidChange(uri, wire_range, text, version);
+            defer self.alloc.free(content);
+            try self.sendFrame(content);
+        }
+        self.version = version;
+        state.* = .{ .version = version, .end = new_end };
+    }
+
+    pub fn didClose(self: *Client) !void {
+        if (!self.isDocOpen(self.uri)) return;
+        if (!self.text_sync.open_close) {
+            _ = self.docs().remove(hashUri(self.uri));
             return;
         }
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
         var td = try std.json.ObjectMap.init(a, &.{}, &.{});
-        try td.put(a, "uri", .{ .string = uri });
-        try td.put(a, "version", .{ .integer = self.version });
-        var change = try std.json.ObjectMap.init(a, &.{}, &.{});
-        if (range) |r| {
-            var range_obj = try std.json.ObjectMap.init(a, &.{}, &.{});
-            var start_obj = try std.json.ObjectMap.init(a, &.{}, &.{});
-            try start_obj.put(a, "line", .{ .integer = r.start.line });
-            try start_obj.put(a, "character", .{ .integer = r.start.character });
-            var end_obj = try std.json.ObjectMap.init(a, &.{}, &.{});
-            try end_obj.put(a, "line", .{ .integer = r.end.line });
-            try end_obj.put(a, "character", .{ .integer = r.end.character });
-            try range_obj.put(a, "start", .{ .object = start_obj });
-            try range_obj.put(a, "end", .{ .object = end_obj });
-            try change.put(a, "range", .{ .object = range_obj });
-        }
-        try change.put(a, "text", .{ .string = text });
-        var changes = std.json.Array.init(a);
-        try changes.append(.{ .object = change });
+        try td.put(a, "uri", .{ .string = self.uri });
         var params = try std.json.ObjectMap.init(a, &.{}, &.{});
         try params.put(a, "textDocument", .{ .object = td });
-        try params.put(a, "contentChanges", .{ .array = changes });
-        try self.notify("textDocument/didChange", .{ .object = params });
-        self.docs().put(hashUri(uri), self.version) catch {};
-    }
-
-    pub fn didClose(self: *Client) !void {
-        var td = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
-        errdefer td.deinit(self.alloc);
-        const uri_copy = try self.alloc.dupe(u8, self.uri);
-        errdefer self.alloc.free(uri_copy);
-        try td.put(self.alloc, "uri", .{ .string = uri_copy });
-        var params = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
-        errdefer params.deinit(self.alloc);
-        try params.put(self.alloc, "textDocument", .{ .object = td });
-        var v = std.json.Value{ .object = params };
-        defer self.freeDidCloseParams(&v);
-        try self.notify("textDocument/didClose", v);
-        if (self.open_docs) |*od| _ = od.remove(hashUri(self.uri));
+        try self.notify("textDocument/didClose", .{ .object = params });
+        _ = self.docs().remove(hashUri(self.uri));
     }
 
     /// Retarget the client's current document without talking to the server
@@ -761,8 +757,8 @@ pub const Client = struct {
     /// and unchanged, so switching back is free. Versions keep increasing
     /// across the client's lifetime, which LSP requires.
     pub fn switchDocument(self: *Client, new_uri: []const u8, text: []const u8) !void {
+        try self.syncDocument(new_uri, null, text);
         try self.retarget(new_uri);
-        try self.didOpen(text);
     }
 
     // ---- requests / notifications ----
@@ -860,7 +856,7 @@ pub const Client = struct {
                 .did_change => |dc| {
                     // JSON-encode HERE, off the UI thread (per-keystroke
                     // full-document stringify is the expensive part)
-                    const content = self.encodeDidChange(dc.uri, dc.text, dc.version) catch continue;
+                    const content = self.encodeDidChange(dc.uri, dc.range, dc.text, dc.version) catch continue;
                     defer self.alloc.free(content);
                     self.writeRawFrame(content) catch {};
                 },
@@ -876,31 +872,15 @@ pub const Client = struct {
         try std.Io.File.writeStreamingAll(self.stdin, self.io, content);
     }
 
-    /// Build the serialized full-text didChange notification (writer thread).
-    /// Shares the param-graph lifetime rules with didChange (see
-    /// freeDidChangeParams). `uri` is the push-time copy from the frame.
-    fn encodeDidChange(self: *Client, uri: []const u8, text: []const u8, version: i32) ![]u8 {
-        var td = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
-        errdefer td.deinit(self.alloc);
-        const uri_copy = try self.alloc.dupe(u8, uri);
-        errdefer self.alloc.free(uri_copy);
-        try td.put(self.alloc, "uri", .{ .string = uri_copy });
-        try td.put(self.alloc, "version", .{ .integer = version });
-        var change = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
-        errdefer change.deinit(self.alloc);
-        const text_copy = try self.alloc.dupe(u8, text);
-        errdefer self.alloc.free(text_copy);
-        try change.put(self.alloc, "text", .{ .string = text_copy });
-        var changes = std.json.Array.init(self.alloc);
-        errdefer changes.deinit();
-        try changes.append(.{ .object = change });
-        var params = try std.json.ObjectMap.init(self.alloc, &.{}, &.{});
-        errdefer params.deinit(self.alloc);
-        try params.put(self.alloc, "textDocument", .{ .object = td });
-        try params.put(self.alloc, "contentChanges", .{ .array = changes });
-        var v = std.json.Value{ .object = params };
-        defer self.freeDidChangeParams(&v);
-        return json_rpc.encodeNotification(self.alloc, "textDocument/didChange", v);
+    fn encodeDidChange(self: *Client, uri: []const u8, range: ?types.Range, text: []const u8, version: i32) ![]u8 {
+        return std.json.Stringify.valueAlloc(self.alloc, .{
+            .jsonrpc = "2.0",
+            .method = "textDocument/didChange",
+            .params = .{
+                .textDocument = .{ .uri = uri, .version = version },
+                .contentChanges = .{.{ .range = range, .text = text }},
+            },
+        }, .{ .emit_null_optional_fields = false });
     }
 
     /// Drain all queued messages. Responses fill pending request slots;
@@ -1338,6 +1318,7 @@ fn testClient(alloc: std.mem.Allocator, io: std.Io, stdin: std.Io.File) !Client 
         .stdin = stdin,
         .queue = .{ .io = io },
         .out = .{ .io = io },
+        .text_sync = .{ .open_close = true, .change = .incremental },
     };
 }
 
@@ -1390,8 +1371,8 @@ test "didOpen/didChange: hidden document synchronization preserves focus and ver
     var client = try testClient(alloc, io, write_end);
     defer cleanupClient(alloc, &client);
     try client.didOpen("source");
-    try client.syncDocument("file:///b.zig", "before");
-    try client.syncDocument("file:///b.zig", "RENAMED_B");
+    try client.syncDocument("file:///b.zig", null, "before");
+    try client.syncDocument("file:///b.zig", "before", "RENAMED_B");
     try std.testing.expectEqualStrings("file:///t.zig", client.uri);
     try std.testing.expectEqual(@as(?i32, 1), client.documentVersion("file:///t.zig"));
     try std.testing.expectEqual(@as(?i32, 3), client.documentVersion("file:///b.zig"));
@@ -1410,6 +1391,102 @@ test "didOpen/didChange: hidden document synchronization preserves focus and ver
             const changes = params.get("contentChanges").?.array.items;
             try std.testing.expectEqualStrings("RENAMED_B", changes[0].object.get("text").?.string);
         }
+    }
+}
+
+test "LSP sync: coalesced incremental snapshots retain the server's original EOF" {
+    const alloc = std.testing.allocator;
+    var q = OutQueue{ .io = std.testing.io };
+    defer q.deinit(alloc);
+    for ([_]u32{ 5, 12 }, 1..) |old_eof, v| {
+        try q.push(alloc, .{ .did_change = .{
+            .uri = try alloc.dupe(u8, "file:///a"),
+            .text = try alloc.dupe(u8, if (v == 1) "intermediate" else "end"),
+            .version = @intCast(v),
+            .range = .{ .start = origin, .end = .{ .line = 0, .character = old_eof } },
+        } });
+    }
+    const latest = q.pop().?;
+    defer latest.deinit(alloc);
+    try std.testing.expectEqualStrings("end", latest.did_change.text);
+    try std.testing.expectEqual(@as(i32, 2), latest.did_change.version);
+    try std.testing.expectEqual(@as(u32, 5), latest.did_change.range.?.end.character);
+    try std.testing.expect(q.pop() == null);
+}
+
+test "LSP sync: failed close preserves the baseline and releases notification parameters" {
+    const io = std.testing.io;
+    const fds = try std.Io.Threaded.pipe2(.{});
+    const input = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+    const output = std.Io.File{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+    defer input.close(io);
+    defer output.close(io);
+    const Session = struct {
+        fn close(failing: std.mem.Allocator, pipe: std.Io.File) !void {
+            const alloc = std.testing.allocator;
+            var client = try testClient(alloc, std.testing.io, pipe);
+            defer cleanupClient(alloc, &client);
+            try client.docs().put(Client.hashUri(client.uri), .{ .version = 1 });
+            client.alloc = failing;
+            client.didClose() catch |err| {
+                try std.testing.expectEqual(@as(?i32, 1), client.documentVersion(client.uri));
+                return err;
+            };
+            try std.testing.expect(!client.isDocOpen(client.uri));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Session.close, .{output});
+}
+
+test "LSP sync: hidden changes, reopen and undo use each URI's pre-edit UTF-16 EOF" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const fds = try std.Io.Threaded.pipe2(.{});
+    const input = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+    const output = std.Io.File{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+    defer input.close(io);
+    defer output.close(io);
+    var client = try testClient(alloc, io, output);
+    defer cleanupClient(alloc, &client);
+    client.text_sync = .{ .change = .incremental, .open_close = false };
+    try client.openDocument("source");
+    try std.testing.expectEqual(@as(?i32, null), client.documentVersion(client.uri));
+    const hidden = "file:///b.zig";
+    try client.syncDocument(hidden, "old\r\n中😀", "m\nq😀");
+    try std.testing.expectEqualStrings("file:///t.zig", client.uri);
+    try client.retarget(hidden);
+    const character = types.Range{ .start = .{ .line = 1, .character = 1 }, .end = .{ .line = 1, .character = 3 } };
+    try client.didChange(character, "a\n😀é!");
+    try client.didChange(null, "undo");
+    try client.didClose();
+    try std.testing.expect(!client.isDocOpen(hidden));
+    try client.openDocument("new");
+    try client.didChange(null, "e");
+    var reader = FrameReader.init(alloc, input, io);
+    defer reader.deinit();
+    const edits = [_]struct { from: types.Position, to: types.Position, text: []const u8 }{
+        .{ .from = origin, .to = .{ .line = 1, .character = 3 }, .text = "m\nq😀" },
+        .{ .from = character.start, .to = character.end, .text = "a\n😀é!" },
+        .{ .from = origin, .to = .{ .line = 2, .character = 4 }, .text = "undo" },
+        .{ .from = origin, .to = .{ .line = 0, .character = 3 }, .text = "e" },
+    };
+    for (edits) |e| {
+        const bytes = (try reader.next()).?;
+        defer alloc.free(bytes);
+        const Change = struct { range: types.Range, text: []const u8 };
+        const Message = struct {
+            method: []const u8,
+            params: struct { textDocument: struct { uri: []const u8 }, contentChanges: []const Change },
+        };
+        const parsed = try std.json.parseFromSlice(Message, alloc, bytes, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("textDocument/didChange", parsed.value.method);
+        try std.testing.expectEqualStrings(hidden, parsed.value.params.textDocument.uri);
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.params.contentChanges.len);
+        const change = parsed.value.params.contentChanges[0];
+        try std.testing.expectEqual(e.from, change.range.start);
+        try std.testing.expectEqual(e.to, change.range.end);
+        try std.testing.expectEqualStrings(e.text, change.text);
     }
 }
 

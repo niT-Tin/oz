@@ -1,6 +1,7 @@
 //! Stable disk baselines and conflict-checked saves. Document bytes are owned
 //! by the piece table, never backed by a mutable file mapping.
 const std = @import("std");
+const PieceTable = @import("piece_table.zig").PieceTable;
 
 const Hash = [32]u8;
 
@@ -59,9 +60,12 @@ pub const Baseline = struct {
     target: []u8,
     /// null means this buffer was opened as a new, nonexistent file.
     fingerprint: ?Hash,
+    saved_len: usize,
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io, path: []const u8, bytes: ?[]const u8) !Baseline {
-        return .{ .target = try targetPath(alloc, io, path), .fingerprint = if (bytes) |b| hash(b) else null };
+        var baseline = Baseline{ .target = try targetPath(alloc, io, path), .fingerprint = null, .saved_len = 0 };
+        if (bytes) |b| baseline.didWrite(b);
+        return baseline;
     }
 
     pub fn deinit(self: *Baseline, alloc: std.mem.Allocator) void {
@@ -71,6 +75,21 @@ pub const Baseline = struct {
 
     pub fn didWrite(self: *Baseline, bytes: []const u8) void {
         self.fingerprint = hash(bytes);
+        self.saved_len = bytes.len;
+    }
+
+    /// Undo/redo may land on either side of a write, an external refresh,
+    /// or a branch. Compare against the last known disk content without I/O
+    /// or allocating a flat document. Most edits differ in length alone.
+    pub fn matchesBuffer(self: *const Baseline, pt: *const PieceTable) bool {
+        if (pt.len() != self.saved_len) return false;
+        const expected = self.fingerprint orelse return pt.len() == 0;
+        var hasher = std.crypto.hash.Blake3.init(.{});
+        var it = pt.iterator();
+        while (it.next()) |p| hasher.update(pt.pieceBytes(p));
+        var actual: Hash = undefined;
+        hasher.final(&actual);
+        return std.mem.eql(u8, &expected, &actual);
     }
 
     fn verify(self: *const Baseline, alloc: std.mem.Allocator, io: std.Io, path: []const u8, force: bool) !void {
@@ -114,6 +133,33 @@ pub const Baseline = struct {
         self.didWrite(bytes);
     }
 };
+
+test "disk baseline: history compares pieces against the last successful write" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "new.txt" });
+    defer alloc.free(path);
+    var disk = try Baseline.init(alloc, io, path, null);
+    defer disk.deinit(alloc);
+    var pt = try PieceTable.init(alloc, "");
+    defer pt.deinit();
+    try std.testing.expect(disk.matchesBuffer(&pt));
+    _ = try pt.replace(0, 0, "abc");
+    try std.testing.expect(!disk.matchesBuffer(&pt));
+    try disk.write(alloc, io, path, "abc", false);
+    try std.testing.expect(disk.matchesBuffer(&pt));
+    _ = try pt.replace(1, 1, "X");
+    try std.testing.expect(!disk.matchesBuffer(&pt));
+    try tmp.dir.writeFile(io, .{ .sub_path = "new.txt", .data = "external" });
+    try std.testing.expectError(error.FileChanged, disk.write(alloc, io, path, "aXc", false));
+    try std.testing.expect(!disk.matchesBuffer(&pt));
+    _ = try pt.replace(1, 1, "b");
+    try std.testing.expect(disk.matchesBuffer(&pt));
+}
 
 test "disk baseline: a new file cannot overwrite a later external creation" {
     const alloc = std.testing.allocator;

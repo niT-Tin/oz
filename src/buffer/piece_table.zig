@@ -460,6 +460,12 @@ pub const PieceTable = struct {
         return .{ .table = self, .index = 0 };
     }
 
+    /// Borrow one contiguous span returned by the iterator until the next edit.
+    pub fn pieceBytes(self: *const PieceTable, p: Piece) []const u8 {
+        const src = if (p.source == .origin) self.origin else self.add.items;
+        return src[p.start..][0..p.len];
+    }
+
     /// (Re)build the `line_starts` cache with a full scan of the document.
     /// Called from `init`, and lazily from the line* queries when the cache is
     /// dirty (only possible if an incremental update ran out of memory; the
@@ -502,13 +508,6 @@ fn expectDoc(pt: *PieceTable, allocator: std.mem.Allocator, expected: []const u8
     defer allocator.free(buf);
     pt.copyRange(0, buf);
     try std.testing.expectEqualSlices(u8, expected, buf);
-}
-
-fn pieceBytes(pt: *const PieceTable, p: Piece) []const u8 {
-    return if (p.source == .origin)
-        pt.origin[@as(usize, p.start) .. @as(usize, p.start) + p.len]
-    else
-        pt.add.items[@as(usize, p.start) .. @as(usize, p.start) + p.len];
 }
 
 fn randomBytes(rng: std.Random, allocator: std.mem.Allocator, alphabet: []const u8) ![]u8 {
@@ -810,13 +809,13 @@ test "iterator walks pieces in document order and then returns null" {
     var it = pt.iterator();
     const p0 = it.next().?;
     try std.testing.expectEqual(.add, p0.source);
-    try std.testing.expectEqualStrings(">", pieceBytes(&pt, p0));
+    try std.testing.expectEqualStrings(">", pt.pieceBytes(p0));
     const p1 = it.next().?;
     try std.testing.expectEqual(.origin, p1.source);
-    try std.testing.expectEqualStrings("hello", pieceBytes(&pt, p1));
+    try std.testing.expectEqualStrings("hello", pt.pieceBytes(p1));
     const p2 = it.next().?;
     try std.testing.expectEqual(.add, p2.source);
-    try std.testing.expectEqualStrings(" world", pieceBytes(&pt, p2));
+    try std.testing.expectEqualStrings(" world", pt.pieceBytes(p2));
     try std.testing.expectEqual(@as(?Piece, null), it.next());
 
     // pieces are contiguous and cover the whole document

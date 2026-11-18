@@ -8,6 +8,7 @@
 //!   count pending) is the line_start_bol motion, never the start of a count
 //!   ("10" is count ten, not 0+1). The same rule applies while an operator is
 //!   pending, so "d0" deletes to column 0 while "d10w" is delete 10 words.
+//!   Counts on opposite sides of an operator multiply: "2d3w" deletes 6 words.
 //! - operator pending: d/c/y wait for a motion; repeating the same key
 //!   (dd/cc/yy) is a whole-line operation (op_motion, line-wise).
 //! - motions: plain movement keys → Result.motion; f/F/t/T wait for a target
@@ -23,8 +24,8 @@
 //!   insert keymap comes back as `.action { .insert_char }`.
 //! - mode transitions: emitting an insert/visual action updates state.mode;
 //!   emitting to_normal sets mode = .normal; ':' sets mode = .command.
-//! - '.' repeat: emitting an action/op_motion result records
-//!   state.last_action / last_count (M0: emitting counts as executing).
+//! - '.' repeat: keep the last repeatable edit and its count across yanks,
+//!   navigation, and other read-only commands.
 const std = @import("std");
 const vaxis = @import("vaxis");
 const KeyEvent = @import("key_event.zig");
@@ -181,6 +182,7 @@ pub const State = struct {
     mode: Mode = .normal,
     count_digits: []const u8 = "", // pending count prefix (unparsed)
     pending_op: ?KeyEvent.ActionId = null, // d / c / y seen, awaiting motion
+    operator_count: u32 = 1, // prefix captured before d/c/y; digits now belong to the motion
     motion_args: Motion.Args = .{}, // last find/till char for ';'/',' repeat
     /// last executed action for '.' repeat
     last_action: ?KeyEvent.ActionId = null,
@@ -236,6 +238,14 @@ pub const State = struct {
     pub fn init() State {
         return .{};
     }
+
+    /// Commit an operator to '.' after its motion produced an edit.
+    pub fn rememberOperator(self: *State, command: OpMotion) void {
+        if (command.op == .yank) return;
+        self.last_action = command.op;
+        self.last_count = command.count;
+        self.last_repeat = .{ .op = command };
+    }
 };
 
 /// Feed one key into the state machine. `keymap` is the keymap for the
@@ -277,7 +287,7 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
                     .add_char = .{
                         .motion = .left, // unused with text_object
                         .args = .{},
-                        .count = 1,
+                        .count = takeCount(state),
                         .exclusive_end = true,
                         .text_object = kind,
                     },
@@ -304,7 +314,14 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
             return .pending;
         }
         if (state.pending_op) |op| {
-            return emitTextObject(state, op, kind);
+            return emitOperator(state, .{
+                .op = op,
+                .motion = .left, // unused with a text object
+                .args = .{},
+                .count = takeCount(state),
+                .exclusive_end = true,
+                .text_object = kind,
+            });
         }
         return .pending;
     }
@@ -563,13 +580,11 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         if (isPlain(key)) {
             // @@ replays the last played register (the caller resolves it)
             if (macro_action == .play_macro and key.codepoint == '@') {
-                const count = countValue(state);
-                resetCount(state);
+                const count = takeCount(state);
                 return .{ .macro = .{ .op = .play, .reg = '@', .count = count } };
             }
             if (key.codepoint >= 'a' and key.codepoint <= 'z') {
-                const count = countValue(state);
-                resetCount(state);
+                const count = takeCount(state);
                 return .{ .macro = .{
                     .op = if (macro_action == .record_macro) .record else .play,
                     .reg = @intCast(key.codepoint),
@@ -705,6 +720,7 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         // 's' after y/d/c starts a surround sequence (ys / ds / cs)
         if (key.codepoint == 's' and (op == .yank or op == .delete or op == .change)) {
             state.pending_op = null;
+            if (op != .yank) resetCount(state); // only ys takes a counted motion
             state.pending_surround = switch (op) {
                 .yank => .add_motion,
                 .delete => .delete,
@@ -715,29 +731,13 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         }
         if (KeyEvent.lookup(keymap, key)) |action| {
             if (action == op) { // dd / cc / yy → whole-line operation
-                state.pending_op = null;
-                const count = countValue(state);
-                resetCount(state);
-                state.last_action = op;
-                state.last_count = count;
-                state.last_repeat = .{
-                    .op = .{
-                        .op = op,
-                        .motion = .line_start, // linewise sentinel, see Result docs
-                        .args = .{},
-                        .count = count,
-                        .exclusive_end = false,
-                    },
-                };
-                return .{
-                    .op_motion = .{
-                        .op = op,
-                        .motion = .line_start, // linewise sentinel, see Result docs
-                        .args = .{},
-                        .count = count,
-                        .exclusive_end = false,
-                    },
-                };
+                return emitOperator(state, .{
+                    .op = op,
+                    .motion = .line_start, // linewise sentinel, see Result docs
+                    .args = .{},
+                    .count = takeCount(state),
+                    .exclusive_end = false,
+                });
             }
             switch (action) {
                 .find_char, .find_char_back, .till_char, .till_char_back => {
@@ -846,6 +846,7 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
             .pending,
         // operators → pending until a motion arrives
         .delete, .change, .yank => blk: {
+            state.operator_count = takeCount(state);
             state.pending_op = action;
             break :blk .pending;
         },
@@ -1064,30 +1065,18 @@ fn handleCommand(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result 
 // ---- helpers ----
 
 fn emitMotion(state: *State, motion: Motion.Motion, args: Motion.Args) Result {
-    const count = countValue(state);
+    const count = takeCount(state);
     const exclusive_end = !isLinewise(motion);
     const inclusive = isInclusive(motion);
-    resetCount(state);
     if (state.pending_op) |op| {
-        state.pending_op = null;
-        state.last_action = op; // d{motion} is repeatable via '.'
-        state.last_count = count;
-        state.last_repeat = .{ .op = .{
+        return emitOperator(state, .{
             .op = op,
             .motion = motion,
             .args = args,
             .count = count,
             .exclusive_end = exclusive_end,
             .inclusive = inclusive,
-        } };
-        return .{ .op_motion = .{
-            .op = op,
-            .motion = motion,
-            .args = args,
-            .count = count,
-            .exclusive_end = exclusive_end,
-            .inclusive = inclusive,
-        } };
+        });
     }
     return .{ .motion = .{
         .motion = motion,
@@ -1120,34 +1109,9 @@ fn isInclusive(motion: Motion.Motion) bool {
     };
 }
 
-/// Operator + text object (diw / ci( / yaw …). The caller resolves the
-/// object's range at the cursor.
-fn emitTextObject(state: *State, op: KeyEvent.ActionId, kind: TextObject.Kind) Result {
-    const count = countValue(state);
-    resetCount(state);
+fn emitOperator(state: *State, command: OpMotion) Result {
     state.pending_op = null;
-    state.last_action = op;
-    state.last_count = count;
-    state.last_repeat = .{
-        .op = .{
-            .op = op,
-            .motion = .left, // unused when text_object is set
-            .args = .{},
-            .count = count,
-            .exclusive_end = true,
-            .text_object = kind,
-        },
-    };
-    return .{
-        .op_motion = .{
-            .op = op,
-            .motion = .left, // unused when text_object is set
-            .args = .{},
-            .count = count,
-            .exclusive_end = true,
-            .text_object = kind,
-        },
-    };
+    return .{ .op_motion = command };
 }
 
 /// Map a text-object target character (after 'i' or 'a') to a Kind.
@@ -1167,20 +1131,41 @@ fn textObjectKind(inner: u8, ch: u8) ?TextObject.Kind {
 }
 
 fn emitAction(state: *State, action: KeyEvent.ActionId) Result {
-    const count = countValue(state);
-    resetCount(state);
-    // '.' repeat snapshot (M0: emitting counts as executing). Undo/redo and
-    // '.' itself are not repeatable via '.', mirroring vim; insert_char is
-    // per-key, not a top-level command; the zz/zt/zb scrolls and the
-    // za/zo/zc/zR/zM fold commands are view/buffer state (no edit), so '.'
-    // must not replay them either.
+    const count = takeCount(state);
+    // Only top-level edits replace the dot snapshot. In particular, entering
+    // Visual mode and yanking a selection must preserve the previous change.
     switch (action) {
-        .undo, .redo, .repeat_last, .normal_mode, .insert_char, .scroll_cursor_center, .scroll_cursor_top, .scroll_cursor_bottom, .fold_toggle, .fold_open, .fold_close, .fold_open_all, .fold_close_all, .term_float, .term_bottom, .term_right, .ai_toggle, .hint_mode, .workspace_new, .workspace_pick, .workspace_rename, .workspace_delete, .workspace_kill_session, .workspace_prev, .workspace_next => {},
-        else => {
+        .insert_mode,
+        .insert_before,
+        .insert_line_after,
+        .insert_line_before,
+        .append,
+        .append_end,
+        .delete,
+        .change,
+        .delete_char,
+        .delete_char_before,
+        .delete_to_eol,
+        .change_to_eol,
+        .change_line,
+        .replace_char,
+        .toggle_case,
+        .join_lines,
+        .indent_line,
+        .dedent_line,
+        .paste,
+        .paste_before,
+        .toggle_comment_line,
+        .increment,
+        .decrement,
+        .increment_visual,
+        .decrement_visual,
+        => {
             state.last_action = action;
             state.last_count = count;
             state.last_repeat = .{ .action = .{ .action = action, .count = count } };
         },
+        else => {},
     }
     return .{ .action = .{ .action = action, .count = count } };
 }
@@ -1286,14 +1271,17 @@ fn pushCountDigit(state: *State, digit: u8) void {
 fn resetCount(state: *State) void {
     state.count_len = 0;
     state.count_digits = "";
+    state.operator_count = 1;
 }
 
-fn countValue(state: *const State) u32 {
+fn takeCount(state: *State) u32 {
     var v: u32 = 0;
     for (state.count_digits) |d| {
         v = v * 10 + (d - '0');
     }
-    return if (v == 0) 1 else v;
+    const count = @min(state.operator_count *| @max(v, 1), 999_999_999);
+    resetCount(state);
+    return count;
 }
 /// True while a `<leader>` sequence is awaiting its next key (including the
 /// `s`/`b`/`r`/`l`/`t`/`g`/TAB sub-families). Key routers that run BEFORE the
@@ -1370,8 +1358,7 @@ fn handleAlign(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
             }
             if (KeyEvent.lookup(keymap, key)) |action| {
                 if (actionToMotion(action)) |m| {
-                    const count = countValue(state);
-                    resetCount(state);
+                    const count = takeCount(state);
                     state.pending_align = .{ .char = .{ .motion = m, .args = .{}, .count = count } };
                     return .pending;
                 }
@@ -1441,8 +1428,7 @@ fn handleSurround(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result
             }
             if (KeyEvent.lookup(keymap, key)) |action| {
                 if (actionToMotion(action)) |m| {
-                    const count = countValue(state);
-                    resetCount(state);
+                    const count = takeCount(state);
                     state.pending_surround = .{ .add_char = .{
                         .motion = m,
                         .args = .{},
@@ -1527,6 +1513,63 @@ test "3dw → op_motion(delete, word_next, count 3)" {
     try testing.expectEqual(Motion.Motion.word_next, r.op_motion.motion);
     try testing.expectEqual(@as(u32, 3), r.op_motion.count);
     try testing.expect(r.op_motion.exclusive_end); // charwise
+}
+
+test "operator parsing: multiply separate counts, including find, zero and text objects" {
+    const cases = [_]struct { keys: []const u8, count: u32 }{
+        .{ .keys = "2d3d", .count = 6 },
+        .{ .keys = "2d3w", .count = 6 },
+        .{ .keys = "12c10w", .count = 120 },
+        .{ .keys = "2y3iw", .count = 6 },
+        .{ .keys = "2d3fx", .count = 6 },
+        .{ .keys = "2d0", .count = 2 },
+        .{ .keys = "999999999d999999999d", .count = 999_999_999 },
+    };
+    for (cases) |case| {
+        var s = State.init();
+        var r: Result = .pending;
+        for (case.keys) |key| r = handle(&s, press(key), Keymaps.normal);
+        try testing.expectEqual(.op_motion, tag(r));
+        try testing.expectEqual(case.count, r.op_motion.count);
+        if (std.mem.endsWith(u8, case.keys, "0"))
+            try testing.expectEqual(Motion.Motion.line_start_bol, r.op_motion.motion);
+        try testing.expectEqual(@as(?Repeat, null), s.last_repeat);
+        try testing.expectEqual(@as(u32, 1), handle(&s, press('j'), Keymaps.normal).motion.count);
+    }
+    var cancelled = State.init();
+    for ("12d3") |key| _ = handle(&cancelled, press(key), Keymaps.normal);
+    _ = handle(&cancelled, esc(), Keymaps.normal);
+    try testing.expectEqual(@as(u32, 1), handle(&cancelled, press('j'), Keymaps.normal).motion.count);
+}
+
+test "operator parsing: yanks preserve the previous repeat in normal and visual modes" {
+    for ([_][]const u8{ "yy", "yw", "y2iw", "vly", "Vjy" }) |keys| {
+        var s = State.init();
+        for ("2d") |key| _ = handle(&s, press(key), Keymaps.normal);
+        s.rememberOperator(handle(&s, press('d'), Keymaps.normal).op_motion);
+        const previous = s.last_repeat.?;
+        var result: Result = .pending;
+        for (keys) |key| result = handle(&s, press(key), Keymaps.normal);
+        const op = switch (result) {
+            .op_motion => |m| blk: {
+                s.rememberOperator(m);
+                break :blk m.op;
+            },
+            .action => |a| a.action,
+            else => return error.TestUnexpectedResult,
+        };
+        try testing.expectEqual(KeyEvent.ActionId.yank, op);
+        try testing.expectEqualDeep(previous, s.last_repeat.?);
+    }
+
+    var s = State.init();
+    for ("2d") |key| _ = handle(&s, press(key), Keymaps.normal);
+    s.rememberOperator(handle(&s, press('d'), Keymaps.normal).op_motion);
+    const previous = s.last_repeat.?;
+    // Searching, inspecting the symbol and clearing highlights also leave
+    // the editing command available, even across several read-only actions.
+    for ("nK h") |key| _ = handle(&s, press(key), Keymaps.normal);
+    try testing.expectEqualDeep(previous, s.last_repeat.?);
 }
 
 test "dd/yy → line-wise op_motion" {
@@ -1953,6 +1996,8 @@ test "'.' repeat snapshot: operator+motion records the full combo" {
     try testing.expectEqual(.pending, tag(r1));
     const r2 = handle(&s, press('w'), Keymaps.normal);
     try testing.expectEqual(.op_motion, tag(r2));
+    try testing.expectEqual(@as(?Repeat, null), s.last_repeat);
+    s.rememberOperator(r2.op_motion);
     try testing.expectEqual(@as(std.meta.Tag(Repeat), .op), std.meta.activeTag(s.last_repeat.?));
     const rep = s.last_repeat.?.op;
     try testing.expectEqual(KeyEvent.ActionId.delete, rep.op);
@@ -1965,6 +2010,7 @@ test "'.' repeat snapshot: operator+motion records the full combo" {
     _ = handle(&s2, press('d'), Keymaps.normal);
     const r3 = handle(&s2, press('d'), Keymaps.normal);
     try testing.expectEqual(.op_motion, tag(r3));
+    s2.rememberOperator(r3.op_motion);
     try testing.expectEqual(@as(std.meta.Tag(Repeat), .op), std.meta.activeTag(s2.last_repeat.?));
     try testing.expectEqual(Motion.Motion.line_start, s2.last_repeat.?.op.motion);
     try testing.expect(!s2.last_repeat.?.op.exclusive_end);
@@ -1975,6 +2021,7 @@ test "'.' repeat snapshot: operator+motion records the full combo" {
     _ = handle(&s3, press('i'), Keymaps.normal);
     const r4 = handle(&s3, press('('), Keymaps.normal);
     try testing.expectEqual(.op_motion, tag(r4));
+    s3.rememberOperator(r4.op_motion);
     try testing.expectEqual(@as(std.meta.Tag(Repeat), .op), std.meta.activeTag(s3.last_repeat.?));
     try testing.expectEqual(TextObject.Kind.inner_paren, s3.last_repeat.?.op.text_object.?);
 }

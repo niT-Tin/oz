@@ -242,7 +242,7 @@ pub fn execOpMotion(self: *App, m: editor.OpMotion) !void {
         const line = self.cur().pt.lineOf(self.curCursor().*);
         const n = @max(m.count, 1);
         const start_line = @min(line, self.cur().pt.lineCount() - 1);
-        const end_line = @min(start_line + n - 1, self.cur().pt.lineCount() - 1);
+        const end_line = @min(start_line +| (n - 1), self.cur().pt.lineCount() - 1);
         const start = self.cur().pt.lineStart(start_line);
         var end = self.cur().pt.lineStart(end_line) + self.cur().pt.lineLen(end_line);
         // dd/yy take the trailing newline (the line is gone from the
@@ -342,17 +342,17 @@ pub fn execOpMotion(self: *App, m: editor.OpMotion) !void {
     // include the full character at the sorted right endpoint, including
     // multibyte characters and backward inclusive find motions.
     //
-    // Forward t needs its own resolution: Motion.target cannot distinguish
-    // "target not found" from "target adjacent" — both land on the cursor —
-    // yet vim aborts the whole operator only for the former (dtZ is a no-op,
-    // while dtu deletes the character under the cursor). tillTarget reports
-    // the miss explicitly; the inclusive flag (set by Mode for t only)
-    // covers the landing character on a hit.
-    const target_pos = if (m.motion == .till)
-        editor.Motion.tillTarget(&self.cur().pt, self.curCursor().*, m.args.ch, 1, m.count) orelse return
-    else
-        editor.Motion.target(&self.cur().pt, m.motion, m.args, self.curCursor().*, m.count);
-    const range = edit_range.characterwise(&self.cur().pt, self.curCursor().*, target_pos, m.inclusive);
+    // Find/till operators require the count-th match. A miss aborts the
+    // entire edit; using the cursor as a fallback would delete a character
+    // for an inclusive motion, or enter Insert for a change with no target.
+    const pt = &self.cur().pt;
+    const from = self.curCursor().*;
+    const target_pos = switch (m.motion) {
+        .find, .find_back => editor.Motion.findTarget(pt, from, m.args.ch, if (m.motion == .find) 1 else -1, m.count) orelse return,
+        .till, .till_back => editor.Motion.tillTarget(pt, from, m.args.ch, if (m.motion == .till) 1 else -1, m.count) orelse return,
+        else => editor.Motion.target(pt, m.motion, m.args, from, m.count),
+    };
+    const range = edit_range.characterwise(pt, from, target_pos, m.inclusive);
     try self.applyOpRange(m.op, range.start, range.end, false, false);
 }
 
@@ -844,36 +844,21 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
         .paste => try self.pasteBuffer(false, count),
         .paste_before => try self.pasteBuffer(true, count),
         .delete_char => {
-            // x: vim dl — delete `count` characters under the cursor. At
-            // the end of a line the newline is deleted (joining the next
-            // line), like vim; at EOF nothing happens. One undo group.
-            // The deleted text fills the unnamed register (charwise) —
-            // vim's xp char-swap depends on it. Capture BEFORE deleting:
-            // setRegister reads the live piece table.
+            // x deletes whole graphemes in one edit. Capture the same byte
+            // range in the unnamed register before changing the piece table.
             const c0 = self.curCursor().*;
             var reg_end = c0;
-            var i: u32 = 0;
-            while (i < @max(count, 1)) : (i += 1) {
-                if (reg_end >= self.cur().pt.len()) break;
-                const seq = self.charLenAt(&self.cur().pt, reg_end);
-                reg_end = @min(reg_end + seq, self.cur().pt.len());
+            var clusters = edit_range.graphemes(&self.cur().pt, c0, self.cur().pt.len());
+            for (0..@max(count, 1)) |_| {
+                const cluster = clusters.nextGrapheme() orelse break;
+                reg_end = @intCast(cluster.end);
             }
-            if (reg_end > c0) try self.setRegister(c0, reg_end, false);
+            if (reg_end == c0) return;
+            try self.setRegister(c0, reg_end, false);
             // LSP range in the PRE-EDIT document: [c0, reg_end).
             const start_pos = self.lspPositionAt(&self.cur().pt, c0);
             const end_pos = self.lspPositionAt(&self.cur().pt, reg_end);
-            self.cur().history.beginGroup();
-            i = 0;
-            while (i < @max(count, 1)) : (i += 1) {
-                const c = self.curCursor().*;
-                if (c >= self.cur().pt.len()) break;
-                const pt = &self.cur().pt;
-                const seq = self.charLenAt(pt, c);
-                const end = @min(c + seq, pt.len());
-                if (end <= c) break;
-                try self.recordEdit(c, end - c, "");
-            }
-            self.cur().history.endGroup();
+            try self.recordEdit(c0, reg_end - c0, "");
             self.markDirtyRange(start_pos, end_pos, "");
         },
         .delete_char_before => {
@@ -1014,43 +999,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
             self.cur().history.endGroup();
             self.markDirty();
         },
-        .join_lines => {
-            // J: join the current line with the next: remove the whole
-            // terminator (`\n` or `\r\n` — removing only the `\n` would
-            // leave a stray `\r` in the text), trim the next line's leading
-            // whitespace to one space (vim joins with a single space when
-            // the first line is non-empty).
-            const pt = &self.cur().pt;
-            const line = pt.lineOf(self.curCursor().*);
-            if (line + 1 >= pt.lineCount()) return;
-            const line_start = pt.lineStart(line);
-            const cur_text_len = pt.lineTextLen(line);
-            const term_start = line_start + cur_text_len;
-            const next_start = pt.lineStart(line + 1);
-            const next_len = pt.lineTextLen(line + 1);
-            const term_len = next_start - term_start;
-            var next_indent: u32 = 0;
-            while (next_indent < next_len) : (next_indent += 1) {
-                const b = pt.byteAt(next_start + next_indent);
-                if (b != ' ' and b != '\t') break;
-            }
-            self.cur().history.beginGroup();
-            // remove the terminator; the next line now starts at term_start
-            try self.recordEdit(term_start, term_len, "");
-            // collapse leading whitespace of the next line
-            if (next_indent > 0) {
-                try self.recordEdit(term_start, next_indent, "");
-            }
-            // join with a single space unless the first line is empty.
-            // The next line's first char now sits at term_start; inserting
-            // BEFORE it glues the lines.
-            if (cur_text_len > 0) {
-                try self.recordEdit(term_start, 0, " ");
-            }
-            self.cur().history.endGroup();
-            self.curCursor().* = @min(self.curCursor().*, pt.len());
-            self.markDirty();
-        },
+        .join_lines => try joinLines(self, count),
         .indent_line, .dedent_line => {
             // >> / <<: add / remove one indent unit (4 spaces, matching
             // the insert-mode tab) at the start of each line the count
@@ -1107,6 +1056,68 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
         .fold_toggle, .fold_open, .fold_close, .fold_open_all, .fold_close_all => try self.execFold(action),
         else => {},
     }
+}
+
+fn joinNeedsSpace(left: ?u8, right: u8) bool {
+    const prev = left orelse return false;
+    return prev != ' ' and prev != '\t' and right != ')';
+}
+
+/// Normal [count]J counts the current line. A final LF terminates the
+/// last file line; the empty display row after it is not another join target.
+fn joinLines(self: *App, count: u32) !void {
+    const pt = &self.cur().pt;
+    if (pt.len() == 0) return;
+    const first = pt.lineOf(self.curCursor().*);
+    const last = @min(first +| (@max(count, 2) - 1), pt.lineOf(pt.len() - 1));
+    if (last <= first) return;
+
+    const first_start = pt.lineStart(first);
+    const start = first_start + pt.lineTextLen(first);
+    const last_start = pt.lineStart(last);
+    const last_end = last_start + pt.lineTextLen(last);
+    var end = last_start;
+    while (end < last_end and (pt.byteAt(end) == ' ' or pt.byteAt(end) == '\t')) end += 1;
+
+    // Copy only the span being replaced. Strip intermediate indentation in
+    // place: each inserted space fits in the preceding removed terminator.
+    const span = try self.alloc.alloc(u8, end - start);
+    defer self.alloc.free(span);
+    pt.copyRange(start, span);
+    var middle = span[pt.lineStart(first + 1) - start .. last_start - start];
+    var left: ?u8 = if (start > first_start) pt.byteAt(start - 1) else null;
+    var used: usize = 0;
+    while (std.mem.indexOfScalar(u8, middle, '\n')) |lf| {
+        const raw = middle[0..lf];
+        middle = middle[lf + 1 ..];
+        const body = std.mem.trimStart(u8, std.mem.cutSuffix(u8, raw, "\r") orelse raw, " \t");
+        if (body.len == 0) continue;
+        if (joinNeedsSpace(left, body[0])) {
+            span[used] = ' ';
+            used += 1;
+        }
+        @memmove(span[used..][0..body.len], body);
+        used += body.len;
+        left = span[used - 1];
+    }
+    const seam = start + @as(u32, @intCast(used));
+    if (end < last_end and joinNeedsSpace(left, pt.byteAt(end))) {
+        span[used] = ' ';
+        used += 1;
+    }
+    const from = self.lspPositionAt(pt, start);
+    const to = self.lspPositionAt(pt, end);
+    const offsets = captureInlayOffsetsForReplace(self, start, end - start, @intCast(used));
+    defer if (offsets) |value| self.alloc.free(value);
+    try self.recordEdit(start, end - start, span[0..used]);
+    var cursor = seam;
+    if (end == last_end and seam > first_start) {
+        var clusters = edit_range.graphemes(pt, first_start, seam);
+        while (clusters.nextGrapheme()) |cluster| cursor = @intCast(cluster.start);
+    }
+    self.curCursor().* = cursor;
+    self.markDirtyRange(from, to, span[0..used]);
+    if (offsets) |value| applyInlayOffsetsAfterHistory(self, value);
 }
 
 /// r{char}: replace a complete typed grapheme, atomically, within this line.

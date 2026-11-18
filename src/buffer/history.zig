@@ -140,10 +140,11 @@ pub const History = struct {
         const after_copy = try self.allocator.dupe(u8, after);
         errdefer self.allocator.free(after_copy);
 
-        // Reserve the slot up front so the append below cannot fail: record
-        // either applies the edit AND stores it, or fails with the document
-        // untouched (pt.replace is atomic on failure).
+        // Both the edit and its eventual group commit must fit before the
+        // document changes. Empty groups don't need an undo slot.
         try self.open.?.edits.ensureUnusedCapacity(self.allocator, 1);
+        if (self.open.?.edits.items.len == 0)
+            try self.undo_stack.ensureUnusedCapacity(self.allocator, 1);
 
         // Apply the edit to the document (this is the only mutation).
         _ = try pt.replace(pos, before_len, after);
@@ -173,13 +174,7 @@ pub const History = struct {
             return;
         }
 
-        // Pushing can only fail on OOM. Dropping the group loses history but
-        // leaks nothing; the editor treats OOM as fatal anyway (see
-        // piece_table.zig), so this path is effectively unreachable.
-        self.undo_stack.append(self.allocator, g) catch {
-            g.deinit(self.allocator);
-            return;
-        };
+        self.undo_stack.appendAssumeCapacity(g);
 
         // New branch: any redo history is now invalid.
         for (self.redo_stack.items) |*r| r.deinit(self.allocator);
@@ -349,6 +344,45 @@ test "single edit: record → undo → redo round-trip" {
     try expectDoc(&pt, std.testing.allocator, "hello cruel world");
     try std.testing.expect(hist.redo(&pt));
     try expectDoc(&pt, std.testing.allocator, "hello world");
+}
+
+fn checkRecordFailure(allocator: std.mem.Allocator) !void {
+    var pt = try PieceTable.init(std.testing.allocator, "abc");
+    defer pt.deinit();
+    var hist = History.init(allocator);
+    defer hist.deinit();
+    hist.record(&pt, 0, 1, "Z") catch |err| {
+        try expectDoc(&pt, std.testing.allocator, "abc");
+        try std.testing.expect(hist.open == null and !hist.canUndo() and hist.last_record == null);
+        try std.testing.expectEqual(@as(u64, 0), hist.revision);
+        return err;
+    };
+    try expectDoc(&pt, std.testing.allocator, "Zbc");
+    try std.testing.expect(hist.canUndo());
+}
+
+test "history: failure reserving an auto group's undo slot leaves the document untouched" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkRecordFailure, .{});
+}
+
+test "history: an explicit group can commit with all further allocations disabled" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var hist = History.init(failing.allocator());
+    defer hist.deinit();
+    var pt = try PieceTable.init(std.testing.allocator, "abc");
+    defer pt.deinit();
+    hist.beginGroup();
+    try hist.record(&pt, 0, 1, "Z");
+    try hist.record(&pt, 1, 1, "Y");
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    hist.endGroup();
+    try std.testing.expect(hist.canUndo());
+    try std.testing.expect(!failing.has_induced_failure);
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try std.testing.expect(hist.undo(&pt));
+    try expectDoc(&pt, std.testing.allocator, "abc");
 }
 
 test "group: multiple edits undo/redo atomically" {

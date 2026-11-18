@@ -91,9 +91,13 @@ pub fn apply(
         cursor.* = tillTarget(pt, pos, args.ch, dir, n) orelse pos;
         return;
     }
-    var i: u32 = 0;
-    while (i < n) : (i += 1) {
-        pos = moveOnce(pt, motion, args, pos);
+    // % may first seek a bracket from ordinary text. From its first match
+    // onward it alternates between the same two endpoints.
+    const steps = if (motion == .match_pair) 2 - n % 2 else n;
+    for (0..steps) |_| {
+        const next = moveOnce(pt, motion, args, pos);
+        if (next == pos) break; // deterministic step at a document/line boundary
+        pos = next;
     }
     cursor.* = pos;
 }
@@ -779,20 +783,19 @@ fn tillLanding(pt: *const PieceTable, match: u32, dir: i8) u32 {
     return @min(t, end);
 }
 
-/// Landing position of `count` successive forward `t` or backward `T`
-/// steps, or null when the count-th target does not exist. Like vim, each
-/// step searches from the previous MATCH (not its landing), so `2t,` finds
-/// the second comma, and a failed step makes the whole motion/operator
-/// fail instead of silently landing on the cursor.
-pub fn tillTarget(pt: *const PieceTable, from: u32, ch: u21, dir: i8, count: u32) ?u32 {
+/// Find the count-th occurrence on the current line. An operator requires
+/// all matches; the cursor position or a partial match cannot stand in for one.
+pub fn findTarget(pt: *const PieceTable, from: u32, ch: u21, dir: i8, count: u32) ?u32 {
     var pos = @min(from, pt.len());
-    const n = @max(count, 1);
-    var i: u32 = 0;
-    var match: u32 = undefined;
-    while (i < n) : (i += 1) {
-        match = findMatch(pt, pos, ch, dir) orelse return null;
-        pos = match;
+    for (0..@max(count, 1)) |_| {
+        pos = findMatch(pt, pos, ch, dir) orelse return null;
     }
+    return pos;
+}
+
+/// t/T step from the previous match, then stop one character short of the last.
+pub fn tillTarget(pt: *const PieceTable, from: u32, ch: u21, dir: i8, count: u32) ?u32 {
+    const match = findTarget(pt, from, ch, dir, count) orelse return null;
     return tillLanding(pt, match, dir);
 }
 
@@ -1529,6 +1532,24 @@ test "count: repeated motions clamp to the document edges" {
 
     // count 0 behaves like count 1.
     try check(&pt, .left, args, 5, 0, 4);
+}
+
+test "operator parsing: huge counted motions stop at a boundary or a bracket cycle" {
+    var pt = try PieceTable.init(testing.allocator, "pre ((x)) z");
+    defer pt.deinit();
+    try check(&pt, .word_next, .{}, 0, 999_999_999, 10);
+    try check(&pt, .word_prev, .{}, 10, 999_999_999, 0);
+    // Start before, on, and inside a pair. Compare with actual unaccelerated
+    // single steps to catch an off-by-one on the first forward bracket scan.
+    for ([_]u32{ 0, 4, 5, 6, 7, 8, 10 }) |start| {
+        var reference = start;
+        for (1..9) |n| {
+            reference = moveOnce(&pt, .match_pair, .{}, reference);
+            try check(&pt, .match_pair, .{}, start, @intCast(n), reference);
+        }
+    }
+    try check(&pt, .match_pair, .{}, 0, 999_999_999, 8);
+    try check(&pt, .match_pair, .{}, 0, 999_999_998, 4);
 }
 
 test "apply clamps an out-of-range cursor" {

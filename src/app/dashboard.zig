@@ -53,9 +53,7 @@ pub fn dashboardKey(self: *App, key: vaxis.Key) !bool {
             // the dashboard's buffer IS the empty scratch buffer; entering
             // insert mode leaves the dashboard (isDashboard requires
             // normal mode) and lets the user start typing immediately
-            self.state.mode = .insert;
-            self.in_insert = true;
-            self.beginInsertSession();
+            try self.execAction(.insert_mode, 1);
             return true;
         },
         else => return false,
