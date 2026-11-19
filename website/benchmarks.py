@@ -53,7 +53,7 @@ def table(rows, locale):
         bits.append(f'<tr data-metric="{key}"><th scope="row">{choose(label)}</th>')
         for ed in EDITORS:
             p50, p90 = values(rows, ed, key)
-            bits.append(f'<td>{p50:,.2f}<small> / {p90:,.2f}</small></td>')
+            bits.append(f'<td>{p50:,.2f}<small><span class="stat-separator"> / </span>{p90:,.2f}</small></td>')
         bits.append("</tr>")
     return "\n".join([*bits, "</tbody></table></div>"])
 

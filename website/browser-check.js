@@ -89,7 +89,9 @@ async ({ page, context }) => {
       check(await page.locator('html').getAttribute('lang') === (lang === 'zh' ? 'zh-CN' : 'en'), 'Benchmark link keeps locale');
       check(await noOverflow(), `Benchmark fits ${width}px in ${lang}`);
       const row = page.locator('#log-2048-warm tr[data-metric="insert_ms"]');
-      check((await row.locator('td').first().innerText()).includes('2.94 / 2.98'), 'Optimized first-edit median and P90 visible');
+      check(/2\.94\s*\/?\s*2\.98/.test(await row.locator('td').first().innerText()), 'First-edit median and P90 visible');
+      check(await page.locator('#log-2048-warm .table-wrap').evaluate((el) => el.scrollWidth <= el.clientWidth),
+        'Both editors fit side by side without scrolling');
       await page.locator('#log-1024-cold summary').click();
       check(await page.locator('#log-1024-cold table').isVisible(), 'Cold-cache data expands independently');
       for (const [study, charts] of [['large', 2], ['daily', 2]]) {

@@ -31,5 +31,7 @@
   .bench-intro { grid-template-columns: 1fr; gap: 1.5rem; padding: 2.5rem 0 1.6rem; }
   .bench-intro h1, :lang(zh-CN) .bench-intro h1 { font-size: 2.7rem; }
   .bench-section th, .bench-section td { padding: .5rem; }
+  .bench-section td small { display: block; font-size: .78rem; }
+  .bench-section .stat-separator { display: none; }
   .number { font-size: 1.6rem; }
 }
