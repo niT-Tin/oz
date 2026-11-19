@@ -15,6 +15,10 @@ cat > "$release_test_dir/CHANGELOG.md" <<'EOF'
 
 预发布正文。
 
+## [0.4.1.1] - 2026-11-19
+
+后续修订。
+
 ## [0.4.0] - 2026-11-16
 
 ### 新增
@@ -39,6 +43,7 @@ EOF
 (cd "$release_test_dir/.scripts" && bash "$release_extract" v0.4.0) > "$release_test_dir/actual"
 diff -u "$release_test_dir/expected" "$release_test_dir/actual"
 [[ $(bash "$release_extract" v0.5.0-rc.1) == '预发布正文。' ]]
+[[ $(bash "$release_extract" v0.4.1.1) == '后续修订。' ]]
 [[ $(bash "$release_extract" v0.3.0) == '旧版本正文。' ]]
 
 for release_bad_tag in v9.9.9 0.4.0 'v0.4.0;echo bad' $'v0.4.0\nv0.3.0'; do

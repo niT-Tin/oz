@@ -15,6 +15,7 @@
     'download.selected': 'Download',
   });
   const zh = {
+    'nav.benchmark': '性能测试',
     'skip': '跳到正文',
     'nav.inside': '编辑器',
     'nav.agents': 'Agent',
@@ -133,6 +134,9 @@
     language = value;
     document.documentElement.lang = value === 'zh' ? 'zh-CN' : 'en';
     for (const node of nodes) setText(node, t(node.dataset.i18n));
+    for (const link of document.querySelectorAll('[data-benchmark]')) {
+      link.href = value === 'zh' ? './benchmark/zh.html' : './benchmark/';
+    }
     const languageSwitch = document.querySelector('[data-language-switch]');
     languageSwitch.textContent = value === 'zh' ? 'English' : '中文';
     languageSwitch.lang = value === 'zh' ? 'en' : 'zh-CN';

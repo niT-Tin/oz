@@ -1,0 +1,35 @@
+.bench-intro { display: grid; grid-template-columns: 1fr minmax(17rem, .65fr); gap: 3rem; align-items: end; padding: 4rem 0 3rem; }
+.bench-intro h1, :lang(zh-CN) .bench-intro h1 { font-size: 4rem; line-height: 1.04; }
+.caption { color: var(--ember); font: .81rem var(--mono); margin-bottom: 1.1rem; }
+.lead, .bench-section > p, .bench-section li { max-width: 80ch; color: #c2c3c3; }
+.lead { margin-top: 1rem; }
+.finding { border-left: 2px solid var(--ember); padding: .4rem 0 .4rem 1.4rem; color: var(--dim); }
+.number { margin: .4rem 0; font: 500 2.2rem/1.2 var(--mono); color: var(--text); }
+.number strong, .bench-links a { color: var(--ember); }
+.number small { font-size: 1rem; }
+.comparison { font-family: var(--mono); }
+.bench-section { padding: 2.1rem 0; border-top: 1px solid var(--line); }
+.bench-section h2 { font-size: 1.65rem; margin: 0 0 .5rem; }
+.bench-section details { border-top: 1px solid var(--line); margin: 0; }
+.bench-section details:first-of-type, .bench-section .table-wrap:first-of-type { margin-top: 1.4rem; }
+.bench-section summary { padding: .85rem .15rem; cursor: pointer; font-weight: 600; }
+.bench-section summary::marker { color: var(--ember); }
+.table-wrap { overflow-x: auto; margin: .4rem 0 1.2rem; }
+.bench-section table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+.bench-section caption { text-align: left; font-size: .85rem; padding-bottom: .55rem; color: var(--dim); }
+.bench-section th, .bench-section td { padding: .55rem .8rem; text-align: right; border-bottom: 1px solid var(--line); }
+.bench-section thead th { background: var(--panel); font-size: .85rem; }
+.bench-section th:first-child { text-align: left; }
+.bench-section tbody th { font-weight: 450; }
+.bench-section td { white-space: nowrap; font: .85rem var(--mono); }
+.bench-section td small { color: var(--dim); font: inherit; }
+.bench-links { display: flex; gap: 1.2rem; flex-wrap: wrap; margin: 1rem 0; }
+.bench-links a { text-decoration: underline; text-underline-offset: .2em; }
+.bench-section ul { padding-left: 1.3rem; }
+.bench-section li { margin: .5rem 0; }
+@media (max-width: 760px) {
+  .bench-intro { grid-template-columns: 1fr; gap: 1.5rem; padding: 2.5rem 0 1.6rem; }
+  .bench-intro h1, :lang(zh-CN) .bench-intro h1 { font-size: 2.7rem; }
+  .bench-section th, .bench-section td { padding: .5rem; }
+  .number { font-size: 1.6rem; }
+}

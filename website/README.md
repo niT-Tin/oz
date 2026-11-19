@@ -52,3 +52,10 @@ third-party scripts or remote font services are used.
 DM Sans is self-hosted in WOFF2 format. Its SIL Open Font License is
 included beside the font file. The site code is
 covered by the repository's MIT license.
+
+The build also renders English and Chinese benchmark pages at `benchmark/`
+and `benchmark/zh.html`. Timing tables use the per-trial CSVs in
+`website/benchmark/`. The same directory holds symbolized CPU stacks for
+the standalone flame graphs. The build embeds these only in the detailed
+reports. Opening a summary page loads neither the stacks nor JavaScript.
+The measurement commands are in [the benchmark guide](../.bench/README.md).

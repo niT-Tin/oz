@@ -5,6 +5,8 @@ import pathlib
 import re
 import shutil
 
+import benchmarks
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SITE = ROOT / "website"
 FILES = ("index.html", "style.css", "site.js", "favicon.svg", "404.html", "robots.txt", "sitemap.xml")
@@ -14,7 +16,7 @@ def build(output, version=None):
     output = output.resolve()
     if not output.is_relative_to(ROOT / ".verify") or output == ROOT / ".verify":
         raise ValueError("Output must be a subdirectory of .verify")
-    if version and not re.fullmatch(r"v\d+\.\d+\.\d+(?:-[\w.-]+)?", version):
+    if version and not re.fullmatch(r"v\d+\.\d+\.\d+(?:\.\d+)?(?:-[\w.-]+)?", version):
         raise ValueError("Expected a release version such as v0.4.0")
     for path in SITE.rglob("*"):
         if path.is_symlink():
@@ -25,6 +27,7 @@ def build(output, version=None):
     for name in FILES:
         shutil.copy2(SITE / name, output / name)
     shutil.copytree(SITE / "assets", output / "assets")
+    benchmarks.build(output / "benchmark")
     if version:
         path = output / "index.html"
         text, count = re.subn(r'(data-release-version[^>]*>)[^<]*(?=</a>)', rf'\g<1>{version}', path.read_text())

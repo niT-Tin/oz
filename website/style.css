@@ -37,11 +37,11 @@ section[id] { scroll-margin-top: 20px; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
 
 .mast, .mast nav, .external, .footer, .hero-links, .window-bar, .dialog-toolbar { display: flex; align-items: center; }
-.mast { min-height: 76px; gap: 54px; border-bottom: 1px solid var(--line); }
+.mast { flex-wrap: wrap; row-gap: 6px; min-height: 76px; gap: 54px; border-bottom: 1px solid var(--line); }
 .brand { display: inline-flex; align-items: baseline; flex: none; line-height: .86; }
 .brand b { font: 800 2.1rem/.86 "DM Sans", sans-serif; letter-spacing: -.09em; }
 .brand i { width: .54rem; height: .24rem; margin-left: .2rem; background: var(--ember); }
-.mast nav, .external { gap: 26px; }
+.mast nav, .external { flex-wrap: wrap; gap: 26px; }
 .external { margin-left: auto; }
 .mast nav a, .external a, .footer > a:not(.brand) { font-size: .875rem; color: #c4c3c1; }
 .mast a:hover, .footer a:hover, .version:hover { color: var(--ember); }

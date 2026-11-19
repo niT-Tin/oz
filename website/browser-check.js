@@ -81,6 +81,31 @@ async ({ page, context }) => {
   check(await page.locator('html').getAttribute('lang') === 'en', 'Explicit locale survives reload');
   await visit('?lang=invalid');
   check(['en', 'zh-CN'].includes(await page.locator('html').getAttribute('lang')), 'Invalid locale falls back without breaking the page');
+  for (const width of [320, 1440]) {
+    await page.setViewportSize({ width, height: 900 });
+    for (const lang of ['en', 'zh']) {
+      await visit(`?lang=${lang}`);
+      await page.locator('footer [data-benchmark]').click();
+      check(await page.locator('html').getAttribute('lang') === (lang === 'zh' ? 'zh-CN' : 'en'), 'Benchmark link keeps locale');
+      check(await noOverflow(), `Benchmark fits ${width}px in ${lang}`);
+      const row = page.locator('#log-2048-warm tr[data-metric="insert_ms"]');
+      check((await row.locator('td').first().innerText()).includes('2.94 / 2.98'), 'Optimized first-edit median and P90 visible');
+      await page.locator('#log-1024-cold summary').click();
+      check(await page.locator('#log-1024-cold table').isVisible(), 'Cold-cache data expands independently');
+      for (const [study, charts] of [['large', 2], ['daily', 2]]) {
+        await page.locator(`#${study} a[href*="-flames-"]`).click();
+        check(await page.locator('canvas').count() === charts, `CPU charts for ${study}`);
+        await page.locator('#phase').selectOption('search_ms');
+        await page.locator('#scope').selectOption('editor');
+        await page.locator('#scale').selectOption('shared');
+        await page.locator('#mode').selectOption('inclusive');
+        check(await page.locator('#hot tr').count() > 0 && await noOverflow(), 'Flame controls expose hotspot data and fit viewport');
+        await page.locator('main > p a').first().click();
+      }
+      await page.locator('.external a[lang]').click();
+      check(await page.locator('html').getAttribute('lang') === (lang === 'zh' ? 'en' : 'zh-CN'), 'Benchmark language switch reaches alternate page');
+    }
+  }
   const browser = context.browser();
   const blocked = await browser.newContext({ viewport: { width: 390, height: 844 } });
   try {
@@ -97,6 +122,10 @@ async ({ page, context }) => {
     check(await other.locator('h1').isVisible(), 'Core introduction is readable without JavaScript');
     check((await other.locator('#download-link').getAttribute('href')).endsWith('/releases/latest'), 'Downloads remain usable without JavaScript');
     check(await other.locator('noscript a').count() === 4, 'No-JavaScript alternative exposes screenshots and Chinese introduction');
+    await other.locator('footer [data-benchmark]').click();
+    check(await other.locator('#log-2048-warm table').isVisible(), 'Benchmark table works without JavaScript');
+    await other.locator('.external a[lang]').click();
+    check(await other.locator('html').getAttribute('lang') === 'zh-CN', 'Chinese benchmark also works without JavaScript');
   } finally { await plain.close(); }
   check(failures.length === 0, `No uncaught page errors: ${failures.join(', ')}`);
   await page.setViewportSize({ width: 1440, height: 1000 });

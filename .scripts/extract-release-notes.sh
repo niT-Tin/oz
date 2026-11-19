@@ -3,8 +3,8 @@
 # if the tag has no nonempty changelog entry.
 set -euo pipefail
 
-if [[ $# -ne 1 ]] || [[ ! "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-  printf 'usage: %s vMAJOR.MINOR.PATCH\n' "$0" >&2
+if [[ $# -ne 1 ]] || [[ ! "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+  printf 'usage: %s vMAJOR.MINOR.PATCH[.REVISION]\n' "$0" >&2
   exit 1
 fi
 

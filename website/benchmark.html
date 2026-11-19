@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="$lang">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>$title · oz</title>
+  <meta name="description" content="$intro">
+  <link rel="icon" href="../favicon.svg">
+  <link rel="stylesheet" href="../style.css">
+  <link rel="stylesheet" href="benchmark.css">
+  <link rel="alternate" hreflang="en" href="./">
+  <link rel="alternate" hreflang="zh-CN" href="zh.html">
+</head>
+<body>
+  <a class="skip-link" href="#main">$skip</a>
+  <header class="shell mast">
+    <a href="../?lang=$short" class="brand" aria-label="oz"><b aria-hidden="true">oz</b><i aria-hidden="true"></i></a>
+    <a href="../?lang=$short">$home</a>
+    <div class="external"><a lang="$other_lang" href="$other_url">$other</a><a href="https://github.com/niT-Tin/oz">GitHub ↗</a></div>
+  </header>
+  <main id="main" class="shell">
+    <section class="bench-intro">
+      <div><p class="caption"><time datetime="2026-11-19">2026-11-19</time> · Linux x86_64</p>
+        <h1>$title</h1><p class="lead">$intro</p></div>
+      <div class="finding"><p>$feature</p><p class="number"><strong>$oz_time</strong> ms <small>oz</small></p><p class="comparison">$nvim_time ms · nvim --clean</p></div>
+    </section>
+    <section class="bench-section" id="large"><h2>$large</h2><p>$large_note</p>
+      $large_tables
+      <div class="bench-links"><a href="$large_flame">$flame →</a><a href="large-timings.csv" download>$csv ↓</a></div>
+      <p class="interpretation">$tradeoff</p>
+    </section>
+    <section class="bench-section" id="daily"><h2>$daily</h2><p>$daily_note</p>
+      $daily_table
+      <div class="bench-links"><a href="$daily_flame">$flame →</a><a href="daily-timings.csv" download>$csv ↓</a></div>
+    </section>
+    <section class="bench-section" id="method"><h2>$method</h2><ul>$methods</ul>
+      <div class="bench-links"><a href="https://github.com/niT-Tin/oz/blob/master/.bench/README.md">$reproduce ↗</a></div>
+    </section>
+  </main>
+</body>
+</html>
