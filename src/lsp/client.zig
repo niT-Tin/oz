@@ -89,16 +89,15 @@ const Queue = struct {
         return self.items.orderedRemove(0);
     }
 
-    /// Block up to `timeout_ns` for an item; null on timeout. Polls at 20ms —
-    /// used only for the one-shot initialize handshake, so latency is fine.
-    fn popTimeout(self: *Queue, timeout_ns: i128) ?[]u8 {
-        const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
-        const deadline = now + timeout_ns;
-        while (true) {
-            if (self.pop()) |c| return c;
-            if (std.Io.Timestamp.now(self.io, .real).nanoseconds >= deadline) return null;
-            std.Io.sleep(self.io, .fromNanoseconds(20 * std.time.ns_per_ms), .real) catch {};
-        }
+    /// Wait for a handshake response, keeping the caller's cancellation bound.
+    fn popTimeout(self: *Queue, timeout_ns: i96) ?[]u8 {
+        const timeout = std.Io.Timeout{ .duration = .{ .raw = .fromNanoseconds(timeout_ns), .clock = .awake } };
+        const deadline = timeout.toDeadline(self.io);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        while (self.items.items.len == 0)
+            self.cond.waitTimeout(self.io, &self.mutex, deadline) catch return null;
+        return self.items.orderedRemove(0);
     }
 
     fn deinit(self: *Queue, alloc: std.mem.Allocator) void {
@@ -165,6 +164,10 @@ const OutQueue = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.items.items.len == 0) return null;
+        return self.popLocked();
+    }
+
+    fn popLocked(self: *OutQueue) OutFrame {
         const f = self.items.orderedRemove(0);
         if (self.did_change_idx) |i| {
             self.did_change_idx = if (i == 0) null else i - 1;
@@ -172,18 +175,17 @@ const OutQueue = struct {
         return f;
     }
 
-    /// Block up to `timeout_ns` for an item; null on timeout.
-    fn popTimeout(self: *OutQueue, timeout_ns: i128) ?OutFrame {
-        const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
-        const deadline = now + timeout_ns;
-        while (true) {
-            if (self.pop()) |c| return c;
-            if (std.Io.Timestamp.now(self.io, .real).nanoseconds >= deadline) return null;
-            std.Io.sleep(self.io, .fromNanoseconds(20 * std.time.ns_per_ms), .real) catch {};
+    fn waitPop(self: *OutQueue, stop: *const std.atomic.Value(bool)) ?OutFrame {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        while (!stop.load(.acquire)) {
+            if (self.items.items.len > 0) return self.popLocked();
+            self.cond.waitUncancelable(self.io, &self.mutex);
         }
+        return null;
     }
 
-    /// Wake a blocked popTimeout (teardown).
+    /// Wake the idle writer after publishing the stop flag.
     fn wake(self: *OutQueue) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -848,8 +850,7 @@ pub const Client = struct {
     /// error means the server's pipe is broken — the reader thread's EOF
     /// handling (server_died) reports it; the frame is just dropped.
     fn writerMain(self: *Client) void {
-        while (!self.stop.load(.acquire)) {
-            const frame = self.out.popTimeout(50 * std.time.ns_per_ms) orelse continue;
+        while (self.out.waitPop(&self.stop)) |frame| {
             defer frame.deinit(self.alloc);
             switch (frame) {
                 .raw => |f| _ = std.Io.File.writeStreamingAll(self.stdin, self.io, f) catch {},
@@ -1002,6 +1003,7 @@ pub const Client = struct {
             }
         }
         self.stop.store(true, .release);
+        self.out.wake();
     }
 
     // ---- params builders ----
@@ -1251,6 +1253,44 @@ test "queue: popTimeout returns null on timeout" {
     const item = q.popTimeout(20 * std.time.ns_per_ms);
     try std.testing.expect(item == null);
     try std.testing.expect(std.Io.Timestamp.now(std.testing.io, .real).nanoseconds - start < std.time.ns_per_s);
+}
+
+test "out queue: idle writer receives a request and wakes for shutdown" {
+    const Worker = struct {
+        queue: OutQueue,
+        stop: std.atomic.Value(bool) = .init(false),
+        received: std.Io.Event = .unset,
+        correct: bool = false,
+
+        fn run(self: *@This()) void {
+            const frame = self.queue.waitPop(&self.stop) orelse return;
+            defer frame.deinit(std.testing.allocator);
+            self.correct = frame == .raw and std.mem.eql(u8, frame.raw, "hover");
+            self.received.set(self.queue.io);
+            if (self.queue.waitPop(&self.stop)) |extra| {
+                extra.deinit(std.testing.allocator);
+                self.correct = false;
+            }
+        }
+    };
+    const a = std.testing.allocator;
+    var worker = Worker{ .queue = .{ .io = std.testing.io } };
+    defer worker.queue.deinit(a);
+    {
+        const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+        defer {
+            worker.stop.store(true, .release);
+            worker.queue.wake();
+            thread.join();
+        }
+        const request = try a.dupe(u8, "hover");
+        worker.queue.push(a, .{ .raw = request }) catch |err| {
+            a.free(request);
+            return err;
+        };
+        try worker.received.waitTimeout(std.testing.io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } });
+    }
+    try std.testing.expect(worker.correct);
 }
 
 test "out queue: didChange frames coalesce, other frames queue in order" {

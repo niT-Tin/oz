@@ -103,7 +103,7 @@ pub fn main(init: std.process.Init) !void {
             errdefer if (own_loaded) loaded.deinit();
             const loaded_path = try app.absolutePath(file_path);
             errdefer if (own_loaded) app.alloc.free(loaded_path);
-            const disk = try disk_file.Baseline.init(app.alloc, app.io, loaded_path, loaded.origin);
+            const disk = try disk_file.Baseline.fromOrigin(app.alloc, app.io, loaded_path, &loaded);
             app.cur().pt.deinit();
             app.cur().pt = loaded;
             app.cur().disk = disk;
@@ -122,7 +122,7 @@ pub fn main(init: std.process.Init) !void {
         break; // M0: first file only
     }
     if (target_line > 0) {
-        app.curCursor().* = app.cur().pt.lineStart(@min(target_line - 1, app.cur().pt.lineCount() - 1));
+        app.curCursor().* = app.cur().pt.lineStart(app.cur().pt.clampLine(target_line - 1));
     }
 
     // the CLI arg path edits cur() directly (no openInBuffer/switchTo), so

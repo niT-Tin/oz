@@ -5111,6 +5111,45 @@ test "tree-sitter: zig keywords/comments/strings get syntax colors" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+test "markdown: large documents render across viewports and recover after crossing the size limit" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const head = "# Large document\n\n- [x] **top styled**\n\n";
+    const tail = "\n\n## Last section\n\n**tail styled**\n\nTail sentinel";
+    const source = try a.alloc(u8, 1024 * 1024);
+    defer a.free(source);
+    @memcpy(source[0..head.len], head);
+    @memcpy(source[source.len - tail.len ..], tail);
+    const padding = source[head.len .. source.len - tail.len];
+    for (padding, 0..) |*byte, i| byte.* = if (i % 128 >= 126) '\n' else 'x';
+
+    var name_buf: [192:0]u8 = undefined;
+    const path = try erFixture(io, &name_buf, ".md", source);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var sess = try Session.spawn(io, &.{ oz_exe_path, path });
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(a);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "top styled", 5000);
+    try std.testing.expect(grid.contains("\u{f046}"));
+    try std.testing.expect(!grid.contains("**top styled**"));
+    try sess.send("G");
+    try gridWaitFor(&sess, &grid, "Tail sentinel", 5000);
+    try std.testing.expect(grid.contains("tail styled"));
+    try std.testing.expect(!grid.contains("**tail styled**"));
+
+    try sess.send("A!\x1b");
+    try gridWaitFor(&sess, &grid, "Tail sentinel!", 5000);
+    try gridWaitFor(&sess, &grid, "NORMAL", 5000);
+    try std.testing.expect(grid.contains("**tail styled**"));
+    try sess.send("u");
+    try gridWaitGone(&sess, &grid, "Tail sentinel!", 5000);
+    try gridWaitGone(&sess, &grid, "**tail styled**", 5000);
+    try std.testing.expect(grid.contains("tail styled"));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q!\r"));
+}
+
 test "markdown: inline rendering with conceal, injection and decorations" {
     // M4 markdown 内联渲染: block + inline highlight via the two-grammar
     // injection, fence content in the fence's language, and conceal of the
@@ -18686,6 +18725,8 @@ test "navigator: 120x30 tabs switch files/notes/agents with real content" {
     try std.testing.expectEqual(@as(usize, 0), navTabsRow());
     try std.testing.expect(aiRowContains(&grid, grid.rows - 1, "[main]"));
     const panel = findNavigatorBox(&grid) orelse return error.TestUnexpectedResult;
+    // Labels near the top can arrive in an earlier PTY read than the divider.
+    try gutterWaitCell(&sess, &grid, panel.bottom, panel.right, "│");
     try expectNavigatorPanel(&grid, panel);
 
     const tab_row = grid.rowText(navTabsRow());
@@ -24868,6 +24909,39 @@ test "file safety: atomic replacement refuses normal save and permits explicit f
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
 }
 
+test "file safety: a same-inode equal-length modification before the first edit survives normal save" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "file.txt" });
+    defer alloc.free(path);
+    try aiWriteFile(io, root, "file.txt", "INITIAL\n");
+    var sess = try Session.spawnCwd(io, &.{ oz_exe_path, path }, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "INITIAL", 8000);
+    {
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+        defer file.close(io);
+        const before = try file.stat(io);
+        try file.writePositionalAll(io, "CHANGED", 0);
+        try file.setTimestamps(io, .{ .modify_timestamp = .{ .new = before.mtime } });
+    }
+    try sess.send("rX");
+    try gridWaitFor(&sess, &grid, "XNITIAL", 5000);
+    try sess.send(":wq\r");
+    try gridWaitFor(&sess, &grid, "file changed on disk", 5000);
+    try expectLspDisk(io, alloc, path, "CHANGED\n");
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "INITIAL", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q\r"));
+    try expectLspDisk(io, alloc, path, "CHANGED\n");
+}
+
 test "undo save point: quit respects undo, redo and equal-length divergent branches" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -24877,6 +24951,10 @@ test "undo save point: quit respects undo, redo and equal-length divergent branc
         .{ .keys = "rX:w\ru\x12", .current = "Xbc", .saved = "Xbc\n", .dirty = false },
         .{ .keys = "rX:w\ru", .current = "abc", .saved = "Xbc\n", .dirty = true },
         .{ .keys = "rX:w\rurY", .current = "Ybc", .saved = "Xbc\n", .dirty = true },
+        .{ .keys = "A\x7fX\x03", .current = "abX", .saved = "abc\n", .dirty = true },
+        .{ .keys = "A\x7fc\x03", .current = "abc", .saved = "abc\n", .dirty = false },
+        .{ .keys = "rX:w\rAY\x7f\x03", .current = "Xbc", .saved = "Xbc\n", .dirty = false },
+        .{ .keys = "rXAY\x7f\x03", .current = "Xbc", .saved = "abc\n", .dirty = true },
     };
     for (cases) |case| {
         var name_buf: [192:0]u8 = undefined;
@@ -29624,6 +29702,38 @@ test "inlay indentation: parameter anchors preserve guides and source cursor cel
     }
 }
 
+test "viewport: far jump counts wrapped rows and skips a closed fold" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var source = std.ArrayList(u8).empty;
+    defer source.deinit(a);
+    try source.appendSlice(a, "TOP_MARK\r\n");
+    for (0..1024) |_| try source.appendSlice(a, "filler\r\n");
+    try source.appendSlice(a, "FOLD_HEAD\r\n");
+    for (0..24) |_| try source.appendSlice(a, "    hidden_body\r\n");
+    try source.appendNTimes(a, 'x', 92);
+    try source.appendSlice(a, " WRAP_TAIL\r\nEOF_MARK");
+    var name_buf: [192:0]u8 = undefined;
+    const path = try erFixture(io, &name_buf, ".txt", source.items);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var sess = try erStart(io, a, path, 16, 46);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 16, 46);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "TOP_MARK", 5000);
+    try sess.send("/FOLD_HEAD\rza");
+    try gridWaitFor(&sess, &grid, "24 lines", 5000);
+    try sess.send("gg");
+    try gridWaitFor(&sess, &grid, "TOP_MARK", 5000);
+    try sess.send("G");
+    try gridWaitFor(&sess, &grid, "EOF_MARK", 5000);
+    try std.testing.expect(grid.contains("FOLD_HEAD"));
+    try std.testing.expect(grid.contains("WRAP_TAIL"));
+    try std.testing.expect(!grid.contains("hidden_body"));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q\r"));
+}
+
 test "folds: indenting the boundary updates closed range through undo and redo" {
     const io = std.testing.io;
     const a = std.testing.allocator;
@@ -33177,4 +33287,153 @@ test "history audit: inlay indentation remains virtual during Unicode edits and 
         defer a.free(text);
         try std.testing.expectEqualStrings(want, text);
     }
+}
+
+test "large log: first frame then G, numeric jump, search and newline undo have exact line numbers" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "large.log" });
+    defer alloc.free(path);
+    const row = "ordinary log entry with enough columns for paged indexing\r\n";
+    var block: [1024 * row.len]u8 = undefined;
+    for (0..1024) |i| @memcpy(block[i * row.len ..][0..row.len], row);
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    {
+        defer file.close(io);
+        try file.writeStreamingAll(io, "OPEN_HEAD\n");
+        for (0..64) |_| try file.writeStreamingAll(io, &block);
+        try file.writeStreamingAll(io, "MIDDLE_MATCH\r\n");
+        for (0..64) |_| try file.writeStreamingAll(io, &block);
+        try file.writeStreamingAll(io, "FINAL_TAIL");
+    }
+    var sess = try Session.spawnCwd(io, &.{ oz_exe_path, path }, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(alloc);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "OPEN_HEAD", 8000);
+    // Inspect the real first status, even if the exact total arrived in a
+    // subsequent frame in the same PTY read.
+    const seen = sess.used;
+    try std.testing.expect(try sess.waitFor("line 1/…", 5000));
+    grid.feed(sess.out[seen..sess.used]);
+    try sess.send("G");
+    try gridWaitFor(&sess, &grid, "FINAL_TAIL", 5000);
+    try gridWaitFor(&sess, &grid, "line 131075/131075", 5000);
+    try sess.send(":65538\r");
+    try gridWaitFor(&sess, &grid, "MIDDLE_MATCH", 5000);
+    try gridWaitPosition(&sess, &grid, 65538, 0, 5000);
+    try sess.send("gg");
+    try gridWaitPosition(&sess, &grid, 1, 0, 5000);
+    try sess.send("/MIDDLE_MATCH\r");
+    try gridWaitPosition(&sess, &grid, 65538, 0, 5000);
+    try sess.send("iNEW_LINE\r\x1b");
+    try gridWaitFor(&sess, &grid, "line 65539/131076", 5000);
+    try sess.send("G");
+    try gridWaitFor(&sess, &grid, "line 131076/131076", 5000);
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "/131075", 5000);
+    try sess.send(":999999999\r");
+    try gridWaitPosition(&sess, &grid, 131075, 0, 5000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q!\r"));
+
+    // Opening via :e also completes the total without any navigation key.
+    var idle = try Session.spawnCwd(io, &.{oz_exe_path}, root);
+    defer idle.close();
+    defer killPid(idle.pid);
+    var idle_grid = try Grid.init(alloc);
+    defer idle_grid.deinit(alloc);
+    try gridWaitFor(&idle, &idle_grid, "终端文本编辑器", 8000);
+    try idle.send(":e large.log\r");
+    try gridWaitFor(&idle, &idle_grid, "line 1/131075", 8000);
+    try std.testing.expectEqual(@as(u32, 0), try idle.commandAndWaitExit(":q!\r"));
+}
+
+test "git: large tracked file drops a delayed dirty revision after undo and G" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const root = try std.fmt.allocPrint(a, "/tmp/oz_git_large_gate_{d}", .{linux.getpid()});
+    defer a.free(root);
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(a);
+    try text.appendSlice(a, "INITIAL_HEAD\n");
+    // Unique rows ensure well-separated hunks have independent anchors.
+    var row: [128]u8 = undefined;
+    for (0..70000) |i| try text.appendSlice(a, try std.fmt.bufPrint(&row, "line {d} content to keep the tracked fixture above the window threshold\n", .{i}));
+    try text.appendSlice(a, "AT_THE_END");
+    try writeTestFile(io, root, "large.log", text.items);
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q", "-b", "main" },
+        &.{ "git", "add", "-f", "large.log" },
+        &.{ "git", "-c", "user.email=bench@localhost", "-c", "user.name=fixture", "-c", "commit.gpgsign=false", "commit", "-qm", "baseline" },
+    }) |cmd| a.free(try runCmdCapture(io, a, cmd, root));
+    const git = try runCmdCapture(io, a, &.{ "/bin/sh", "-c", "command -v git" }, root);
+    defer a.free(git);
+    const real = try std.fmt.allocPrint(a, "REAL_GIT={s}", .{std.mem.trim(u8, git, "\r\n")});
+    defer a.free(real);
+    const path = try std.fmt.allocPrint(a, "PATH={s}:/usr/bin:/bin", .{root});
+    defer a.free(path);
+    try writeTestFile(io, root, "git",
+        \\#!/bin/sh
+        \\if [ "$1 $2" = 'cat-file blob' ] && [ ! -e release ]; then
+        \\  : > reading
+        \\  while [ ! -e release ]; do sleep 0.02; done
+        \\fi
+        \\if [ "$1" = status ] && [ -e reading ] && [ ! -e release-next ]; then
+        \\  : > next-status
+        \\  while [ ! -e release-next ]; do sleep 0.02; done
+        \\fi
+        \\if [ "$1 $2" = 'cat-file blob' ]; then echo read >> blob-reads; fi
+        \\if [ "$1 $2" = 'diff --no-index' ]; then
+        \\  for arg do
+        \\    case "$arg" in /tmp/oz_git_*.tmp)
+        \\      if [ "$(wc -c < "$arg")" -gt 4096 ]; then touch oversized; fi ;;
+        \\    esac
+        \\  done
+        \\fi
+        \\exec "$REAL_GIT" "$@"
+        \\
+    );
+    a.free(try runCmdCapture(io, a, &.{ "chmod", "+x", "git" }, root));
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "large.log" }, &.{ real, path }, 24, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    defer writeTestFile(io, root, "release", "") catch {};
+    defer writeTestFile(io, root, "release-next", "") catch {};
+    var grid = try Grid.init(a);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "⎇ main", 10000);
+    try sess.send("iOLD_EDIT\x1b");
+    try std.testing.expect(try erWaitBarrier(io, root, "reading", 10000));
+    try sess.send("uG");
+    try gridWaitFor(&sess, &grid, "AT_THE_END", 5000);
+    try writeTestFile(io, root, "release", "");
+    try std.testing.expect(try erWaitBarrier(io, root, "next-status", 10000));
+    _ = try uiPump(&sess, &grid, 150);
+    try std.testing.expect(!grid.contains("~1"));
+    try writeTestFile(io, root, "release-next", "");
+    try sess.send("iTAIL_EDIT\x1b");
+    try gridWaitFor(&sess, &grid, "~1", 5000);
+    try gridWaitRowContains(&sess, &grid, grid.row, "▎", 5000);
+    try sess.send("ggiHEAD_EDIT\x1b");
+    try gridWaitFor(&sess, &grid, "~2", 5000);
+    try gridWaitRowContains(&sess, &grid, grid.row, "▎", 5000);
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "~1", 5000);
+    try std.testing.expect(!rowContains(&grid, grid.row, "▎"));
+    try sess.send("u");
+    try gridWaitGone(&sess, &grid, "~1", 5000);
+    try std.testing.expect(!grid.contains("TAIL_EDIT"));
+    const reads = try runCmdCapture(io, a, &.{ "cat", "blob-reads" }, root);
+    defer a.free(reads);
+    try std.testing.expectEqualStrings("read", std.mem.trim(u8, reads, "\r\n"));
+    const oversize = try std.fs.path.join(a, &.{ root, "oversized" });
+    defer a.free(oversize);
+    try std.testing.expect(!pathExists(io, oversize));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q!\r"));
 }

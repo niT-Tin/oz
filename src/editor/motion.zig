@@ -334,7 +334,7 @@ fn moveRight(pt: *const PieceTable, pos: u32) u32 {
 /// A shorter target line clamps to its last character (line start if empty).
 fn moveVert(pt: *const PieceTable, pos: u32, dir: i8) u32 {
     const line = pt.lineOf(pos);
-    if (dir > 0 and line + 1 >= pt.lineCount()) return pos;
+    if (dir > 0 and pt.clampLine(line + 1) == line) return pos;
     if (dir < 0 and line == 0) return pos;
     const target_line = if (dir > 0) line + 1 else line - 1;
     return toLineKeepCol(pt, pos, target_line);
@@ -350,7 +350,7 @@ pub fn toLineKeepCol(pt: *const PieceTable, pos: u32, target_line: u32) u32 {
     var col = @min(pos, pt.len()) - start;
     const line_len = pt.lineTextLen(line);
     if (col > line_len) col = line_len; // defensive clamp
-    const tl = @min(target_line, pt.lineCount() - 1);
+    const tl = pt.clampLine(target_line);
     const t_start = pt.lineStart(tl);
     const t_len = pt.lineTextLen(tl);
     var t_col = col;
@@ -390,7 +390,7 @@ fn insertRight(pt: *const PieceTable, pos: u32) u32 {
 /// j/k in Insert mode: one line down (dir > 0) / up (dir < 0).
 fn insertVert(pt: *const PieceTable, pos: u32, dir: i8) u32 {
     const line = pt.lineOf(pos);
-    if (dir > 0 and line + 1 >= pt.lineCount()) return pos;
+    if (dir > 0 and pt.clampLine(line + 1) == line) return pos;
     if (dir < 0 and line == 0) return pos;
     const target_line = if (dir > 0) line + 1 else line - 1;
     return insertToLineKeepCol(pt, pos, target_line);
@@ -401,7 +401,7 @@ fn insertVert(pt: *const PieceTable, pos: u32, dir: i8) u32 {
 /// character (and never on the '\r'/'\n' of a CRLF). Public so the App can
 /// keep a vim-style goal column across consecutive Up/Down moves.
 pub fn insertPosForLineCol(pt: *const PieceTable, target_line: u32, goal_col: u32) u32 {
-    const tl = @min(target_line, pt.lineCount() - 1);
+    const tl = pt.clampLine(target_line);
     const t_start = pt.lineStart(tl);
     const t_len = pt.lineTextLen(tl);
     const t_col = @min(goal_col, t_len);

@@ -364,7 +364,7 @@ pub fn execCommand(self: *App, cmd: editor.ex_command.Command) !void {
         .goto_line => |ln| {
             // :<number> — vim: 1-based, clamped to the last line (:0
             // and :1 both land on the first line)
-            const target = @min(ln -| 1, self.cur().pt.lineCount() - 1);
+            const target = self.cur().pt.clampLine(ln -| 1);
             self.curCursor().* = self.cur().pt.lineStart(target);
             self.clearHover();
         },

@@ -10,9 +10,9 @@
 //!      (Query.Cursor.setByteRange) so screen-off tokens never materialize;
 //!   3. emit one flat `[]Span` per frame, arena-allocated, no per-token
 //!      objects (the "统一装饰管线" model).
-//! Big-file degradation: files over `SIZE_LIMIT` (100 KB — same threshold as
-//! the nvim mitigation report) get NO highlight pass at all; the caller
-//! checks `languageFor`/`overLimit` and skips the Highlighter entirely.
+//! Code buffers use a 100 KiB parse budget. Markdown uses a larger block
+//! parse budget because its tree also drives document layout; inline and
+//! fenced-language injections are still queried for the viewport.
 //!
 //! Query files: src/syntax/queries/<lang>.scm (copied verbatim from the
 //! tree-sitter-grammars repos shipped inside the tree_sitter package).
@@ -308,8 +308,12 @@ fn isFallbackKeyword(word: []const u8) bool {
     return false;
 }
 
-/// Files larger than this get no syntax pass (see file header).
+/// Default syntax budget, also used for the file picker's bounded read.
 pub const SIZE_LIMIT: usize = 100 * 1024;
+
+pub fn bufferSizeLimit(language: []const u8) usize {
+    return if (std.mem.eql(u8, language, "markdown")) 1024 * 1024 else SIZE_LIMIT;
+}
 
 /// Resolve a filetype (from `filetypeOf`) to a tree-sitter language name.
 /// Returns null when no grammar is bundled for this filetype.
@@ -415,13 +419,13 @@ fn isBracketCapture(name: []const u8) bool {
 /// text. Returns true when the pattern has no predicates or all of them hold;
 /// false (rejecting the capture) when any predicate fails or is unsupported.
 fn matchPredicates(self: *Highlighter, match: treez.Query.Match, text: []const u8) bool {
-    const preds = self.query.getPredicatesForPattern(match.pattern_index);
+    const preds = self.queries.highlight.getPredicatesForPattern(match.pattern_index);
     if (preds.len == 0) return true;
     var i: usize = 0;
     while (i < preds.len) {
         // each predicate: [string op] [capture|string args...] [done]
         if (preds[i].type != .string) return false;
-        const op = self.query.getStringValueForId(preds[i].value_id);
+        const op = self.queries.highlight.getStringValueForId(preds[i].value_id);
         i += 1;
         var cap_id: ?u32 = null;
         var str_values: [4][]const u8 = undefined;
@@ -431,7 +435,7 @@ fn matchPredicates(self: *Highlighter, match: treez.Query.Match, text: []const u
                 .capture => cap_id = preds[i].value_id,
                 .string => {
                     if (nstr < str_values.len) {
-                        str_values[nstr] = self.query.getStringValueForId(preds[i].value_id);
+                        str_values[nstr] = self.queries.highlight.getStringValueForId(preds[i].value_id);
                     }
                     nstr += 1;
                 },
@@ -614,7 +618,9 @@ fn depthOf(node: treez.Node, depths: *const std.AutoHashMap(*const anyopaque, u3
 pub const Highlighter = struct {
     allocator: std.mem.Allocator,
     parser: *treez.Parser,
-    query: *treez.Query,
+    // Queries are immutable after compilation. Open buffers of the same
+    // language share them; parsers, trees and cursors stay buffer-local.
+    queries: *Queries,
     /// Language name ("zig", "rust", …) — used by tests and deinit.
     lang_name: []const u8,
     /// Last parsed tree (null before the first parse).
@@ -642,14 +648,8 @@ pub const Highlighter = struct {
     /// for (inline) nodes + one per fence language). Owned keys and values.
     /// One level deep: children never carry injections of their own.
     children: std.StringHashMap(*Highlighter),
-    /// Injection pattern query (src/syntax/queries/<lang>.injections.scm) —
-    /// null for languages without injections.
-    inj_query: ?*treez.Query = null,
     /// Reusable cursor for the injection query (created on first sync).
     inj_cursor: ?*treez.Query.Cursor = null,
-    /// Decoration query (syntax/queries/<lang>.decor.scm, "@md.*" captures)
-    /// — markdown and markdown_inline only, null elsewhere.
-    decor_query: ?*treez.Query = null,
     /// Reusable cursor for the decoration query.
     decor_cursor: ?*treez.Query.Cursor = null,
     /// Injection sync state (see ensureInjections): children re-parse when
@@ -658,6 +658,13 @@ pub const Highlighter = struct {
     inj_dirty: bool = true,
     inj_start: u32 = 0,
     inj_end: u32 = 0,
+
+    const Queries = struct {
+        highlight: *treez.Query,
+        injections: ?*treez.Query,
+        decorations: ?*treez.Query,
+        refs: usize = 1,
+    };
 
     /// Grammars with a bundled query file (src/syntax/queries/<lang>.scm).
     const LANGUAGES = [_][]const u8{
@@ -677,32 +684,42 @@ pub const Highlighter = struct {
 
     fn initLang(allocator: std.mem.Allocator, comptime lang: []const u8) !Highlighter {
         const language = try treez.Language.get(lang);
-        var parser = try treez.Parser.create();
-        errdefer parser.destroy();
-        try parser.setLanguage(language);
         var error_offset: u32 = 0;
         const query = try treez.Query.create(language, @embedFile("syntax/queries/" ++ lang ++ ".scm"), &error_offset);
         errdefer query.destroy();
-        var inj_query: ?*treez.Query = null;
-        // markdown is a two-parser grammar: the block tree's (inline) nodes
-        // and fenced code blocks are re-parsed by child languages
-        // (markdown_inline, the fence's language) via included ranges.
-        if (comptime std.mem.eql(u8, lang, "markdown")) {
-            inj_query = try treez.Query.create(language, @embedFile("syntax/queries/markdown.injections.scm"), &error_offset);
-        }
-        var decor_query: ?*treez.Query = null;
-        if (comptime std.mem.eql(u8, lang, "markdown") or std.mem.eql(u8, lang, "markdown_inline")) {
-            decor_query = try treez.Query.create(language, @embedFile("syntax/queries/" ++ lang ++ ".decor.scm"), &error_offset);
-        }
+        const injections: ?*treez.Query = if (comptime std.mem.eql(u8, lang, "markdown"))
+            try treez.Query.create(language, @embedFile("syntax/queries/markdown.injections.scm"), &error_offset)
+        else
+            null;
+        errdefer if (injections) |q| q.destroy();
+        const decorations: ?*treez.Query = if (comptime std.mem.eql(u8, lang, "markdown") or std.mem.eql(u8, lang, "markdown_inline"))
+            try treez.Query.create(language, @embedFile("syntax/queries/" ++ lang ++ ".decor.scm"), &error_offset)
+        else
+            null;
+        errdefer if (decorations) |q| q.destroy();
+        const queries = try allocator.create(Queries);
+        errdefer allocator.destroy(queries);
+        queries.* = .{ .highlight = query, .injections = injections, .decorations = decorations };
+        return initParser(allocator, lang, language, queries);
+    }
+
+    fn initParser(allocator: std.mem.Allocator, lang: []const u8, language: *const treez.Language, queries: *Queries) !Highlighter {
+        const parser = try treez.Parser.create();
+        errdefer parser.destroy();
+        try parser.setLanguage(language);
         return .{
             .allocator = allocator,
             .parser = parser,
-            .query = query,
+            .queries = queries,
             .lang_name = lang,
             .children = std.StringHashMap(*Highlighter).init(allocator),
-            .inj_query = inj_query,
-            .decor_query = decor_query,
         };
+    }
+
+    pub fn forAnotherBuffer(self: *const Highlighter) !Highlighter {
+        const other = try initParser(self.allocator, self.lang_name, self.parser.getLanguage().?, self.queries);
+        self.queries.refs += 1;
+        return other;
     }
 
     pub fn deinit(self: *Highlighter) void {
@@ -714,15 +731,19 @@ pub const Highlighter = struct {
         }
         self.children.deinit();
         if (self.decor_cursor) |c| c.destroy();
-        if (self.decor_query) |q| q.destroy();
         if (self.inj_cursor) |c| c.destroy();
-        if (self.inj_query) |q| q.destroy();
         self.prev_text.deinit(self.allocator);
         self.zig_brackets.deinit(self.allocator);
         self.line_starts.deinit(self.allocator);
         if (self.tree) |t| t.destroy();
         if (self.cursor) |c| c.destroy();
-        self.query.destroy();
+        self.queries.refs -= 1;
+        if (self.queries.refs == 0) {
+            self.queries.highlight.destroy();
+            if (self.queries.injections) |q| q.destroy();
+            if (self.queries.decorations) |q| q.destroy();
+            self.allocator.destroy(self.queries);
+        }
         self.parser.destroy();
     }
 
@@ -748,6 +769,22 @@ pub const Highlighter = struct {
             }
         }
         self.inj_dirty = true;
+    }
+
+    /// Coalesce a batch of edits from the same document into one replacement.
+    /// Only the common prefix and suffix can be reused. Expand endpoints to
+    /// whole UTF-8 characters when the edit shares part of a code point.
+    pub fn reparseChanges(self: *Highlighter, text: []const u8) !void {
+        if (self.tree == null) return self.reparse(text);
+        const old = self.prev_text.items;
+        var start = std.mem.findDiff(u8, old, text) orelse return;
+        while (start > 0 and ((start < old.len and old[start] & 0xc0 == 0x80) or
+            (start < text.len and text[start] & 0xc0 == 0x80))) start -= 1;
+        var suffix: usize = 0;
+        const limit = @min(old.len, text.len) - start;
+        while (suffix < limit and old[old.len - suffix - 1] == text[text.len - suffix - 1]) suffix += 1;
+        while (suffix > 0 and text[text.len - suffix] & 0xc0 == 0x80) suffix -= 1;
+        try self.reparseEdit(@intCast(start), @intCast(old.len - suffix), @intCast(text.len - suffix), text);
     }
 
     /// Full reset of the owned text copy and its line index (buffer switch,
@@ -934,7 +971,7 @@ pub const Highlighter = struct {
     /// (dirty, range): the render loop's span+decor pair for the same
     /// viewport syncs once.
     fn ensureInjections(self: *Highlighter, start_byte: u32, end_byte: u32) !void {
-        const q = self.inj_query orelse return;
+        const q = self.queries.injections orelse return;
         if (self.tree == null) return;
         if (!self.inj_dirty and self.inj_start == start_byte and self.inj_end == end_byte) return;
         self.inj_dirty = false;
@@ -1234,7 +1271,7 @@ pub const Highlighter = struct {
             break :blk self.cursor.?;
         };
         cursor.setByteRange(start_byte, end_byte);
-        cursor.execute(self.query, tree.getRootNode());
+        cursor.execute(self.queries.highlight, tree.getRootNode());
         while (cursor.nextCapture()) |nc| {
             const match = nc[0];
             const cap = match.captures()[nc[1]];
@@ -1244,7 +1281,7 @@ pub const Highlighter = struct {
             // (see matchPredicates). Without this, "@type" with a
             // `#lua-match? "^[A-Z_]..."` predicate matches EVERY identifier.
             if (!matchPredicates(self, match, text)) continue;
-            const name = self.query.getCaptureNameForId(cap.id);
+            const name = self.queries.highlight.getCaptureNameForId(cap.id);
             // rainbow brackets: "@punctuation.bracket" spans get bracketN
             // instead of the plain .punctuation that captureStyle() would
             // fold them to (it collapses dotted suffixes onto the base).
@@ -1284,7 +1321,7 @@ pub const Highlighter = struct {
     /// The decoration-query pass over [start_byte, end_byte) for ONE tree.
     /// No predicates in the decor queries, so no matchPredicates here.
     fn decorQueryInto(self: *Highlighter, start_byte: u32, end_byte: u32, arena: std.mem.Allocator, out: *std.ArrayList(Decor)) !void {
-        const q = self.decor_query orelse return;
+        const q = self.queries.decorations orelse return;
         const tree = self.tree orelse return;
         const text = self.prev_text.items;
         const cursor = if (self.decor_cursor) |c| c else blk: {
@@ -1750,6 +1787,44 @@ test "highlight: markdown fence injection — zig fence content gets zig colors"
     try std.testing.expectEqual(Style.keyword, spanAt(spans.items, const_at).?);
     const one_at: u32 = @intCast(std.mem.indexOf(u8, src, "1").?);
     try std.testing.expectEqual(Style.number, spanAt(spans.items, one_at).?);
+}
+
+test "batched edits and undo match a fresh Markdown parse including injections" {
+    const a = std.testing.allocator;
+    var live = try Highlighter.init(a, "markdown");
+    defer live.deinit();
+    var reference = try Highlighter.init(a, "markdown");
+    defer reference.deinit();
+    const initial = "# Hé\r\n\r\n**one** and `two`\r\n\r\n```zig\r\nconst x = 12;\r\n```\r\n";
+    for ([_][]const u8{
+        initial,
+        "# Hê\r\n\r\n**one** and `two`\r\n\r\n```zig\r\nconst x = 12;\r\n```\r\n",
+        "## 中文\n\n*one* and `two`\n\n```zig\nconst s = \"中\";\n```\n",
+        initial, // undo a batch whose edits span multiple nodes
+        initial, // zero net change
+        "",
+        initial,
+    }) |text| {
+        try live.reparseChanges(text);
+        try reference.reparse(text);
+        try std.testing.expectEqualStrings(text, live.prev_text.items);
+        try expectPointsEqual(text, &live);
+        var actual = std.ArrayList(Span).empty;
+        defer actual.deinit(a);
+        var expected = std.ArrayList(Span).empty;
+        defer expected.deinit(a);
+        const end: u32 = @intCast(text.len);
+        try live.spansInRange(0, end, a, &actual);
+        try reference.spansInRange(0, end, a, &expected);
+        try std.testing.expectEqualSlices(Span, expected.items, actual.items);
+        var decorations = std.ArrayList(Decor).empty;
+        defer decorations.deinit(a);
+        var fresh = std.ArrayList(Decor).empty;
+        defer fresh.deinit(a);
+        try live.decorInRange(0, end, a, &decorations);
+        try reference.decorInRange(0, end, a, &fresh);
+        try std.testing.expectEqualDeep(fresh.items, decorations.items);
+    }
 }
 
 test "highlight: markdown inline injection survives incremental edits" {
@@ -2342,4 +2417,34 @@ test "highlight stability: lexical bracket pairs ignore quotes comments and inco
         }
         try std.testing.expectEqual(@as(?Style, .string), spanAt(spans.items, @intCast(quoted)));
     }
+}
+
+test "same-language buffers share immutable queries and retain independent parse state" {
+    const a = std.testing.allocator;
+    var first = try Highlighter.init(a, "markdown");
+    var second = first.forAnotherBuffer() catch |err| {
+        first.deinit();
+        return err;
+    };
+    defer second.deinit();
+    {
+        defer first.deinit();
+        try std.testing.expect(first.queries == second.queries);
+        try std.testing.expect(first.parser != second.parser);
+        try first.reparse("# First\n");
+        try second.reparse("**Second**\n");
+        try std.testing.expect(first.tree != second.tree);
+        try std.testing.expectEqualStrings("# First\n", first.prev_text.items);
+    }
+    var reference = try Highlighter.init(a, "markdown");
+    defer reference.deinit();
+    try reference.reparse("**Second**\n");
+    var actual = std.ArrayList(Span).empty;
+    var expected = std.ArrayList(Span).empty;
+    defer actual.deinit(a);
+    defer expected.deinit(a);
+    try second.spansInRange(0, 11, a, &actual);
+    try reference.spansInRange(0, 11, a, &expected);
+    try std.testing.expect(actual.items.len > 0);
+    try std.testing.expectEqualSlices(Span, expected.items, actual.items);
 }

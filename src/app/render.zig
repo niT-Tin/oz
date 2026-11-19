@@ -330,6 +330,20 @@ fn addWrappedText(layout: *wrap.Layout, win: vaxis.Window, text: []const u8) voi
     }
 }
 const LineWrap = struct { cursor: wrap.Pos, rows: u32 };
+
+// Printable ASCII has exactly one cell per byte. Inspect complete lines so a
+// combining mark in the next piece always selects the grapheme-aware path.
+fn plainAscii(pt: *const buffer.PieceTable, start: u32, end: u32) bool {
+    var pos = start;
+    while (pos < end) {
+        const piece = pt.bytesAt(pos);
+        const bytes = piece[0..@min(end - pos, piece.len)];
+        for (bytes) |b| if (!std.ascii.isPrint(b)) return false;
+        pos += @intCast(bytes.len);
+    }
+    return true;
+}
+
 fn lineWrap(self: *App, win: vaxis.Window, buf: *Buffer, buf_index: usize, line: u32, width: u32, target: ?u32) LineWrap {
     const ls = buf.pt.lineStart(line);
     const end = ls + buf.pt.lineTextLen(line);
@@ -338,6 +352,14 @@ fn lineWrap(self: *App, win: vaxis.Window, buf: *Buffer, buf_index: usize, line:
     var hint_i: usize = 0;
     const hints = if (!self.inlay_stale and self.inlay_buf == buf_index) self.inlay_hints.items else &.{};
     while (hint_i < hints.len and hints[hint_i].line < line) hint_i += 1;
+    const insert_eol = self.state.mode == .insert and buf_index == self.current and self.curCursor().* == end;
+    if ((hint_i == hints.len or hints[hint_i].line != line) and foldAt(buf, line) == null and plainAscii(&buf.pt, ls, end)) {
+        const col = @min(target orelse end, end) -| ls;
+        const cw = layout.width;
+        const cursor = wrap.Pos{ .row = col / cw, .col = col % cw };
+        const text_rows = (end - ls -| 1) / cw + 1;
+        return .{ .cursor = cursor, .rows = if (insert_eol) @max(text_rows, cursor.row + 1) else text_rows };
+    }
     var it = LineGraphemes{ .pt = &buf.pt, .pos = ls, .end = end };
     while (it.next()) |g| {
         while (hint_i < hints.len and hints[hint_i].line == line and hints[hint_i].character <= g.start - ls) : (hint_i += 1)
@@ -359,7 +381,7 @@ fn lineWrap(self: *App, win: vaxis.Window, buf: *Buffer, buf_index: usize, line:
         addWrappedText(&layout, win, std.fmt.bufPrint(&mbuf, " … {d} lines", .{f.hiddenCount()}) catch "");
     }
     var rows = layout.pos.row + 1;
-    if (self.state.mode == .insert and buf_index == self.current and buf.pt.lineOf(self.curCursor().*) == line and self.curCursor().* == end)
+    if (insert_eol)
         rows = @max(rows, result.?.row + 1);
     return .{ .cursor = result.?, .rows = rows };
 }
@@ -527,7 +549,7 @@ fn displayRowsWithMarkdown(self: *App, win: vaxis.Window, buf: *Buffer, buf_inde
 pub const ScreenPos = struct { row: u32, col: u32 };
 pub fn focusedScreenPos(self: *App, win: vaxis.Window, rect: LeafRect, line: u32, pos: u32) ScreenPos {
     const buf = self.cur();
-    const cw: u32 = @max(rect.width -| self.gutterWidthFor(buf.pt.lineCount(), rect.width), 1);
+    const cw: u32 = @max(rect.width -| self.gutterWidthFor(buf.pt.lineCountUpperBound(), rect.width), 1);
     const md_layout = if (self.state.mode == .normal and !self.mc_active and !self.em_active and self.markdown_frame_buf == self.current)
         self.markdown_frame
     else
@@ -599,7 +621,7 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
     // cursor sat there) — clamp before any line math, which asserts on
     // out-of-range positions (lineOf / lineStart).
     if (w.cursor > buf.pt.len()) w.cursor = buf.pt.len();
-    if (w.view_top > buf.pt.lineCount() -| 1) w.view_top = buf.pt.lineCount() -| 1;
+    w.view_top = buf.pt.clampLine(w.view_top);
 
     // Fold backstop: the cursor must never sit on a hidden line. Every
     // fold-aware motion snaps already; this catches the paths that don't
@@ -607,9 +629,14 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
     w.cursor = foldSnapPos(buf, w.cursor);
 
     const cursor_line = buf.pt.lineOf(w.cursor);
-    const line_count = buf.pt.lineCount();
+    // Folded ranges can skip arbitrary distances. In an unfolded pane only
+    // the viewport and its next line need to be addressable.
+    const line_count = buf.pt.knownLineCount() orelse if (buf.folds.items.len != 0)
+        buf.pt.lineCount()
+    else
+        buf.pt.clampLine(@max(w.view_top, cursor_line) +| rect.height +| 1) + 1;
     // relative-number gutter: computed once per frame per window
-    const gutter_layout = gutter_model.forPane(line_count, rect.width);
+    const gutter_layout = gutter_model.forPane(buf.pt.lineCountUpperBound(), rect.width);
     const gutter = gutter_layout.width;
     const gutter_digits = gutter_layout.number_columns;
     // text columns per screen row: soft wrap splits a line every
@@ -644,33 +671,19 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
     const cur_line_rows = displayRowsWithMarkdown(self, win, buf, w.buf, cursor_line, content_width, active_md);
     const cursor_before_rows = markdownVirtualRows(win, active_md, cursor_line, content_width, true, false);
     const cursor_wrap_row: u32 = cursor_before_rows + cursor_layout.cursor.row;
-    // Rows between view_top and the cursor's row (view_top row counts as
-    // row 0). Single forward pass with a ring of per-line row counts: as
-    // the walk advances, view_top follows so the window never spans more
-    // than rect.height rows — the pass ends with view_top at the highest
-    // line for which the cursor's row is still visible.
-    var rows_to_cursor: u32 = 0;
-    {
-        const ring = try a.alloc(u32, rect.height);
-        var head: u32 = 0; // ring slot of view_top's row count
-        var cnt: u32 = 0; // lines in the ring
-        var sum: u32 = 0; // their rows
-        var l = w.view_top;
-        while (l < cursor_line) {
-            const r = displayRowsWithMarkdown(self, win, buf, w.buf, l, content_width, active_md);
-            ring[(head + cnt) % rect.height] = r;
-            cnt += 1;
-            sum += r;
-            while (sum + cursor_wrap_row >= rect.height and cnt > 0) {
-                sum -= ring[head];
-                head = (head + 1) % rect.height;
-                cnt -= 1;
-                w.view_top = foldNextLine(buf, w.view_top);
-            }
-            l = foldNextLine(buf, l);
-        }
-        rows_to_cursor = sum + cursor_wrap_row;
+    // Walk back from the destination. Once the screen is full, no earlier
+    // line can be visible. A jump to EOF costs at most one viewport of
+    // measurements even when the old viewport was millions of lines away.
+    var rows_to_cursor = cursor_wrap_row;
+    var top = cursor_line;
+    while (top > w.view_top and rows_to_cursor < rect.height) {
+        const prev = foldPrevLine(buf, top);
+        const rows = displayRowsWithMarkdown(self, win, buf, w.buf, prev, content_width, active_md);
+        if (rows >= rect.height - rows_to_cursor) break;
+        rows_to_cursor += rows;
+        top = prev;
     }
+    w.view_top = top;
     w.view_wrap = if (w.view_top == cursor_line and cursor_wrap_row >= rect.height)
         cursor_wrap_row - rect.height + 1
     else
@@ -1260,7 +1273,8 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
             if (prev_blank != null and line == prev_blank.? + 1) {
                 ctx_levels = blank_run_ctx;
             } else {
-                ctx_levels = self.blankContextLevels(buf, line, line_count);
+                const context_count = buf.pt.knownLineCount() orelse (buf.pt.clampLine(line +| 500) + 1);
+                ctx_levels = self.blankContextLevels(buf, line, context_count);
                 blank_run_ctx = ctx_levels;
             }
             prev_blank = line;
@@ -2544,7 +2558,7 @@ pub fn drawRichPopup(
         }
     }
     // Build each block: joined text, per-line byte offsets, and
-    // merged tree-sitter spans (all arena — the highlighter lives
+    // merged tree-sitter spans (the highlighter lives
     // only for this frame). The fence language wins; a bare or
     // unknown fence falls back to the current file's language.
     for (blocks.items) |*blk| {
@@ -2562,12 +2576,12 @@ pub fn drawRichPopup(
         var hl: ?syntax.Highlighter = null;
         if (blk.lang) |l| {
             if (l.len > 0) {
-                if (syntax.languageFor(l)) |ln| hl = syntax.Highlighter.init(a, ln) catch null;
+                if (syntax.languageFor(l)) |ln| hl = self.newHighlighter(ln) catch null;
             }
         }
         if (hl == null) {
             const ft = autil.filetypeOf(self.cur().path);
-            if (syntax.languageFor(ft)) |ln| hl = syntax.Highlighter.init(a, ln) catch null;
+            if (syntax.languageFor(ft)) |ln| hl = self.newHighlighter(ln) catch null;
         }
         if (hl) |*h| {
             defer h.deinit();
@@ -3015,10 +3029,10 @@ fn completionLiteralRow(self: *App, a: std.mem.Allocator, win: vaxis.Window, tex
 /// native parsers per frame (a multi-second stall on completion docs).
 fn completionBlockSpans(self: *App, a: std.mem.Allocator, text: []const u8, lang: []const u8) ![]syntax.Span {
     var hl: ?syntax.Highlighter = null;
-    if (syntax.languageFor(lang)) |ln| hl = syntax.Highlighter.init(a, ln) catch null;
+    if (syntax.languageFor(lang)) |ln| hl = self.newHighlighter(ln) catch null;
     if (hl == null) {
         const ft = autil.filetypeOf(self.cur().path);
-        if (syntax.languageFor(ft)) |ln| hl = syntax.Highlighter.init(a, ln) catch null;
+        if (syntax.languageFor(ft)) |ln| hl = self.newHighlighter(ln) catch null;
     }
     if (hl) |*h| {
         // Parser/query/tree/cursor are native resources: freeing the frame
@@ -3365,10 +3379,9 @@ pub fn render(self: *App) !void {
     // piece_table.lineOf asserts pos <= len in Debug builds.
     const fw = &self.windows.items[self.current_win];
     if (fw.cursor > self.cur().pt.len()) fw.cursor = self.cur().pt.len();
-    if (fw.view_top > self.cur().pt.lineCount() -| 1) fw.view_top = self.cur().pt.lineCount() -| 1;
+    fw.view_top = self.cur().pt.clampLine(fw.view_top);
 
     const cursor_line = self.cur().pt.lineOf(self.curCursor().*);
-    const line_count = self.cur().pt.lineCount();
     // Each pane owns one row immediately above its source. Hidden buffers
     // keep their last pane; a buffer shown in several panes has one tab,
     // with the focused pane taking ownership. No header can spill into a
@@ -3403,7 +3416,7 @@ pub fn render(self: *App) !void {
         }
         // The first filename shares the source's left text spine. On tiny
         // panes readability takes priority over the decorative alignment.
-        const text_col = self.gutterWidthFor(self.buffers.items[own].pt.lineCount(), lr.width);
+        const text_col = self.gutterWidthFor(self.buffers.items[own].pt.lineCountUpperBound(), lr.width);
         const inset = text_col -| (tabstrip.pad_left + tabstrip.icon_cells + tabstrip.gap_cells);
         const p = tabstrip.plan(tab_specs[0..n], lr.width -| inset);
         try self.drawBufferTabPlan(a, win, label_row, lr.col + inset, lr.win, p, tab_bufs[0..n]);
@@ -3566,9 +3579,10 @@ pub fn render(self: *App) !void {
         try self.renderWindowLines(a, lr, false);
     }
     // Cursor/overlays use the same focused-pane gutter as source and mouse.
-    const gutter = self.gutterWidthFor(line_count, cur_rect.width);
+    const gutter = self.gutterWidthFor(self.cur().pt.lineCountUpperBound(), cur_rect.width);
     self.addMousePaneTarget(cur_rect.win, cur_rect.row, cur_rect.col, cur_rect.height, cur_rect.width);
     try self.renderWindowLines(a, cur_rect, true);
+    if (cur_rect.width > 0 and cur_rect.height > 0) self.cur().line_index_frame_seen = true;
     hideInactiveMarkdownImages(self);
 
     // window separators (vim statusline semantics): one "─" row per
@@ -4721,7 +4735,11 @@ pub fn render(self: *App) !void {
     var pos_buf: [64]u8 = undefined;
     // Keep the established, testable wording while sourcing the column from
     // document cells (not `screenCellCol`, which includes inlay hints).
-    const pos_text = std.fmt.bufPrint(&pos_buf, "line {d}/{d} col {d}", .{ cursor_line + 1, line_count, doc_col }) catch "?";
+    const known_total = self.cur().pt.knownLineCount();
+    const pos_text = if (known_total) |n|
+        std.fmt.bufPrint(&pos_buf, "line {d}/{d} col {d}", .{ cursor_line + 1, n, doc_col }) catch "?"
+    else
+        std.fmt.bufPrint(&pos_buf, "line {d}/… col {d}", .{ cursor_line + 1, doc_col }) catch "?";
 
     var lsp_buf: [64]u8 = undefined;
     var lsp_text: ?[]const u8 = null;
@@ -4785,8 +4803,8 @@ pub fn render(self: *App) !void {
     var progress_buf: [32]u8 = undefined;
     const progress_text: ?[]const u8 = blk: {
         if (win.width < 88) break :blk null;
-        if (line_count == 0) break :blk null;
         if (cursor_line == 0) break :blk "Top";
+        const line_count = known_total orelse break :blk null;
         if (cursor_line + 1 >= line_count) break :blk "Bot";
         const pct = (@as(u64, cursor_line + 1) * 100) / @as(u64, line_count);
         break :blk std.fmt.bufPrint(&progress_buf, "{d}%", .{pct}) catch null;
@@ -5200,7 +5218,11 @@ pub fn run(self: *App) !void {
         // the blame ghost appearing as the 1s CursorHold expires, or the
         // animation's last spread) and the loop would block forever
         // without ever drawing it. Force that one render.
-        var poll_transition = false;
+        // Present the first frame before counting far-away lines. Drain input
+        // between slices, and paint the final exact total even when idle.
+        const indexing = self.cur().line_index_frame_seen and self.cur().pt.knownLineCount() == null;
+        if (indexing) self.cur().pt.advanceLineIndex();
+        var poll_transition = indexing and self.cur().pt.knownLineCount() != null;
         if (self.scopeAnimActive() or self.blameHoldActive() or self.gitHoldActive() or self.animationActive() or self.completionResolveWaiting() or (term.supported and self.term_pane != null)) {
             std.Io.sleep(self.io, .fromMilliseconds(1), .real) catch {};
             self.poll_mode_active = true;
@@ -5212,7 +5234,7 @@ pub fn run(self: *App) !void {
             // The next iteration blocks as usual.
             self.poll_mode_active = false;
             poll_transition = true;
-        } else {
+        } else if (!indexing) {
             try self.loop.pollEvent();
         }
         var handled = false;

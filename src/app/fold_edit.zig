@@ -38,30 +38,20 @@ pub fn recordEdit(self: *App, pos: u32, before_len: u32, after: []const u8) !voi
 pub fn recordEditBuffer(self: *App, buf: *App.Buffer, pos: u32, before_len: u32, after: []const u8) !void {
     // No closed folds → no state to carry; skip the pre-edit newline scan
     // (this is the overwhelmingly common case for typing and large pastes).
-    if (buf.folds.items.len == 0) {
-        try buf.history.record(&buf.pt, pos, before_len, after);
-        return;
-    }
-    // Whole-document replacement: anchors cannot be tracked byte-wise, so the
-    // post-edit text is re-matched by header signature instead. Decided on the
-    // PRE-edit length.
-    const whole = fold.isWholeDocument(.{
+    const pre_len = buf.pt.len();
+    const inserted: u32 = @intCast(after.len);
+    const fold_span: ?fold.EditSpan = if (buf.folds.items.len == 0) null else .{
         .pos = pos,
         .removed = before_len,
-        .inserted = @intCast(after.len),
-        .removed_newlines = 0,
-        .inserted_newlines = 0,
-    }, buf.pt.len());
-    const span = fold.EditSpan{
-        .pos = pos,
-        .removed = before_len,
-        .inserted = @intCast(after.len),
+        .inserted = inserted,
         // Removed-byte newline count must be taken BEFORE the edit is applied.
         .removed_newlines = fold.newlinesIn(&buf.pt, pos, before_len),
         .inserted_newlines = fold.countNewlines(after),
     };
     try buf.history.record(&buf.pt, pos, before_len, after);
-    if (whole) {
+    buf.search_index.afterEdit(&buf.pt, buf.history.revision, pos, pos + before_len, pos + inserted);
+    const span = fold_span orelse return;
+    if (fold.isWholeDocument(span, pre_len)) {
         fold.reanchor(self.alloc, &buf.folds, &buf.pt) catch buf.folds.clearRetainingCapacity();
     } else {
         fold.transformFolds(&buf.folds, span, &buf.pt);
@@ -87,10 +77,17 @@ pub fn historyApply(self: *App, buf: *App.Buffer, kind: history_mod.UndoKind) hi
         .redo => buf.history.topRedoGroup(),
     } orelse return .{ .changed = false, .kind = kind, .revision = buf.history.revision };
     if (buf.folds.items.len > 0) transformThroughHistory(self, buf, group, kind);
-    return switch (kind) {
+    const pre_len = buf.pt.len();
+    const result = switch (kind) {
         .undo => buf.history.undoResult(&buf.pt),
         .redo => buf.history.redoResult(&buf.pt),
     };
+    if (result.changed) {
+        // Outside the group's changed range the suffix has identical bytes.
+        const old_end = pre_len - (buf.pt.len() - result.change_end);
+        buf.search_index.afterEdit(&buf.pt, result.revision, result.change_start, old_end, result.change_end);
+    }
+    return result;
 }
 
 fn transformThroughHistory(

@@ -20,6 +20,16 @@ const Buffer = App.Buffer;
 
 // ---- tree-sitter syntax highlighting ----
 
+/// Each view parses its own text; only compiled language queries are shared.
+pub fn newHighlighter(self: *App, lang: []const u8) !syntax.Highlighter {
+    for (self.buffers.items) |*other| {
+        if (other.hl) |*existing| {
+            if (std.mem.eql(u8, existing.lang_name, lang)) return existing.forAnotherBuffer();
+        }
+    }
+    return syntax.Highlighter.init(self.alloc, lang);
+}
+
 /// Merged non-overlapping spans for the visible byte range of `buf`
 /// (later spans win overlaps), arena-allocated. Empty when highlighting
 /// is inactive (no grammar for the filetype / over the size limit).
@@ -27,16 +37,24 @@ const Buffer = App.Buffer;
 /// Every buffer owns its highlighter (`Buffer.hl`), so ANY window —
 /// focused or not, showing the current buffer or another — gets real
 /// tree-sitter highlighting for what it displays. Reparse policy: a
-/// single recorded edit since the last parse takes the incremental path
-/// (tree.edit + parse); everything else (undo/redo, multi-edit ops, first
-/// parse, forced full reparses) falls back to a full reparse — the
-/// incremental bookkeeping must never guess.
+/// single recorded edit supplies exact offsets. A batch or undo uses the
+/// actual before/after text. First parses and explicit resets start fresh.
 pub fn visibleSpansFor(self: *App, buf: *Buffer, arena: std.mem.Allocator, view_top: u32, content_rows: u32) ![]syntax.Span {
+    const lang = if (buf.hl) |*h| h.lang_name else syntax.languageFor(autil.filetypeOf(buf.path)) orelse return &.{};
+    if (buf.pt.len() > syntax.bufferSizeLimit(lang)) {
+        if (buf.hl) |*h| {
+            h.deinit();
+            buf.hl = null;
+            buf.spans_cache_valid = false;
+            buf.decors_cache_valid = false;
+            if (buf.markdown_arena) |*md| md.deinit();
+            buf.markdown_arena = null;
+            buf.markdown_layout = null;
+        }
+        return &.{};
+    }
     if (buf.hl == null) {
-        const ft = autil.filetypeOf(buf.path);
-        const lang = syntax.languageFor(ft) orelse return &.{};
-        if (buf.pt.len() > syntax.SIZE_LIMIT) return &.{};
-        buf.hl = syntax.Highlighter.init(self.alloc, lang) catch null;
+        buf.hl = self.newHighlighter(lang) catch return &.{};
     }
     const hl = &buf.hl.?;
     const hist = &buf.history;
@@ -54,6 +72,8 @@ pub fn visibleSpansFor(self: *App, buf: *Buffer, arena: std.mem.Allocator, view_
         if (incremental) {
             const e = hist.last_record.?;
             try hl.reparseEdit(e.pos, e.pos + @as(u32, @intCast(e.before.len)), e.pos + @as(u32, @intCast(e.after.len)), text);
+        } else if (parsed and rev > buf.syntax_revision) {
+            try hl.reparseChanges(text);
         } else {
             try hl.reparse(text);
         }
@@ -134,7 +154,7 @@ pub fn visibleSpansFor(self: *App, buf: *Buffer, arena: std.mem.Allocator, view_
 /// Call AFTER visibleSpansFor so the tree is fresh.
 pub fn visibleDecorsFor(self: *App, buf: *Buffer, arena: std.mem.Allocator, view_top: u32, content_rows: u32) ![]syntax.Decor {
     const hl = if (buf.hl) |*h| h else return &.{};
-    if (hl.decor_query == null or hl.tree == null) return &.{};
+    if (hl.queries.decorations == null or hl.tree == null) return &.{};
     const rev = buf.history.revision;
     const line_count = buf.pt.lineCount();
     const start = buf.pt.lineStart(@min(view_top, line_count -| 1));
@@ -170,7 +190,7 @@ pub fn visibleMarkdownFor(
     content_width: u32,
 ) !?*markdown.Layout {
     const hl = if (buf.hl) |*h| h else return null;
-    if (hl.decor_query == null) return null;
+    if (hl.queries.decorations == null) return null;
     const rev = buf.history.revision;
     if (buf.markdown_layout != null and buf.markdown_cache_rev == rev and
         buf.markdown_cache_top == view_top and buf.markdown_cache_rows == content_rows and

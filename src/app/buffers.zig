@@ -202,7 +202,10 @@ fn openInBufferAt(self: *App, path: []const u8, target: OpenTarget) !bool {
     defer if (own_loaded) loaded.deinit();
     const new_path = try self.alloc.dupe(u8, abs);
     defer if (own_loaded) self.alloc.free(new_path);
-    var disk = disk_file.Baseline.init(self.alloc, self.io, abs, if (file != null) loaded.origin else null) catch |err| {
+    var disk = (if (file != null)
+        disk_file.Baseline.fromOrigin(self.alloc, self.io, abs, &loaded)
+    else
+        disk_file.Baseline.init(self.alloc, self.io, abs, null)) catch |err| {
         try self.setMsg(try std.fmt.allocPrint(self.alloc, "E484: cannot open {s}: {s}", .{ abs, @errorName(err) }));
         return false;
     };
@@ -225,6 +228,7 @@ fn openInBufferAt(self: *App, path: []const u8, target: OpenTarget) !bool {
         self.clearSpanCache(buf);
         buf.views.clear();
         buf.pt = loaded;
+        buf.line_index_frame_seen = false;
         buf.path = new_path;
         buf.disk = disk;
         buf.history = buffer.History.init(self.alloc);
@@ -370,22 +374,11 @@ pub fn requestQuit(self: *App, force: bool) void {
     self.quit = true;
 }
 
-/// FNV-1a hash of the current buffer content (for dirty detection).
-pub fn contentHash(self: *App) u64 {
-    var h: u64 = 0xcbf29ce484222325;
-    var buf: [4096]u8 = undefined;
-    var off: u32 = 0;
-    const len = self.cur().pt.len();
-    while (off < len) {
-        const n: u32 = @intCast(@min(buf.len, len - off));
-        self.cur().pt.copyRange(off, buf[0..n]);
-        for (buf[0..n]) |b| {
-            h ^= b;
-            h *%= 0x100000001b3;
-        }
-        off += n;
-    }
-    return h;
+fn scratchHash(buf: *const App.Buffer) u64 {
+    var hash = std.hash.Wyhash.init(0);
+    var it = buf.pt.iterator();
+    while (it.next()) |piece| hash.update(buf.pt.pieceBytes(piece));
+    return hash.final();
 }
 
 /// Called when an insert session begins (all entry paths). A fresh
@@ -397,15 +390,24 @@ pub fn beginInsertSession(self: *App) void {
     self.insert_session +%= 1;
     self.invalidatePassiveHints();
     self.closeCompletion();
-    self.insert_base_hash = self.contentHash();
-    self.insert_was_dirty = self.cur().dirty;
+    const buf = self.cur();
+    self.insert_clean_len = if (buf.dirty) null else buf.pt.len();
+    if (!buf.dirty and buf.disk == null and buf.pt.len() != 0)
+        self.insert_scratch_hash = scratchHash(buf);
 }
 
 /// Called when an insert session ends (exitInsert / exitMcInsert): a
 /// session with zero net change clears the dirty flag.
 pub fn endInsertSession(self: *App) void {
-    const now = self.contentHash();
-    if (!self.insert_was_dirty and now == self.insert_base_hash) {
-        self.cur().dirty = false;
-    }
+    const initial_len = self.insert_clean_len orelse return;
+    self.insert_clean_len = null;
+    const buf = self.cur();
+    if (!buf.dirty or buf.pt.len() != initial_len) return;
+    // A clean named buffer already has a saved fingerprint. Only an actual
+    // equal-length edit needs to read its bytes to establish equality.
+    const restored = if (buf.disk) |*disk|
+        disk.matchesBuffer(&buf.pt)
+    else
+        initial_len == 0 or scratchHash(buf) == self.insert_scratch_hash;
+    if (restored) buf.dirty = false;
 }

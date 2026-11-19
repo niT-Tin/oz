@@ -9,14 +9,21 @@
 //! "abc" has 1. `lineStart(n)` is the byte offset of line n's first byte,
 //! `lineLen(n)` excludes the trailing '\n'.
 //!
-//! `line_starts` is maintained incrementally: `init` builds it with a single
-//! full scan, and every `replace` updates only the affected suffix — line
-//! starts after the edit shift by the length delta, starts from '\n's inside
-//! the inserted bytes are added, and starts that fell inside the deleted span
-//! disappear — so it stays valid across edits without ever re-scanning the
-//! document. `compact` never touches it because compaction leaves the
-//! document content unchanged.
+//! Small buffers keep a dense index. Large owned files index immutable
+//! source pages on demand. The dense index is maintained incrementally: a single
+//! full scan initializes it. Starts up through the edited line are offsets from the start
+//! of the document; later starts are distances from EOF. Typing repeatedly
+//! on one line never rewrites the following offsets. Inserting or deleting
+//! newlines splices their slots. Compaction leaves the index untouched.
 const std = @import("std");
+
+const PageIndex = @import("line_pages.zig").Index;
+const PagedLines = struct {
+    origin: PageIndex = .{},
+    add: PageIndex = .{},
+    total: ?u32 = null,
+};
+const paged_threshold = 4 * 1024 * 1024;
 
 pub const Piece = struct {
     source: enum { origin, add },
@@ -33,15 +40,37 @@ pub const Edit = struct {
     after: []const u8,
 };
 
+/// Baselines, tables and worker snapshots share these immutable bytes.
+pub const OwnedOrigin = struct {
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    refs: std.atomic.Value(usize) = .init(1),
+    // Only the serialized Git status worker accesses this cache. A verified
+    // Git object ID identifies the exact immutable bytes across revisions.
+    verified_blob: [64]u8 = undefined,
+    verified_blob_len: u8 = 0,
+
+    pub fn release(self: *OwnedOrigin) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) {
+            self.allocator.free(self.bytes);
+            self.allocator.destroy(self);
+        }
+    }
+};
+
 pub const PieceTable = struct {
     allocator: std.mem.Allocator,
-    origin: []u8, // initial content (owned copy, or a read-only file mapping)
+    origin: []const u8, // initial content (owned copy, or a read-only file mapping)
+    shared_origin: ?*OwnedOrigin = null,
     /// When non-null, `origin` aliases this read-only mmap of the loaded file
     /// and deinit must munmap it instead of freeing (see `initMapped`).
     origin_mapping: ?[]align(std.heap.page_size_min) u8 = null,
     add: std.ArrayList(u8), // append-only edit bytes
     pieces: std.ArrayList(Piece), // ordered pieces covering the whole doc
     line_starts: std.ArrayList(u32), // cached; line_starts[0] == 0
+    /// First line whose stored offset is relative to EOF.
+    suffix_start: usize = 0,
+    pages: ?*PagedLines = null,
 
     // --- internal bookkeeping (not part of the public contract) ---
     /// Cached logical document length so that `len()` is O(1). Maintained by
@@ -90,15 +119,17 @@ pub const PieceTable = struct {
                 .len = @intCast(initial.len),
             });
         }
-        self.ensureLineStarts();
+        if (initial.len >= paged_threshold) {
+            const pages = try allocator.create(PagedLines);
+            pages.* = .{};
+            self.pages = pages;
+        } else self.ensureLineStarts();
         return self;
     }
 
     /// Create a table whose origin is a read-only file mapping (zero-copy
-    /// load path: the file bytes are never copied into the heap). The
-    /// mapping must stay alive for the table's lifetime; `deinit` munmaps
-    /// it. Only used for regular files where mmap succeeds — the load path
-    /// falls back to `init` (read + copy) otherwise.
+    /// view). External writes can change these bytes. Normal editor file
+    /// loading uses initOwned; deinit unmaps this alternative representation.
     pub fn initMapped(allocator: std.mem.Allocator, mapping: []align(std.heap.page_size_min) u8) !PieceTable {
         var self = PieceTable{
             .allocator = allocator,
@@ -125,15 +156,36 @@ pub const PieceTable = struct {
         return self;
     }
 
+    /// Share the existing heap allocation without copying its contents. A file
+    /// mapping can reflect external writes and cannot be used as a baseline.
+    pub fn retainOwnedOrigin(self: *PieceTable) !*OwnedOrigin {
+        std.debug.assert(self.origin_mapping == null);
+        const origin = self.shared_origin orelse blk: {
+            const owner = try self.allocator.create(OwnedOrigin);
+            owner.* = .{ .allocator = self.allocator, .bytes = self.origin };
+            self.shared_origin = owner;
+            break :blk owner;
+        };
+        _ = origin.refs.fetchAdd(1, .monotonic);
+        return origin;
+    }
+
     pub fn deinit(self: *PieceTable) void {
         if (self.origin_mapping) |m| {
             std.posix.munmap(m);
+        } else if (self.shared_origin) |owner| {
+            owner.release();
         } else {
             self.allocator.free(self.origin);
         }
         self.add.deinit(self.allocator);
         self.pieces.deinit(self.allocator);
         self.line_starts.deinit(self.allocator);
+        if (self.pages) |pages| {
+            pages.origin.deinit(self.allocator);
+            pages.add.deinit(self.allocator);
+            self.allocator.destroy(pages);
+        }
         self.scratch.deinit(self.allocator);
     }
 
@@ -146,6 +198,11 @@ pub const PieceTable = struct {
     /// O(1) amortized via the `byte_hint` (last resolved piece). Out of range
     /// is a bug (debug assert).
     pub fn byteAt(self: *const PieceTable, pos: u32) u8 {
+        return self.bytesAt(pos)[0];
+    }
+
+    /// Contiguous bytes from pos to the end of its piece, valid until an edit.
+    pub fn bytesAt(self: *const PieceTable, pos: u32) []const u8 {
         std.debug.assert(pos < self.doc_len);
         // Start the scan from the last piece this query resolved: pieces are
         // contiguous and ordered, so for any pos at/after that piece's start
@@ -158,12 +215,11 @@ pub const PieceTable = struct {
         }
         for (self.pieces.items[start_i..], start_i..) |p, i| {
             if (pos < offset + p.len) {
-                const src: []const u8 = if (p.source == .origin) self.origin else self.add.items;
                 // Benign interior mutation (same pattern as ensureLineStarts).
                 const s: *PieceTable = @constCast(self);
                 s.byte_hint_index = i;
                 s.byte_hint_offset = offset;
-                return src[@as(usize, p.start) + (pos - offset)];
+                return self.pieceBytes(p)[pos - offset ..];
             }
             offset += p.len;
         }
@@ -287,8 +343,13 @@ pub const PieceTable = struct {
         // Commit: adopt the new piece list (the old list becomes the scratch
         // for the next edit, keeping its capacity), then update the cached
         // line index incrementally.
+        if (self.pages) |pg| {
+            if (pg.total) |total| {
+                const removed = if (del_len == 0) 0 else self.pagedLineOf(pos + del_len) - self.pagedLineOf(pos);
+                pg.total = total - removed + @import("line_pages.zig").countNewlines(after);
+            }
+        }
         std.mem.swap(std.ArrayList(Piece), &self.pieces, scratch);
-        self.doc_len = @intCast(@as(u64, doc_len) + @as(u64, bytes.len) - @as(u64, del_len));
         self.byte_hint_index = 0;
         self.byte_hint_offset = 0;
         if (self.line_starts_valid) {
@@ -298,6 +359,8 @@ pub const PieceTable = struct {
                 self.line_starts_valid = false;
             };
         }
+        // The index update decodes distances against the pre-edit EOF.
+        self.doc_len = @intCast(@as(u64, doc_len) + @as(u64, bytes.len) - @as(u64, del_len));
 
         return .{ .pos = pos, .before_len = del_len, .after = after };
     }
@@ -322,20 +385,17 @@ pub const PieceTable = struct {
 
         // First line start strictly after the deleted span. O(deleted lines).
         var le: usize = li + 1;
-        while (le < starts.items.len and starts.items[le] <= del_end) le += 1;
-
-        // Shift the untouched suffix by the length delta (values only; the
-        // removed and inserted slots are handled by the replaceRange below).
-        const delta: i64 = @as(i64, @intCast(bytes.len)) - @as(i64, del_len);
-        if (delta != 0) {
-            for (starts.items[le..]) |*s| {
-                s.* = @intCast(@as(i64, s.*) + delta);
-            }
-        }
+        while (le < starts.items.len and self.cachedLineStart(le) <= del_end) le += 1;
 
         // Old starts in [li+1, le) disappeared; the '\n's in `bytes` replace
         // them (possibly zero of either).
         const n_new = std.mem.count(u8, bytes, "\n");
+        if (bytes.len == del_len and n_new == 0 and le == li + 1) return;
+        // Convert only entries crossed since the previous edit. Subtracting
+        // from the old EOF works in either direction. New starts are absolute.
+        const boundary = li + 1;
+        for (starts.items[@min(boundary, self.suffix_start)..@max(boundary, self.suffix_start)]) |*entry|
+            entry.* = self.doc_len - entry.*;
         if (n_new > 0) {
             const tmp = try self.allocator.alloc(u32, n_new);
             defer self.allocator.free(tmp);
@@ -350,31 +410,110 @@ pub const PieceTable = struct {
         } else if (le > li + 1) {
             try starts.replaceRange(self.allocator, li + 1, le - li - 1, &[_]u32{});
         }
+        self.suffix_start = boundary + n_new;
     }
 
-    /// Number of lines (vim semantics, see header). O(1) via line_starts.
+    fn cachedLineStart(self: *const PieceTable, line: usize) u32 {
+        const offset = self.line_starts.items[line];
+        return if (line < self.suffix_start) offset else self.doc_len - offset;
+    }
+
+    fn pageSource(self: *const PieceTable, p: Piece) struct { index: *PageIndex, bytes: []const u8 } {
+        return if (p.source == .origin)
+            .{ .index = &self.pages.?.origin, .bytes = self.origin }
+        else
+            .{ .index = &self.pages.?.add, .bytes = self.add.items };
+    }
+
+    fn pagedLineOf(self: *const PieceTable, pos: u32) u32 {
+        var remaining = pos;
+        var lines: u32 = 0;
+        for (self.pieces.items) |p| {
+            if (remaining == 0) break;
+            const src = self.pageSource(p);
+            const take = @min(remaining, p.len);
+            lines += src.index.rank(self.allocator, src.bytes, p.start + take) -
+                src.index.rank(self.allocator, src.bytes, p.start);
+            remaining -= take;
+        }
+        if (pos == self.doc_len) self.pages.?.total = lines + 1;
+        return lines;
+    }
+
+    fn pagedLineStart(self: *const PieceTable, line: u32) ?u32 {
+        if (line == 0) return 0;
+        var left = line;
+        var offset: u32 = 0;
+        for (self.pieces.items) |p| {
+            const src = self.pageSource(p);
+            const before = src.index.rank(self.allocator, src.bytes, p.start);
+            if (std.math.add(u32, before, left)) |ordinal| {
+                if (src.index.select(self.allocator, src.bytes, p.start + p.len, ordinal)) |lf|
+                    return offset + (lf - p.start) + 1;
+            } else |_| {}
+            left -= src.index.rank(self.allocator, src.bytes, p.start + p.len) - before;
+            offset += p.len;
+        }
+        self.pages.?.total = line - left + 1;
+        return null;
+    }
+
+    /// Exact last reachable line up to the requested zero-based index.
+    pub fn clampLine(self: *const PieceTable, line: u32) u32 {
+        if (self.pages) |pg| {
+            if (pg.total) |n| return @min(line, n - 1);
+            return if (self.pagedLineStart(line) != null) line else pg.total.? - 1;
+        }
+        return @min(line, self.lineCount() - 1);
+    }
+
+    pub fn knownLineCount(self: *const PieceTable) ?u32 {
+        return if (self.pages) |pg| pg.total else self.lineCount();
+    }
+
+    /// A layout sizing bound, never displayed as the actual number of lines.
+    pub fn lineCountUpperBound(self: *const PieceTable) u32 {
+        return self.knownLineCount() orelse (self.len() +| 1);
+    }
+
+    /// Once a frame has been presented, populate coarse counts in bounded
+    /// slices on the UI thread. Per-line offsets stay on demand.
+    pub fn advanceLineIndex(self: *const PieceTable) void {
+        const pg = self.pages orelse return;
+        if (pg.total != null) return;
+        if (!pg.origin.advance(self.allocator, self.origin, 128)) return;
+        if (!pg.add.advance(self.allocator, self.add.items, 128)) return;
+        _ = self.pagedLineOf(self.doc_len);
+    }
+
     pub fn lineCount(self: *const PieceTable) u32 {
+        if (self.pages) |pg| return pg.total orelse (self.pagedLineOf(self.doc_len) + 1);
         self.ensureLineStarts();
         return @intCast(self.line_starts.items.len);
     }
 
     /// Byte offset of the first byte of `line`. Assumes line < lineCount.
     pub fn lineStart(self: *const PieceTable, line: u32) u32 {
+        if (self.pages != null) return self.pagedLineStart(line).?;
         self.ensureLineStarts();
         std.debug.assert(line < self.line_starts.items.len);
-        return self.line_starts.items[@as(usize, line)];
+        return self.cachedLineStart(line);
     }
 
     /// Byte length of `line`, excluding its trailing '\n' (if any).
     pub fn lineLen(self: *const PieceTable, line: u32) u32 {
+        if (self.pages != null) {
+            const start = self.lineStart(line);
+            return if (self.pagedLineStart(line + 1)) |next| next - start - 1 else self.doc_len - start;
+        }
         self.ensureLineStarts();
         const starts = self.line_starts.items;
         std.debug.assert(line < starts.len);
-        const s = starts[@as(usize, line)];
+        const s = self.cachedLineStart(line);
         if (line + 1 < starts.len) {
             // The next line start is preceded by '\n' (it is a line start),
             // so this line's content is [s, next) minus that '\n'.
-            return starts[@as(usize, line) + 1] - s - 1;
+            return self.cachedLineStart(@as(usize, line) + 1) - s - 1;
         }
         return self.doc_len - s;
     }
@@ -387,7 +526,7 @@ pub const PieceTable = struct {
     /// `\r` too).
     pub fn lineTextLen(self: *const PieceTable, line: u32) u32 {
         const raw_len = self.lineLen(line);
-        if (line + 1 < self.lineCount() and raw_len > 0 and
+        if (raw_len > 0 and self.lineStart(line) + raw_len < self.doc_len and
             self.byteAt(self.lineStart(line) + raw_len - 1) == '\r')
         {
             return raw_len - 1;
@@ -398,6 +537,7 @@ pub const PieceTable = struct {
     /// Line containing byte offset `pos`. `pos == len` maps to the last line.
     pub fn lineOf(self: *const PieceTable, pos: u32) u32 {
         std.debug.assert(pos <= self.doc_len);
+        if (self.pages != null) return self.pagedLineOf(pos);
         self.ensureLineStarts();
         const starts = self.line_starts.items;
         // Greatest index with starts[i] <= pos (binary search).
@@ -405,7 +545,7 @@ pub const PieceTable = struct {
         var hi: usize = starts.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (starts[mid] <= pos) lo = mid + 1 else hi = mid;
+            if (self.cachedLineStart(mid) <= pos) lo = mid + 1 else hi = mid;
         }
         // starts[0] == 0 <= pos, so lo >= 1.
         std.debug.assert(lo >= 1);
@@ -484,13 +624,31 @@ pub const PieceTable = struct {
         for (s.pieces.items) |p| {
             const src: []const u8 = if (p.source == .origin) s.origin else s.add.items;
             const bytes = src[@as(usize, p.start) .. @as(usize, p.start) + p.len];
-            for (bytes, 0..) |b, k| {
+            // Scan a vector at a time, then visit only the newline lanes.
+            // The tail also handles short pieces produced by edits.
+            const lanes = std.simd.suggestVectorLength(u8) orelse 1;
+            var i: usize = 0;
+            if (lanes > 1) {
+                const V = @Vector(lanes, u8);
+                const Mask = @Int(.unsigned, lanes);
+                while (bytes.len - i >= lanes) : (i += lanes) {
+                    const block: V = bytes[i..][0..lanes].*;
+                    var hits: Mask = @bitCast(block == @as(V, @splat('\n')));
+                    if (@import("builtin").target.cpu.arch.endian() == .big) hits = @bitReverse(hits);
+                    while (hits != 0) : (hits &= hits - 1) {
+                        const k = i + @ctz(hits);
+                        s.line_starts.append(s.allocator, doc_off + @as(u32, @intCast(k)) + 1) catch unreachable;
+                    }
+                }
+            }
+            for (bytes[i..], i..) |b, k| {
                 if (b == '\n') {
                     s.line_starts.append(s.allocator, doc_off + @as(u32, @intCast(k)) + 1) catch unreachable;
                 }
             }
             doc_off += p.len;
         }
+        s.suffix_start = s.line_starts.items.len;
         s.line_starts_valid = true;
     }
 };
@@ -881,4 +1039,127 @@ test "random edits preserve all invariants (fixed seed)" {
 
     // Final state still matches the mirror.
     try expectDoc(&pt, alloc, expected.items);
+}
+
+test "piece table: rebuilding the line index across vector boundaries and fragments" {
+    const alloc = std.testing.allocator;
+    var bytes: [263]u8 = @splat('x');
+    const newlines = [_]usize{ 0, 15, 16, 30, 31, 32, 62, 63, 64, 127, 128, 255, 256, 262 };
+    for (newlines) |i| bytes[i] = '\n';
+    var table = try PieceTable.init(alloc, &bytes);
+    defer table.deinit();
+    _ = try table.replace(14, 75, bytes[14..89]);
+    table.line_starts_valid = false;
+    try std.testing.expectEqual(newlines.len + 1, table.lineCount());
+    for (newlines, 1..) |i, line| {
+        try std.testing.expectEqual(i + 1, table.lineStart(@intCast(line)));
+        try std.testing.expectEqual(line, table.lineOf(@intCast(i + 1)));
+    }
+}
+
+test "paged lines: viewport and edits precede full indexing, exact totals survive later edits" {
+    const a = std.testing.allocator;
+    const page = @import("line_pages.zig").page_size;
+    const bytes = try a.alloc(u8, paged_threshold * 3 + 17);
+    @memset(bytes, 'x');
+    for (0..1000) |i| bytes[i * 4] = '\n';
+    bytes[page - 1] = '\r';
+    bytes[page] = '\n';
+    bytes[bytes.len - 1] = '\n';
+    var pt = try PieceTable.initOwned(a, bytes);
+    defer pt.deinit();
+    try std.testing.expectEqual(@as(?u32, null), pt.knownLineCount());
+    try std.testing.expectEqual(0, pt.pages.?.origin.ends.items.len);
+    try std.testing.expectEqual(81, pt.clampLine(81));
+    try std.testing.expectEqual(317, pt.lineStart(80));
+    try std.testing.expectEqual(80, pt.lineOf(317));
+    try std.testing.expect(pt.pages.?.origin.ends.items.len <= 1);
+    _ = try pt.replace(3, 4, "a\r\nb\nc");
+    try std.testing.expectEqual(6, pt.lineStart(2));
+    try std.testing.expectEqual(4, pt.lineLen(1));
+    try std.testing.expectEqual(3, pt.lineTextLen(1));
+    try std.testing.expectEqual(@as(?u32, null), pt.knownLineCount());
+    pt.advanceLineIndex();
+    try std.testing.expectEqual(@as(?u32, null), pt.knownLineCount());
+    try std.testing.expect(pt.pages.?.origin.ends.items.len < bytes.len / page);
+    try std.testing.expectEqual(1004, pt.lineCount());
+    try std.testing.expectEqual(pt.len(), pt.lineStart(1003));
+    try std.testing.expectEqual(1003, pt.clampLine(std.math.maxInt(u32)));
+    _ = try pt.replace(pt.len() - 1, 1, "");
+    try std.testing.expectEqual(@as(?u32, 1003), pt.knownLineCount());
+    _ = try pt.replace(pt.len(), 0, "\r\n\n");
+    try std.testing.expectEqual(@as(?u32, 1005), pt.knownLineCount());
+    try std.testing.expectEqual(0, pt.lineTextLen(1003));
+    try std.testing.expectEqual(pt.len(), pt.lineStart(1004));
+}
+
+test "paged lines: fragmented original and append pages agree with an independent newline map" {
+    const a = std.testing.allocator;
+    const page = @import("line_pages.zig").page_size;
+    var model: std.ArrayList(u8) = .empty;
+    defer model.deinit(a);
+    try model.resize(a, paged_threshold + 3);
+    @memset(model.items, 'a');
+    @memset(model.items[page .. 2 * page], '\n');
+    for ([_]usize{ 0, page - 1, 3 * page, paged_threshold }) |i| model.items[i] = '\n';
+    var pt = try PieceTable.init(a, model.items);
+    defer pt.deinit();
+    const added = try a.alloc(u8, page + 11);
+    defer a.free(added);
+    @memset(added, '\n');
+    const Step = struct { at: u32, del: u32, insert: []const u8 };
+    for ([_]Step{
+        .{ .at = 40, .del = 1, .insert = added },
+        .{ .at = page + 49, .del = 4, .insert = "\r\nZ" },
+        .{ .at = 3 * page, .del = page + 7, .insert = "x\r\n\n" },
+        .{ .at = 0, .del = 1, .insert = "\n" },
+        .{ .at = 1, .del = 2 * page, .insert = "" },
+    }) |step| {
+        _ = try pt.replace(step.at, step.del, step.insert);
+        try model.replaceRange(a, step.at, step.del, step.insert);
+        pt.compact();
+        var starts: std.ArrayList(u32) = .empty;
+        defer starts.deinit(a);
+        try starts.append(a, 0);
+        for (model.items, 0..) |b, i| if (b == '\n') {
+            try starts.append(a, @intCast(i + 1));
+        };
+        for (starts.items, 0..) |start, n| {
+            if (n % 71 != 0 and n + 3 < starts.items.len) continue;
+            const line: u32 = @intCast(n);
+            const end = if (n + 1 < starts.items.len) starts.items[n + 1] - 1 else model.items.len;
+            try std.testing.expectEqual(start, pt.lineStart(line));
+            try std.testing.expectEqual(line, pt.lineOf(start));
+            try std.testing.expectEqual(line, pt.lineOf(@intCast(end)));
+            try std.testing.expectEqual(end - start, pt.lineLen(line));
+        }
+        try std.testing.expectEqual(starts.items.len, pt.lineCount());
+    }
+}
+
+test "paged lines: jump and edit beyond the signed 32-bit byte boundary" {
+    const a = std.testing.allocator;
+    // Reuse one immutable piece to exercise a real >2 GiB document offset
+    // with only 4 MiB of backing memory in the regular test suite.
+    const stride = 4 * 1024 * 1024;
+    const block = try a.alloc(u8, stride);
+    @memset(block, 'x');
+    block[stride - 1] = '\n';
+    var pt = try PieceTable.initOwned(a, block);
+    defer pt.deinit();
+    try pt.pieces.appendNTimes(a, pt.pieces.items[0], 512);
+    pt.doc_len = 513 * stride;
+
+    const boundary: u32 = 1 << 31;
+    try std.testing.expectEqual(boundary, pt.lineStart(512));
+    try std.testing.expectEqual(512, pt.lineOf(boundary + 1));
+    try std.testing.expectEqual(514, pt.lineCount());
+    _ = try pt.replace(boundary + 1, 1, "\r\nX");
+    try std.testing.expectEqual(boundary + 3, pt.lineStart(513));
+    try std.testing.expectEqual(1, pt.lineTextLen(512));
+    try std.testing.expectEqual(515, pt.lineCount());
+    try std.testing.expectEqual(514, pt.lineOf(pt.len()));
+    _ = try pt.replace(boundary + 1, 3, "x");
+    try std.testing.expectEqual(514, pt.lineCount());
+    try std.testing.expectEqual(pt.len(), pt.lineStart(513));
 }
