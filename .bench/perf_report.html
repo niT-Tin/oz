@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="zh-CN">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>oz · CPU 火焰图与终端延迟</title>
+  <style>
+  :root {
+    color-scheme: light;
+    --ink: #222d2b;
+    --muted: #52635e;
+    --line: #c5d0cb;
+    --paper: #fafbf8;
+    --accent: #00644f;
+    font: 15px/1.55 'Source Sans 3',system-ui,sans-serif;
+    color: var(--ink);
+    background: var(--paper);
+  }
+  * {
+    box-sizing: border-box;
+  }
+  body {
+    margin: 0;
+  }
+  main {
+    max-width: 1800px;
+    margin: auto;
+    padding: 32px clamp(16px,3vw,55px) 70px;
+  }
+  h1,
+  h2,
+  h3,
+  p {
+    margin: 0;
+  }
+  h1 {
+    font-size: clamp(24px,3vw,39px);
+    letter-spacing: -.04em;
+  }
+  h2 {
+    margin-top: 26px;
+    font-size: 21px;
+  }
+  p,
+  small,
+  caption {
+    color: var(--muted);
+  }
+  .control {
+    display: flex;
+    gap: 18px;
+    flex-wrap: wrap;
+    background: #ecf1ec;
+    padding: 13px 16px;
+    margin: 22px 0 16px;
+    align-items: center;
+  }
+  label {
+    display: flex;
+    gap: 7px;
+    align-items: center;
+  }
+  select,
+  button {
+    font: inherit;
+    background: white;
+    color: inherit;
+    border: 1px solid #8f9e97;
+    border-radius: 4px;
+    padding: 4px 9px;
+    cursor: pointer;
+  }
+  .control label { flex-wrap: wrap; max-width: 100%; }
+  .control select { max-width: 100%; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(2,minmax(0,1fr));
+    gap: 14px;
+    margin-top: 14px;
+  }
+  @media (min-width:1100px) {
+    .grid {
+      grid-template-columns: repeat(auto-fit,minmax(315px,1fr));
+    }
+  }
+  @media (max-width:700px) {
+    .grid {
+      grid-template-columns: 1fr;
+    }
+  }
+  article {
+    background: white;
+    border: 1px solid var(--line);
+    border-top: 3px solid var(--accent);
+    border-radius: 4px;
+    padding: 10px;
+    min-width: 0;
+  }
+  h3 {
+    font-size: 16px;
+  }
+  canvas {
+    width: 100%;
+    display: block;
+    margin: 10px 0;
+    cursor: crosshair;
+  }
+  output {
+    display: block;
+    font: 12px/1.4 ui-monospace,monospace;
+    overflow-wrap: anywhere;
+    min-height: 2.8em;
+  }
+  button {
+    font-size: 13px;
+    padding: 1px 7px;
+  }
+  button:disabled {
+    opacity: .45;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: white;
+    font-variant-numeric: tabular-nums;
+  }
+  td,
+  th {
+    text-align: right;
+    padding: 7px 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  td:first-child,
+  th:first-child {
+    text-align: left;
+  }
+  #hot td:first-child {
+    max-width: 55ch;
+    overflow-wrap: anywhere;
+  }
+  td:last-child {
+    color: var(--muted);
+  }
+  caption {
+    text-align: left;
+    padding: 4px 0 9px;
+    font-size: 14px;
+  }
+  .scroll {
+    overflow: auto;
+  }
+  summary {
+    cursor: pointer;
+    font-weight: 600;
+  }
+  details {
+    margin-top: 20px;
+  }
+  a {
+    color: var(--accent);
+  }
+  </style>
+  <main>
+<!--report-navigation-->
+<h1><span data-en="CPU flame graphs and terminal latency">oz · CPU 火焰图与终端延迟</span></h1>
+<p><span data-en="The same files and keys in a 120 × 40 terminal. Latencies come from separate runs without perf.">同一文件、按键和 120 × 40 终端。耗时取自独立的无采样运行。</span></p>
+<div class="control"><label><span data-en="File">文件</span> <select id="file"></select></label><label><span data-en="Operation">火焰图范围</span> <select id="phase"></select></label><label><span data-en="Processes">采样任务</span> <select id="scope"><option value="all" data-en="Editor and children">编辑器与子进程</option><option value="editor" data-en="Editor process only">任务名为 oz / nvim</option><option value="zls" data-en="ZLS only">任务名为 zls</option></select></label><label><span data-en="Scale">宽度</span> <select id="scale"><option value="local" data-en="Fit each graph">每张图占满</option><option value="shared" data-en="Same samples per run">每轮采样数同尺度</option></select></label></div>
+<h2><span data-en="User-space CPU flame graphs">用户态 CPU 火焰图</span></h2><p><span data-en="Read stacks from the bottom up. Hover for sample counts and click a frame to zoom. Fewer than 30 samples give only a rough indication. The process filter applies to CPU samples.">从下往上读调用链。悬停查看函数、采样数和占比，点击放大。少于 30 个样本时只作定位参考。火焰图的任务筛选只影响 CPU 样本。</span></p><div class="grid" id="charts"></div>
+<h2><span data-en="Time to visible response">按键到屏幕可见</span></h2><div class="scroll"><table><caption id="caption"></caption><thead><tr id="head"></tr></thead><tbody id="rows"></tbody></table></div>
+<h2><span data-en="Hottest functions">热点函数</span></h2><div class="control"><label><span data-en="Editor">版本</span> <select id="hotEditor"></select></label><label><span data-en="Attribution">口径</span> <select id="mode"><option value="self" data-en="Self (executing at sample time)">自身：采样时正在执行</option><option value="inclusive" data-en="Inclusive (anywhere in stack)">含下游：出现在调用链上</option></select></label></div>
+<div class="scroll"><table><caption id="hotCaption"></caption><thead><tr><th><span data-en="Function or symbol">函数或符号</span></th><th><span data-en="Samples">样本</span></th><th><span data-en="Share">占比</span></th><th><span data-en="Est. million cycles per run">每轮估算百万周期</span></th></tr></thead><tbody id="hot"></tbody></table></div>
+<details open><summary><span data-en="How to read these measurements">采样与口径</span></summary><p id="method"></p><p><span data-en="Width represents sampled CPU cycles. The default view includes child processes. Wall time also includes I/O, scheduling and animations. Unknown frames include stripped system libraries and LuaJIT. Sample counts do not measure function call counts.">火焰宽度代表用户态硬件周期样本，含该编辑器启动的子进程。等待 I/O、调度、动画的时间计入屏幕延迟。保留可解析的本机符号；unknown 含缺少调试符号的系统库和 LuaJIT。各图不推测 Lua 插件名。固定周期采样不提供函数的精确调用次数。</span></p></details>
+<noscript>Enable JavaScript to view the flame graphs. 请启用 JavaScript 查看火焰图。</noscript></main>
+  <script>
+  const data = PERF_REPORT_DATA;
+  const english = document.documentElement.lang === "en";
+  const tr = (en, zh) => english ? en : zh;
+  if (english) {
+    document.title = "CPU flame graphs and terminal latency · oz";
+    for (const node of document.querySelectorAll("[data-en]")) node.textContent = node.dataset.en;
+  }
+  const names = { final: "oz", nvim_clean: "nvim --clean" };
+  const labels = Object.keys(names).concat(data.entries.map((row) => row.editor));
+  const available = new Set(data.entries.map((row) => row.editor));
+  const editors = Object.fromEntries([...new Set(labels)].filter((id) => available.has(id)).map((id) => [id, names[id] || id]));
+  const files = {
+    "large.log": Math.round(data.sizes["large.log"] / 1048576) + tr(" MiB log", " MiB 多行日志"),
+    "code.zig": tr("33 KiB Zig source", "33 KiB Zig 源码"),
+    "wrapped.log": tr("Log with a 512 KiB line", "含 512 KiB 单行的日志"),
+    "notes.md": tr("165 KiB Markdown", "165 KiB Markdown"),
+    "hover.zig": tr("Zig cross-file hover", "Zig 跨文件文档"),
+  };
+  const phases = {
+    all: tr("All measured windows", "全部计时窗口"),
+    open_ms: tr("First frame", "打开文件"),
+    jump_ms: tr("First G", "G 到末尾"),
+    top_ms: tr("gg to start", "gg 到开头"),
+    line_ms: tr(":81 jump to line 81", ":81 跳到第 81 行"),
+    repeat_jump_ms: tr("G after undo", "再次 G 到末尾"),
+    search_ms: tr("Search /zqneedle", "搜索 /zqneedle"),
+    insert_ms: tr("First edit", "输入 TYPE_CHECK"),
+    scroll_ms: tr("Scroll 80j", "80j 滚动"),
+    undo_ms: tr("Undo", "u 撤销"),
+    save_ms: tr("First save to next input", "首次 :w 到可继续输入"),
+    switch_ms: tr(":e next.txt", ":e 打开纯文本"),
+    switch_zig_ms: tr(":e second.zig", ":e 打开第二个 Zig 文件"),
+    hover_ms: tr("K hover", "K 查看新符号文档"),
+  };
+  const el = (id) => document.getElementById(id),
+    num = (n) => n.toLocaleString("en-US"),
+    ms = (n) => n.toFixed(n < 10 ? 2 : 1);
+  const add = (parent, tag, content) => {
+    const e = document.createElement(tag);
+    if (content != null) e.textContent = content;
+    parent.append(e);
+    return e;
+  };
+  function option(parent, value, label) {
+    parent.add(new Option(label, value));
+  }
+  for (const [k, v] of Object.entries(files)) if (k in data.sizes) option(el("file"), k, v);
+  for (const k of Object.keys(data.sizes).sort((a,b) => parseInt(a) - parseInt(b))) {
+    const m = k.match(/^(\d+)-(cold|warm)\.log$/);
+    if (m) option(el("file"), k, m[1] + tr(" MiB · ", " MiB 日志 · ") + (m[2] === "cold" ? tr("cold file pages", "冷文件页") : tr("warm file pages", "热文件页")));
+  }
+  if ("2048-warm.log" in data.sizes) el("file").value = "2048-warm.log";
+  function refreshPhases() {
+    const before = el("phase").value || ("2048-warm.log" in data.sizes ? "insert_ms" : "switch_zig_ms");
+    el("phase").replaceChildren();
+    for (const [key, label] of Object.entries(phases)) {
+      if (key === "all" || data.entries.some((r) => r.file === el("file").value && r.phase === key)) {
+        option(el("phase"), key, label);
+      }
+    }
+    if ([...el("phase").options].some((o) => o.value === before)) el("phase").value = before;
+    render();
+  }
+  for (const [id, name] of Object.entries(editors)) option(el("hotEditor"), id, name);
+  el("hotEditor").value = "final";
+  function included(stack, id) {
+    const scope = el("scope").value, comm = data.symbols[stack[0]];
+    return scope === "all" || (scope === "editor" && comm === (id === "nvim" || id === "nvim_clean" ? "nvim" : "oz")) ||
+      (scope === "zls" && comm === "zls");
+  }
+  function tree(entries, id) {
+    const root = { name: tr("All samples", "全部样本"), n: 0, kids: new Map() };
+    for (const entry of entries) {
+      for (const [count, stack] of entry.stacks) {
+        if (!included(stack, id)) continue;
+        root.n += count;
+        let n = root;
+        for (const id of stack) {
+          if (!n.kids.has(id)) n.kids.set(id, { name: data.symbols[id], n: 0, kids: new Map() });
+          n = n.kids.get(id);
+          n.n += count;
+        }
+      }
+    }
+    return root;
+  }
+  const color = (s) => {
+    let h = 0;
+    for (const c of s) h = (Math.imul(h, 31) + c.charCodeAt(0)) >>> 0;
+    return s.includes("unknown") ? "#ccd4d4" : `hsl(${16 + h % 34} 78% ${62 + h % 17}%)`;
+  };
+  function hotspots() {
+    const ed = el("hotEditor").value,
+      phase = el("phase").value,
+      rows = data.entries.filter((r) =>
+        r.file === el("file").value && r.editor === ed && (phase === "all" || r.phase === phase)
+      ),
+      counts = new Map();
+    let total = 0;
+    const n = rows[0]?.traces || 1;
+    for (const r of rows) {
+      for (const [count, stack] of r.stacks) {
+        if (!included(stack, ed)) continue;
+        total += count;
+        const ids = el("mode").value === "self" ? [stack.at(-1)] : new Set(stack.slice(1));
+        for (const id of ids) counts.set(id, (counts.get(id) || 0) + count);
+      }
+    }
+    el("hot").replaceChildren();
+    for (const [id, c] of [...counts].sort((a, b) => b[1] - a[1]).slice(0, 15)) {
+      const tr = add(el("hot"), "tr");
+      for (
+        const v of [
+          data.symbols[id],
+          num(c),
+          (100 * c / total).toFixed(1) + "%",
+          (c * data.period / 1e6 / n).toFixed(1),
+        ]
+      ) add(tr, "td", v);
+    }
+    el("hotCaption").textContent = editors[ed] + " · " + phases[phase] + " · " + num(total) + tr(" samples · ", " 个样本 · ") +
+      n + tr(" runs. Inclusive shares can overlap.", " 轮。含下游的百分比可重叠。");
+  }
+  let drawAll = () => {};
+  function render() {
+    const file = el("file").value,
+      phase = el("phase").value,
+      entries = data.entries.filter((r) => r.file === file),
+      groups = Object.entries(editors).map(([id, name]) => {
+        const rows = entries.filter((r) => r.editor === id && (phase === "all" || r.phase === phase));
+        return { id, name, root: tree(rows, id), runs: rows[0]?.traces || 1 };
+      });
+    const shared = Math.max(1, ...groups.map((g) => g.root.n / g.runs));
+    const charts = el("charts");
+    charts.replaceChildren();
+    const drawFns = [];
+    for (const g of groups) {
+      const a = add(charts, "article");
+      add(a, "h3", g.name);
+      add(
+        a,
+        "small",
+        num(g.root.n) + tr(" samples · ", " 个样本 · ") + g.runs + tr(" runs · ", " 轮 · 每轮 ") + (g.root.n / g.runs).toFixed(1) + tr(" per run", " 个"),
+      );
+      const canvas = add(a, "canvas");
+      canvas.setAttribute("aria-label", g.name + tr(" flame graph", " 火焰图"));
+      const reset = add(a, "button", tr("Reset zoom", "重置视图")), info = add(a, "output");
+      let focus = g.root, rects = [];
+      const paint = () => {
+        const w = Math.max(1, canvas.clientWidth), dpr = window.devicePixelRatio || 1, rh = 16;
+        rects = [];
+        function walk(n, x, width, d) {
+          if (width < .65) return;
+          rects.push({ n, x, width, d });
+          let childX = x;
+          for (const child of [...n.kids.values()].sort((a, b) => a.name.localeCompare(b.name))) {
+            const widthChild = width * child.n / n.n;
+            walk(child, childX, widthChild, d + 1);
+            childX += widthChild;
+          }
+        }
+        const share = focus === g.root && el("scale").value === "shared" ? g.root.n / g.runs / shared : 1;
+        if (focus.n) walk(focus, 0, w * share, 0);
+        const h = (Math.max(4, ...rects.map((r) => r.d)) + 1) * rh;
+        canvas.style.height = h + "px";
+        canvas.width = Math.ceil(w * dpr);
+        canvas.height = Math.ceil(h * dpr);
+        const c = canvas.getContext("2d");
+        c.scale(dpr, dpr);
+        c.font = "11px ui-monospace, monospace";
+        for (const r of rects) {
+          r.y = h - (r.d + 1) * rh;
+          c.fillStyle = color(r.n.name);
+          c.fillRect(r.x, r.y, Math.max(.5, r.width - .5), rh - 1);
+          if (r.width > 26) {
+            c.save();
+            c.beginPath();
+            c.rect(r.x + 2, r.y, r.width - 5, rh);
+            c.clip();
+            c.fillStyle = "#152a25";
+            c.fillText(r.n.name, r.x + 3, r.y + 12);
+            c.restore();
+          }
+        }
+        reset.disabled = focus === g.root;
+        info.textContent = g.root.n === 0 ? tr("No user-space samples in this window", "本次计时窗口没有采到用户态周期样本") : focus.name;
+      };
+      function hit(event) {
+        const b = canvas.getBoundingClientRect();
+        return rects.find((r) =>
+          event.clientX - b.left >= r.x && event.clientX - b.left < r.x + r.width &&
+          event.clientY - b.top >= r.y && event.clientY - b.top < r.y + 16
+        );
+      }
+      canvas.onmousemove = (e) => {
+        const n = hit(e)?.n;
+        if (n) {
+          info.textContent = n.name + " · " + num(n.n) + tr(" samples · ", " 个样本 · ") + (100 * n.n / g.root.n).toFixed(1) +
+            "%";
+        }
+      };
+      canvas.onclick = (e) => {
+        const n = hit(e)?.n;
+        if (n) {
+          focus = n;
+          paint();
+        }
+      };
+      reset.onclick = () => {
+        focus = g.root;
+        paint();
+      };
+      drawFns.push(paint);
+    }
+    drawAll = () => drawFns.forEach((f) => f());
+    drawAll();
+    el("head").replaceChildren();
+    for (const title of [tr("Operation", "操作"), ...Object.values(editors)]) add(el("head"), "th", title);
+    el("rows").replaceChildren();
+    for (const [key, label] of Object.entries(phases)) {
+      const rows = entries.filter((r) => r.phase === key);
+      if (!rows.length) continue;
+      const tr = add(el("rows"), "tr");
+      add(tr, "td", label);
+      for (const id of Object.keys(editors)) {
+        const r = rows.find((r) => r.editor === id);
+        add(tr, "td", r ? ms(r.median) + " / " + ms(r.p90) : "—");
+      }
+    }
+    el("caption").textContent = num(data.sizes[file]) + tr(" bytes · ", " 字节 · 每项 ") + entries[0].n +
+      tr(" runs per cell · median / P90 in ms.", " 轮 · 格内为中位数 / P90，单位 ms。");
+    hotspots();
+    el("method").textContent = tr("Linux perf cycles:u, one sample per ", "Linux · perf cycles:u，每 ") + num(data.period) +
+      tr(" user-space cycles, frame-pointer stacks. Each run starts a new process. The timer stops on the first frame containing the target text.", " 个用户态 CPU 周期采一次，frame pointer 调用栈。从启动或发键计至目标内容首次可见。每轮均为新进程。冷、热文件页按文件选项标注。");
+  }
+  el("file").onchange = refreshPhases;
+  el("phase").onchange = render;
+  el("scale").onchange = render;
+  el("scope").onchange = render;
+  el("mode").onchange = hotspots;
+  el("hotEditor").onchange = hotspots;
+  window.addEventListener("resize", () => drawAll());
+  refreshPhases();
+  </script>
+</html>

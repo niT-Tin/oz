@@ -257,7 +257,7 @@ pub fn loadPreview(self: *App, path: []const u8) void {
     self.preview_text = text;
     const ft = autil.filetypeOf(path);
     if (syntax.languageFor(ft)) |lang| {
-        var hl = syntax.Highlighter.init(self.alloc, lang) catch return;
+        var hl = self.newHighlighter(lang) catch return;
         hl.reparse(text) catch {
             hl.deinit();
             return;

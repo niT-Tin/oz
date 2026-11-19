@@ -106,8 +106,7 @@ pub fn clampCursor(pt: *const PieceTable, pos: u32) u32 {
 /// never below the cursor line (the renderer would scroll it down anyway).
 pub fn clampViewTop(pt: *const PieceTable, top: u32, cursor: u32) u32 {
     const at_line = pt.lineOf(cursor);
-    const last_line = pt.lineCount() - 1;
-    return @min(@min(top, last_line), at_line);
+    return @min(top, at_line);
 }
 
 /// Re-validate a saved snapshot against the current document. Content is

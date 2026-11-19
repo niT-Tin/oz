@@ -443,12 +443,12 @@ fn panePositionAt(self: *App, win_idx: usize, rect: mouse.Rect, col: u32, row: u
     const w = &self.windows.items[win_idx];
     if (w.buf >= self.buffers.items.len) return null;
     const buf = &self.buffers.items[w.buf];
-    const line_count = buf.pt.lineCount();
+    const line_count = if (buf.folds.items.len == 0) buf.pt.clampLine(w.view_top +| rect.height) + 1 else buf.pt.lineCount();
     if (line_count == 0) return null;
     if (row < rect.row or row >= rect.row + rect.height) return null;
 
     const win = self.vx.window();
-    const gutter = self.gutterWidthFor(line_count, rect.width);
+    const gutter = self.gutterWidthFor(buf.pt.lineCountUpperBound(), rect.width);
     const content_width: u32 = @max(rect.width -| gutter, 1);
     const dr = row - rect.row;
 

@@ -3,9 +3,9 @@ name: website
 on:
   push:
     branches: [master]
-    paths: ['website/**', '.github/workflows/pages.yml']
+    paths: ['website/**', '.bench/perf_report.html', '.github/workflows/pages.yml']
   pull_request:
-    paths: ['website/**', '.github/workflows/pages.yml']
+    paths: ['website/**', '.bench/perf_report.html', '.github/workflows/pages.yml']
   release:
     types: [published]
   # Releases created by GITHUB_TOKEN do not trigger the release event.

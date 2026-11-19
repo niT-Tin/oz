@@ -16,7 +16,39 @@ pub const Index = struct {
     }
 
     pub fn ensure(self: *Index, a: std.mem.Allocator, pt: *const PieceTable, revision: u64, query: []const u8) !void {
-        if (self.valid and self.revision == revision and self.query != null and std.mem.eql(u8, self.query.?, query)) return;
+        if (self.valid and self.revision == revision) {
+            if (self.query) |prev| {
+                if (std.mem.eql(u8, prev, query)) return;
+                // A prefix whose first byte never recurs cannot overlap itself:
+                // its non-overlapping index contains every possible start.
+                if (prev.len > 0 and std.mem.startsWith(u8, query, prev) and
+                    self.starts.items.len <= 4096 and std.mem.findScalar(u8, prev[1..], prev[0]) == null)
+                {
+                    const owned = try a.dupe(u8, query);
+                    var count: usize = 0;
+                    var next_start: u32 = 0;
+                    for (self.starts.items) |pos| {
+                        if (pos < next_start or query.len > pt.len() - pos) continue;
+                        var offset = prev.len;
+                        while (offset < query.len) {
+                            const bytes = pt.bytesAt(pos + @as(u32, @intCast(offset)));
+                            const n = @min(bytes.len, query.len - offset);
+                            if (!std.mem.eql(u8, bytes[0..n], query[offset..][0..n])) break;
+                            offset += n;
+                        }
+                        if (offset == query.len) {
+                            self.starts.items[count] = pos;
+                            count += 1;
+                            next_start = pos + @as(u32, @intCast(query.len));
+                        }
+                    }
+                    self.starts.shrinkRetainingCapacity(count);
+                    a.free(prev);
+                    self.query = owned;
+                    return;
+                }
+            }
+        }
         var fresh = Index{ .revision = revision, .valid = true };
         errdefer fresh.deinit(a);
         fresh.query = try a.dupe(u8, query);
@@ -31,18 +63,27 @@ pub const Index = struct {
                 prefix[i] = k;
             }
             k = 0;
-            var pos: u32 = 0;
+            var base: u32 = 0;
             for (pt.pieces.items) |piece| {
-                const src = if (piece.source == .origin) pt.origin else pt.add.items;
-                for (src[piece.start..][0..piece.len]) |byte| {
+                const bytes = pt.pieceBytes(piece);
+                var i: usize = 0;
+                while (i < bytes.len) {
+                    // With no partial match, skip directly to the next possible
+                    // start. Carry KMP state across pieces and mismatches.
+                    if (k == 0 and bytes[i] != query[0]) {
+                        i = std.mem.findScalarPos(u8, bytes, i + 1, query[0]) orelse break;
+                    }
+                    const byte = bytes[i];
                     while (k > 0 and query[k] != byte) k = prefix[k - 1];
                     if (query[k] == byte) k += 1;
-                    pos += 1;
+                    i += 1;
                     if (k == query.len) {
-                        try fresh.starts.append(a, pos - @as(u32, @intCast(query.len)));
+                        const end = base + @as(u32, @intCast(i));
+                        try fresh.starts.append(a, end - @as(u32, @intCast(query.len)));
                         k = 0; // same non-overlap policy as highlight and n/N
                     }
                 }
+                base += piece.len;
             }
         }
         self.deinit(a);
@@ -57,6 +98,29 @@ pub const Index = struct {
             if (self.starts.items[mid] < pos) lo = mid + 1 else hi = mid;
         }
         return lo;
+    }
+
+    /// Carry an index over an edit when no old match was touched and no new
+    /// match can cross the edit. Uncertain cases rebuild on the next ensure.
+    pub fn afterEdit(self: *Index, pt: *const PieceTable, revision: u64, start: u32, old_end: u32, new_end: u32) void {
+        if (!self.valid or self.revision +% 1 != revision) return;
+        const query = self.query orelse return;
+        if (query.len == 0 or query.len > std.math.maxInt(u32)) return;
+        const from = start -| @as(u32, @intCast(query.len - 1));
+        const first = self.lowerBound(from);
+        const tail = self.starts.items[first..];
+        // Bound work on the edit path even when highlight is currently off.
+        if (new_end - from > 4096 or tail.len > 1024) return;
+        if (tail.len > 0 and tail[0] < old_end) return;
+        var pos = from;
+        while (pos < new_end) {
+            const piece = pt.bytesAt(pos);
+            const bytes = piece[0..@min(new_end - pos, piece.len)];
+            if (std.mem.findScalar(u8, bytes, query[0]) != null) return;
+            pos += @intCast(bytes.len);
+        }
+        for (tail) |*hit| hit.* = (hit.* - old_end) + new_end;
+        self.revision = revision;
     }
 
     /// Strictly before/after the anchor, then wrap, including a singleton.
@@ -177,5 +241,61 @@ test "search index: fragmented results agree with an independent byte-string ora
             try std.testing.expectEqual(fwd, index.next(@intCast(cursor), false));
             try std.testing.expectEqual(bwd, index.next(@intCast(cursor), true));
         }
+    }
+}
+
+test "search index: maintained offsets agree with fresh scans after insert, delete and replace" {
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(4871);
+    const random = prng.random();
+    for ([_][]const u8{ "aa", "ab", "aba", "中", "\nb", "needle" }) |query| {
+        var pt = try PieceTable.init(a, "abaaa\nbaa中needle");
+        defer pt.deinit();
+        var index = Index{};
+        defer index.deinit(a);
+        try index.ensure(a, &pt, 0, query);
+        for (1..160) |revision| {
+            const at = random.uintLessThan(u32, pt.len() + 1);
+            const remove = random.uintLessThan(u32, @min(pt.len() - at, 4) + 1);
+            const inserts = [_][]const u8{ "", "a", "baa", "中", "\n", "x", "needle" };
+            const insert = inserts[random.uintLessThan(usize, inserts.len)];
+            _ = try pt.replace(at, remove, insert);
+            index.afterEdit(&pt, revision, at, at + remove, at + @as(u32, @intCast(insert.len)));
+            try index.ensure(a, &pt, revision, query);
+            const flat = try a.alloc(u8, pt.len());
+            defer a.free(flat);
+            pt.copyRange(0, flat);
+            var from: usize = 0;
+            var count: usize = 0;
+            while (std.mem.findPos(u8, flat, from, query)) |hit| {
+                try std.testing.expect(count < index.starts.items.len);
+                try std.testing.expectEqual(hit, index.starts.items[count]);
+                count += 1;
+                from = hit + query.len;
+            }
+            try std.testing.expectEqual(count, index.starts.items.len);
+        }
+    }
+}
+
+test "search index: refining live prefixes retains exact non-overlapping hits" {
+    const a = std.testing.allocator;
+    const text = "aaab aba ababa xa中xa中\nend";
+    var pt = try PieceTable.init(a, text);
+    defer pt.deinit();
+    _ = try pt.replace(18, 1, text[18..19]); // a UTF-8 sequence split across pieces
+    var index = Index{};
+    defer index.deinit(a);
+    for ([_][]const u8{ "a", "aa", "aab", "a", "ab", "aba", "ababa", "x", "xa", "xa中", "xa中x", "xa中xa中", "z", "zz" }) |query| {
+        try index.ensure(a, &pt, 1, query);
+        var offset: usize = 0;
+        var hits: usize = 0;
+        while (std.mem.findPos(u8, text, offset, query)) |hit| {
+            try std.testing.expect(hits < index.starts.items.len);
+            try std.testing.expectEqual(hit, index.starts.items[hits]);
+            hits += 1;
+            offset = hit + query.len;
+        }
+        try std.testing.expectEqual(hits, index.starts.items.len);
     }
 }

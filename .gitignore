@@ -25,3 +25,8 @@ docs/aegis/
 # Local UI audit and agent handoff (not for publication yet)
 /docs/local-ui-audit/
 /.gitnexus/
+
+# Local benchmark and site tooling
+/website/__pycache__/
+/.bench/__pycache__/
+/nvim.log

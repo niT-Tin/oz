@@ -15,6 +15,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const strip = b.option(bool, "strip", "Strip debug info from the installed binaries") orelse false;
+    const profile = b.option(bool, "profile", "Retain frame pointers for perf call graphs") orelse false;
     // `-Dtest-filter=NAME` narrows `zig build test` / `zig build e2e` to
     // tests whose name contains NAME (Zig's runner has no runtime filter).
     const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this string");
@@ -53,6 +54,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .strip = strip,
+            .omit_frame_pointer = if (profile) false else null,
             .imports = &.{
                 .{ .name = "vaxis", .module = vaxis_mod },
                 .{ .name = "treez", .module = treez_mod },

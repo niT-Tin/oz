@@ -200,6 +200,9 @@ pub const App = struct {
         path: ?[]u8 = null,
         disk: ?@import("buffer/file.zig").Baseline = null,
         dirty: bool = false,
+        /// A non-empty pane has drawn this document at least once. The first
+        /// resize can arrive after git or another wake requests a zero-size frame.
+        line_index_frame_seen: bool = false,
         /// tree-sitter highlighter for THIS buffer (independent of any
         /// window) — lazily built on the first render of a window showing it,
         /// so every split window gets real highlighting for its own buffer.
@@ -527,11 +530,9 @@ pub const App = struct {
     notes: NoteStore = .{},
     /// Ctrl-w seen, awaiting the window-motion key (h/l/j/k).
     pending_window: bool = false,
-    /// Content hash at insert-session entry, so an insert session that ends
-    /// with no net change can clear the dirty flag ("typed then deleted it
-    /// all back" must not mark the buffer modified).
-    insert_base_hash: u64 = 0,
-    insert_was_dirty: bool = false,
+    /// Only an initially clean buffer can become clean again on Insert exit.
+    insert_clean_len: ?u32 = null,
+    insert_scratch_hash: u64 = 0,
     /// cwd root node; its children are the first level (built on first open).
     /// The root node's `path` now holds the ABSOLUTE directory the tree is
     /// rooted at (its own `project_root` at build time), and every child
@@ -993,7 +994,7 @@ pub const App = struct {
     /// math as focusedWinHeight so H/M/L and zz/zt/zb count wrapped rows
     /// the way the renderer draws them.
     pub fn focusedContentWidth(self: *App) u32 {
-        const count = self.cur().pt.lineCount();
+        const count = self.cur().pt.lineCountUpperBound();
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const win = self.vx.window();
@@ -1014,9 +1015,10 @@ pub const App = struct {
     pub fn viewMotionTargetLine(self: *App, motion: editor.Motion.Motion) ?u32 {
         const w = &self.windows.items[self.current_win];
         const buf = &self.buffers.items[w.buf];
-        const line_count = buf.pt.lineCount();
+        if (motion != .view_top_line and motion != .view_middle_line and motion != .view_bottom_line) return null;
         const height = self.focusedWinHeight();
-        const top = @min(w.view_top, line_count - 1);
+        const top = buf.pt.clampLine(w.view_top);
+        const line_count = if (buf.folds.items.len == 0) buf.pt.clampLine(top +| height) + 1 else buf.pt.lineCount();
         // walk VISIBLE lines from the top, counting soft-WRAPPED rows: a
         // closed fold is one screen row and a long line is several, so
         // M/L can't be top + height (they'd overshoot past hidden lines
@@ -1807,10 +1809,7 @@ pub const App = struct {
             if (job.thread) |t| t.join(); // let the worker finish, then free
             self.alloc.free(job.path);
             self.alloc.free(job.cwd);
-            if (job.work_path) |w| {
-                std.Io.Dir.cwd().deleteFile(self.io, w) catch {};
-                self.alloc.free(w);
-            }
+            job.diff.deinit(self.alloc);
             if (job.out) |o| self.alloc.free(o);
             if (job.branch) |b| self.alloc.free(b);
             if (job.msg) |m| self.alloc.free(m);
@@ -1923,7 +1922,6 @@ pub const App = struct {
     pub const gitRefreshSoon = @import("app/git.zig").gitRefreshSoon;
     pub const gitShiftForEdit = @import("app/git.zig").gitShiftForEdit;
     pub const gitShiftInsertAt = @import("app/git.zig").gitShiftInsertAt;
-    pub const snapshotGitWork = @import("app/git.zig").snapshotGitWork;
     pub const gotoHunk = @import("app/git.zig").gotoHunk;
     pub const applyHunk = @import("app/git.zig").applyHunk;
     pub const previewHunk = @import("app/git.zig").previewHunk;
@@ -1945,7 +1943,6 @@ pub const App = struct {
     pub const teardownLsp = @import("app/buffers.zig").teardownLsp;
     pub const closeBufferAt = @import("app/buffers.zig").closeBufferAt;
     pub const closeCurrentBuffer = @import("app/buffers.zig").closeCurrentBuffer;
-    pub const contentHash = @import("app/buffers.zig").contentHash;
     pub const beginInsertSession = @import("app/buffers.zig").beginInsertSession;
     pub const endInsertSession = @import("app/buffers.zig").endInsertSession;
     // ---- workspace → src/app/workspace.zig ----
@@ -2147,6 +2144,7 @@ pub const App = struct {
     pub const execMacro = @import("app/macro.zig").execMacro;
     pub const macroStopRecord = @import("app/macro.zig").macroStopRecord;
     // ---- highlight → src/app/highlight.zig ----
+    pub const newHighlighter = @import("app/highlight.zig").newHighlighter;
     pub const visibleSpansFor = @import("app/highlight.zig").visibleSpansFor;
     pub const visibleDecorsFor = @import("app/highlight.zig").visibleDecorsFor;
     pub const visibleMarkdownFor = @import("app/highlight.zig").visibleMarkdownFor;

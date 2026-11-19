@@ -620,8 +620,8 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
                 // lines instead of document lines (foldNext/foldPrev
                 // skip hidden bodies).
                 const buf = self.cur();
-                const line_count = buf.pt.lineCount();
                 var line = buf.pt.lineOf(new_cursor);
+                const line_count = if (buf.folds.items.len == 0) buf.pt.clampLine(line +| m.count) + 1 else buf.pt.lineCount();
                 var i: u32 = 0;
                 while (i < m.count) : (i += 1) {
                     if (m.motion == .down) {

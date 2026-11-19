@@ -40,38 +40,6 @@ pub const BlameGhostLabel = struct {
 
 // ---- M3a git (async jobs + hunk/blame/lazygit actions) ----
 
-/// Write the CURRENT buffer's text into a fresh temp file (owned path).
-/// The git worker diffs this snapshot against the file's HEAD blob — the
-/// piece table is main-thread state, so the snapshot is taken HERE before
-/// the worker spawns. Returns null on failure (caller falls back to the
-/// disk-based diff).
-pub fn snapshotGitWork(self: *App) ?[]u8 {
-    const path = git_job.makeTempPath(self.alloc, "buf") orelse return null;
-    var f = std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = true }) catch {
-        self.alloc.free(path);
-        return null;
-    };
-    var ok = false;
-    defer {
-        f.close(self.io);
-        if (!ok) {
-            std.Io.Dir.cwd().deleteFile(self.io, path) catch {};
-            self.alloc.free(path);
-        }
-    }
-    var chunk: [16384]u8 = undefined;
-    var off: u32 = 0;
-    const len = self.cur().pt.len();
-    while (off < len) {
-        const n: u32 = @intCast(@min(chunk.len, len - off));
-        self.cur().pt.copyRange(off, chunk[0..n]);
-        f.writeStreamingAll(self.io, chunk[0..n]) catch return null;
-        off += n;
-    }
-    ok = true;
-    return path;
-}
-
 /// Spawn one async git job for `path`. One job at a time: when a job is
 /// already running, a status request is remembered (git_refresh_pending)
 /// and re-spawned after the current one lands; other kinds are queued
@@ -111,31 +79,19 @@ pub fn spawnGitJob(self: *App, kind: GitJobKind, path: []const u8, hunk_start: u
     errdefer self.alloc.free(cwd);
     const path_copy = try self.alloc.dupe(u8, path);
     errdefer self.alloc.free(path_copy);
-    var work: ?[]u8 = null;
-    if (kind == .status) {
-        // Live buffer-vs-HEAD marks need a buffer snapshot ONLY while the
-        // buffer differs from the file on disk. For a clean buffer (opened
-        // or just saved) the disk file IS the buffer text: skip the
-        // snapshot (and the worker's git-show + temp-base + no-index steps)
-        // and diff the disk file against HEAD in ONE spawn — identical
-        // output, no /tmp writes, no main-thread copy of the whole file.
-        const buffer_matches = if (self.cur().path) |cp|
-            std.mem.eql(u8, cp, path)
-        else
-            false;
-        if (buffer_matches and self.cur().dirty) work = self.snapshotGitWork();
-    }
-    errdefer {
-        if (work) |w| {
-            std.Io.Dir.cwd().deleteFile(self.io, w) catch {};
-            self.alloc.free(w);
-        }
-    }
+    const buf = self.cur();
+    const snapshot = if (kind == .status and buf.path != null and std.mem.eql(u8, buf.path.?, path) and
+        (buf.dirty or buf.pt.len() >= @import("git_windows.zig").threshold))
+        try git_job.Snapshot.capture(&buf.pt)
+    else
+        null;
+    errdefer if (snapshot) |view| view.deinit();
     job.* = .{
         .kind = kind,
         .path = path_copy,
         .cwd = cwd,
-        .work_path = work,
+        .snapshot = snapshot,
+        .dirty = buf.dirty,
         .hunk_start = hunk_start,
         .op = op,
         .alloc = self.alloc,
@@ -156,47 +112,24 @@ pub fn consumeGitJob(self: *App, job: *GitJob) void {
     defer self.finishGitJob(job);
     switch (job.kind) {
         .status => {
-            // A landed status job reflects the buffer text at the moment its
-            // snapshot was taken (git_status_spawn_seq). If the current text
-            // has moved on (edit_seq bumped after the snapshot) the diff is
-            // STALE: the displayed marks were shifted along with the edits
-            // (FileDiff.shiftInsert/shiftDelete) and are closer to the truth
-            // than the job's pre-edit diff — keep them instead of swapping
-            // in a diff that would visibly jump back. Branch/untracked are
-            // repo-level and safe to adopt either way.
+            const path = self.cur().path orelse return;
+            if (!std.mem.eql(u8, path, job.path)) return;
             if (self.git_branch) |b| self.alloc.free(b);
-            self.git_branch = job.branch; // thread-owned → App-owned
+            self.git_branch = job.branch;
             job.branch = null;
-            const fresh = if (self.cur().path) |cp|
-                std.mem.eql(u8, cp, job.path) and self.edit_seq == self.git_status_spawn_seq
-            else
-                false;
-            if (fresh or self.cur().path == null or !std.mem.eql(u8, self.cur().path.?, job.path)) {
-                // adopt the job's diff wholesale (exact for the current
-                // buffer — or the previous buffer's state, replaced so the
-                // path bookkeeping stays coherent across switches)
+            const fresh = self.edit_seq == self.git_status_spawn_seq;
+            if (fresh and job.diff_valid) {
                 if (self.git_diff_path) |p| self.alloc.free(p);
                 self.git_diff.deinit(self.alloc);
-                self.git_diff = .{};
+                self.git_diff = job.diff;
+                job.diff = .{};
                 self.git_diff_path = dupOrNull(self.alloc, job.path);
-                if (job.out) |o| {
-                    // parseDiff copies what it keeps — job.out stays owned by
-                    // the job and finishGitJob frees it below
-                    self.git_diff = git.parseDiff(self.alloc, o) catch git.FileDiff{};
-                }
             }
-            // untracked must land even when the diff output is EMPTY
-            // (git diff prints nothing for an untracked file — without
-            // this the all-added marks never appeared)
-            self.git_diff.untracked = job.untracked;
-            if (self.cur().path) |cp| {
-                if (std.mem.eql(u8, cp, job.path)) {
-                    // same-buffer job: stale only when edits raced the
-                    // snapshot; the loop re-diffs once the hold expires
-                    self.git_marks_stale = (self.edit_seq != self.git_status_spawn_seq);
-                    if (!self.git_marks_stale) self.git_marks_at = 0;
-                }
-            }
+            self.git_marks_stale = !fresh;
+            if (fresh) self.git_marks_at = 0;
+            // An already-expired edit hold has no timer left to wake the loop.
+            // Replace a late result before the UI goes back to waiting for input.
+            if (!fresh and !self.gitHoldActive()) self.git_refresh_pending = true;
             // auto current-line blame (nvim current_line_blame=true):
             // the repo is confirmed now — load blame for this file
             self.maybeLoadBlame();
@@ -247,10 +180,7 @@ pub fn consumeGitJob(self: *App, job: *GitJob) void {
 pub fn finishGitJob(self: *App, job: *GitJob) void {
     self.alloc.free(job.path);
     self.alloc.free(job.cwd);
-    if (job.work_path) |w| {
-        std.Io.Dir.cwd().deleteFile(self.io, w) catch {};
-        self.alloc.free(w);
-    }
+    job.diff.deinit(self.alloc);
     if (job.out) |o| self.alloc.free(o);
     if (job.branch) |b| self.alloc.free(b);
     if (job.msg) |m| self.alloc.free(m);
@@ -493,7 +423,7 @@ pub fn maybeLoadBlame(self: *App) void {
     if (!self.blame_active) return;
     if (self.git_branch == null) return; // not a repo — no blame
     const path = self.cur().path orelse return;
-    if (self.cur().pt.lineCount() > max_blame_lines) return; // degrade
+    if (self.cur().pt.clampLine(max_blame_lines) == max_blame_lines) return; // degrade
     const stale = if (self.git_blame_path) |bp|
         !std.mem.eql(u8, bp, path)
     else

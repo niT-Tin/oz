@@ -19,7 +19,6 @@
 //! single-file approve still edits the in-memory buffer only and leaves
 //! `:w` as the user's separate action.
 const std = @import("std");
-const disk_file = @import("../buffer/file.zig");
 const history_mod = @import("../buffer/history.zig");
 const vaxis = @import("vaxis");
 
@@ -1938,8 +1937,7 @@ pub fn refreshAfterAcp(self: *App) usize {
             continue;
         };
         defer self.alloc.free(text);
-        const fingerprint = disk_file.hash(text);
-        if (disk.fingerprint) |old| if (std.mem.eql(u8, &old, &fingerprint)) continue;
+        if (disk.matchesBytes(text)) continue;
         if (bufferTextEquals(self, i, text)) {
             if (!buf.dirty) disk.didWrite(text);
             continue;
