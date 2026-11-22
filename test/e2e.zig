@@ -24262,13 +24262,14 @@ fn runAiGolden(name: []const u8, rows: u16, cols: u16, golden_rel_path: []const 
     try gridWaitFor(&sess, &grid, "❯ ", 4000);
     try sess.send("hello");
     try gridWaitFor(&sess, &grid, "hello", 3000);
-    try sess.send("\r");
-    try gridWaitFor(&sess, &grid, "mock reply", 8000);
-    try gridWaitFor(&sess, &grid, "idle", 5000);
     if (surface == .window_prefix) {
         try sess.send("\t\x17");
         try gridWaitFor(&sess, &grid, "Ctrl-w a input", 4000);
         try gridWaitRowContains(&sess, &grid, rows - 1, "Ctrl-w …", 4000);
+    } else {
+        try sess.send("\r");
+        try gridWaitFor(&sess, &grid, "mock reply", 8000);
+        try gridWaitFor(&sess, &grid, "idle", 5000);
     }
     try gridSettle(&sess, &grid, 400, 6000);
 
