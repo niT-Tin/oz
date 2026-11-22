@@ -26,8 +26,6 @@ const tools = @import("tools.zig");
 pub const Event = union(enum) {
     /// Transport progressed without changing the transcript.
     acp_permission: []u8,
-    acp_tool: acp.ToolUpdate,
-    acp_session: struct { id: []u8, can_load: bool, reconnect: bool },
     phase: telemetry.Phase,
     /// Provider-reported token accounting (DeepSeek sends a final usage-only chunk).
     usage: telemetry.Usage,
@@ -42,16 +40,18 @@ pub const Event = union(enum) {
     /// One assistant turn's finalized tool calls (ordered by stream index).
     /// Ownership transfers to the receiver; free with `tools.freeCalls`.
     tool_calls: []tools.ToolCall,
+    acp_tool: acp.ToolUpdate,
+    acp_session: struct { id: []u8, can_load: bool, reconnect: bool },
 
     pub fn deinit(self: Event, alloc: std.mem.Allocator) void {
         switch (self) {
-            .acp_session => |session| alloc.free(session.id),
-            .acp_tool => |update| update.arena.deinit(),
             .acp_permission => |d| alloc.free(d),
             .delta => |d| alloc.free(d),
             .err => |e| alloc.free(e),
             .tool_calls => |calls| tools.freeCalls(alloc, calls),
             .phase, .usage, .done, .cancelled => {},
+            .acp_session => |session| alloc.free(session.id),
+            .acp_tool => |update| update.arena.deinit(),
         }
     }
 };

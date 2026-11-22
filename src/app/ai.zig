@@ -1823,18 +1823,6 @@ pub fn drainAi(self: *App) !bool {
         while (client.pop()) |ev| {
             changed = true;
             switch (ev) {
-                .acp_session => |session| {
-                    if (t.acp_session) |old| self.alloc.free(old);
-                    t.acp_session = session.id;
-                    t.acp_local_only = !session.can_load;
-                    if (session.reconnect and !session.can_load) setToolNote(self, idx, local_only_notice);
-                    checkpoint = true;
-                },
-                .acp_tool => |update| {
-                    if (update.start or update.status == .ok or update.status == .err) checkpoint = true;
-                    defer update.arena.deinit();
-                    try self.ai.threads.applyAcpTool(self.alloc, idx, update);
-                },
                 .acp_permission => |title| {
                     if (t.cancel_requested) {
                         self.alloc.free(title);
@@ -1854,6 +1842,18 @@ pub fn drainAi(self: *App) !bool {
                 .phase => |phase| {
                     if (t.cancel_requested) continue;
                     t.request.setPhase(phase);
+                },
+                .acp_session => |session| {
+                    if (t.acp_session) |old| self.alloc.free(old);
+                    t.acp_session = session.id;
+                    t.acp_local_only = !session.can_load;
+                    if (session.reconnect and !session.can_load) setToolNote(self, idx, local_only_notice);
+                    checkpoint = true;
+                },
+                .acp_tool => |update| {
+                    if (update.start or update.status == .ok or update.status == .err) checkpoint = true;
+                    defer update.arena.deinit();
+                    try self.ai.threads.applyAcpTool(self.alloc, idx, update);
                 },
                 .usage => |usage| {
                     if (t.cancel_requested) continue;
@@ -2453,7 +2453,11 @@ fn appendToolCardRows(
             }
         },
         .cancelled => {
-            try appendCardRow(a, rows, inner_w, st.card_bg, &.{.{ .text = "  stopped (no result applied)", .style = st.faint }});
+            const detail = if (msg.text.len != 0)
+                try std.fmt.allocPrint(a, "  {s}", .{try displaySafe(a, msg.text)})
+            else
+                "  stopped (no result applied)";
+            try appendCardRow(a, rows, inner_w, st.card_bg, &.{.{ .text = detail, .style = st.faint }});
         },
         .running => {
             if (!msg.display_only) try appendCardRow(a, rows, inner_w, st.card_bg, &.{.{ .text = "  ⋯ working", .style = st.faint }});
