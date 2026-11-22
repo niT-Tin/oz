@@ -208,7 +208,7 @@ pub fn metrics(rail_rows: u32, tab: WorkboxTab) Metrics {
 // Focus policy
 // ---------------------------------------------------------------------------
 
-pub const Focus = enum { editor, rail, prompt };
+pub const Focus = enum { editor, rail, prompt, approval };
 
 pub const WorkboxTab = enum { chat, changes, tools, terminal };
 
@@ -361,6 +361,8 @@ pub const Thread = struct {
     /// Set on explicit cancel: late worker events must not touch
     /// this thread's conversation.
     cancel_requested: bool = false,
+    /// An in-memory grant for this user turn, revoked when leaving the thread.
+    acp_turn_grant: ?u64 = null,
 
     pub fn deinit(self: *Thread, alloc: std.mem.Allocator) void {
         for (self.messages.items) |*m| m.deinit(alloc);
@@ -425,6 +427,7 @@ pub const Threads = struct {
     pub fn select(self: *Threads, idx: usize) SelectResult {
         std.debug.assert(idx < self.items.items.len);
         const prev = self.active;
+        if (prev != idx) self.items.items[prev].acp_turn_grant = null;
         self.active = idx;
         self.items.items[idx].unread_done = false;
         return .{ .prev = prev, .cancelled = false };
@@ -1149,13 +1152,13 @@ fn validFocusState(open: bool, focus: Focus) bool {
     // from the editor (non-modal dock) or own a rail/prompt focus.
     if (!open) return focus == .editor;
     return switch (focus) {
-        .editor, .rail, .prompt => true,
+        .editor, .rail, .prompt, .approval => true,
     };
 }
 
 test "property: focus transitions never produce an invalid state" {
     for ([_]bool{ false, true }) |open| {
-        for ([_]Focus{ .editor, .rail, .prompt }) |focus| {
+        for ([_]Focus{ .editor, .rail, .prompt, .approval }) |focus| {
             for ([_]bool{ false, true }) |narrow| {
                 const toggled = toggleRail(open, focus);
                 try std.testing.expect(validFocusState(toggled.open, toggled.focus));

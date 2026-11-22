@@ -2,6 +2,7 @@
 //! No client filesystem/terminal capabilities: harnesses execute their own tools.
 const std = @import("std");
 const V = std.json.Value;
+const permissions = @import("permissions.zig");
 pub const max_frame = 8 * 1024 * 1024;
 pub fn field(v: V, key: []const u8) V {
     return if (v == .object) v.object.get(key) orelse .null else .null;
@@ -12,6 +13,80 @@ pub fn str(v: V) []const u8 {
 pub fn eq(v: V, s: []const u8) bool {
     return std.mem.eql(u8, str(v), s);
 }
+const detail_limit = 16384;
+
+// Only the current prompt's recent tool descriptors are available for display.
+// Neither prior updates nor fields copied from them participate in policy.
+const ToolHistory = struct {
+    const Entry = struct { id: []u8, detail: []u8 };
+    entries: std.ArrayList(Entry) = .empty,
+
+    fn remove(self: *ToolHistory, a: std.mem.Allocator, i: usize) void {
+        const entry = self.entries.orderedRemove(i);
+        a.free(entry.id);
+        a.free(entry.detail);
+    }
+
+    fn deinit(self: *ToolHistory, a: std.mem.Allocator) void {
+        while (self.entries.items.len > 0) self.remove(a, self.entries.items.len - 1);
+        self.entries.deinit(a);
+    }
+
+    fn index(self: *const ToolHistory, id: []const u8) ?usize {
+        for (self.entries.items, 0..) |entry, i| if (std.mem.eql(u8, entry.id, id)) return i;
+        return null;
+    }
+
+    fn merge(self: *const ToolHistory, a: std.mem.Allocator, update: V, prior: ?usize) ![]u8 {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const tmp = arena.allocator();
+        var descriptor: V = if (prior) |i|
+            try std.json.parseFromSliceLeaky(V, tmp, self.entries.items[i].detail, .{})
+        else
+            .{ .object = .empty };
+        if (update != .object) return std.json.Stringify.valueAlloc(a, update, .{});
+        var fields = update.object.iterator();
+        while (fields.next()) |f| {
+            if (!std.mem.eql(u8, f.key_ptr.*, "sessionUpdate")) try descriptor.object.put(tmp, f.key_ptr.*, f.value_ptr.*);
+        }
+        return std.json.Stringify.valueAlloc(a, descriptor, .{});
+    }
+
+    fn record(self: *ToolHistory, a: std.mem.Allocator, update: V, fresh: bool) !void {
+        const id = str(field(update, "toolCallId"));
+        if (id.len == 0 or id.len > 1024) return;
+        const prior = self.index(id);
+        const detail = try self.merge(a, update, if (fresh) null else prior);
+        if (prior) |i| self.remove(a, i);
+        if (detail.len > detail_limit) {
+            a.free(detail);
+            return;
+        }
+        errdefer a.free(detail);
+        if (self.entries.items.len == 32) self.remove(a, 0);
+        const key = try a.dupe(u8, id);
+        errdefer a.free(key);
+        try self.entries.append(a, .{ .id = key, .detail = detail });
+    }
+};
+
+fn onceOption(options: V, allowed: bool) ?[]const u8 {
+    if (options != .array) return null;
+    for (options.array.items) |option| {
+        if (!eq(field(option, "kind"), if (allowed) "allow_once" else "reject_once")) continue;
+        const id = str(field(option, "optionId"));
+        if (id.len == 0) continue;
+        // A response selects by ID alone. An ambiguous ID could designate
+        // a persistent grant even though the entry here says allow_once.
+        for (options.array.items) |other| {
+            if (eq(field(other, "optionId"), id) and !eq(field(other, "kind"), str(field(option, "kind")))) return null;
+        }
+        return id;
+    }
+    return null;
+}
+
 pub fn preset(name: []const u8) ![]const u8 {
     if (std.mem.eql(u8, name, "kimi")) return "[\"kimi\",\"acp\"]";
     if (std.mem.eql(u8, name, "codex")) return "[\"npx\",\"-y\",\"@agentclientprotocol/codex-acp\"]";
@@ -145,6 +220,8 @@ pub const Connection = struct {
     }
     // Host supplies owned transcript events and an explicit permission decision.
     fn wait(self: *Connection, id: u64, host: anytype) !std.json.Parsed(V) {
+        var history = ToolHistory{};
+        defer history.deinit(self.alloc);
         while (true) {
             var p = try self.read();
             errdefer p.deinit();
@@ -168,6 +245,9 @@ pub const Connection = struct {
                 }
                 const u = field(params, "update");
                 const kind = field(u, "sessionUpdate");
+                if (eq(kind, "tool_call") or eq(kind, "tool_call_update")) {
+                    try history.record(self.alloc, u, eq(kind, "tool_call"));
+                }
                 if (eq(kind, "agent_message_chunk")) {
                     const c = field(u, "content");
                     if (eq(field(c, "type"), "text")) try host.acpText(str(field(c, "text")));
@@ -176,18 +256,36 @@ pub const Connection = struct {
                 }
             } else if (eq(field(v, "method"), "session/request_permission")) {
                 const params = field(v, "params");
-                var selected: ?V = null;
+                const call = field(params, "toolCall");
                 const options = field(params, "options");
-                const detail = try std.json.Stringify.valueAlloc(self.alloc, field(params, "toolCall"), .{});
-                defer self.alloc.free(detail);
-                const same_session = if (self.session) |s| eq(field(params, "sessionId"), s) else false;
-                const allowed = if (same_session and detail.len <= 16384) try host.acpPermission(detail) else false;
-                if (options == .array) for (options.array.items) |option| {
-                    if (eq(field(option, "kind"), if (allowed) "allow_once" else "reject_once")) {
-                        selected = field(option, "optionId");
-                        break;
+                const raw = try std.json.Stringify.valueAlloc(self.alloc, call, .{});
+                defer self.alloc.free(raw);
+                var selected: ?[]const u8 = null;
+                if (self.session != null and eq(field(params, "sessionId"), self.session.?)) {
+                    const allow_once = onceOption(options, true);
+                    const reject_once = onceOption(options, false);
+                    if (raw.len > detail_limit) {
+                        try host.acpText("\nACP permission cancelled: request details exceed 16 KiB.\n");
+                    } else if (allow_once == null and reject_once == null) {
+                        try host.acpText("\nACP permission cancelled: harness offered no valid single-use option.\n");
+                    } else {
+                        const detail = try history.merge(self.alloc, call, history.index(str(field(call, "toolCallId"))));
+                        defer self.alloc.free(detail);
+                        const description = try permissions.describeAcp(self.alloc, detail, self.root orelse "unknown");
+                        defer self.alloc.free(description);
+                        const allowed = try host.acpPermission(.{
+                            .description = description,
+                            .read_only = permissions.readOnlyAcp(self.alloc, raw),
+                            .described = permissions.described(call),
+                            .allow_once = allow_once != null,
+                        });
+                        selected = if (allowed) allow_once else reject_once;
+                        if (selected == null) try host.acpText(if (allowed)
+                            "\nACP permission cancelled: harness offered no valid allow_once option.\n"
+                        else
+                            "\nACP permission cancelled: harness offered no valid reject_once option.\n");
                     }
-                };
+                }
                 if (selected) |option| {
                     try self.send(.{ .jsonrpc = "2.0", .id = mid, .result = .{ .outcome = .{ .outcome = "selected", .optionId = option } } });
                 } else try self.send(.{ .jsonrpc = "2.0", .id = mid, .result = .{ .outcome = .{ .outcome = "cancelled" } } });
@@ -237,4 +335,58 @@ test "ACP presets and argv validation" {
     try std.testing.expectError(error.InvalidAcpAgent, preset("unknown"));
     for ([_][]const u8{ "[]", "[1]", "[\"\"]", "{}", "[\"a\\u0000b\"]" }) |bad| try std.testing.expectError(error.InvalidAcpCommand, validateCommand(a, bad));
     try validateCommand(a, "[\"/path with spaces/kimi\",\"acp\"]");
+}
+
+test "ACP one-shot selection rejects persistent, missing, malformed and ambiguous IDs" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const options = try std.json.parseFromSliceLeaky(V, arena.allocator(),
+        \\[{"kind":"allow_always","optionId":"forever"},{"kind":"reject_always","optionId":"never"},{"kind":"reject_once","optionId":"no"},{"kind":"allow_once","optionId":"yes"}]
+    , .{});
+    try std.testing.expectEqualStrings("yes", onceOption(options, true).?);
+    try std.testing.expectEqualStrings("no", onceOption(options, false).?);
+    for ([_][]const u8{
+        \\[{"kind":"allow_always","optionId":"yes"},{"kind":"reject_always","optionId":"no"}]
+        ,
+        \\[{"kind":"allow_once","optionId":7},{"kind":"reject_once","optionId":""}]
+        ,
+        \\[{"kind":"allow_once","optionId":"same"},{"kind":"allow_always","optionId":"same"}]
+        ,
+        "[]",
+        "null",
+    }) |raw| {
+        const invalid = try std.json.parseFromSliceLeaky(V, arena.allocator(), raw, .{});
+        try std.testing.expect(onceOption(invalid, true) == null and onceOption(invalid, false) == null);
+    }
+}
+
+test "ACP display history merges matching partial updates and restarts reused tool IDs" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const tmp = arena.allocator();
+    var history = ToolHistory{};
+    defer history.deinit(a);
+    const initial = try std.json.parseFromSliceLeaky(V, tmp,
+        \\{"toolCallId":"one","title":"Read settings","rawInput":{"command":"cat settings"},"locations":[{"path":"settings"}]}
+    , .{});
+    try history.record(a, initial, true);
+    const partial = try std.json.parseFromSliceLeaky(V, tmp,
+        \\{"toolCallId":"one","kind":"read","status":"in_progress"}
+    , .{});
+    try history.record(a, partial, false);
+    const request = try std.json.parseFromSliceLeaky(V, tmp,
+        \\{"toolCallId":"one","kind":"edit"}
+    , .{});
+    const merged = try history.merge(tmp, request, history.index("one"));
+    const value = try std.json.parseFromSliceLeaky(V, tmp, merged, .{});
+    try std.testing.expectEqualStrings("edit", str(field(value, "kind")));
+    try std.testing.expectEqualStrings("cat settings", str(field(field(value, "rawInput"), "command")));
+    try std.testing.expect(field(value, "locations") == .array);
+    try std.testing.expect(!permissions.described(request));
+    try std.testing.expect(!permissions.readOnlyAcp(a, "{\"toolCallId\":\"one\"}"));
+    try history.record(a, partial, true);
+    try std.testing.expect(history.index("other") == null);
+    try std.testing.expect(std.mem.indexOf(u8, history.entries.items[0].detail, "cat settings") == null);
 }

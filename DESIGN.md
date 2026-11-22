@@ -1666,7 +1666,9 @@ unversioned publications cannot be reliably dated by the client.
 - `<Space>a` 打开后，`Ctrl-w h/j/k/l/w` 回到编辑区，草稿保留；`Ctrl-w a` 回线程列表。`Ctrl-PageUp/Down` 从输入框或列表切换线程；`Ctrl-n` 新建。切换不取消，Ctrl+c 只取消当前线程。
 - 本地命令在发送模型前解析：`/threads` 展开列表；`/thread <id>|next|prev`；`/new [backend]`；`/agent builtin|codex|kimi|deepseek|default`；`/agent acp <JSON argv>`；`/model <native-model-id>`。环境变量仍提供默认值，线程覆盖互相独立；新建线程使用默认配置。ACP 启动命令可带工作目录（preset 后的余下文本），ACP 的模型由该 harness 配置，不冒充支持通用动态模型协商。运行/待审批期间拒绝替换后端配置；空闲替换仅释放当前线程的旧连接。
 - 每线程初始为 manual；`/auto` 只自动批准明确只读操作，`/manual` 恢复逐次审批。自动允许的 shell 命令限定 `pwd/ls/cat/head/tail/wc/rg`；替换、重定向、复合 shell、脚本、rg 外部 helper、未知命令均需手动决定。不是 shell 沙箱。编辑、patch、删除、覆盖始终保留审核；新线程不继承 auto。切换 auto 时已挂起的明确只读审批也会应用同一规则。
-- ACP 只发送 `allow_once`；按 kind 加 rawInput 判断，kind=read 却携带删除命令不会获准。未知输入需人工决定。审批展示 Action、Kind、captured Workspace 和原始参数，a/r 单次决策；输入非空时 a/r 属于草稿，不会吞掉 `/manual` 等命令。
+- ACP 只发送 `allow_once`；按 kind 加 rawInput 判断，kind=read 却携带删除命令不会获准。未知输入需人工决定。ACP 审批卡固定在 rail 内，F6 或点击提示进入审批，重复 F6 可转到下一个待审批线程。输入草稿和编辑器原有焦点保留。卡内 `a` / `r` 作单次决定，`j/k` 查看长参数，Esc 离开审批。
+- 卡内 `A` 启用当前用户回合的 ACP 批准，标题显示 `AUTO-TURN`。结束、取消、切线程、换后端或输入 `/manual` 都撤销此授权。`/auto` 切回原有的只读自动策略。请求本身缺少操作描述时，即使已有本回合授权也要单独决定，按 `A` 会拒绝该请求。原生终端和文件变更继续由各自的审批界面处理。
+- 同一 prompt 内的工具更新按 toolCallId 合并供展示，自动策略只检查实际权限请求的描述。若 harness 仅提供持久选项或选项 ID 无效，界面会说明取消原因。
 - Terminal 按线程拥有 pending、job、generation 与滚动状态。自动允许仍经过 staging 和同一 Allow 路径，有可检查的卡片、完整命令和工作目录；不会抢焦点。后台 edit review 不会切走当前线程；原有跨文件事务仍一次只审核一组 diff，后来的编辑请求会明确报 busy，不会覆盖旧 review。
 - 浮动终端在 Agent 面板之后绘制，覆盖区域的鼠标事件优先交给浮动终端；普通底部/右侧终端保持布局语义。
 - 新行为由 `agent workflow:` PTY、纯 `auto policy:` / `threads parallel:` 测试覆盖。并行测试使用文件屏障，明确 B 已完成后才允许 A 返回；取消测试检查实际磁盘副作用，不能只根据屏幕上出现 cancelled 推断进程停止。

@@ -4815,7 +4815,7 @@ pub fn render(self: *App) !void {
     // the resulting cells on the right before placing services/position.
     var ai_text: ?[]const u8 = null;
     var ai_cells: u32 = 0;
-    if (!self.hints.active and self.msg == null) {
+    if (!self.hints.active and (self.msg == null or self.aiApprovalAttention())) {
         const ai_budget = @min(win.width / 3, 48);
         if (ai_budget > 0) {
             if (try self.aiStatusText(a)) |full| {
