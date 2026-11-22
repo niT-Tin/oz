@@ -308,7 +308,7 @@ pub fn ensureAi(self: *App) !void {
         break :blk null;
     };
     const idx = restored orelse try createAiThread(self);
-    self.ai.threads.active = idx;
+    _ = self.ai.threads.select(idx);
     self.ai.thread_cursor = idx;
     self.ai.thread_top = idx;
     if (self.ai.browsing_root) |prev| self.alloc.free(prev);
