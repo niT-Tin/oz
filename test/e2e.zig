@@ -1796,10 +1796,8 @@ test "mouse: reporting lifecycle restores the terminal; Alt+r stays clean; no hi
     try std.testing.expect(!grid.contains("info("));
     try std.testing.expect(!grid.contains("couldn't write uri"));
 
-    // Esc returns keyboard focus to the editor; clicking the visible
-    // terminal again focuses it (click target is the overlay rect).
-    try sess.send("\x1b");
-    std.Io.sleep(io, .fromMilliseconds(250), .real) catch {};
+    // Click outside the terminal to blur it, then inside to refocus it.
+    try termClickEditor(&sess, &grid);
     try mouseClickAt(&sess, 20, 10);
     try sess.send("printf 'MOUSE_TERM_%s\\n' FOCUS\r");
     try gridWaitFor(&sess, &grid, "MOUSE_TERM_FOCUS", 8000);
@@ -15598,11 +15596,10 @@ test "terminal: Alt+R hide/show reuses the shell session; layouts keep it; exit 
     try sess.send("printf 'OZPID5=%s\\n' \"$$\"\r");
     try std.testing.expectEqual(pid1, try termWaitPid(&sess, &grid, "OZPID5=", 15000));
 
-    // Visible but unfocused + Alt+R focuses the session (does not hide or
-    // recreate it); the next Alt+R hides it. Esc is acknowledged by the frame
-    // turning to the quiet border color before the next key is sent.
+    // Esc dismisses the float. A single Alt+R restores the same shell.
     try sess.send("\x1b");
-    try termWaitFocus(&sess, &grid, box5, accent, false, 8000);
+    try gridWaitGone(&sess, &grid, "oz terminal", 8000);
+    try gridWaitFor(&sess, &grid, "terminal session fixture", 5000);
     try sess.send("\x1br");
     try termWaitFocus(&sess, &grid, box5, accent, true, 8000);
     try sess.send("printf 'OZPID6=%s\\n' \"$$\"\r");
@@ -15722,6 +15719,69 @@ test "terminal: frame bounds the inner PTY across layouts at 80 and 40 columns" 
     const exit40 = try by_cols[1].?.commandAndWaitExit(":q!\r");
     try std.testing.expectEqual(@as(u32, 0), exit80);
     try std.testing.expectEqual(@as(u32, 0), exit40);
+}
+
+test "terminal: wide Markdown and shell output leave both float edges intact" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const words = "中文日志文件边界测试中文日志文件边界测试";
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(alloc);
+    for (0..20) |_| try content.appendSlice(alloc, "- " ++ words ++ "\n1. " ++ words ++ "\n");
+    try writeTestFile(io, root, "wide.md", content.items);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "wide.md" }, &.{"SHELL=/bin/sh"}, 30, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    for ([_]u16{ 80, 100, 106, 120 }, 0..) |cols, i| {
+        var grid = try Grid.initSizedCols(alloc, 30, cols);
+        defer grid.deinit(alloc);
+        if (i != 0) {
+            const size = Winsize{ .ws_row = 30, .ws_col = cols, .ws_xpixel = cols * 10, .ws_ypixel = 600 };
+            _ = linux.ioctl(sess.pty.master, TIOCSWINSZ, @intFromPtr(&size));
+        } else {
+            try gridWaitFor(&sess, &grid, "中文", 8000);
+            try sess.send("\x1br");
+        }
+        const width = cols * 8 / 10;
+        const box = try termWaitLayout(&sess, &grid, .floating, 10000);
+        try std.testing.expectEqual(@as(usize, width), box.width());
+        // Place a CJK glyph at the last PTY column. It may wrap, or be
+        // clipped by the child, but must never displace the outer rule.
+        var buf: [100]u8 = undefined;
+        try sess.send(try std.fmt.bufPrint(&buf, "printf '\\033[2;{d}H界\\nOK_%s\\n' {d}\r", .{ width - 2, cols }));
+        var marker: [16]u8 = undefined;
+        try gridWaitFor(&sess, &grid, try std.fmt.bufPrint(&marker, "OK_{d}", .{cols}), 8000);
+        try gridSettle(&sess, &grid, 80, 1500);
+        try frame.expectBorderBox(&grid, box, null);
+        const bg = frame.cellBg(&grid, box.top, box.right);
+        try std.testing.expect(bg != 0);
+        for (box.top..box.bottom + 1) |row| {
+            try std.testing.expectEqual(bg, frame.cellBg(&grid, row, box.left));
+            try std.testing.expectEqual(bg, frame.cellBg(&grid, row, box.right));
+        }
+        if (i == 3) {
+            try termClickEditor(&sess, &grid);
+            try sess.send("ggjjjjjjjjllllllllllll");
+            try gridWaitFor(&sess, &grid, "9/41", 5000);
+            try gridSettle(&sess, &grid, 100, 1500);
+            const shown = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "\x1b[?25h") orelse 0;
+            const hidden = std.mem.lastIndexOf(u8, sess.out[0..sess.used], "\x1b[?25l") orelse 0;
+            if (shown >= hidden) {
+                grid.dump();
+                std.debug.print("cursor {d},{d}, float {any}, hide/show {d}/{d}\n", .{ grid.row, grid.col, box, hidden, shown });
+                return error.TestUnexpectedResult;
+            }
+            try sess.send("\x1br");
+            try termWaitFocus(&sess, &grid, box, packRgb(0xE6, 0xC3, 0x84), true, 5000);
+            try sess.send("\x1b");
+            try gridWaitGone(&sess, &grid, "oz terminal", 5000);
+            try gridWaitRowContains(&sess, &grid, box.top + 1, "中文", 5000);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q!\r"));
 }
 
 // ---- issue #19: terminal scrollback / mouse-wheel history viewport ----
@@ -31520,7 +31580,11 @@ test "terminal blame layering: cached blame stays below all layouts and an unfoc
                 try std.testing.expectEqual(blame_fg, frame.cellFg(&grid, ghost.row, ghost.col));
                 try std.testing.expectEqualStrings("O", frame.cellText(&grid, ghost.row, ghost.col));
             }
-            try sess.send("\x1b");
+            if (case.kind == .floating) {
+                try mouseClickAt(&sess, 0, grid.rows - 1);
+            } else {
+                try sess.send("\x1b");
+            }
             try termWaitFocus(&sess, &grid, box, accent, false, 5000);
             _ = try uiPump(&sess, &grid, 1200);
             try expectTerminalCoversBlame(&grid, box, ghost.row, blame_fg);
@@ -31598,7 +31662,7 @@ test "terminal blame layering: a gated late result cannot paint over a float or 
     _ = try uiPump(&sess, &grid, 1200);
     try expectTerminalCoversBlame(&grid, box, row, blame_fg);
     const accent = packRgb(0xE6, 0xC3, 0x84);
-    try sess.send("\x1b");
+    try mouseClickAt(&sess, 0, grid.rows - 1);
     try termWaitFocus(&sess, &grid, box, accent, false, 5000);
     try expectTerminalCoversBlame(&grid, box, row, blame_fg);
     try sess.send("\x1br");
@@ -31617,7 +31681,7 @@ test "terminal blame layering: a gated late result cannot paint over a float or 
     box = try termWaitBoxInner(&sess, &narrow, 38, 11, 10000);
     _ = try uiPump(&sess, &narrow, 1200);
     try expectTerminalCoversBlame(&narrow, box, row, blame_fg);
-    try sess.send("\x1b");
+    try mouseClickAt(&sess, 0, narrow.rows - 1);
     try termWaitFocus(&sess, &narrow, box, accent, false, 5000);
     try sess.send("\x1br");
     try termWaitFocus(&sess, &narrow, box, accent, true, 5000);
@@ -31656,7 +31720,7 @@ test "terminal blame layering: inline diagnostics stay below terminals but gl re
     try sess.send("printf 'TERM_%s\\n' DIAG_READY\r");
     try gridWaitFor(&sess, &grid, "TERM_DIAG_READY", 10000);
     const accent = packRgb(0xE6, 0xC3, 0x84);
-    try sess.send("\x1b");
+    try mouseClickAt(&sess, 0, grid.rows - 1);
     try termWaitFocus(&sess, &grid, box, accent, false, 5000);
     _ = try uiPump(&sess, &grid, 300);
     try expectTerminalCoversBlame(&grid, box, label.row, diag_fg);
@@ -33131,10 +33195,9 @@ test "agent workflow: floating terminal covers Agent cells and pointer hits foll
         // The right rule lies inside the Agent area: it must be complete.
         try std.testing.expectEqualStrings("╮", frame.cellText(&grid, box.top, box.right));
         try std.testing.expectEqualStrings("╯", frame.cellText(&grid, box.bottom, box.right));
-        // Esc leaves the terminal visible; clicking the covered Agent region
+        // Click outside the float to blur it. Clicking the covered Agent region
         // must focus the terminal, not an underlying thread/prompt target.
-        try sess.send("\x1b");
-        try gridSettle(&sess, &grid, 80, 1000);
+        try termClickEditor(&sess, &grid);
         try mouseClickAt(&sess, box.right - 2, box.top + 2);
         try sess.send("printf 'LAYER%s\\n' _POINTER_OK\r");
         try gridWaitFor(&sess, &grid, "LAYER_POINTER_OK", 5000);

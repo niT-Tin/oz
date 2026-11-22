@@ -654,7 +654,7 @@ Client = {
 ### M3 — Git + 终端（≈4-6 周）
 
 - **M3a**：git gutter（diff 符号）、]c/[c hunk 跳转、hunk stage/reset/preview、行内 blame（1s 延迟，leader tb 开关）、leader lg 起 lazygit（外部浮窗）
-- **M3b**：内嵌终端（改用 vaxis `widgets/terminal`：PTY + VT 仿真 + scrollback 骨架），<M-r> 浮动 / <M-w> 底部 / <M-e> 右侧三种布局；终端内 Esc 退回 Normal；lazygit 改跑内嵌浮动终端
+- **M3b**：内嵌终端（改用 vaxis `widgets/terminal`：PTY + VT 仿真 + scrollback 骨架），<M-r> 浮动 / <M-w> 底部 / <M-e> 右侧三种布局；Esc 隐藏浮动终端并保留 shell，底部和右侧终端仅交还编辑焦点；lazygit 改跑内嵌浮动终端
 
 > 风险标注：~~M3b（内嵌终端仿真）是全项目最大工程项~~ 已交付（vaxis 自带 widgets/terminal 大幅降低工程量；自研 scrollback 仍为 TODO）。
 

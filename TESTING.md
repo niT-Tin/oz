@@ -879,7 +879,7 @@ the response was actually consumed. The test then checks hide/reopen and a
 resize from 80 to 40 columns. Failure cleanup releases the wrapper as well.
 
 A wrapped diagnostic line also intersects the terminal's top border. Inline
-diagnostics remain below the visible terminal after Esc returns focus to the
+diagnostics remain below the visible terminal after a click outside it returns focus to the
 editor, while an explicitly opened `gl` float retains its modal layer above
 the terminal. Existing split/Agent blame clipping and diagnostic tests remain
 unchanged. No golden frames are regenerated for this fix.

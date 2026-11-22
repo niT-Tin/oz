@@ -165,6 +165,10 @@ pub const Rect = struct {
     y: u32,
     w: u32,
     h: u32,
+
+    pub fn contains(self: Rect, col: u32, row: u32) bool {
+        return col >= self.x and col < self.x + self.w and row >= self.y and row < self.y + self.h;
+    }
 };
 
 /// `num`/`den` percent of `n` computed in u64 to avoid overflow, floored.
