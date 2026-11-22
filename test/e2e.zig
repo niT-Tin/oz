@@ -30233,9 +30233,11 @@ test "path completion: quoted Unicode paths with spaces preserve both delimiters
     var grid = try Grid.initSizedCols(a, 30, 120);
     defer grid.deinit(a);
     try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
-    const keys = try std.fmt.allocPrint(a, "i\"{s}/中文 dir/fi", .{root});
-    defer a.free(keys);
-    try sess.send(keys);
+    // Paste only the random temp path. Typing a generated "jk" would leave
+    // Insert mode. The quote, path triggers and Unicode filename are real keys.
+    try sess.send("i\"\x1b[200~");
+    try sess.send(root);
+    try sess.send("\x1b[201~/中文 dir/fi");
     try gridWaitFor(&sess, &grid, "file name.txt", 5000);
     try sess.send("\r");
     try gridDrain(&sess, &grid, 250);
