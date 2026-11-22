@@ -29,6 +29,7 @@ pub fn buildMessages(
     errdefer out.deinit(alloc);
 
     for (messages) |m| {
+        if (m.display_only) continue;
         switch (m.role) {
             .user => try out.append(alloc, .{ .role = "user", .content = m.api_text }),
             .assistant => {

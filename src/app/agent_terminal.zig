@@ -240,6 +240,7 @@ fn setCard(
     api: []const u8,
     duration_ms: u32,
 ) void {
+    defer @import("ai.zig").saveHistory(self, thread_index, card_index);
     self.ai.threads.setToolOutcome(
         self.alloc,
         thread_index,

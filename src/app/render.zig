@@ -2382,6 +2382,7 @@ fn renderAgentsRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, body_to
         }
     } else self.ai.thread_top = 0;
 
+    const now_ns = std.Io.Timestamp.now(self.io, .real).nanoseconds;
     var k: usize = 0;
     while (k < avail) : (k += 1) {
         const idx = self.ai.thread_top + k;
@@ -2390,7 +2391,7 @@ fn renderAgentsRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, body_to
         const row = list_top + @as(u32, @intCast(k));
         const selected = idx == self.ai.thread_cursor;
         const bg: vaxis.Color = if (selected) .{ .rgb = self.theme.bg_sel } else base_bg;
-        const label = thread.statusLabel();
+        const label = try @import("ai.zig").threadListStatus(self, a, idx, now_ns);
         const label_cells: u32 = @intCast(buffer.utf8.displayWidth(label));
         var title_budget: u32 = usable -| 2; // dot + space
         var show_status = false;
@@ -2398,7 +2399,7 @@ fn renderAgentsRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, body_to
             title_budget -= label_cells + 1;
             show_status = true;
         }
-        const title = buffer.utf8.truncateWidth(thread.title, title_budget);
+        const title = buffer.utf8.truncateWidth(try @import("ai.zig").threadListTitle(self, a, idx), title_budget);
         const title_cells: u32 = @intCast(buffer.utf8.displayWidth(title));
         const dot_color = switch (thread.status) {
             .idle => self.theme.fg_faint,

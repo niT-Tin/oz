@@ -890,6 +890,7 @@ fn updateCard(self: *App, p: *const model.Pending, status: ws.ToolStatus, text: 
     if (msg.role != .tool or msg.tool_name == null) return;
     if (!std.mem.eql(u8, msg.tool_name.?, p.kind.toolName())) return;
     self.ai.threads.setToolDecision(self.alloc, p.thread_index, p.card_index, status, text);
+    @import("ai.zig").saveHistory(self, p.thread_index, p.card_index);
 }
 
 fn recordDecision(self: *App, p: *const model.Pending, verdict: agent.Verdict) void {

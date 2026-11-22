@@ -31,15 +31,26 @@ for line in sys.stdin:
     rid = v.get('id')
     if method == 'initialize':
         assert v['params']['clientCapabilities'] == {}
-        result(rid, {'protocolVersion': 2 if mode == 'version' else 1, 'agentCapabilities': {}})
+        result(rid, {'protocolVersion': 2 if mode == 'version' else 1, 'agentCapabilities': {'loadSession': mode == 'load'}})
     elif method == 'session/new':
         assert v['params']['cwd'].startswith('/')
         assert v['params']['mcpServers'] == []
         result(rid, {'sessionId': 's1'})
+    elif method == 'session/load':
+        assert mode == 'load' and v['params']['sessionId'] == 's1'
+        assert v['params']['cwd'].startswith('/') and v['params']['mcpServers'] == []
+        # ACP can replay notifications while loading. The local transcript
+        # already contains them and must not grow duplicate cards or text.
+        update('HISTORY_DUPLICATE')
+        turn = 1
+        result(rid, {})
     elif method == 'session/prompt':
         assert v['params']['sessionId'] == 's1'
         assert v['params']['prompt'][0]['type'] == 'text'
         turn += 1
+        if 'SECOND_PROMPT' in v['params']['prompt'][0]['text']:
+            assert 'FIRST_PROMPT' not in v['params']['prompt'][0]['text']
+            update('LOADED_BACKEND' if turn == 2 else 'FRESH_BACKEND')
         if mode == 'disconnect':
             sys.exit(0)
         if mode == 'hang':
@@ -51,6 +62,16 @@ for line in sys.stdin:
         elif mode == 'oversized':
             sys.stdout.write('x' * (8 * 1024 * 1024 + 1) + '\n')
             sys.stdout.flush()
+        elif mode == 'tool-progress':
+            def tool(**change):
+                send({'jsonrpc': '2.0', 'method': 'session/update',
+                      'params': {'sessionId': 's1', 'update': dict(toolCallId='t1', **change)}})
+            tool(sessionUpdate='tool_call', title='Bash', status='pending', rawInput={'command': 'pwd'})
+            for _ in range(20):
+                tool(sessionUpdate='tool_call_update', status='in_progress')
+            tool(sessionUpdate='tool_call_update', status='completed',
+                 content=[{'type': 'content', 'content': {'type': 'text', 'text': 'PROGRESS_RESULT'}}])
+            finish(rid)
         elif mode == 'barrier':
             from pathlib import Path
             root = Path(sys.argv[2])

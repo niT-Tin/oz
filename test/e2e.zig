@@ -176,10 +176,10 @@ fn spawnChildEnvCwd(io: Io, pty: *Pty, argv: []const []const u8, env_extra: ?[]c
     }
     const argv_z: [*:null]const ?[*:0]const u8 = @ptrCast(&arg_ptrs);
 
-    var env_bufs: [12][256:0]u8 = undefined;
-    var env_ptrs: [13]?[*:0]const u8 = @splat(null);
+    var env_bufs: [13][256:0]u8 = undefined;
+    var env_ptrs: [14]?[*:0]const u8 = @splat(null);
     var nenv: usize = 0;
-    const base_env = [_][]const u8{ "TERM=xterm-256color", "PATH=/usr/bin:/bin:/usr/local/bin", "HOME=/tmp" };
+    const base_env = [_][]const u8{ "TERM=xterm-256color", "PATH=/usr/bin:/bin:/usr/local/bin", "HOME=/tmp", "OZ_AGENT_DIR=" };
     outer: for (base_env) |e| {
         const key = e[0..(std.mem.indexOfScalar(u8, e, '=') orelse e.len)];
         if (env_extra) |extra| {
@@ -231,6 +231,7 @@ const Session = struct {
     io: Io,
     pty: Pty,
     pid: std.posix.pid_t,
+    agent_store: ?std.testing.TmpDir = null,
     // 1 MiB capture buffer: a single full-color frame of a syntax-highlighted
     // file is ~60KB (every cell carries two 38;2/48;2 SGR sequences), and a
     // session with LSP status frames + overlays can exceed 64KB. A full
@@ -267,30 +268,33 @@ const Session = struct {
         cols: u16,
         cwd: ?[]const u8,
     ) !Session {
+        var agent_store = std.testing.tmpDir(.{});
+        errdefer agent_store.cleanup();
+        var storage_path: [std.fs.max_path_bytes]u8 = undefined;
+        const path_len = try agent_store.dir.realPath(io, &storage_path);
+        var storage_entry: [std.fs.max_path_bytes + 32]u8 = undefined;
+        const storage = try std.fmt.bufPrint(&storage_entry, "OZ_AGENT_DIR={s}", .{storage_path[0..path_len]});
+        const extra = env_extra orelse &.{};
+        var entries: std.ArrayList([]const u8) = .empty;
+        defer entries.deinit(std.testing.allocator);
+        try entries.appendSlice(std.testing.allocator, extra);
+        for (extra) |entry| {
+            if (std.mem.startsWith(u8, entry, "OZ_AGENT_DIR=")) break;
+        } else try entries.append(std.testing.allocator, storage);
         var pty = try Pty.openSize(rows, cols);
         errdefer pty.close();
-        const pid = spawnChildEnvCwd(io, &pty, argv, env_extra, cwd) catch |e| {
-            pty.close();
-            return e;
-        };
-        errdefer killPid(pid);
-        return .{ .io = io, .pty = pty, .pid = pid };
+        const pid = try spawnChildEnvCwd(io, &pty, argv, entries.items, cwd);
+        return .{ .io = io, .pty = pty, .pid = pid, .agent_store = agent_store };
     }
 
     /// Spawn with a specific cwd (git tests run inside a temp repo).
     fn spawnCwd(io: Io, argv: []const []const u8, cwd: []const u8) !Session {
-        var pty = try Pty.open();
-        errdefer pty.close();
-        const pid = spawnChildEnvCwd(io, &pty, argv, null, cwd) catch |e| {
-            pty.close();
-            return e;
-        };
-        errdefer killPid(pid);
-        return .{ .io = io, .pty = pty, .pid = pid };
+        return spawnEnvSizeCwd(io, argv, null, 24, 80, cwd);
     }
 
     fn close(self: *Session) void {
         self.pty.close();
+        if (self.agent_store) |*tmp| tmp.cleanup();
     }
 
     /// Send raw bytes to the editor's stdin (tty master).
@@ -25555,6 +25559,16 @@ fn acpEditorScenario(mode: []const u8, dirty: bool, allow: bool) !void {
     } else {
         try gridWaitFor(&sess, &grid, "ACP_REPLY_1", 5000);
         try gridWaitFor(&sess, &grid, "idle", 5000);
+        if (std.mem.eql(u8, mode, "tool-progress")) {
+            var headers: usize = 0;
+            for (0..grid.rows) |row| if (rowContains(&grid, row, "Bash")) {
+                headers += 1;
+                try std.testing.expect(rowContains(&grid, row, "ok"));
+            };
+            try std.testing.expectEqual(@as(usize, 1), headers);
+            try std.testing.expect(grid.contains("PROGRESS_RESULT"));
+            try std.testing.expect(!grid.contains("[tool "));
+        }
         if (std.mem.eql(u8, mode, "normal")) {
             try sess.send("second\r");
             try gridWaitFor(&sess, &grid, "ACP_REPLY_2", 5000);
@@ -25569,6 +25583,81 @@ fn acpEditorScenario(mode: []const u8, dirty: bool, allow: bool) !void {
     try sess.send("\x1b");
     try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
     try aiQuit(&sess);
+}
+test "ACP editor: one card survives twenty progress updates" {
+    try acpEditorScenario("tool-progress", false, false);
+}
+fn agentHistoryRestart(mode: []const u8) !void {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const builtin = std.mem.eql(u8, mode, "builtin");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    try aiWriteFile(io, root, "edit.txt", "context");
+    const script = try std.Io.Dir.cwd().realPathFileAlloc(io, "test/fixtures/acp_agent.py", a);
+    defer a.free(script);
+    const command = try std.json.Stringify.valueAlloc(a, .{ "python3", "-u", script, mode }, .{});
+    defer a.free(command);
+    const provider = if (builtin) try std.fmt.allocPrint(a, "OZ_AI_MOCK_DIR={s}", .{root}) else try std.fmt.allocPrint(a, "OZ_ACP_COMMAND={s}", .{command});
+    defer a.free(provider);
+    const storage = try std.fmt.allocPrint(a, "OZ_AGENT_DIR={s}/agent", .{root});
+    defer a.free(storage);
+    for (0..2) |round| {
+        const response = try aiTextSse(a, if (round == 0) "FIRST_ANSWER" else "SECOND_ANSWER");
+        defer a.free(response);
+        try aiWriteFile(io, root, "stream.sse", response);
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "edit.txt" }, &.{ provider, storage }, 40, 150, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 40, 150);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+        try sess.send(" a");
+        try gridWaitFor(&sess, &grid, "AGENTS", 5000);
+        if (round == 0) {
+            if (builtin) try sess.send("/model saved-model\r");
+            try sess.send("/auto\r");
+            try sess.send("FIRST_PROMPT\r");
+            try gridWaitFor(&sess, &grid, if (builtin) "FIRST_ANSWER" else "ACP_REPLY_1", 5000);
+        } else {
+            try gridWaitFor(&sess, &grid, "FIRST_PROMPT", 5000);
+            try std.testing.expect(!grid.contains(" · auto"));
+            try gridWaitFor(&sess, &grid, if (builtin) "builtin now" else "ACP now", 5000);
+            if (builtin) try gridWaitFor(&sess, &grid, "saved-model", 5000);
+            if (std.mem.eql(u8, mode, "normal")) try gridWaitFor(&sess, &grid, "Local history restored", 5000);
+            try sess.send("\rSECOND_PROMPT\r");
+            const answer = if (builtin) "SECOND_ANSWER" else if (std.mem.eql(u8, mode, "load")) "LOADED_BACKEND" else "FRESH_BACKEND";
+            try gridWaitFor(&sess, &grid, answer, 5000);
+            try std.testing.expect(!grid.contains("HISTORY_DUPLICATE"));
+            if (builtin) {
+                const request = try aiReadFile(io, a, root, "request.json");
+                defer a.free(request);
+                for ([_][]const u8{ "FIRST_PROMPT", "FIRST_ANSWER", "SECOND_PROMPT" }) |part|
+                    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, request, part));
+            }
+        }
+        try gridWaitFor(&sess, &grid, "idle", 5000);
+        if (round == 1) {
+            try sess.send("/new\r");
+            try gridWaitFor(&sess, &grid, "thread 2", 5000);
+            try gridWaitFor(&sess, &grid, "no messages yet", 5000);
+        }
+        try sess.send("\x1b");
+        try aiWaitRailFocus(&sess, &grid, aiRailCol(150), false, 3000);
+        try aiQuit(&sess);
+    }
+}
+
+test "agent history: builtin resumes prior messages and model after process exit" {
+    try agentHistoryRestart("builtin");
+}
+test "agent history: ACP loads context and ignores replayed transcript" {
+    try agentHistoryRestart("load");
+}
+test "agent history: ACP discloses a local-only restore for a fresh backend" {
+    try agentHistoryRestart("normal");
 }
 test "ACP editor: generic command and persistent conversation" {
     try acpEditorScenario("normal", false, false);

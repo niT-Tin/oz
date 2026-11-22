@@ -874,7 +874,7 @@ Narrow drawer 必须有焦点隔离，不能挤压编辑器到不可用宽度；
 - 切换（`select`）只改变可见线程，原线程继续运行；只有显式 Ctrl+c 会取消当前线程，按 generation 丢弃取消后的迟到事件。
 - 各线程独立拥有 transport、配置、工具循环、终端进程与审批状态，可以同时 streaming；新建线程与切换不取消任何其他任务。
 - 切回已取消线程显示冻结的 transcript（含 `[stream cancelled]` 标记），不会被后续事件修改；各线程的请求体只包含自己的 messages（验证见 e2e `threads stream in parallel` 和屏障控制的 ACP A 晚于 B 测试）。
-- 关闭 rail 不删除线程、不取消流；workspace 切换也不动 `App.ai`；不落盘。
+- 关闭 rail 保留线程和流。Agent 将对话按项目根目录保存，重启可从线程列表继续。
 
 **范围与限制**
 
@@ -1620,11 +1620,17 @@ M3 把 chat 从“只会说话”升级为“能安全调用工具、需要时�
 
 ### ACP v1 backend
 
-`src/ai/acp.zig` owns newline-delimited JSON-RPC framing (8 MiB per frame), process/session lifetime, numeric client request IDs, string-or-number server request IDs, v1 initialization, session creation and prompt responses. The existing asynchronous Client transports ACP events through its owned queue; App continues polling until a terminal event. Each editor thread keeps one connection between turns. Cancellation interrupts blocked I/O and kills/reaps the process group; errors drop the connection so retry creates a fresh session. A connection rejects a changed project root rather than sending a different project's context into its existing session.
+`src/ai/acp.zig` owns newline-delimited JSON-RPC framing (8 MiB per frame), process/session lifetime, numeric client request IDs, string-or-number server request IDs, v1 initialization, session creation and prompt responses. The existing asynchronous Client transports ACP events through its owned queue; App continues polling until a terminal event. Each editor thread keeps one connection between turns. Cancellation interrupts blocked I/O and kills/reaps the process group; errors drop the connection so retry renegotiates session loading. A connection rejects a changed project root rather than sending a different project's context into its existing session.
 
-The client advertises no terminal or filesystem capabilities. Agents own their tool implementations and model/context budgets. Unknown requests receive JSON-RPC method-not-found, unknown notifications are ignored, and foreign-session message updates are discarded. Tool lifecycle updates are transcript text, never oz tool-loop requests. Permission requests show serialized tool details and wait for a human one-shot decision. Only allow_once/reject_once options are selected; absent matching options or invalid sessions produce rejection/cancellation. Oversized permission details are denied. No always-allow policy is inferred.
+The client advertises no terminal or filesystem capabilities. Agents own their tool implementations and model/context budgets. Unknown requests receive JSON-RPC method-not-found, unknown notifications are ignored, and foreign-session message updates are discarded. Tool lifecycle updates patch one expandable display card per call ID in the current turn. Builtin provider requests omit these harness-owned cards. Permission decisions use single-use options. Missing matching options, invalid sessions and oversized permission details result in rejection or cancellation.
 
-External writes are already committed by the harness. After a turn, clean open buffers in the visible workspace refresh as undoable replacements and synchronize LSP; dirty buffers and their save baselines are preserved. Retargeted/deleted paths produce a conflict note. ACP is separate from inline replacement generation, which directs users to the Agent panel. Sessions/transcripts are currently in memory only: no loadSession, backend history replay, model selector, or MCP configuration UI is claimed. Commands are explicitly configured by the user's environment, never loaded from repository-local settings.
+External writes are already committed by the harness. After a turn, clean open buffers in the visible workspace refresh as undoable replacements and synchronize LSP; dirty buffers and their save baselines are preserved. Retargeted/deleted paths produce a conflict note. ACP is separate from inline replacement generation, which directs users to the Agent panel. Sessions are restored from private local journals. When the harness advertises `loadSession`, oz requests `session/load` with the saved ID and project root on the next send. Loading can replay notifications, which oz discards before accepting new prompt output. Other harnesses start a new backend session with a visible local-history notice.
+
+### Agent conversation history
+
+Opening Agent discovers the 24 most recently updated conversations for the current project. Select a row and press Enter to continue. Rows show a number for `/thread`, the first prompt, backend and age. `+` and `/new` start an independent conversation. Each nonempty conversation has a random 128-bit identity. The storage directory comes from `OZ_AGENT_DIR`, `$XDG_DATA_HOME/oz/agent`, or `$HOME/.local/share/oz/agent`. An empty explicit override disables persistence.
+
+Each project has a private directory of JSONL journals. Committed lines checkpoint changed messages, provider selections and ACP session identity at user sends, tool transitions and turn completion. Scanning the journals recreates the list. Incomplete trailing records are ignored. Stale concurrent writers continue in independent journals and an 8 MiB limit bounds each file. Builtin requests replay saved API messages. Runtime clients, permission decisions and executable jobs always start fresh. Interrupted tools are marked on restore and approvals start in manual mode.
 
 
 ### Current-line diagnostics

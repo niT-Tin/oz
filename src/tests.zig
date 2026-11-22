@@ -91,6 +91,7 @@ pub const ai_config = @import("ai/config.zig");
 pub const ai_client = @import("ai/client.zig");
 pub const ai_permissions = @import("ai/permissions.zig");
 pub const ai_panel = @import("ai/panel.zig");
+pub const ai_history = @import("ai/history.zig");
 pub const ai_workspace = @import("ai/workspace.zig");
 // M3 tool protocol (pure; no execution or App wiring)
 pub const ai_tools = @import("ai/tools.zig");

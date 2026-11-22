@@ -40,6 +40,8 @@ pub const Event = union(enum) {
     /// One assistant turn's finalized tool calls (ordered by stream index).
     /// Ownership transfers to the receiver; free with `tools.freeCalls`.
     tool_calls: []tools.ToolCall,
+    acp_tool: acp.ToolUpdate,
+    acp_session: struct { id: []u8, can_load: bool, reconnect: bool },
 
     pub fn deinit(self: Event, alloc: std.mem.Allocator) void {
         switch (self) {
@@ -48,6 +50,8 @@ pub const Event = union(enum) {
             .err => |e| alloc.free(e),
             .tool_calls => |calls| tools.freeCalls(alloc, calls),
             .phase, .usage, .done, .cancelled => {},
+            .acp_session => |session| alloc.free(session.id),
+            .acp_tool => |update| update.arena.deinit(),
         }
     }
 };
@@ -58,6 +62,7 @@ pub const Spec = struct {
     acp_cwd: ?[]const u8 = null,
     acp_root: ?[]const u8 = null,
     acp_prompt: ?[]const u8 = null,
+    acp_resume: ?[]const u8 = null,
     url: []const u8,
     /// Optional `Authorization: Bearer ...` credential.
     api_key: ?[]const u8 = null,
@@ -75,6 +80,7 @@ const Job = struct {
     acp_cwd: ?[]u8,
     acp_root: ?[]u8,
     acp_prompt: ?[]u8,
+    acp_resume: ?[]u8,
     url: []u8,
     api_key: ?[]u8,
     body: []u8,
@@ -85,7 +91,7 @@ const Job = struct {
     seq: u32,
 
     fn deinit(self: *Job, alloc: std.mem.Allocator) void {
-        inline for (.{ "acp_command", "acp_cwd", "acp_root", "acp_prompt" }) |f| {
+        inline for (.{ "acp_command", "acp_cwd", "acp_root", "acp_prompt", "acp_resume" }) |f| {
             if (@field(self, f)) |v| alloc.free(v);
         }
         alloc.free(self.url);
@@ -154,11 +160,11 @@ pub const Client = struct {
         }
         errdefer if (mock_dir) |m| self.alloc.free(m);
 
-        var acp_fields: [4]?[]u8 = @splat(null);
+        var acp_fields: [5]?[]u8 = @splat(null);
         errdefer for (acp_fields) |v| {
             if (v) |b| self.alloc.free(b);
         };
-        inline for (.{ "acp_command", "acp_cwd", "acp_root", "acp_prompt" }, 0..) |f, i| {
+        inline for (.{ "acp_command", "acp_cwd", "acp_root", "acp_prompt", "acp_resume" }, 0..) |f, i| {
             if (@field(spec, f)) |v| acp_fields[i] = self.alloc.dupe(u8, v) catch return error.OutOfMemory;
         }
         self.permission.store(0, .release);
@@ -168,6 +174,7 @@ pub const Client = struct {
             .acp_cwd = acp_fields[1],
             .acp_root = acp_fields[2],
             .acp_prompt = acp_fields[3],
+            .acp_resume = acp_fields[4],
             .url = url,
             .api_key = api_key,
             .body = body,
@@ -296,6 +303,14 @@ pub const Client = struct {
         };
     }
 
+    pub fn acpSession(self: *Client, id: []const u8, can_load: bool, reconnect: bool) !void {
+        try self.push(.{ .acp_session = .{ .id = try self.alloc.dupe(u8, id), .can_load = can_load, .reconnect = reconnect } });
+    }
+
+    pub fn acpTool(self: *Client, update: acp.ToolUpdate) !void {
+        try self.push(.{ .acp_tool = update });
+    }
+
     pub fn acpText(self: *Client, text: []const u8) !void {
         try self.push(.{ .delta = try self.alloc.dupe(u8, text) });
     }
@@ -318,7 +333,7 @@ pub const Client = struct {
         };
         if (self.acp_connection == null) self.acp_connection = try acp.Connection.start(self.alloc, self.io, job.acp_command.?, job.acp_cwd orelse job.acp_root.?);
         try self.push(.{ .phase = .streaming });
-        try self.acp_connection.?.prompt(job.acp_root.?, job.acp_prompt.?, self);
+        try self.acp_connection.?.prompt(job.acp_root.?, job.acp_prompt.?, job.acp_resume, self);
         try self.push(.done);
     }
 
@@ -704,7 +719,7 @@ test "client: mock stream emits phases, deltas, DeepSeek usage and done" {
         if (client.pop()) |ev| {
             defer ev.deinit(alloc);
             switch (ev) {
-                .acp_permission => unreachable,
+                .acp_tool, .acp_session, .acp_permission => unreachable,
                 .phase => |phase| switch (phase) {
                     .waiting => saw_waiting = true,
                     .streaming => saw_streaming = true,
@@ -767,7 +782,7 @@ test "client: SSE error payload becomes a terminal error" {
         if (client.pop()) |ev| {
             defer ev.deinit(alloc);
             switch (ev) {
-                .acp_permission => unreachable,
+                .acp_tool, .acp_session, .acp_permission => unreachable,
                 .err => |e| {
                     try std.testing.expect(std.mem.indexOf(u8, e, "Insufficient Balance") != null);
                     saw_error = true;
@@ -810,7 +825,7 @@ test "client: stream with no text or tool calls reports an empty response" {
         if (client.pop()) |ev| {
             defer ev.deinit(alloc);
             switch (ev) {
-                .acp_permission => unreachable,
+                .acp_tool, .acp_session, .acp_permission => unreachable,
                 .err => |e| {
                     try std.testing.expect(std.mem.indexOf(u8, e, "empty response") != null);
                     try std.testing.expect(std.mem.indexOf(u8, e, "insufficient_system_resource") != null);
@@ -850,7 +865,7 @@ test "client: mock error.txt becomes an error event" {
     while (saw_err == null and waited_ms < 3000) : (waited_ms += 5) {
         if (client.pop()) |ev| {
             switch (ev) {
-                .acp_permission => unreachable,
+                .acp_tool, .acp_session, .acp_permission => unreachable,
                 .err => |e| saw_err = e,
                 .phase, .usage, .delta, .done, .cancelled => ev.deinit(alloc),
                 .tool_calls => |calls| {
@@ -1056,7 +1071,7 @@ test "client: tool_calls fragments accumulate while text deltas still stream" {
     while (!done and waited_ms < 3000) : (waited_ms += 5) {
         if (client.pop()) |ev| {
             switch (ev) {
-                .acp_permission => unreachable,
+                .acp_tool, .acp_session, .acp_permission => unreachable,
                 .delta => |d| {
                     defer alloc.free(d);
                     try got.appendSlice(alloc, d);
@@ -1115,7 +1130,7 @@ test "client: malformed tool-call fields become a chat error, not a panic" {
     while (err_text == null and waited_ms < 3000) : (waited_ms += 5) {
         if (client.pop()) |ev| {
             switch (ev) {
-                .acp_permission => unreachable,
+                .acp_tool, .acp_session, .acp_permission => unreachable,
                 .err => |e| err_text = e,
                 else => ev.deinit(alloc),
             }
@@ -1160,7 +1175,7 @@ test "client: per-request mock fixtures and request-<n>.json for follow-ups" {
     while (calls == null and waited_ms < 3000) : (waited_ms += 5) {
         if (client.pop()) |ev| {
             switch (ev) {
-                .acp_permission => unreachable,
+                .acp_tool, .acp_session, .acp_permission => unreachable,
                 .tool_calls => |c| calls = c,
                 else => ev.deinit(alloc),
             }
@@ -1182,7 +1197,7 @@ test "client: per-request mock fixtures and request-<n>.json for follow-ups" {
     while (!done and waited_ms < 3000) : (waited_ms += 5) {
         if (client.pop()) |ev| {
             switch (ev) {
-                .acp_permission => unreachable,
+                .acp_tool, .acp_session, .acp_permission => unreachable,
                 .delta => |d| {
                     defer alloc.free(d);
                     try got.appendSlice(alloc, d);
@@ -1250,7 +1265,7 @@ fn testAcp(mode: []const u8, allow: bool, expected_error: ?[]const u8, turns: us
                         failed = true;
                         if (expected_error) |expected| try std.testing.expect(std.mem.indexOf(u8, message, expected) != null) else return error.UnexpectedAcpError;
                     },
-                    .phase => {},
+                    .phase, .acp_tool, .acp_session => {},
                     else => return error.UnexpectedAcpEvent,
                 }
             } else try std.Io.sleep(io, .fromMilliseconds(2), .real);
