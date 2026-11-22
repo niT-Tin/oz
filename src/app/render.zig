@@ -1681,18 +1681,6 @@ pub fn hoverFenceSegs(self: *App, a: std.mem.Allocator, line: []const u8, cols: 
     return segs.items;
 }
 
-/// A blank markdown fence row: the ``` markers are concealed (not dimmed),
-/// so a hover renders like markdown instead of like source text. The row is
-/// still painted with bg_float to keep the floating panel solid.
-pub fn hoverBlankSegs(self: *App, a: std.mem.Allocator, cols: u32) ![]vaxis.Segment {
-    var segs = std.ArrayList(vaxis.Segment).empty;
-    const style: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float } };
-    const pad = try a.alloc(u8, @intCast(cols));
-    @memset(pad, ' ');
-    try segs.append(a, .{ .text = pad, .style = style });
-    return segs.items;
-}
-
 /// One code-block row inside the hover window: token colors from the
 /// block's merged tree-sitter spans (each span clipped to this line,
 /// syntaxStyle fg on bg_float), then padding to `cols` so the panel
@@ -1745,18 +1733,6 @@ pub fn hoverCodeLineSegs(self: *App, a: std.mem.Allocator, block: []const u8, li
 /// rowAllBg on hover rows). The text slices reference the caller's owned
 /// hover buffer, and the padding is allocator-owned — both outlive the
 /// render call.
-/// Literal one-segment renderer for plaintext hover content. Unlike
-/// hoverLineSegs it never hides Markdown markers or starts fences: a server
-/// that negotiated plaintext (or an unknown contentFormat) must be shown
-/// exactly as sent.
-pub fn hoverPlainLineSegs(self: *App, a: std.mem.Allocator, line: []const u8, cols: u32) ![]vaxis.Segment {
-    const base: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } };
-    const shown = buffer.utf8.truncateWidth(line, cols);
-    const segs = try a.alloc(vaxis.Segment, 1);
-    segs[0] = .{ .text = shown, .style = base };
-    return segs;
-}
-
 pub fn hoverLineSegs(self: *App, a: std.mem.Allocator, line: []const u8, cols: u32) ![]vaxis.Segment {
     var segs = std.ArrayList(vaxis.Segment).empty;
     const base: vaxis.Style = .{ .bg = .{ .rgb = self.theme.bg_float }, .fg = .{ .rgb = self.theme.fg } };
@@ -2452,211 +2428,29 @@ fn renderAgentsRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, body_to
     }
 }
 
-/// Draw one bordered, solid-background rich-text popup at (start_row, col0).
-/// `text` is LSP markdown: prose lines get markdown-ish token colors, fenced
-/// ```lang blocks have their markers concealed and their body highlighted
-/// with tree-sitter. At most `max_rows` lines and `cols` cells per line.
-/// Shared by the hover/signature window and the completion documentation
-/// pane, so both get the same geometry guarantees (see hoverLineSegs).
-pub fn drawRichPopup(
-    self: *App,
-    a: std.mem.Allocator,
-    win: vaxis.Window,
-    md: []const u8,
-    start_row: u32,
-    col0: u32,
-    max_rows: u32,
-    cols: u32,
-    as_markdown: bool,
-) !void {
-    // Height = number of source lines, capped: a huge hover never covers
-    // the buffer and a small one does not leave blank rows.
-    var rows: u32 = 1;
-    for (md) |c| {
-        if (c == '\n') rows += 1;
-    }
-    rows = @min(rows, max_rows);
-    const border_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = .{ .rgb = self.theme.bg_float } };
-    const border = "│";
-    const tl = "╭";
-    const tr = "╮";
-    const bl = "╰";
-    const br = "╯";
-    // top border
-    {
-        const seg = [_]vaxis.Segment{
-            .{ .text = tl, .style = border_style },
-            .{ .text = "─", .style = border_style },
-        };
-        _ = win.print(&seg, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(col0), .wrap = .none });
-        var cx: u32 = 1;
-        while (cx <= cols) : (cx += 1) {
-            const hseg = [_]vaxis.Segment{.{
-                .text = "─",
-                .style = border_style,
-            }};
-            _ = win.print(&hseg, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(col0 + cx), .wrap = .none });
-        }
-        const rseg = [_]vaxis.Segment{.{
-            .text = tr,
-            .style = border_style,
-        }};
-        _ = win.print(&rseg, .{ .row_offset = @intCast(start_row), .col_offset = @intCast(col0 + cols + 1), .wrap = .none });
-    }
-    // Split the text into up to rows lines; fence off ```lang
-    // code blocks and syntax-highlight their content with
-    // tree-sitter (hoverCodeLineSegs); prose lines get markdown-
-    // ish token colors (hoverLineSegs). Fence lines render dim.
-    // Every cell keeps bg_float — the panel stays a solid block.
-    const HoverBlock = struct {
-        start: usize,
-        end: usize, // line indices, end exclusive
-        lang: ?[]const u8,
-        text: []u8, // lines joined with '\n' (arena)
-        offsets: []u32, // byte offset of each line in text
-        spans: []syntax.Span, // merged spans over text
-    };
-    var lines = std.ArrayList([]const u8).empty;
-    var kinds = std.ArrayList(u8).empty; // 0 prose, 1 fence, 2 code
-    var blocks = std.ArrayList(HoverBlock).empty;
-    {
-        var remaining = md;
-        var r: u32 = 0;
-        var in_fence: ?[]const u8 = null;
-        var block_start: usize = 0;
-        while (r < rows) : (r += 1) {
-            const nl = std.mem.indexOfScalar(u8, remaining, '\n');
-            const line_len = if (nl) |i| i else remaining.len;
-            try lines.append(a, remaining[0..line_len]);
-            if (in_fence == null) {
-                if (as_markdown) if (autil.isFenceLine(remaining[0..line_len])) |flang| {
-                    try kinds.append(a, 1);
-                    in_fence = flang;
-                    block_start = lines.items.len;
-                } else {
-                    try kinds.append(a, 0);
-                } else {
-                    try kinds.append(a, 0);
-                }
-            } else {
-                if (autil.isFenceLine(remaining[0..line_len]) != null) {
-                    try kinds.append(a, 1);
-                    try blocks.append(a, .{ .start = block_start, .end = lines.items.len, .lang = in_fence, .text = &.{}, .offsets = &.{}, .spans = &.{} });
-                    in_fence = null;
-                } else {
-                    try kinds.append(a, 2);
-                }
-            }
-            if (nl) |i| {
-                remaining = remaining[@min(i + 1, remaining.len)..];
-            } else {
-                remaining = remaining[remaining.len..];
-            }
-        }
-        if (in_fence != null) {
-            try blocks.append(a, .{ .start = block_start, .end = lines.items.len, .lang = in_fence, .text = &.{}, .offsets = &.{}, .spans = &.{} });
-        }
-    }
-    // Build each block: joined text, per-line byte offsets, and
-    // merged tree-sitter spans (the highlighter lives
-    // only for this frame). The fence language wins; a bare or
-    // unknown fence falls back to the current file's language.
-    for (blocks.items) |*blk| {
-        if (blk.start >= blk.end) continue;
-        var text = std.ArrayList(u8).empty;
-        var offsets = std.ArrayList(u32).empty;
-        var bli = blk.start;
-        while (bli < blk.end) : (bli += 1) {
-            try offsets.append(a, @intCast(text.items.len));
-            try text.appendSlice(a, lines.items[bli]);
-            try text.append(a, '\n');
-        }
-        blk.text = try text.toOwnedSlice(a);
-        blk.offsets = try offsets.toOwnedSlice(a);
-        var hl: ?syntax.Highlighter = null;
-        if (blk.lang) |l| {
-            if (l.len > 0) {
-                if (syntax.languageFor(l)) |ln| hl = self.newHighlighter(ln) catch null;
-            }
-        }
-        if (hl == null) {
-            const ft = autil.filetypeOf(self.cur().path);
-            if (syntax.languageFor(ft)) |ln| hl = self.newHighlighter(ln) catch null;
-        }
-        if (hl) |*h| {
-            defer h.deinit();
-            h.reparse(blk.text) catch {};
-            var raw = std.ArrayList(syntax.Span).empty;
-            h.spansInRange(0, @intCast(blk.text.len), a, &raw) catch {};
-            var merged = std.ArrayList(syntax.Span).empty;
-            for (raw.items) |sp| {
-                while (merged.items.len > 0) {
-                    var last = &merged.items[merged.items.len - 1];
-                    if (sp.start >= last.end) break; // disjoint
-                    if (sp.start <= last.start) {
-                        _ = merged.pop(); // covered wholly
-                        continue;
-                    }
-                    last.end = sp.start; // later span wins
-                    break;
-                }
-                try merged.append(a, sp);
-            }
-            blk.spans = try merged.toOwnedSlice(a);
-        }
-    }
-    // Render each row: code lines use their block's spans, fence
-    // lines dim, prose lines the markdown tokenizer.
-    var r: u32 = 0;
-    var cur_block: usize = 0;
-    while (r < rows) : (r += 1) {
-        const line = lines.items[r];
-        var inner: []vaxis.Segment = undefined;
-        switch (kinds.items[r]) {
-            1 => inner = try self.hoverBlankSegs(a, cols),
-            2 => {
-                while (cur_block < blocks.items.len and blocks.items[cur_block].end <= r) cur_block += 1;
-                if (cur_block < blocks.items.len and blocks.items[cur_block].start <= r) {
-                    const blk = &blocks.items[cur_block];
-                    const bi = r - blk.start;
-                    const ls = blk.offsets[bi];
-                    const shown = buffer.utf8.truncateWidth(line, cols);
-                    inner = try self.hoverCodeLineSegs(a, blk.text, ls, ls + @as(u32, @intCast(shown.len)), blk.spans, cols);
-                } else {
-                    inner = try self.hoverLineSegs(a, line, cols);
-                }
-            },
-            else => inner = if (as_markdown)
-                try self.hoverLineSegs(a, line, cols)
-            else
-                try self.hoverPlainLineSegs(a, line, cols),
-        }
-        var segs = std.ArrayList(vaxis.Segment).empty;
-        try segs.append(a, .{ .text = border, .style = border_style });
-        try segs.appendSlice(a, inner);
-        try segs.append(a, .{ .text = border, .style = border_style });
-        _ = win.print(segs.items, .{ .row_offset = @intCast(start_row + 1 + r), .col_offset = @intCast(col0), .wrap = .none });
-    }
-    // bottom border
-    {
-        const bseg = [_]vaxis.Segment{.{
-            .text = bl,
-            .style = border_style,
-        }};
-        _ = win.print(&bseg, .{ .row_offset = @intCast(start_row + 1 + rows), .col_offset = @intCast(col0), .wrap = .none });
-        var cx: u32 = 1;
-        while (cx <= cols) : (cx += 1) {
-            const hseg = [_]vaxis.Segment{.{
-                .text = "─",
-                .style = border_style,
-            }};
-            _ = win.print(&hseg, .{ .row_offset = @intCast(start_row + 1 + rows), .col_offset = @intCast(col0 + cx), .wrap = .none });
-        }
-        const rseg = [_]vaxis.Segment{.{
-            .text = br,
-            .style = border_style,
-        }};
-        _ = win.print(&rseg, .{ .row_offset = @intCast(start_row + 1 + rows), .col_offset = @intCast(col0 + cols + 1), .wrap = .none });
+/// Automatic signatureHelp contains a literal label. Bound it to six lines
+/// and let the same pane layout as K decide which side of the caret fits.
+fn drawSignature(self: *App, win: vaxis.Window, text: []const u8, pane: completion_layout.Rect, cursor_row: u32, anchor_col: u32) void {
+    var rows: [6][]const u8 = undefined;
+    var n: u32 = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (n < rows.len) : (n += 1) rows[n] = lines.next() orelse break;
+    const layout = hover_layout.plan(pane, cursor_row, anchor_col, n, 60);
+    if (layout.visible_rows == 0) return;
+    const rect = layout.rect;
+    const bg: vaxis.Color = .{ .rgb = self.theme.bg_float };
+    const inner = win.child(.{
+        .x_off = @intCast(rect.col),
+        .y_off = @intCast(rect.row),
+        .width = @intCast(rect.width),
+        .height = @intCast(rect.height),
+        .border = .{ .where = .all, .style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = bg } },
+    });
+    inner.fill(.{ .style = .{ .bg = bg } });
+    for (rows[0..layout.visible_rows], 0..) |line, row| {
+        const fit = autil.cellFitPrefix(inner, line, inner.width);
+        const segs = [_]vaxis.Segment{.{ .text = fit.slice, .style = .{ .fg = .{ .rgb = self.theme.fg }, .bg = bg } }};
+        _ = inner.print(&segs, .{ .row_offset = @intCast(row), .wrap = .none });
     }
 }
 
@@ -4683,29 +4477,13 @@ pub fn render(self: *App) !void {
     // viewport. Automatic signatures retain their short passive window.
     if (self.nav_hover_text) |htext| {
         if (htext.len > 0 and self.navHoverAlive()) {
+            const line = self.cur().pt.lineOf(self.curCursor().*);
+            const pos = self.focusedScreenPos(win, cur_rect, line, self.curCursor().*);
+            const pane = completion_layout.Rect{ .row = cur_rect.row, .col = cur_rect.col, .width = cur_rect.width, .height = cur_rect.height };
             if (self.nav_hover_action == .hover) {
-                const line = self.cur().pt.lineOf(self.curCursor().*);
-                const pos = self.focusedScreenPos(win, cur_rect, line, self.curCursor().*);
-                try drawHoverDocument(self, a, win, htext, .{
-                    .row = cur_rect.row,
-                    .col = cur_rect.col,
-                    .width = cur_rect.width,
-                    .height = cur_rect.height,
-                }, cur_rect.row + pos.row, cur_rect.col + gutter + pos.col);
+                try drawHoverDocument(self, a, win, htext, pane, pane.row + pos.row, pane.col + gutter + pos.col);
             } else {
-                const h_line = self.cur().pt.lineOf(self.curCursor().*);
-                var hrows: u32 = 1;
-                for (htext) |c| {
-                    if (c == '\n') hrows += 1;
-                }
-                hrows = @min(hrows, 6);
-                const h_sp = self.focusedScreenPos(win, cur_rect, h_line, self.curCursor().*);
-                var start_row = cur_rect.row + h_sp.row + 1;
-                if (start_row + hrows >= height) {
-                    start_row = (cur_rect.row + h_sp.row) -| hrows;
-                }
-                const col0 = cur_rect.col + gutter + 1;
-                try self.drawRichPopup(a, win, htext, start_row, col0, 6, 60, self.nav_hover_markdown);
+                drawSignature(self, win, htext, pane, pane.row + pos.row, pane.col + gutter + 1);
             }
         }
     }
