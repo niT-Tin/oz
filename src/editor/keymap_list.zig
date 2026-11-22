@@ -169,8 +169,11 @@ pub const entries: []const Entry = &.{
     .{ .keys = "/agent /model /new /threads", .desc = "Agent 输入框：选择后端、模型、新建、浏览线程", .group = "Agent" },
 
     // ---- 窗口 ----
-    .{ .keys = "ctrl-w h l", .desc = "窗口焦点向左/右（有文件树时切换树焦点）", .group = "窗口" },
+    .{ .keys = "ctrl-w h l", .desc = "窗口焦点向左/右（左侧导航器 / 右侧 Agent 输入框）", .group = "窗口" },
     .{ .keys = "ctrl-w j k", .desc = "窗口焦点向下/上", .group = "窗口" },
+    .{ .keys = "ctrl-w a", .desc = "打开 Agent 线程列表；再按一次进入所选输入框", .group = "窗口" },
+    .{ .keys = "ctrl-w w", .desc = "进入已打开的 Agent 输入框 / 回编辑器；否则轮换窗口", .group = "窗口" },
+    .{ .keys = "ctrl-w A", .desc = "切换 Agent 专注布局", .group = "窗口" },
     .{ .keys = "ctrl-w < > =", .desc = "Agent 面板缩窄 / 加宽 / 恢复默认（也可拖动左边框）", .group = "窗口" },
     .{ .keys = "gt gT", .desc = "下一个/上一个标签页（Buffer）", .group = "窗口" },
 

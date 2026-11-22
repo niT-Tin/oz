@@ -219,14 +219,16 @@ pub fn closeNavigator(self: *App) void {
 /// (or, for the already-open tab, closes) the peek.
 pub fn navigatorSetTab(self: *App, tab: nav.Tab) !void {
     self.filetree_pending_g = false;
-    const was_active = self.filetree_active;
-    if (!was_active) try self.toggleFiletree();
+    if (!self.filetree_active) {
+        self.navigator_tab = tab;
+        return self.toggleFiletree();
+    }
 
     if (self.navigatorCompact()) {
         // Selecting the already-open tab toggles the peek closed (the demo's
         // icon behavior); any other selection opens/switches it. A first
         // entry through `toggleFiletree` already opened the requested tab.
-        if (was_active and self.navigator_peek and
+        if (self.navigator_peek and
             nav.peekAfterSelect(true, self.navigator_tab, tab) == null)
         {
             self.navigatorPeekClose();
@@ -246,7 +248,11 @@ pub fn navigatorSetTab(self: *App, tab: nav.Tab) !void {
     self.navigator_tab = tab;
     self.ai.focus = .editor; // navigator owns keys; the rail may stay visible
     self.focus = .navigator;
-    switch (tab) {
+    try loadNavigatorTab(self);
+}
+
+pub fn loadNavigatorTab(self: *App) !void {
+    switch (self.navigator_tab) {
         .files => {},
         .notes => self.refreshNotes(),
         .agents => {

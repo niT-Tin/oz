@@ -19,6 +19,7 @@ const animation = @import("animation.zig");
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const ws = ai.workspace;
+const prompt_edit = @import("../ai/prompt.zig");
 const tool_job = @import("tool_job.zig");
 const app_agent_edit = @import("agent_edit_ui.zig");
 const app_agent_terminal = @import("agent_terminal.zig");
@@ -620,7 +621,7 @@ fn handleLocalCommand(self: *App, idx: usize) !bool {
     const owned = try self.alloc.dupe(u8, input);
     defer self.alloc.free(owned);
     // Clear before an action that can append/reallocate the thread list.
-    self.ai.threads.items.items[idx].input.clearRetainingCapacity();
+    self.ai.threads.items.items[idx].clearInput();
     const end = std.mem.indexOfAny(u8, owned, " \t") orelse owned.len;
     const command = owned[1..end];
     const argument = std.mem.trim(u8, owned[end..], " \t");
@@ -732,7 +733,7 @@ pub fn handleAiKey(self: *App, key: vaxis.Key) !void {
                 self.focus = .buffer;
                 self.navigator_peek = false;
             },
-            'a' => try self.focusAiRail(),
+            'a' => if (self.ai.focus == .rail) selectThreadAtCursor(self) else try self.focusAiRail(),
             'A' => try self.toggleAiFocus(),
             else => {},
         }
@@ -773,17 +774,8 @@ fn handleAiPromptKey(self: *App, key: vaxis.Key) !void {
         .scroll_down => aiScroll(self, 1),
         .page_up => aiScroll(self, -@as(i64, @intCast(@max(t.view_rows, 1)))),
         .page_down => aiScroll(self, @as(i64, @intCast(@max(t.view_rows, 1)))),
-        .backspace => {
-            if (t.input.items.len > 0) {
-                const cut = buffer.utf8.prevBoundary(t.input.items, t.input.items.len);
-                t.input.shrinkRetainingCapacity(cut);
-            }
-        },
-        .text => if (key.text) |text| {
-            // key.text is one complete UTF-8 sequence (vaxis reports text
-            // per key event); appending it verbatim can never split bytes.
-            try t.input.appendSlice(self.alloc, text);
-        },
+        .edit => |op| try prompt_edit.edit(t, self.alloc, op),
+        .text => try prompt_edit.insert(t, self.alloc, key.text.?),
         .ignore => {},
     }
 }
@@ -865,7 +857,7 @@ fn handleAgentTerminalKey(self: *App, key: vaxis.Key) !bool {
 /// accepts text; the thread list ignores it (no accidental drafts).
 pub fn aiPaste(self: *App, text: []const u8) !void {
     if (self.ai.focus != .prompt or self.ai.threads.items.items.len == 0) return;
-    try self.ai.threads.activeThread().input.appendSlice(self.alloc, text);
+    try prompt_edit.paste(self.ai.threads.activeThread(), self.alloc, text);
 }
 
 /// Mouse wheel over the workbox body: scroll whatever the active tab shows
@@ -1262,7 +1254,7 @@ pub fn aiSend(self: *App) !void {
         return e;
     };
 
-    t.input.clearRetainingCapacity();
+    t.clearInput();
     t.scroll = 0;
     t.auto_scroll = true;
 }
@@ -2521,6 +2513,29 @@ fn drawRailTextRow(
     try drawRailRow(win, a, y, x, w, "│", border_style, bg, segs.items, @intCast(fit.cells));
 }
 
+const ComposerWindow = struct { text: []const u8, cells: usize, caret: usize };
+
+fn composerWindow(a: std.mem.Allocator, win: vaxis.Window, before: []const u8, after: []const u8, cap: usize) !ComposerWindow {
+    if (cap == 0) return .{ .text = "", .cells = 0, .caret = 0 };
+    // Give the following text up to half the row. At the end of a draft the
+    // caret still needs a free cell, even when the text fits exactly.
+    const right_budget = @max(@min(autil.cellWidth(win, after), cap / 2), 1);
+    const left_cap = cap - right_budget;
+    const clipped_left = autil.cellWidth(win, before) > left_cap;
+    const left = autil.cellFitSuffix(win, before, left_cap -| @intFromBool(clipped_left));
+    const lead = if (clipped_left and left_cap > 0) "…" else "";
+    const caret = left.cells + @intFromBool(lead.len > 0);
+    const right_cap = cap - caret;
+    const clipped_right = autil.cellWidth(win, after) > right_cap;
+    const right = autil.cellFitPrefix(win, after, right_cap - @intFromBool(clipped_right));
+    const tail = if (clipped_right) "…" else "";
+    return .{
+        .text = try std.fmt.allocPrint(a, "{s}{s}{s}{s}", .{ lead, left.slice, right.slice, tail }),
+        .cells = caret + right.cells + @intFromBool(clipped_right),
+        .caret = caret,
+    };
+}
+
 /// Draw the docked rail / drawer. Called after the editor panes (and the
 /// terminal) so the rail covers exactly its reserved cells; overlays that
 /// open afterwards (pickers, hovers) render above it.
@@ -2662,9 +2677,18 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
     // uses the header and current conversation, without an empty list.
     if (m.thread_rows > 0) {
         var segs = std.ArrayList(vaxis.Segment).empty;
-        const ws_fit = autil.cellFitPrefix(win, self.curWsName(), content_w);
+        const help_label = "Ctrl-w a input";
+        const help = if (self.ai.focus == .rail and content_w > help_label.len) help_label else "";
+        const help_width: u32 = @intCast(help.len);
+        const ws_fit = autil.cellFitPrefix(win, self.curWsName(), content_w - help_width - @intFromBool(help_width > 0));
         try segs.append(a, .{ .text = ws_fit.slice, .style = st.faint });
-        try drawRailRow(win, a, m.group_row, x, w, "│", border_style, rail_bg, segs.items, @intCast(ws_fit.cells));
+        var used: u32 = @intCast(ws_fit.cells);
+        if (help_width > 0 and used + 1 + help_width <= content_w) {
+            try segs.append(a, .{ .text = try spaces(a, content_w - used - help_width), .style = st.faint });
+            try segs.append(a, .{ .text = help, .style = st.faint });
+            used = content_w;
+        }
+        try drawRailRow(win, a, m.group_row, x, w, "│", border_style, rail_bg, segs.items, used);
     }
 
     if (self.ai.thread_cursor >= self.ai.threads.items.items.len) {
@@ -2925,21 +2949,22 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         const streaming = active.status == .streaming;
         const hint = if (streaming) "Ctrl+c stop" else "Enter send";
         var hint_fit = autil.cellFitSuffix(win, hint, content_w -| prefix_cells -| 2);
-        const safe_input = try displaySafe(a, active.input.items);
+        const before = try displaySafe(a, active.input.items[0..active.input_cursor]);
+        const after = try displaySafe(a, active.input.items[active.input_cursor..]);
         var input_cap = content_w -| prefix_cells -| @as(u32, @intCast(hint_fit.cells)) -| 2;
-        if (safe_input.len > 0 and autil.cellWidth(win, safe_input) > input_cap) {
+        if (autil.cellWidth(win, before) + @max(autil.cellWidth(win, after), 1) > input_cap) {
             hint_fit = .{ .slice = "", .cells = 0 };
             input_cap = content_w -| prefix_cells;
         }
         const hint_cells: u32 = @intCast(hint_fit.cells);
-        const fit = autil.cellFitSuffix(win, safe_input, input_cap);
+        const fit = try composerWindow(a, win, before, after, input_cap);
         const placeholder = try std.fmt.allocPrint(a, "Message {s}…", .{active.title});
         const placeholder_fit = autil.cellFitPrefix(win, placeholder, input_cap);
         var segs = std.ArrayList(vaxis.Segment).empty;
         try segs.append(a, .{ .text = prefix, .style = styleOn(st.accent, st.band_bg) });
         var used: u32 = prefix_cells;
-        if (fit.cells > 0) {
-            try segs.append(a, .{ .text = fit.slice, .style = styleOn(st.base, st.band_bg) });
+        if (active.input.items.len != 0) {
+            try segs.append(a, .{ .text = fit.text, .style = styleOn(st.base, st.band_bg) });
             used += @intCast(fit.cells);
         } else if (placeholder_fit.cells > 0) {
             try segs.append(a, .{ .text = placeholder_fit.slice, .style = styleOn(st.faint, st.band_bg) });
@@ -2960,7 +2985,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
             }, .agent_prompt_focus);
         }
         if (self.ai.focus == .prompt) {
-            const cursor_col = x + 2 + prefix_cells + @as(u32, @intCast(fit.cells));
+            const cursor_col = x + 2 + prefix_cells + @as(u32, @intCast(fit.caret));
             self.vx.screen.cursor = .{
                 .row = @intCast(prompt_row),
                 .col = @intCast(@min(cursor_col, x + w - 2)),

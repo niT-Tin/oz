@@ -184,7 +184,10 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
                     self.navigateWindow(.left);
                     if (self.current_win == before) self.navigatorEnter();
                 } else if (!self.filetree_active) {
+                    const before = self.current_win;
                     self.navigateWindow(.left);
+                    if (before == self.current_win)
+                        try self.setMsg(try self.alloc.dupe(u8, "Space e opens Navigator"));
                 }
                 // from the navigator (tree open, focus == .navigator) there is
                 // nothing further left
@@ -194,7 +197,9 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
                     self.navigator_peek = false;
                     self.focus = .buffer;
                 } else {
+                    const before = self.current_win;
                     self.navigateWindow(.right);
+                    if (before == self.current_win and self.ai.rail_open) try self.aiFocusPrompt();
                 }
             },
             'j' => {
@@ -219,7 +224,7 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
             'a' => try self.focusAiRail(),
             'A' => try self.toggleAiFocus(),
             'w' => if (self.ai.rail_open) {
-                try self.focusAiRail();
+                try self.aiFocusPrompt();
             } else if (self.windows.items.len > 1) {
                 self.switchWindowTo((self.current_win + 1) % self.windows.items.len);
             },

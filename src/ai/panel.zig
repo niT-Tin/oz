@@ -6,6 +6,7 @@
 //!   - `classifyRail` thread-list / workbox navigation
 const std = @import("std");
 const vaxis = @import("vaxis");
+const prompt = @import("prompt.zig");
 
 pub fn threadStep(key: vaxis.Key) ?i8 {
     if (!key.mods.ctrl or key.mods.alt or key.mods.super or key.mods.shift) return null;
@@ -16,41 +17,65 @@ pub fn threadStep(key: vaxis.Key) ?i8 {
     };
 }
 
-pub const Action = enum {
-    close, // Esc -> editor focus (narrow drawer closes)
-    send, // Enter
-    cancel, // Ctrl+c
-    new_thread, // Ctrl+n
-    focus_rail, // Tab
-    scroll_up, // Ctrl+k
-    scroll_down, // Ctrl+j
+pub const Action = union(enum) {
+    close,
+    send,
+    cancel,
+    new_thread,
+    focus_rail,
+    scroll_up,
+    scroll_down,
     page_up,
     page_down,
-    backspace,
-    /// Printable text (the caller appends key.text verbatim).
+    edit: prompt.Edit,
     text,
     ignore,
 };
 
 pub fn classify(key: vaxis.Key) Action {
-    if (key.mods.ctrl and !key.mods.alt and !key.mods.super) {
-        switch (key.codepoint) {
-            'c' => return .cancel,
-            'n' => return .new_thread,
-            'k' => return .scroll_up,
-            'j' => return .scroll_down,
-            else => return .ignore,
-        }
-    }
-    if (key.codepoint == vaxis.Key.escape) return .close;
-    if (key.codepoint == vaxis.Key.tab) return .focus_rail;
-    if (key.codepoint == vaxis.Key.enter) return .send;
-    if (key.codepoint == vaxis.Key.backspace) return .backspace;
-    if (key.codepoint == vaxis.Key.page_up) return .page_up;
-    if (key.codepoint == vaxis.Key.page_down) return .page_down;
-    if (key.text) |t| {
-        if (t.len > 0 and !key.mods.ctrl and !key.mods.alt and !key.mods.super) return .text;
-    }
+    var mods = key.mods;
+    mods.caps_lock = false;
+    mods.num_lock = false;
+    if (mods.eql(.{ .ctrl = true })) return switch (key.codepoint) {
+        'c' => .cancel,
+        'n' => .new_thread,
+        'a' => .{ .edit = .home },
+        'e' => .{ .edit = .end },
+        'b' => .{ .edit = .left },
+        'f' => .{ .edit = .right },
+        'd' => .{ .edit = .delete },
+        'k' => .{ .edit = .kill_right },
+        'u' => .{ .edit = .kill_left },
+        'y' => .{ .edit = .yank },
+        vaxis.Key.left => .{ .edit = .word_left },
+        vaxis.Key.right => .{ .edit = .word_right },
+        else => .ignore,
+    };
+    if (mods.eql(.{ .alt = true })) return switch (key.codepoint) {
+        'b' => .{ .edit = .word_left },
+        'f' => .{ .edit = .word_right },
+        'd' => .{ .edit = .kill_word_right },
+        vaxis.Key.backspace => .{ .edit = .kill_word_left },
+        else => .ignore,
+    };
+    if (mods.eql(.{})) switch (key.codepoint) {
+        vaxis.Key.escape => return .close,
+        vaxis.Key.tab => return .focus_rail,
+        vaxis.Key.enter => return .send,
+        vaxis.Key.up => return .scroll_up,
+        vaxis.Key.down => return .scroll_down,
+        vaxis.Key.page_up => return .page_up,
+        vaxis.Key.page_down => return .page_down,
+        vaxis.Key.left => return .{ .edit = .left },
+        vaxis.Key.right => return .{ .edit = .right },
+        vaxis.Key.home => return .{ .edit = .home },
+        vaxis.Key.end => return .{ .edit = .end },
+        vaxis.Key.delete => return .{ .edit = .delete },
+        vaxis.Key.backspace => return .{ .edit = .backspace },
+        else => {},
+    };
+    mods.shift = false;
+    if (mods.eql(.{}) and key.text != null and key.text.?.len > 0) return .text;
     return .ignore;
 }
 
@@ -99,25 +124,29 @@ pub fn classifyRail(key: vaxis.Key) RailAction {
 }
 
 test "prompt keys: enter/esc/ctrl+c/ctrl+n/tab/backspace/page" {
-    try std.testing.expectEqual(Action.send, classify(.{ .codepoint = vaxis.Key.enter }));
-    try std.testing.expectEqual(Action.close, classify(.{ .codepoint = vaxis.Key.escape }));
-    try std.testing.expectEqual(Action.cancel, classify(.{ .codepoint = 'c', .mods = .{ .ctrl = true } }));
-    try std.testing.expectEqual(Action.new_thread, classify(.{ .codepoint = 'n', .mods = .{ .ctrl = true } }));
-    try std.testing.expectEqual(Action.focus_rail, classify(.{ .codepoint = vaxis.Key.tab }));
-    try std.testing.expectEqual(Action.backspace, classify(.{ .codepoint = vaxis.Key.backspace }));
-    try std.testing.expectEqual(Action.page_up, classify(.{ .codepoint = vaxis.Key.page_up }));
-    try std.testing.expectEqual(Action.page_down, classify(.{ .codepoint = vaxis.Key.page_down }));
-    try std.testing.expectEqual(Action.scroll_up, classify(.{ .codepoint = 'k', .mods = .{ .ctrl = true } }));
-    try std.testing.expectEqual(Action.scroll_down, classify(.{ .codepoint = 'j', .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(@as(Action, .send), classify(.{ .codepoint = vaxis.Key.enter }));
+    try std.testing.expectEqual(@as(Action, .close), classify(.{ .codepoint = vaxis.Key.escape }));
+    try std.testing.expectEqual(@as(Action, .cancel), classify(.{ .codepoint = 'c', .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(@as(Action, .new_thread), classify(.{ .codepoint = 'n', .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(@as(Action, .focus_rail), classify(.{ .codepoint = vaxis.Key.tab }));
+    try std.testing.expectEqual(Action{ .edit = .backspace }, classify(.{ .codepoint = vaxis.Key.backspace }));
+    try std.testing.expectEqual(@as(Action, .page_up), classify(.{ .codepoint = vaxis.Key.page_up }));
+    try std.testing.expectEqual(@as(Action, .page_down), classify(.{ .codepoint = vaxis.Key.page_down }));
+    try std.testing.expectEqual(Action{ .edit = .kill_right }, classify(.{ .codepoint = 'k', .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(@as(Action, .scroll_up), classify(.{ .codepoint = vaxis.Key.up }));
+    try std.testing.expectEqual(@as(Action, .scroll_down), classify(.{ .codepoint = vaxis.Key.down }));
+    try std.testing.expectEqual(Action{ .edit = .kill_word_left }, classify(.{ .codepoint = vaxis.Key.backspace, .mods = .{ .alt = true } }));
+    try std.testing.expectEqual(@as(Action, .ignore), classify(.{ .codepoint = 'w', .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(@as(Action, .ignore), classify(.{ .codepoint = 'k', .mods = .{ .ctrl = true, .shift = true } }));
 }
 
 test "prompt keys: printable text is not treated as a command" {
-    try std.testing.expectEqual(Action.text, classify(.{ .codepoint = 'a', .text = "a" }));
-    try std.testing.expectEqual(Action.text, classify(.{ .codepoint = 0x4F60, .text = "你" }));
-    try std.testing.expectEqual(Action.text, classify(.{ .codepoint = 'n', .text = "n" }));
-    try std.testing.expectEqual(Action.ignore, classify(.{ .codepoint = 'a' }));
-    try std.testing.expectEqual(Action.ignore, classify(.{ .codepoint = 'a', .text = "a", .mods = .{ .alt = true } }));
-    try std.testing.expectEqual(Action.ignore, classify(.{ .codepoint = 'z', .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(@as(Action, .text), classify(.{ .codepoint = 'a', .text = "a" }));
+    try std.testing.expectEqual(@as(Action, .text), classify(.{ .codepoint = 0x4F60, .text = "你" }));
+    try std.testing.expectEqual(@as(Action, .text), classify(.{ .codepoint = 'n', .text = "n" }));
+    try std.testing.expectEqual(@as(Action, .ignore), classify(.{ .codepoint = 'a' }));
+    try std.testing.expectEqual(@as(Action, .ignore), classify(.{ .codepoint = 'a', .text = "a", .mods = .{ .alt = true } }));
+    try std.testing.expectEqual(@as(Action, .ignore), classify(.{ .codepoint = 'z', .mods = .{ .ctrl = true } }));
 }
 
 test "rail keys: threads, tabs, new thread, focus exit" {

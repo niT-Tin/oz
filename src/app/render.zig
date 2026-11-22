@@ -4719,7 +4719,7 @@ pub fn render(self: *App) !void {
     const status_row: u32 = height - 1;
     const doc_col = self.lineCellCol(win, cursor_line, self.curCursor().*);
 
-    const mode_text: []const u8 = switch (self.state.mode) {
+    const mode_text: []const u8 = if (self.pending_window) "Ctrl-w … " else switch (self.state.mode) {
         .normal => "[NORMAL] ",
         .insert => "[INSERT] ",
         .visual_char, .visual_line, .visual_block => "[VISUAL] ",
@@ -5263,12 +5263,6 @@ pub fn run(self: *App) !void {
                     // buffer them (paste_end inserts the whole thing) so
                     // auto-indent/auto-pairs can't mangle pasted text
                     if (self.pasting and !term_focused) {
-                        if (self.ai.rail_open and self.ai.focus == .prompt) {
-                            if (key.text) |text| try self.aiPaste(text);
-                            continue;
-                        } else if (self.ai.rail_open and self.ai.focus == .rail) {
-                            continue;
-                        }
                         try self.pasteAccumulate(key);
                         continue;
                     }
