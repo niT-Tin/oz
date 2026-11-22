@@ -7,6 +7,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 
+const prompt_edit = @import("../ai/prompt.zig");
 const buffer = @import("../buffer/root.zig");
 const theme = @import("../theme.zig");
 const ai = @import("../ai/root.zig");
@@ -19,7 +20,6 @@ const animation = @import("animation.zig");
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const ws = ai.workspace;
-const prompt_edit = @import("../ai/prompt.zig");
 const tool_job = @import("tool_job.zig");
 const app_agent_edit = @import("agent_edit_ui.zig");
 const app_agent_terminal = @import("agent_terminal.zig");
@@ -1986,6 +1986,29 @@ const Assembler = struct {
     }
 };
 
+const ComposerWindow = struct { text: []const u8, cells: usize, caret: usize };
+
+fn composerWindow(a: std.mem.Allocator, win: vaxis.Window, before: []const u8, after: []const u8, cap: usize) !ComposerWindow {
+    if (cap == 0) return .{ .text = "", .cells = 0, .caret = 0 };
+    // Give the following text up to half the row. At the end of a draft the
+    // caret still needs a free cell, even when the text fits exactly.
+    const right_budget = @max(@min(autil.cellWidth(win, after), cap / 2), 1);
+    const left_cap = cap - right_budget;
+    const clipped_left = autil.cellWidth(win, before) > left_cap;
+    const left = autil.cellFitSuffix(win, before, left_cap -| @intFromBool(clipped_left));
+    const lead = if (clipped_left and left_cap > 0) "…" else "";
+    const caret = left.cells + @intFromBool(lead.len > 0);
+    const right_cap = cap - caret;
+    const clipped_right = autil.cellWidth(win, after) > right_cap;
+    const right = autil.cellFitPrefix(win, after, right_cap - @intFromBool(clipped_right));
+    const tail = if (clipped_right) "…" else "";
+    return .{
+        .text = try std.fmt.allocPrint(a, "{s}{s}{s}{s}", .{ lead, left.slice, right.slice, tail }),
+        .cells = caret + right.cells + @intFromBool(clipped_right),
+        .caret = caret,
+    };
+}
+
 fn spaces(alloc: std.mem.Allocator, n: usize) ![]const u8 {
     const buf = try alloc.alloc(u8, n);
     @memset(buf, ' ');
@@ -2511,29 +2534,6 @@ fn drawRailTextRow(
     var segs = std.ArrayList(vaxis.Segment).empty;
     if (fit.cells > 0) try segs.append(a, .{ .text = fit.slice, .style = style });
     try drawRailRow(win, a, y, x, w, "│", border_style, bg, segs.items, @intCast(fit.cells));
-}
-
-const ComposerWindow = struct { text: []const u8, cells: usize, caret: usize };
-
-fn composerWindow(a: std.mem.Allocator, win: vaxis.Window, before: []const u8, after: []const u8, cap: usize) !ComposerWindow {
-    if (cap == 0) return .{ .text = "", .cells = 0, .caret = 0 };
-    // Give the following text up to half the row. At the end of a draft the
-    // caret still needs a free cell, even when the text fits exactly.
-    const right_budget = @max(@min(autil.cellWidth(win, after), cap / 2), 1);
-    const left_cap = cap - right_budget;
-    const clipped_left = autil.cellWidth(win, before) > left_cap;
-    const left = autil.cellFitSuffix(win, before, left_cap -| @intFromBool(clipped_left));
-    const lead = if (clipped_left and left_cap > 0) "…" else "";
-    const caret = left.cells + @intFromBool(lead.len > 0);
-    const right_cap = cap - caret;
-    const clipped_right = autil.cellWidth(win, after) > right_cap;
-    const right = autil.cellFitPrefix(win, after, right_cap - @intFromBool(clipped_right));
-    const tail = if (clipped_right) "…" else "";
-    return .{
-        .text = try std.fmt.allocPrint(a, "{s}{s}{s}{s}", .{ lead, left.slice, right.slice, tail }),
-        .cells = caret + right.cells + @intFromBool(clipped_right),
-        .caret = caret,
-    };
 }
 
 /// Draw the docked rail / drawer. Called after the editor panes (and the

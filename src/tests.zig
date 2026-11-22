@@ -91,7 +91,6 @@ pub const ai_config = @import("ai/config.zig");
 pub const ai_client = @import("ai/client.zig");
 pub const ai_permissions = @import("ai/permissions.zig");
 pub const ai_panel = @import("ai/panel.zig");
-pub const ai_prompt = @import("ai/prompt.zig");
 pub const ai_workspace = @import("ai/workspace.zig");
 // M3 tool protocol (pure; no execution or App wiring)
 pub const ai_tools = @import("ai/tools.zig");
@@ -126,3 +125,4 @@ pub const replace_plan = @import("editor/replace_plan.zig");
 
 pub const git_job = @import("app/git_job.zig");
 pub const text_snapshot = @import("buffer/text_snapshot.zig");
+pub const ai_prompt = @import("ai/prompt.zig");
