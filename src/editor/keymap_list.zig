@@ -165,6 +165,8 @@ pub const entries: []const Entry = &.{
 
     // ---- Agent ----
     .{ .keys = "ctrl-pageup ctrl-pagedown", .desc = "Agent 内切换线程，后台任务继续运行", .group = "Agent" },
+    .{ .keys = "F6", .desc = "聚焦或切换待审批的 ACP 卡片", .group = "Agent" },
+    .{ .keys = "a A r Esc", .desc = "ACP 审批卡内允许一次、允许本回合、拒绝、离开", .group = "Agent" },
     .{ .keys = "/auto /manual", .desc = "Agent 输入框：当前线程只读自动审批 / 手动审批", .group = "Agent" },
     .{ .keys = "/agent /model /new /threads", .desc = "Agent 输入框：选择后端、模型、新建、浏览线程", .group = "Agent" },
 

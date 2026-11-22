@@ -25529,6 +25529,10 @@ fn acpEditorScenario(mode: []const u8, dirty: bool, allow: bool) !void {
     try sess.send("hello\r");
     if (std.mem.eql(u8, mode, "permission")) {
         try gridWaitFor(&sess, &grid, "ACP permission", 5000);
+        try sess.send("add a test");
+        try gridWaitFor(&sess, &grid, "add a test", 3000);
+        try std.testing.expect(!grid.contains("PERMISSION_yes"));
+        try sess.send("\x1b[17~"); // F6 enters the visible review
         try sess.send(if (allow) "a" else "r");
         try gridWaitFor(&sess, &grid, if (allow) "PERMISSION_yes" else "PERMISSION_no", 5000);
     }
@@ -25554,6 +25558,220 @@ fn acpEditorScenario(mode: []const u8, dirty: bool, allow: bool) !void {
     try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
     try aiQuit(&sess);
 }
+const AcpReviewCase = enum { multi, turn_opaque, dual, opaque_request, always, long, manual, change_thread, cancel };
+
+fn acpReviewScenario(case: AcpReviewCase, rows: u16, cols: u16) !void {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var root_buf: [128]u8 = undefined;
+    const root = if (case == .long) frame_root: {
+        const dir = try std.fmt.bufPrint(&root_buf, "/tmp/oz_acp_approval_golden_workspace_{d}x{d}_{d}", .{ cols, rows, linux.getpid() });
+        try std.Io.Dir.cwd().createDirPath(io, dir);
+        break :frame_root dir;
+    } else try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "source.txt", "REVIEW_BUFFER\n");
+    const script = try std.Io.Dir.cwd().realPathFileAlloc(io, "test/fixtures/acp_agent.py", a);
+    defer a.free(script);
+    const mode = switch (case) {
+        .multi => "permission-multi",
+        .turn_opaque => "permission-turn-opaque",
+        .dual => "permission-read",
+        .opaque_request => "permission-opaque",
+        .always => "permission-always",
+        .long => "permission-long",
+        .manual, .change_thread, .cancel => "permission-gated",
+    };
+    const argv = try std.json.Stringify.valueAlloc(a, .{ "python3", "-u", script, mode }, .{});
+    defer a.free(argv);
+    const env = try std.fmt.allocPrint(a, "OZ_ACP_COMMAND={s}", .{argv});
+    defer a.free(env);
+    const mock_env = try std.fmt.allocPrint(a, "OZ_AI_MOCK_DIR={s}", .{root});
+    defer a.free(mock_env);
+    if (case == .dual) {
+        const args = try aiTerminalArgs(a, "printf changed > source.txt", 4000);
+        defer a.free(args);
+        const staged = try aiToolCallsSse(a, &.{.{ .id = "term", .name = "terminal", .args = args }});
+        defer a.free(staged);
+        try aiWriteFile(io, root, "stream-1.sse", staged);
+        const done = try aiTextSse(a, "NATIVE_DONE");
+        defer a.free(done);
+        try aiWriteFile(io, root, "stream-2.sse", done);
+    }
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{ env, mock_env }, rows, cols, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, rows, cols);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 5000);
+    try sess.send(" a");
+    if (case == .opaque_request) try sess.send("/auto\r");
+    try sess.send("first\r");
+    const focus = "\x1b[17~";
+    switch (case) {
+        .multi => {
+            try gridWaitFor(&sess, &grid, "Request 1.1", 5000);
+            try sess.send(focus ++ "A");
+            try gridWaitFor(&sess, &grid, "PERMISSION_yes_yes_yes", 5000);
+            try sess.send("second\r");
+            try gridWaitFor(&sess, &grid, "Request 2.1", 5000);
+            try sess.send(focus ++ "a");
+            try gridWaitFor(&sess, &grid, "Request 2.2", 5000);
+            try sess.send(focus ++ "r");
+            try gridWaitFor(&sess, &grid, "Request 2.3", 5000);
+            try sess.send(focus ++ "r");
+            try gridWaitFor(&sess, &grid, "PERMISSION_yes_no_no", 5000);
+        },
+        .dual => {
+            try gridWaitFor(&sess, &grid, "F6 ACP permission", 5000);
+            try sess.send("/new builtin\r");
+            try gridWaitFor(&sess, &grid, "thread 2", 4000);
+            try sess.send("native write\r");
+            try gridWaitFor(&sess, &grid, "[a] allow", 6000);
+            try gridWaitFor(&sess, &grid, "F6 ACP permission · thread 1", 4000);
+            const deny = aiFindCell(&grid, "[r] deny") orelse return error.TestUnexpectedResult;
+            try mouseClickAt(&sess, deny.col + 1, deny.row);
+            try gridWaitFor(&sess, &grid, "terminal · rejected", 4000);
+            try sess.send(focus);
+            try gridWaitFor(&sess, &grid, "> ACP permission · thread 1", 4000);
+            try sess.send("r");
+            try gridWaitFor(&sess, &grid, "PERMISSION_no", 4000);
+            const file = try aiReadFile(io, a, root, "source.txt");
+            defer a.free(file);
+            try std.testing.expectEqualStrings("REVIEW_BUFFER\n", file);
+        },
+        .turn_opaque => {
+            try gridWaitFor(&sess, &grid, "Request 1.1", 5000);
+            try sess.send(focus ++ "A");
+            try gridWaitFor(&sess, &grid, "No harness description", 4000);
+            try gridWaitRowContains(&sess, &grid, aiWorkboxHeaderRow(&grid), "AUTO-TURN", 4000);
+            try sess.send(focus ++ "A");
+            try gridWaitFor(&sess, &grid, "Request 1.3", 4000);
+            try sess.send(focus ++ "r");
+            try gridWaitFor(&sess, &grid, "PERMISSION_yes_no_no", 4000);
+        },
+        .opaque_request => {
+            // The prior read-only tool update enriches display but grants no trust.
+            try gridWaitFor(&sess, &grid, "No harness description", 5000);
+            try gridWaitFor(&sess, &grid, "Command: cat settings", 5000);
+            try gridWaitFor(&sess, &grid, "Action: Inspect config", 5000);
+            try sess.send(focus ++ "A");
+            try gridWaitFor(&sess, &grid, "PERMISSION_no", 5000);
+        },
+        .always => {
+            try gridWaitFor(&sess, &grid, "single-use option", 5000);
+            try gridWaitFor(&sess, &grid, "PERMISSION_cancelled", 5000);
+        },
+        .long => {
+            try gridWaitFor(&sess, &grid, "LONG_HEAD_", 5000);
+            try sess.send("rain"); // a nonempty draft survives tab/editor detours
+            try gridWaitFor(&sess, &grid, "rain", 3000);
+            try sess.send("\tt"); // rail, Tools
+            try gridWaitFor(&sess, &grid, ">tools", 3000);
+            try gridWaitFor(&sess, &grid, "F6 ACP permission", 3000);
+            try sess.send("a");
+            try sess.send("\x1b"); // leave for editor; narrow drawer closes
+            try gridSettle(&sess, &grid, 80, 1000);
+            try sess.send(focus);
+            try gridWaitFor(&sess, &grid, "> ACP permission", 3000);
+            try gridWaitFor(&sess, &grid, "[r] reject", 3000);
+            const where = aiFindCell(&grid, "[r] reject") orelse return error.TestUnexpectedResult;
+            const banner = aiFindCell(&grid, "> ACP permission") orelse return error.TestUnexpectedResult;
+            // Crop the live PTY frame to the tab strip and sticky card.
+            // Exclude asynchronous request timers and temporary workspace paths.
+            const first = (banner.row - 1) * grid.cols;
+            const end = (where.row + 1) * grid.cols;
+            const band = .{
+                .rows = (end - first) / grid.cols,
+                .cols = grid.cols,
+                .buf = grid.buf[first * 4 .. end * 4],
+                .fg_buf = grid.fg_buf[first..end],
+                .bg_buf = grid.bg_buf[first..end],
+            };
+            const name = if (cols == 80) "ai-acp-permission-80x24" else "ai-acp-permission-120x30";
+            const path = try std.fmt.allocPrint(a, "test/golden/{s}.txt", .{name});
+            defer a.free(path);
+            try golden.check(io, a, &band, name, path);
+            try sess.send("jjjj");
+            try gridSettle(&sess, &grid, 80, 1000);
+            const still = aiFindCell(&grid, "[r] reject") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(where, still);
+            try frame.expectNoHorizontalOverflow(&grid, cols);
+            try sess.send("\x1b"); // leave review without deciding
+            try gridSettle(&sess, &grid, 80, 1000);
+            try sess.send(focus);
+            try gridWaitFor(&sess, &grid, "[r] reject", 3000);
+            if (cols == 80) {
+                const button = aiFindCell(&grid, "[r] reject") orelse return error.TestUnexpectedResult;
+                try mouseClickAt(&sess, button.col + 2, button.row);
+            } else {
+                const button = aiFindCell(&grid, "[r] reject") orelse return error.TestUnexpectedResult;
+                try sess.send(" j");
+                try gridWaitFor(&sess, &grid, "HINTS ·", 5000);
+                const n = hintLabelLenFor(hintTargetCount(&grid) orelse return error.TestUnexpectedResult);
+                var label_buf: [3]u8 = undefined;
+                const label = hintLabelAt(&grid, &label_buf, button.row, button.col, n);
+                try std.testing.expectEqual(n, label.len);
+                try sess.send(label);
+            }
+            // Ctrl-w a reopens the drawer and Enter attaches to chat.
+            try sess.send("\x17a\r");
+            try gridWaitFor(&sess, &grid, "rain", 4000);
+            try gridWaitFor(&sess, &grid, "PERMISSION_no", 4000);
+            try gridWaitFor(&sess, &grid, "REVIEW_BUFFER", 4000);
+        },
+        .manual, .change_thread, .cancel => {
+            try gridWaitFor(&sess, &grid, "Request 1.1", 5000);
+            try sess.send(focus ++ "A");
+            try gridWaitFor(&sess, &grid, "GATED", 5000);
+            try gridWaitRowContains(&sess, &grid, aiWorkboxHeaderRow(&grid), "AUTO-TURN", 4000);
+            if (case == .cancel) {
+                try sess.send("\x17h");
+                try gridSettle(&sess, &grid, 80, 1000);
+                try sess.send("\x03");
+                try gridWaitFor(&sess, &grid, "cancelled", 4000);
+                try sess.send("\x17a\rretry\r");
+                try gridWaitFor(&sess, &grid, "Request 1.1", 4000);
+                try gridWaitFor(&sess, &grid, "F6 ACP permission", 4000);
+            } else {
+                try sess.send(if (case == .manual) "/manual\r" else "/new\r");
+                if (case == .manual) try gridWaitFor(&sess, &grid, "approvals: manual", 4000) else try gridWaitFor(&sess, &grid, "thread 2", 4000);
+                try aiWriteFile(io, root, "release", "release");
+                try gridWaitFor(&sess, &grid, "F6 ACP permission", 5000);
+                try sess.send(focus);
+                try gridWaitFor(&sess, &grid, "Request 1.2", 5000);
+                try sess.send("r");
+                try gridWaitFor(&sess, &grid, "Request 1.3", 5000);
+                try sess.send(focus ++ "r");
+                try gridWaitFor(&sess, &grid, "PERMISSION_yes_no_no", 5000);
+            }
+        },
+    }
+}
+
+test "ACP review: scoped approvals and single-use responses across turns" {
+    try acpReviewScenario(.multi, 30, 120);
+}
+test "ACP review: opaque tool updates are display-only and offer no turn trust" {
+    try acpReviewScenario(.opaque_request, 30, 120);
+    try acpReviewScenario(.turn_opaque, 30, 120);
+}
+test "ACP review: a visible native terminal decision keeps its own target" {
+    try acpReviewScenario(.dual, 30, 120);
+}
+test "ACP review: always-only harness explains cancellation" {
+    try acpReviewScenario(.always, 30, 120);
+}
+test "ACP review golden: 120x30 and 80x24 frames keep actions visible and focus explicit" {
+    try acpReviewScenario(.long, 30, 120);
+    try acpReviewScenario(.long, 24, 80);
+}
+test "ACP review: manual, cancellation and changing the active thread revoke the grant" {
+    try acpReviewScenario(.manual, 30, 120);
+    try acpReviewScenario(.change_thread, 30, 120);
+    try acpReviewScenario(.cancel, 30, 120);
+}
+
 test "ACP editor: generic command and persistent conversation" {
     try acpEditorScenario("normal", false, false);
 }
@@ -32958,7 +33176,7 @@ test "agent workflow: ACP auto read permits once; writes and disguised reads req
             try sess.send("/manual\r");
             try gridWaitFor(&sess, &grid, "approvals: manual", 4000);
             try std.testing.expect(!grid.contains("PERMISSION_yes"));
-            try sess.send("r");
+            try sess.send("\x1b[17~r");
         }
         try gridWaitFor(&sess, &grid, if (read) "PERMISSION_yes" else "PERMISSION_no", 5000);
         try gridWaitFor(&sess, &grid, "ACP_REPLY_1", 5000);
@@ -33094,7 +33312,7 @@ test "agent workflow: ACP pending approval and auto trust do not cross threads" 
     try gridWaitRowContains(&sess, &grid, aiWorkboxHeaderRow(&grid), "thread 1", 4000);
     try gridWaitFor(&sess, &grid, "ACP permission", 4000);
     try std.testing.expect(!grid.contains("PERMISSION_yes"));
-    try sess.send("r");
+    try sess.send("\x1b[17~r");
     try gridWaitFor(&sess, &grid, "PERMISSION_no", 5000);
     try gridWaitFor(&sess, &grid, "complete", 5000);
     try sess.send("\x1b[6;5~");

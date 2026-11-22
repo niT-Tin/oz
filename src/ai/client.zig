@@ -17,6 +17,7 @@
 //!     `stream.sse` in small paced chunks (plus an optional `error.txt`).
 //!     Deliberately undocumented outside the code/DESIGN.
 const std = @import("std");
+const permissions = @import("permissions.zig");
 const acp = @import("acp.zig");
 const sse = @import("sse.zig");
 const openai = @import("openai.zig");
@@ -25,7 +26,7 @@ const tools = @import("tools.zig");
 
 pub const Event = union(enum) {
     /// Transport progressed without changing the transcript.
-    acp_permission: []u8,
+    acp_permission: permissions.Review,
     phase: telemetry.Phase,
     /// Provider-reported token accounting (DeepSeek sends a final usage-only chunk).
     usage: telemetry.Usage,
@@ -43,7 +44,7 @@ pub const Event = union(enum) {
 
     pub fn deinit(self: Event, alloc: std.mem.Allocator) void {
         switch (self) {
-            .acp_permission => |d| alloc.free(d),
+            .acp_permission => |d| alloc.free(d.description),
             .delta => |d| alloc.free(d),
             .err => |e| alloc.free(e),
             .tool_calls => |calls| tools.freeCalls(alloc, calls),
@@ -299,9 +300,11 @@ pub const Client = struct {
     pub fn acpText(self: *Client, text: []const u8) !void {
         try self.push(.{ .delta = try self.alloc.dupe(u8, text) });
     }
-    pub fn acpPermission(self: *Client, title: []const u8) !bool {
+    pub fn acpPermission(self: *Client, review: permissions.Review) !bool {
         self.permission.store(0, .release);
-        try self.push(.{ .acp_permission = try self.alloc.dupe(u8, title) });
+        var owned = review;
+        owned.description = try self.alloc.dupe(u8, review.description);
+        try self.push(.{ .acp_permission = owned });
         while (self.permission.load(.acquire) == 0) {
             try self.checkCancel();
             try std.Io.sleep(self.io, .fromMilliseconds(10), .real);

@@ -1,0 +1,40 @@
+# oz-cell-golden v1
+# name: ai-acp-permission-80x24
+# size: 12 rows x 80 cols
+size 12 80
+row 00 |~                                             │ chat changes 0 >tools terminal|
+bg 00 1f1f28*46 2a2a37*17 284159*6 2a2a37*11
+fg 00 727169*1 -*45 e6c384*1 -*1 727169*4 -*1 727169*9 -*1 7e9cd8*1 dcd7ba*5 -*1 727169*8 -*2
+row 01 |~                                             │ > ACP permission · thread 1|
+bg 01 1f1f28*46 284159*34
+fg 01 727169*1 -*45 ff9e3b*1 -*1 ff9e3b*27 -*5
+row 02 |~                                             │ Action: LONG_HEAD_abcdefabcdef…|
+bg 02 1f1f28*46 284159*34
+fg 02 727169*1 -*45 ff9e3b*1 -*1 dcd7ba*31 -*1
+row 03 |~                                             │ Kind: edit|
+bg 03 1f1f28*46 284159*34
+fg 03 727169*1 -*45 ff9e3b*1 -*1 dcd7ba*10 -*22
+row 04 |~                                             │ Workspace: /tmp/oz_acp_approva…|
+bg 04 1f1f28*46 284159*34
+fg 04 727169*1 -*45 ff9e3b*1 -*1 dcd7ba*31 -*1
+row 05 |~                                             │ Command: list long arguments|
+bg 05 1f1f28*46 284159*34
+fg 05 727169*1 -*45 ff9e3b*1 -*1 dcd7ba*28 -*4
+row 06 |~                                             │ Details · j/k scroll · Esc back|
+bg 06 1f1f28*46 284159*34
+fg 06 727169*1 -*45 ff9e3b*1 -*1 ff9e3b*31 -*1
+row 07 |~                                             │ {"title":"LONG_HEAD_abcdefabcde|
+bg 07 1f1f28*46 284159*34
+fg 07 727169*1 -*45 ff9e3b*1 -*1 dcd7ba*31 -*1
+row 08 |~                                             │ fabcdefabcdefabcdefabcdefabcdef|
+bg 08 1f1f28*46 284159*34
+fg 08 727169*1 -*45 ff9e3b*1 -*1 dcd7ba*31 -*1
+row 09 |~                                             │ abcdefabcdefabcdefabcdefabcdefa|
+bg 09 1f1f28*46 284159*34
+fg 09 727169*1 -*45 ff9e3b*1 -*1 dcd7ba*31 -*1
+row 10 |~                                             │ bcdefabcdefabcdefabcdefabcdefab|
+bg 10 1f1f28*46 284159*34
+fg 10 727169*1 -*45 ff9e3b*1 -*1 dcd7ba*31 -*1
+row 11 |~                                             │ [a] once [A] turn [r] reject|
+bg 11 1f1f28*46 284159*34
+fg 11 727169*1 -*45 ff9e3b*1 -*1 dcd7ba*29 -*3

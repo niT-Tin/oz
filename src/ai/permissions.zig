@@ -65,12 +65,28 @@ fn eq(v: V, text: []const u8) bool {
     return std.mem.eql(u8, str(v), text);
 }
 
+pub const Review = struct {
+    description: []u8,
+    read_only: bool,
+    described: bool,
+    allow_once: bool,
+};
+
+pub fn described(call: V) bool {
+    if (std.mem.trim(u8, str(field(call, "title")), " \t\n\r").len > 0) return true;
+    const input = field(call, "rawInput");
+    for ([_][]const u8{ "command", "path", "file_path", "filePath", "uri", "glob", "pattern", "query" }) |key| {
+        if (std.mem.trim(u8, str(field(input, key)), " \t\n\r").len > 0) return true;
+    }
+    return false;
+}
+
 pub fn readOnlyAcp(alloc: std.mem.Allocator, raw: []const u8) bool {
     if (raw.len > 16384) return false;
     var parsed = std.json.parseFromSlice(V, alloc, raw, .{}) catch return false;
     defer parsed.deinit();
     const v = parsed.value;
-    if (v != .object) return false;
+    if (v != .object or !described(v)) return false;
     // Trust only the ACP descriptor shape. A non-standard top-level
     // command/script may contradict kind=read and must be reviewed.
     var descriptor = v.object.iterator();
@@ -138,7 +154,7 @@ pub fn describeAcp(alloc: std.mem.Allocator, raw: []const u8, root: []const u8) 
     const escaped = try @import("terminal_tool.zig").escapeCommand(alloc, if (command.len > 0) command else path);
     defer alloc.free(escaped);
     const label = if (command.len > 0) "Command: " else if (path.len > 0) "Path: " else "";
-    return std.fmt.allocPrint(alloc, "Action: {s}\nKind: {s}\nWorkspace: {s}\n{s}{s}{s}Details: {s}", .{ title, kind, cwd, label, escaped, if (label.len > 0) "\n" else "", raw });
+    return std.fmt.allocPrint(alloc, "Action: {s}\nKind: {s}\nWorkspace: {s}\n{s}{s}{s}Details: {s}", .{ if (title.len > 0) title else "(unspecified)", if (kind.len > 0) kind else "(unspecified)", cwd, label, escaped, if (label.len > 0) "\n" else "", raw });
 }
 
 test "auto policy: read-only allowlist rejects shell execution and write disguises" {
@@ -159,6 +175,8 @@ test "auto policy: ACP reads accept bounded known input; kind alone cannot hide 
         \\{"kind":"read","rawInput":{"path":"source.txt"},"command":"rm source.txt"}
         ,
         \\{"kind":"read","title":"unknown action"}
+        ,
+        \\{"kind":"read","rawInput":{"limit":1}}
         ,
         \\{"kind":"read","rawInput":{}}
         ,

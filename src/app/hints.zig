@@ -128,7 +128,14 @@ pub fn clampRect(rect: Rect, rows: u32, cols: u32) ?Rect {
 /// What activating a target does. Payloads are indices/slots, not copies of
 /// business state: `src/app/hint_ui.zig` maps each variant onto the SAME App
 /// method the keyboard path uses (no duplicated logic).
+pub const AcpAction = struct {
+    thread: usize,
+    serial: u64,
+    choice: enum { focus, once, turn, reject },
+};
+
 pub const Action = union(enum) {
+    acp_review: AcpAction,
     /// Select a filetree row without activating it (API completeness; M2.6a
     /// registers `filetree_activate` for rows, which also selects).
     filetree_select: usize,

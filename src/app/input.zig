@@ -84,6 +84,16 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
         }
     }
 
+    // Entering ACP review is deliberate, even with an empty composer or
+    // while editing. Higher modal surfaces keep ownership of their keys.
+    if (key.codepoint == vaxis.Key.f6 and key.mods.eql(.{}) and
+        !self.picker_active and !self.em_active and self.state.mode != .command and self.aiFocusApproval()) return;
+
+    // Stop a granted ACP turn even after returning to the editor. The
+    // editor still processes its own Ctrl+c (e.g. leaving Insert mode).
+    if (self.ai.focus == .editor and key.codepoint == 'c' and key.mods.ctrl and
+        !key.mods.alt and !key.mods.super and self.aiTurnGrantActive()) self.aiCancel();
+
     // AI workspace: while the rail or its prompt owns the keyboard, every
     // key belongs to the AI surface. Placed before the macro recorder so AI
     // typing never lands in a register. An editor-focused docked rail is NOT

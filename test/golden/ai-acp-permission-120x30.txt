@@ -1,0 +1,40 @@
+# oz-cell-golden v1
+# name: ai-acp-permission-120x30
+# size: 12 rows x 120 cols
+size 12 120
+row 00 |~                                                                                 │ chat  changes 0  >tools  terminal|
+bg 00 1f1f28*82 2a2a37*19 284159*6 2a2a37*13
+fg 00 727169*1 -*81 e6c384*1 -*1 727169*4 -*2 727169*9 -*2 7e9cd8*1 dcd7ba*5 -*2 727169*8 -*3
+row 01 |~                                                                                 │ > ACP permission · thread 1|
+bg 01 1f1f28*82 284159*38
+fg 01 727169*1 -*81 ff9e3b*1 -*1 ff9e3b*27 -*9
+row 02 |~                                                                                 │ Action: LONG_HEAD_abcdefabcdefabcd…|
+bg 02 1f1f28*82 284159*38
+fg 02 727169*1 -*81 ff9e3b*1 -*1 dcd7ba*35 -*1
+row 03 |~                                                                                 │ Kind: edit|
+bg 03 1f1f28*82 284159*38
+fg 03 727169*1 -*81 ff9e3b*1 -*1 dcd7ba*10 -*26
+row 04 |~                                                                                 │ Workspace: /tmp/oz_acp_approval_go…|
+bg 04 1f1f28*82 284159*38
+fg 04 727169*1 -*81 ff9e3b*1 -*1 dcd7ba*35 -*1
+row 05 |~                                                                                 │ Command: list long arguments|
+bg 05 1f1f28*82 284159*38
+fg 05 727169*1 -*81 ff9e3b*1 -*1 dcd7ba*28 -*8
+row 06 |~                                                                                 │ Details · j/k scroll · Esc back|
+bg 06 1f1f28*82 284159*38
+fg 06 727169*1 -*81 ff9e3b*1 -*1 ff9e3b*31 -*5
+row 07 |~                                                                                 │ {"title":"LONG_HEAD_abcdefabcdefabc|
+bg 07 1f1f28*82 284159*38
+fg 07 727169*1 -*81 ff9e3b*1 -*1 dcd7ba*35 -*1
+row 08 |~                                                                                 │ defabcdefabcdefabcdefabcdefabcdefab|
+bg 08 1f1f28*82 284159*38
+fg 08 727169*1 -*81 ff9e3b*1 -*1 dcd7ba*35 -*1
+row 09 |~                                                                                 │ cdefabcdefabcdefabcdefabcdefabcdefa|
+bg 09 1f1f28*82 284159*38
+fg 09 727169*1 -*81 ff9e3b*1 -*1 dcd7ba*35 -*1
+row 10 |~                                                                                 │ bcdefabcdefabcdefabcdefabcdefabcdef|
+bg 10 1f1f28*82 284159*38
+fg 10 727169*1 -*81 ff9e3b*1 -*1 dcd7ba*35 -*1
+row 11 |~                                                                                 │ [a] once [A] all turn [r] reject|
+bg 11 1f1f28*82 284159*38
+fg 11 727169*1 -*81 ff9e3b*1 -*1 dcd7ba*33 -*3

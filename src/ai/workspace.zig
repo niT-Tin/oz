@@ -208,7 +208,7 @@ pub fn metrics(rail_rows: u32, tab: WorkboxTab) Metrics {
 // Focus policy
 // ---------------------------------------------------------------------------
 
-pub const Focus = enum { editor, rail, prompt };
+pub const Focus = enum { editor, rail, prompt, approval };
 
 pub const WorkboxTab = enum { chat, changes, tools, terminal };
 
@@ -1076,13 +1076,13 @@ fn validFocusState(open: bool, focus: Focus) bool {
     // from the editor (non-modal dock) or own a rail/prompt focus.
     if (!open) return focus == .editor;
     return switch (focus) {
-        .editor, .rail, .prompt => true,
+        .editor, .rail, .prompt, .approval => true,
     };
 }
 
 test "property: focus transitions never produce an invalid state" {
     for ([_]bool{ false, true }) |open| {
-        for ([_]Focus{ .editor, .rail, .prompt }) |focus| {
+        for ([_]Focus{ .editor, .rail, .prompt, .approval }) |focus| {
             for ([_]bool{ false, true }) |narrow| {
                 const toggled = toggleRail(open, focus);
                 try std.testing.expect(validFocusState(toggled.open, toggled.focus));

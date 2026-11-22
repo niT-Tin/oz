@@ -2231,6 +2231,10 @@ pub const App = struct {
     // ---- staged terminal tool approval (M3b3) → src/app/agent_terminal.zig ----
     pub const deinitAgentTerminal = app_agent_terminal.deinitAgentTerminal;
     pub const agentTerminalPendingCount = app_agent_terminal.pendingCount;
+    pub const aiAcpAction = app_ai.aiAcpAction;
+    pub const aiApprovalAttention = app_ai.aiApprovalAttention;
+    pub const aiTurnGrantActive = app_ai.aiTurnGrantActive;
+    pub const aiFocusApproval = app_ai.aiFocusApproval;
     pub const aiAgentTerminalAllow = app_ai.aiAgentTerminalAllow;
     pub const aiAgentTerminalDeny = app_ai.aiAgentTerminalDeny;
     pub const drainTerminal = app_ai.drainTerminal;

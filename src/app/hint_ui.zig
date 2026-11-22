@@ -200,6 +200,7 @@ pub fn execHintAction(self: *App, action: hints.Action) !void {
         .agent_approve => try self.agentEditApprove(),
         .agent_reject => self.agentEditReject(),
         .agent_patch_file => |idx| self.agentEditSelectFile(idx),
+        .acp_review => |review| self.aiAcpAction(review),
         .agent_terminal_allow => self.aiAgentTerminalAllow(),
         .agent_terminal_deny => self.aiAgentTerminalDeny(),
         .tool_card_toggle => |msg_index| self.aiToggleToolCard(msg_index),
