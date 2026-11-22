@@ -346,6 +346,8 @@ pub const Thread = struct {
     /// Set on explicit cancel: late worker events must not touch
     /// this thread's conversation.
     cancel_requested: bool = false,
+    /// An in-memory grant for this user turn, revoked when leaving the thread.
+    acp_turn_grant: ?u64 = null,
 
     fn deinit(self: *Thread, alloc: std.mem.Allocator) void {
         for (self.messages.items) |*m| m.deinit(alloc);
@@ -400,6 +402,7 @@ pub const Threads = struct {
     pub fn select(self: *Threads, idx: usize) SelectResult {
         std.debug.assert(idx < self.items.items.len);
         const prev = self.active;
+        if (prev != idx) self.items.items[prev].acp_turn_grant = null;
         self.active = idx;
         self.items.items[idx].unread_done = false;
         return .{ .prev = prev, .cancelled = false };

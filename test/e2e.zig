@@ -25558,6 +25558,23 @@ fn acpEditorScenario(mode: []const u8, dirty: bool, allow: bool) !void {
     try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
     try aiQuit(&sess);
 }
+test "ACP editor: generic command and persistent conversation" {
+    try acpEditorScenario("normal", false, false);
+}
+test "ACP editor: permission allow and reject" {
+    try acpEditorScenario("permission", false, true);
+    try acpEditorScenario("permission", false, false);
+}
+test "ACP editor: cancel blocked harness" {
+    try acpEditorScenario("hang", false, false);
+}
+test "ACP editor: external writes refresh clean buffers" {
+    try acpEditorScenario("edit", false, false);
+}
+test "ACP editor: external writes preserve dirty buffers" {
+    try acpEditorScenario("edit", true, false);
+}
+
 const AcpReviewCase = enum { multi, turn_opaque, dual, opaque_request, always, long, manual, change_thread, cancel };
 
 fn acpReviewScenario(case: AcpReviewCase, rows: u16, cols: u16) !void {
@@ -25770,23 +25787,6 @@ test "ACP review: manual, cancellation and changing the active thread revoke the
     try acpReviewScenario(.manual, 30, 120);
     try acpReviewScenario(.change_thread, 30, 120);
     try acpReviewScenario(.cancel, 30, 120);
-}
-
-test "ACP editor: generic command and persistent conversation" {
-    try acpEditorScenario("normal", false, false);
-}
-test "ACP editor: permission allow and reject" {
-    try acpEditorScenario("permission", false, true);
-    try acpEditorScenario("permission", false, false);
-}
-test "ACP editor: cancel blocked harness" {
-    try acpEditorScenario("hang", false, false);
-}
-test "ACP editor: external writes refresh clean buffers" {
-    try acpEditorScenario("edit", false, false);
-}
-test "ACP editor: external writes preserve dirty buffers" {
-    try acpEditorScenario("edit", true, false);
 }
 
 test "ACP editor: unchanged disk does not conflict with local edits" {

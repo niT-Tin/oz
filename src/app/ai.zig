@@ -41,9 +41,6 @@ pub const ToolThreadState = struct {
     acp_permission: ?permissions.Review = null,
     permission_serial: u64 = 0,
     permission_scroll: usize = 0,
-    // A local grant belongs to the current user turn only. Every actual
-    // ACP reply remains allow_once; native tools never consult this field.
-    acp_turn_grant: ?u64 = null,
     terminal: app_agent_terminal.Session = .{},
     approval_mode: permissions.Mode = .manual,
     /// Captured when a user turn starts, shared with its follow-ups.
@@ -211,7 +208,7 @@ fn cancelClient(self: *App, idx: usize) void {
         if (self.ai.clients.items[idx]) |c| c.requestCancel();
     }
     if (toolState(self, idx)) |st| {
-        st.acp_turn_grant = null;
+        self.ai.threads.items.items[idx].acp_turn_grant = null;
         leaveApproval(self, idx);
         if (st.acp_permission) |v| {
             self.alloc.free(v.description);
@@ -235,7 +232,7 @@ fn cancelClient(self: *App, idx: usize) void {
 fn resetToolTurn(self: *App, idx: usize) void {
     const st = toolState(self, idx) orelse return;
     st.generation +%= 1;
-    st.acp_turn_grant = null;
+    self.ai.threads.items.items[idx].acp_turn_grant = null;
     st.rounds = 0;
     st.calls = 0;
     st.limits = if (threadConfig(self, idx)) |cfg| cfg.tool_limits else .{};
@@ -417,7 +414,6 @@ pub fn aiNewThread(self: *App) !void {
     try ensureAi(self);
     self.navigator_peek = false;
     const idx = try createAiThread(self);
-    if (self.ai.threads.active != idx) self.ai.tool_states.items[self.ai.threads.active].acp_turn_grant = null;
     _ = self.ai.threads.select(idx);
     // Switching changes the visible draft, not background work.
     self.ai.thread_cursor = idx;
@@ -436,7 +432,6 @@ fn selectThreadAtCursor(self: *App) void {
 pub fn aiSelectThread(self: *App, idx: usize) void {
     if (idx >= self.ai.threads.items.items.len) return;
     self.navigator_peek = false;
-    if (self.ai.threads.active != idx) self.ai.tool_states.items[self.ai.threads.active].acp_turn_grant = null;
     _ = self.ai.threads.select(idx);
     self.ai.thread_cursor = idx;
     self.ai.focus = .prompt;
@@ -672,7 +667,7 @@ fn handleLocalCommand(self: *App, idx: usize) !bool {
         }
     } else if (std.mem.eql(u8, command, "auto") or std.mem.eql(u8, command, "manual")) {
         const state = toolState(self, idx) orelse return true;
-        state.acp_turn_grant = null;
+        self.ai.threads.items.items[idx].acp_turn_grant = null;
         state.approval_mode = if (std.mem.eql(u8, command, "auto")) .auto else .manual;
         try localNote(self, idx, "approvals: {s}; edits, deletes, overwrites and unknown commands require review", .{@tagName(state.approval_mode)});
         if (state.approval_mode == .auto) {
@@ -709,7 +704,7 @@ fn selectAgentProfile(self: *App, idx: usize, argument: []const u8) !void {
         next_cfg.deinit(self.alloc);
         return err;
     };
-    self.ai.tool_states.items[idx].acp_turn_grant = null;
+    self.ai.threads.items.items[idx].acp_turn_grant = null;
     dropThreadClient(self, idx); // an idle old ACP connection cannot survive a backend switch
     if (self.ai.thread_configs.items[idx]) |*old| old.deinit(self.alloc);
     self.ai.thread_configs.items[idx] = next_cfg;
@@ -1151,11 +1146,11 @@ pub fn aiAcpAction(self: *App, action: AcpAction) void {
     if (action.choice == .turn) {
         if (!review.described or !review.allow_once) {
             setToolNote(self, action.thread, if (!review.described) "Denied: harness did not describe this operation" else "Denied: harness offered no single-use allow option");
-            st.acp_turn_grant = null;
+            self.ai.threads.items.items[action.thread].acp_turn_grant = null;
             resolveAcp(self, action.thread, false);
             return;
         }
-        st.acp_turn_grant = st.generation;
+        self.ai.threads.items.items[action.thread].acp_turn_grant = st.generation;
     }
     resolveAcp(self, action.thread, action.choice != .reject);
 }
@@ -1839,7 +1834,7 @@ pub fn drainAi(self: *App) !bool {
                     st.permission_serial +%= 1;
                     st.permission_scroll = 0;
                     st.acp_permission = review;
-                    const by_turn = st.acp_turn_grant == st.generation and review.described;
+                    const by_turn = t.acp_turn_grant == st.generation and review.described;
                     const by_mode = st.approval_mode == .auto and review.read_only;
                     if (review.allow_once and (by_turn or by_mode)) {
                         resolveAcp(self, idx, true);
@@ -1896,7 +1891,7 @@ pub fn drainAi(self: *App) !bool {
             client.joinAfterTerminal();
             if (threadConfig(self, idx)) |cfg| if (cfg.acp_command != null) {
                 if (toolState(self, idx)) |state| {
-                    state.acp_turn_grant = null;
+                    t.acp_turn_grant = null;
                     leaveApproval(self, idx);
                     if (state.acp_permission) |review| self.alloc.free(review.description);
                     state.acp_permission = null;
@@ -1938,7 +1933,7 @@ pub fn drainAi(self: *App) !bool {
 
 pub fn aiTurnGrantActive(self: *App) bool {
     const state = toolState(self, self.ai.threads.active) orelse return false;
-    return state.acp_turn_grant == state.generation;
+    return self.ai.threads.activeThread().acp_turn_grant == state.generation;
 }
 
 pub fn aiApprovalAttention(self: *App) bool {
@@ -2547,7 +2542,7 @@ fn aiStatusLabelFor(self: *App, idx: usize) []const u8 {
     if (idx < self.ai.threads.items.items.len) {
         if (app_agent_terminal.statusLabelFor(self, idx)) |label| return label;
         if (toolState(self, idx)) |st| {
-            if (st.acp_turn_grant == st.generation) return "AUTO-TURN";
+            if (self.ai.threads.items.items[idx].acp_turn_grant == st.generation) return "AUTO-TURN";
             if (st.acp_permission != null) return "approval…";
             if (self.agent_edit.pending) |p| if (p.thread_index == idx and idx != self.ai.threads.active) return "approval…";
             if (st.active or st.pending_followup) return "tools…";
@@ -2631,101 +2626,6 @@ fn drawRailTextRow(
     var segs = std.ArrayList(vaxis.Segment).empty;
     if (fit.cells > 0) try segs.append(a, .{ .text = fit.slice, .style = style });
     try drawRailRow(win, a, y, x, w, "│", border_style, bg, segs.items, @intCast(fit.cells));
-}
-
-// The banner occupies the tab separator on every tab. The preview and
-// focused card reserve their own body rows so transcript scrolling, a long
-// tool title, or a native terminal/diff review cannot displace the actions.
-fn drawAcpReview(self: *App, a: std.mem.Allocator, win: vaxis.Window, st: Styles, x: u32, w: u32, m: *ws.Metrics, idx: usize) !void {
-    const owner = &self.ai.threads.items.items[idx];
-    const state = &self.ai.tool_states.items[idx];
-    const review = state.acp_permission.?;
-    const focused = self.ai.focus == .approval and idx == self.ai.threads.active;
-    const bg = if (focused) chrome.mutedSelectionColor(self.theme) else st.card_bg;
-    const warn = styleOn(st.warn, bg);
-    const base = styleOn(st.base, bg);
-    const width = w -| 3;
-    const header = try std.fmt.allocPrint(a, "{s} ACP permission · {s}", .{ if (focused) ">" else "F6", owner.title });
-    try drawRailTextRow(self, win, a, m.tabs_sep_row, x, w, warn, bg, header, warn);
-    if (self.mouseTargetsCollecting()) self.addHintTarget(.{ .row = m.tabs_sep_row, .col = x + 2, .width = width, .height = 1 }, .{ .acp_review = .{ .thread = idx, .serial = state.permission_serial, .choice = .focus } });
-    if (m.body_rows == 0) return;
-    if (w < 23) {
-        try drawRailTextRow(self, win, a, m.body_top, x, w, warn, bg, "Widen to review", warn);
-        m.body_top += 1;
-        m.body_rows -= 1;
-        return;
-    }
-    if (idx != self.ai.threads.active or (!focused and self.ai.tab != .chat)) {
-        const end = std.mem.indexOfScalar(u8, review.description, '\n') orelse review.description.len;
-        try drawRailTextRow(self, win, a, m.body_top, x, w, warn, bg, review.description[0..end], base);
-        m.body_top += 1;
-        m.body_rows -= 1;
-        return;
-    }
-
-    const rows = @min(m.body_rows, if (focused) @as(u32, 10) else @as(u32, 5));
-    const action_rows: u32 = @intFromBool(focused);
-    const caution_rows: u32 = @intFromBool(!review.described and rows > action_rows);
-    const details = rows - caution_rows - action_rows;
-    var top = m.body_top;
-    if (caution_rows != 0) {
-        try drawRailTextRow(self, win, a, top, x, w, warn, bg, "No harness description; A denies", warn);
-        top += 1;
-    }
-    const action_row = top + details;
-    var fields = std.mem.splitScalar(u8, review.description, '\n');
-    while (top < action_row) : (top += 1) {
-        const line = fields.next() orelse "";
-        if (focused and std.mem.startsWith(u8, line, "Details: ")) {
-            try drawRailTextRow(self, win, a, top, x, w, warn, bg, "Details · j/k scroll · Esc back", warn);
-            top += 1;
-            var raw = line["Details: ".len..];
-            var lines = std.ArrayList([]const u8).empty;
-            while (raw.len > 0) {
-                const fit = autil.cellFitPrefix(win, raw, width);
-                if (fit.slice.len == 0) break;
-                try lines.append(a, fit.slice);
-                raw = raw[fit.slice.len..];
-            }
-            state.permission_scroll = @min(state.permission_scroll, lines.items.len -| (action_row - top));
-            var at = state.permission_scroll;
-            while (top < action_row) : (top += 1) {
-                const text = if (at < lines.items.len) lines.items[at] else "";
-                try drawRailTextRow(self, win, a, top, x, w, warn, bg, text, base);
-                at += 1;
-            }
-            break;
-        }
-        const fit = autil.cellFitPrefix(win, line, width);
-        const shown = if (fit.slice.len == line.len) line else try std.fmt.allocPrint(a, "{s}…", .{autil.cellFitPrefix(win, line, width -| 1).slice});
-        try drawRailTextRow(self, win, a, top, x, w, warn, bg, shown, base);
-    }
-    if (focused) {
-        const compact = width < 32;
-        const tiny = width < 29;
-        const buttons = [_]struct { label: []const u8, choice: @FieldType(AcpAction, "choice") }{
-            .{ .label = if (tiny) "[a]one" else "[a] once", .choice = .once },
-            .{ .label = if (!review.described or !review.allow_once) (if (tiny) "[A]no" else "[A] deny") else if (tiny) "[A]turn" else if (compact) "[A] turn" else "[A] all turn", .choice = .turn },
-            .{ .label = if (tiny) "[r]no" else "[r] reject", .choice = .reject },
-        };
-        var used: u32 = 0;
-        var segs = std.ArrayList(vaxis.Segment).empty;
-        for (buttons) |button| {
-            const len: u32 = @intCast(button.label.len);
-            if (used + len > width) break;
-            try segs.append(a, .{ .text = button.label, .style = styleOn(st.bold, bg) });
-            if (self.mouseTargetsCollecting()) self.addHintTarget(.{ .row = action_row, .col = x + 2 + used, .width = len, .height = 1 }, .{ .acp_review = .{ .thread = idx, .serial = state.permission_serial, .choice = button.choice } });
-            used += len;
-            if (used < width) {
-                try segs.append(a, .{ .text = " ", .style = base });
-                used += 1;
-            }
-        }
-        try drawRailRow(win, a, action_row, x, w, "│", warn, bg, segs.items, used);
-        self.vx.screen.cursor_vis = false;
-    }
-    m.body_top += rows;
-    m.body_rows -= rows;
 }
 
 /// Draw the docked rail / drawer. Called after the editor panes (and the
@@ -2965,7 +2865,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         try segs.append(a, .{ .text = active_status_label, .style = styleOn(railStatusStyle(st, active.status, self.frame_now_ms), st.band_bg) });
         var used: u32 = @intCast(autil.cellWidth(win, active.title) + 3 + autil.cellWidth(win, active_status_label));
         const model: []const u8 = if (threadConfig(self, self.ai.threads.active)) |cfg| cfg.model else ai.config.default_model;
-        if (toolState(self, active_idx)) |state| if (state.acp_turn_grant == null and state.approval_mode == .auto and content_w >= used + 7) {
+        if (toolState(self, active_idx)) |state| if (active.acp_turn_grant == null and state.approval_mode == .auto and content_w >= used + 7) {
             try segs.append(a, .{ .text = " · auto", .style = styleOn(st.dim, st.band_bg) });
             used += 7;
         };
@@ -3186,6 +3086,101 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
             self.vx.screen.cursor_shape = .block;
         }
     }
+}
+
+// The banner occupies the tab separator on every tab. The preview and
+// focused card reserve their own body rows so transcript scrolling, a long
+// tool title, or a native terminal/diff review cannot displace the actions.
+fn drawAcpReview(self: *App, a: std.mem.Allocator, win: vaxis.Window, st: Styles, x: u32, w: u32, m: *ws.Metrics, idx: usize) !void {
+    const owner = &self.ai.threads.items.items[idx];
+    const state = &self.ai.tool_states.items[idx];
+    const review = state.acp_permission.?;
+    const focused = self.ai.focus == .approval and idx == self.ai.threads.active;
+    const bg = if (focused) chrome.mutedSelectionColor(self.theme) else st.card_bg;
+    const warn = styleOn(st.warn, bg);
+    const base = styleOn(st.base, bg);
+    const width = w -| 3;
+    const header = try std.fmt.allocPrint(a, "{s} ACP permission · {s}", .{ if (focused) ">" else "F6", owner.title });
+    try drawRailTextRow(self, win, a, m.tabs_sep_row, x, w, warn, bg, header, warn);
+    if (self.mouseTargetsCollecting()) self.addHintTarget(.{ .row = m.tabs_sep_row, .col = x + 2, .width = width, .height = 1 }, .{ .acp_review = .{ .thread = idx, .serial = state.permission_serial, .choice = .focus } });
+    if (m.body_rows == 0) return;
+    if (w < 23) {
+        try drawRailTextRow(self, win, a, m.body_top, x, w, warn, bg, "Widen to review", warn);
+        m.body_top += 1;
+        m.body_rows -= 1;
+        return;
+    }
+    if (idx != self.ai.threads.active or (!focused and self.ai.tab != .chat)) {
+        const end = std.mem.indexOfScalar(u8, review.description, '\n') orelse review.description.len;
+        try drawRailTextRow(self, win, a, m.body_top, x, w, warn, bg, review.description[0..end], base);
+        m.body_top += 1;
+        m.body_rows -= 1;
+        return;
+    }
+
+    const rows = @min(m.body_rows, if (focused) @as(u32, 10) else @as(u32, 5));
+    const action_rows: u32 = @intFromBool(focused);
+    const caution_rows: u32 = @intFromBool(!review.described and rows > action_rows);
+    const details = rows - caution_rows - action_rows;
+    var top = m.body_top;
+    if (caution_rows != 0) {
+        try drawRailTextRow(self, win, a, top, x, w, warn, bg, "No harness description; A denies", warn);
+        top += 1;
+    }
+    const action_row = top + details;
+    var fields = std.mem.splitScalar(u8, review.description, '\n');
+    while (top < action_row) : (top += 1) {
+        const line = fields.next() orelse "";
+        if (focused and std.mem.startsWith(u8, line, "Details: ")) {
+            try drawRailTextRow(self, win, a, top, x, w, warn, bg, "Details · j/k scroll · Esc back", warn);
+            top += 1;
+            var raw = line["Details: ".len..];
+            var lines = std.ArrayList([]const u8).empty;
+            while (raw.len > 0) {
+                const fit = autil.cellFitPrefix(win, raw, width);
+                if (fit.slice.len == 0) break;
+                try lines.append(a, fit.slice);
+                raw = raw[fit.slice.len..];
+            }
+            state.permission_scroll = @min(state.permission_scroll, lines.items.len -| (action_row - top));
+            var at = state.permission_scroll;
+            while (top < action_row) : (top += 1) {
+                const text = if (at < lines.items.len) lines.items[at] else "";
+                try drawRailTextRow(self, win, a, top, x, w, warn, bg, text, base);
+                at += 1;
+            }
+            break;
+        }
+        const fit = autil.cellFitPrefix(win, line, width);
+        const shown = if (fit.slice.len == line.len) line else try std.fmt.allocPrint(a, "{s}…", .{autil.cellFitPrefix(win, line, width -| 1).slice});
+        try drawRailTextRow(self, win, a, top, x, w, warn, bg, shown, base);
+    }
+    if (focused) {
+        const compact = width < 32;
+        const tiny = width < 29;
+        const buttons = [_]struct { label: []const u8, choice: @FieldType(AcpAction, "choice") }{
+            .{ .label = if (tiny) "[a]one" else "[a] once", .choice = .once },
+            .{ .label = if (!review.described or !review.allow_once) (if (tiny) "[A]no" else "[A] deny") else if (tiny) "[A]turn" else if (compact) "[A] turn" else "[A] all turn", .choice = .turn },
+            .{ .label = if (tiny) "[r]no" else "[r] reject", .choice = .reject },
+        };
+        var used: u32 = 0;
+        var segs = std.ArrayList(vaxis.Segment).empty;
+        for (buttons) |button| {
+            const len: u32 = @intCast(button.label.len);
+            if (used + len > width) break;
+            try segs.append(a, .{ .text = button.label, .style = styleOn(st.bold, bg) });
+            if (self.mouseTargetsCollecting()) self.addHintTarget(.{ .row = action_row, .col = x + 2 + used, .width = len, .height = 1 }, .{ .acp_review = .{ .thread = idx, .serial = state.permission_serial, .choice = button.choice } });
+            used += len;
+            if (used < width) {
+                try segs.append(a, .{ .text = " ", .style = base });
+                used += 1;
+            }
+        }
+        try drawRailRow(win, a, action_row, x, w, "│", warn, bg, segs.items, used);
+        self.vx.screen.cursor_vis = false;
+    }
+    m.body_top += rows;
+    m.body_rows -= rows;
 }
 
 fn packThemeRgb(rgb: [3]u8) u32 {

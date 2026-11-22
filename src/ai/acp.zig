@@ -13,18 +13,6 @@ pub fn str(v: V) []const u8 {
 pub fn eq(v: V, s: []const u8) bool {
     return std.mem.eql(u8, str(v), s);
 }
-pub fn preset(name: []const u8) ![]const u8 {
-    if (std.mem.eql(u8, name, "kimi")) return "[\"kimi\",\"acp\"]";
-    if (std.mem.eql(u8, name, "codex")) return "[\"npx\",\"-y\",\"@agentclientprotocol/codex-acp\"]";
-    if (std.mem.eql(u8, name, "deepseek")) return "[\"pnpm\",\"--silent\",\"dsh\",\"--profile\",\"acp\"]";
-    return error.InvalidAcpAgent;
-}
-pub fn validateCommand(a: std.mem.Allocator, json: []const u8) !void {
-    const p = try std.json.parseFromSlice(V, a, json, .{});
-    defer p.deinit();
-    if (p.value != .array or p.value.array.items.len == 0) return error.InvalidAcpCommand;
-    for (p.value.array.items) |v| if (v != .string or v.string.len == 0 or std.mem.indexOfScalar(u8, v.string, 0) != null) return error.InvalidAcpCommand;
-}
 const detail_limit = 16384;
 
 // Only the current prompt's recent tool descriptors are available for display.
@@ -99,6 +87,18 @@ fn onceOption(options: V, allowed: bool) ?[]const u8 {
     return null;
 }
 
+pub fn preset(name: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, name, "kimi")) return "[\"kimi\",\"acp\"]";
+    if (std.mem.eql(u8, name, "codex")) return "[\"npx\",\"-y\",\"@agentclientprotocol/codex-acp\"]";
+    if (std.mem.eql(u8, name, "deepseek")) return "[\"pnpm\",\"--silent\",\"dsh\",\"--profile\",\"acp\"]";
+    return error.InvalidAcpAgent;
+}
+pub fn validateCommand(a: std.mem.Allocator, json: []const u8) !void {
+    const p = try std.json.parseFromSlice(V, a, json, .{});
+    defer p.deinit();
+    if (p.value != .array or p.value.array.items.len == 0) return error.InvalidAcpCommand;
+    for (p.value.array.items) |v| if (v != .string or v.string.len == 0 or std.mem.indexOfScalar(u8, v.string, 0) != null) return error.InvalidAcpCommand;
+}
 pub const Connection = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -187,11 +187,13 @@ pub const Connection = struct {
                 }
                 const u = field(params, "update");
                 const kind = field(u, "sessionUpdate");
+                if (eq(kind, "tool_call") or eq(kind, "tool_call_update")) {
+                    try history.record(self.alloc, u, eq(kind, "tool_call"));
+                }
                 if (eq(kind, "agent_message_chunk")) {
                     const c = field(u, "content");
                     if (eq(field(c, "type"), "text")) try host.acpText(str(field(c, "text")));
                 } else if (eq(kind, "tool_call") or eq(kind, "tool_call_update")) {
-                    try history.record(self.alloc, u, eq(kind, "tool_call"));
                     const text = try std.fmt.allocPrint(self.alloc, "\n[tool {s}] {s} {s}\n", .{ str(field(u, "toolCallId")), str(field(u, "title")), str(field(u, "status")) });
                     defer self.alloc.free(text);
                     try host.acpText(text);
