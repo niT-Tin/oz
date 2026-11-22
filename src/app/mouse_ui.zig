@@ -222,8 +222,7 @@ fn terminalContains(self: *App, col: u32, row: u32) bool {
     var arena = std.heap.ArenaAllocator.init(self.alloc);
     defer arena.deinit();
     const r = self.termRect(arena.allocator());
-    if (r.w == 0 or r.h == 0) return false;
-    return col >= r.x and col < r.x + r.w and row >= r.y and row < r.y + r.h;
+    return r.contains(col, row);
 }
 
 fn handleLeftClick(self: *App, col: u32, row: u32) !bool {
@@ -246,11 +245,15 @@ fn handleLeftClick(self: *App, col: u32, row: u32) !bool {
         self.ai.focus = .editor;
         return true;
     }
+    var blurred_terminal = false;
     if (term.supported) {
-        if (self.term_pane) |*tp| tp.focused = false;
+        if (self.term_pane) |*tp| {
+            blurred_terminal = tp.focused;
+            tp.focused = false;
+        }
     }
 
-    const hit = self.mouse.hitClick(col, row) orelse return false;
+    const hit = self.mouse.hitClick(col, row) orelse return blurred_terminal;
     // The compact navigator peek is an opaque overlay: only its own hint
     // targets (tabs, ×, rows) may receive a click. Without this guard the
     // editor pane target underneath would focus/place the cursor through the

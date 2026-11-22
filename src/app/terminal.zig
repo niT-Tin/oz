@@ -92,6 +92,18 @@ pub fn termRect(self: *App, a: std.mem.Allocator) term.Rect {
     return r;
 }
 
+/// A wide glyph starting one cell before an overlay boundary would make
+/// the terminal renderer advance straight past the first overlaid cell.
+fn clipWideAtEdge(win: vaxis.Window, edge: u32, top: u32, rows: u32) void {
+    if (edge == 0) return;
+    const col: u16 = @intCast(edge - 1);
+    for (top..top + rows) |row| {
+        const cell = win.readCell(col, @intCast(row)) orelse continue;
+        const width = if (cell.char.width == 0) win.gwidth(cell.char.grapheme) else cell.char.width;
+        if (width > 1) win.writeCell(col, @intCast(row), .{ .char = .{ .grapheme = " ", .width = 1 }, .style = cell.style });
+    }
+}
+
 /// Draw the themed outer frame around the terminal's rect. The frame is the
 /// visual boundary of the float/strip: a `bg_float` plate, a focus-aware
 /// border and an `oz terminal` title. The child grid is drawn afterwards
@@ -167,6 +179,7 @@ pub fn drawTerm(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         if (r.w == 0 or r.h == 0) return;
         if (inner.w == 0 or inner.h == 0) return;
         try tp.t.resize(@intCast(inner.h), @intCast(inner.w));
+        clipWideAtEdge(win, r.x, r.y, r.h);
         try drawTermFrame(self, win, r, tp.focused);
         const sub = win.child(.{
             .x_off = @intCast(inner.x),
@@ -175,10 +188,11 @@ pub fn drawTerm(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
             .height = @intCast(inner.h),
         });
         try tp.t.draw(sub);
+        clipWideAtEdge(sub, sub.width, 0, sub.height);
         restyleTerm(sub, self.theme);
         if (!tp.focused) {
             self.vx.screen.cursor = saved_cursor;
-            self.vx.screen.cursor_vis = saved_visible;
+            self.vx.screen.cursor_vis = saved_visible and !r.contains(saved_cursor.col, saved_cursor.row);
             self.vx.screen.cursor_shape = saved_shape;
         }
     }
@@ -281,6 +295,7 @@ pub fn handleTerminalKey(self: *App, key: vaxis.Key) !void {
     if (!term.supported) return;
     const tp = &self.term_pane.?;
     if (key.codepoint == vaxis.Key.escape) {
+        if (tp.layout == .floating) tp.visible = false;
         tp.focused = false;
         return;
     }

@@ -4998,6 +4998,10 @@ pub fn render(self: *App) !void {
             .row = @intCast(@min(@min(cursor_row, cur_rect.row + cur_rect.height -| 1), win.height -| 1)),
             .col = @intCast(@min(cursor_col, win.width -| 1)),
         };
+        if (term.supported and self.term_pane != null and self.term_pane.?.visible) {
+            const cursor = self.vx.screen.cursor;
+            if (self.termRect(a).contains(cursor.col, cursor.row)) editor_cursor_hidden = true;
+        }
     }
     self.vx.screen.cursor_vis = !editor_cursor_hidden;
     self.vx.screen.cursor_shape = if (self.state.mode == .insert) .beam else .block;
