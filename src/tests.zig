@@ -125,3 +125,4 @@ pub const replace_plan = @import("editor/replace_plan.zig");
 
 pub const git_job = @import("app/git_job.zig");
 pub const text_snapshot = @import("buffer/text_snapshot.zig");
+pub const ai_prompt = @import("ai/prompt.zig");

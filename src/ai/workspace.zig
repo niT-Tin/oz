@@ -330,6 +330,8 @@ pub const Thread = struct {
     title: []u8,
     messages: std.ArrayList(Message) = .empty,
     input: std.ArrayList(u8) = .empty,
+    input_cursor: usize = 0,
+    input_kill: std.ArrayList(u8) = .empty,
     status: Status = .idle,
     unread_done: bool = false,
     error_text: ?[]u8 = null,
@@ -351,8 +353,14 @@ pub const Thread = struct {
         for (self.messages.items) |*m| m.deinit(alloc);
         self.messages.deinit(alloc);
         self.input.deinit(alloc);
+        self.input_kill.deinit(alloc);
         if (self.error_text) |e| alloc.free(e);
         alloc.free(self.title);
+    }
+
+    pub fn clearInput(self: *Thread) void {
+        self.input.clearRetainingCapacity();
+        self.input_cursor = 0;
     }
 
     pub fn statusLabel(self: *const Thread) []const u8 {

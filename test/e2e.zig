@@ -17371,9 +17371,7 @@ test "ai workspace: 120-col docked rail keeps editor+filetree, streams, focus re
     try sess.send("\x1b");
     try aiWaitRailFocus(&sess, &grid, rail_col, false, 3000);
     try std.testing.expect(aiCellText(&grid, 5, rail_col).len > 0);
-    // The file tree still has App focus after leaving the rail; Ctrl+w l
-    // hands the keyboard back to the buffer.
-    try sess.send("\x17l");
+    // Opening the Agent hid the Navigator. Esc already returned to the buffer.
     try sess.send("i");
     try sess.send("zz");
     try sess.send("\x1b");
@@ -18939,6 +18937,14 @@ test "navigator: agents tab Enter attaches the selected real thread" {
     try sess.send("\t\t");
     try gridWaitFor(&sess, &grid, "thread 1", 5000);
     try std.testing.expect(aiRowContains(&grid, navBodyRow(), "main"));
+
+    try sess.send(" e");
+    try gridWaitGone(&sess, &grid, "Files", 4000);
+    try sess.send("\x17h");
+    try gridWaitFor(&sess, &grid, "Space e opens Navigator", 4000);
+    try sess.send(" e");
+    try gridWaitFor(&sess, &grid, "Files", 4000);
+    try gridWaitRowContains(&sess, &grid, navBodyRow() + 1, "thread 1", 4000);
 
     // `n` on the navigator = aiNewThread: the rail opens on thread 2.
     try sess.send("n");
@@ -24206,7 +24212,7 @@ const golden = @import("golden.zig");
 /// plain-text file in a fixed non-git cwd, a fixed theme/HOME, the mock
 /// stream, and the same key sequence. Volatile inputs (paths, branch, time)
 /// are absent by construction; the frame is stable across runs.
-fn runAiGolden(name: []const u8, rows: u16, cols: u16, golden_rel_path: []const u8, agent_focus: bool) !void {
+fn runAiGolden(name: []const u8, rows: u16, cols: u16, golden_rel_path: []const u8, surface: enum { coding, agent_focus, window_prefix }) !void {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
@@ -24250,34 +24256,44 @@ fn runAiGolden(name: []const u8, rows: u16, cols: u16, golden_rel_path: []const 
     // The text-file LSP probe settles to this deterministic label; waiting
     // for it keeps the status bar identical between fresh and warm runs.
     try gridWaitFor(&sess, &grid, "NoLspServer", 5000);
-    try sess.send(if (agent_focus) "\x17A" else " a");
+    try sess.send(if (surface == .agent_focus) "\x17A" else " a");
     try gridWaitFor(&sess, &grid, "AGENTS", 5000);
     try gridWaitFor(&sess, &grid, "thread 1", 4000);
     try gridWaitFor(&sess, &grid, "❯ ", 4000);
     try sess.send("hello");
     try gridWaitFor(&sess, &grid, "hello", 3000);
-    try sess.send("\r");
-    try gridWaitFor(&sess, &grid, "mock reply", 8000);
-    try gridWaitFor(&sess, &grid, "idle", 5000);
+    if (surface == .window_prefix) {
+        try sess.send("\t\x17");
+        try gridWaitFor(&sess, &grid, "Ctrl-w a input", 4000);
+        try gridWaitRowContains(&sess, &grid, rows - 1, "Ctrl-w …", 4000);
+    } else {
+        try sess.send("\r");
+        try gridWaitFor(&sess, &grid, "mock reply", 8000);
+        try gridWaitFor(&sess, &grid, "idle", 5000);
+    }
     try gridSettle(&sess, &grid, 400, 6000);
 
     try golden.check(io, alloc, &grid, name, golden_rel_path);
 }
 
 test "golden: 120x30 docked AI workspace" {
-    try runAiGolden("ai-dock-120x30", 30, 120, "test/golden/ai-dock-120x30.txt", false);
+    try runAiGolden("ai-dock-120x30", 30, 120, "test/golden/ai-dock-120x30.txt", .coding);
 }
 
 test "golden: 100x30 docked AI workspace" {
-    try runAiGolden("ai-dock-100x30", 30, 100, "test/golden/ai-dock-100x30.txt", false);
+    try runAiGolden("ai-dock-100x30", 30, 100, "test/golden/ai-dock-100x30.txt", .coding);
 }
 
 test "golden: 80x24 narrow AI drawer" {
-    try runAiGolden("ai-drawer-80x24", 24, 80, "test/golden/ai-drawer-80x24.txt", false);
+    try runAiGolden("ai-drawer-80x24", 24, 80, "test/golden/ai-drawer-80x24.txt", .coding);
+}
+
+test "golden: Agent window prefix and prompt focus shortcut" {
+    try runAiGolden("ai-window-prefix", 30, 120, "test/golden/ai-window-prefix.txt", .window_prefix);
 }
 
 test "golden: 120x30 Agent-focus workspace" {
-    try runAiGolden("ai-focus-120x30", 30, 120, "test/golden/ai-focus-120x30.txt", true);
+    try runAiGolden("ai-focus-120x30", 30, 120, "test/golden/ai-focus-120x30.txt", .agent_focus);
 }
 
 /// A modal picker still owns a compact status band. This frame locks the
@@ -30217,9 +30233,11 @@ test "path completion: quoted Unicode paths with spaces preserve both delimiters
     var grid = try Grid.initSizedCols(a, 30, 120);
     defer grid.deinit(a);
     try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
-    const keys = try std.fmt.allocPrint(a, "i\"{s}/中文 dir/fi", .{root});
-    defer a.free(keys);
-    try sess.send(keys);
+    // Paste only the random temp path. Typing a generated "jk" would leave
+    // Insert mode. The quote, path triggers and Unicode filename are real keys.
+    try sess.send("i\"\x1b[200~");
+    try sess.send(root);
+    try sess.send("\x1b[201~/中文 dir/fi");
     try gridWaitFor(&sess, &grid, "file name.txt", 5000);
     try sess.send("\r");
     try gridDrain(&sess, &grid, 250);
@@ -32587,6 +32605,97 @@ test "search workflow: literal text after expanded tabs and wide glyphs receives
     try sess.send("\r");
     try gridWaitRowContains(&sess, &grid, 23, "[1/2]", 4000);
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "agent input: caret, bracketed paste, word editing and window focus through the PTY" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    for ([_]u16{ 80, 120 }) |cols| {
+        var root_buf: [128]u8 = undefined;
+        const root = try aiMockDir(io, &root_buf);
+        defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        try writeTestFile(io, root, "source.txt", "BUFFER\n");
+        const home = try backgroundTestHome(io, a, root, "kanagawa-wave");
+        defer a.free(home);
+        const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+        defer a.free(env);
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "source.txt" }, &.{env}, 30, cols, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 30, cols);
+        defer grid.deinit(a);
+        const row = aiPromptRow(30);
+        try gridWaitFor(&sess, &grid, "[NORMAL]", 8000);
+        try sess.send(" aabc\x1b[DX");
+        try gridWaitRowContains(&sess, &grid, row, "❯ abXc", 4000);
+        try sess.send("\x1b[H+\x1b[F!\x01\x04\x05\x7f");
+        try gridWaitRowContains(&sess, &grid, row, "❯ abXc ", 4000);
+        try sess.send("\x15你好\x1b[DX");
+        try gridWaitRowContains(&sess, &grid, row, "❯ 你X好", 4000);
+        try gridSettle(&sess, &grid, 60, 1000);
+        try std.testing.expectEqual(aiRailCol(cols) + 4 + 3, grid.col);
+        try sess.send("\x02\x1b[3~\x1b[200~p\r\nq\tr\x1b[201~");
+        try gridWaitRowContains(&sess, &grid, row, "❯ 你p q    r好", 4000);
+        try sess.send("\x01\x0bone two!\x1bbX\x1bfY");
+        try gridWaitRowContains(&sess, &grid, row, "❯ one XtwoY!", 4000);
+        try sess.send("\x1b[1;5D\x1bd\x19\x1b[1;5C\x1b\x7f");
+        try gridWaitRowContains(&sess, &grid, row, "❯ one ", 4000);
+        try gridWaitGone(&sess, &grid, "XtwoY", 4000);
+        try sess.send("\x15one\x02X\x0etwo\x1b[5;5~Y");
+        try gridWaitRowContains(&sess, &grid, row, "❯ onXYe", 4000);
+        try sess.send("\x1b[6;5~\x06!");
+        try gridWaitRowContains(&sess, &grid, row, "❯ two!", 4000);
+        try sess.send("\x17gZ");
+        try gridWaitRowContains(&sess, &grid, row, "❯ two!Z", 4000);
+        try sess.send("\x15abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\x1b[H^");
+        try gridWaitRowContains(&sess, &grid, row, "❯ ^abcde", 4000);
+        try gridWaitRowContains(&sess, &grid, row, "…", 4000);
+        try gridSettle(&sess, &grid, 60, 1000);
+        try std.testing.expectEqual(aiRailCol(cols) + 5, grid.col);
+        try frame.expectNoHorizontalOverflow(&grid, cols);
+        try sess.send("\x0b");
+        try gridWaitGone(&sess, &grid, "abcde", 4000);
+        // Clicking the editor leaves the Agent visible at either breakpoint.
+        try mouseClickAt(&sess, 4, 1);
+        try aiWaitRailFocus(&sess, &grid, aiRailCol(cols), false, 4000);
+        try sess.send("\x17");
+        try gridWaitRowContains(&sess, &grid, 29, "Ctrl-w …", 4000);
+        try sess.send("lL");
+        try gridWaitRowContains(&sess, &grid, row, "❯ ^L", 4000);
+        try sess.send("\x17h");
+        if (cols < 90) try gridWaitGone(&sess, &grid, "AGENTS", 4000) else try aiWaitRailFocus(&sess, &grid, aiRailCol(cols), false, 4000);
+        try sess.send("0iword \x17OK\x1b");
+        try gridWaitFor(&sess, &grid, "OKBUFFER", 4000);
+        try sess.send("\x17a");
+        try gridWaitFor(&sess, &grid, "Ctrl-w a input", 4000);
+        try sess.send("\x17aR");
+        try gridWaitRowContains(&sess, &grid, row, "❯ ^LR", 4000);
+        try mouseClickAt(&sess, 4, 1);
+        try aiWaitRailFocus(&sess, &grid, aiRailCol(cols), false, 4000);
+        try sess.send("\x17wW");
+        try gridWaitRowContains(&sess, &grid, row, "❯ ^LRW", 4000);
+        try sess.send("\x17h");
+        try gridSettle(&sess, &grid, 60, 1000);
+        if (cols == 120) {
+            // A buffer on the right wins over the Agent until we reach the edge.
+            try writeTestFile(io, root, "right.txt", "SIDE\n");
+            try sess.send(":w\r:vs right.txt\r");
+            try gridWaitFor(&sess, &grid, "SIDE", 4000);
+            try sess.send("\x17h\x17l0iR-\x1b");
+            try gridWaitFor(&sess, &grid, "R-SIDE", 4000);
+            try sess.send("\x17lS");
+            try gridWaitRowContains(&sess, &grid, row, "❯ ^LRWS", 4000);
+            try sess.send("\x17h:wq\r");
+            try gridWaitGone(&sess, &grid, "R-SIDE", 4000);
+            const right = try aiReadFile(io, a, root, "right.txt");
+            defer a.free(right);
+            try std.testing.expectEqualStrings("R-SIDE\n", right);
+        }
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+        const saved = try aiReadFile(io, a, root, "source.txt");
+        defer a.free(saved);
+        try std.testing.expectEqualStrings("OKBUFFER\n", saved);
+    }
 }
 
 test "agent workflow: Ctrl-w leaves prompt or rail without consuming editor input or losing drafts" {

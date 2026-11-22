@@ -762,7 +762,7 @@ src/app/ai.zig  会话状态 / 键处理 / 请求生命周期 / 渲染
 
 - Ctrl+c：主线程立刻置 `cancelled` 并 `client.requestCancel()`；此后排空到的事件全部丢弃。后台 supervisor 取消 `std.Io.concurrent` transport，可中断等待 HTTP headers、SSE body 和 TLS handshake 的 I/O；活 worker 未释放前重试立即返回 Busy，保留输入，不在 UI 线程 join。Ctrl+n 清空会话并同样取消。
 - 上下文：始终 `Current file: <path>`；有 visual 选区时 `Selected lines A-B:` + 选中文本；否则 `Cursor line: N` + `Context (lines A-B):`（光标 ±10 行）。总输出 ≤8 KiB，按 UTF-8 边界截断，追加 `… [truncated]`。
-- 自动滚动：streaming 时跟随底部；Ctrl+j/k 或 PageUp/PageDown 手动滚动后关闭自动跟随，下一次发送重新开启。
+- 自动滚动：streaming 时跟随底部；↑/↓ 或 PageUp/PageDown 手动滚动后关闭自动跟随，下一次发送重新开启。
 
 ### 17.4 测试接缝（test-only，不对外文档化）
 
@@ -859,16 +859,18 @@ Narrow drawer 必须有焦点隔离，不能挤压编辑器到不可用宽度；
 **焦点策略（实际实现）**
 
 - `<leader>a` 是可见性 toggle：关闭 → 打开 rail 并聚焦 **prompt**（Workbox 切到 Chat）；已打开（editor 或线程列表聚焦时）→ 关闭 rail 并把焦点还给 editor。prompt 聚焦时所有可打印输入都归 prompt，因此不能在 prompt 内用 leader 关闭；先 Esc（回 editor，rail 保持）再 `<leader>a` 关闭，或 Tab 到线程列表再 `<leader>a`。
-- `<Ctrl-w> a`：从 editor 重新进入 rail 的**线程列表**（rail 关闭时也会打开）。这是 editor → rail 的固定回入口；Ctrl-w hjkl 不变。
-- prompt：Enter 发送，Ctrl+c 取消，Ctrl+n 新建线程，Tab → 线程列表（prompt 是单行，不接收 tab 字符），Ctrl+j/k 单行滚动，PageUp/PageDown 翻页，Esc → editor（narrow：关闭 drawer）。
+- `<Ctrl-w> a`：从 editor 重新进入 rail 的**线程列表**（rail 关闭时也会打开）。再按一次进入所选线程的输入框。普通模式在最右窗口按 `Ctrl-w l`，或在任何窗口按 `Ctrl-w w`，直接进入可见 Agent 的输入框。`Ctrl-w A` 切换 Agent 专注布局。插入模式保留 `Ctrl-w` 删词；先 Esc，再用窗口键。
+- prompt：Enter 发送，Ctrl+c 取消，Ctrl+n 新建线程，Tab → 线程列表（prompt 是单行，不接收 tab 字符），↑/↓ 单行滚动，PageUp/PageDown 翻页，Esc → editor（narrow：关闭 drawer）。
+- 输入框：←/→ 或 Ctrl+b/f 按字素移动；Home/End 或 Ctrl+a/e 到行首/尾。Alt+b/f 或 Ctrl+←/→ 按词移动。Backspace 删除前一个字素，Delete 或 Ctrl+d 删除后一个字素。Ctrl+k/u 剪切到行尾/首，Alt+Backspace/d 剪切前/后一个词，Ctrl+y 粘回。粘贴在光标处插入，换行折为一个空格，Tab 展开为四个空格。
 - 线程列表 / workbox：`j/k` 移动线程光标，Enter attach 并聚焦 prompt（切回 Chat），`n`/`+` 新建线程并聚焦其 prompt，`c/d/t/r` 切 Chat/Changes/Tools/Terminal，Tab/Shift+Tab 循环 tab，`q`/Esc → editor（narrow 关闭 drawer）。
+- `Space e` 重开上次使用的导航器页签（Files / Notes / Agents）。`Space E` 在 Files 定位当前文件。导航器与右侧 Agent 输入框分别接受焦点。
 - dock 且 editor 聚焦时 rail 非模态：所有 editor 快捷键、pickers、command mode、宏录制、文件树、终端焦点均照旧；rail/prompt 聚焦时按键先在 AI 层消费，终端焦点仍最优先。
 - 焦点可见性：rail 左边框 accent（rail/prompt 聚焦）/ `fg_faint`（editor 聚焦）；prompt 显示 beam cursor，线程列表显示 block cursor。
 
 **线程切换策略（实际实现）**
 
 - `src/ai/workspace.zig: Threads` 持有 session 级 `items` / `active` / `next_number`；`src/app/ai.zig: Session` 另持有一一对应的 `clients`。线程标题由 `next_number` 生成（`thread 1`、`thread 2`…）。
-- 每个线程独立保存 messages、prompt draft、status、error、scroll/auto-scroll、view 尺寸和 cancel_requested；client 与线程索引一一对应。
+- 每个线程独立保存 messages、prompt draft、字素边界上的光标和最近剪切文本、status、error、scroll/auto-scroll、view 尺寸和 cancel_requested；client 与线程索引一一对应。
 - 切换（`select`）只改变可见线程，原线程继续运行；只有显式 Ctrl+c 会取消当前线程，按 generation 丢弃取消后的迟到事件。
 - 各线程独立拥有 transport、配置、工具循环、终端进程与审批状态，可以同时 streaming；新建线程与切换不取消任何其他任务。
 - 切回已取消线程显示冻结的 transcript（含 `[stream cancelled]` 标记），不会被后续事件修改；各线程的请求体只包含自己的 messages（验证见 e2e `threads stream in parallel` 和屏障控制的 ACP A 晚于 B 测试）。

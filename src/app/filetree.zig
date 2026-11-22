@@ -124,9 +124,7 @@ pub fn toggleFiletree(self: *App) !void {
     self.clearAgentFocus(false);
     self.filetree_top = 0;
     self.filetree_sel = 0;
-    // <leader>e is the canonical Files entry; the tab strip can switch to
-    // Notes/Agents afterwards (Tab/Shift-Tab or 1/2/3).
-    self.navigator_tab = .files;
+    // Keep the tab selected on the last visit. Space E selects Files explicitly.
     self.focus = .navigator;
     // Compact mode has no inline list: the explicit navigator entry opens
     // its peek so the focused pane has visible content. Esc returns to the
@@ -141,6 +139,7 @@ pub fn toggleFiletree(self: *App) !void {
     }
     try self.rebuildFiletreeRows();
     self.filetree_active = true;
+    try @import("notes.zig").loadNavigatorTab(self);
 }
 
 /// Build a replacement off to the side: permission/read failures leave the
