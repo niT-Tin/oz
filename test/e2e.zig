@@ -12645,6 +12645,61 @@ test "lsp: signature help — typing ( shows the callee signature" {
     }
     try std.testing.expect(std.mem.indexOf(u8, sess.out[0..sess.used], "leaked") == null);
 }
+test "lsp: signature box aligns literal wide text, blank rows and clipped text in each pane" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(a);
+    for (0..30) |_| try text.appendSlice(a, "const argument = 1;\n");
+    try writeTestFile(io, root, "sig.zig", text.items);
+    const path = try std.fs.path.join(a, &.{ root, "sig.zig" });
+    defer a.free(path);
+    for ([_]u16{ 80, 120, 40, 60, 120 }, 0..) |cols, i| {
+        const split = i == 4;
+        var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, path }, &.{
+            "OZ_LSP_CMD=zig-out/bin/mock_lsp", "OZ_MOCK_SCRIPT=rich",
+        }, 24, cols);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 24, cols);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "argument", 8000);
+        if (split) {
+            try sess.send(":vs\r");
+            try gridSettle(&sess, &grid, 80, 1200);
+        }
+        // Exercise placement below a top caret and above a bottom caret.
+        if (i % 2 == 1 or split) try sess.send("G");
+        try sess.send("$a(");
+        try gridWaitFor(&sess, &grid, "mockSig(中文)", 8000);
+        try gridSettle(&sess, &grid, 80, 1000);
+        const sig = termFindText(&grid, "mockSig") orelse return error.TestUnexpectedResult;
+        const top = sig.row - 1;
+        const left = glyphCol(&grid, top, "╭", 0) orelse return error.TestUnexpectedResult;
+        const right = glyphCol(&grid, top, "╮", left + 1) orelse return error.TestUnexpectedResult;
+        const bottom = try assertPopupBoxAt(&grid, top, left, right);
+        try std.testing.expectEqual(top + 4, bottom);
+        try std.testing.expect(right < grid.cols and bottom < grid.rows - 1);
+        if (split) try std.testing.expect(left >= cols / 2);
+        if (cols >= 80 and !split) try std.testing.expectEqual(@as(usize, 62), right + 1 - left);
+        if (i % 2 == 1 or split) try std.testing.expect(bottom < grid.row) else try std.testing.expect(top > grid.row);
+        const bg = frame.cellBg(&grid, top, right);
+        try std.testing.expect(bg != 0);
+        for (top + 1..bottom) |row| {
+            for (left..right + 1) |col| try std.testing.expectEqual(bg, frame.cellBg(&grid, row, col));
+            try std.testing.expectEqual(right, glyphCol(&grid, row, "│", left + 1) orelse return error.TestUnexpectedResult);
+        }
+        for (left + 1..right) |col| try std.testing.expectEqualStrings(" ", frame.cellText(&grid, top + 2, col));
+        try std.testing.expect(!grid.contains("_tail"));
+        try sess.send("\x1b");
+        try gridWaitGone(&sess, &grid, "mockSig", 5000);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+    }
+}
+
 test "lsp: editing — rename, format, inlay hints, outline" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;

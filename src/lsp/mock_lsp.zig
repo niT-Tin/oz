@@ -418,6 +418,12 @@ pub fn handleMessage(
                         state.signature_responses += 1;
                     },
                 }
+            } else if (script == .rich) {
+                try pushResponse(alloc, &out, id, try buildSignatureLabel(
+                    a,
+                    "mockSig(中文)\n\n" ++
+                        "01234567890123456789012345678901234567890123456789012345678界_tail",
+                ));
             } else {
                 try pushResponse(alloc, &out, id, try buildSignatureResult(a));
             }
