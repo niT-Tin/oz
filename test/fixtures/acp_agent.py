@@ -51,6 +51,16 @@ for line in sys.stdin:
         elif mode == 'oversized':
             sys.stdout.write('x' * (8 * 1024 * 1024 + 1) + '\n')
             sys.stdout.flush()
+        elif mode == 'tool-progress':
+            def tool(**change):
+                send({'jsonrpc': '2.0', 'method': 'session/update',
+                      'params': {'sessionId': 's1', 'update': dict(toolCallId='t1', **change)}})
+            tool(sessionUpdate='tool_call', title='Bash', status='pending', rawInput={'command': 'pwd'})
+            for _ in range(20):
+                tool(sessionUpdate='tool_call_update', status='in_progress')
+            tool(sessionUpdate='tool_call_update', status='completed',
+                 content=[{'type': 'content', 'content': {'type': 'text', 'text': 'PROGRESS_RESULT'}}])
+            finish(rid)
         elif mode == 'barrier':
             from pathlib import Path
             root = Path(sys.argv[2])

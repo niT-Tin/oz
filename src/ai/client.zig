@@ -26,6 +26,7 @@ const tools = @import("tools.zig");
 pub const Event = union(enum) {
     /// Transport progressed without changing the transcript.
     acp_permission: []u8,
+    acp_tool: acp.ToolUpdate,
     phase: telemetry.Phase,
     /// Provider-reported token accounting (DeepSeek sends a final usage-only chunk).
     usage: telemetry.Usage,
@@ -43,6 +44,7 @@ pub const Event = union(enum) {
 
     pub fn deinit(self: Event, alloc: std.mem.Allocator) void {
         switch (self) {
+            .acp_tool => |update| update.arena.deinit(),
             .acp_permission => |d| alloc.free(d),
             .delta => |d| alloc.free(d),
             .err => |e| alloc.free(e),
@@ -294,6 +296,10 @@ pub const Client = struct {
             error.Cancelled, error.Canceled => {},
             else => self.pushErrorFmt("{s}", .{@errorName(e)}),
         };
+    }
+
+    pub fn acpTool(self: *Client, update: acp.ToolUpdate) !void {
+        try self.push(.{ .acp_tool = update });
     }
 
     pub fn acpText(self: *Client, text: []const u8) !void {
@@ -1250,7 +1256,7 @@ fn testAcp(mode: []const u8, allow: bool, expected_error: ?[]const u8, turns: us
                         failed = true;
                         if (expected_error) |expected| try std.testing.expect(std.mem.indexOf(u8, message, expected) != null) else return error.UnexpectedAcpError;
                     },
-                    .phase => {},
+                    .phase, .acp_tool => {},
                     else => return error.UnexpectedAcpEvent,
                 }
             } else try std.Io.sleep(io, .fromMilliseconds(2), .real);

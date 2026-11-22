@@ -291,6 +291,7 @@ pub const ToolStatus = enum {
 
 pub const Message = struct {
     role: Role,
+    display_only: bool = false,
     /// What the transcript shows (the user's typed prompt / assistant text /
     /// a bounded tool-result excerpt).
     text: []u8,
@@ -518,6 +519,53 @@ pub const Threads = struct {
         return t.messages.items.len - 1;
     }
 
+    /// Match only this user turn. A harness can reuse IDs in later turns.
+    /// Bound the number of display cards independently of the tool runner.
+    pub fn applyAcpTool(self: *Threads, alloc: std.mem.Allocator, idx: usize, update: @import("acp.zig").ToolUpdate) !void {
+        const t = &self.items.items[idx];
+        if (t.status != .streaming or t.cancel_requested) return;
+        var count: usize = 0;
+        var i = t.messages.items.len;
+        const status: ?ToolStatus = if (update.status) |st| switch (st) {
+            .running => .running,
+            .ok => .ok,
+            .err => .err,
+        } else null;
+        while (i > 0) {
+            i -= 1;
+            const m = &t.messages.items[i];
+            if (m.role == .user) break;
+            if (!m.display_only or m.role != .tool) continue;
+            count += 1;
+            if (!std.mem.eql(u8, m.tool_call_id.?, update.id)) continue;
+            if (update.title) |title| try replaceString(alloc, &m.tool_name, title);
+            if (update.args) |args| try replaceString(alloc, &m.tool_args, args);
+            if (update.output) |body| {
+                const summary = try @import("agent.zig").resultExcerpt(alloc, body, 160);
+                defer alloc.free(summary);
+                try self.setToolOutcome(alloc, idx, i, status orelse m.tool_status, summary, body, 0);
+            } else if (status) |st| m.tool_status = st;
+            return;
+        }
+        if (count >= 64) return;
+        self.dropEmptyAssistant(alloc, idx);
+        const card = try self.appendToolMessage(alloc, idx, update.id, update.title orelse "tool", update.args orelse "", status orelse .running, update.output orelse "");
+        const m = &t.messages.items[card];
+        m.display_only = true;
+        if (update.output) |body| {
+            const summary = try @import("agent.zig").resultExcerpt(alloc, body, 160);
+            alloc.free(m.text);
+            m.text = summary;
+        }
+    }
+
+    fn replaceString(alloc: std.mem.Allocator, dst: *?[]u8, value: []const u8) !void {
+        if (dst.*) |old| if (std.mem.eql(u8, old, value)) return;
+        const copy = try alloc.dupe(u8, value);
+        if (dst.*) |old| alloc.free(old);
+        dst.* = copy;
+    }
+
     /// Replace a tool card's display/API content and status in place. The
     /// old buffers are freed exactly once; on OOM the card is left untouched
     /// (the caller reports the failure instead of corrupting the transcript).
@@ -591,6 +639,7 @@ pub const Threads = struct {
         const t = &self.items.items[idx];
         if (t.status != .streaming or t.cancel_requested) return false;
         if (t.messages.items.len == 0) return false;
+        if (t.messages.items[t.messages.items.len - 1].display_only) try self.beginAssistant(alloc, idx);
         const last = &t.messages.items[t.messages.items.len - 1];
         if (last.role != .assistant) return false;
         const merged = try std.mem.concat(alloc, u8, &.{ last.text, text });
@@ -1186,4 +1235,48 @@ test "threads parallel: selecting B preserves A and explicit cancel only freezes
     try std.testing.expectEqualStrings("A_START_FINISH", threads.items.items[first].messages.items[1].text);
     try std.testing.expectEqualStrings("", threads.items.items[second].messages.items[1].text);
     try std.testing.expectEqual(Status.cancelled, threads.items.items[second].status);
+}
+
+test "ACP tool patches keep a bounded card per ID and never leak into builtin history" {
+    const alloc = std.testing.allocator;
+    var threads: Threads = .{};
+    defer threads.deinit(alloc);
+    const idx = try threads.create(alloc);
+    const t = &threads.items.items[idx];
+    try threads.appendUser(alloc, idx, "go", "go");
+    threads.markStreaming(alloc, idx);
+    try threads.beginAssistant(alloc, idx);
+    var patch: @import("acp.zig").ToolUpdate = .{
+        .arena = std.heap.ArenaAllocator.init(alloc),
+        .id = "first",
+        .title = "Bash",
+        .status = .running,
+        .args = "pwd",
+        .output = null,
+    };
+    defer patch.arena.deinit();
+    try threads.applyAcpTool(alloc, idx, patch);
+    patch.title = null;
+    patch.args = null;
+    for (0..20) |_| try threads.applyAcpTool(alloc, idx, patch);
+    try std.testing.expect(try threads.applyDelta(alloc, idx, "after card"));
+    patch.status = .ok;
+    patch.output = "line one\nline two";
+    try threads.applyAcpTool(alloc, idx, patch);
+    try std.testing.expectEqual(@as(usize, 3), t.messages.items.len);
+    try std.testing.expectEqualStrings("Bash", t.messages.items[1].tool_name.?);
+    try std.testing.expectEqualStrings("pwd", t.messages.items[1].tool_args.?);
+    try std.testing.expectEqual(ToolStatus.ok, t.messages.items[1].tool_status);
+    try std.testing.expectEqualStrings("line one\nline two", t.messages.items[1].api_text);
+    patch.output = null;
+    for (0..70) |i| {
+        var buf: [20]u8 = undefined;
+        patch.id = try std.fmt.bufPrint(&buf, "other-{d}", .{i});
+        try threads.applyAcpTool(alloc, idx, patch);
+    }
+    try std.testing.expectEqual(@as(usize, 66), t.messages.items.len);
+    const wire = try @import("turn.zig").buildMessages(alloc, t.messages.items, null);
+    defer alloc.free(wire);
+    try std.testing.expectEqual(@as(usize, 2), wire.len);
+    try std.testing.expectEqualStrings("after card", wire[1].content);
 }

@@ -25539,6 +25539,16 @@ fn acpEditorScenario(mode: []const u8, dirty: bool, allow: bool) !void {
     } else {
         try gridWaitFor(&sess, &grid, "ACP_REPLY_1", 5000);
         try gridWaitFor(&sess, &grid, "idle", 5000);
+        if (std.mem.eql(u8, mode, "tool-progress")) {
+            var headers: usize = 0;
+            for (0..grid.rows) |row| if (rowContains(&grid, row, "Bash")) {
+                headers += 1;
+                try std.testing.expect(rowContains(&grid, row, "ok"));
+            };
+            try std.testing.expectEqual(@as(usize, 1), headers);
+            try std.testing.expect(grid.contains("PROGRESS_RESULT"));
+            try std.testing.expect(!grid.contains("[tool "));
+        }
         if (std.mem.eql(u8, mode, "normal")) {
             try sess.send("second\r");
             try gridWaitFor(&sess, &grid, "ACP_REPLY_2", 5000);
@@ -25553,6 +25563,9 @@ fn acpEditorScenario(mode: []const u8, dirty: bool, allow: bool) !void {
     try sess.send("\x1b");
     try aiWaitRailFocus(&sess, &grid, aiRailCol(120), false, 3000);
     try aiQuit(&sess);
+}
+test "ACP editor: one card survives twenty progress updates" {
+    try acpEditorScenario("tool-progress", false, false);
 }
 test "ACP editor: generic command and persistent conversation" {
     try acpEditorScenario("normal", false, false);

@@ -1740,6 +1740,10 @@ pub fn drainAi(self: *App) !bool {
         while (client.pop()) |ev| {
             changed = true;
             switch (ev) {
+                .acp_tool => |update| {
+                    defer update.arena.deinit();
+                    try self.ai.threads.applyAcpTool(self.alloc, idx, update);
+                },
                 .acp_permission => |title| {
                     if (t.cancel_requested) {
                         self.alloc.free(title);
@@ -2243,7 +2247,7 @@ fn appendToolCardRows(
     msg: *const Message,
 ) !void {
     const status = msg.tool_status;
-    const name = msg.tool_name orelse "tool";
+    const name = try displaySafe(a, msg.tool_name orelse "tool");
     const args = msg.tool_args orelse "";
     const now_ms = self.frame_now_ms;
     var status_style = cardStatusStyle(st, status);
@@ -2256,7 +2260,7 @@ fn appendToolCardRows(
     }
 
     var status_buf: [agent.max_status_text_bytes]u8 = undefined;
-    const status_text = agent.cardStatusText(&status_buf, switch (status) {
+    const status_text = if (msg.display_only and status == .ok) "ok" else if (msg.display_only and status == .err) "error" else agent.cardStatusText(&status_buf, switch (status) {
         .running => .running,
         .ok => .ok,
         .err => .err,
@@ -2300,7 +2304,7 @@ fn appendToolCardRows(
     }
     try appendCardRow(a, rows, inner_w, st.card_bg, header.items);
 
-    if (args.len > 0) {
+    if (args.len > 0 and (!msg.display_only or msg.tool_expanded or msg.text.len == 0)) {
         const args_safe = try displaySafe(a, args);
         if (std.mem.eql(u8, name, "terminal")) {
             // A terminal command can be far wider than the rail. Clip with an
@@ -2358,7 +2362,7 @@ fn appendToolCardRows(
             try appendCardRow(a, rows, inner_w, st.card_bg, &.{.{ .text = "  stopped (no result applied)", .style = st.faint }});
         },
         .running => {
-            try appendCardRow(a, rows, inner_w, st.card_bg, &.{.{ .text = "  ⋯ working", .style = st.faint }});
+            if (!msg.display_only) try appendCardRow(a, rows, inner_w, st.card_bg, &.{.{ .text = "  ⋯ working", .style = st.faint }});
         },
         .ok, .err, .none => {
             if (msg.text.len > 0) {

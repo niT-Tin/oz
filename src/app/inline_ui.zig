@@ -393,7 +393,7 @@ pub fn drainInline(self: *App) !bool {
             },
             // Inline has no harness of its own yet; transport phases and usage
             // do not alter the replacement text. Tool calls are not advertised.
-            .phase, .usage, .tool_calls => {},
+            .phase, .usage, .tool_calls, .acp_tool => {},
         }
     }
     if (s.request_active and s.status == .streaming and !c.isRunning() and !c.hasEvents()) {

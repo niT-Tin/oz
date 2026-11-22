@@ -24,6 +24,62 @@ pub fn validateCommand(a: std.mem.Allocator, json: []const u8) !void {
     if (p.value != .array or p.value.array.items.len == 0) return error.InvalidAcpCommand;
     for (p.value.array.items) |v| if (v != .string or v.string.len == 0 or std.mem.indexOfScalar(u8, v.string, 0) != null) return error.InvalidAcpCommand;
 }
+/// Fields in ACP tool_call_update are patches. Missing fields retain their
+/// previous value, including a missing status on an output-only update.
+pub const ToolUpdate = struct {
+    arena: std.heap.ArenaAllocator,
+    id: []const u8,
+    title: ?[]const u8,
+    status: ?enum { running, ok, err },
+    args: ?[]const u8,
+    output: ?[]const u8,
+
+    fn prefix(bytes: []const u8, limit: usize) []const u8 {
+        var n = @min(bytes.len, limit);
+        while (n < bytes.len and n > 0 and bytes[n] & 0xc0 == 0x80) n -= 1;
+        return bytes[0..n];
+    }
+
+    pub fn parse(alloc: std.mem.Allocator, update: V) !?ToolUpdate {
+        const id = str(field(update, "toolCallId"));
+        if (id.len == 0 or id.len > 512) return null;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const title = str(field(update, "title"));
+        const status = field(update, "status");
+        const input = field(update, "rawInput");
+        const args = if (input == .null) null else try a.dupe(u8, prefix(try std.json.Stringify.valueAlloc(a, input, .{}), 1024));
+        const content = field(update, "content");
+        var output: ?[]const u8 = null;
+        if (content == .array) {
+            var lines: std.ArrayList(u8) = .empty;
+            for (content.array.items) |entry| {
+                const block = field(entry, "content");
+                if (!eq(field(block, "type"), "text")) continue;
+                if (lines.items.len != 0) try lines.append(a, '\n');
+                try lines.appendSlice(a, prefix(str(field(block, "text")), 16384 - lines.items.len));
+                if (lines.items.len >= 16380) break;
+            }
+            output = lines.items;
+        } else if (field(update, "rawOutput") != .null) {
+            const raw = field(update, "rawOutput");
+            const bytes = if (raw == .string) raw.string else try std.json.Stringify.valueAlloc(a, raw, .{});
+            output = try a.dupe(u8, prefix(bytes, 16384));
+        }
+        const call_id = try a.dupe(u8, id);
+        const name = if (title.len == 0) null else try a.dupe(u8, prefix(title, 256));
+        return .{
+            .id = call_id,
+            .title = name,
+            .status = if (eq(status, "failed")) .err else if (eq(status, "completed")) .ok else if (eq(status, "pending") or eq(status, "in_progress")) .running else null,
+            .args = args,
+            .output = output,
+            .arena = arena,
+        };
+    }
+};
+
 pub const Connection = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -114,9 +170,7 @@ pub const Connection = struct {
                     const c = field(u, "content");
                     if (eq(field(c, "type"), "text")) try host.acpText(str(field(c, "text")));
                 } else if (eq(kind, "tool_call") or eq(kind, "tool_call_update")) {
-                    const text = try std.fmt.allocPrint(self.alloc, "\n[tool {s}] {s} {s}\n", .{ str(field(u, "toolCallId")), str(field(u, "title")), str(field(u, "status")) });
-                    defer self.alloc.free(text);
-                    try host.acpText(text);
+                    if (try ToolUpdate.parse(self.alloc, u)) |update| try host.acpTool(update);
                 }
             } else if (eq(field(v, "method"), "session/request_permission")) {
                 const params = field(v, "params");
