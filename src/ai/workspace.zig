@@ -329,6 +329,18 @@ pub const Message = struct {
 pub const Thread = struct {
     id: u64,
     title: []u8,
+    /// Per-process numeric IDs remain keyboard shortcuts. The random key
+    /// names the journal across processes and workspaces.
+    key: [32]u8 = @splat(0),
+    root: ?[]u8 = null,
+    subject: ?[]u8 = null,
+    created_ms: i64 = 0,
+    updated_ms: i64 = 0,
+    disk_size: usize = 0,
+    valid_size: usize = 0,
+    journal_hashes: std.ArrayList(u64) = .empty,
+    acp_session: ?[]u8 = null,
+    acp_local_only: bool = false,
     messages: std.ArrayList(Message) = .empty,
     input: std.ArrayList(u8) = .empty,
     status: Status = .idle,
@@ -348,11 +360,15 @@ pub const Thread = struct {
     /// this thread's conversation.
     cancel_requested: bool = false,
 
-    fn deinit(self: *Thread, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Thread, alloc: std.mem.Allocator) void {
         for (self.messages.items) |*m| m.deinit(alloc);
         self.messages.deinit(alloc);
         self.input.deinit(alloc);
         if (self.error_text) |e| alloc.free(e);
+        self.journal_hashes.deinit(alloc);
+        if (self.root) |v| alloc.free(v);
+        if (self.subject) |v| alloc.free(v);
+        if (self.acp_session) |v| alloc.free(v);
         alloc.free(self.title);
     }
 

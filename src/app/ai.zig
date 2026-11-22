@@ -19,6 +19,7 @@ const animation = @import("animation.zig");
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const ws = ai.workspace;
+const history = @import("../ai/history.zig");
 const tool_job = @import("tool_job.zig");
 const app_agent_edit = @import("agent_edit_ui.zig");
 const app_agent_terminal = @import("agent_terminal.zig");
@@ -89,10 +90,10 @@ pub const ChartCache = struct {
     }
 };
 
-/// Session-wide AI state. Deliberately NOT per workspace: closing the rail
-/// keeps every thread, switching workspaces keeps the same list. Not
-/// persisted to disk.
+/// Live clients and approvals stay process-local. Journal discovery is
+/// scoped to the current workspace root.
 pub const Session = struct {
+    browsing_root: ?[]u8 = null,
     config: ?ai.config.Config = null,
     thread_configs: std.ArrayList(?ai.config.Config) = .empty,
     threads: ws.Threads = .{},
@@ -144,7 +145,13 @@ fn createAiThread(self: *App) !usize {
     try self.ai.thread_configs.ensureUnusedCapacity(self.alloc, 1);
     try self.ai.tool_states.ensureUnusedCapacity(self.alloc, 1);
     try self.ai.tool_jobs.ensureUnusedCapacity(self.alloc, 1);
+    const root = try self.currentRootDir();
+    errdefer self.alloc.free(root);
     const idx = try self.ai.threads.create(self.alloc);
+    const thread = &self.ai.threads.items.items[idx];
+    thread.key = history.newKey(self.io);
+    thread.created_ms = history.now(self.io);
+    thread.root = root;
     self.ai.clients.appendAssumeCapacity(null);
     self.ai.thread_configs.appendAssumeCapacity(null);
     self.ai.tool_states.appendAssumeCapacity(.{});
@@ -241,18 +248,72 @@ fn resetToolTurn(self: *App, idx: usize) void {
     }
 }
 
-/// Create the first thread lazily (the rail may never be opened).
+const local_only_notice = "Local history restored. The backend starts a new session.";
+
+pub fn saveHistory(self: *App, idx: usize, changed_from: ?usize) void {
+    if (idx >= self.ai.threads.items.items.len) return;
+    const t = &self.ai.threads.items.items[idx];
+    if (t.subject == null or t.root == null) return;
+    const cfg = threadConfig(self, idx) orelse return;
+    const base = (history.directory(self.alloc, self.env_map) catch return) orelse return;
+    defer self.alloc.free(base);
+    history.save(self.alloc, self.io, base, t, cfg, changed_from) catch |err| {
+        var buf: [128]u8 = undefined;
+        setToolNote(self, idx, std.fmt.bufPrint(&buf, "History could not be saved ({s})", .{@errorName(err)}) catch "History could not be saved");
+    };
+}
+
+fn restoreRoot(self: *App, root: []const u8) !?usize {
+    for (self.ai.threads.items.items, 0..) |t, i| {
+        if (t.root) |owner| if (std.mem.eql(u8, owner, root)) return i;
+    }
+    const base = (try history.directory(self.alloc, self.env_map)) orelse return null;
+    defer self.alloc.free(base);
+    try aiLoadConfig(self);
+    const restored = try history.recent(self.alloc, self.io, base, root, &self.ai.config.?);
+    defer self.alloc.free(restored);
+    var moved: usize = 0;
+    defer for (restored[moved..]) |*item| item.deinit(self.alloc);
+    const first = self.ai.threads.items.items.len;
+    for (restored) |*item| {
+        const idx = try createAiThread(self);
+        const t = &self.ai.threads.items.items[idx];
+        self.alloc.free(item.thread.title);
+        item.thread.title = t.title;
+        item.thread.id = t.id;
+        self.alloc.free(t.root.?);
+        t.* = item.thread;
+        self.ai.thread_configs.items[idx] = item.cfg;
+        moved += 1;
+        if (item.cfg.acp_command != null) {
+            setToolNote(self, idx, if (t.acp_local_only or t.acp_session == null) local_only_notice else "Local history restored. Backend reconnects on send.");
+        }
+    }
+    if (moved == 0) return null;
+    self.ai.threads_expanded = true;
+    self.ai.focus = .rail;
+    return first;
+}
+
 pub fn ensureAi(self: *App) !void {
     try syncAiSidecars(self);
-    if (self.ai.threads.items.items.len == 0) {
-        const idx = try createAiThread(self);
-        self.ai.threads.active = idx;
-        self.ai.thread_cursor = idx;
-        self.ai.thread_top = 0;
-    }
-    if (self.ai.thread_cursor >= self.ai.threads.items.items.len) {
-        self.ai.thread_cursor = self.ai.threads.items.items.len - 1;
-    }
+    const root = try self.currentRootDir();
+    defer self.alloc.free(root);
+    if (self.ai.browsing_root) |prev| if (std.mem.eql(u8, root, prev)) return;
+    const owned = try self.alloc.dupe(u8, root);
+    errdefer self.alloc.free(owned);
+    var load_err: ?anyerror = null;
+    const restored = restoreRoot(self, root) catch |err| blk: {
+        load_err = err;
+        break :blk null;
+    };
+    const idx = restored orelse try createAiThread(self);
+    self.ai.threads.active = idx;
+    self.ai.thread_cursor = idx;
+    self.ai.thread_top = idx;
+    if (self.ai.browsing_root) |prev| self.alloc.free(prev);
+    self.ai.browsing_root = owned;
+    if (load_err) |err| aiSetThreadErrorFmt(self, idx, "history: {s}", .{@errorName(err)});
 }
 
 fn railMetrics(self: *App, rows: u32) ws.Metrics {
@@ -562,6 +623,7 @@ pub fn deinitAi(self: *App) void {
     self.ai.clients.deinit(self.alloc);
     self.ai.tool_states.deinit(self.alloc);
     self.ai.tool_jobs.deinit(self.alloc);
+    if (self.ai.browsing_root) |root| self.alloc.free(root);
     self.ai.threads.deinit(self.alloc);
     for (self.ai.thread_configs.items) |*slot| if (slot.*) |*cfg| cfg.deinit(self.alloc);
     self.ai.thread_configs.deinit(self.alloc);
@@ -634,7 +696,7 @@ fn handleLocalCommand(self: *App, idx: usize) !bool {
         var target: ?usize = null;
         if (std.mem.eql(u8, argument, "next")) target = (idx + 1) % n else if (std.mem.eql(u8, argument, "prev")) target = (idx + n - 1) % n else {
             const id = std.fmt.parseInt(u64, argument, 10) catch 0;
-            for (self.ai.threads.items.items, 0..) |t, i| if (t.id == id) {
+            for (self.ai.threads.items.items, 0..) |t, i| if (t.id == id or std.mem.eql(u8, argument, &t.key)) {
                 target = i;
                 break;
             };
@@ -658,6 +720,7 @@ fn handleLocalCommand(self: *App, idx: usize) !bool {
                 const model = try self.alloc.dupe(u8, argument);
                 self.alloc.free(cfg.model);
                 cfg.model = model;
+                saveHistory(self, idx, null);
                 try localNote(self, idx, "model: {s}", .{cfg.model});
             }
         }
@@ -702,6 +765,11 @@ fn selectAgentProfile(self: *App, idx: usize, argument: []const u8) !void {
     dropThreadClient(self, idx); // an idle old ACP connection cannot survive a backend switch
     if (self.ai.thread_configs.items[idx]) |*old| old.deinit(self.alloc);
     self.ai.thread_configs.items[idx] = next_cfg;
+    const thread = &self.ai.threads.items.items[idx];
+    if (thread.acp_session) |sid| self.alloc.free(sid);
+    thread.acp_session = null;
+    thread.acp_local_only = false;
+    saveHistory(self, idx, null);
     try localNote(self, idx, "agent: {s} · {s}", .{ name, next_cfg.model });
 }
 
@@ -922,7 +990,10 @@ pub fn aiCancel(self: *App) void {
     // worker/follow-up is still live. `cancelClient` freezes running cards
     // and invalidates the job generation.
     const tool_live = if (toolState(self, idx)) |st| st.active or st.pending_followup else false;
-    if (streaming or tool_live) cancelClient(self, idx);
+    if (streaming or tool_live) {
+        cancelClient(self, idx);
+        saveHistory(self, idx, null);
+    }
 }
 
 /// Build the provider request for the active prompt, append the messages,
@@ -991,6 +1062,7 @@ fn startThreadRequest(self: *App, idx: usize, plan: *RequestPlan) !void {
         .acp_cwd = cfg.acp_cwd,
         .acp_root = if (st_acp) |s| s.root else null,
         .acp_prompt = acp_prompt,
+        .acp_resume = self.ai.threads.items.items[idx].acp_session,
         .url = plan.url,
         .api_key = cfg.api_key,
         .body = plan.body,
@@ -1186,6 +1258,12 @@ pub fn aiSend(self: *App) !void {
     if (t.status == .streaming) return;
     const prompt = std.mem.trim(u8, t.input.items, " \t\r\n");
     if (prompt.len == 0) return;
+    const root = try self.currentRootDir();
+    defer self.alloc.free(root);
+    if (t.root) |owner| if (!std.mem.eql(u8, root, owner)) {
+        setToolNote(self, idx, "This conversation belongs to another workspace. Use /new here or return to its project.");
+        return;
+    };
     // M3b3: a terminal approval pauses the conversation until the human
     // allows/denies it (or Ctrl+c cancels). Starting a new turn here would
     // race the decision's follow-up.
@@ -1244,14 +1322,17 @@ pub fn aiSend(self: *App) !void {
     // The tool root is captured once per user turn: follow-up rounds keep
     // reading the same workspace even if the visible workspace changes.
     const st = toolState(self, idx) orelse return error.ToolStateUnavailable;
+    const owned_root = try self.alloc.dupe(u8, root);
     if (st.root) |old| self.alloc.free(old);
-    st.root = try self.currentRootDir();
+    st.root = owned_root;
     resetToolTurn(self, idx);
 
     self.ai.threads.appendUser(self.alloc, idx, prompt, api_text) catch |e| {
         aiSetThreadError(self, idx, @errorName(e));
         return e;
     };
+    if (t.subject == null) t.subject = try history.subject(self.alloc, prompt);
+    saveHistory(self, idx, null);
     self.ai.threads.beginAssistant(self.alloc, idx) catch |e| {
         aiSetThreadError(self, idx, @errorName(e));
         return e;
@@ -1720,6 +1801,7 @@ pub fn drainToolJobs(self: *App) !bool {
         slot.* = null;
 
         if (matches) {
+            saveHistory(self, idx, null);
             _ = try maybeFollowup(self, idx);
         }
     }
@@ -1737,10 +1819,19 @@ pub fn drainAi(self: *App) !bool {
         if (idx >= self.ai.threads.items.items.len) continue;
         const t = &self.ai.threads.items.items[idx];
         var saw_terminal = false;
+        var checkpoint = false;
         while (client.pop()) |ev| {
             changed = true;
             switch (ev) {
+                .acp_session => |session| {
+                    if (t.acp_session) |old| self.alloc.free(old);
+                    t.acp_session = session.id;
+                    t.acp_local_only = !session.can_load;
+                    if (session.reconnect and !session.can_load) setToolNote(self, idx, local_only_notice);
+                    checkpoint = true;
+                },
                 .acp_tool => |update| {
+                    if (update.start or update.status == .ok or update.status == .err) checkpoint = true;
                     defer update.arena.deinit();
                     try self.ai.threads.applyAcpTool(self.alloc, idx, update);
                 },
@@ -1799,6 +1890,7 @@ pub fn drainAi(self: *App) !bool {
                         continue;
                     }
                     aiHandleToolCalls(self, idx, calls);
+                    checkpoint = true;
                 },
             }
         }
@@ -1842,8 +1934,10 @@ pub fn drainAi(self: *App) !bool {
         if (t.status == .streaming and !waiting_tools and !client.isRunning() and !client.hasEvents()) {
             t.request.finish(self.nowMs());
             self.ai.threads.fail(self.alloc, idx, "stream ended unexpectedly");
+            checkpoint = true;
             changed = true;
         }
+        if (saw_terminal or checkpoint) saveHistory(self, idx, null);
     }
     return changed;
 }
@@ -2525,6 +2619,27 @@ fn drawRailTextRow(
     try drawRailRow(win, a, y, x, w, "│", border_style, bg, segs.items, @intCast(fit.cells));
 }
 
+pub fn threadListTitle(self: *App, a: std.mem.Allocator, idx: usize) ![]const u8 {
+    const thread = &self.ai.threads.items.items[idx];
+    const title = thread.subject orelse return thread.title;
+    if (thread.root) |root| if (self.ai.browsing_root) |current| {
+        if (!std.mem.eql(u8, current, root))
+            return std.fmt.allocPrint(a, "{d} [{s}] {s}", .{ thread.id, std.fs.path.basename(root), title });
+    };
+    return std.fmt.allocPrint(a, "{d} {s}", .{ thread.id, title });
+}
+
+pub fn threadListStatus(self: *App, a: std.mem.Allocator, idx: usize, now_ns: i96) ![]const u8 {
+    const thread = &self.ai.threads.items.items[idx];
+    const label = aiStatusLabelFor(self, idx);
+    if (thread.subject == null or thread.updated_ms == 0 or !std.mem.eql(u8, label, "idle")) return label;
+    const cfg = threadConfig(self, idx) orelse return label;
+    const backend = if (cfg.acp_command != null) cfg.model else "builtin";
+    var buf: [32]u8 = undefined;
+    const age = @import("note_store.zig").formatAge(now_ns, @as(i128, thread.updated_ms) * std.time.ns_per_ms, &buf);
+    return std.fmt.allocPrint(a, "{s} {s}", .{ backend, age });
+}
+
 /// Draw the docked rail / drawer. Called after the editor panes (and the
 /// terminal) so the rail covers exactly its reserved cells; overlays that
 /// open afterwards (pickers, hovers) render above it.
@@ -2689,6 +2804,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
 
     const muted_sel = chrome.mutedSelectionColor(t);
     var cursor_row: ?u32 = null;
+    const now_ns = std.Io.Timestamp.now(self.io, .real).nanoseconds;
     var vis: u32 = 0;
     while (vis < m.thread_rows) : (vis += 1) {
         const ti = self.ai.thread_top + vis;
@@ -2708,7 +2824,7 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
             .bold = attached,
         };
         const dot_style = threadDotStyle(st, thread.status, self.frame_now_ms);
-        const status_text = aiStatusLabelFor(self, ti);
+        const status_text = try threadListStatus(self, a, ti, now_ns);
         const status_cells = autil.cellWidth(win, status_text);
         // Active thread: `>` + bold in monochrome. Other rows keep an ASCII
         // status marker so no nerd-font/geometric glyph is required.
@@ -2726,7 +2842,8 @@ pub fn drawAiRail(self: *App, a: std.mem.Allocator, win: vaxis.Window) !void {
         // use the full row (narrow rails never overflow).
         const show_status = content_w >= used + status_cells + 5;
         const title_cap: usize = @intCast(content_w -| used -| (if (show_status) status_cells + 1 else 0));
-        const title_fit = autil.cellFitPrefix(win, thread.title, title_cap);
+        const row_title = try threadListTitle(self, a, ti);
+        const title_fit = autil.cellFitPrefix(win, row_title, title_cap);
         try segs.append(a, .{ .text = title_fit.slice, .style = title_style });
         used += @intCast(title_fit.cells);
         if (show_status) {

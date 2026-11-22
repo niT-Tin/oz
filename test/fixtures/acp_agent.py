@@ -31,15 +31,26 @@ for line in sys.stdin:
     rid = v.get('id')
     if method == 'initialize':
         assert v['params']['clientCapabilities'] == {}
-        result(rid, {'protocolVersion': 2 if mode == 'version' else 1, 'agentCapabilities': {}})
+        result(rid, {'protocolVersion': 2 if mode == 'version' else 1, 'agentCapabilities': {'loadSession': mode == 'load'}})
     elif method == 'session/new':
         assert v['params']['cwd'].startswith('/')
         assert v['params']['mcpServers'] == []
         result(rid, {'sessionId': 's1'})
+    elif method == 'session/load':
+        assert mode == 'load' and v['params']['sessionId'] == 's1'
+        assert v['params']['cwd'].startswith('/') and v['params']['mcpServers'] == []
+        # ACP can replay notifications while loading. The local transcript
+        # already contains them and must not grow duplicate cards or text.
+        update('HISTORY_DUPLICATE')
+        turn = 1
+        result(rid, {})
     elif method == 'session/prompt':
         assert v['params']['sessionId'] == 's1'
         assert v['params']['prompt'][0]['type'] == 'text'
         turn += 1
+        if 'SECOND_PROMPT' in v['params']['prompt'][0]['text']:
+            assert 'FIRST_PROMPT' not in v['params']['prompt'][0]['text']
+            update('LOADED_BACKEND' if turn == 2 else 'FRESH_BACKEND')
         if mode == 'disconnect':
             sys.exit(0)
         if mode == 'hang':

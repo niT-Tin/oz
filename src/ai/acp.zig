@@ -28,6 +28,7 @@ pub fn validateCommand(a: std.mem.Allocator, json: []const u8) !void {
 /// previous value, including a missing status on an output-only update.
 pub const ToolUpdate = struct {
     arena: std.heap.ArenaAllocator,
+    start: bool = false,
     id: []const u8,
     title: ?[]const u8,
     status: ?enum { running, ok, err },
@@ -71,6 +72,7 @@ pub const ToolUpdate = struct {
         const name = if (title.len == 0) null else try a.dupe(u8, prefix(title, 256));
         return .{
             .id = call_id,
+            .start = eq(field(update, "sessionUpdate"), "tool_call"),
             .title = name,
             .status = if (eq(status, "failed")) .err else if (eq(status, "completed")) .ok else if (eq(status, "pending") or eq(status, "in_progress")) .running else null,
             .args = args,
@@ -158,11 +160,11 @@ pub const Connection = struct {
             }
             if (eq(field(v, "method"), "session/update")) {
                 const params = field(v, "params");
-                if (self.session) |s| {
-                    if (!eq(field(params, "sessionId"), s)) {
-                        p.deinit();
-                        continue;
-                    }
+                // session/load can replay the entire old transcript before
+                // its response. The local journal already owns that history.
+                if (self.session == null or !eq(field(params, "sessionId"), self.session.?)) {
+                    p.deinit();
+                    continue;
                 }
                 const u = field(params, "update");
                 const kind = field(u, "sessionUpdate");
@@ -195,7 +197,7 @@ pub const Connection = struct {
             p.deinit();
         }
     }
-    pub fn prompt(self: *Connection, cwd: []const u8, text: []const u8, host: anytype) !void {
+    pub fn prompt(self: *Connection, cwd: []const u8, text: []const u8, resume_id: ?[]const u8, host: anytype) !void {
         if (self.root) |root| if (!std.mem.eql(u8, root, cwd)) return error.AcpWorkspaceChangedCreateNewThread;
         if (self.root == null) self.root = try self.alloc.dupe(u8, cwd);
         if (self.session == null) {
@@ -203,11 +205,20 @@ pub const Connection = struct {
             defer init.deinit();
             const ver = field(field(init.value, "result"), "protocolVersion");
             if (ver != .integer or ver.integer != 1) return error.UnsupportedAcpVersion;
-            var session = try self.wait(try self.request("session/new", .{ .cwd = cwd, .mcpServers = [0]V{} }), host);
-            defer session.deinit();
-            const sid = field(field(session.value, "result"), "sessionId");
-            if (sid != .string or sid.string.len == 0) return error.InvalidAcpSession;
-            self.session = try self.alloc.dupe(u8, sid.string);
+            const cap = field(field(field(init.value, "result"), "agentCapabilities"), "loadSession");
+            const can_load = cap == .bool and cap.bool;
+            if (can_load and resume_id != null) {
+                var loaded = try self.wait(try self.request("session/load", .{ .sessionId = resume_id.?, .cwd = cwd, .mcpServers = [0]V{} }), host);
+                defer loaded.deinit();
+                self.session = try self.alloc.dupe(u8, resume_id.?);
+            } else {
+                var session = try self.wait(try self.request("session/new", .{ .cwd = cwd, .mcpServers = [0]V{} }), host);
+                defer session.deinit();
+                const sid = field(field(session.value, "result"), "sessionId");
+                if (sid != .string or sid.string.len == 0) return error.InvalidAcpSession;
+                self.session = try self.alloc.dupe(u8, sid.string);
+            }
+            try host.acpSession(self.session.?, can_load, resume_id != null);
         }
         var result = try self.wait(try self.request("session/prompt", .{ .sessionId = self.session.?, .prompt = .{.{ .type = "text", .text = text }} }), host);
         defer result.deinit();
