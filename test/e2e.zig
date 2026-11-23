@@ -19814,8 +19814,10 @@ test "navigator: 120x30 one header keeps real counts with workspace and branch i
     try gridWaitFor(&sess, &grid, "⎇", 5000); // async git status settled
 
     try sess.send(" e");
-    try gridWaitFor(&sess, &grid, "Files", 5000);
-    try gridWaitFor(&sess, &grid, "Files", 5000);
+    // A PTY read can end at "Files", before either right border arrives.
+    try gridWaitRowContains(&sess, &grid, navTabsRow(), "Files", 5000);
+    try gutterWaitCell(&sess, &grid, navTabsRow(), 29, "│");
+    try gutterWaitCell(&sess, &grid, navBodyRow(), 29, "│");
     try std.testing.expect(aiRowContains(&grid, grid.rows - 1, "[main]"));
     try std.testing.expect(aiRowContains(&grid, grid.rows - 1, "⎇"));
     try std.testing.expectEqualStrings(" ", aiCellText(&grid, navTabsRow(), 0));
