@@ -5507,6 +5507,33 @@ test "markdown: i opens a cell editor with live lists, one undo and safe source"
     try std.testing.expectEqualStrings(expected, saved);
 }
 
+test "markdown: editing a neighboring word preserves literal entities inside cell code" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const source = "| Example | Kind |\n| --- | --- |\n| Zed: \x60&#124;\x60 | syntax |\n";
+    var name_buf: [192:0]u8 = undefined;
+    const path = try erFixture(io, &name_buf, ".md", source);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{}, 24, 80, "/tmp");
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(a);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "&#124;", 5000);
+    try sess.send("2jfZi");
+    try gridWaitFor(&sess, &grid, "Edit cell", 5000);
+    try sess.send("X");
+    try gridWaitFor(&sess, &grid, "XZed", 5000);
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "Edit cell", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024));
+    defer a.free(saved);
+    const expected = try std.mem.replaceOwned(u8, a, source, "Zed", "XZed");
+    defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, saved);
+}
+
 test "markdown: local PNG uses Kitty graphics placement" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;

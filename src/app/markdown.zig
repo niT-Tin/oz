@@ -692,7 +692,7 @@ fn tableGlyphs(
         }
         const pipe_len: usize = if (!draft and std.mem.startsWith(u8, rest, "\\|"))
             2
-        else if (!draft and std.mem.startsWith(u8, rest, "&#124;"))
+        else if (!draft and g.start >= code_end and std.mem.startsWith(u8, rest, "&#124;"))
             "&#124;".len
         else
             0;

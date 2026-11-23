@@ -88,7 +88,7 @@ fn decode(a: std.mem.Allocator, src: []const u8, source_cursor: usize) !Decoded 
         } else if (std.mem.startsWith(u8, rest, "\\|")) {
             try out.append(a, '|');
             i += 2;
-        } else if (std.mem.startsWith(u8, rest, "&#124;")) {
+        } else if (i >= code_end and std.mem.startsWith(u8, rest, "&#124;")) {
             try out.append(a, '|');
             i += "&#124;".len;
         } else {
