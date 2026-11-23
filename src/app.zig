@@ -377,6 +377,8 @@ pub const App = struct {
     next_win_id: u64 = 1,
     markdown_frame: ?*const markdown.Layout = null,
     markdown_frame_buf: usize = std.math.maxInt(usize),
+    markdown_frame_rev: u64 = 0,
+    cell_edit: ?@import("app/table_cell.zig").Edit = null,
     markdown_images: std.StringHashMap(union(enum) { loaded: vaxis.Image, failed: void }),
     markdown_placed_images: std.ArrayList(u32) = .empty,
     markdown_visible_images: std.ArrayList(u32) = .empty,
@@ -1704,6 +1706,7 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        if (self.cell_edit) |*cell| cell.deinit(self.alloc);
         if (self.pending_filetree_create) |path| self.alloc.free(path);
         self.loop.stop();
         // An in-flight LSP attach must be cancelled and joined before the

@@ -24,6 +24,8 @@ const editor = @import("../editor/root.zig");
 const hints = @import("hints.zig");
 const mouse = @import("mouse.zig");
 const nav_tabs = @import("navigator.zig");
+const markdown = @import("markdown.zig");
+const render = @import("render.zig");
 
 /// Lines moved by one wheel notch over an editor pane. The renderer always
 /// keeps the cursor visible, so the viewport follows: wheel = a 3-line
@@ -123,6 +125,7 @@ pub fn addMouseScrollTarget(self: *App, row: u32, col: u32, width: u32, height: 
 /// border; ordinary motion/release never repaint or steal terminal selection.
 pub fn handleMouse(self: *App, m: vaxis.Mouse) !bool {
     if (!self.mouse.enabled) return false;
+    if (self.cell_edit != null) return false;
     const win = self.vx.window();
     if (self.ai.rail_resizing) {
         if (!self.ai.rail_open or mouseBlocked(self) or m.mods.shift or win.width == 0) {
@@ -454,17 +457,49 @@ fn panePositionAt(self: *App, win_idx: usize, rect: mouse.Rect, col: u32, row: u
     const gutter = self.gutterWidthFor(buf.pt.lineCountUpperBound(), rect.width);
     const content_width: u32 = @max(rect.width -| gutter, 1);
     const dr = row - rect.row;
+    const clicked_cell = col -| rect.col;
+
+    var arena = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const md: ?*const markdown.Layout = blk: {
+        if (self.state.mode != .normal or self.mc_active or self.em_active) break :blk null;
+        if (win_idx == self.current_win and self.markdown_frame_buf == w.buf) break :blk self.markdown_frame;
+        const hl = if (buf.hl) |*h| h else break :blk null;
+        if (hl.queries.decorations == null or hl.tree == null) break :blk null;
+        const decors = try self.visibleDecorsFor(buf, a, w.view_top, rect.height);
+        break :blk try @import("highlight.zig").markdownForRange(buf, a, win, decors, w.view_top, rect.height, content_width, null);
+    };
+    const cursor_line = buf.pt.lineOf(@min(w.cursor, buf.pt.len()));
 
     var line = @min(w.view_top, line_count - 1);
     var rem = dr + w.view_wrap;
+    // Only wrapped tables count their leading rule as skippable.
+    if (md) |layout| {
+        if (layout.get(line)) |info| {
+            if (info.wrapped_table == null and info.top_rule != null and dr == 0)
+                rem = dr;
+        }
+    }
     var target_line: u32 = line;
     var chunk: u32 = 0;
     var found = false;
     while (true) {
-        const rows = self.lineDisplayRows(win, buf, w.buf, line, content_width);
+        const rows = render.displayRowsWithMarkdown(self, win, buf, w.buf, line, content_width, md, cursor_line);
         if (rem < rows) {
             target_line = line;
-            chunk = rem;
+            const before = render.markdownTopRuleRows(md, line);
+            const start = buf.pt.lineStart(line);
+            if (rem < before or clicked_cell < gutter) return start;
+            chunk = rem - before;
+            if (md) |layout| {
+                if (layout.get(line)) |info| {
+                    if (info.wrapped_table) |table| {
+                        if (chunk >= table.rows.len) return table.end -| 1;
+                        return table.byteAt(chunk, clicked_cell - gutter);
+                    }
+                }
+            }
             found = true;
             break;
         }
@@ -476,10 +511,6 @@ fn panePositionAt(self: *App, win_idx: usize, rect: mouse.Rect, col: u32, row: u
 
     const line_start = buf.pt.lineStart(target_line);
     const line_len = buf.pt.lineTextLen(target_line);
-    const clicked_cell = col -| rect.col;
-    // Anywhere left of the text area is the gutter/line-number zone: place
-    // the cursor at the line start (vim's "click margin" behavior).
-    if (clicked_cell < gutter) return line_start;
     const text_col = clicked_cell - gutter;
 
     // Bounded line copy for the cell/byte walk. A >256 KiB line maps within
@@ -491,9 +522,6 @@ fn panePositionAt(self: *App, win_idx: usize, rect: mouse.Rect, col: u32, row: u
     defer self.alloc.free(text);
     buf.pt.copyRange(line_start, text);
 
-    var arena = std.heap.ArenaAllocator.init(self.alloc);
-    defer arena.deinit();
-    const a = arena.allocator();
     var hint_at = std.ArrayList(u32).empty;
     var hint_width = std.ArrayList(u32).empty;
     // Match the renderer's hint filter: only this window's buffer hints are
