@@ -200,13 +200,43 @@ pub fn visibleMarkdownFor(
     buf.markdown_arena = std.heap.ArenaAllocator.init(self.alloc);
     buf.markdown_layout = null;
     const a = buf.markdown_arena.?.allocator();
-    const layout = try markdown.build(a, &buf.pt, decors, win, content_width, buf.path);
+    const layout = try markdownForRange(buf, a, win, decors, view_top, content_rows, content_width);
     buf.markdown_layout = layout;
     buf.markdown_cache_rev = rev;
     buf.markdown_cache_top = view_top;
     buf.markdown_cache_rows = content_rows;
     buf.markdown_cache_width = content_width;
     return layout;
+}
+
+pub fn markdownForRange(
+    buf: *Buffer,
+    a: std.mem.Allocator,
+    win: @import("vaxis").Window,
+    decors: []const syntax.Decor,
+    view_top: u32,
+    content_rows: u32,
+    content_width: u32,
+) !*markdown.Layout {
+    const start = buf.pt.lineStart(view_top);
+    const bottom = view_top + content_rows;
+    const end = if (bottom >= buf.pt.lineCount()) buf.pt.len() else buf.pt.lineStart(bottom);
+    const visible: markdown.LineRange = .{ .start = view_top, .end = bottom };
+    var table_start = start;
+    var table_end = end;
+    for (decors) |d| {
+        if (d.kind != .table or d.end <= start or d.start >= end) continue;
+        table_start = @min(table_start, d.start);
+        table_end = @max(table_end, d.end);
+    }
+    if (table_start == start and table_end == end)
+        return markdown.build(a, &buf.pt, decors, win, content_width, buf.path, visible);
+
+    // A table entering or leaving the viewport must keep the same widths.
+    // Query its full set of cells and inline decorations before layout.
+    var full = std.ArrayList(syntax.Decor).empty;
+    try buf.hl.?.decorInRange(table_start, table_end, a, &full);
+    return markdown.build(a, &buf.pt, full.items, win, content_width, buf.path, visible);
 }
 
 /// Load recent files from ~/.cache/oz/recent (one path per line).

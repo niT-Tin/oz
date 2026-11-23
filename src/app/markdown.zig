@@ -2,6 +2,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const buffer = @import("../buffer/root.zig");
 const syntax = @import("../syntax.zig");
+const wrap = @import("wrap.zig");
 
 pub const Gap = struct {
     start: u32,
@@ -21,6 +22,7 @@ pub const Line = struct {
     after: []const []const u8 = &.{},
     prefix: []const u8 = "",
     display_width: u32 = 0,
+    wrapped_table: ?WrappedTableLine = null,
     fence: bool = false,
     table: bool = false,
     image: ?Image = null,
@@ -40,6 +42,68 @@ const Cell = struct {
     width: u32,
 };
 
+pub const TableGlyph = struct {
+    text: []const u8,
+    start: u32,
+    end: u32,
+    width: u32,
+};
+
+pub const TablePart = struct {
+    col: u32,
+    glyphs: []const TableGlyph,
+};
+
+pub const WrappedTableLine = struct {
+    chrome: []const u8,
+    rows: []const std.ArrayList(TablePart),
+    width: u32,
+    start: u32,
+    end: u32,
+
+    pub fn cursorAt(self: WrappedTableLine, pos: u32) wrap.Pos {
+        if (pos <= self.start) return .{ .row = 0, .col = 0 };
+        var nearest = self.end;
+        var result: wrap.Pos = .{ .row = 0, .col = self.width - 1 };
+        var last: u32 = self.start;
+        var last_row: u32 = 0;
+        for (self.rows, 0..) |row, ri| {
+            for (row.items) |part| {
+                var col = part.col;
+                for (part.glyphs) |g| {
+                    if (pos >= g.start and pos < g.end) return .{ .row = @intCast(ri), .col = col };
+                    if (pos < g.start and g.start < nearest) {
+                        nearest = g.start;
+                        result = .{ .row = @intCast(ri), .col = col };
+                    }
+                    if (g.end > last) {
+                        last = g.end;
+                        last_row = @intCast(ri);
+                    }
+                    col += g.width;
+                }
+            }
+        }
+        if (self.rows.len == 1 and self.rows[0].items.len == 0)
+            return .{ .row = 0, .col = @min(pos - self.start, self.width - 1) };
+        if (nearest == self.end) result.row = last_row;
+        return result;
+    }
+
+    pub fn byteAt(self: WrappedTableLine, row: u32, col: u32) u32 {
+        var pos = self.start;
+        for (self.rows[row].items) |part| {
+            var x = part.col;
+            for (part.glyphs) |g| {
+                if (col < x + g.width) return g.start;
+                pos = g.start;
+                x += g.width;
+            }
+        }
+        return pos;
+    }
+};
+
 const Row = struct {
     line: u32,
     start: u32,
@@ -49,6 +113,15 @@ const Row = struct {
 
 const Alignment = enum { left, right, center };
 
+pub const LineRange = struct {
+    start: u32,
+    end: u32,
+
+    fn contains(self: LineRange, line: u32) bool {
+        return line >= self.start and line < self.end;
+    }
+};
+
 pub fn build(
     a: std.mem.Allocator,
     pt: *const buffer.PieceTable,
@@ -56,18 +129,19 @@ pub fn build(
     win: vaxis.Window,
     content_width: u32,
     document_path: ?[]const u8,
+    visible: LineRange,
 ) !*Layout {
     const layout = try a.create(Layout);
     layout.* = .{ .entries = std.AutoHashMap(u32, Line).init(a) };
     for (decors) |d| {
         if (d.kind == .table) {
             const first = pt.lineOf(d.start);
-            if (!layout.entries.contains(first)) try buildTable(a, pt, decors, win, layout, d);
+            if (!layout.entries.contains(first)) try buildTable(a, pt, decors, win, layout, d, content_width, visible);
         }
     }
     for (decors) |d| {
         if (d.kind == .fence) try buildFence(a, pt, decors, win, layout, d, content_width);
-        if (d.kind == .image) try buildImage(a, pt, decors, layout, d, document_path);
+        if (d.kind == .image and visible.contains(pt.lineOf(d.start))) try buildImage(a, pt, decors, layout, d, document_path);
     }
     return layout;
 }
@@ -79,13 +153,19 @@ fn buildTable(
     win: vaxis.Window,
     layout: *Layout,
     table: syntax.Decor,
+    content_width: u32,
+    visible: LineRange,
 ) !void {
     const first = pt.lineOf(table.start);
     const last = pt.lineOf(table.end -| 1);
     var widths = std.ArrayList(u32).empty;
+    var minimums = std.ArrayList(u32).empty;
     var aligns = std.ArrayList(Alignment).empty;
     var rows = std.ArrayList(Row).empty;
-    for (decors) |d| {
+    var delimiter: ?u32 = null;
+    const first_decor = decorLowerBound(decors, table.start);
+    const table_decors = decors[first_decor..decorLowerBound(decors, table.end)];
+    for (table_decors) |d| {
         if (d.kind != .table_align or d.start < table.start or d.end > table.end) continue;
         const text = try copyRange(a, pt, d.start, d.end);
         const trimmed = std.mem.trim(u8, text, " \t");
@@ -98,39 +178,74 @@ fn buildTable(
     }
 
     var line = first;
+    var decor_i: usize = 0;
     while (line <= last) : (line += 1) {
-        var is_delimiter = false;
-        for (decors) |d| {
-            if (d.kind == .table_delimiter and d.start < table.end and d.end > table.start and pt.lineOf(d.start) == line) {
-                is_delimiter = true;
-                break;
-            }
-        }
-        if (is_delimiter) continue;
         const start = pt.lineStart(line);
-        const end = start + pt.lineLen(line);
+        const end = start + pt.lineTextLen(line);
+        const begin = decor_i;
+        while (decor_i < table_decors.len and table_decors[decor_i].start < end) : (decor_i += 1) {}
+        const line_decors = table_decors[begin..decor_i];
         var cells = std.ArrayList(Cell).empty;
-        for (decors) |d| {
-            if (d.kind != .table_cell or d.start < start or d.start >= end or d.end > table.end) continue;
+        for (line_decors) |d| {
+            if (d.kind == .table_delimiter) delimiter = line;
+            if (d.kind != .table_cell or d.start < start or d.end > end) continue;
             const cell_text = try copyRange(a, pt, d.start, d.end);
             const lead = std.mem.indexOfNone(u8, cell_text, " \t") orelse cell_text.len;
             const cs = d.start + @as(u32, @intCast(lead));
             const ce = if (lead == cell_text.len) cs else d.start + @as(u32, @intCast((std.mem.lastIndexOfNone(u8, cell_text, " \t").? + 1)));
-            const width = if (ce > cs) try visibleWidth(a, pt, decors, win, cs, ce) else 0;
+            const metrics = try tableGlyphs(a, win, cell_text[lead .. ce - d.start], cs, line_decors, null);
             const col = cells.items.len;
-            try cells.append(a, .{ .start = cs, .end = ce, .width = width });
-            if (col >= widths.items.len) try widths.append(a, width) else widths.items[col] = @max(widths.items[col], width);
+            try cells.append(a, .{ .start = cs, .end = ce, .width = metrics.width });
+            if (col >= widths.items.len) {
+                try widths.append(a, metrics.width);
+                try minimums.append(a, metrics.min_width);
+            } else {
+                widths.items[col] = @max(widths.items[col], metrics.width);
+                minimums.items[col] = @max(minimums.items[col], metrics.min_width);
+            }
         }
-        if (cells.items.len > 0) try rows.append(a, .{ .line = line, .start = start, .end = end, .cells = cells.items });
+        if (cells.items.len > 0 and visible.contains(line)) {
+            try rows.append(a, .{ .line = line, .start = start, .end = end, .cells = cells.items });
+        } else {
+            cells.deinit(a);
+        }
     }
-    if (rows.items.len == 0 or widths.items.len == 0) return;
+    if (widths.items.len == 0) return;
     while (aligns.items.len < widths.items.len) try aligns.append(a, .left);
 
-    const top = try tableBorder(a, widths.items, "┌", "┬", "┐");
-    const middle = try tableBorder(a, widths.items, "├", "┼", "┤");
-    const bottom = try tableBorder(a, widths.items, "└", "┴", "┘");
+    const edge = @as(u32, win.gwidth("│"));
+    const edges = edge * @as(u32, @intCast(widths.items.len + 1));
+    const natural_width = sumWidths(widths.items) + edges + @as(u32, @intCast(widths.items.len * 2));
+    const wrapped = natural_width > content_width;
+    var padding: u32 = 1;
+    if (wrapped) {
+        const min_width = sumWidths(minimums.items) + edges;
+        // When even unpadded cells and dividers cannot fit, show editable
+        // source instead of emitting a clipped or overlapping table.
+        if (min_width > content_width) return;
+        if (min_width + @as(u32, @intCast(widths.items.len * 2)) > content_width) padding = 0;
+        const overhead = edges + padding * 2 * @as(u32, @intCast(widths.items.len));
+        fitWidths(widths.items, minimums.items, content_width - overhead);
+    }
+    const top = try tableBorder(a, widths.items, padding, "┌", "┬", "┐");
+    const middle = try tableBorder(a, widths.items, padding, "├", "┼", "┤");
+    const bottom = try tableBorder(a, widths.items, padding, "└", "┴", "┘");
     const table_width = autilWidth(win, top);
-    for (rows.items, 0..) |row, ri| {
+    const chrome = if (wrapped) try tableChrome(a, widths.items, padding) else "";
+    for (rows.items) |row| {
+        const before: []const []const u8 = if (row.line == first) try a.dupe([]const u8, &.{top}) else &.{};
+        const after: []const []const u8 = if (row.line == last) try a.dupe([]const u8, &.{bottom}) else &.{};
+        if (wrapped) {
+            const parts = try wrapTableRow(a, pt, win, table_decors, row.cells, widths.items, aligns.items, padding);
+            try layout.entries.put(row.line, .{
+                .before = before,
+                .after = after,
+                .display_width = table_width,
+                .table = true,
+                .wrapped_table = .{ .chrome = chrome, .rows = parts, .width = table_width, .start = row.start, .end = row.end },
+            });
+            continue;
+        }
         var gaps = std.ArrayList(Gap).empty;
         const first_cell = row.cells[0];
         try gaps.append(a, .{
@@ -160,21 +275,20 @@ fn buildTable(
                 try gaps.append(a, .{ .start = cell.end, .end = row.end, .text = suffix.items });
             }
         }
-        const before: []const []const u8 = if (ri == 0) try a.dupe([]const u8, &.{top}) else &.{};
-        const after: []const []const u8 = if (row.line == last) try a.dupe([]const u8, &.{bottom}) else &.{};
         try layout.entries.put(row.line, .{ .gaps = gaps.items, .before = before, .after = after, .display_width = table_width, .table = true });
     }
-    line = first;
-    while (line <= last) : (line += 1) {
-        for (decors) |d| {
-            if (d.kind == .table_delimiter and pt.lineOf(d.start) == line and d.start >= table.start and d.end <= table.end) {
-                const start = pt.lineStart(line);
-                const end = start + pt.lineLen(line);
-                const after: []const []const u8 = if (line == last) try a.dupe([]const u8, &.{bottom}) else &.{};
-                try layout.entries.put(line, .{ .gaps = try a.dupe(Gap, &.{.{ .start = start, .end = end, .text = middle }}), .after = after, .display_width = table_width, .table = true });
-                break;
-            }
-        }
+    if (delimiter) |dl| {
+        if (!visible.contains(dl)) return;
+        const start = pt.lineStart(dl);
+        const end = start + pt.lineTextLen(dl);
+        const after: []const []const u8 = if (dl == last) try a.dupe([]const u8, &.{bottom}) else &.{};
+        try layout.entries.put(dl, .{
+            .gaps = if (wrapped) &.{} else try a.dupe(Gap, &.{.{ .start = start, .end = end, .text = middle }}),
+            .after = after,
+            .display_width = table_width,
+            .table = true,
+            .wrapped_table = if (wrapped) .{ .chrome = middle, .rows = &.{.empty}, .width = table_width, .start = start, .end = end } else null,
+        });
     }
 }
 
@@ -298,15 +412,118 @@ fn joinGaps(a: std.mem.Allocator, old: []const Gap, gap: Gap) ![]const Gap {
     return out;
 }
 
-fn tableBorder(a: std.mem.Allocator, widths: []const u32, left: []const u8, join: []const u8, right: []const u8) ![]const u8 {
+fn tableBorder(a: std.mem.Allocator, widths: []const u32, padding: u32, left: []const u8, join: []const u8, right: []const u8) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     try out.appendSlice(a, left);
     for (widths, 0..) |width, i| {
         var n: u32 = 0;
-        while (n < width + 2) : (n += 1) try out.appendSlice(a, "─");
+        while (n < width + 2 * padding) : (n += 1) try out.appendSlice(a, "─");
         try out.appendSlice(a, if (i + 1 == widths.len) right else join);
     }
     return out.items;
+}
+
+fn tableChrome(a: std.mem.Allocator, widths: []const u32, padding: u32) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    try out.appendSlice(a, "│");
+    for (widths) |width| {
+        try appendSpaces(a, &out, width + 2 * padding);
+        try out.appendSlice(a, "│");
+    }
+    return out.items;
+}
+
+fn sumWidths(widths: []const u32) u32 {
+    var total: u32 = 0;
+    for (widths) |width| total += width;
+    return total;
+}
+
+/// Keep narrow columns at their natural width. Cap the wider columns at a
+/// common width, reserving enough room for an entire grapheme in every cell.
+fn fitWidths(widths: []u32, minimums: []const u32, budget: u32) void {
+    var lo: u32 = 0;
+    var hi = budget + 1;
+    while (lo + 1 < hi) {
+        const cap = lo + (hi - lo) / 2;
+        var used: u32 = 0;
+        for (widths, minimums) |width, min| used += std.math.clamp(cap, min, width);
+        if (used <= budget) lo = cap else hi = cap;
+    }
+    var remaining = budget;
+    for (widths, minimums) |width, min| remaining -= std.math.clamp(lo, min, width);
+    for (widths, minimums) |*width, min| {
+        const fitted = std.math.clamp(lo, min, width.*);
+        const extra = remaining > 0 and fitted == lo and fitted < width.*;
+        if (extra) remaining -= 1;
+        width.* = fitted + @intFromBool(extra);
+    }
+}
+
+fn wrapTableRow(
+    a: std.mem.Allocator,
+    pt: *const buffer.PieceTable,
+    win: vaxis.Window,
+    decors: []const syntax.Decor,
+    cells: []const Cell,
+    widths: []const u32,
+    aligns: []const Alignment,
+    padding: u32,
+) ![]const std.ArrayList(TablePart) {
+    var rows = std.ArrayList(std.ArrayList(TablePart)).empty;
+    try rows.append(a, .empty);
+    const edge: u32 = win.gwidth("│");
+    var col = edge + padding;
+    for (cells, widths[0..cells.len], aligns[0..cells.len]) |cell, width, alignment| {
+        const raw = try copyRange(a, pt, cell.start, cell.end);
+        var glyphs = std.ArrayList(TableGlyph).empty;
+        _ = try tableGlyphs(a, win, raw, cell.start, decors, &glyphs);
+        var i: usize = 0;
+        var ri: usize = 0;
+        while (i < glyphs.items.len) : (ri += 1) {
+            const part = takeCellLine(glyphs.items, &i, width);
+            if (ri == rows.items.len) try rows.append(a, .empty);
+            const left = switch (alignment) {
+                .left => 0,
+                .center => (width - part.width) / 2,
+                .right => width - part.width,
+            };
+            try rows.items[ri].append(a, .{ .col = col + left, .glyphs = part.glyphs });
+        }
+        col += width + padding * 2 + edge;
+    }
+    return rows.items;
+}
+
+fn takeCellLine(glyphs: []const TableGlyph, offset: *usize, width: u32) struct { glyphs: []const TableGlyph, width: u32 } {
+    const start = offset.*;
+    var i = start;
+    var used: u32 = 0;
+    var word_end: ?usize = null;
+    var word_width: u32 = 0;
+    while (i < glyphs.len and used + glyphs[i].width <= width) : (i += 1) {
+        if (i > start and isCellSpace(glyphs[i]) and !isCellSpace(glyphs[i - 1])) {
+            word_end = i;
+            word_width = used;
+        }
+        used += glyphs[i].width;
+    }
+    // Prefer the latest word boundary. Split unbroken tokens and CJK text
+    // at grapheme boundaries when no whitespace is available.
+    if (i < glyphs.len and !isCellSpace(glyphs[i])) {
+        if (word_end) |end| {
+            i = end;
+            used = word_width;
+        }
+    }
+    std.debug.assert(i > start);
+    offset.* = i;
+    while (offset.* < glyphs.len and isCellSpace(glyphs[offset.*])) offset.* += 1;
+    return .{ .glyphs = glyphs[start..i], .width = used };
+}
+
+fn isCellSpace(glyph: TableGlyph) bool {
+    return std.mem.eql(u8, glyph.text, " ");
 }
 
 fn fenceBorder(a: std.mem.Allocator, win: vaxis.Window, left: []const u8, right: []const u8, label: []const u8, width: u32) ![]const u8 {
@@ -340,25 +557,47 @@ fn appendSpaces(a: std.mem.Allocator, out: *std.ArrayList(u8), count: u32) !void
     while (i < count) : (i += 1) try out.append(a, ' ');
 }
 
-fn visibleWidth(a: std.mem.Allocator, pt: *const buffer.PieceTable, decors: []const syntax.Decor, win: vaxis.Window, start: u32, end: u32) !u32 {
-    const raw = try copyRange(a, pt, start, end);
-    var visible = std.ArrayList(u8).empty;
-    var pos: u32 = 0;
-    while (pos < raw.len) {
-        var concealed: ?u32 = null;
-        for (decors) |d| {
-            if (d.kind != .conceal or d.start > start + pos or d.end <= start + pos or d.start < start or d.end > end) continue;
-            concealed = d.end - start;
-            break;
+fn decorLowerBound(decors: []const syntax.Decor, pos: u32) usize {
+    return std.sort.lowerBound(syntax.Decor, decors, pos, struct {
+        fn order(p: u32, d: syntax.Decor) std.math.Order {
+            return std.math.order(p, d.start);
         }
-        if (concealed) |next| {
-            pos = next;
-            continue;
+    }.order);
+}
+
+fn tableGlyphs(
+    a: std.mem.Allocator,
+    win: vaxis.Window,
+    raw: []const u8,
+    start: u32,
+    decors: []const syntax.Decor,
+    out: ?*std.ArrayList(TableGlyph),
+) !struct { width: u32, min_width: u32 } {
+    const end = start + @as(u32, @intCast(raw.len));
+    var di = decorLowerBound(decors, start);
+    var hidden_until = start;
+    var width: u32 = 0;
+    var min_width: u32 = 0;
+    var iter = vaxis.unicode.graphemeIterator(raw);
+    while (iter.next()) |g| {
+        const source_start = start + @as(u32, @intCast(g.start));
+        const source_end = source_start + @as(u32, @intCast(g.len));
+        while (di < decors.len and decors[di].start < source_end) : (di += 1) {
+            const d = decors[di];
+            if (d.kind == .conceal and d.end <= end) hidden_until = @max(hidden_until, d.end);
         }
-        try visible.append(a, raw[pos]);
-        pos += 1;
+        if (source_start < hidden_until) continue;
+        const text = g.bytes(raw);
+        const tab = std.mem.eql(u8, text, "\t");
+        const columns: u32 = if (tab) 1 else win.gwidth(text);
+        if (columns == 0) continue;
+        width += if (tab) @import("../app.zig").tab_width else columns;
+        min_width = @max(min_width, columns);
+        if (out) |glyphs| {
+            try glyphs.append(a, .{ .text = if (tab) " " else text, .start = source_start, .end = source_end, .width = columns });
+        }
     }
-    return autilWidth(win, visible.items);
+    return .{ .width = width, .min_width = min_width };
 }
 
 fn autilWidth(win: vaxis.Window, text: []const u8) u32 {
@@ -386,6 +625,10 @@ const TestLayout = struct {
     layout: *Layout,
 
     fn init(src: []const u8, document_path: ?[]const u8) !TestLayout {
+        return initWidth(src, document_path, 60);
+    }
+
+    fn initWidth(src: []const u8, document_path: ?[]const u8, content_width: u32) !TestLayout {
         const alloc = std.testing.allocator;
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
@@ -407,7 +650,7 @@ const TestLayout = struct {
         };
         var decors = std.ArrayList(syntax.Decor).empty;
         try hl.decorInRange(0, @intCast(src.len), arena.allocator(), &decors);
-        const layout = try build(arena.allocator(), &pt, decors.items, win, 60, document_path);
+        const layout = try build(arena.allocator(), &pt, decors.items, win, content_width, document_path, .{ .start = 0, .end = pt.lineCount() });
         return .{ .arena = arena, .pt = pt, .hl = hl, .screen = screen, .layout = layout };
     }
 
@@ -482,4 +725,17 @@ test "markdown layout: header-only table keeps its bottom border" {
     const delimiter = fixture.layout.get(1).?;
     try std.testing.expectEqual(@as(usize, 1), delimiter.after.len);
     try std.testing.expect(std.mem.startsWith(u8, delimiter.after[0], "└"));
+}
+
+test "markdown layout: wide tables fit borders inside the pane" {
+    const src =
+        \\| ID | Details | 值 |
+        \\| --- | --- | ---: |
+        \\| oz | a long explanation with 中文 and an emoji 👩‍💻 | 42 |
+        \\
+    ;
+    var fixture = try TestLayout.initWidth(src, null, 26);
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(u32, 26), fixture.layout.get(0).?.display_width);
+    try std.testing.expectEqual(@as(u32, 26), fixture.layout.get(2).?.display_width);
 }

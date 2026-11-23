@@ -5276,6 +5276,111 @@ test "markdown: inline rendering with conceal, injection and decorations" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+test "markdown: wide tables wrap inside aligned borders and reflow on resize" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const source =
+        \\# Checklist
+        \\
+        \\| ID | Details | Status |
+        \\| --- | :--- | ---: |
+        \\| oz | **Canary** verify 中文日志 and keep reading until TARGET appears. | READY |
+        \\| qa | Check alerts. | OK |
+        \\
+        \\End of checklist.
+        \\
+    ;
+    var name_buf: [192:0]u8 = undefined;
+    const path = try erFixture(io, &name_buf, ".md", source);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{}, 24, 44, "/tmp");
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 24, 44);
+    defer grid.deinit(alloc);
+    try gridWaitFor(&sess, &grid, "End of checklist.", 5000);
+    const top = aiFindCell(&grid, "┌") orelse return error.TestUnexpectedResult;
+    const bottom = aiFindCell(&grid, "└") orelse return error.TestUnexpectedResult;
+    const header_break = aiFindCell(&grid, "├") orelse return error.TestUnexpectedResult;
+    const first_body = aiFindCell(&grid, "Canary") orelse return error.TestUnexpectedResult;
+    const target = aiFindCell(&grid, "TARGET") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(target.row > first_body.row);
+    try std.testing.expect(grid.contains("中文日志"));
+    try std.testing.expect(!grid.contains("**Canary**"));
+    try std.testing.expectEqualStrings("┐", frame.cellText(&grid, top.row, 43));
+    try std.testing.expectEqualStrings("┘", frame.cellText(&grid, bottom.row, 43));
+    var joins: usize = 0;
+    for (top.col..44) |col| {
+        const cap = frame.cellText(&grid, top.row, col);
+        if (std.mem.eql(u8, cap, "┬")) joins += 1;
+        const body_rule: []const u8 = if (std.mem.eql(u8, cap, "┌") or std.mem.eql(u8, cap, "┬") or std.mem.eql(u8, cap, "┐")) "│" else continue;
+        for (top.row + 1..bottom.row) |row| {
+            if (row == header_break.row) continue;
+            try std.testing.expectEqualStrings(body_rule, frame.cellText(&grid, row, col));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), joins);
+
+    // Clicking a continuation row must target the source byte it displays.
+    try mouseClickAt(&sess, target.col, target.row);
+    try sess.send("rZ");
+    try gridWaitFor(&sess, &grid, "ZARGET", 5000);
+    try std.testing.expectEqualStrings("│", frame.cellText(&grid, target.row, 43));
+    try sess.send("gg");
+    try gridWaitFor(&sess, &grid, "# Checklist", 5000);
+
+    const size = Winsize{ .ws_row = 24, .ws_col = 110, .ws_xpixel = 1100, .ws_ypixel = 480 };
+    _ = linux.ioctl(sess.pty.master, TIOCSWINSZ, @intFromPtr(&size));
+    var wide = try Grid.initSizedCols(alloc, 24, 110);
+    defer wide.deinit(alloc);
+    try gridWaitFor(&sess, &wide, "End of checklist.", 5000);
+    const wide_first = aiFindCell(&wide, "Canary") orelse return error.TestUnexpectedResult;
+    const wide_target = aiFindCell(&wide, "ZARGET") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(wide_first.row, wide_target.row);
+    try std.testing.expect(wide.contains("┘"));
+
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1024));
+    defer alloc.free(saved);
+    const expected = try std.mem.replaceOwned(u8, alloc, source, "TARGET", "ZARGET");
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, saved);
+}
+
+test "markdown: table widths include rows beyond the viewport" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var source = std.ArrayList(u8).empty;
+    defer source.deinit(alloc);
+    try source.appendSlice(alloc, "# Checklist\n\n| ID | Notes |\n| --- | --- |\n");
+    for (0..64) |_| try source.appendSlice(alloc, "| a | short |\n");
+    try source.appendSlice(alloc, "| z | tail-marker and a wide note that needs several lines in this terminal pane. |\n\nEnd of table.\n");
+
+    var name_buf: [192:0]u8 = undefined;
+    const path = try erFixture(io, &name_buf, ".md", source.items);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{}, 18, 40, "/tmp");
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(alloc, 18, 40);
+    defer grid.deinit(alloc);
+
+    try gridWaitFor(&sess, &grid, "┐", 5000);
+    const start = aiFindCell(&grid, "┌") orelse return error.TestUnexpectedResult;
+    const divider = aiFindCell(&grid, "┬") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("┐", frame.cellText(&grid, start.row, 39));
+    try std.testing.expect(!grid.contains("tail-marker"));
+    try sess.send("G");
+    try gridWaitFor(&sess, &grid, "End of table.", 5000);
+    const tail = aiFindCell(&grid, "tail-marker") orelse return error.TestUnexpectedResult;
+    const bottom = aiFindCell(&grid, "└") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("│", frame.cellText(&grid, tail.row, divider.col));
+    try std.testing.expectEqualStrings("│", frame.cellText(&grid, tail.row, 39));
+    try std.testing.expectEqualStrings("┴", frame.cellText(&grid, bottom.row, divider.col));
+    try std.testing.expectEqualStrings("┘", frame.cellText(&grid, bottom.row, 39));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q\r"));
+}
+
 test "markdown: local PNG uses Kitty graphics placement" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
