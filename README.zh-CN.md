@@ -18,4 +18,6 @@
 
 文件树右侧的两列 Git 状态分别对应暂存区和工作区。`M.` 表示修改已暂存，`.M` 表示磁盘文件有未暂存的修改，`MM` 表示两者都有。`A`、`D`、`R` 分别表示新增、删除、重命名，`UU` 表示双方修改导致的冲突，`??` 表示未跟踪文件。目录旁的 `*` 表示其中有变更。
 
+用 `Space g v` 或 `:GitReview` 打开 Git 审查。按 `Tab` 切换工作区变更和提交历史，`Enter` 查看差异，`o` 跳到源码对应行。
+
 [接入 coding agent](https://nit-tin.github.io/oz/?lang=zh#agents) · [从源码构建](https://nit-tin.github.io/oz/?lang=zh#download) · [更新日志](CHANGELOG.md) · [MIT 许可证](LICENSE)
