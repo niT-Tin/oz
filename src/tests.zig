@@ -71,6 +71,8 @@ pub const app_inlay_history = @import("app/inlay_history.zig");
 pub const app_view_state = @import("app/view_state.zig");
 // M2b1 navigator tabs + note store (pure; app/notes.zig is e2e-tested)
 pub const app_navigator = @import("app/navigator.zig");
+pub const app_repo_status = @import("app/repo_status.zig");
+pub const app_navigator_git = @import("app/navigator_git.zig");
 pub const app_filetree_create = @import("app/filetree_create.zig");
 pub const app_gutter = @import("app/gutter.zig");
 pub const app_note_store = @import("app/note_store.zig");
@@ -125,6 +127,9 @@ pub const text_object_edit = @import("editor/text_object_edit.zig");
 
 pub const replace_plan = @import("editor/replace_plan.zig");
 
+pub const git_review_render = @import("app/git_review_render.zig");
+pub const git_review_patch = @import("app/git_review_patch.zig");
+pub const git_review_data = @import("app/git_review_data.zig");
 pub const git_job = @import("app/git_job.zig");
 pub const text_snapshot = @import("buffer/text_snapshot.zig");
 pub const ai_prompt = @import("ai/prompt.zig");

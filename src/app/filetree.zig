@@ -5,6 +5,7 @@ const vaxis = @import("vaxis");
 
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
+const watch = @import("filetree_watch.zig");
 const nav_tabs = @import("navigator.zig");
 
 /// One node of the lazy directory tree (snacks-explorer style). `name`
@@ -16,6 +17,7 @@ pub const TreeNode = struct {
     path: []u8,
     is_dir: bool,
     expanded: bool,
+    stamp: ?watch.Stamp = null,
     children: std.ArrayList(*TreeNode),
     parent: ?*TreeNode,
 };
@@ -207,6 +209,7 @@ fn appendTreeChild(self: *App, node: *TreeNode, name: []const u8, is_dir: bool) 
 /// opens / a dir expands correctly regardless of which directory the tree is
 /// rooted at.
 pub fn walkTreeLevel(self: *App, dir: std.Io.Dir, node: *TreeNode) !void {
+    node.stamp = if (dir.stat(self.io)) |stat| .of(stat) else |_| null;
     var it = dir.iterate();
     while (try it.next(self.io)) |entry| {
         if (treeEntryFiltered(entry.name)) continue;
@@ -264,6 +267,7 @@ pub fn collapseDir(self: *App, node: *TreeNode) !void {
 
 /// DFS over the expanded subtree starting at the root's children.
 pub fn rebuildFiletreeRows(self: *App) !void {
+    self.navigator_git.tree_dirty = true;
     self.filetree_rows.clearRetainingCapacity();
     const root = self.filetree_root orelse return;
     try self.appendTreeRows(root, 0, &self.filetree_rows);
@@ -500,6 +504,73 @@ fn nodeWithPath(node: *TreeNode, path: []const u8) ?*TreeNode {
     return null;
 }
 
+/// Reuse surviving nodes, including expanded directories and explicitly
+/// revealed hidden entries. Commit each replacement only once allocations succeed.
+fn reconcileDirectory(self: *App, node: *TreeNode, listing: watch.Listing) !bool {
+    var old: std.StringHashMapUnmanaged(*TreeNode) = .empty;
+    defer old.deinit(self.alloc);
+    for (node.children.items) |child| try old.put(self.alloc, child.name, child);
+    var replacement = node.*;
+    replacement.children = .empty;
+    errdefer {
+        for (replacement.children.items) |child| if (child.parent == &replacement) self.freeFiletreeNode(child);
+        replacement.children.deinit(self.alloc);
+    }
+    var changed = false;
+    for (listing.entries) |entry| {
+        if (old.get(entry.name)) |existing| {
+            if (existing.is_dir == entry.is_dir) {
+                try replacement.children.append(self.alloc, existing);
+                _ = old.remove(entry.name);
+                continue;
+            }
+        } else if (treeEntryFiltered(entry.name)) continue;
+        try appendTreeChild(self, &replacement, entry.name, entry.is_dir);
+        changed = true;
+    }
+    changed = changed or old.count() != 0;
+    if (changed) {
+        var removed = old.valueIterator();
+        while (removed.next()) |child| self.freeFiletreeNode(child.*);
+        node.children.deinit(self.alloc);
+        node.children = replacement.children;
+        for (node.children.items) |child| child.parent = node;
+        self.sortTreeChildren(node);
+    } else replacement.children.deinit(self.alloc);
+    node.stamp = listing.after;
+    return changed;
+}
+
+pub fn applyDirectoryChanges(self: *App, changes: *const watch.Changes) !bool {
+    const root = self.filetree_root orelse return false;
+    if (changes.dirs.items.len == 0) return false;
+    const selected = if (self.filetreeNodeAt(self.filetree_sel)) |n| try self.alloc.dupe(u8, n.path) else null;
+    defer if (selected) |path| self.alloc.free(path);
+    // Every added visible row is an entry in one of these listings. Reserve
+    // before replacing any old node referenced by the flattened row array.
+    var max_rows = self.filetree_rows.items.len;
+    for (changes.dirs.items) |listing| max_rows += listing.entries.len;
+    try self.filetree_rows.ensureTotalCapacity(self.alloc, max_rows);
+    var changed = false;
+    for (changes.dirs.items) |listing| {
+        const node = nodeWithPath(root, listing.path) orelse continue;
+        if (!node.expanded or !std.meta.eql(node.stamp, listing.before)) continue;
+        const updated = reconcileDirectory(self, node, listing) catch continue;
+        self.navigator_git.tree_dirty = true; // publish the accepted directory stamp
+        changed = changed or updated;
+    }
+    if (changed) {
+        try self.rebuildFiletreeRows();
+        self.filetree_sel = @min(self.filetree_sel, self.filetree_rows.items.len -| 1);
+        if (selected) |path| {
+            if (nodeWithPath(root, path)) |node| {
+                if (self.rowIndexOf(node)) |row| self.filetree_sel = row;
+            }
+        }
+    }
+    return changed;
+}
+
 /// Reload only the affected directory, preserving every unrelated subtree.
 fn refreshCreatedDirectory(self: *App, path: []const u8, leaf: []const u8) !void {
     const root = self.filetree_root orelse return;
@@ -527,6 +598,7 @@ fn refreshCreatedDirectory(self: *App, path: []const u8, leaf: []const u8) !void
         for (node.children.items) |old| {
             if (fresh.is_dir == old.is_dir and std.mem.eql(u8, fresh.name, old.name)) {
                 fresh.expanded = old.expanded;
+                fresh.stamp = old.stamp;
                 fresh.children = old.children;
                 old.children = .empty;
                 for (fresh.children.items) |child| child.parent = fresh;
@@ -537,6 +609,7 @@ fn refreshCreatedDirectory(self: *App, path: []const u8, leaf: []const u8) !void
     for (node.children.items) |child| self.freeFiletreeNode(child);
     node.children.deinit(self.alloc);
     node.children = replacement.children;
+    node.stamp = replacement.stamp;
     transferred = true;
     node.expanded = true;
     for (node.children.items) |child| child.parent = node;

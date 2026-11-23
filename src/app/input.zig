@@ -50,6 +50,7 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
             self.invalidatePassiveHints();
         }
     }
+    if (self.review.open) return @import("git_review.zig").keyPress(self, key);
     try handleKeyInner(self, key);
 }
 

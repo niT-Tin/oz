@@ -2181,8 +2181,7 @@ fn renderNavigatorTabs(self: *App, a: std.mem.Allocator, win: vaxis.Window, row:
     }
 }
 
-/// Files tab: the pre-M2b1 filetree row loop unchanged (same geometry,
-/// selection, scroll window and absolute-row hint payload).
+/// Files rows share one immutable repository snapshot until the next refresh.
 fn renderFiletreeRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, body_top: u32, body_bottom: u32, usable: u32) !void {
     const ft_col: u32 = 0;
     const inner_left = ft_col + 1;
@@ -2218,7 +2217,10 @@ fn renderFiletreeRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, body_
         // ancestors, top-down. frow.depth is the number of visible
         // ancestors (the root itself is not a row).
         var anc_stack: [256]@TypeOf(node) = undefined;
-        const an = @min(frow.depth, anc_stack.len);
+        const badge = self.navigator_git.get(self.filetree_root.?.path, node.path);
+        const badge_width: u32 = if (badge != null) 3 else 0; // gap + XY
+        // Clip deep tree guides first so the branch, icon and badge fit.
+        const an = @min(frow.depth, anc_stack.len, (usable -| badge_width -| 6) / 2);
         var p = node.parent;
         var ai: usize = 0;
         while (ai < an) : (ai += 1) {
@@ -2245,32 +2247,43 @@ fn renderFiletreeRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, body_
         try line.appendSlice(a, if (last_sibling) "└╴" else "├╴");
         const prefix_cells: u32 = 1 + 2 * @as(u32, @intCast(an)) + 2;
 
-        // name budget in CELLS (CJK names are 2 cells/glyph)
-        const avail_name: u32 = usable -| prefix_cells -| 1 -| 1;
-        var shown = buffer.utf8.truncateWidth(node.name, avail_name);
-        const ellipsized = shown.len < node.name.len;
-        if (ellipsized and avail_name > 0) {
-            shown = buffer.utf8.truncateWidth(node.name, avail_name - 1);
-        }
-        const shown_cells = buffer.utf8.displayWidth(shown);
-        const content_cells: u32 = prefix_cells + 1 + (if (shown_cells > 0) 1 + shown_cells + @as(u32, if (ellipsized) 1 else 0) else 0);
+        const icon_cells = win.gwidth(icon.glyph);
+        const avail = usable -| badge_width -| prefix_cells -| icon_cells -| 1;
+        var fit = autil.cellFitPrefix(win, node.name, avail);
+        const ellipsized = fit.slice.len < node.name.len and avail >= win.gwidth("…");
+        if (ellipsized) fit = autil.cellFitPrefix(win, node.name, avail - win.gwidth("…"));
+        const name_cells = fit.cells + (if (ellipsized) win.gwidth("…") else 0);
+        const content_cells = prefix_cells + icon_cells + @as(u32, @intCast(if (name_cells > 0) name_cells + 1 else 0));
 
         const style: vaxis.Style = if (ri == self.filetree_sel)
             .{ .bg = .{ .rgb = self.theme.bg_sel }, .fg = .{ .rgb = self.theme.fg } }
         else
             .{ .bg = .{ .rgb = self.theme.bg }, .fg = .{ .rgb = self.theme.fg } };
 
+        const badge_rgb = if (badge) |b| switch (b.color) {
+            .modified => self.theme.git_mod,
+            .added => self.theme.git_add,
+            .deleted => self.theme.git_del,
+            .renamed => self.theme.accent_alt,
+            .conflict => self.theme.diag_error,
+            .directory => self.theme.fg_dim,
+        } else self.theme.fg;
+        var name_style = style;
+        if (badge != null) name_style.fg = .{ .rgb = theme.blend(self.theme.fg, badge_rgb, 40) };
         var segs = std.ArrayList(vaxis.Segment).empty;
         try segs.append(a, .{ .text = line.items, .style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = style.bg } });
         try segs.append(a, .{ .text = icon.glyph, .style = .{ .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) }, .bg = style.bg } });
-        if (shown_cells > 0) {
+        if (name_cells > 0) {
             try segs.append(a, .{ .text = " ", .style = style });
-            try segs.append(a, .{ .text = shown, .style = style });
+            try segs.append(a, .{ .text = fit.slice, .style = name_style });
             if (ellipsized) try segs.append(a, .{ .text = "…", .style = style });
         }
-        const pads = try a.alloc(u8, usable -| content_cells);
+        const pads = try a.alloc(u8, usable -| content_cells -| (if (badge != null) @as(u32, 2) else 0));
         @memset(pads, ' ');
         if (pads.len > 0) try segs.append(a, .{ .text = pads, .style = style });
+        if (badge) |b| {
+            try segs.append(a, .{ .text = try a.dupe(u8, &b.text), .style = .{ .fg = .{ .rgb = badge_rgb }, .bg = style.bg, .bold = true } });
+        }
         _ = win.print(segs.items, .{ .row_offset = @intCast(body_top + @as(u32, @intCast(k))), .col_offset = @intCast(inner_left), .wrap = .none });
         if (self.mouseTargetsCollecting()) {
             // Inner row rect (starts after the left border so a label never
@@ -3242,6 +3255,12 @@ pub fn render(self: *App) !void {
     // branch) unless mouse reporting is enabled; the same registrations that
     // feed hint labels also feed hit-testing on mouse frames.
     self.beginMouseFrame(height, win.width);
+    if (self.review.open) {
+        hideInactiveMarkdownImages(self);
+        win.hideCursor();
+        try @import("git_review_render.zig").draw(self, a, win);
+        return self.vx.render(self.tty.writer());
+    }
     if (height <= status_row_count) return;
     // One timestamp for every animated element this frame (streaming dots,
     // tool spinners, badge flash). Idle frames compute it but draw nothing
@@ -3522,11 +3541,6 @@ pub fn render(self: *App) !void {
         }
     }
 
-    // file tree sidebar (nvim neo-tree style: the panel shares the
-    // EDITOR background — Normal bg, not a float — so sidebar and text
-    // area read as one surface; only the fg_faint border separates them)
-    if (self.filetree_active) try renderNavigator(self, a, win, height);
-
     // multi-cursor word highlights (overlay)
     if (self.mc_active) {
         for (self.mc.cursors.items) |cpos| {
@@ -3667,6 +3681,10 @@ pub fn render(self: *App) !void {
             }
         }
     }
+
+    // The compact Files peek covers editor cells, including inline
+    // diagnostics, blame text and motion labels painted above.
+    if (self.filetree_active) try renderNavigator(self, a, win, height);
 
     // Pane surfaces first; the terminal then covers their shared rectangle.
     // Global modal overlays below retain their matching input priority.
@@ -4981,7 +4999,8 @@ pub fn run(self: *App) !void {
         // Consume a completed git job (status refresh / blame / hunk
         // apply): gutter marks, branch and floats update without a
         // keypress, same as the LSP slots.
-        var git_ready = false;
+        var git_ready = self.navigator_git.tick(self);
+        if (@import("git_review.zig").poll(self)) git_ready = true;
         if (self.git_job) |job| {
             if (job.done.load(.acquire)) {
                 self.consumeGitJob(job);
@@ -5128,6 +5147,7 @@ pub fn run(self: *App) !void {
             defer self.syncPassiveFocus();
             switch (event) {
                 .mouse => |m| {
+                    if (self.review.open) continue;
                     // Left press = click, wheel = scroll. Motion/drag/
                     // release/unbound buttons return false, so moving the
                     // mouse cannot cause renders or steal terminal selection.
@@ -5141,6 +5161,7 @@ pub fn run(self: *App) !void {
                     // mid-paste keystrokes are paste content, not input:
                     // buffer them (paste_end inserts the whole thing) so
                     // auto-indent/auto-pairs can't mangle pasted text
+                    if (self.pasting and self.review.open) continue;
                     if (self.pasting and !term_focused) {
                         try self.pasteAccumulate(key);
                         continue;
@@ -5157,6 +5178,7 @@ pub fn run(self: *App) !void {
                     handled = true;
                     if (!self.pasting) continue;
                     self.pasting = false;
+                    if (self.review.open) continue;
                     if (term_focused) continue; // child got the keys already
                     if (self.cell_edit != null) {
                         try table_cell_ui.paste(self, self.paste_buf.items);
@@ -5192,6 +5214,7 @@ pub fn run(self: *App) !void {
                     }
                 },
                 .paste => |text| {
+                    if (self.review.open) continue;
                     handled = true;
                     // OSC 52 clipboard reply — terminal focus: forward the
                     // paste to the child

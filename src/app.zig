@@ -647,7 +647,10 @@ pub const App = struct {
     nav_float_col: u32 = 0,
 
     // ---- M3a git (gutter / hunks / blame / lazygit) ----
+    navigator_git: @import("app/navigator_git.zig").Monitor = .{},
+
     /// In-flight async git job (one at a time). See GitJob.
+    review: @import("app/git_review.zig").State = .{},
     git_job: ?*GitJob = null,
     /// A status refresh was requested while a job was running: when the
     /// current job completes, spawn another status job (keeps branch/marks
@@ -1708,7 +1711,9 @@ pub const App = struct {
     pub fn deinit(self: *App) void {
         if (self.cell_edit) |*cell| cell.deinit(self.alloc);
         if (self.pending_filetree_create) |path| self.alloc.free(path);
+        self.navigator_git.deinit(self);
         self.loop.stop();
+        self.review.deinit(self.alloc);
         // An in-flight LSP attach must be cancelled and joined before the
         // pieces it borrows (env_map, io, the vaxis loop its wake posts to)
         // go away.

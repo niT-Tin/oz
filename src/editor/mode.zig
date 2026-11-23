@@ -402,6 +402,7 @@ fn handleNormal(state: *State, key: vaxis.Key, keymap: KeyEvent.KeyMap) Result {
         switch (key.codepoint) {
             's' => return emitAction(state, .hunk_stage), // <leader>gs stage
             'r' => return emitAction(state, .hunk_reset), // <leader>gr reset
+            'v' => return emitAction(state, .git_review),
             'p' => return emitAction(state, .hunk_preview), // <leader>gp preview
             else => {
                 resetPending(state);
@@ -950,6 +951,7 @@ fn dispatchNormal(state: *State, action: KeyEvent.ActionId) Result {
         .hunk_reset => emitAction(state, .hunk_reset),
         .hunk_preview => emitAction(state, .hunk_preview),
         .blame_toggle => emitAction(state, .blame_toggle),
+        .git_review => emitAction(state, .git_review),
         .git_lazygit => emitAction(state, .git_lazygit),
         .term_float => emitAction(state, .term_float),
         .term_bottom => emitAction(state, .term_bottom),
@@ -2426,7 +2428,7 @@ test "search keys: Space-h completes immediately and Git actions moved to Space-
     try t.expect(idle(&state));
     const move = handle(&state, .{ .codepoint = 'j' }, Keymaps.normal);
     try t.expectEqual(Motion.Motion.down, move.motion.motion);
-    for ([_]u8{ 's', 'r', 'p' }, [_]KeyEvent.ActionId{ .hunk_stage, .hunk_reset, .hunk_preview }) |tail, action| {
+    for ([_]u8{ 's', 'r', 'p', 'v' }, [_]KeyEvent.ActionId{ .hunk_stage, .hunk_reset, .hunk_preview, .git_review }) |tail, action| {
         _ = handle(&state, .{ .codepoint = ' ' }, Keymaps.normal);
         _ = handle(&state, .{ .codepoint = 'g' }, Keymaps.normal);
         try t.expect(leaderPending(&state));

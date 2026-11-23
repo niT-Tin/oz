@@ -955,7 +955,7 @@ pub fn glyph(t: Theme, comptime role: enum { comment, keyword, statement, inacti
     return g;
 }
 
-fn blend(a: Rgb, b: Rgb, pct: u16) Rgb {
+pub fn blend(a: Rgb, b: Rgb, pct: u16) Rgb {
     var out: Rgb = undefined;
     inline for (0..3) |i| {
         out[i] = @intCast((@as(u16, a[i]) * (100 - pct) + @as(u16, b[i]) * pct) / 100);

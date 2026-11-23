@@ -162,6 +162,7 @@ pub fn consumeGitJob(self: *App, job: *GitJob) void {
             } else if (dupOrNull(self.alloc, "git apply failed")) |m| {
                 self.setMsg(m) catch {};
             }
+            self.navigator_git.refresh(self.io);
             // the working tree changed (staged/reset): refresh the marks
             if (self.cur().path) |p| self.spawnGitJob(.status, p, 0, .stage) catch {};
             // and the blame describes the old file — invalidate it so

@@ -14647,6 +14647,245 @@ test "folds: split windows keep closed folds through edits" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+fn gitBadgeFixture(io: Io, root: []const u8, script: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const result = try std.process.run(alloc, io, .{ .argv = &.{ "sh", "-ec", script }, .cwd = .{ .path = root } });
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        std.debug.print("Git fixture failed: {s}\n", .{result.stderr});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "navigator git badges: XY, conflicts, deleted parent, live save/stage/checkout, compact row targets" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    for ([_]u16{ 120, 80 }) |cols| {
+        const root = try std.fmt.allocPrint(alloc, "/tmp/oz_git_badges_{d}_{d}", .{ linux.getpid(), cols });
+        defer alloc.free(root);
+        try std.Io.Dir.cwd().createDirPath(io, root);
+        defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        try gitBadgeFixture(io, root,
+            \\git init -q -b main
+            \\git config user.email e2e@example.com
+            \\git config user.name E2E
+            \\mkdir nested
+            \\printf '%s\n' base > nested/child
+            \\for p in clean conflict mixed old staged '文件 long filename with spaces'; do printf '%s\n' "$p" > "$p"; done
+            \\echo ignored > .gitignore
+            \\git add . && git commit -qm initial
+            \\git switch -qc other
+            \\echo other > conflict && git commit -qam other
+            \\git switch -q main
+            \\echo main > conflict && git commit -qam main
+            \\if git merge --no-edit other; then exit 1; fi
+            \\rm nested/child
+            \\git mv old renamed
+            \\echo staged >> mixed && echo staged >> staged && git add mixed staged
+            \\echo worktree >> mixed && echo changed >> '文件 long filename with spaces'
+            \\touch ignored untracked
+        );
+        const clean = try std.fs.path.join(alloc, &.{ root, "clean" });
+        defer alloc.free(clean);
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, clean }, &.{}, 24, cols, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(alloc, 24, cols);
+        defer grid.deinit(alloc);
+        try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+        try sess.send(" e");
+        const first = navBodyRow();
+        try gridWaitRowContains(&sess, &grid, first, "*│", 8000);
+        const badges = [_][]const u8{ " *", "  ", "UU", "  ", "MM", "R.", "M.", "??", ".M" };
+        const names = [_][]const u8{ "nested", "clean", "conflict", "ignored", "mixed", "renamed", "staged", "untracked", "文件" };
+        const col = nav_model.panel_width - 3;
+        for (badges, names, 0..) |badge, name, i| {
+            try gridWaitRowContains(&sess, &grid, first + i, name, 2000);
+            try std.testing.expectEqualStrings(badge[0..1], frame.cellText(&grid, first + i, col));
+            try std.testing.expectEqualStrings(badge[1..2], frame.cellText(&grid, first + i, col + 1));
+        }
+        try gridWaitRowContains(&sess, &grid, first + 8, "… .M│", 2000);
+        try std.testing.expectEqual(frame.cellBg(&grid, first, 3), frame.cellBg(&grid, first, col + 1));
+
+        // External Git and disk operations refresh on an idle editor.
+        try gitBadgeFixture(io, root,
+            \\git restore --source=HEAD --staged --worktree -- nested/child
+            \\git add '文件 long filename with spaces'
+            \\echo news >> staged
+        );
+        try gridWaitRowContains(&sess, &grid, first + 8, "M.│", 8000);
+        try gridWaitRowContains(&sess, &grid, first + 6, "MM│", 2000);
+        try std.testing.expectEqualStrings(" ", frame.cellText(&grid, first, col + 1));
+        // Expand by clicking the badge's former cell, collapse via keyboard.
+        try mouseClickAt(&sess, col + 1, first);
+        try gridWaitRowContains(&sess, &grid, first + 1, "child", 3000);
+        try sess.send("h");
+        try gridWaitRowContains(&sess, &grid, first + 1, "clean", 3000);
+
+        if (cols == 120) {
+            try sess.send("\x17liunsaved\x1b");
+            try gridWaitFor(&sess, &grid, "unsaved", 3000);
+            try gitBadgeFixture(io, root, "echo again >> renamed");
+            try gridWaitRowContains(&sess, &grid, first + 5, "RM│", 8000);
+            try std.testing.expectEqualStrings(" ", frame.cellText(&grid, first + 1, col + 1));
+            try sess.send(":w\r");
+            try gridWaitRowContains(&sess, &grid, first + 1, ".M│", 5000);
+            try sess.send("\x17h");
+        }
+        try gitBadgeFixture(io, root, "git merge --quit && git switch --discard-changes -q other");
+        try gridWaitRowContains(&sess, &grid, first + 2, "  │", 8000);
+        try std.testing.expectEqualStrings(" ", frame.cellText(&grid, first + 2, col));
+        // Move Files to a non-repository parent, dropping its old snapshot.
+        try sess.send("\x7f");
+        try gridWaitGone(&sess, &grid, "??│", 4000);
+        try aiQuit(&sess);
+    }
+}
+
+test "navigator git badges: live directory entries keep selected path, expanded children and grapheme-aligned badges" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const root = try std.fmt.allocPrint(a, "/tmp/oz_nav_entries_{d}", .{linux.getpid()});
+    defer a.free(root);
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try gitBadgeFixture(io, root,
+        \\git init -q && mkdir sub
+        \\for f in sub/keep sub/old sub/unlink 'hand👋🏿.txt' plain.txt z-focus; do echo "$f" > "$f"; done
+        \\git add . && git -c user.name=E2E -c user.email=e2e@example.com commit -qm initial
+        \\echo changed >> 'hand👋🏿.txt' && echo changed >> plain.txt
+    );
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "z-focus" }, &.{}, 24, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try sess.send(" e");
+    const first = navBodyRow();
+    const divider = nav_model.panel_width - 1;
+    for ([_]usize{ first + 1, first + 2 }) |r| {
+        try gridWaitRowContains(&sess, &grid, r, ".M│", 5000);
+        try std.testing.expectEqualStrings(".", frame.cellText(&grid, r, divider - 2));
+        try std.testing.expectEqualStrings("M", frame.cellText(&grid, r, divider - 1));
+        try std.testing.expectEqualStrings("│", frame.cellText(&grid, r, divider));
+        try std.testing.expectEqualStrings(" ", frame.cellText(&grid, r, divider + 1));
+    }
+    try sess.send("lG");
+    try gridWaitRowContains(&sess, &grid, first + 3, "unlink", 3000);
+    try gitBadgeFixture(io, root,
+        \\touch a-new-root sub/new-child
+        \\git mv sub/old sub/renamed
+        \\rm sub/unlink
+    );
+    try gridWaitRowContains(&sess, &grid, first + 4, "a-new-root", 8000);
+    try gridWaitRowContains(&sess, &grid, first + 4, "??│", 3000);
+    try gridWaitRowContains(&sess, &grid, first + 2, "new-child", 3000);
+    try gridWaitRowContains(&sess, &grid, first + 3, "renamed", 3000);
+    try gridWaitRowContains(&sess, &grid, first + 3, "R.│", 3000);
+    try std.testing.expect(!grid.contains("unlink"));
+    try std.testing.expect(!aiRowContains(&grid, first + 2, "old"));
+    try std.testing.expect(aiRowContains(&grid, grid.row, "z-focus"));
+
+    // These two untracked paths vanish from porcelain as well as the tree.
+    try gitBadgeFixture(io, root, "rm a-new-root sub/new-child");
+    try gridWaitGone(&sess, &grid, "a-new-root", 8000);
+    try gridWaitGone(&sess, &grid, "new-child", 3000);
+    try std.testing.expect(aiRowContains(&grid, first + 1, "keep"));
+    try std.testing.expect(aiRowContains(&grid, grid.row, "z-focus"));
+    try aiQuit(&sess);
+}
+
+test "navigator git badges: switching linked worktrees while a status reply is held" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const fixture = try std.fmt.allocPrint(a, "/tmp/oz_nav_worktrees_{d}", .{linux.getpid()});
+    defer a.free(fixture);
+    try std.Io.Dir.cwd().createDirPath(io, fixture);
+    defer std.Io.Dir.cwd().deleteTree(io, fixture) catch {};
+    try gitBadgeFixture(io, fixture,
+        \\git init -q first
+        \\echo base > first/same
+        \\git -C first add same
+        \\git -C first -c user.name=E2E -c user.email=e2e@example.com commit -qm initial
+        \\git -C first worktree add --detach -q ../second HEAD
+        \\echo first >> first/same
+        \\echo second >> second/same && git -C second add same
+        \\mkdir bin
+        \\cat > bin/git <<'SH'
+        \\#!/bin/sh
+        \\case " $* " in
+        \\  *" --porcelain=v1 "*) dir=${PWD##*/}; touch "../started-$dir"
+        \\    while [ ! -f "../release-$dir" ]; do sleep 0.02; done ;;
+        \\esac
+        \\exec /usr/bin/git "$@"
+        \\SH
+        \\chmod +x bin/git
+    );
+    const first = try std.fs.path.join(a, &.{ fixture, "first" });
+    defer a.free(first);
+    const path = try std.fmt.allocPrint(a, "PATH={s}/bin:/usr/bin:/bin", .{fixture});
+    defer a.free(path);
+    const command = try std.fmt.allocPrint(a, ":e {s}/second/same\r", .{fixture});
+    defer a.free(command);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "same" }, &.{path}, 24, 120, first);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try sess.send(" e");
+    try std.testing.expect(try erWaitBarrier(io, fixture, "started-first", 5000));
+    try sess.send(command);
+    try gridWaitFor(&sess, &grid, "second", 5000);
+    try sess.send(" e");
+    try gridWaitRowContains(&sess, &grid, navBodyRow(), "same", 3000);
+    try writeTestFile(io, fixture, "release-first", "");
+    try std.testing.expect(try erWaitBarrier(io, fixture, "started-second", 5000));
+    _ = try uiPump(&sess, &grid, 100);
+    try std.testing.expect(!aiRowContains(&grid, navBodyRow(), ".M│"));
+    try writeTestFile(io, fixture, "release-second", "");
+    try gridWaitRowContains(&sess, &grid, navBodyRow(), "M.│", 5000);
+    try aiQuit(&sess);
+}
+
+test "git review: deleted worktree source keeps the patch open even for a cached buffer" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var buf: [160]u8 = undefined;
+    const dir = try aiMockDir(io, &buf);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try writeTestFile(io, dir, "removed.txt", "DELETED_REVIEW_CONTENT\n");
+    try writeTestFile(io, dir, "current.txt", "ACTIVE_SOURCE_BUFFER\n");
+    a.free(try runCmdCapture(io, a, &.{ "git", "init", "-q" }, dir));
+    a.free(try runCmdCapture(io, a, &.{ "git", "add", "." }, dir));
+    a.free(try runCmdCapture(io, a, &.{ "git", "-c", "user.name=Review", "-c", "user.email=review@example.invalid", "commit", "-qm", "root" }, dir));
+
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "removed.txt" }, null, 24, 80, dir);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "DELETED_REVIEW_CONTENT", 6000);
+    try sess.send(":e current.txt\r");
+    try gridWaitFor(&sess, &grid, "ACTIVE_SOURCE_BUFFER", 5000);
+    const path = try std.fs.path.join(a, &.{ dir, "removed.txt" });
+    defer a.free(path);
+    try Io.Dir.cwd().deleteFile(io, path);
+    try sess.send(":GitReview\r");
+    try gridWaitFor(&sess, &grid, "Unstaged", 6000);
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "DELETED_REVIEW_CONTENT", 6000);
+    try sess.send("o");
+    try gridWaitFor(&sess, &grid, "Source unavailable in this worktree", 4000);
+    try std.testing.expect(grid.contains("Git Review"));
+    try sess.send("q");
+    try gridWaitFor(&sess, &grid, "ACTIVE_SOURCE_BUFFER", 4000);
+    try std.testing.expect(!pathExists(io, path));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
 test "git: gutter signs, ]c hunk jump, hunk stage/reset, blame ghost, branch" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -34231,4 +34470,201 @@ test "git: large tracked file drops a delayed dirty revision after undo and G" {
     defer a.free(oversize);
     try std.testing.expect(!pathExists(io, oversize));
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q!\r"));
+}
+
+test "git review: navigate staged, unstaged and historical patches at 80 and 120 columns" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var dir_buf: [160]u8 = undefined;
+    const dir = try aiMockDir(io, &dir_buf);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const setup = try std.process.run(a, io, .{
+        .argv = &.{
+            "/bin/sh", "-ec",
+            \\git init -q -b main
+            \\git config user.name Review
+            \\git config user.email review@example.invalid
+            \\printf 'ROOT_A\n' > alpha.txt
+            \\printf 'ROOT_B\n' > beta.txt
+            \\git add alpha.txt beta.txt
+            \\git commit -qm Root
+            \\printf 'HISTORIC_A\n' > alpha.txt
+            \\printf 'HISTORIC_B\n' > beta.txt
+            \\git commit -qam 'Older review'
+            \\git rev-parse HEAD
+            \\printf 'NEWER_A\n' > alpha.txt
+            \\git commit -qam 'Latest review'
+            \\printf 'INDEX_ONLY_A\n' > alpha.txt
+            \\git add alpha.txt
+            \\printf 'WORKTREE_ONLY_A\n' > alpha.txt
+        },
+        .cwd = .{ .path = dir },
+    });
+    defer a.free(setup.stdout);
+    defer a.free(setup.stderr);
+    try std.testing.expect(setup.term == .exited and setup.term.exited == 0);
+    const older = std.mem.trimEnd(u8, setup.stdout, "\r\n");
+    try std.testing.expectEqual(@as(usize, 40), older.len);
+    const index = try runCmdCapture(io, a, &.{ "git", "diff", "--cached" }, dir);
+    defer a.free(index);
+    const worktree = try runCmdCapture(io, a, &.{ "git", "diff" }, dir);
+    defer a.free(worktree);
+    for ([_]u16{ 80, 120 }) |cols| {
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "beta.txt" }, null, 32, cols, dir);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 32, cols);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, "HISTORIC_B", 6000);
+        try sess.send(if (cols == 80) ":GitReview\r" else " gv");
+        try gridWaitFor(&sess, &grid, "Unstaged", 6000);
+        try sess.send("\r");
+        try gridWaitFor(&sess, &grid, "INDEX_ONLY_A", 6000);
+        try std.testing.expect(grid.contains("NEWER_A") and !grid.contains("WORKTREE_ONLY_A"));
+        try sess.send("\x1b");
+        try gridWaitFor(&sess, &grid, "Unstaged", 4000);
+        try sess.send("j\r");
+        try gridWaitFor(&sess, &grid, "WORKTREE_ONLY_A", 6000);
+        try std.testing.expect(grid.contains("INDEX_ONLY_A") and !grid.contains("NEWER_A"));
+        try sess.send("\t");
+        try gridWaitFor(&sess, &grid, "Latest review", 6000);
+        try sess.send("j\r");
+        try gridWaitFor(&sess, &grid, "HISTORIC_A", 6000);
+        try std.testing.expect(grid.contains(older) and grid.contains("ROOT_A"));
+        try std.testing.expect(!grid.contains("NEWER_A") and !grid.contains("WORKTREE_ONLY_A"));
+        try sess.send("J");
+        try gridWaitFor(&sess, &grid, "HISTORIC_B", 6000);
+        try std.testing.expect(grid.contains("ROOT_B"));
+        try sess.send("\x1b");
+        try gridWaitGone(&sess, &grid, "ROOT_B", 4000);
+        try sess.send("\r");
+        try gridWaitFor(&sess, &grid, older, 6000);
+        try sess.send("\t");
+        try gridWaitFor(&sess, &grid, "WORKTREE_ONLY_A", 6000);
+        try sess.send("o");
+        try gridWaitGone(&sess, &grid, "Git Review", 5000);
+        try gridWaitFor(&sess, &grid, "WORKTREE_ONLY_A", 5000);
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+    }
+    const index_after = try runCmdCapture(io, a, &.{ "git", "diff", "--cached" }, dir);
+    defer a.free(index_after);
+    const worktree_after = try runCmdCapture(io, a, &.{ "git", "diff" }, dir);
+    defer a.free(worktree_after);
+    try std.testing.expectEqualStrings(index, index_after);
+    try std.testing.expectEqualStrings(worktree, worktree_after);
+}
+
+test "git review: late repository result cannot replace a newly opened review" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [180]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    const setup = try std.process.run(a, io, .{
+        .argv = &.{
+            "/bin/sh", "-ec",
+            \\for r in first second; do
+            \\    git init -q "$r"
+            \\    echo "$r workspace" > "$r/file.txt"
+            \\    touch "$r/change-$r-only"
+            \\done
+        },
+        .cwd = .{ .path = root },
+    });
+    defer a.free(setup.stdout);
+    defer a.free(setup.stderr);
+    try std.testing.expect(setup.term == .exited and setup.term.exited == 0);
+    const real_git = try runCmdCapture(io, a, &.{ "/bin/sh", "-c", "command -v git" }, root);
+    defer a.free(real_git);
+    const real_env = try std.fmt.allocPrint(a, "OZ_REAL_GIT={s}", .{std.mem.trim(u8, real_git, "\n\r")});
+    defer a.free(real_env);
+    const path_env = try std.fmt.allocPrint(a, "PATH={s}:/usr/bin:/bin", .{root});
+    defer a.free(path_env);
+    try writeTestFile(io, root, "git",
+        \\#!/bin/sh
+        \\case "$PWD:$*" in
+        \\    */first:*for-each-ref*)
+        \\        : > ../started
+        \\        while [ ! -f ../release ]; do sleep 0.02; done
+        \\        ;;
+        \\esac
+        \\exec "$OZ_REAL_GIT" "$@"
+        \\
+    );
+    a.free(try runCmdCapture(io, a, &.{ "chmod", "+x", "git" }, root));
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "first/file.txt" }, &.{ path_env, real_env }, 26, 100, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    defer writeTestFile(io, root, "release", "") catch {};
+    var grid = try Grid.initSizedCols(a, 26, 100);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "first workspace", 5000);
+    try sess.send(":GitReview\r");
+    try std.testing.expect(try erWaitBarrier(io, root, "started", 6000));
+    try sess.send("q");
+    try gridWaitFor(&sess, &grid, "first workspace", 3000);
+    const open_second = try std.fmt.allocPrint(a, ":e {s}/second/file.txt\r", .{root});
+    defer a.free(open_second);
+    try sess.send(open_second);
+    try gridWaitFor(&sess, &grid, "second workspace", 4000);
+    try sess.send(":GitReview\r");
+    try gridWaitFor(&sess, &grid, "Git Review", 3000);
+    try writeTestFile(io, root, "release", "");
+    try gridWaitFor(&sess, &grid, "change-second-only", 8000);
+    try std.testing.expect(!grid.contains("change-first-only"));
+    try sess.send("q");
+    try gridWaitFor(&sess, &grid, "second workspace", 4000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
+}
+
+test "git review: named comparison jumps to the second committed hunk in the source editor" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [180]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    const setup = try std.process.run(a, io, .{
+        .argv = &.{
+            "/bin/sh", "-ec",
+            \\git init -q -b main
+            \\git config user.name Review
+            \\git config user.email review@example.invalid
+            \\awk 'BEGIN {for(i=1;i<=32;i++) print "context " i}' > file.txt
+            \\git add file.txt
+            \\git commit -qm root
+            \\git checkout -qb base
+            \\echo side > side-only
+            \\git add side-only
+            \\git commit -qm divergent
+            \\git checkout -q main
+            \\sed -e '3s/.*/FIRST_COMMITTED/' -e '28s/.*/SECOND_COMMITTED/' file.txt > temp
+            \\mv temp file.txt
+            \\git commit -qam 'two distant hunks'
+            \\echo local > local-only
+        },
+        .cwd = .{ .path = root },
+    });
+    defer a.free(setup.stdout);
+    defer a.free(setup.stderr);
+    try std.testing.expect(setup.term == .exited and setup.term.exited == 0);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "file.txt" }, null, 28, 80, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 28, 80);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "FIRST_COMMITTED", 5000);
+    try sess.send(":GitReview\r");
+    try gridWaitFor(&sess, &grid, "local-only", 6000);
+    try sess.send("b");
+    try gridWaitFor(&sess, &grid, "Compare against", 4000);
+    try sess.send("j\r");
+    try gridWaitFor(&sess, &grid, "base (merge base", 6000);
+    try gridWaitFor(&sess, &grid, "file.txt", 4000);
+    try std.testing.expect(!grid.contains("local-only") and !grid.contains("side-only"));
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "FIRST_COMMITTED", 6000);
+    try sess.send("]o");
+    try gridWaitGone(&sess, &grid, "Git Review", 4000);
+    try gridWaitPosition(&sess, &grid, 28, 0, 4000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":qa!\r"));
 }
