@@ -645,6 +645,8 @@ pub const App = struct {
     nav_float_col: u32 = 0,
 
     // ---- M3a git (gutter / hunks / blame / lazygit) ----
+    navigator_git: @import("app/navigator_git.zig").Monitor = .{},
+
     /// In-flight async git job (one at a time). See GitJob.
     git_job: ?*GitJob = null,
     /// A status refresh was requested while a job was running: when the
@@ -1704,6 +1706,7 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        self.navigator_git.deinit(self);
         if (self.pending_filetree_create) |path| self.alloc.free(path);
         self.loop.stop();
         // An in-flight LSP attach must be cancelled and joined before the

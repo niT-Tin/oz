@@ -14386,6 +14386,155 @@ test "folds: split windows keep closed folds through edits" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+fn gitBadgeFixture(io: Io, root: []const u8, script: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const result = try std.process.run(alloc, io, .{ .argv = &.{ "sh", "-ec", script }, .cwd = .{ .path = root } });
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        std.debug.print("Git fixture failed: {s}\n", .{result.stderr});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "navigator git badges: XY, conflicts, deleted parent, live save/stage/checkout, compact row targets" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    for ([_]u16{ 120, 80 }) |cols| {
+        const root = try std.fmt.allocPrint(alloc, "/tmp/oz_git_badges_{d}_{d}", .{ linux.getpid(), cols });
+        defer alloc.free(root);
+        try std.Io.Dir.cwd().createDirPath(io, root);
+        defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        try gitBadgeFixture(io, root,
+            \\git init -q -b main
+            \\git config user.email e2e@example.com
+            \\git config user.name E2E
+            \\mkdir nested
+            \\printf '%s\n' base > nested/child
+            \\for p in clean conflict mixed old staged '文件 long filename with spaces'; do printf '%s\n' "$p" > "$p"; done
+            \\echo ignored > .gitignore
+            \\git add . && git commit -qm initial
+            \\git switch -qc other
+            \\echo other > conflict && git commit -qam other
+            \\git switch -q main
+            \\echo main > conflict && git commit -qam main
+            \\if git merge --no-edit other; then exit 1; fi
+            \\rm nested/child
+            \\git mv old renamed
+            \\echo staged >> mixed && echo staged >> staged && git add mixed staged
+            \\echo worktree >> mixed && echo changed >> '文件 long filename with spaces'
+            \\touch ignored untracked
+        );
+        const clean = try std.fs.path.join(alloc, &.{ root, "clean" });
+        defer alloc.free(clean);
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, clean }, &.{}, 24, cols, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(alloc, 24, cols);
+        defer grid.deinit(alloc);
+        try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+        try sess.send(" e");
+        const first = navBodyRow();
+        try gridWaitRowContains(&sess, &grid, first, "*│", 8000);
+        const badges = [_][]const u8{ " *", "  ", "UU", "  ", "MM", "R.", "M.", "??", ".M" };
+        const names = [_][]const u8{ "nested", "clean", "conflict", "ignored", "mixed", "renamed", "staged", "untracked", "文件" };
+        const col = nav_model.panel_width - 3;
+        for (badges, names, 0..) |badge, name, i| {
+            try gridWaitRowContains(&sess, &grid, first + i, name, 2000);
+            try std.testing.expectEqualStrings(badge[0..1], frame.cellText(&grid, first + i, col));
+            try std.testing.expectEqualStrings(badge[1..2], frame.cellText(&grid, first + i, col + 1));
+        }
+        try gridWaitRowContains(&sess, &grid, first + 8, "… .M│", 2000);
+        try std.testing.expectEqual(frame.cellBg(&grid, first, 3), frame.cellBg(&grid, first, col + 1));
+
+        // External Git and disk operations refresh on an idle editor.
+        try gitBadgeFixture(io, root,
+            \\git restore --source=HEAD --staged --worktree -- nested/child
+            \\git add '文件 long filename with spaces'
+            \\echo news >> staged
+        );
+        try gridWaitRowContains(&sess, &grid, first + 8, "M.│", 8000);
+        try gridWaitRowContains(&sess, &grid, first + 6, "MM│", 2000);
+        try std.testing.expectEqualStrings(" ", frame.cellText(&grid, first, col + 1));
+        // Expand by clicking the badge's former cell, collapse via keyboard.
+        try mouseClickAt(&sess, col + 1, first);
+        try gridWaitRowContains(&sess, &grid, first + 1, "child", 3000);
+        try sess.send("h");
+        try gridWaitRowContains(&sess, &grid, first + 1, "clean", 3000);
+
+        if (cols == 120) {
+            try sess.send("\x17liunsaved\x1b");
+            try gridWaitFor(&sess, &grid, "unsaved", 3000);
+            try gitBadgeFixture(io, root, "echo again >> renamed");
+            try gridWaitRowContains(&sess, &grid, first + 5, "RM│", 8000);
+            try std.testing.expectEqualStrings(" ", frame.cellText(&grid, first + 1, col + 1));
+            try sess.send(":w\r");
+            try gridWaitRowContains(&sess, &grid, first + 1, ".M│", 5000);
+            try sess.send("\x17h");
+        }
+        try gitBadgeFixture(io, root, "git merge --quit && git switch --discard-changes -q other");
+        try gridWaitRowContains(&sess, &grid, first + 2, "  │", 8000);
+        try std.testing.expectEqualStrings(" ", frame.cellText(&grid, first + 2, col));
+        // Move Files to a non-repository parent, dropping its old snapshot.
+        try sess.send("\x7f");
+        try gridWaitGone(&sess, &grid, "??│", 4000);
+        try aiQuit(&sess);
+    }
+}
+
+test "navigator git badges: switching linked worktrees while a status reply is held" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const fixture = try std.fmt.allocPrint(a, "/tmp/oz_nav_worktrees_{d}", .{linux.getpid()});
+    defer a.free(fixture);
+    try std.Io.Dir.cwd().createDirPath(io, fixture);
+    defer std.Io.Dir.cwd().deleteTree(io, fixture) catch {};
+    try gitBadgeFixture(io, fixture,
+        \\git init -q first
+        \\echo base > first/same
+        \\git -C first add same
+        \\git -C first -c user.name=E2E -c user.email=e2e@example.com commit -qm initial
+        \\git -C first worktree add --detach -q ../second HEAD
+        \\echo first >> first/same
+        \\echo second >> second/same && git -C second add same
+        \\mkdir bin
+        \\cat > bin/git <<'SH'
+        \\#!/bin/sh
+        \\case " $* " in
+        \\  *" --porcelain=v1 "*) dir=${PWD##*/}; touch "../started-$dir"
+        \\    while [ ! -f "../release-$dir" ]; do sleep 0.02; done ;;
+        \\esac
+        \\exec /usr/bin/git "$@"
+        \\SH
+        \\chmod +x bin/git
+    );
+    const first = try std.fs.path.join(a, &.{ fixture, "first" });
+    defer a.free(first);
+    const path = try std.fmt.allocPrint(a, "PATH={s}/bin:/usr/bin:/bin", .{fixture});
+    defer a.free(path);
+    const command = try std.fmt.allocPrint(a, ":e {s}/second/same\r", .{fixture});
+    defer a.free(command);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "same" }, &.{path}, 24, 120, first);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try sess.send(" e");
+    try std.testing.expect(try erWaitBarrier(io, fixture, "started-first", 5000));
+    try sess.send(command);
+    try gridWaitFor(&sess, &grid, "second", 5000);
+    try sess.send(" e");
+    try gridWaitRowContains(&sess, &grid, navBodyRow(), "same", 3000);
+    try writeTestFile(io, fixture, "release-first", "");
+    try std.testing.expect(try erWaitBarrier(io, fixture, "started-second", 5000));
+    _ = try uiPump(&sess, &grid, 100);
+    try std.testing.expect(!aiRowContains(&grid, navBodyRow(), ".M│"));
+    try writeTestFile(io, fixture, "release-second", "");
+    try gridWaitRowContains(&sess, &grid, navBodyRow(), "M.│", 5000);
+    try aiQuit(&sess);
+}
+
 test "git: gutter signs, ]c hunk jump, hunk stage/reset, blame ghost, branch" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;

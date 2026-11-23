@@ -2092,8 +2092,7 @@ fn renderNavigatorTabs(self: *App, a: std.mem.Allocator, win: vaxis.Window, row:
     }
 }
 
-/// Files tab: the pre-M2b1 filetree row loop unchanged (same geometry,
-/// selection, scroll window and absolute-row hint payload).
+/// Files rows share one immutable repository snapshot until the next refresh.
 fn renderFiletreeRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, body_top: u32, body_bottom: u32, usable: u32) !void {
     const ft_col: u32 = 0;
     const inner_left = ft_col + 1;
@@ -2129,7 +2128,10 @@ fn renderFiletreeRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, body_
         // ancestors, top-down. frow.depth is the number of visible
         // ancestors (the root itself is not a row).
         var anc_stack: [256]@TypeOf(node) = undefined;
-        const an = @min(frow.depth, anc_stack.len);
+        const badge = self.navigator_git.get(self.filetree_root.?.path, node.path);
+        const badge_width: u32 = if (badge != null) 3 else 0; // gap + XY
+        // Clip deep tree guides first so the branch, icon and badge fit.
+        const an = @min(frow.depth, anc_stack.len, (usable -| badge_width -| 6) / 2);
         var p = node.parent;
         var ai: usize = 0;
         while (ai < an) : (ai += 1) {
@@ -2157,7 +2159,7 @@ fn renderFiletreeRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, body_
         const prefix_cells: u32 = 1 + 2 * @as(u32, @intCast(an)) + 2;
 
         // name budget in CELLS (CJK names are 2 cells/glyph)
-        const avail_name: u32 = usable -| prefix_cells -| 1 -| 1;
+        const avail_name: u32 = usable -| badge_width -| prefix_cells -| 1 -| 1;
         var shown = buffer.utf8.truncateWidth(node.name, avail_name);
         const ellipsized = shown.len < node.name.len;
         if (ellipsized and avail_name > 0) {
@@ -2171,17 +2173,30 @@ fn renderFiletreeRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, body_
         else
             .{ .bg = .{ .rgb = self.theme.bg }, .fg = .{ .rgb = self.theme.fg } };
 
+        const badge_rgb = if (badge) |b| switch (b.color) {
+            .modified => self.theme.git_mod,
+            .added => self.theme.git_add,
+            .deleted => self.theme.git_del,
+            .renamed => self.theme.accent_alt,
+            .conflict => self.theme.diag_error,
+            .directory => self.theme.fg_dim,
+        } else self.theme.fg;
+        var name_style = style;
+        if (badge != null) name_style.fg = .{ .rgb = theme.blend(self.theme.fg, badge_rgb, 40) };
         var segs = std.ArrayList(vaxis.Segment).empty;
         try segs.append(a, .{ .text = line.items, .style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = style.bg } });
         try segs.append(a, .{ .text = icon.glyph, .style = .{ .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) }, .bg = style.bg } });
         if (shown_cells > 0) {
             try segs.append(a, .{ .text = " ", .style = style });
-            try segs.append(a, .{ .text = shown, .style = style });
+            try segs.append(a, .{ .text = shown, .style = name_style });
             if (ellipsized) try segs.append(a, .{ .text = "…", .style = style });
         }
-        const pads = try a.alloc(u8, usable -| content_cells);
+        const pads = try a.alloc(u8, usable -| content_cells -| (if (badge != null) @as(u32, 2) else 0));
         @memset(pads, ' ');
         if (pads.len > 0) try segs.append(a, .{ .text = pads, .style = style });
+        if (badge) |b| {
+            try segs.append(a, .{ .text = try a.dupe(u8, &b.text), .style = .{ .fg = .{ .rgb = badge_rgb }, .bg = style.bg, .bold = true } });
+        }
         _ = win.print(segs.items, .{ .row_offset = @intCast(body_top + @as(u32, @intCast(k))), .col_offset = @intCast(inner_left), .wrap = .none });
         if (self.mouseTargetsCollecting()) {
             // Inner row rect (starts after the left border so a label never
@@ -3428,11 +3443,6 @@ pub fn render(self: *App) !void {
         }
     }
 
-    // file tree sidebar (nvim neo-tree style: the panel shares the
-    // EDITOR background — Normal bg, not a float — so sidebar and text
-    // area read as one surface; only the fg_faint border separates them)
-    if (self.filetree_active) try renderNavigator(self, a, win, height);
-
     // multi-cursor word highlights (overlay)
     if (self.mc_active) {
         for (self.mc.cursors.items) |cpos| {
@@ -3573,6 +3583,10 @@ pub fn render(self: *App) !void {
             }
         }
     }
+
+    // The compact Files peek covers editor cells, including inline
+    // diagnostics, blame text and motion labels painted above.
+    if (self.filetree_active) try renderNavigator(self, a, win, height);
 
     // Pane surfaces first; the terminal then covers their shared rectangle.
     // Global modal overlays below retain their matching input priority.
@@ -4885,7 +4899,7 @@ pub fn run(self: *App) !void {
         // Consume a completed git job (status refresh / blame / hunk
         // apply): gutter marks, branch and floats update without a
         // keypress, same as the LSP slots.
-        var git_ready = false;
+        var git_ready = self.navigator_git.tick(self);
         if (self.git_job) |job| {
             if (job.done.load(.acquire)) {
                 self.consumeGitJob(job);
