@@ -4,6 +4,7 @@
 const std = @import("std");
 const porcelain = @import("repo_status.zig");
 const App = @import("../app.zig").App;
+const watch = @import("filetree_watch.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Badge = struct {
@@ -93,6 +94,9 @@ pub const Monitor = struct {
     scope: ?[]u8 = null,
     generation: u64 = 0,
     stopping: bool = false,
+    tree_dirty: bool = true,
+    targets: ?watch.Targets = null,
+    pending_dirs: ?watch.Changes = null,
     mutex: std.Io.Mutex = .init,
     signal: std.Io.Condition = .init,
     task: ?std.Io.Future(void) = null,
@@ -126,7 +130,16 @@ pub const Monitor = struct {
         }
         self.mutex.lockUncancelable(app.io);
         defer self.mutex.unlock(app.io);
+        if (root != null and (self.tree_dirty or !self.matches(root))) {
+            if (watch.Targets.capture(app)) |targets| {
+                if (self.targets) |*old| old.arena.deinit();
+                self.targets = targets;
+                self.tree_dirty = false;
+            } else |_| self.tree_dirty = true;
+        }
         if (!self.matches(root)) {
+            if (self.pending_dirs) |*old| old.arena.deinit();
+            self.pending_dirs = null;
             const new = if (root) |dir| app.alloc.dupe(u8, dir) catch null else null;
             if (self.scope) |old| app.alloc.free(old);
             self.scope = new;
@@ -149,12 +162,22 @@ pub const Monitor = struct {
         if (self.visible) |*s| s.deinit(app.alloc);
         self.visible = self.pending;
         self.pending = null;
+        if (self.pending_dirs) |*changes| {
+            defer {
+                changes.arena.deinit();
+                self.pending_dirs = null;
+            }
+            const rows_changed = @import("filetree.zig").applyDirectoryChanges(app, changes) catch false;
+            return changed or rows_changed;
+        }
         return changed;
     }
 
     fn worker(self: *Monitor, app: *App) void {
         const io = app.io;
         var seen: u64 = 0;
+        var targets: ?watch.Targets = null;
+        defer if (targets) |*t| t.arena.deinit();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         while (!self.stopping) {
@@ -169,14 +192,23 @@ pub const Monitor = struct {
             const scope = self.scope orelse continue;
             seen = self.generation;
             const dir = app.alloc.dupe(u8, scope) catch continue;
+            if (self.targets) |new| {
+                if (targets) |*old| old.arena.deinit();
+                targets = new;
+                self.targets = null;
+            }
             self.mutex.unlock(io);
+            var dirs = if (targets) |*t| t.scan(app.alloc, io) catch null else null;
             var result: ?Snapshot = Snapshot.read(app.alloc, io, dir) catch null;
             app.alloc.free(dir);
             self.mutex.lockUncancelable(io);
             if (self.stopping or self.generation != seen) {
+                if (dirs) |*d| d.arena.deinit();
                 if (result) |*s| s.deinit(app.alloc);
                 continue;
             }
+            if (self.pending_dirs) |*old| old.arena.deinit();
+            self.pending_dirs = dirs;
             if (self.pending) |*s| s.deinit(app.alloc);
             self.pending = result;
             self.has_reply = true;
@@ -192,6 +224,8 @@ pub const Monitor = struct {
             self.mutex.unlock(app.io);
             task.cancel(app.io);
         }
+        if (self.targets) |*t| t.arena.deinit();
+        if (self.pending_dirs) |*d| d.arena.deinit();
         if (self.scope) |p| app.alloc.free(p);
         if (self.pending) |*s| s.deinit(app.alloc);
         if (self.visible) |*s| s.deinit(app.alloc);

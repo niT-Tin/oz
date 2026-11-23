@@ -14482,6 +14482,60 @@ test "navigator git badges: XY, conflicts, deleted parent, live save/stage/check
     }
 }
 
+test "navigator git badges: live directory entries keep selected path, expanded children and grapheme-aligned badges" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const root = try std.fmt.allocPrint(a, "/tmp/oz_nav_entries_{d}", .{linux.getpid()});
+    defer a.free(root);
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try gitBadgeFixture(io, root,
+        \\git init -q && mkdir sub
+        \\for f in sub/keep sub/old sub/unlink 'hand👋🏿.txt' plain.txt z-focus; do echo "$f" > "$f"; done
+        \\git add . && git -c user.name=E2E -c user.email=e2e@example.com commit -qm initial
+        \\echo changed >> 'hand👋🏿.txt' && echo changed >> plain.txt
+    );
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "z-focus" }, &.{}, 24, 120, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 120);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "NORMAL", 8000);
+    try sess.send(" e");
+    const first = navBodyRow();
+    const divider = nav_model.panel_width - 1;
+    for ([_]usize{ first + 1, first + 2 }) |r| {
+        try gridWaitRowContains(&sess, &grid, r, ".M│", 5000);
+        try std.testing.expectEqualStrings(".", frame.cellText(&grid, r, divider - 2));
+        try std.testing.expectEqualStrings("M", frame.cellText(&grid, r, divider - 1));
+        try std.testing.expectEqualStrings("│", frame.cellText(&grid, r, divider));
+        try std.testing.expectEqualStrings(" ", frame.cellText(&grid, r, divider + 1));
+    }
+    try sess.send("lG");
+    try gridWaitRowContains(&sess, &grid, first + 3, "unlink", 3000);
+    try gitBadgeFixture(io, root,
+        \\touch a-new-root sub/new-child
+        \\git mv sub/old sub/renamed
+        \\rm sub/unlink
+    );
+    try gridWaitRowContains(&sess, &grid, first + 4, "a-new-root", 8000);
+    try gridWaitRowContains(&sess, &grid, first + 4, "??│", 3000);
+    try gridWaitRowContains(&sess, &grid, first + 2, "new-child", 3000);
+    try gridWaitRowContains(&sess, &grid, first + 3, "renamed", 3000);
+    try gridWaitRowContains(&sess, &grid, first + 3, "R.│", 3000);
+    try std.testing.expect(!grid.contains("unlink"));
+    try std.testing.expect(!aiRowContains(&grid, first + 2, "old"));
+    try std.testing.expect(aiRowContains(&grid, grid.row, "z-focus"));
+
+    // These two untracked paths vanish from porcelain as well as the tree.
+    try gitBadgeFixture(io, root, "rm a-new-root sub/new-child");
+    try gridWaitGone(&sess, &grid, "a-new-root", 8000);
+    try gridWaitGone(&sess, &grid, "new-child", 3000);
+    try std.testing.expect(aiRowContains(&grid, first + 1, "keep"));
+    try std.testing.expect(aiRowContains(&grid, grid.row, "z-focus"));
+    try aiQuit(&sess);
+}
+
 test "navigator git badges: switching linked worktrees while a status reply is held" {
     const io = std.testing.io;
     const a = std.testing.allocator;

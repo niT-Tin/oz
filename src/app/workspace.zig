@@ -154,6 +154,7 @@ fn storeFiletree(self: *App, ws: *Workspace) void {
 /// load, before the slot's other fields are reset.
 fn loadFiletree(self: *App, ws: *Workspace) void {
     self.filetree_root = ws.filetree_root;
+    self.navigator_git.tree_dirty = true;
     self.filetree_rows = ws.filetree_rows;
     self.filetree_active = ws.filetree_active;
     self.filetree_sel = ws.filetree_sel;

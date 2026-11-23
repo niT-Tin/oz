@@ -2158,15 +2158,13 @@ fn renderFiletreeRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, body_
         try line.appendSlice(a, if (last_sibling) "└╴" else "├╴");
         const prefix_cells: u32 = 1 + 2 * @as(u32, @intCast(an)) + 2;
 
-        // name budget in CELLS (CJK names are 2 cells/glyph)
-        const avail_name: u32 = usable -| badge_width -| prefix_cells -| 1 -| 1;
-        var shown = buffer.utf8.truncateWidth(node.name, avail_name);
-        const ellipsized = shown.len < node.name.len;
-        if (ellipsized and avail_name > 0) {
-            shown = buffer.utf8.truncateWidth(node.name, avail_name - 1);
-        }
-        const shown_cells = buffer.utf8.displayWidth(shown);
-        const content_cells: u32 = prefix_cells + 1 + (if (shown_cells > 0) 1 + shown_cells + @as(u32, if (ellipsized) 1 else 0) else 0);
+        const icon_cells = win.gwidth(icon.glyph);
+        const avail = usable -| badge_width -| prefix_cells -| icon_cells -| 1;
+        var fit = autil.cellFitPrefix(win, node.name, avail);
+        const ellipsized = fit.slice.len < node.name.len and avail >= win.gwidth("…");
+        if (ellipsized) fit = autil.cellFitPrefix(win, node.name, avail - win.gwidth("…"));
+        const name_cells = fit.cells + (if (ellipsized) win.gwidth("…") else 0);
+        const content_cells = prefix_cells + icon_cells + @as(u32, @intCast(if (name_cells > 0) name_cells + 1 else 0));
 
         const style: vaxis.Style = if (ri == self.filetree_sel)
             .{ .bg = .{ .rgb = self.theme.bg_sel }, .fg = .{ .rgb = self.theme.fg } }
@@ -2186,9 +2184,9 @@ fn renderFiletreeRows(self: *App, a: std.mem.Allocator, win: vaxis.Window, body_
         var segs = std.ArrayList(vaxis.Segment).empty;
         try segs.append(a, .{ .text = line.items, .style = .{ .fg = .{ .rgb = self.theme.fg_faint }, .bg = style.bg } });
         try segs.append(a, .{ .text = icon.glyph, .style = .{ .fg = .{ .rgb = icons.rgbOf(self.theme, icon.color) }, .bg = style.bg } });
-        if (shown_cells > 0) {
+        if (name_cells > 0) {
             try segs.append(a, .{ .text = " ", .style = style });
-            try segs.append(a, .{ .text = shown, .style = name_style });
+            try segs.append(a, .{ .text = fit.slice, .style = name_style });
             if (ellipsized) try segs.append(a, .{ .text = "…", .style = style });
         }
         const pads = try a.alloc(u8, usable -| content_cells -| (if (badge != null) @as(u32, 2) else 0));
