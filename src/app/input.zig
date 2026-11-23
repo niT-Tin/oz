@@ -54,6 +54,7 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
 }
 
 fn handleKeyInner(self: *App, key: vaxis.Key) !void {
+    if (self.cell_edit != null) return @import("table_cell_ui.zig").key(self, key);
     // Keyboard hints (M2.6a): while the overlay is active it owns every key
     // — label characters, Backspace and Esc. Routed before terminal/macro/
     // AI/picker/editor handling so label chars can never leak into a
@@ -356,6 +357,10 @@ fn handleKeyInner(self: *App, key: vaxis.Key) !void {
         try self.blockInsert(key.codepoint == 'A');
         return;
     }
+
+    if (self.state.mode == .normal and key.codepoint == 'i' and key.mods.eql(.{}) and
+        editor.Mode.idle(&self.state) and try @import("table_cell_ui.zig").start(self))
+        return;
 
     // Insert mode: characters insert directly; jk exits (removing the
     // just-typed 'j'), backspace and Ctrl-w delete before the cursor.
