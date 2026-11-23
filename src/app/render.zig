@@ -389,17 +389,10 @@ pub fn lineDisplayRows(self: *App, win: vaxis.Window, buf: *Buffer, buf_index: u
     return lineWrap(self, win, buf, buf_index, line, content_width, null).rows;
 }
 
-pub fn markdownVirtualRows(win: vaxis.Window, layout: ?*const markdown.Layout, line: u32, content_width: u32, before: bool, after: bool) u32 {
+pub fn markdownTopRuleRows(layout: ?*const markdown.Layout, line: u32) u32 {
     const md = layout orelse return 0;
     const info = md.get(line) orelse return 0;
-    var rows: u32 = 0;
-    if (before) {
-        for (info.before) |text| rows += markdown.wrappedRows(win, text, content_width);
-    }
-    if (after) {
-        for (info.after) |text| rows += markdown.wrappedRows(win, text, content_width);
-    }
-    return rows;
+    return @intFromBool(info.top_rule != null);
 }
 
 fn loadMarkdownImage(self: *App, path: []const u8) !vaxis.Image {
@@ -522,8 +515,8 @@ fn drawMarkdownImage(self: *App, a: std.mem.Allocator, win: vaxis.Window, rect: 
 pub fn displayRowsWithMarkdown(self: *App, win: vaxis.Window, buf: *Buffer, buf_index: usize, line: u32, content_width: u32, layout: ?*const markdown.Layout, cursor_line: u32) u32 {
     if (layout) |md| {
         if (md.get(line)) |info| {
-            const virtual_rows = markdownVirtualRows(win, layout, line, content_width, true, true) +
-                markdownImageRows(self, win, info, content_width);
+            const virtual_rows = markdownImageRows(self, win, info, content_width) +
+                @intFromBool(info.top_rule != null) + @intFromBool(info.bottom_rule != null);
             if (info.wrapped_table) |table| return virtual_rows + @as(u32, @intCast(table.rows.len));
             var display_width = info.display_width;
             if (display_width == 0 and info.gaps.len == 1 and
@@ -564,7 +557,7 @@ pub fn focusedScreenPos(self: *App, win: vaxis.Window, rect: LeafRect, line: u32
     while (l < line) : (l = foldNextLine(buf, l)) {
         row += displayRowsWithMarkdown(self, win, buf, self.current, l, cw, md_layout, cursor_line);
     }
-    row += markdownVirtualRows(win, md_layout, line, cw, true, false);
+    row += markdownTopRuleRows(md_layout, line);
     const cursor = markdownCursor(md_layout, line, pos) orelse lineWrap(self, win, buf, self.current, line, cw, pos).cursor;
     const skipped = self.windows.items[self.current_win].view_wrap;
     return .{
@@ -578,45 +571,34 @@ fn markdownCursor(layout: ?*const markdown.Layout, line: u32, pos: u32) ?wrap.Po
     return (info.wrapped_table orelse return null).cursorAt(pos);
 }
 
-fn printMarkdownVirtual(
+fn printMarkdownRule(
     a: std.mem.Allocator,
     win: vaxis.Window,
     rect: LeafRect,
-    start_row: u32,
+    row: u32,
     gutter: u32,
-    content_width: u32,
-    lines: []const []const u8,
+    rule: ?[]const u8,
     style: vaxis.Style,
 ) !u32 {
-    var row = start_row;
+    const text = rule orelse return row;
+    if (row >= rect.row + rect.height) return row;
+    // A table rule is a single structural row. The layout already sizes
+    // its cells; never feed a corner into an ordinary text continuation.
+    const pane_row = win.child(.{
+        .x_off = @intCast(rect.col),
+        .y_off = @intCast(row),
+        .width = @intCast(rect.width),
+        .height = 1,
+    });
     const blank = try a.alloc(u8, gutter);
     @memset(blank, ' ');
-    for (lines) |text| {
-        const stable_text = try a.dupe(u8, text);
-        var offset: usize = 0;
-        while (offset < text.len or (text.len == 0 and offset == 0)) {
-            if (row >= rect.row + rect.height) return row;
-            var take: usize = 0;
-            var used: u32 = 0;
-            var iter = vaxis.unicode.graphemeIterator(text[offset..]);
-            while (iter.next()) |g| {
-                const gw: u32 = win.gwidth(g.bytes(text[offset..]));
-                if (used + gw > content_width and used > 0) break;
-                used += gw;
-                take = g.start + g.len;
-            }
-            const gutter_seg = [_]vaxis.Segment{.{ .text = blank, .style = style }};
-            _ = win.print(&gutter_seg, .{ .row_offset = @intCast(row), .col_offset = @intCast(rect.col), .wrap = .none });
-            if (take > 0) {
-                const seg = [_]vaxis.Segment{.{ .text = stable_text[offset .. offset + take], .style = style }};
-                _ = win.print(&seg, .{ .row_offset = @intCast(row), .col_offset = @intCast(rect.col + gutter), .wrap = .none });
-            }
-            offset += take;
-            row += 1;
-            if (text.len == 0) break;
-        }
-    }
-    return row;
+    const segs = [_]vaxis.Segment{
+        .{ .text = blank, .style = style },
+        // The per-buffer layout may be replaced by another split this frame.
+        .{ .text = try a.dupe(u8, text), .style = style },
+    };
+    _ = pane_row.print(&segs, .{ .wrap = .none });
+    return row + 1;
 }
 
 fn drawWrappedTable(
@@ -766,7 +748,7 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
     const cursor_pos = markdownCursor(active_md, cursor_line, w.cursor) orelse
         lineWrap(self, win, buf, w.buf, cursor_line, content_width, w.cursor).cursor;
     const cur_line_rows = displayRowsWithMarkdown(self, win, buf, w.buf, cursor_line, content_width, active_md, cursor_line);
-    const cursor_before_rows = markdownVirtualRows(win, active_md, cursor_line, content_width, true, false);
+    const cursor_before_rows = markdownTopRuleRows(active_md, cursor_line);
     const cursor_wrap_row: u32 = cursor_before_rows + cursor_pos.row;
     // Walk back from the destination. Once the screen is full, no earlier
     // line can be visible. A jump to EOF costs at most one viewport of
@@ -1035,13 +1017,13 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         const md_source = if (line != cursor_line) md_info else null;
         const table = if (md_info) |info| info.wrapped_table else null;
         const skip_rows = if (line == w.view_top) w.view_wrap else 0;
-        const skip_before = if (table != null) @min(skip_rows, md_info.?.before.len) else 0;
+        const skip_before = table != null and skip_rows > 0 and md_info.?.top_rule != null;
         if (md_info) |info| {
             const virtual_style: vaxis.Style = .{
                 .fg = .{ .rgb = self.theme.fg_dim },
                 .bg = .{ .rgb = if (info.fence) self.theme.bg_alt else self.theme.bg },
             };
-            row = try printMarkdownVirtual(a, win, rect, row, gutter, content_width, info.before[skip_before..], virtual_style);
+            if (!skip_before) row = try printMarkdownRule(a, win, rect, row, gutter, info.top_rule, virtual_style);
             if (row >= rect.row + rect.height) break;
         }
         const rel: u32 = if (line == cursor_line)
@@ -1149,7 +1131,7 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         const sign_fg = if (diag_mark.len > 1) diag_mark_fg else git_mark_fg;
         const line_row = row;
         if (table) |wrapped_table| {
-            const skip = skip_rows - @as(u32, @intCast(skip_before));
+            const skip = skip_rows - @intFromBool(skip_before);
             if (is_focused and is_cur_line) self.rendered_cursor_row = row + (cursor_pos.row -| skip);
             const query = self.activeSearchQuery();
             if (query) |q| try buf.search_index.ensure(self.alloc, &buf.pt, buf.history.revision, q);
@@ -1158,7 +1140,7 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
                 drawEditorLineSign(win, rect.col + gutter_layout.sign_column, line_row, sign, sign_fg, cursorline_style);
             const info = md_info.?;
             const virtual_style: vaxis.Style = .{ .fg = .{ .rgb = self.theme.fg_dim }, .bg = .{ .rgb = self.theme.bg } };
-            row = try printMarkdownVirtual(a, win, rect, row, gutter, content_width, info.after, virtual_style);
+            row = try printMarkdownRule(a, win, rect, row, gutter, info.bottom_rule, virtual_style);
             row = try drawMarkdownImage(self, a, win, rect, row, gutter, content_width, info);
             continue;
         }
@@ -1742,7 +1724,7 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
                 .fg = .{ .rgb = self.theme.fg_dim },
                 .bg = .{ .rgb = if (info.fence) self.theme.bg_alt else self.theme.bg },
             };
-            row = try printMarkdownVirtual(a, win, rect, row, gutter, content_width, info.after, virtual_style);
+            row = try printMarkdownRule(a, win, rect, row, gutter, info.bottom_rule, virtual_style);
             row = try drawMarkdownImage(self, a, win, rect, row, gutter, content_width, info);
         }
     }

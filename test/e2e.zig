@@ -5307,8 +5307,8 @@ test "markdown: wide tables wrap inside aligned borders and reflow on resize" {
     try std.testing.expect(target.row > first_body.row);
     try std.testing.expect(grid.contains("中文日志"));
     try std.testing.expect(!grid.contains("**Canary**"));
-    try std.testing.expectEqualStrings("┐", frame.cellText(&grid, top.row, 43));
-    try std.testing.expectEqualStrings("┘", frame.cellText(&grid, bottom.row, 43));
+    try std.testing.expectEqualStrings("┐", frame.cellText(&grid, top.row, 42));
+    try std.testing.expectEqualStrings("┘", frame.cellText(&grid, bottom.row, 42));
     var joins: usize = 0;
     for (top.col..44) |col| {
         const cap = frame.cellText(&grid, top.row, col);
@@ -5325,7 +5325,7 @@ test "markdown: wide tables wrap inside aligned borders and reflow on resize" {
     try mouseClickAt(&sess, target.col, target.row);
     try sess.send("rZ");
     try gridWaitFor(&sess, &grid, "ZARGET", 5000);
-    try std.testing.expectEqualStrings("│", frame.cellText(&grid, target.row, 43));
+    try std.testing.expectEqualStrings("│", frame.cellText(&grid, target.row, 42));
     try sess.send("gg");
     try gridWaitFor(&sess, &grid, "# Checklist", 5000);
 
@@ -5368,16 +5368,75 @@ test "markdown: table widths include rows beyond the viewport" {
     try gridWaitFor(&sess, &grid, "┐", 5000);
     const start = aiFindCell(&grid, "┌") orelse return error.TestUnexpectedResult;
     const divider = aiFindCell(&grid, "┬") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("┐", frame.cellText(&grid, start.row, 39));
+    try std.testing.expectEqualStrings("┐", frame.cellText(&grid, start.row, 38));
     try std.testing.expect(!grid.contains("tail-marker"));
     try sess.send("G");
     try gridWaitFor(&sess, &grid, "End of table.", 5000);
     const tail = aiFindCell(&grid, "tail-marker") orelse return error.TestUnexpectedResult;
     const bottom = aiFindCell(&grid, "└") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("│", frame.cellText(&grid, tail.row, divider.col));
-    try std.testing.expectEqualStrings("│", frame.cellText(&grid, tail.row, 39));
+    try std.testing.expectEqualStrings("│", frame.cellText(&grid, tail.row, 38));
     try std.testing.expectEqualStrings("┴", frame.cellText(&grid, bottom.row, divider.col));
-    try std.testing.expectEqualStrings("┘", frame.cellText(&grid, bottom.row, 39));
+    try std.testing.expectEqualStrings("┘", frame.cellText(&grid, bottom.row, 38));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q\r"));
+}
+
+test "markdown: four-column table rules stay on single rows after narrowing the terminal" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const source =
+        \\# Runbook
+        \\
+        \\| 分类 | 场景 | 操作步骤 | 完成标准 |
+        \\| --- | --- | --- | --- |
+        \\| 服务 | 发布 | 先检查服务状态，再处理实例。 Start with the canary deployment and wait for it to become healthy before continuing with the rest of the deployment. | 确认流量恢复并检查日志。 Check that the service has returned to its normal request rate, that alerts are quiet, and that the rollout is complete. |
+        \\| 服务 | 回滚 | Review the last known working version. | Confirm the previous revision is healthy. |
+        \\
+        \\End of runbook.
+        \\
+    ;
+    var name_buf: [192:0]u8 = undefined;
+    const path = try erFixture(io, &name_buf, ".md", source);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{}, 26, 150, "/tmp");
+    defer sess.close();
+    defer killPid(sess.pid);
+
+    for ([_]u16{ 150, 124, 91 }, 0..) |cols, i| {
+        if (i != 0) {
+            const size = Winsize{ .ws_row = 26, .ws_col = cols, .ws_xpixel = cols * 10, .ws_ypixel = 520 };
+            _ = linux.ioctl(sess.pty.master, TIOCSWINSZ, @intFromPtr(&size));
+        }
+        var grid = try Grid.initSizedCols(alloc, 26, cols);
+        defer grid.deinit(alloc);
+        try gridWaitFor(&sess, &grid, "End of runbook.", 5000);
+
+        const top = aiFindCell(&grid, "┌") orelse return error.TestUnexpectedResult;
+        const header = aiFindCell(&grid, "分类") orelse return error.TestUnexpectedResult;
+        const middle = aiFindCell(&grid, "├") orelse return error.TestUnexpectedResult;
+        const bottom = aiFindCell(&grid, "└") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(top.row + 1, header.row);
+        try std.testing.expectEqual(header.row + 1, middle.row);
+        const right = cols - 2;
+        try std.testing.expectEqualStrings("┐", frame.cellText(&grid, top.row, right));
+        try std.testing.expectEqualStrings("┤", frame.cellText(&grid, middle.row, right));
+        try std.testing.expectEqualStrings("┘", frame.cellText(&grid, bottom.row, right));
+        for (top.row..bottom.row + 1) |row| {
+            const margin = frame.cellText(&grid, row, cols - 1);
+            try std.testing.expect(margin.len == 0 or std.mem.eql(u8, margin, " "));
+            if (row != top.row and row != middle.row and row != bottom.row)
+                try std.testing.expectEqualStrings("│", frame.cellText(&grid, row, right));
+        }
+        var joins: usize = 0;
+        for (top.col + 1..right) |col| {
+            if (!std.mem.eql(u8, frame.cellText(&grid, top.row, col), "┬")) continue;
+            joins += 1;
+            try std.testing.expectEqualStrings("│", frame.cellText(&grid, header.row, col));
+            try std.testing.expectEqualStrings("┼", frame.cellText(&grid, middle.row, col));
+            try std.testing.expectEqualStrings("┴", frame.cellText(&grid, bottom.row, col));
+        }
+        try std.testing.expectEqual(@as(usize, 3), joins);
+    }
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q\r"));
 }
 

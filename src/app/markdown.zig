@@ -18,8 +18,8 @@ pub const Image = struct {
 
 pub const Line = struct {
     gaps: []const Gap = &.{},
-    before: []const []const u8 = &.{},
-    after: []const []const u8 = &.{},
+    top_rule: ?[]const u8 = null,
+    bottom_rule: ?[]const u8 = null,
     prefix: []const u8 = "",
     display_width: u32 = 0,
     wrapped_table: ?WrappedTableLine = null,
@@ -216,16 +216,19 @@ fn buildTable(
     const edge = @as(u32, win.gwidth("│"));
     const edges = edge * @as(u32, @intCast(widths.items.len + 1));
     const natural_width = sumWidths(widths.items) + edges + @as(u32, @intCast(widths.items.len * 2));
-    const wrapped = natural_width > content_width;
+    // Keep the right edge clear of the pane boundary, including when
+    // the pane ends at the terminal's autowrap column.
+    const budget = content_width -| 1;
+    const wrapped = natural_width > budget;
     var padding: u32 = 1;
     if (wrapped) {
         const min_width = sumWidths(minimums.items) + edges;
         // When even unpadded cells and dividers cannot fit, show editable
         // source instead of emitting a clipped or overlapping table.
-        if (min_width > content_width) return;
-        if (min_width + @as(u32, @intCast(widths.items.len * 2)) > content_width) padding = 0;
+        if (min_width > budget) return;
+        if (min_width + @as(u32, @intCast(widths.items.len * 2)) > budget) padding = 0;
         const overhead = edges + padding * 2 * @as(u32, @intCast(widths.items.len));
-        fitWidths(widths.items, minimums.items, content_width - overhead);
+        fitWidths(widths.items, minimums.items, budget - overhead);
     }
     const top = try tableBorder(a, widths.items, padding, "┌", "┬", "┐");
     const middle = try tableBorder(a, widths.items, padding, "├", "┼", "┤");
@@ -233,13 +236,13 @@ fn buildTable(
     const table_width = autilWidth(win, top);
     const chrome = if (wrapped) try tableChrome(a, widths.items, padding) else "";
     for (rows.items) |row| {
-        const before: []const []const u8 = if (row.line == first) try a.dupe([]const u8, &.{top}) else &.{};
-        const after: []const []const u8 = if (row.line == last) try a.dupe([]const u8, &.{bottom}) else &.{};
+        const top_rule = if (row.line == first) top else null;
+        const bottom_rule = if (row.line == last) bottom else null;
         if (wrapped) {
             const parts = try wrapTableRow(a, pt, win, table_decors, row.cells, widths.items, aligns.items, padding);
             try layout.entries.put(row.line, .{
-                .before = before,
-                .after = after,
+                .top_rule = top_rule,
+                .bottom_rule = bottom_rule,
                 .display_width = table_width,
                 .table = true,
                 .wrapped_table = .{ .chrome = chrome, .rows = parts, .width = table_width, .start = row.start, .end = row.end },
@@ -275,16 +278,15 @@ fn buildTable(
                 try gaps.append(a, .{ .start = cell.end, .end = row.end, .text = suffix.items });
             }
         }
-        try layout.entries.put(row.line, .{ .gaps = gaps.items, .before = before, .after = after, .display_width = table_width, .table = true });
+        try layout.entries.put(row.line, .{ .gaps = gaps.items, .top_rule = top_rule, .bottom_rule = bottom_rule, .display_width = table_width, .table = true });
     }
     if (delimiter) |dl| {
         if (!visible.contains(dl)) return;
         const start = pt.lineStart(dl);
         const end = start + pt.lineTextLen(dl);
-        const after: []const []const u8 = if (dl == last) try a.dupe([]const u8, &.{bottom}) else &.{};
         try layout.entries.put(dl, .{
             .gaps = if (wrapped) &.{} else try a.dupe(Gap, &.{.{ .start = start, .end = end, .text = middle }}),
-            .after = after,
+            .bottom_rule = if (dl == last) bottom else null,
             .display_width = table_width,
             .table = true,
             .wrapped_table = if (wrapped) .{ .chrome = middle, .rows = &.{.empty}, .width = table_width, .start = start, .end = end } else null,
@@ -450,13 +452,17 @@ fn fitWidths(widths: []u32, minimums: []const u32, budget: u32) void {
         for (widths, minimums) |width, min| used += std.math.clamp(cap, min, width);
         if (used <= budget) lo = cap else hi = cap;
     }
-    var remaining = budget;
-    for (widths, minimums) |width, min| remaining -= std.math.clamp(lo, min, width);
+    // Sum the fitted widths first. Zig 0.17 ReleaseFast on macOS arm64
+    // miscompiles the subtracting reduction for runtime slices.
+    var fitted_total: u32 = 0;
+    for (widths, minimums) |width, min| fitted_total += std.math.clamp(lo, min, width);
+    var remaining = budget - fitted_total;
     for (widths, minimums) |*width, min| {
-        const fitted = std.math.clamp(lo, min, width.*);
-        const extra = remaining > 0 and fitted == lo and fitted < width.*;
-        if (extra) remaining -= 1;
-        width.* = fitted + @intFromBool(extra);
+        const natural = width.*;
+        width.* = std.math.clamp(lo, min, natural);
+        if (remaining == 0 or width.* != lo or width.* == natural) continue;
+        width.* += 1;
+        remaining -= 1;
     }
 }
 
@@ -613,10 +619,6 @@ fn copyRange(a: std.mem.Allocator, pt: *const buffer.PieceTable, start: u32, end
     return text;
 }
 
-pub fn wrappedRows(win: vaxis.Window, text: []const u8, width: u32) u32 {
-    return @max(1, (autilWidth(win, text) + @max(width, 1) - 1) / @max(width, 1));
-}
-
 const TestLayout = struct {
     arena: std.heap.ArenaAllocator,
     pt: buffer.PieceTable,
@@ -637,7 +639,8 @@ const TestLayout = struct {
         var hl = try syntax.Highlighter.init(alloc, "markdown");
         errdefer hl.deinit();
         try hl.reparse(src);
-        var screen = try vaxis.Screen.init(alloc, .{ .rows = 24, .cols = 80, .x_pixel = 800, .y_pixel = 480 });
+        const cols: u16 = @intCast(@max(80, content_width));
+        var screen = try vaxis.Screen.init(alloc, .{ .rows = 24, .cols = cols, .x_pixel = cols * 10, .y_pixel = 480 });
         errdefer screen.deinit(alloc);
         const win = vaxis.Window{
             .x_off = 0,
@@ -674,14 +677,14 @@ test "markdown layout: table borders, CJK widths and alignment" {
     var fixture = try TestLayout.init(src, null);
     defer fixture.deinit();
     const header = fixture.layout.get(0).?;
-    try std.testing.expectEqualStrings("┌──────┬──────┐", header.before[0]);
+    try std.testing.expectEqualStrings("┌──────┬──────┐", header.top_rule.?);
     try std.testing.expect(header.table);
     const delimiter = fixture.layout.get(1).?;
     try std.testing.expectEqualStrings("├──────┼──────┤", delimiter.gaps[0].text);
     const bold = fixture.layout.get(2).?;
     try std.testing.expectEqual(@as(u32, 15), bold.display_width);
     const last = fixture.layout.get(3).?;
-    try std.testing.expectEqualStrings("└──────┴──────┘", last.after[0]);
+    try std.testing.expectEqualStrings("└──────┴──────┘", last.bottom_rule.?);
     try std.testing.expect(std.mem.indexOf(u8, last.gaps[1].text, "│  ") != null);
 }
 
@@ -723,8 +726,7 @@ test "markdown layout: header-only table keeps its bottom border" {
     var fixture = try TestLayout.init(src, null);
     defer fixture.deinit();
     const delimiter = fixture.layout.get(1).?;
-    try std.testing.expectEqual(@as(usize, 1), delimiter.after.len);
-    try std.testing.expect(std.mem.startsWith(u8, delimiter.after[0], "└"));
+    try std.testing.expect(std.mem.startsWith(u8, delimiter.bottom_rule.?, "└"));
 }
 
 test "markdown layout: wide tables fit borders inside the pane" {
@@ -736,6 +738,25 @@ test "markdown layout: wide tables fit borders inside the pane" {
     ;
     var fixture = try TestLayout.initWidth(src, null, 26);
     defer fixture.deinit();
-    try std.testing.expectEqual(@as(u32, 26), fixture.layout.get(0).?.display_width);
-    try std.testing.expectEqual(@as(u32, 26), fixture.layout.get(2).?.display_width);
+    try std.testing.expectEqual(@as(u32, 25), fixture.layout.get(0).?.display_width);
+    try std.testing.expectEqual(@as(u32, 25), fixture.layout.get(2).?.display_width);
+}
+
+test "markdown layout: four columns stay within even and odd cell budgets" {
+    const src =
+        \\| 分类 | 场景 | 操作步骤 | 完成标准 |
+        \\| --- | --- | --- | --- |
+        \\| 服务 | 发布 | 先检查服务状态，再处理实例。 Start with the canary deployment and wait for it to become healthy before continuing with the rest of the deployment. | 确认流量恢复并检查日志。 Check that the service has returned to its normal request rate, that alerts are quiet, and that the rollout is complete. |
+        \\
+    ;
+    for ([_]u32{ 119, 120 }) |pane_width| {
+        var fixture = try TestLayout.initWidth(src, null, pane_width);
+        defer fixture.deinit();
+        const header = fixture.layout.get(0).?;
+        const body = fixture.layout.get(2).?;
+        try std.testing.expectEqual(pane_width - 1, header.display_width);
+        try std.testing.expectEqual(header.display_width, body.display_width);
+        try std.testing.expect(header.top_rule != null);
+        try std.testing.expect(body.bottom_rule != null);
+    }
 }

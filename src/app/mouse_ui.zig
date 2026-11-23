@@ -476,7 +476,7 @@ fn panePositionAt(self: *App, win_idx: usize, rect: mouse.Rect, col: u32, row: u
     // Only wrapped tables count their leading rule as skippable.
     if (md) |layout| {
         if (layout.get(line)) |info| {
-            if (info.wrapped_table == null and dr < render.markdownVirtualRows(win, md, line, content_width, true, false))
+            if (info.wrapped_table == null and info.top_rule != null and dr == 0)
                 rem = dr;
         }
     }
@@ -487,7 +487,7 @@ fn panePositionAt(self: *App, win_idx: usize, rect: mouse.Rect, col: u32, row: u
         const rows = render.displayRowsWithMarkdown(self, win, buf, w.buf, line, content_width, md, cursor_line);
         if (rem < rows) {
             target_line = line;
-            const before = render.markdownVirtualRows(win, md, line, content_width, true, false);
+            const before = render.markdownTopRuleRows(md, line);
             const start = buf.pt.lineStart(line);
             if (rem < before or clicked_cell < gutter) return start;
             chunk = rem - before;
