@@ -1706,8 +1706,8 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
-        self.navigator_git.deinit(self);
         if (self.pending_filetree_create) |path| self.alloc.free(path);
+        self.navigator_git.deinit(self);
         self.loop.stop();
         // An in-flight LSP attach must be cancelled and joined before the
         // pieces it borrows (env_map, io, the vaxis loop its wake posts to)
