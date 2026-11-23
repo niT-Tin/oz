@@ -125,6 +125,7 @@ pub fn addMouseScrollTarget(self: *App, row: u32, col: u32, width: u32, height: 
 /// border; ordinary motion/release never repaint or steal terminal selection.
 pub fn handleMouse(self: *App, m: vaxis.Mouse) !bool {
     if (!self.mouse.enabled) return false;
+    if (self.cell_edit != null) return false;
     const win = self.vx.window();
     if (self.ai.rail_resizing) {
         if (!self.ai.rail_open or mouseBlocked(self) or m.mods.shift or win.width == 0) {
@@ -467,7 +468,7 @@ fn panePositionAt(self: *App, win_idx: usize, rect: mouse.Rect, col: u32, row: u
         const hl = if (buf.hl) |*h| h else break :blk null;
         if (hl.queries.decorations == null or hl.tree == null) break :blk null;
         const decors = try self.visibleDecorsFor(buf, a, w.view_top, rect.height);
-        break :blk try @import("highlight.zig").markdownForRange(buf, a, win, decors, w.view_top, rect.height, content_width);
+        break :blk try @import("highlight.zig").markdownForRange(buf, a, win, decors, w.view_top, rect.height, content_width, null);
     };
     const cursor_line = buf.pt.lineOf(@min(w.cursor, buf.pt.len()));
 

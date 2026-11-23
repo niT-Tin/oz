@@ -200,7 +200,7 @@ pub fn visibleMarkdownFor(
     buf.markdown_arena = std.heap.ArenaAllocator.init(self.alloc);
     buf.markdown_layout = null;
     const a = buf.markdown_arena.?.allocator();
-    const layout = try markdownForRange(buf, a, win, decors, view_top, content_rows, content_width);
+    const layout = try markdownForRange(buf, a, win, decors, view_top, content_rows, content_width, null);
     buf.markdown_layout = layout;
     buf.markdown_cache_rev = rev;
     buf.markdown_cache_top = view_top;
@@ -217,6 +217,7 @@ pub fn markdownForRange(
     view_top: u32,
     content_rows: u32,
     content_width: u32,
+    draft: ?@import("table_cell.zig").Preview,
 ) !*markdown.Layout {
     const start = buf.pt.lineStart(view_top);
     const bottom = view_top + content_rows;
@@ -230,13 +231,13 @@ pub fn markdownForRange(
         table_end = @max(table_end, d.end);
     }
     if (table_start == start and table_end == end)
-        return markdown.build(a, &buf.pt, decors, win, content_width, buf.path, visible);
+        return markdown.build(a, &buf.pt, decors, win, content_width, buf.path, visible, draft);
 
     // A table entering or leaving the viewport must keep the same widths.
     // Query its full set of cells and inline decorations before layout.
     var full = std.ArrayList(syntax.Decor).empty;
     try buf.hl.?.decorInRange(table_start, table_end, a, &full);
-    return markdown.build(a, &buf.pt, full.items, win, content_width, buf.path, visible);
+    return markdown.build(a, &buf.pt, full.items, win, content_width, buf.path, visible, draft);
 }
 
 /// Load recent files from ~/.cache/oz/recent (one path per line).

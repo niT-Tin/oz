@@ -5440,6 +5440,100 @@ test "markdown: four-column table rules stay on single rows after narrowing the 
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q\r"));
 }
 
+test "markdown: i opens a cell editor with live lists, one undo and safe source" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const source = "# Checklist\n\n| ID | Details | Status |\n| --- | --- | --- |\n| oz | draft | ready |\n\nTail of checklist.\n";
+    var name_buf: [192:0]u8 = undefined;
+    const path = try erFixture(io, &name_buf, ".md", source);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{}, 30, 64, "/tmp");
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 30, 64);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "Tail of checklist.", 5000);
+
+    try sess.send("4jfdi");
+    try gridWaitFor(&sess, &grid, "Edit cell", 5000);
+    const panel = aiFindCell(&grid, "Edit cell") orelse return error.TestUnexpectedResult;
+    try sess.send("\x1b[F\r- first\rsecond");
+    try gridWaitFor(&sess, &grid, "• second", 5000);
+    try sess.send("\x1b[200~\n1. 检查\x1b[201~\rcheck | logs");
+    try gridWaitFor(&sess, &grid, "2. check | logs", 5000);
+    const preview = aiFindCell(&grid, "2. check | logs") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(preview.row < panel.row);
+    try std.testing.expect(grid.contains("• first"));
+    try std.testing.expect(grid.contains("1. 检查"));
+    const border = aiFindCell(&grid, "┐") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("│", frame.cellText(&grid, preview.row, border.col));
+    const before_save = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024));
+    defer a.free(before_save);
+    try std.testing.expectEqualStrings(source, before_save);
+
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "Edit cell", 5000);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 5000);
+    try std.testing.expect(grid.contains("2. check | logs"));
+    try sess.send("u");
+    try gridWaitGone(&sess, &grid, "2. check | logs", 5000);
+    try std.testing.expect(!grid.contains("• first"));
+    try sess.send("\x12");
+    try gridWaitFor(&sess, &grid, "2. check | logs", 5000);
+
+    try sess.send("i");
+    try gridWaitFor(&sess, &grid, "Edit cell", 5000);
+    const reopened = aiFindCell(&grid, "Edit cell") orelse return error.TestUnexpectedResult;
+    try gridWaitRowContains(&sess, &grid, reopened.row + 5, "2. check | logs", 5000);
+    try sess.send("cancelled\x03");
+    try gridWaitGone(&sess, &grid, "Edit cell", 5000);
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 5000);
+    try gridWaitGone(&sess, &grid, "cancelled", 5000);
+
+    // Vim's f| still goes to a real source delimiter, even though the
+    // rendered border is │. Insert on a delimiter uses source editing.
+    try sess.send("0f|i");
+    try gridWaitFor(&sess, &grid, "[INSERT]", 5000);
+    try gridWaitFor(&sess, &grid, "draft<br>- first", 5000);
+    try std.testing.expect(!grid.contains("Edit cell"));
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+
+    const saved = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024));
+    defer a.free(saved);
+    const expected = try std.mem.replaceOwned(u8, a, source, "draft", "draft<br>- first<br>- second<br>1. 检查<br>2. check \\| logs");
+    defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, saved);
+}
+
+test "markdown: editing a neighboring word preserves literal entities inside cell code" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const source = "| Example | Kind |\n| --- | --- |\n| Zed: \x60&#124;\x60 | syntax |\n";
+    var name_buf: [192:0]u8 = undefined;
+    const path = try erFixture(io, &name_buf, ".md", source);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{}, 24, 80, "/tmp");
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(a);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "&#124;", 5000);
+    try sess.send("2jfZi");
+    try gridWaitFor(&sess, &grid, "Edit cell", 5000);
+    try sess.send("X");
+    try gridWaitFor(&sess, &grid, "XZed", 5000);
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "Edit cell", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+    const saved = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024));
+    defer a.free(saved);
+    const expected = try std.mem.replaceOwned(u8, a, source, "Zed", "XZed");
+    defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, saved);
+}
+
 test "markdown: local PNG uses Kitty graphics placement" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;

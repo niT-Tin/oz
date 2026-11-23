@@ -107,6 +107,7 @@ pub const app_tool_job = @import("app/tool_job.zig");
 // M3b3 terminal command worker (real POSIX spawn/kill; App-side)
 pub const app_terminal_job = @import("app/terminal_job.zig");
 pub const app_markdown = @import("app/markdown.zig");
+pub const app_table_cell = @import("app/table_cell.zig");
 
 test {
     std.testing.refAllDecls(@This());

@@ -3,6 +3,7 @@ const vaxis = @import("vaxis");
 const buffer = @import("../buffer/root.zig");
 const syntax = @import("../syntax.zig");
 const wrap = @import("wrap.zig");
+const table_cell = @import("table_cell.zig");
 
 pub const Gap = struct {
     start: u32,
@@ -25,6 +26,7 @@ pub const Line = struct {
     wrapped_table: ?WrappedTableLine = null,
     fence: bool = false,
     table: bool = false,
+    cells: []const Cell = &.{},
     image: ?Image = null,
 };
 
@@ -36,10 +38,11 @@ pub const Layout = struct {
     }
 };
 
-const Cell = struct {
-    start: u32,
-    end: u32,
+pub const Cell = struct {
+    range: table_cell.Range,
     width: u32,
+    min_width: u32,
+    draft: ?[]const u8 = null,
 };
 
 pub const TableGlyph = struct {
@@ -47,11 +50,13 @@ pub const TableGlyph = struct {
     start: u32,
     end: u32,
     width: u32,
+    line_break: bool = false,
 };
 
 pub const TablePart = struct {
     col: u32,
     glyphs: []const TableGlyph,
+    draft_end: ?usize = null,
 };
 
 pub const WrappedTableLine = struct {
@@ -60,6 +65,19 @@ pub const WrappedTableLine = struct {
     width: u32,
     start: u32,
     end: u32,
+
+    pub fn draftCursorAt(self: WrappedTableLine, caret: usize) ?wrap.Pos {
+        var last: ?wrap.Pos = null;
+        for (self.rows, 0..) |row, ri| {
+            for (row.items) |part| {
+                const end = part.draft_end orelse continue;
+                const pos: wrap.Pos = .{ .row = @intCast(ri), .col = part.col };
+                if (caret <= end) return pos;
+                last = pos;
+            }
+        }
+        return last;
+    }
 
     pub fn cursorAt(self: WrappedTableLine, pos: u32) wrap.Pos {
         if (pos <= self.start) return .{ .row = 0, .col = 0 };
@@ -130,13 +148,14 @@ pub fn build(
     content_width: u32,
     document_path: ?[]const u8,
     visible: LineRange,
+    draft: ?table_cell.Preview,
 ) !*Layout {
     const layout = try a.create(Layout);
     layout.* = .{ .entries = std.AutoHashMap(u32, Line).init(a) };
     for (decors) |d| {
         if (d.kind == .table) {
             const first = pt.lineOf(d.start);
-            if (!layout.entries.contains(first)) try buildTable(a, pt, decors, win, layout, d, content_width, visible);
+            if (!layout.entries.contains(first)) try buildTable(a, pt, decors, win, layout, d, content_width, visible, draft);
         }
     }
     for (decors) |d| {
@@ -155,6 +174,7 @@ fn buildTable(
     table: syntax.Decor,
     content_width: u32,
     visible: LineRange,
+    draft: ?table_cell.Preview,
 ) !void {
     const first = pt.lineOf(table.start);
     const last = pt.lineOf(table.end -| 1);
@@ -163,6 +183,7 @@ fn buildTable(
     var aligns = std.ArrayList(Alignment).empty;
     var rows = std.ArrayList(Row).empty;
     var delimiter: ?u32 = null;
+    var structured = false;
     const first_decor = decorLowerBound(decors, table.start);
     const table_decors = decors[first_decor..decorLowerBound(decors, table.end)];
     for (table_decors) |d| {
@@ -193,9 +214,17 @@ fn buildTable(
             const lead = std.mem.indexOfNone(u8, cell_text, " \t") orelse cell_text.len;
             const cs = d.start + @as(u32, @intCast(lead));
             const ce = if (lead == cell_text.len) cs else d.start + @as(u32, @intCast((std.mem.lastIndexOfNone(u8, cell_text, " \t").? + 1)));
-            const metrics = try tableGlyphs(a, win, cell_text[lead .. ce - d.start], cs, line_decors, null);
+            const preview = if (draft) |p| (if (p.start == cs and p.end == ce) p.text else null) else null;
+            const raw = preview orelse cell_text[lead .. ce - d.start];
+            const metrics = try tableGlyphs(a, win, raw, cs, line_decors, preview != null, null);
+            structured = structured or preview != null or metrics.transformed or table_cell.marker(raw) != null;
             const col = cells.items.len;
-            try cells.append(a, .{ .start = cs, .end = ce, .width = metrics.width });
+            try cells.append(a, .{
+                .range = .{ .start = cs, .end = ce, .outer_start = d.start, .outer_end = d.end },
+                .width = metrics.width,
+                .min_width = metrics.min_width,
+                .draft = preview,
+            });
             if (col >= widths.items.len) {
                 try widths.append(a, metrics.width);
                 try minimums.append(a, metrics.min_width);
@@ -219,9 +248,10 @@ fn buildTable(
     // Keep the right edge clear of the pane boundary, including when
     // the pane ends at the terminal's autowrap column.
     const budget = content_width -| 1;
-    const wrapped = natural_width > budget;
+    const needs_fit = natural_width > budget;
+    const wrapped = needs_fit or structured;
     var padding: u32 = 1;
-    if (wrapped) {
+    if (needs_fit) {
         const min_width = sumWidths(minimums.items) + edges;
         // When even unpadded cells and dividers cannot fit, show editable
         // source instead of emitting a clipped or overlapping table.
@@ -245,6 +275,7 @@ fn buildTable(
                 .bottom_rule = bottom_rule,
                 .display_width = table_width,
                 .table = true,
+                .cells = row.cells,
                 .wrapped_table = .{ .chrome = chrome, .rows = parts, .width = table_width, .start = row.start, .end = row.end },
             });
             continue;
@@ -253,7 +284,7 @@ fn buildTable(
         const first_cell = row.cells[0];
         try gaps.append(a, .{
             .start = row.start,
-            .end = first_cell.start,
+            .end = first_cell.range.start,
             .text = try std.mem.concat(a, u8, &.{ "│ ", try alignmentPad(a, widths.items[0], first_cell.width, aligns.items[0], true) }),
         });
         for (row.cells, 0..) |cell, ci| {
@@ -262,8 +293,8 @@ fn buildTable(
                 const next = row.cells[ci + 1];
                 const left_pad = try alignmentPad(a, widths.items[ci + 1], next.width, aligns.items[ci + 1], true);
                 try gaps.append(a, .{
-                    .start = cell.end,
-                    .end = next.start,
+                    .start = cell.range.end,
+                    .end = next.range.start,
                     .text = try std.mem.concat(a, u8, &.{ right_pad, " │ ", left_pad }),
                 });
             } else {
@@ -275,10 +306,10 @@ fn buildTable(
                     try appendSpaces(a, &suffix, widths.items[missing] + 2);
                     try suffix.appendSlice(a, "│");
                 }
-                try gaps.append(a, .{ .start = cell.end, .end = row.end, .text = suffix.items });
+                try gaps.append(a, .{ .start = cell.range.end, .end = row.end, .text = suffix.items });
             }
         }
-        try layout.entries.put(row.line, .{ .gaps = gaps.items, .top_rule = top_rule, .bottom_rule = bottom_rule, .display_width = table_width, .table = true });
+        try layout.entries.put(row.line, .{ .gaps = gaps.items, .top_rule = top_rule, .bottom_rule = bottom_rule, .display_width = table_width, .table = true, .cells = row.cells });
     }
     if (delimiter) |dl| {
         if (!visible.contains(dl)) return;
@@ -481,27 +512,64 @@ fn wrapTableRow(
     const edge: u32 = win.gwidth("│");
     var col = edge + padding;
     for (cells, widths[0..cells.len], aligns[0..cells.len]) |cell, width, alignment| {
-        const raw = try copyRange(a, pt, cell.start, cell.end);
+        const raw = cell.draft orelse try copyRange(a, pt, cell.range.start, cell.range.end);
         var glyphs = std.ArrayList(TableGlyph).empty;
-        _ = try tableGlyphs(a, win, raw, cell.start, decors, &glyphs);
-        var i: usize = 0;
+        _ = try tableGlyphs(a, win, raw, cell.range.start, decors, cell.draft != null, &glyphs);
+        var start: usize = 0;
         var ri: usize = 0;
-        while (i < glyphs.items.len) : (ri += 1) {
-            const part = takeCellLine(glyphs.items, &i, width);
-            if (ri == rows.items.len) try rows.append(a, .empty);
-            const left = switch (alignment) {
-                .left => 0,
-                .center => (width - part.width) / 2,
-                .right => width - part.width,
-            };
-            try rows.items[ri].append(a, .{ .col = col + left, .glyphs = part.glyphs });
+        while (start <= glyphs.items.len) {
+            var end = start;
+            while (end < glyphs.items.len and !glyphs.items[end].line_break) : (end += 1) {}
+            const logical = glyphs.items[start..end];
+            const list = listMarker(logical);
+            if (list) |m| {
+                if (m.number == null) logical[0].text = "•";
+            }
+            const hang: u32 = if (list) |m| @intCast(m.len) else 0;
+            var i: usize = 0;
+            while (true) : (ri += 1) {
+                const indent = if (i != 0 and width -| hang >= cell.min_width) hang else 0;
+                const part: CellLine = if (logical.len == 0) .{} else takeCellLine(logical, &i, width - indent);
+                if (ri == rows.items.len) try rows.append(a, .empty);
+                const left = if (list != null) indent else switch (alignment) {
+                    .left => 0,
+                    .center => (width - part.width) / 2,
+                    .right => width - part.width,
+                };
+                const draft_end = if (cell.draft == null) null else if (i < logical.len)
+                    @as(usize, logical[i].start)
+                else if (end < glyphs.items.len)
+                    @as(usize, glyphs.items[end].start)
+                else
+                    raw.len;
+                try rows.items[ri].append(a, .{ .col = col + left, .glyphs = part.glyphs, .draft_end = draft_end });
+                if (i == logical.len) {
+                    ri += 1;
+                    break;
+                }
+            }
+            start = end + 1;
         }
         col += width + padding * 2 + edge;
     }
     return rows.items;
 }
 
-fn takeCellLine(glyphs: []const TableGlyph, offset: *usize, width: u32) struct { glyphs: []const TableGlyph, width: u32 } {
+fn listMarker(glyphs: []const TableGlyph) ?table_cell.Marker {
+    var prefix: [11]u8 = undefined;
+    var count: usize = 0;
+    for (glyphs[0..@min(glyphs.len, prefix.len)]) |g| {
+        if (g.text.len != 1) break;
+        prefix[count] = g.text[0];
+        count += 1;
+        if (g.text[0] == ' ') break;
+    }
+    return table_cell.marker(prefix[0..count]);
+}
+
+const CellLine = struct { glyphs: []const TableGlyph = &.{}, width: u32 = 0 };
+
+fn takeCellLine(glyphs: []const TableGlyph, offset: *usize, width: u32) CellLine {
     const start = offset.*;
     var i = start;
     var used: u32 = 0;
@@ -577,33 +645,73 @@ fn tableGlyphs(
     raw: []const u8,
     start: u32,
     decors: []const syntax.Decor,
+    draft: bool,
     out: ?*std.ArrayList(TableGlyph),
-) !struct { width: u32, min_width: u32 } {
-    const end = start + @as(u32, @intCast(raw.len));
+) !struct { width: u32, min_width: u32, transformed: bool } {
+    const end = if (draft) start else start + @as(u32, @intCast(raw.len));
     var di = decorLowerBound(decors, start);
     var hidden_until = start;
     var width: u32 = 0;
+    var line_width: u32 = 0;
     var min_width: u32 = 0;
+    var skip: usize = 0;
+    var code_end: usize = 0;
+    var transformed = false;
     var iter = vaxis.unicode.graphemeIterator(raw);
     while (iter.next()) |g| {
-        const source_start = start + @as(u32, @intCast(g.start));
-        const source_end = source_start + @as(u32, @intCast(g.len));
-        while (di < decors.len and decors[di].start < source_end) : (di += 1) {
-            const d = decors[di];
-            if (d.kind == .conceal and d.end <= end) hidden_until = @max(hidden_until, d.end);
+        if (g.start < skip) continue;
+        if (g.start >= code_end) if (table_cell.codeSpanEnd(raw, g.start)) |end_index| {
+            code_end = end_index;
+        };
+        // Draft bytes have no document position until the edit is accepted.
+        // Their relative offsets only help the live table follow the caret.
+        const source_start = (if (draft) 0 else start) + @as(u32, @intCast(g.start));
+        var source_end = source_start + @as(u32, @intCast(g.len));
+        if (!draft) {
+            while (di < decors.len and decors[di].start < source_end) : (di += 1) {
+                const d = decors[di];
+                if (d.kind == .conceal and d.end <= end) hidden_until = @max(hidden_until, d.end);
+            }
+            if (source_start < hidden_until) continue;
         }
-        if (source_start < hidden_until) continue;
-        const text = g.bytes(raw);
+        const rest = raw[g.start..];
+        const br = if (g.start < code_end and rest[0] != '\n') 0 else table_cell.breakLen(rest);
+        if (br > 0) {
+            width = @max(width, line_width);
+            line_width = 0;
+            transformed = true;
+            skip = g.start + br;
+            if (out) |glyphs| try glyphs.append(a, .{
+                .text = "",
+                .start = source_start,
+                .end = source_end,
+                .width = 0,
+                .line_break = true,
+            });
+            continue;
+        }
+        const pipe_len: usize = if (!draft and std.mem.startsWith(u8, rest, "\\|"))
+            2
+        else if (!draft and g.start >= code_end and std.mem.startsWith(u8, rest, "&#124;"))
+            "&#124;".len
+        else
+            0;
+        if (pipe_len > 0) {
+            skip = g.start + pipe_len;
+            source_end = source_start + @as(u32, @intCast(pipe_len));
+            transformed = true;
+        }
+        const text = if (pipe_len > 0) "|" else g.bytes(raw);
         const tab = std.mem.eql(u8, text, "\t");
         const columns: u32 = if (tab) 1 else win.gwidth(text);
         if (columns == 0) continue;
-        width += if (tab) @import("../app.zig").tab_width else columns;
+        line_width += if (tab) @import("../app.zig").tab_width else columns;
         min_width = @max(min_width, columns);
         if (out) |glyphs| {
             try glyphs.append(a, .{ .text = if (tab) " " else text, .start = source_start, .end = source_end, .width = columns });
         }
     }
-    return .{ .width = width, .min_width = min_width };
+    return .{ .width = @max(width, line_width), .min_width = min_width, .transformed = transformed };
 }
 
 fn autilWidth(win: vaxis.Window, text: []const u8) u32 {
@@ -653,7 +761,7 @@ const TestLayout = struct {
         };
         var decors = std.ArrayList(syntax.Decor).empty;
         try hl.decorInRange(0, @intCast(src.len), arena.allocator(), &decors);
-        const layout = try build(arena.allocator(), &pt, decors.items, win, content_width, document_path, .{ .start = 0, .end = pt.lineCount() });
+        const layout = try build(arena.allocator(), &pt, decors.items, win, content_width, document_path, .{ .start = 0, .end = pt.lineCount() }, null);
         return .{ .arena = arena, .pt = pt, .hl = hl, .screen = screen, .layout = layout };
     }
 

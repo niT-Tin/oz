@@ -31,6 +31,7 @@ const tabstrip = @import("tabstrip.zig");
 const animation = @import("animation.zig");
 const git_job = @import("git_job.zig");
 const markdown = @import("markdown.zig");
+const table_cell_ui = @import("table_cell_ui.zig");
 const wrap = @import("wrap.zig");
 
 const tab_width = app_mod.tab_width;
@@ -632,6 +633,7 @@ fn drawWrappedTable(
         const text_start = rect.col + gutter;
         _ = win.print(&edge, .{ .row_offset = @intCast(row), .col_offset = @intCast(text_start), .wrap = .none });
         for (parts.items) |part| {
+            const editing = part.draft_end != null;
             var col = text_start + part.col;
             for (part.glyphs) |glyph| {
                 const span = std.sort.upperBound(syntax.Span, spans, glyph.start, struct {
@@ -639,12 +641,12 @@ fn drawWrappedTable(
                         return std.math.order(pos, s.end);
                     }
                 }.order);
-                var style = if (span < spans.len and spans[span].start <= glyph.start)
+                var style = if (!editing and span < spans.len and spans[span].start <= glyph.start)
                     autil.syntaxStyle(spans[span].style, self.theme)
                 else
                     vaxis.Style{ .fg = .{ .rgb = self.theme.fg } };
-                style.bg = bg;
-                if (search) |index| {
+                style.bg = if (editing) .{ .rgb = self.theme.bg_sel } else bg;
+                if (if (editing) null else search) |index| {
                     const hit_i = index.lowerBound(glyph.end);
                     if (hit_i > 0) {
                         const hit = index.starts.items[hit_i - 1];
@@ -712,7 +714,8 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
     // content_width cells (long lines wrap instead of clipping)
     const content_width: u32 = @max(rect.width -| gutter, 1);
     if (rect.height == 0 or rect.width == 0) return;
-    const conceal_mode = self.state.mode == .normal and !self.mc_active and !self.em_active;
+    const draft = if (is_focused and self.cell_edit != null) self.cell_edit.?.preview() else null;
+    const conceal_mode = draft != null or (self.state.mode == .normal and !self.mc_active and !self.em_active);
     const viewport_anchor = if (cursor_line < w.view_top or cursor_line >= w.view_top +| rect.height)
         cursor_line
     else
@@ -724,11 +727,14 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
         if (buf.hl == null or buf.syntax_revision != buf.history.revision)
             _ = try self.visibleSpansFor(buf, a, layout_top, layout_rows);
         const initial_decors = try self.visibleDecorsFor(buf, a, layout_top, layout_rows);
+        if (draft != null and buf.hl != null)
+            break :blk try @import("highlight.zig").markdownForRange(buf, a, win, initial_decors, layout_top, layout_rows, content_width, draft);
         break :blk try self.visibleMarkdownFor(buf, win, initial_decors, layout_top, layout_rows, content_width);
     } else null;
-    if (is_focused) {
+    if (is_focused and draft == null) {
         self.markdown_frame = md_layout;
         self.markdown_frame_buf = w.buf;
+        self.markdown_frame_rev = buf.history.revision;
     }
     try prepareMarkdownImages(self, md_layout);
     const active_md = if (conceal_mode) md_layout else null;
@@ -745,7 +751,13 @@ pub fn renderWindowLines(self: *App, a: std.mem.Allocator, rect: LeafRect, is_fo
     }
     // the cursor's cell column decides which wrap chunk of its line it
     // sits on — that chunk must be visible, not just the line's first row
-    const cursor_pos = markdownCursor(active_md, cursor_line, w.cursor) orelse
+    const draft_cursor = blk: {
+        if (draft == null) break :blk null;
+        const info = (active_md orelse break :blk null).get(cursor_line) orelse break :blk null;
+        const table = info.wrapped_table orelse break :blk null;
+        break :blk table.draftCursorAt(self.cell_edit.?.cursor);
+    };
+    const cursor_pos = draft_cursor orelse markdownCursor(active_md, cursor_line, w.cursor) orelse
         lineWrap(self, win, buf, w.buf, cursor_line, content_width, w.cursor).cursor;
     const cur_line_rows = displayRowsWithMarkdown(self, win, buf, w.buf, cursor_line, content_width, active_md, cursor_line);
     const cursor_before_rows = markdownTopRuleRows(active_md, cursor_line);
@@ -3201,6 +3213,7 @@ fn applySearchHighlight(self: *App, a: std.mem.Allocator, segs: *std.ArrayList(v
 }
 
 pub fn render(self: *App) !void {
+    try table_cell_ui.check(self);
     // Final safeguard for focus changes outside input dispatch. Event
     // boundaries already synchronize before subsequent input can request
     // a new hint in that focus.
@@ -3450,6 +3463,10 @@ pub fn render(self: *App) !void {
         self.addMousePaneTarget(lr.win, lr.row, lr.col, lr.height, lr.width);
         try self.renderWindowLines(a, lr, false);
     }
+    var cell_rect = cur_rect;
+    cell_rect.height = if (self.cell_edit != null) table_cell_ui.panelHeight(cur_rect.height) else 0;
+    cur_rect.height -= cell_rect.height;
+    cell_rect.row += cur_rect.height;
     // Cursor/overlays use the same focused-pane gutter as source and mouse.
     const gutter = self.gutterWidthFor(self.cur().pt.lineCountUpperBound(), cur_rect.width);
     self.addMousePaneTarget(cur_rect.win, cur_rect.row, cur_rect.col, cur_rect.height, cur_rect.width);
@@ -4811,7 +4828,9 @@ pub fn render(self: *App) !void {
     // cursor position — drawAiRail already placed the prompt/thread cursor
     // when the rail or prompt owns focus; otherwise the editor cursor wins.
     var editor_cursor_hidden = false;
-    if (self.inlinePromptOpen()) {
+    if (self.cell_edit != null) {
+        editor_cursor_hidden = !try table_cell_ui.draw(self, a, win, cell_rect);
+    } else if (self.inlinePromptOpen()) {
         // cursor was placed by drawInlinePrompt
     } else if (self.ai.rail_open and self.ai.focus != .editor) {
         // rail cursor was set by drawAiRail
@@ -5139,6 +5158,11 @@ pub fn run(self: *App) !void {
                     if (!self.pasting) continue;
                     self.pasting = false;
                     if (term_focused) continue; // child got the keys already
+                    if (self.cell_edit != null) {
+                        try table_cell_ui.paste(self, self.paste_buf.items);
+                        self.paste_buf.clearRetainingCapacity();
+                        continue;
+                    }
                     if (self.pending_filetree_create != null) {
                         try @import("filetree.zig").filetreeCreatePaste(self, self.paste_buf.items);
                         self.paste_buf.clearRetainingCapacity();
@@ -5179,7 +5203,9 @@ pub fn run(self: *App) !void {
                             }
                         }
                     }
-                    if (self.pending_filetree_create != null) {
+                    if (self.cell_edit != null) {
+                        try table_cell_ui.paste(self, text);
+                    } else if (self.pending_filetree_create != null) {
                         try @import("filetree.zig").filetreeCreatePaste(self, text);
                     } else if (self.inlinePromptOpen()) {
                         try self.inlinePaste(text);
