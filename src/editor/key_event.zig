@@ -146,6 +146,7 @@ pub const ActionId = enum {
     hunk_reset, // <leader>gr — reset the hunk under the cursor
     hunk_preview, // <leader>gp — preview the hunk under the cursor (float)
     blame_toggle, // <leader>tb — toggle inline blame
+    git_review, // <leader>gv — native change and history review
     git_lazygit, // <leader>lg — launch lazygit in the embedded terminal
     // M3b embedded terminal layouts
     term_float, // <M-r> — toggle the floating terminal

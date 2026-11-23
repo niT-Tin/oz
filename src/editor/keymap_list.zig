@@ -156,6 +156,7 @@ pub const entries: []const Entry = &.{
     .{ .keys = "space gr", .desc = "Reset 当前 hunk", .group = "Git" },
     .{ .keys = "space gp", .desc = "预览当前 hunk 的 diff", .group = "Git" },
     .{ .keys = "space tb", .desc = "行内 blame 开关", .group = "Git" },
+    .{ .keys = "space gv", .desc = "Git Review · 改动和提交历史 (:GitReview)", .group = "Git" },
     .{ .keys = "space lg", .desc = "内嵌浮动终端启动 lazygit", .group = "Git" },
 
     // ---- 内嵌终端 ----

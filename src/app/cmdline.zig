@@ -215,7 +215,7 @@ pub fn completeCommandName(self: *App) !void {
             "write",   "quit",       "quitall", "wq",    "edit",
             "vsplit",  "split",      "bnext",   "bprev", "buffers",
             "bdelete", "nohlsearch", "set",     "theme", "colorscheme",
-            "noh",     "help",       "new",     "vnew",
+            "noh",     "help",       "new",     "vnew",  "GitReview",
         };
         for (commands) |c| {
             if (std.mem.startsWith(u8, c, prefix)) {
@@ -360,6 +360,7 @@ pub fn execCommand(self: *App, cmd: editor.ex_command.Command) !void {
             self.search_hl_active = false;
             try self.setMsg(try self.alloc.dupe(u8, ""));
         },
+        .git_review => try @import("git_review.zig").open(self),
         .help => try self.openKeymapPicker(),
         .goto_line => |ln| {
             // :<number> — vim: 1-based, clamped to the last line (:0
