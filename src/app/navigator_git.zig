@@ -7,85 +7,27 @@ const App = @import("../app.zig").App;
 const watch = @import("filetree_watch.zig");
 const Allocator = std.mem.Allocator;
 
-pub const Badge = struct {
-    text: [2]u8,
-    color: enum { modified, added, deleted, renamed, conflict, directory },
+pub const Badge = porcelain.Badge;
+const Snapshot = porcelain.Snapshot;
 
-    fn fromRecord(r: porcelain.Record) Badge {
-        const kind = if (r.worktree != ' ') r.worktree else r.index;
-        return .{
-            .text = .{ if (r.index == ' ') '.' else r.index, if (r.worktree == ' ') '.' else r.worktree },
-            .color = if (r.conflicted()) .conflict else switch (kind) {
-                'A', '?' => .added,
-                'D' => .deleted,
-                'R', 'C' => .renamed,
-                else => .modified,
-            },
-        };
-    }
-};
+fn command(alloc: Allocator, io: std.Io, root: []const u8, argv: []const []const u8) ![]u8 {
+    const result = try std.process.run(alloc, io, .{ .argv = argv, .cwd = .{ .path = root } });
+    defer alloc.free(result.stderr);
+    errdefer alloc.free(result.stdout);
+    if (result.term != .exited or result.term.exited != 0) return error.GitUnavailable;
+    return result.stdout;
+}
 
-const Snapshot = struct {
-    /// Map keys are slices of the original NUL-delimited command output.
-    bytes: []u8,
-    prefix: []u8,
-    paths: std.StringHashMapUnmanaged(Badge) = .empty,
-
-    fn deinit(self: *Snapshot, alloc: Allocator) void {
-        self.paths.deinit(alloc);
-        alloc.free(self.bytes);
-        alloc.free(self.prefix);
-    }
-
-    fn markParents(self: *Snapshot, alloc: Allocator, path: []const u8) !void {
-        var parent = std.fs.path.dirname(path);
-        while (parent) |dir| : (parent = std.fs.path.dirname(dir)) {
-            const slot = try self.paths.getOrPut(alloc, dir);
-            if (slot.found_existing) break;
-            slot.value_ptr.* = .{ .text = " *".*, .color = .directory };
-        }
-    }
-
-    fn indexPaths(self: *Snapshot, alloc: Allocator) !void {
-        // --show-prefix always appends a newline, even for the empty prefix.
-        const prefix = std.mem.trimEnd(u8, self.prefix, "\n");
-        var iter: porcelain.Iterator = .{ .remaining = self.bytes };
-        while (try iter.next()) |record| {
-            if (record.index == '!') continue;
-            if (std.mem.startsWith(u8, record.path, prefix)) {
-                // Git keeps a trailing slash for embedded, untracked repositories.
-                const path = std.mem.trimEnd(u8, record.path[prefix.len..], "/");
-                try self.paths.put(alloc, path, Badge.fromRecord(record));
-                try self.markParents(alloc, path);
-            }
-            if (record.index == 'R' or record.worktree == 'R') {
-                const source = record.original_path.?;
-                if (std.mem.startsWith(u8, source, prefix))
-                    try self.markParents(alloc, source[prefix.len..]);
-            }
-        }
-    }
-
-    fn command(alloc: Allocator, io: std.Io, root: []const u8, argv: []const []const u8) ![]u8 {
-        const result = try std.process.run(alloc, io, .{ .argv = argv, .cwd = .{ .path = root } });
-        defer alloc.free(result.stderr);
-        errdefer alloc.free(result.stdout);
-        if (result.term != .exited or result.term.exited != 0) return error.GitUnavailable;
-        return result.stdout;
-    }
-
-    fn read(alloc: Allocator, io: std.Io, root: []const u8) !Snapshot {
-        const prefix = try command(alloc, io, root, &.{ "git", "rev-parse", "--show-prefix" });
-        errdefer alloc.free(prefix);
-        const bytes = try command(alloc, io, root, &porcelain.status_argv);
-        errdefer alloc.free(bytes);
-        var snap: Snapshot = .{ .bytes = bytes, .prefix = prefix };
-        errdefer snap.paths.deinit(alloc);
-        try snap.indexPaths(alloc);
-        return snap;
-    }
-};
-
+fn read(alloc: Allocator, io: std.Io, root: []const u8) !Snapshot {
+    const prefix = try command(alloc, io, root, &.{ "git", "rev-parse", "--show-prefix" });
+    errdefer alloc.free(prefix);
+    const bytes = try command(alloc, io, root, &porcelain.status_argv);
+    errdefer alloc.free(bytes);
+    var snap: Snapshot = .{ .bytes = bytes, .prefix = prefix };
+    errdefer snap.paths.deinit(alloc);
+    try snap.indexPaths(alloc);
+    return snap;
+}
 pub const Monitor = struct {
     // The UI thread owns visible. The worker publishes pending under mutex.
     visible: ?Snapshot = null,
@@ -97,6 +39,9 @@ pub const Monitor = struct {
     tree_dirty: bool = true,
     targets: ?watch.Targets = null,
     pending_dirs: ?watch.Changes = null,
+    scan: u64 = 0,
+    reading: bool = false,
+    suspended: bool = false,
     mutex: std.Io.Mutex = .init,
     signal: std.Io.Condition = .init,
     task: ?std.Io.Future(void) = null,
@@ -104,6 +49,31 @@ pub const Monitor = struct {
     fn matches(self: *const Monitor, root: ?[]const u8) bool {
         if (self.scope) |scope| return root != null and std.mem.eql(u8, scope, root.?);
         return root == null;
+    }
+
+    /// Borrowed on the main thread until Job.start copies the scope. Changes
+    /// always reads live Git state. Only an idle Navigator can reuse that scan.
+    pub fn reviewTarget(self: *Monitor, io: std.Io) ?porcelain.ReviewTarget {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.reading or self.stopping) return null;
+        return .{ .scope = self.scope orelse return null, .generation = self.generation, .scan = self.scan };
+    }
+
+    fn accepts(self: *Monitor, target: porcelain.ReviewTarget) bool {
+        return !self.stopping and !self.reading and self.matches(target.scope) and
+            self.generation == target.generation and self.scan == target.scan;
+    }
+
+    pub fn acceptReview(self: *Monitor, app: *App, target: porcelain.ReviewTarget, prepared: *?Snapshot) void {
+        if (prepared.* == null) return;
+        self.mutex.lockUncancelable(app.io);
+        defer self.mutex.unlock(app.io);
+        if (!self.accepts(target)) return;
+        if (self.pending) |*old| old.deinit(app.alloc);
+        self.pending = prepared.*;
+        prepared.* = null;
+        self.has_reply = true;
     }
 
     pub fn get(self: *const Monitor, root: []const u8, absolute: []const u8) ?Badge {
@@ -136,6 +106,13 @@ pub const Monitor = struct {
                 self.targets = targets;
                 self.tree_dirty = false;
             } else |_| self.tree_dirty = true;
+        }
+        // Review covers the Files pane and can publish the same status itself.
+        // Keep its scope eligible for that hand-off while periodic reads sleep.
+        if (self.suspended != app.review.open) {
+            self.suspended = app.review.open;
+            if (!self.suspended) self.generation +%= 1;
+            self.signal.signal(app.io);
         }
         if (!self.matches(root)) {
             if (self.pending_dirs) |*old| old.arena.deinit();
@@ -181,14 +158,15 @@ pub const Monitor = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         while (!self.stopping) {
-            if (self.scope == null or self.generation == seen) {
-                const wait: std.Io.Timeout = if (self.scope == null) .none else .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(1500) } };
+            if (self.suspended or self.scope == null or self.generation == seen) {
+                const wait: std.Io.Timeout = if (self.suspended or self.scope == null) .none else .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(1500) } };
                 self.signal.waitTimeout(io, &self.mutex, wait) catch |err| switch (err) {
                     error.Canceled => return,
                     error.Timeout => {},
                 };
             }
             if (self.stopping) return;
+            if (self.suspended) continue;
             const scope = self.scope orelse continue;
             seen = self.generation;
             const dir = app.alloc.dupe(u8, scope) catch continue;
@@ -197,11 +175,14 @@ pub const Monitor = struct {
                 targets = new;
                 self.targets = null;
             }
+            self.reading = true;
+            self.scan +%= 1;
             self.mutex.unlock(io);
             var dirs = if (targets) |*t| t.scan(app.alloc, io) catch null else null;
-            var result: ?Snapshot = Snapshot.read(app.alloc, io, dir) catch null;
+            var result: ?Snapshot = read(app.alloc, io, dir) catch null;
             app.alloc.free(dir);
             self.mutex.lockUncancelable(io);
+            self.reading = false;
             if (self.stopping or self.generation != seen) {
                 if (dirs) |*d| d.arena.deinit();
                 if (result) |*s| s.deinit(app.alloc);
@@ -251,4 +232,22 @@ test "repository status: nested tree maps XY changes, deletion and rename parent
         try std.testing.expect(snapshot.paths.get(dir).?.color == .directory);
     for ([_][]const u8{ "ignored", "dest", "src-like/sibling" }) |path|
         try std.testing.expect(snapshot.paths.get(path) == null);
+}
+
+test "Navigator only accepts Review snapshots for its unchanged scope and scan" {
+    var monitor: Monitor = .{ .scope = @constCast("/repo"), .generation = 4, .scan = 8 };
+    const target = monitor.reviewTarget(std.testing.io).?;
+    try std.testing.expect(monitor.accepts(target));
+    monitor.reading = true;
+    try std.testing.expect(monitor.reviewTarget(std.testing.io) == null);
+    try std.testing.expect(!monitor.accepts(target));
+    monitor.reading = false;
+    monitor.scan += 1;
+    try std.testing.expect(!monitor.accepts(target));
+    monitor.scan -= 1;
+    monitor.generation += 1;
+    try std.testing.expect(!monitor.accepts(target));
+    monitor.generation -= 1;
+    monitor.scope = @constCast("/another-repo");
+    try std.testing.expect(!monitor.accepts(target));
 }

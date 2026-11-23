@@ -145,7 +145,11 @@ fn request(app: *App, slot: Slot, req: data.Request) void {
     const s = &app.review;
     const cache = s.cache.getPtr(slot);
     if (cache.job != null or cache.failure != null) return;
-    const job = data.Job.start(app.alloc, app.io, s.root orelse s.cwd.?, req, app, App.lspWake) catch |err| {
+    const request_data: data.Request = if (req == .changes) blk: {
+        if (app.navigator_git.reviewTarget(app.io)) |target| break :blk .{ .changes_shared = target };
+        break :blk req;
+    } else req;
+    const job = data.Job.start(app.alloc, app.io, s.root orelse s.cwd.?, request_data, app, App.lspWake) catch |err| {
         cache.failure = @errorName(err);
         return;
     };
@@ -187,7 +191,11 @@ pub fn poll(app: *App) bool {
         if (s.root != null and root.len > 0 and !std.mem.eql(u8, root, s.root.?)) {
             cache.failure = "Repository changed. Reopen Git Review.";
             r.job.deinit();
-        } else cache.job = r.job;
+        } else {
+            if (r.job.request == .changes_shared and r.job.result.problem == null)
+                app.navigator_git.acceptReview(app, r.job.request.changes_shared, &r.job.navigator_snapshot);
+            cache.job = r.job;
+        }
     } else r.job.deinit();
     schedule(app);
     return s.open;

@@ -63,6 +63,7 @@ pub const Commit = struct {
 
 pub const Request = union(enum) {
     changes,
+    changes_shared: porcelain.ReviewTarget,
     history,
     history_page: struct { tip: []const u8, offset: usize },
     comparison: []const u8,
@@ -72,6 +73,11 @@ pub const Request = union(enum) {
     fn clone(self: Request, a: Allocator) !Request {
         return switch (self) {
             .changes, .history => self,
+            .changes_shared => |target| .{ .changes_shared = .{
+                .scope = try a.dupe(u8, target.scope),
+                .generation = target.generation,
+                .scan = target.scan,
+            } },
             .history_page => |p| .{ .history_page = .{ .tip = try a.dupe(u8, p.tip), .offset = p.offset } },
             .comparison => |ref| .{ .comparison = try a.dupe(u8, ref) },
             .detail => |d| .{ .detail = .{ .hash = try a.dupe(u8, d.hash), .parent_index = d.parent_index } },
@@ -108,6 +114,7 @@ pub const Job = struct {
     result: Result = .{},
     done: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
+    navigator_snapshot: ?porcelain.Snapshot = null,
     wake_ctx: ?*anyopaque,
     wake_fn: ?*const fn (*anyopaque) void,
 
@@ -133,6 +140,7 @@ pub const Job = struct {
 
     pub fn deinit(self: *Job) void {
         if (self.thread) |thread| thread.join();
+        if (self.navigator_snapshot) |*snap| snap.deinit(self.owner);
         self.arena.deinit();
         self.owner.destroy(self);
     }
@@ -155,7 +163,7 @@ pub const Job = struct {
         self.result.root = chomp(try self.git(&.{ "rev-parse", "--show-toplevel" }));
         self.cwd = self.result.root;
         switch (self.request) {
-            .changes => try self.changes(),
+            .changes, .changes_shared => try self.changes(),
             .history => try self.history(null, 0),
             .history_page => |p| try self.history(p.tip, p.offset),
             .comparison => |ref| try self.comparison(ref),
@@ -238,7 +246,8 @@ pub const Job = struct {
         const a = self.arena.allocator();
         const tip = try self.head();
         const base = tip orelse try self.emptyTree();
-        var records = porcelain.Iterator{ .remaining = try self.output(try self.run(&porcelain.status_argv)) };
+        const bytes = try self.output(try self.run(&porcelain.status_argv));
+        var records = porcelain.Iterator{ .remaining = bytes };
         var files: std.ArrayList(File) = .empty;
         while (try records.next()) |r| {
             if (files.items.len >= max_files) return error.TooManyChangedFiles;
@@ -277,6 +286,21 @@ pub const Job = struct {
             begin = end;
         }
         self.result.files = files.items;
+        if (self.request == .changes_shared) self.prepareBadges(self.request.changes_shared.scope, bytes) catch {};
+    }
+
+    fn prepareBadges(self: *Job, scope: []const u8, bytes: []const u8) !void {
+        // Nested and linked worktrees can live inside another worktree. Git
+        // must verify the Navigator scope before it can adopt these records.
+        var prefix: []const u8 = "\n";
+        if (!std.mem.eql(u8, self.result.root, scope)) {
+            const root = try self.command(&.{ "-C", scope, "rev-parse", "--show-toplevel" });
+            if (root.term != .exited or root.term.exited != 0 or !std.mem.eql(u8, chomp(root.stdout), self.result.root)) return;
+            const subdir = try self.command(&.{ "-C", scope, "rev-parse", "--show-prefix" });
+            if (subdir.term != .exited or subdir.term.exited != 0) return;
+            prefix = subdir.stdout;
+        }
+        self.navigator_snapshot = try porcelain.Snapshot.copy(self.owner, bytes, prefix);
     }
 
     const commit_fields = "%H%x00%h%x00%P%x00%an%x00%as%x00%D%x00%s";
@@ -854,4 +878,30 @@ test "Git Review streams a full history page and follows its final parent onto t
     try std.testing.expectEqual(3, second.result.commits.len);
     try std.testing.expect(!second.result.history_more);
     try std.testing.expectEqualStrings(first.result.commits[history_page_size - 1].parents[0], second.result.commits[0].hash);
+}
+
+test "Git Review publishes fresh, independently owned badge data for the same repository" {
+    var repo = try Fixture.init();
+    defer repo.deinit();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    try repo.tmp.dir.createDir(io, "sub", .default_dir);
+    try repo.write("sub/file", "staged immediately before opening Review\n");
+    try repo.write("elsewhere", "not in the Navigator subtree\n");
+    try repo.git(&.{ "add", "sub/file" });
+    const scope = try repo.tmp.dir.realPathFileAlloc(io, "sub", a);
+    defer a.free(scope);
+    const job = try repo.review(.{ .changes_shared = .{ .scope = scope, .generation = 2, .scan = 4 } });
+    var snap = job.navigator_snapshot.?;
+    defer snap.deinit(a);
+    job.navigator_snapshot = null;
+    job.deinit();
+    try std.testing.expectEqualStrings("A.", &snap.paths.get("file").?.text);
+    try std.testing.expectEqual(null, snap.paths.get("elsewhere"));
+    var other = try Fixture.init();
+    defer other.deinit();
+    const unrelated = try repo.review(.{ .changes_shared = .{ .scope = other.cwd, .generation = 2, .scan = 4 } });
+    defer unrelated.deinit();
+    try std.testing.expectEqual(null, unrelated.navigator_snapshot);
+    try std.testing.expectEqual(2, unrelated.result.files.len);
 }
