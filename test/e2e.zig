@@ -1990,13 +1990,16 @@ test "text regression: Unicode ranges and reversed selections save exact bytes" 
         var grid = try Grid.initSizedCols(alloc, 30, 120);
         defer grid.deinit(alloc);
         try gridWaitFor(&sess, &grid, "NORMAL", 8000);
-        try sess.send(case.keys);
-        // A case may deliberately end in Insert mode (ct_): wait for its
-        // Esc to land before sending the ex command. Sending ":wq" while
-        // the ESC is still in flight coalesces into Alt+':' and types the
-        // command into the buffer instead of opening the cmdline.
-        try gridWaitGone(&sess, &grid, "INSERT", 4000);
-        try gridWaitFor(&sess, &grid, "NORMAL", 4000);
+        if (std.mem.cutSuffix(u8, case.keys, "\x1b")) |edit_keys| {
+            // Observe Insert first so the startup Normal frame cannot satisfy
+            // the wait for Esc. A following ':' in the same PTY read is Alt+:.
+            try sess.send(edit_keys);
+            try gridWaitRowContains(&sess, &grid, grid.rows - 1, "[INSERT]", 4000);
+            try sess.send("\x1b");
+            try gridWaitRowContains(&sess, &grid, grid.rows - 1, "[NORMAL]", 4000);
+        } else {
+            try sess.send(case.keys);
+        }
         try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
         const saved = try std.Io.Dir.cwd().readFileAlloc(io, name, alloc, .limited(1024));
         defer alloc.free(saved);
