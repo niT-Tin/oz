@@ -54,6 +54,7 @@ pub fn handleKey(self: *App, key: vaxis.Key) !void {
 }
 
 fn handleKeyInner(self: *App, key: vaxis.Key) !void {
+    if (self.review.open) return @import("git_review.zig").keyPress(self, key);
     // Keyboard hints (M2.6a): while the overlay is active it owns every key
     // — label characters, Backspace and Esc. Routed before terminal/macro/
     // AI/picker/editor handling so label chars can never leak into a

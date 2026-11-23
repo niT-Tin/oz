@@ -126,6 +126,9 @@ pub const text_object_edit = @import("editor/text_object_edit.zig");
 
 pub const replace_plan = @import("editor/replace_plan.zig");
 
+pub const git_review_render = @import("app/git_review_render.zig");
+pub const git_review_patch = @import("app/git_review_patch.zig");
+pub const git_review_data = @import("app/git_review_data.zig");
 pub const git_job = @import("app/git_job.zig");
 pub const text_snapshot = @import("buffer/text_snapshot.zig");
 pub const ai_prompt = @import("ai/prompt.zig");

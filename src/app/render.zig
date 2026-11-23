@@ -3165,6 +3165,12 @@ pub fn render(self: *App) !void {
     // branch) unless mouse reporting is enabled; the same registrations that
     // feed hint labels also feed hit-testing on mouse frames.
     self.beginMouseFrame(height, win.width);
+    if (self.review.open) {
+        hideInactiveMarkdownImages(self);
+        win.hideCursor();
+        try @import("git_review_render.zig").draw(self, a, win);
+        return self.vx.render(self.tty.writer());
+    }
     if (height <= status_row_count) return;
     // One timestamp for every animated element this frame (streaming dots,
     // tool spinners, badge flash). Idle frames compute it but draw nothing
@@ -4898,6 +4904,7 @@ pub fn run(self: *App) !void {
         // apply): gutter marks, branch and floats update without a
         // keypress, same as the LSP slots.
         var git_ready = self.navigator_git.tick(self);
+        if (@import("git_review.zig").poll(self)) git_ready = true;
         if (self.git_job) |job| {
             if (job.done.load(.acquire)) {
                 self.consumeGitJob(job);
@@ -5044,6 +5051,7 @@ pub fn run(self: *App) !void {
             defer self.syncPassiveFocus();
             switch (event) {
                 .mouse => |m| {
+                    if (self.review.open) continue;
                     // Left press = click, wheel = scroll. Motion/drag/
                     // release/unbound buttons return false, so moving the
                     // mouse cannot cause renders or steal terminal selection.
@@ -5057,6 +5065,7 @@ pub fn run(self: *App) !void {
                     // mid-paste keystrokes are paste content, not input:
                     // buffer them (paste_end inserts the whole thing) so
                     // auto-indent/auto-pairs can't mangle pasted text
+                    if (self.pasting and self.review.open) continue;
                     if (self.pasting and !term_focused) {
                         try self.pasteAccumulate(key);
                         continue;
@@ -5073,6 +5082,7 @@ pub fn run(self: *App) !void {
                     handled = true;
                     if (!self.pasting) continue;
                     self.pasting = false;
+                    if (self.review.open) continue;
                     if (term_focused) continue; // child got the keys already
                     if (self.pending_filetree_create != null) {
                         try @import("filetree.zig").filetreeCreatePaste(self, self.paste_buf.items);
@@ -5103,6 +5113,7 @@ pub fn run(self: *App) !void {
                     }
                 },
                 .paste => |text| {
+                    if (self.review.open) continue;
                     handled = true;
                     // OSC 52 clipboard reply — terminal focus: forward the
                     // paste to the child

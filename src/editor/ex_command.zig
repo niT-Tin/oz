@@ -35,6 +35,7 @@ pub const Command = union(enum) {
     noh,
     /// :help / :h — open the keymap search overlay.
     help,
+    git_review,
     /// :set <option> — M0: accepted, applied if recognized, else ignored.
     set: []const u8,
     /// :theme [name] — switch color theme (no arg lists available themes).
@@ -149,6 +150,7 @@ pub fn parse(line: []const u8) Command {
     if (std.mem.eql(u8, word, "h") or std.mem.eql(u8, word, "help")) {
         return if (args.len == 0) .help else .unknown;
     }
+    if (std.mem.eql(u8, word, "GitReview") and args.len == 0) return .git_review;
     if (std.mem.eql(u8, word, "set")) return .{ .set = args };
     if (std.mem.eql(u8, word, "theme") or std.mem.eql(u8, word, "colorscheme")) return .{ .theme = args };
 

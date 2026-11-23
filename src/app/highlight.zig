@@ -850,6 +850,7 @@ pub fn execAction(self: *App, action: editor.KeyEvent.ActionId, count: u32) !voi
         .hunk_reset => self.applyHunk(.reset),
         .hunk_preview => self.previewHunk(),
         .blame_toggle => self.toggleBlame(),
+        .git_review => try @import("git_review.zig").open(self),
         .git_lazygit => self.launchLazygit(),
         // M3b embedded terminal
         .term_float => if (term.supported) try self.toggleTerm(.floating) else {},
