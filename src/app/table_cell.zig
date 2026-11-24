@@ -1,10 +1,13 @@
-//! Plain multiline editing for a single GFM table cell. Physical newlines
+//! Modal multiline editing for a single GFM table cell. Physical newlines
 //! stay in the draft; the buffer stores them as <br> so the table stays valid.
 const std = @import("std");
 const vaxis = @import("vaxis");
 const utf8 = @import("../buffer/utf8.zig");
 const wrap = @import("wrap.zig");
 const prompt = @import("../ai/prompt.zig");
+const editor = @import("../editor/root.zig");
+const edit_range = @import("../editor/edit_range.zig");
+const PieceTable = @import("../buffer/piece_table.zig").PieceTable;
 
 pub const Range = struct {
     start: u32,
@@ -135,6 +138,10 @@ pub const Edit = struct {
     cursor: usize,
     panel_width: u32 = 1,
     goal_col: ?u32 = null,
+    normal: editor.Mode.State = .{},
+    in_insert: bool = true,
+    replace_count: ?u32 = null,
+    register: ?struct { text: []u8, linewise: bool } = null,
 
     pub fn init(a: std.mem.Allocator, range: Range, buf: usize, window_id: u64, revision: u64, src: []const u8, caret: u32) !Edit {
         const draft = try decode(a, src, caret -| range.start);
@@ -153,6 +160,7 @@ pub const Edit = struct {
     pub fn deinit(self: *Edit, a: std.mem.Allocator) void {
         a.free(self.original);
         self.text.deinit(a);
+        if (self.register) |reg| a.free(reg.text);
     }
 
     pub fn preview(self: *const Edit) Preview {
@@ -198,6 +206,214 @@ pub const Edit = struct {
 
     fn lineEnd(self: *const Edit) usize {
         return std.mem.indexOfScalarPos(u8, self.text.items, self.cursor, '\n') orelse self.text.items.len;
+    }
+
+    fn graphemeStart(self: *const Edit, at: usize) usize {
+        var it = vaxis.unicode.graphemeIterator(self.text.items);
+        while (it.next()) |g| {
+            if (at < g.start + g.len) return g.start;
+        }
+        return self.text.items.len;
+    }
+
+    fn nextGrapheme(self: *const Edit, at: usize) usize {
+        var it = vaxis.unicode.graphemeIterator(self.text.items[at..]);
+        return if (it.next()) |g| at + g.len else at;
+    }
+
+    pub fn normalCaret(self: *const Edit) usize {
+        const start = self.lineStart();
+        return if (self.cursor > start and (self.in_insert or self.cursor == self.lineEnd()))
+            self.graphemeStart(self.cursor - 1)
+        else
+            self.graphemeStart(self.cursor);
+    }
+
+    pub fn leaveInsert(self: *Edit) void {
+        self.cursor = self.normalCaret();
+        self.in_insert = false;
+        self.normal.mode = .normal;
+        self.goal_col = null;
+    }
+
+    pub fn normalKey(self: *Edit, a: std.mem.Allocator, k: vaxis.Key) !void {
+        if (self.replace_count) |count| {
+            self.replace_count = null;
+            const text = k.text orelse return;
+            if (text.len == 0 or k.mods.ctrl or k.mods.alt or k.mods.super or
+                k.mods.meta or k.mods.hyper or k.codepoint < ' ' or k.codepoint == vaxis.Key.backspace) return;
+            var end = self.cursor;
+            for (0..count) |_| {
+                if (end == self.lineEnd()) return;
+                end = self.nextGrapheme(end);
+            }
+            const replacement = try a.alloc(u8, try std.math.mul(usize, count, text.len));
+            defer a.free(replacement);
+            for (0..count) |i| @memcpy(replacement[i * text.len ..][0..text.len], text);
+            try self.text.replaceRange(a, self.cursor, end - self.cursor, replacement);
+            self.cursor = self.graphemeStart(self.cursor + replacement.len - text.len);
+            return;
+        }
+        switch (editor.Mode.handle(&self.normal, k, editor.Keymaps.normal)) {
+            .action => |action| try self.normalAction(a, action.action, action.count),
+            .motion => |m| {
+                // Vim's horizontal cursor steps in the draft follow the same
+                // graphemes that the source panel displays.
+                if (m.motion == .left or m.motion == .right) {
+                    const start = self.lineStart();
+                    const end = self.lineEnd();
+                    for (0..m.count) |_| {
+                        const next = if (m.motion == .left)
+                            self.graphemeStart(@max(start, self.cursor -| 1))
+                        else
+                            self.nextGrapheme(self.cursor);
+                        if (next == self.cursor or next >= end) break;
+                        self.cursor = next;
+                    }
+                } else {
+                    var pt = try PieceTable.init(a, self.text.items);
+                    defer pt.deinit();
+                    self.cursor = editor.Motion.target(&pt, m.motion, m.args, @intCast(self.cursor), m.count);
+                    self.cursor = self.normalCaret();
+                }
+            },
+            .op_motion => |op| try self.normalOperator(a, op),
+            else => {},
+        }
+        // The shared parser also recognizes document and Visual commands.
+        // Only the actions handled here can change the draft's mode.
+        self.normal.mode = .normal;
+    }
+
+    fn normalAction(self: *Edit, a: std.mem.Allocator, action: editor.KeyEvent.ActionId, count: u32) !void {
+        switch (action) {
+            .insert_mode, .insert_before, .append, .append_end, .insert_line_before, .insert_line_after => {
+                switch (action) {
+                    .insert_before => {
+                        self.cursor = self.lineStart();
+                        const end = self.lineEnd();
+                        while (self.cursor < end and std.ascii.isWhitespace(self.text.items[self.cursor])) self.cursor += 1;
+                    },
+                    .append => if (self.cursor < self.lineEnd()) {
+                        self.cursor = self.nextGrapheme(self.cursor);
+                    },
+                    .append_end => self.cursor = self.lineEnd(),
+                    .insert_line_before => {
+                        self.cursor = self.lineStart();
+                        try self.insert(a, "\n");
+                        self.cursor -= 1;
+                    },
+                    .insert_line_after => {
+                        self.cursor = self.lineEnd();
+                        try self.insert(a, "\n");
+                    },
+                    else => {},
+                }
+                self.in_insert = true;
+            },
+            .delete_char, .delete_char_before => {
+                var start = self.cursor;
+                var end = self.cursor;
+                const limit = if (action == .delete_char) self.lineEnd() else self.lineStart();
+                for (0..count) |_| {
+                    if (action == .delete_char) {
+                        if (end == limit) break;
+                        end = self.nextGrapheme(end);
+                    } else {
+                        if (start == limit) break;
+                        start = self.graphemeStart(start - 1);
+                    }
+                }
+                try self.applyOperator(a, .delete, start, end, false);
+            },
+            .delete_to_eol, .change_to_eol => try self.applyOperator(a, if (action == .delete_to_eol) .delete else .change, self.cursor, self.lineEnd(), false),
+            .change_line => try self.normalOperator(a, .{ .op = .change, .motion = .line_start, .args = .{}, .count = count, .exclusive_end = false }),
+            .replace_char => self.replace_count = count,
+            .paste, .paste_before => if (self.register) |reg| {
+                const after = action == .paste;
+                const end = self.lineEnd();
+                const append_line = reg.linewise and after and end == self.text.items.len;
+                const size = try std.math.mul(usize, reg.text.len, count);
+                try self.text.ensureUnusedCapacity(a, try std.math.add(usize, size, @intFromBool(append_line)));
+                if (reg.linewise) {
+                    self.cursor = if (after) @min(end + 1, self.text.items.len) else self.lineStart();
+                    if (append_line) {
+                        self.text.appendAssumeCapacity('\n');
+                        self.cursor += 1;
+                    }
+                } else if (after and self.cursor < end) self.cursor = self.nextGrapheme(self.cursor);
+                const pos = self.cursor;
+                for (0..count) |_| {
+                    self.text.insertSliceAssumeCapacity(self.cursor, reg.text);
+                    self.cursor += reg.text.len;
+                }
+                if (append_line) _ = self.text.pop();
+                if (reg.linewise) {
+                    self.cursor = pos;
+                    self.cursor = self.normalCaret();
+                } else {
+                    self.cursor = self.graphemeStart(self.cursor - 1);
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn normalOperator(self: *Edit, a: std.mem.Allocator, op: editor.OpMotion) !void {
+        var pt = try PieceTable.init(a, self.text.items);
+        defer pt.deinit();
+        const from: u32 = @intCast(self.cursor);
+        if (op.text_object) |kind| {
+            const range = editor.TextObject.range(&pt, kind, from, op.count);
+            return self.applyOperator(a, op.op, range.start, range.end, false);
+        }
+        if (!op.exclusive_end) {
+            const to = switch (op.motion) {
+                .line_start => pt.lineStart(@min(pt.lineOf(from) +| (op.count - 1), pt.lineCount() - 1)),
+                .view_top_line, .view_middle_line, .view_bottom_line => return,
+                else => editor.Motion.target(&pt, op.motion, op.args, from, op.count),
+            };
+            const range = edit_range.linewise(&pt, from, to);
+            const end = if (op.op == .change and range.end > range.start and pt.byteAt(range.end - 1) == '\n') range.end - 1 else range.end;
+            return self.applyOperator(a, op.op, range.start, end, true);
+        }
+        const to = switch (op.motion) {
+            .find, .find_back => editor.Motion.findTarget(&pt, from, op.args.ch, if (op.motion == .find) 1 else -1, op.count) orelse return,
+            .till, .till_back => editor.Motion.tillTarget(&pt, from, op.args.ch, if (op.motion == .till) 1 else -1, op.count) orelse return,
+            else => editor.Motion.target(&pt, op.motion, op.args, from, op.count),
+        };
+        const start = self.graphemeStart(@min(from, to));
+        const last = self.graphemeStart(@max(from, to));
+        const end = if (op.inclusive and last < self.text.items.len and self.text.items[last] != '\n')
+            self.nextGrapheme(last)
+        else if (last < @max(from, to))
+            self.nextGrapheme(last)
+        else
+            last;
+        try self.applyOperator(a, op.op, start, end, false);
+    }
+
+    fn applyOperator(self: *Edit, a: std.mem.Allocator, op: editor.KeyEvent.ActionId, start: usize, end: usize, linewise: bool) !void {
+        if (end > start or linewise) {
+            const text = self.text.items[start..end];
+            const captured = if (linewise and !std.mem.endsWith(u8, text, "\n"))
+                try std.mem.concat(a, u8, &.{ text, "\n" })
+            else
+                try a.dupe(u8, text);
+            if (self.register) |reg| a.free(reg.text);
+            self.register = .{ .text = captured, .linewise = linewise };
+            if (op == .yank) return;
+            const remove_at = if (linewise and op == .delete and end == self.text.items.len and start > 0)
+                start - 1
+            else
+                start;
+            self.text.replaceRangeAssumeCapacity(remove_at, end - remove_at, "");
+            self.cursor = prompt.clampCursor(self.text.items, remove_at);
+        } else if (op == .change) {
+            self.cursor = self.graphemeStart(start);
+        }
+        self.in_insert = op == .change;
+        if (!self.in_insert) self.cursor = self.normalCaret();
     }
 
     pub fn enter(self: *Edit, a: std.mem.Allocator) !void {
@@ -326,4 +542,23 @@ test "table cell: lists, escaped pipes and multiline clipboard round trip" {
     const verbatim = try decode(a, "\x60<br>\x60<br>- next", 0);
     defer a.free(verbatim.bytes);
     try std.testing.expectEqualStrings("\x60<br>\x60\n- next", verbatim.bytes);
+}
+
+test "table cell: counted Normal deletes and puts preserve whole graphemes" {
+    const a = std.testing.allocator;
+    const source = "e\u{301}👩‍💻Z";
+    var edit = try Edit.init(a, .{
+        .start = 0,
+        .end = source.len,
+        .outer_start = 0,
+        .outer_end = source.len,
+    }, 0, 1, 0, source, 0);
+    defer edit.deinit(a);
+    edit.leaveInsert();
+    try edit.normalKey(a, .{ .codepoint = '2' });
+    try edit.normalKey(a, .{ .codepoint = 'x' });
+    try std.testing.expectEqualStrings("Z", edit.text.items);
+    try edit.normalKey(a, .{ .codepoint = 'P' });
+    try std.testing.expectEqualStrings(source, edit.text.items);
+    try std.testing.expectEqual(@as(usize, "e\u{301}".len), edit.cursor);
 }

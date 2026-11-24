@@ -5474,7 +5474,7 @@ test "markdown: i opens a cell editor with live lists, one undo and safe source"
     defer a.free(before_save);
     try std.testing.expectEqualStrings(source, before_save);
 
-    try sess.send("\x1b");
+    try sess.send("\x13");
     try gridWaitGone(&sess, &grid, "Edit cell", 5000);
     try gridWaitFor(&sess, &grid, "[NORMAL]", 5000);
     try std.testing.expect(grid.contains("2. check | logs"));
@@ -5527,7 +5527,7 @@ test "markdown: editing a neighboring word preserves literal entities inside cel
     try gridWaitFor(&sess, &grid, "Edit cell", 5000);
     try sess.send("X");
     try gridWaitFor(&sess, &grid, "XZed", 5000);
-    try sess.send("\x1b");
+    try sess.send("\x13");
     try gridWaitGone(&sess, &grid, "Edit cell", 5000);
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
     const saved = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024));
@@ -5535,6 +5535,44 @@ test "markdown: editing a neighboring word preserves literal entities inside cel
     const expected = try std.mem.replaceOwned(u8, a, source, "Zed", "XZed");
     defer a.free(expected);
     try std.testing.expectEqualStrings(expected, saved);
+}
+
+test "markdown: cell Normal keeps Vim motions and text objects inside the draft" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const source = "| Example | Kind |\n| --- | --- |\n| (old) left \\| right | safe |\n";
+    var name_buf: [192:0]u8 = undefined;
+    const path = try erFixture(io, &name_buf, ".md", source);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{}, 24, 80, "/tmp");
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(a);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "(old) left | right", 5000);
+
+    try sess.send("2jf(i");
+    try gridWaitFor(&sess, &grid, "Edit cell · INSERT", 5000);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "Edit cell · NORMAL", 5000);
+    try sess.send("f|ra0foci(new");
+    try gridWaitFor(&sess, &grid, "Edit cell · INSERT", 5000);
+    try gridWaitFor(&sess, &grid, "(new) left a right", 5000);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "Edit cell · NORMAL", 5000);
+    try sess.send(":wq");
+    try sess.send("\x13");
+    try gridWaitGone(&sess, &grid, "Edit cell", 5000);
+    try std.testing.expect(grid.contains("safe"));
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "(old) left | right", 5000);
+    try sess.send("\x12");
+    try gridWaitFor(&sess, &grid, "(new) left a right", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+
+    const saved = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024));
+    defer a.free(saved);
+    try std.testing.expectEqualStrings("| Example | Kind |\n| --- | --- |\n| (new) left a right | safe |\n", saved);
 }
 
 test "markdown: local PNG uses Kitty graphics placement" {

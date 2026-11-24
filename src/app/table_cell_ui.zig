@@ -1,7 +1,6 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const App = @import("../app.zig").App;
-const utf8 = @import("../buffer/utf8.zig");
 const util = @import("util.zig");
 const cells = @import("table_cell.zig");
 const markdown = @import("markdown.zig");
@@ -77,12 +76,25 @@ pub fn check(self: *App) !void {
 pub fn key(self: *App, k: vaxis.Key) !void {
     try check(self);
     const cell = if (self.cell_edit) |*edit| edit else return;
-    if (k.codepoint == 'c' and k.mods.ctrl and !k.mods.alt and !k.mods.super) return close(self);
-    if (k.codepoint != vaxis.Key.escape) return cell.key(self.alloc, self.vx.window(), k);
+    if (k.matches('c', .{ .ctrl = true })) return close(self);
+    if (k.matches('s', .{ .ctrl = true })) return accept(self, cell);
+    if (cell.in_insert) {
+        if (k.matches(vaxis.Key.escape, .{})) {
+            cell.leaveInsert();
+        } else {
+            try cell.key(self.alloc, self.vx.window(), k);
+        }
+    } else {
+        try cell.normalKey(self.alloc, k);
+    }
+    self.state.mode = if (cell.in_insert) .insert else .normal;
+}
+
+fn accept(self: *App, cell: *const cells.Edit) !void {
     if (!cell.changed()) return close(self);
 
     const range = cell.range;
-    const encoded = try cells.encode(self.alloc, cell.text.items, cell.cursor);
+    const encoded = try cells.encode(self.alloc, cell.text.items, cell.normalCaret());
     defer self.alloc.free(encoded.bytes);
     // An unpadded cell ending in a backslash could escape its own delimiter.
     const replacement = if (std.mem.endsWith(u8, encoded.bytes, "\\") and
@@ -92,13 +104,15 @@ pub fn key(self: *App, k: vaxis.Key) !void {
         encoded.bytes;
     defer if (replacement.ptr != encoded.bytes.ptr) self.alloc.free(replacement);
     try self.applyEdit(range.start, range.end, replacement);
-    self.curCursor().* = range.start + @as(u32, @intCast(utf8.prevBoundary(encoded.bytes, encoded.cursor)));
+    self.curCursor().* = range.start + @as(u32, @intCast(encoded.cursor));
     close(self);
 }
 
 pub fn paste(self: *App, text: []const u8) !void {
     try check(self);
-    if (self.cell_edit) |*cell| try cell.paste(self.alloc, text);
+    if (self.cell_edit) |*cell| {
+        if (cell.in_insert) try cell.paste(self.alloc, text);
+    }
 }
 
 /// Leave at least one table row visible, even if the terminal shrinks.
@@ -116,7 +130,10 @@ pub fn draw(self: *App, a: std.mem.Allocator, win: vaxis.Window, rect: App.LeafR
         .height = @intCast(rect.height),
     });
     panel.fill(.{ .style = .{ .bg = .{ .rgb = self.theme.bg_float } } });
-    const title = util.cellFitPrefix(panel, " Edit cell   Esc done   Ctrl+C cancel", rect.width);
+    const title = util.cellFitPrefix(panel, if (cell.in_insert)
+        " Edit cell · INSERT   Ctrl+S apply   Ctrl+C cancel   Esc normal"
+    else
+        " Edit cell · NORMAL   Ctrl+S apply   Ctrl+C cancel   i insert", rect.width);
     _ = panel.print(&.{.{ .text = title.slice, .style = .{
         .bg = .{ .rgb = self.theme.bg_alt },
         .fg = .{ .rgb = self.theme.accent },
