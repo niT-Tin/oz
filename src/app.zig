@@ -555,6 +555,11 @@ pub const App = struct {
     // fuzzy picker (<leader>sf / <leader>st / <leader>sb / <leader>sr / <leader>sk / <leader>sp)
     picker_mode: enum { files, grep, buffers, recent, keymaps, themes, workspaces } = .files,
     picker_active: bool = false,
+    picker_from_home: bool = false,
+    home_search_pending: bool = false,
+    home_search: ?*@import("app/picker_files.zig").HomeSearch = null,
+    home_search_limited: bool = false,
+    home_search_fallback: bool = false,
     picker_files: std.ArrayList([]u8) = .empty, // owned paths (relative to picker_root)
     /// Absolute directory `picker_files` was walked for (owned); null = the
     /// process cwd. The cache is global/shared across workspaces (plan §2.1),
@@ -1709,6 +1714,7 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        if (self.home_search) |job| job.destroy();
         if (self.cell_edit) |*cell| cell.deinit(self.alloc);
         if (self.pending_filetree_create) |path| self.alloc.free(path);
         self.navigator_git.deinit(self);

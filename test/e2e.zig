@@ -5474,7 +5474,7 @@ test "markdown: i opens a cell editor with live lists, one undo and safe source"
     defer a.free(before_save);
     try std.testing.expectEqualStrings(source, before_save);
 
-    try sess.send("\x1b");
+    try sess.send("\x13");
     try gridWaitGone(&sess, &grid, "Edit cell", 5000);
     try gridWaitFor(&sess, &grid, "[NORMAL]", 5000);
     try std.testing.expect(grid.contains("2. check | logs"));
@@ -5527,7 +5527,7 @@ test "markdown: editing a neighboring word preserves literal entities inside cel
     try gridWaitFor(&sess, &grid, "Edit cell", 5000);
     try sess.send("X");
     try gridWaitFor(&sess, &grid, "XZed", 5000);
-    try sess.send("\x1b");
+    try sess.send("\x13");
     try gridWaitGone(&sess, &grid, "Edit cell", 5000);
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
     const saved = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024));
@@ -5535,6 +5535,44 @@ test "markdown: editing a neighboring word preserves literal entities inside cel
     const expected = try std.mem.replaceOwned(u8, a, source, "Zed", "XZed");
     defer a.free(expected);
     try std.testing.expectEqualStrings(expected, saved);
+}
+
+test "markdown: cell Normal keeps Vim motions and text objects inside the draft" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const source = "| Example | Kind |\n| --- | --- |\n| (old) left \\| right | safe |\n";
+    var name_buf: [192:0]u8 = undefined;
+    const path = try erFixture(io, &name_buf, ".md", source);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, path }, &.{}, 24, 80, "/tmp");
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(a);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "(old) left | right", 5000);
+
+    try sess.send("2jf(i");
+    try gridWaitFor(&sess, &grid, "Edit cell · INSERT", 5000);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "Edit cell · NORMAL", 5000);
+    try sess.send("f|ra0foci(new");
+    try gridWaitFor(&sess, &grid, "Edit cell · INSERT", 5000);
+    try gridWaitFor(&sess, &grid, "(new) left a right", 5000);
+    try sess.send("\x1b");
+    try gridWaitFor(&sess, &grid, "Edit cell · NORMAL", 5000);
+    try sess.send(":wq");
+    try sess.send("\x13");
+    try gridWaitGone(&sess, &grid, "Edit cell", 5000);
+    try std.testing.expect(grid.contains("safe"));
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "(old) left | right", 5000);
+    try sess.send("\x12");
+    try gridWaitFor(&sess, &grid, "(new) left a right", 5000);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
+
+    const saved = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024));
+    defer a.free(saved);
+    try std.testing.expectEqualStrings("| Example | Kind |\n| --- | --- |\n| (new) left a right | safe |\n", saved);
 }
 
 test "markdown: local PNG uses Kitty graphics placement" {
@@ -17269,6 +17307,52 @@ test "dashboard: opening the first file replaces the [No Name] scratch buffer" {
     try wsQuit(&sess, &grid);
 }
 
+test "dashboard: searches home at startup and in a new workspace" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "home/nested/deeper");
+    try tmp.dir.createDirPath(io, "launch");
+    for ([_][]const u8{ "home/home-first.txt", "home/nested/deeper/home-deep.txt", "launch/project-only.txt" }, [_][]const u8{ "HOME FIRST", "HOME DEEP", "PROJECT ONLY" }) |path, data| {
+        try tmp.dir.writeFile(io, .{ .sub_path = path, .data = data });
+    }
+    const home = try tmp.dir.realPathFileAlloc(io, "home", a);
+    defer a.free(home);
+    const launch = try tmp.dir.realPathFileAlloc(io, "launch", a);
+    defer a.free(launch);
+    const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+    defer a.free(env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{oz_exe_path}, &.{env}, 24, 90, launch);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 90);
+    defer grid.deinit(a);
+
+    try gridWaitFor(&sess, &grid, "终端文本编辑器", 5000);
+    try sess.send("f");
+    try gridWaitFor(&sess, &grid, "home-first.txt", 5000);
+    try std.testing.expect(!grid.contains("home-deep.txt"));
+    try std.testing.expect(!grid.contains("project-only.txt"));
+    try sess.send("home-deep");
+    try gridWaitFor(&sess, &grid, "nested/deeper/home-deep.txt", 5000);
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "HOME DEEP", 5000);
+    try sess.send(" sfhome-first");
+    try gridWaitFor(&sess, &grid, "╭ Files ", 5000);
+    try std.testing.expect(!grid.contains("home-first.txt"));
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "╭ Files ", 5000);
+
+    try sess.send(" \tn");
+    try gridWaitFor(&sess, &grid, "终端文本编辑器", 5000);
+    try sess.send("fhome-first");
+    try gridWaitFor(&sess, &grid, "home-first.txt", 5000);
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "HOME FIRST", 5000);
+    try wsQuit(&sess, &grid);
+}
+
 test "dashboard: snacks-style layout and menu keys" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -17330,7 +17414,10 @@ test "picker permissions: Dashboard f skips denied subtrees and opens readable s
         try std.testing.expectError(error.AccessDenied, dir.openDir(io, "nested/locked", .{ .iterate = true }));
         try dir.symLink(io, ".", "loop", .{ .is_directory = true });
 
-        var sess = try Session.spawnEnvSizeCwd(io, &.{oz_exe_path}, null, 24, cols, root);
+        // Exercise both a readable HOME and fallback when HOME is missing.
+        const home = try std.fmt.allocPrint(alloc, "HOME={s}{s}", .{ root, if (cols == 40) "" else "/missing" });
+        defer alloc.free(home);
+        var sess = try Session.spawnEnvSizeCwd(io, &.{oz_exe_path}, &.{home}, 24, cols, root);
         defer sess.close();
         defer killPid(sess.pid);
         var grid = try Grid.initSizedCols(alloc, 24, cols);
@@ -17363,7 +17450,9 @@ test "picker permissions: denied root reports on Dashboard and retries after per
     var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
     defer dir.close(io);
     defer dir.setPermissions(io, std.Io.File.Permissions.fromMode(0o700)) catch {};
-    var sess = try Session.spawnCwd(io, &.{oz_exe_path}, root);
+    const home = try std.fmt.allocPrint(alloc, "HOME={s}", .{root});
+    defer alloc.free(home);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{oz_exe_path}, &.{home}, 24, 80, root);
     defer sess.close();
     defer killPid(sess.pid);
     var grid = try Grid.init(alloc);
