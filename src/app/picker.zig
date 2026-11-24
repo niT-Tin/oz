@@ -18,10 +18,16 @@ pub const GrepResult = struct { path: []u8, line: u32, text: []u8 };
 // ---- fuzzy picker (<leader>sf) ----
 
 pub fn openPicker(self: *App) !void {
-    // The fuzzy file picker walks the workspace's project root (or the
-    // process cwd when none is set). The cache is global/shared, so it is
-    // re-walked whenever the root changed since the last walk — files from
-    // one workspace's project must not leak into another's picker.
+    if (self.isDashboard()) {
+        self.picker_mode = .files;
+        self.picker_input.clearRetainingCapacity();
+        self.picker_top = 0;
+        self.picker_active = true;
+        self.picker_from_home = true;
+        try requestHomeSearch(self);
+        return;
+    }
+    // An established editor workspace searches its project (or the cwd).
     const root_dir = try self.currentRootDir();
     defer self.alloc.free(root_dir);
     if (self.picker_files.items.len == 0 or
@@ -53,6 +59,79 @@ pub fn openPicker(self: *App) !void {
     self.picker_active = true;
     if (self.msg) |m| self.alloc.free(m);
     self.msg = null;
+}
+
+fn clearHomeResults(self: *App) void {
+    self.picker_matches.clearRetainingCapacity();
+    self.picker_sel = 0;
+    picker_files.deinit(self.alloc, &self.picker_files);
+    if (self.picker_root) |p| self.alloc.free(p);
+    self.picker_root = null;
+}
+
+fn requestHomeSearch(self: *App) !void {
+    clearHomeResults(self);
+    if (self.msg) |m| self.alloc.free(m);
+    self.msg = null;
+    self.home_search_limited = false;
+    self.home_search_fallback = false;
+    self.home_search_pending = true;
+    if (self.home_search) |job| {
+        job.cancelled.store(true, .release);
+    } else try startHomeSearch(self);
+}
+
+fn startHomeSearch(self: *App) !void {
+    const a = self.alloc;
+    const home = if (self.env_map.get("HOME")) |path|
+        if (std.fs.path.isAbsolute(path)) try a.dupe(u8, path) else null
+    else
+        null;
+    errdefer if (home) |path| a.free(path);
+    const fallback = try self.currentRootDir();
+    errdefer a.free(fallback);
+    const query = try a.dupe(u8, self.picker_input.items);
+    errdefer a.free(query);
+    const job = try a.create(picker_files.HomeSearch);
+    errdefer a.destroy(job);
+    job.* = .{
+        .alloc = a,
+        .io = self.io,
+        .home = home,
+        .fallback = fallback,
+        .query = query,
+        .wake_ctx = self,
+        .wake = @import("lsp.zig").lspWake,
+    };
+    job.thread = try std.Thread.spawn(.{}, picker_files.HomeSearch.run, .{job});
+    self.home_search = job;
+    self.home_search_pending = false;
+}
+
+pub fn pollHomeSearch(self: *App) !bool {
+    const job = self.home_search orelse return false;
+    if (!job.done.load(.acquire)) return false;
+    self.home_search = null;
+    defer job.destroy();
+    if (!self.picker_from_home or !self.picker_active) return false;
+    if (self.home_search_pending) {
+        try startHomeSearch(self);
+        return false;
+    }
+    const root = if (job.used_fallback) job.fallback else job.home.?;
+    if (job.err) |err| {
+        self.closePicker();
+        try self.setMsg(try std.fmt.allocPrint(self.alloc, "cannot search files ({s}): {s}", .{ @errorName(err), root }));
+        return true;
+    }
+    try self.picker_matches.ensureTotalCapacity(self.alloc, job.files.items.len);
+    self.picker_root = try self.alloc.dupe(u8, root);
+    self.picker_files = job.files;
+    job.files = .empty;
+    self.home_search_limited = job.limited;
+    self.home_search_fallback = job.used_fallback;
+    for (self.picker_files.items, 0..) |_, i| self.picker_matches.appendAssumeCapacity(i);
+    return true;
 }
 
 /// Absolute path for a fuzzy-file picker entry `rel` (relative to
@@ -371,7 +450,7 @@ pub fn renderGrepPreviewRow(
     // per-byte style ids: 0 = base fg, 1+ = syntax palette (Style ordinal
     // + 1), so spans map straight onto a per-frame palette
     var style_palette: [autil.syntax_style_count]vaxis.Style = undefined;
-    for (0..style_palette.len) |i| style_palette[i] = autil.syntaxStyle(@enumFromInt(i), self.theme);
+    for (0..style_palette.len) |i| style_palette[i] = autil.syntaxStyle(@fromBackingInt(@intCast(i)), self.theme);
     const selected_line = (file_line == sel_line);
     const base_bg: vaxis.Style = if (selected_line)
         .{ .bg = .{ .rgb = self.theme.bg_sel } }
@@ -386,7 +465,7 @@ pub fn renderGrepPreviewRow(
         if (sp.end <= row_s or sp.start >= row_e) continue;
         const cs = @max(sp.start, @as(u32, @intCast(row_s)));
         const ce = @min(sp.end, @as(u32, @intCast(row_e)));
-        const sid: u8 = @intCast(@intFromEnum(sp.style) + 1);
+        const sid: u8 = @intCast(@backingInt(sp.style) + 1);
         for (cs..ce) |bi| {
             if (bi - row_s >= n) break;
             ids_buf[bi - row_s] = sid;
@@ -490,9 +569,9 @@ pub fn handlePickerKey(self: *App, key: vaxis.Key) !void {
             if (self.picker_matches.items.len > 0) {
                 const rel = self.picker_files.items[self.picker_matches.items[self.picker_sel]];
                 const abs = try resolvePickerPath(self, rel);
+                defer self.alloc.free(abs);
                 self.closePicker();
                 try self.openFile(abs);
-                self.alloc.free(abs);
             }
         },
         vaxis.Key.backspace => {
@@ -560,6 +639,7 @@ pub fn applyThemePreview(self: *App) void {
 }
 
 pub fn pickerRefilter(self: *App) !void {
+    if (self.picker_from_home and self.picker_mode == .files) return requestHomeSearch(self);
     self.picker_matches.clearRetainingCapacity();
     if (self.picker_mode == .keymaps) {
         // match against "keys desc" via fzy; matches index into
@@ -674,6 +754,12 @@ pub fn pickerRefilter(self: *App) !void {
 }
 
 pub fn closePicker(self: *App) void {
+    if (self.picker_from_home) {
+        clearHomeResults(self);
+        self.picker_from_home = false;
+        self.home_search_pending = false;
+        if (self.home_search) |job| job.cancelled.store(true, .release);
+    }
     self.picker_active = false;
     self.picker_sel = 0;
     self.picker_mode = .files;

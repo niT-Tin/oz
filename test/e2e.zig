@@ -17269,6 +17269,52 @@ test "dashboard: opening the first file replaces the [No Name] scratch buffer" {
     try wsQuit(&sess, &grid);
 }
 
+test "dashboard: searches home at startup and in a new workspace" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "home/nested/deeper");
+    try tmp.dir.createDirPath(io, "launch");
+    for ([_][]const u8{ "home/home-first.txt", "home/nested/deeper/home-deep.txt", "launch/project-only.txt" }, [_][]const u8{ "HOME FIRST", "HOME DEEP", "PROJECT ONLY" }) |path, data| {
+        try tmp.dir.writeFile(io, .{ .sub_path = path, .data = data });
+    }
+    const home = try tmp.dir.realPathFileAlloc(io, "home", a);
+    defer a.free(home);
+    const launch = try tmp.dir.realPathFileAlloc(io, "launch", a);
+    defer a.free(launch);
+    const env = try std.fmt.allocPrint(a, "HOME={s}", .{home});
+    defer a.free(env);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{oz_exe_path}, &.{env}, 24, 90, launch);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 24, 90);
+    defer grid.deinit(a);
+
+    try gridWaitFor(&sess, &grid, "终端文本编辑器", 5000);
+    try sess.send("f");
+    try gridWaitFor(&sess, &grid, "home-first.txt", 5000);
+    try std.testing.expect(!grid.contains("home-deep.txt"));
+    try std.testing.expect(!grid.contains("project-only.txt"));
+    try sess.send("home-deep");
+    try gridWaitFor(&sess, &grid, "nested/deeper/home-deep.txt", 5000);
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "HOME DEEP", 5000);
+    try sess.send(" sfhome-first");
+    try gridWaitFor(&sess, &grid, "╭ Files ", 5000);
+    try std.testing.expect(!grid.contains("home-first.txt"));
+    try sess.send("\x1b");
+    try gridWaitGone(&sess, &grid, "╭ Files ", 5000);
+
+    try sess.send(" \tn");
+    try gridWaitFor(&sess, &grid, "终端文本编辑器", 5000);
+    try sess.send("fhome-first");
+    try gridWaitFor(&sess, &grid, "home-first.txt", 5000);
+    try sess.send("\r");
+    try gridWaitFor(&sess, &grid, "HOME FIRST", 5000);
+    try wsQuit(&sess, &grid);
+}
+
 test "dashboard: snacks-style layout and menu keys" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -17330,7 +17376,10 @@ test "picker permissions: Dashboard f skips denied subtrees and opens readable s
         try std.testing.expectError(error.AccessDenied, dir.openDir(io, "nested/locked", .{ .iterate = true }));
         try dir.symLink(io, ".", "loop", .{ .is_directory = true });
 
-        var sess = try Session.spawnEnvSizeCwd(io, &.{oz_exe_path}, null, 24, cols, root);
+        // Exercise both a readable HOME and fallback when HOME is missing.
+        const home = try std.fmt.allocPrint(alloc, "HOME={s}{s}", .{ root, if (cols == 40) "" else "/missing" });
+        defer alloc.free(home);
+        var sess = try Session.spawnEnvSizeCwd(io, &.{oz_exe_path}, &.{home}, 24, cols, root);
         defer sess.close();
         defer killPid(sess.pid);
         var grid = try Grid.initSizedCols(alloc, 24, cols);
@@ -17363,7 +17412,9 @@ test "picker permissions: denied root reports on Dashboard and retries after per
     var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
     defer dir.close(io);
     defer dir.setPermissions(io, std.Io.File.Permissions.fromMode(0o700)) catch {};
-    var sess = try Session.spawnCwd(io, &.{oz_exe_path}, root);
+    const home = try std.fmt.allocPrint(alloc, "HOME={s}", .{root});
+    defer alloc.free(home);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{oz_exe_path}, &.{home}, 24, 80, root);
     defer sess.close();
     defer killPid(sess.pid);
     var grid = try Grid.init(alloc);

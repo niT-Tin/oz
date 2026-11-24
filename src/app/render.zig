@@ -3706,7 +3706,7 @@ pub fn render(self: *App) !void {
         // fixed-size panel never collapses to a sliver while the query
         // has no hits yet
         var list_rows = @min(@as(usize, 10), total);
-        if (self.picker_mode == .grep) list_rows = @max(list_rows, 1);
+        if (self.picker_mode == .grep or self.picker_from_home) list_rows = @max(list_rows, 1);
         // vim-style scroll window: the selection moves freely inside the
         // window; the window scrolls only when the selection crosses an
         // edge (persisted in picker_top so it doesn't jump around).
@@ -3723,7 +3723,7 @@ pub fn render(self: *App) !void {
         var max_w: usize = 0;
         if (self.picker_mode != .grep) {
             var mk: usize = 0;
-            while (mk < list_rows) : (mk += 1) {
+            while (mk < list_rows and top + mk < total) : (mk += 1) {
                 const ri = top + mk;
                 const label: []const u8 = if (self.picker_mode == .grep) blk: {
                     const r = self.grep_results.items[ri];
@@ -3756,6 +3756,7 @@ pub fn render(self: *App) !void {
             max_w = @min(max_w, 60);
         }
         var inner_w: u32 = @intCast(@max(max_w, 12));
+        if (self.picker_from_home) inner_w = @max(inner_w, 26);
         // Keymap descriptions are long; a slightly wider card gives the
         // reference room to breathe instead of reading as a cramped list.
         if (self.picker_mode == .keymaps) inner_w = @max(inner_w, 48);
@@ -3771,7 +3772,7 @@ pub fn render(self: *App) !void {
             // never spans the whole terminal (telescope/snacks feel)
             box_w = @min(inner_w + 2, win.width * 3 / 5);
         }
-        inner_w = box_w - 2;
+        inner_w = box_w -| 2;
         const title = switch (self.picker_mode) {
             .grep => " Grep ",
             .buffers => " Buffers ",
@@ -3779,7 +3780,12 @@ pub fn render(self: *App) !void {
             .keymaps => " Keymaps ",
             .themes => " Themes ",
             .workspaces => " Workspaces ",
-            else => " Files ",
+            .files => if (!self.picker_from_home or self.home_search_fallback)
+                " Files "
+            else if (self.home_search_limited)
+                " Files · Home (partial) "
+            else
+                " Files · Home ",
         };
         // centered floating window: title + input row + list + bottom
         // border; start_row biased slightly upward (1/3 down the screen)
@@ -3805,9 +3811,9 @@ pub fn render(self: *App) !void {
         {
             var segs = std.ArrayList(vaxis.Segment).empty;
             try segs.append(a, .{ .text = "╭", .style = border_style });
-            try segs.append(a, .{ .text = title, .style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_float } } });
-            var cx: u32 = 1 + @as(u32, @intCast(title.len));
-            while (cx < inner_w + 1) : (cx += 1) {
+            const fit = autil.cellFitPrefix(win, title, inner_w);
+            try segs.append(a, .{ .text = fit.slice, .style = .{ .fg = .{ .rgb = self.theme.accent }, .bg = .{ .rgb = self.theme.bg_float } } });
+            for (fit.cells..inner_w) |_| {
                 try segs.append(a, .{ .text = "─", .style = border_style });
             }
             try segs.append(a, .{ .text = "╮", .style = border_style });
@@ -3844,7 +3850,19 @@ pub fn render(self: *App) !void {
             const rs: vaxis.Style = if (selected) sel_style else row_style;
             var segs = std.ArrayList(vaxis.Segment).empty;
             try segs.append(a, .{ .text = "│", .style = border_style });
-            if (self.picker_mode == .keymaps) {
+            if (self.picker_from_home and total == 0) {
+                const text = self.msg orelse if (self.home_search != null)
+                    "Searching files…"
+                else if (self.picker_input.items.len == 0)
+                    "Type to search files"
+                else
+                    "No matching files";
+                const fit = autil.cellFitPrefix(win, text, inner_w);
+                const row = try a.alloc(u8, fit.slice.len + inner_w - fit.cells);
+                @memset(row, ' ');
+                @memcpy(row[0..fit.slice.len], fit.slice);
+                try segs.append(a, .{ .text = row, .style = row_style });
+            } else if (self.picker_mode == .keymaps) {
                 // segmented keymap row: keys tokens split on spaces —
                 // "space" / "ctrl-*" / "alt-*" / ":*" prefixes render
                 // accent, the rest keyword; then "  " + desc in fg. The
@@ -5000,6 +5018,7 @@ pub fn run(self: *App) !void {
         // apply): gutter marks, branch and floats update without a
         // keypress, same as the LSP slots.
         var git_ready = self.navigator_git.tick(self);
+        const home_ready = try @import("picker.zig").pollHomeSearch(self);
         if (@import("git_review.zig").poll(self)) git_ready = true;
         if (self.git_job) |job| {
             if (job.done.load(.acquire)) {
@@ -5060,7 +5079,7 @@ pub fn run(self: *App) !void {
                 }
             }
         }
-        if (nav_ready or passive_ready or comp_ready or comp_resolved or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready or lsp_ready or term_ready or ai_ready or ai_tools_ready or ai_terminal_ready or inline_ready) {
+        if (nav_ready or passive_ready or comp_ready or comp_resolved or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready or home_ready or lsp_ready or term_ready or ai_ready or ai_tools_ready or ai_terminal_ready or inline_ready) {
             try self.render();
             last_render_ms = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
             continue;
