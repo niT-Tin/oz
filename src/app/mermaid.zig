@@ -1,4 +1,4 @@
-//! Render Markdown diagrams with a user-configured Mermaid CLI. The worker
+//! Render Markdown diagrams with Mermaid CLI. The worker
 //! owns the input and scratch directory; only the UI thread talks to the TTY.
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -48,7 +48,7 @@ pub const State = struct {
             return;
         }
         if (state.job != null or state.cacheSlot() == null) return;
-        const command = app.env_map.get("OZ_MERMAID_CMD") orelse return;
+        const command = app.env_map.get("OZ_MERMAID_CMD") orelse "mmdc";
         if (command.len == 0) return;
         state.job = Job.start(app, command, diagram) catch return;
     }

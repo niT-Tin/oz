@@ -5634,15 +5634,15 @@ test "markdown: Mermaid renders asynchronously and refreshes after an edit" {
         defer file.close(io);
         try file.setPermissions(io, .fromMode(0o755));
     }
-    const tool_env = try std.fmt.allocPrint(a, "OZ_MERMAID_CMD={s}", .{tool});
-    defer a.free(tool_env);
+    const path_env = try std.fmt.allocPrint(a, "PATH={s}:/usr/bin:/bin:/usr/local/bin", .{root});
+    defer a.free(path_env);
     const gate_env = try std.fmt.allocPrint(a, "OZ_MERMAID_TEST_DIR={s}", .{root});
     defer a.free(gate_env);
 
     var name: [192:0]u8 = undefined;
     const path = try erFixture(io, &name, ".md", "# Guide\n\n\x60\x60\x60mermaid\nflowchart LR\n  A --> B\n\x60\x60\x60\n\nAfter diagram.\n");
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
-    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, path }, &.{ tool_env, gate_env }, 24, 80);
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, path }, &.{ path_env, gate_env }, 24, 80);
     defer sess.close();
     defer killPid(sess.pid);
     var grid = try Grid.init(a);

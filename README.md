@@ -4,7 +4,7 @@ A Vim-style terminal editor written in Zig. Edit in splits, look up symbols with
 
 [Download](https://github.com/niT-Tin/oz/releases/latest) · [Website](https://nit-tin.github.io/oz/?lang=en) · [中文](README.zh-CN.md)
 
-![oz editing its own chart renderer with the project tree open](website/assets/editor.png)
+![oz editing Zig code with Git status badges in the file tree](website/assets/editor.png)
 
 ## Open your first file
 
@@ -22,6 +22,6 @@ Open Git Review with `Space g v` or `:GitReview`. Press `Tab` to switch between 
 
 ## Markdown diagrams and images
 
-Ghostty and Kitty can show local Markdown images and PNG previews of Mermaid code blocks. For Mermaid, install the [Mermaid CLI](https://github.com/mermaid-js/mermaid-cli) with `npm install -g @mermaid-js/mermaid-cli`, then open a Markdown file with `OZ_MERMAID_CMD=mmdc oz notes.md`. A preview appears below each complete `mermaid` fence in Normal mode. The diagram source stays editable and remains readable when graphics or rendering are unavailable.
+Ghostty and Kitty can show local Markdown images and Mermaid diagrams. Run `npm install -g @mermaid-js/mermaid-cli`, then open a Markdown file with `oz notes.md`. oz finds `mmdc` on your PATH and previews complete `mermaid` fences in Normal mode. The source remains editable when rendering is unavailable. [Mermaid CLI](https://github.com/mermaid-js/mermaid-cli)
 
 [Connect a coding agent](https://nit-tin.github.io/oz/?lang=en#agents) · [Build from source](https://nit-tin.github.io/oz/?lang=en#download) · [Changelog](CHANGELOG.md) · [MIT license](LICENSE)
