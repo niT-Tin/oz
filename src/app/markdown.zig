@@ -267,7 +267,14 @@ fn buildTable(
     const chrome = if (wrapped) try tableChrome(a, widths.items, padding) else "";
     for (rows.items) |row| {
         const top_rule = if (row.line == first) top else null;
-        const bottom_rule = if (row.line == last) bottom else null;
+        // Attach the divider to the whole source row so it follows all of
+        // that row's wrapped lines, including in the live cell preview.
+        const bottom_rule = if (row.line == last)
+            bottom
+        else if (delimiter != null and row.line > delimiter.?)
+            middle
+        else
+            null;
         if (wrapped) {
             const parts = try wrapTableRow(a, pt, win, table_decors, row.cells, widths.items, aligns.items, padding);
             try layout.entries.put(row.line, .{
@@ -787,10 +794,13 @@ test "markdown layout: table borders, CJK widths and alignment" {
     const header = fixture.layout.get(0).?;
     try std.testing.expectEqualStrings("┌──────┬──────┐", header.top_rule.?);
     try std.testing.expect(header.table);
+    try std.testing.expect(header.bottom_rule == null);
     const delimiter = fixture.layout.get(1).?;
     try std.testing.expectEqualStrings("├──────┼──────┤", delimiter.gaps[0].text);
+    try std.testing.expect(delimiter.bottom_rule == null);
     const bold = fixture.layout.get(2).?;
     try std.testing.expectEqual(@as(u32, 15), bold.display_width);
+    try std.testing.expectEqualStrings(delimiter.gaps[0].text, bold.bottom_rule.?);
     const last = fixture.layout.get(3).?;
     try std.testing.expectEqualStrings("└──────┴──────┘", last.bottom_rule.?);
     try std.testing.expect(std.mem.indexOf(u8, last.gaps[1].text, "│  ") != null);

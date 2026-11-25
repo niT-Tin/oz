@@ -5279,6 +5279,12 @@ test "markdown: inline rendering with conceal, injection and decorations" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
+fn expectMarkdownRowDivider(grid: *const Grid, header_row: usize, divider_row: usize, left: usize) !void {
+    for (left..grid.cols) |col| {
+        try std.testing.expectEqualStrings(frame.cellText(grid, header_row, col), frame.cellText(grid, divider_row, col));
+    }
+}
+
 test "markdown: wide tables wrap inside aligned borders and reflow on resize" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -5307,18 +5313,22 @@ test "markdown: wide tables wrap inside aligned borders and reflow on resize" {
     const header_break = aiFindCell(&grid, "├") orelse return error.TestUnexpectedResult;
     const first_body = aiFindCell(&grid, "Canary") orelse return error.TestUnexpectedResult;
     const target = aiFindCell(&grid, "TARGET") orelse return error.TestUnexpectedResult;
+    const next_body = aiFindCell(&grid, "Check alerts.") orelse return error.TestUnexpectedResult;
+    const body_break = next_body.row - 1;
     try std.testing.expect(target.row > first_body.row);
+    try std.testing.expect(target.row < body_break);
     try std.testing.expect(grid.contains("中文日志"));
     try std.testing.expect(!grid.contains("**Canary**"));
     try std.testing.expectEqualStrings("┐", frame.cellText(&grid, top.row, 42));
     try std.testing.expectEqualStrings("┘", frame.cellText(&grid, bottom.row, 42));
+    try expectMarkdownRowDivider(&grid, header_break.row, body_break, top.col);
     var joins: usize = 0;
     for (top.col..44) |col| {
         const cap = frame.cellText(&grid, top.row, col);
         if (std.mem.eql(u8, cap, "┬")) joins += 1;
         const body_rule: []const u8 = if (std.mem.eql(u8, cap, "┌") or std.mem.eql(u8, cap, "┬") or std.mem.eql(u8, cap, "┐")) "│" else continue;
         for (top.row + 1..bottom.row) |row| {
-            if (row == header_break.row) continue;
+            if (row == header_break.row or row == body_break) continue;
             try std.testing.expectEqualStrings(body_rule, frame.cellText(&grid, row, col));
         }
     }
@@ -5329,6 +5339,12 @@ test "markdown: wide tables wrap inside aligned borders and reflow on resize" {
     try sess.send("rZ");
     try gridWaitFor(&sess, &grid, "ZARGET", 5000);
     try std.testing.expectEqualStrings("│", frame.cellText(&grid, target.row, 42));
+    // The virtual divider must not shift mouse hits into the next body row.
+    try mouseClickAt(&sess, next_body.col, next_body.row);
+    try sess.send("rX");
+    try gridWaitFor(&sess, &grid, "Xheck alerts.", 5000);
+    try sess.send("u");
+    try gridWaitFor(&sess, &grid, "Check alerts.", 5000);
     try sess.send("gg");
     try gridWaitFor(&sess, &grid, "# Checklist", 5000);
 
@@ -5339,7 +5355,11 @@ test "markdown: wide tables wrap inside aligned borders and reflow on resize" {
     try gridWaitFor(&sess, &wide, "End of checklist.", 5000);
     const wide_first = aiFindCell(&wide, "Canary") orelse return error.TestUnexpectedResult;
     const wide_target = aiFindCell(&wide, "ZARGET") orelse return error.TestUnexpectedResult;
+    const wide_next = aiFindCell(&wide, "Check alerts.") orelse return error.TestUnexpectedResult;
+    const wide_header_break = aiFindCell(&wide, "├") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(wide_first.row, wide_target.row);
+    try std.testing.expectEqual(wide_first.row + 2, wide_next.row);
+    try expectMarkdownRowDivider(&wide, wide_header_break.row, wide_next.row - 1, wide_header_break.col);
     try std.testing.expect(wide.contains("┘"));
 
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":wq\r"));
@@ -5418,16 +5438,19 @@ test "markdown: four-column table rules stay on single rows after narrowing the 
         const header = aiFindCell(&grid, "分类") orelse return error.TestUnexpectedResult;
         const middle = aiFindCell(&grid, "├") orelse return error.TestUnexpectedResult;
         const bottom = aiFindCell(&grid, "└") orelse return error.TestUnexpectedResult;
+        const second_body = aiFindCell(&grid, "回滚") orelse return error.TestUnexpectedResult;
+        const body_break = second_body.row - 1;
         try std.testing.expectEqual(top.row + 1, header.row);
         try std.testing.expectEqual(header.row + 1, middle.row);
         const right = cols - 2;
         try std.testing.expectEqualStrings("┐", frame.cellText(&grid, top.row, right));
         try std.testing.expectEqualStrings("┤", frame.cellText(&grid, middle.row, right));
+        try expectMarkdownRowDivider(&grid, middle.row, body_break, top.col);
         try std.testing.expectEqualStrings("┘", frame.cellText(&grid, bottom.row, right));
         for (top.row..bottom.row + 1) |row| {
             const margin = frame.cellText(&grid, row, cols - 1);
             try std.testing.expect(margin.len == 0 or std.mem.eql(u8, margin, " "));
-            if (row != top.row and row != middle.row and row != bottom.row)
+            if (row != top.row and row != middle.row and row != body_break and row != bottom.row)
                 try std.testing.expectEqualStrings("│", frame.cellText(&grid, row, right));
         }
         var joins: usize = 0;
@@ -5446,7 +5469,7 @@ test "markdown: four-column table rules stay on single rows after narrowing the 
 test "markdown: i opens a cell editor with live lists, one undo and safe source" {
     const io = std.testing.io;
     const a = std.testing.allocator;
-    const source = "# Checklist\n\n| ID | Details | Status |\n| --- | --- | --- |\n| oz | draft | ready |\n\nTail of checklist.\n";
+    const source = "# Checklist\n\n| ID | Details | Status |\n| --- | --- | --- |\n| oz | draft | ready |\n| qa | Follow up | waiting |\n\nTail of checklist.\n";
     var name_buf: [192:0]u8 = undefined;
     const path = try erFixture(io, &name_buf, ".md", source);
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
@@ -5470,6 +5493,10 @@ test "markdown: i opens a cell editor with live lists, one undo and safe source"
     try std.testing.expect(grid.contains("1. 检查"));
     const border = aiFindCell(&grid, "┐") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("│", frame.cellText(&grid, preview.row, border.col));
+    const next_body = aiFindCell(&grid, "Follow up") orelse return error.TestUnexpectedResult;
+    const header_break = aiFindCell(&grid, "├") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(preview.row + 2, next_body.row);
+    try expectMarkdownRowDivider(&grid, header_break.row, next_body.row - 1, header_break.col);
     const before_save = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024));
     defer a.free(before_save);
     try std.testing.expectEqualStrings(source, before_save);
