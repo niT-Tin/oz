@@ -9,7 +9,7 @@ pub const decrqm_sync = "\x1b[?2026$p";
 pub const decrqm_unicode = "\x1b[?2027$p";
 pub const decrqm_color_scheme = "\x1b[?2031$p";
 pub const csi_u_query = "\x1b[?u";
-pub const kitty_graphics_query = "\x1b_Gi=1,a=q\x1b\\";
+pub const kitty_graphics_query = "\x1b_Gi=1,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
 pub const sixel_geometry_query = "\x1b[?2;1;0S";
 pub const cursor_position_request = "\x1b[6n";
 pub const explicit_width_query = "\x1b]66;w=1; \x1b\\";

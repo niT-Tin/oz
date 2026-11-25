@@ -379,6 +379,7 @@ pub const App = struct {
     markdown_frame_buf: usize = std.math.maxInt(usize),
     markdown_frame_rev: u64 = 0,
     cell_edit: ?@import("app/table_cell.zig").Edit = null,
+    mermaid: @import("app/mermaid.zig").State = .{},
     markdown_images: std.StringHashMap(union(enum) { loaded: vaxis.Image, failed: void }),
     markdown_placed_images: std.ArrayList(u32) = .empty,
     markdown_visible_images: std.ArrayList(u32) = .empty,
@@ -1714,6 +1715,7 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        @import("app/mermaid.zig").State.deinit(self);
         if (self.home_search) |job| job.destroy();
         if (self.cell_edit) |*cell| cell.deinit(self.alloc);
         if (self.pending_filetree_create) |path| self.alloc.free(path);

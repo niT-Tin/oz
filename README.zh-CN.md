@@ -20,4 +20,8 @@
 
 用 `Space g v` 或 `:GitReview` 打开 Git 审查。按 `Tab` 切换工作区变更和提交历史，`Enter` 查看差异，`o` 跳到源码对应行。
 
+## Markdown 图表和图片
+
+Ghostty 和 Kitty 支持显示 Markdown 本地图片和 Mermaid 代码块的 PNG 预览。用 `npm install -g @mermaid-js/mermaid-cli` 安装 [Mermaid CLI](https://github.com/mermaid-js/mermaid-cli)，然后运行 `OZ_MERMAID_CMD=mmdc oz notes.md`。在 Normal 模式下，预览显示在完整的 `mermaid` 代码块下方。源码可以照常编辑，终端图形协议或渲染不可用时仍可阅读源码。
+
 [接入 coding agent](https://nit-tin.github.io/oz/?lang=zh#agents) · [从源码构建](https://nit-tin.github.io/oz/?lang=zh#download) · [更新日志](CHANGELOG.md) · [MIT 许可证](LICENSE)

@@ -19,6 +19,9 @@
 (fenced_code_block) @md.fence
 (fenced_code_block_delimiter) @md.fence_delimiter
 (info_string) @md.fence_info
+(code_fence_content) @md.fence_content
+(code_fence_content
+  (block_continuation) @md.fence_continuation)
 
 ; pipe tables are laid out as a block, not as independent source rows
 (pipe_table) @md.table

@@ -450,63 +450,79 @@ fn hideInactiveMarkdownImages(self: *App) void {
     self.markdown_visible_images.clearRetainingCapacity();
 }
 
-fn markdownImageRows(self: *App, win: vaxis.Window, info: markdown.Line, content_width: u32) u32 {
-    _ = content_width;
-    const image = info.image orelse return 0;
-    const path = image.path orelse return 0;
-    if (!self.vx.caps.kitty_graphics) return 0;
+fn markdownImage(self: *App, info: markdown.Line) ?vaxis.Image {
+    if (!self.vx.caps.kitty_graphics) return null;
+    if (info.diagram) |diagram| return self.mermaid.image(diagram);
+    const image = info.image orelse return null;
+    const path = image.path orelse return null;
     if (self.markdown_images.get(path) == null) {
         // Capability responses and image loads can arrive after the layout
         // was built; load on demand here so the first frame that renders the
         // image can place it, instead of caching a zero-row placeholder.
-        const key = self.alloc.dupe(u8, path) catch return 0;
+        const key = self.alloc.dupe(u8, path) catch return null;
         const loaded = loadMarkdownImage(self, path) catch {
             self.markdown_images.put(key, .failed) catch self.alloc.free(key);
-            return 0;
+            return null;
         };
         self.markdown_images.put(key, .{ .loaded = loaded }) catch {
             self.alloc.free(key);
-            return 0;
+            self.vx.freeImage(self.tty.writer(), loaded.id);
+            return null;
         };
     }
-    const entry = self.markdown_images.get(path) orelse return 0;
-    const loaded = switch (entry) {
+    return switch (self.markdown_images.get(path).?) {
         .loaded => |img| img,
-        .failed => return 0,
+        .failed => null,
     };
-    const size = loaded.cellSize(win) catch return 0;
-    if (size.rows == 0 or size.cols == 0) return 0;
-    return @min(@as(u32, size.rows), 20);
+}
+
+const MarkdownImageFit = struct {
+    rows: u32,
+    options: vaxis.Image.DrawOptions = .{},
+};
+
+fn fitMarkdownImage(img: vaxis.Image, win: vaxis.Window, cols: u32, rows: u32) ?MarkdownImageFit {
+    if (cols == 0 or rows == 0 or win.screen.width_pix == 0 or win.screen.height_pix == 0) return null;
+    const cell_w = std.math.divCeil(u64, win.screen.width_pix, win.screen.width) catch return null;
+    const cell_h = std.math.divCeil(u64, win.screen.height_pix, win.screen.height) catch return null;
+    const max_width = cols * cell_w;
+    const max_height = rows * cell_h;
+    if (img.width <= max_width and img.height <= max_height)
+        return .{ .rows = @intCast(std.math.divCeil(u64, img.height, cell_h) catch return null) };
+    // Give Kitty the limiting axis. The other axis scales proportionally.
+    if (max_width * img.height <= max_height * img.width) {
+        const height = std.math.divCeil(u64, max_width * img.height, @as(u64, img.width) * cell_h) catch return null;
+        return .{ .rows = @intCast(height), .options = .{ .size = .{ .cols = @intCast(cols) } } };
+    }
+    return .{ .rows = rows, .options = .{ .size = .{ .rows = @intCast(rows) } } };
+}
+
+fn markdownImageRows(self: *App, win: vaxis.Window, info: markdown.Line, content_width: u32) u32 {
+    const loaded = markdownImage(self, info) orelse return 0;
+    const fit = fitMarkdownImage(loaded, win, content_width, 20) orelse return 0;
+    return fit.rows;
 }
 
 fn drawMarkdownImage(self: *App, a: std.mem.Allocator, win: vaxis.Window, rect: LeafRect, row: u32, gutter: u32, content_width: u32, info: markdown.Line) !u32 {
-    const rows = markdownImageRows(self, win, info, content_width);
-    if (rows == 0 or row >= rect.row + rect.height) return row;
-    const image_info = info.image.?;
-    const loaded = switch (self.markdown_images.get(image_info.path.?).?) {
-        .loaded => |img| img,
-        .failed => unreachable,
-    };
+    if (row >= rect.row + rect.height or !self.vx.caps.kitty_graphics) return row;
+    if (info.diagram) |diagram| @import("mermaid.zig").State.request(self, diagram);
+    const loaded = markdownImage(self, info) orelse return row;
+    const fit = fitMarkdownImage(loaded, win, content_width, @min(20, rect.row + rect.height - row)) orelse return row;
     const blank = try a.alloc(u8, gutter + content_width);
     @memset(blank, ' ');
     const blank_seg = [_]vaxis.Segment{.{ .text = blank, .style = .{ .bg = .{ .rgb = self.theme.bg } } }};
     var y = row;
-    const last = @min(row + rows, rect.row + rect.height);
+    const last = row + fit.rows;
     while (y < last) : (y += 1) {
         _ = win.print(&blank_seg, .{ .row_offset = @intCast(y), .col_offset = @intCast(rect.col), .wrap = .none });
     }
-    const size = loaded.cellSize(win) catch return last;
     const sub = win.child(.{
         .x_off = @intCast(rect.col + gutter),
         .y_off = @intCast(row),
         .width = @intCast(content_width),
-        .height = @intCast(rows),
+        .height = @intCast(fit.rows),
     });
-    const options: vaxis.Image.DrawOptions = if (size.rows <= rows and size.cols <= content_width)
-        .{ .scale = .contain }
-    else
-        .{ .scale = .fit };
-    loaded.draw(sub, options) catch return last;
+    loaded.draw(sub, fit.options) catch return last;
     if (std.mem.indexOfScalar(u32, self.markdown_visible_images.items, loaded.id) == null) {
         try self.markdown_visible_images.append(self.alloc, loaded.id);
     }
@@ -3226,6 +3242,7 @@ fn applySearchHighlight(self: *App, a: std.mem.Allocator, segs: *std.ArrayList(v
 }
 
 pub fn render(self: *App) !void {
+    self.mermaid.frame += 1;
     try table_cell_ui.check(self);
     // Final safeguard for focus changes outside input dispatch. Event
     // boundaries already synchronize before subsequent input can request
@@ -4985,6 +5002,8 @@ pub fn run(self: *App) !void {
     defer self.disableMouse();
     try self.loop.start();
     defer self.loop.stop();
+    try self.tty.writer().writeAll(vaxis.ctlseqs.kitty_graphics_query);
+    try self.tty.writer().flush();
     // monotonic ms of the last frame we actually drew — poll-mode
     // iterations without events skip render() until 16ms have elapsed
     // (the animation frame cadence), so idle polling costs no renders.
@@ -5019,6 +5038,7 @@ pub fn run(self: *App) !void {
         // keypress, same as the LSP slots.
         var git_ready = self.navigator_git.tick(self);
         const home_ready = try @import("picker.zig").pollHomeSearch(self);
+        const mermaid_ready = @import("mermaid.zig").State.poll(self);
         if (@import("git_review.zig").poll(self)) git_ready = true;
         if (self.git_job) |job| {
             if (job.done.load(.acquire)) {
@@ -5079,7 +5099,7 @@ pub fn run(self: *App) !void {
                 }
             }
         }
-        if (nav_ready or passive_ready or comp_ready or comp_resolved or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready or home_ready or lsp_ready or term_ready or ai_ready or ai_tools_ready or ai_terminal_ready or inline_ready) {
+        if (nav_ready or passive_ready or comp_ready or comp_resolved or fmt_ready or inlay_ready or outline_ready or diag_changed or git_ready or home_ready or mermaid_ready or lsp_ready or term_ready or ai_ready or ai_tools_ready or ai_terminal_ready or inline_ready) {
             try self.render();
             last_render_ms = @intCast(@divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds, std.time.ns_per_ms));
             continue;
@@ -5263,6 +5283,7 @@ pub fn run(self: *App) !void {
                     handled = true;
                     try self.vx.resize(self.alloc, self.tty.writer(), ws);
                 },
+                .cap_kitty_graphics => handled = true,
                 else => {},
             }
         }

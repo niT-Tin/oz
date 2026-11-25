@@ -374,6 +374,9 @@ pub fn handleEventGeneric(self: anytype, vx: *Vaxis, cache: *GraphemeCache, Even
                     if (!vx.caps.kitty_graphics) {
                         log.info("kitty graphics capability detected", .{});
                         vx.caps.kitty_graphics = true;
+                        if (@hasField(Event, "cap_kitty_graphics")) {
+                            return self.postEvent(.cap_kitty_graphics);
+                        }
                     }
                 },
                 .cap_rgb => {
