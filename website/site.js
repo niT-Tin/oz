@@ -7,7 +7,8 @@
   const en = Object.fromEntries(nodes.map((node) => [node.dataset.i18n, originalText(node)]));
   Object.assign(en, {
     'shot.completion': 'ZLS shows the ArrayList signature and documentation beside the selected completion.',
-    'shot.agent': 'The Codex thread has the current file as context. A question is in the prompt, ready to send.',
+    'shot.git': 'Open a commit to see changed files and its patch.',
+    'shot.agent': 'Draft a question for Codex beside the file you are editing.',
     'agent.kimi': 'Install and sign in to Kimi Code first. The preset starts kimi acp.',
     'agent.deepseek': 'Prepare a DeepSeek Harness checkout and its dependencies. Substitute its path for the example. The preset runs pnpm --silent dsh --profile acp.',
     'copied': 'Command copied.',
@@ -18,6 +19,7 @@
     'nav.benchmark': '性能测试',
     'skip': '跳到正文',
     'nav.inside': '编辑器',
+    'nav.features': '功能',
     'nav.agents': 'Agent',
     'nav.download': '安装',
     'hero.first': '在终端里',
@@ -27,11 +29,34 @@
     'tour.title': '编辑器实拍',
     'showcase.editor': '文件树',
     'showcase.completion': '代码补全',
+    'showcase.git': 'Git 审查',
     'showcase.agent': 'Agent 面板',
     'showcase.enlarge': '查看大图',
-    'shot.editor': '展开项目目录，编辑 oz 自己的图表渲染代码。',
+    'shot.editor': '编辑代码时，可以同时查看目录和文件的 Git 状态。',
     'shot.completion': '选中 ArrayList，右侧立即显示 ZLS 返回的签名和文档。',
-    'shot.agent': 'Codex 线程已关联当前文件，输入框里的问题尚未发送。',
+    'shot.git': '打开某次提交，查看改动文件和差异。',
+    'shot.agent': '在编辑器旁写下给 Codex 的问题，截图中的草稿尚未发送。',
+    'features.title': 'oz 可以做什么',
+    'feature.vim.title': '用 Vim 键位编辑',
+    'feature.vim.body': '支持移动命令、文本对象、可视模式、宏和多光标。按 F1 查看键位。',
+    'feature.search.title': '查找文件和内容',
+    'feature.search.body': '首页按 f 搜索家目录。打开项目后，Space s f 找文件，Space s t 搜索内容。',
+    'feature.workspace.title': '用工作区组织项目',
+    'feature.workspace.body': '按 Space Tab n 新建工作区，用 :sp 或 :vs 分屏查看多个文件。',
+    'feature.lsp.title': '用 LSP 浏览代码',
+    'feature.lsp.body': '用 gd 跳到定义。语言服务器提供补全、诊断和文档。',
+    'feature.git.title': '审查 Git 改动和提交',
+    'feature.git.body': 'Space g v 查看工作区改动、提交历史和差异。Space e 打开带 Git 状态的文件树。',
+    'feature.tools.title': '打开终端或接入 Agent',
+    'feature.tools.body': 'Alt+r 打开浮动终端。Space a 查看 ACP Agent 线程和待审批操作。',
+    'feature.markdown.title': '阅读和编辑 Markdown',
+    'feature.markdown.body': '表格自动折行，数据行之间有分界线。单元格内按 i 边改边看，Esc 切回 Normal，Ctrl+S 应用草稿。',
+    'feature.mermaid.title': 'Mermaid 和本地图片',
+    'feature.mermaid.body': '在 Ghostty 和 Kitty 中，oz 的 Normal 模式可预览本地图片和 Mermaid。安装 Mermaid CLI 后，oz 会从 PATH 找到 mmdc。',
+    'feature.mermaid.caption': 'oz 中的 Markdown 表格和 Mermaid 预览。',
+    'feature.mermaid.alt': 'oz 的界面实拍，显示带分界线的 Markdown 表格，以及 Mermaid 源码下方的流程图。',
+    'features.release': '这里介绍当前源码的功能，部分功能可能晚于你下载的版本。',
+    'features.build': '从源码构建',
     'download.title': '安装 oz',
     'download.intro': '选择系统和架构，解压下载的文件，即可打开代码。',
     'download.platform': '操作系统和处理器架构',
@@ -68,6 +93,7 @@
   const shots = {
     editor: { en: 'oz editing Zig code, with syntax highlighting, a file navigator and status bar.', zh: 'oz 编辑 Zig 代码，展示语法高亮、文件导航器和状态栏。' },
     completion: { en: 'oz LSP completion with colored kinds, signatures and adjacent documentation.', zh: 'oz LSP 补全，展示彩色类型图标、签名和紧邻的文档窗口。' },
+    git: { en: 'oz Git Review showing the changed files and patch for a commit.', zh: 'oz 的 Git 审查页面展示某次提交的改动文件和差异。', file: 'deploy.toml' },
     agent: { en: 'oz with its Agent panel beside the editor, before a prompt is sent.', zh: 'oz 在编辑器旁打开 Agent 面板，尚未发送提示词。' },
   };
   const commands = {
@@ -76,6 +102,8 @@
     deepseek: 'OZ_ACP_AGENT=deepseek \\\nOZ_ACP_CWD=/path/to/deepseek-harness \\\noz src/main.zig',
   };
   const screenshot = document.getElementById('screenshot');
+  const mermaidPreview = document.querySelector('[data-mermaid-preview]');
+  const mermaidAlt = mermaidPreview.alt;
   const dialog = document.getElementById('screenshot-dialog');
   const zoom = document.getElementById('zoom-image');
   const opener = document.querySelector('[data-open-screenshot]');
@@ -85,6 +113,7 @@
 
   function showShot(key) {
     if (!Object.hasOwn(shots, key)) return;
+    const shot = shots[key];
     activeShot = key;
     for (const button of document.querySelectorAll('[data-shot]')) {
       const selected = button.dataset.shot === key;
@@ -93,7 +122,8 @@
     }
     document.getElementById('screenshot-panel').setAttribute('aria-labelledby', `shot-${key}`);
     screenshot.setAttribute('src', `./assets/${key}.png`);
-    screenshot.alt = shots[key][language];
+    document.getElementById('screenshot-command').textContent = `oz ${shot.file ?? 'src/deploy.zig'}`;
+    screenshot.alt = shot[language];
     zoom.src = screenshot.src;
     zoom.alt = screenshot.alt;
     opener.setAttribute('aria-label', `${t('showcase.enlarge')}: ${t(`showcase.${key}`)}`);
@@ -134,6 +164,7 @@
     language = value;
     document.documentElement.lang = value === 'zh' ? 'zh-CN' : 'en';
     for (const node of nodes) setText(node, t(node.dataset.i18n));
+    mermaidPreview.alt = value === 'zh' ? t('feature.mermaid.alt') : mermaidAlt;
     for (const link of document.querySelectorAll('[data-benchmark]')) {
       link.href = value === 'zh' ? './benchmark/zh.html' : './benchmark/';
     }

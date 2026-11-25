@@ -70,6 +70,7 @@ h1 em { font-style: normal; color: var(--ember); }
 .version, .platforms { font-size: .73rem; color: #bbb9b6; }
 .version { text-decoration: underline; text-underline-offset: .23em; }
 .platforms { padding-left: 12px; border-left: 1px solid #57534f; }
+.feature-jump { display: none; color: var(--dim); text-decoration: underline; text-underline-offset: .23em; }
 
 .tour { display: grid; grid-template-columns: minmax(175px, .275fr) minmax(0, 1fr); gap: 4.5%; padding-block: 32px 55px; border-top: 1px solid var(--line); }
 .tour-menu { align-self: start; }
@@ -86,6 +87,37 @@ kbd { color: inherit; font-size: .65rem; white-space: nowrap; }
 .enlarge { margin-left: auto; font: inherit; color: #ddd; padding: 3px; }
 .enlarge:hover { color: var(--ember); }
 #screenshot { width: 100%; height: auto; display: block; }
+
+.features { padding-block: 38px 48px; border-top: 1px solid var(--line); }
+.features h2 { font-size: 2.15rem; line-height: 1.2; font-weight: 580; letter-spacing: -.055em; }
+.features h3, .features h4 { margin: 0; font-weight: 620; line-height: 1.3; }
+.features h3 { font-size: 1.12rem; }
+.features h4 { font-size: 1rem; margin-top: 20px; }
+.features p { margin-top: 8px; color: var(--dim); font-size: .94rem; text-wrap: pretty; }
+.feature-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  column-gap: 32px;
+  list-style: none;
+  padding: 0;
+  margin: 22px 0 0;
+}
+.feature-list li { padding: 16px 0 21px; border-top: 1px solid var(--line); }
+.markdown-feature {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: center;
+  gap: 32px;
+  padding: 24px 0;
+  border-top: 1px solid var(--line);
+}
+.markdown-feature figure { margin: 0; }
+.markdown-feature img { display: block; width: 100%; height: auto; border-radius: 5px; }
+.markdown-feature figcaption { margin-top: 8px; color: var(--dim); font-size: .85rem; }
+.features .markdown-command { background: var(--panel); color: var(--text); }
+.features .markdown-command button:hover { background: var(--line); }
+.features .feature-release { font-size: .85rem; }
+.feature-release a { color: var(--text); text-decoration: underline; text-underline-offset: .23em; }
 
 .manual { color-scheme: light; background: var(--paper); color: var(--ink); }
 .setup { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); padding-block: 48px 54px; }
@@ -118,7 +150,7 @@ dialog::backdrop { background: #07080bd9; }
 .dialog-toolbar h2 { font-size: 1rem; font-weight: 550; }
 .dialog-close { padding: 3px 10px; }
 .zoom-stage { max-height: 78vh; overflow: auto; }
-.zoom-stage img { display: block; width: 1400px; height: auto; }
+.zoom-stage img { display: block; height: auto; }
 .noscript-note { text-align: center; padding: 12px; text-decoration: underline; }
 
 @media (min-width: 1800px) {
@@ -131,6 +163,7 @@ dialog::backdrop { background: #07080bd9; }
   :lang(zh-CN) h1 { font-size: 4.15rem; }
   .sky-art { width: 70%; mask-image: linear-gradient(90deg, transparent, black 53%); }
   .tour { gap: 22px; grid-template-columns: 170px minmax(0,1fr); }
+  .feature-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .setup > section:first-child { padding-right: 5%; }
   .setup > section:last-child { padding-left: 5%; }
 }
@@ -145,6 +178,7 @@ dialog::backdrop { background: #07080bd9; }
   :lang(zh-CN) h1 { font-size: 3.1rem; }
   .sky-inner > p { margin-top: 15px; max-width: 32rem; }
   .hero-links { margin-top: 18px; }
+  .feature-jump { display: inline; font-size: .875rem; }
   .tour { display: flex; flex-direction: column; gap: 12px; padding-block: 21px 28px; }
   .tour-menu { width: 100%; }
   .tour-menu h2 { font-size: 1.2rem; margin: 0 0 10px; }
@@ -153,6 +187,10 @@ dialog::backdrop { background: #07080bd9; }
   .shot-tabs kbd { display: none; }
   #screenshot-caption { margin: 10px 0 0; }
   #screenshot-panel { width: 100%; }
+  .features { padding-block: 27px 34px; }
+  .features h2 { font-size: 1.75rem; }
+  .feature-list, .markdown-feature { grid-template-columns: minmax(0, 1fr); }
+  .markdown-feature { gap: 18px; }
   .setup { grid-template-columns: minmax(0,1fr); gap: 25px; padding-block: 27px 34px; }
   .setup > section:first-child { padding: 0 0 24px; border-right: 0; border-bottom: 1px solid #c8c5bf; }
   .setup > section:last-child { padding: 0; }

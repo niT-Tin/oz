@@ -24,6 +24,7 @@
     <a href="#" class="brand" aria-label="oz"><b aria-hidden="true">oz</b><i aria-hidden="true"></i></a>
     <nav aria-label="Main navigation">
       <a href="#inside" data-i18n="nav.inside">Editor</a>
+      <a href="#features" data-i18n="nav.features">Features</a>
       <a href="#agents" data-i18n="nav.agents">Agents</a>
       <a href="./benchmark/" data-benchmark data-i18n="nav.benchmark">Benchmarks</a>
       <a href="#download" data-i18n="nav.download">Install</a>
@@ -44,6 +45,7 @@
           <a class="button primary" href="#download"><span data-i18n="hero.download">Download oz</span> <span aria-hidden="true">↓</span></a>
           <a class="version" data-release-version href="https://github.com/niT-Tin/oz/releases/latest">Latest</a>
           <span class="platforms">Linux / macOS</span>
+          <a class="feature-jump" href="#features" data-i18n="nav.features">Features</a>
         </div>
       </div>
     </section>
@@ -54,16 +56,63 @@
         <div class="shot-tabs" role="tablist" aria-label="Editor screenshots">
           <button type="button" role="tab" id="shot-editor" data-shot="editor" aria-controls="screenshot-panel" aria-selected="true"><span data-i18n="showcase.editor">File tree</span><kbd>Space e</kbd></button>
           <button type="button" role="tab" id="shot-completion" data-shot="completion" aria-controls="screenshot-panel" aria-selected="false" tabindex="-1"><span data-i18n="showcase.completion">Completion</span><kbd>Ctrl n</kbd></button>
+          <button type="button" role="tab" id="shot-git" data-shot="git" aria-controls="screenshot-panel" aria-selected="false" tabindex="-1"><span data-i18n="showcase.git">Git Review</span><kbd>Space g v</kbd></button>
           <button type="button" role="tab" id="shot-agent" data-shot="agent" aria-controls="screenshot-panel" aria-selected="false" tabindex="-1"><span data-i18n="showcase.agent">Agent panel</span><kbd>Space a</kbd></button>
         </div>
-        <p id="screenshot-caption" data-i18n="shot.editor">Browse the project while editing oz’s own chart renderer.</p>
+        <p id="screenshot-caption" data-i18n="shot.editor">Edit code with the file tree and Git status in view.</p>
       </div>
       <div id="screenshot-panel" role="tabpanel" aria-labelledby="shot-editor">
-        <div class="window-bar"><span class="prompt-mark" aria-hidden="true">❯</span> oz src/chart.zig
+        <div class="window-bar"><span class="prompt-mark" aria-hidden="true">❯</span><span id="screenshot-command">oz src/deploy.zig</span>
           <button type="button" class="enlarge" data-open-screenshot aria-haspopup="dialog"><span data-i18n="showcase.enlarge">Full size</span> ⤢</button>
         </div>
-        <img id="screenshot" src="./assets/editor.png" width="1400" height="825" alt="oz editing src/chart.zig with its project tree open." fetchpriority="high">
+        <img id="screenshot" src="./assets/editor.png" width="1470" height="726" alt="oz editing a Zig deployment example with file status in the project tree." fetchpriority="high">
       </div>
+    </section>
+
+    <section class="shell features" id="features" aria-labelledby="features-title">
+      <h2 id="features-title" data-i18n="features.title">What you can do in oz</h2>
+      <ul class="feature-list" role="list">
+        <li>
+          <h3 data-i18n="feature.vim.title">Edit with Vim keys</h3>
+          <p data-i18n="feature.vim.body">Motions, text objects, Visual mode, macros and multiple cursors. F1 opens the keymap.</p>
+        </li>
+        <li>
+          <h3 data-i18n="feature.search.title">Find files and text</h3>
+          <p data-i18n="feature.search.body">Dashboard f searches your home folder. In a project, Space s f finds files and Space s t searches text.</p>
+        </li>
+        <li>
+          <h3 data-i18n="feature.workspace.title">Keep projects in workspaces</h3>
+          <p data-i18n="feature.workspace.body">Create workspaces with Space Tab n. Use :sp or :vs to view files together.</p>
+        </li>
+        <li>
+          <h3 data-i18n="feature.lsp.title">Navigate code with LSP</h3>
+          <p data-i18n="feature.lsp.body">Jump to definitions with gd. Your language server provides completion, diagnostics and documentation.</p>
+        </li>
+        <li>
+          <h3 data-i18n="feature.git.title">Review Git changes and commits</h3>
+          <p data-i18n="feature.git.body">Space g v shows working changes, commit history and patches. Space e opens the file tree with Git status.</p>
+        </li>
+        <li>
+          <h3 data-i18n="feature.tools.title">Run a shell or talk to an agent</h3>
+          <p data-i18n="feature.tools.body">Alt+r opens a floating terminal. Space a opens ACP agent threads and approvals.</p>
+        </li>
+      </ul>
+
+      <div class="markdown-feature" id="markdown">
+        <div class="markdown-copy">
+          <h3 data-i18n="feature.markdown.title">Read and edit Markdown</h3>
+          <p data-i18n="feature.markdown.body">Tables wrap with dividers between rows. In a cell, i opens live editing, Esc switches to Normal, and Ctrl+S applies the draft.</p>
+          <h4 data-i18n="feature.mermaid.title">Mermaid and local images</h4>
+          <p data-i18n="feature.mermaid.body">Ghostty and Kitty show local images and Mermaid diagrams in Normal mode. Install Mermaid CLI once and oz finds mmdc on PATH.</p>
+          <div class="command markdown-command"><pre><code id="mermaid-command">npm install -g @mermaid-js/mermaid-cli
+oz notes.md</code></pre><button type="button" data-copy="mermaid-command" data-i18n="copy">Copy</button></div>
+        </div>
+        <figure>
+          <img src="./assets/markdown-terminal.png" width="1148" height="726" alt="oz showing an aligned Markdown table and a Mermaid flowchart beneath its source." loading="lazy" data-mermaid-preview>
+          <figcaption data-i18n="feature.mermaid.caption">A Markdown table and Mermaid preview in oz.</figcaption>
+        </figure>
+      </div>
+      <p class="feature-release"><span data-i18n="features.release">These features follow the current source. They may be newer than your download.</span> <a href="#source-command" data-i18n="features.build">Build from source</a></p>
     </section>
 
     <div class="manual">
@@ -113,7 +162,7 @@ zig build -Doptimize=ReleaseFast -Dstrip
   <div id="feedback" class="toast" role="status" aria-live="polite"></div>
   <dialog id="screenshot-dialog" aria-labelledby="dialog-title">
     <div class="dialog-toolbar"><h2 id="dialog-title" data-i18n="dialog.title">Editor screenshot</h2><button type="button" class="dialog-close" data-i18n="dialog.close">Close</button></div>
-    <div class="zoom-stage" tabindex="0" role="region" aria-labelledby="dialog-title"><img id="zoom-image" src="./assets/editor.png" width="1400" height="825" alt="oz editing its chart renderer."></div>
+    <div class="zoom-stage" tabindex="0" role="region" aria-labelledby="dialog-title"><img id="zoom-image" src="./assets/editor.png" width="1470" height="726" alt="oz editing a Zig deployment example with file status in the project tree."></div>
   </dialog>
   <noscript><p class="noscript-note"><a href="https://github.com/niT-Tin/oz/releases/latest">Downloads</a> · <a href="./assets/completion.png">Completion screenshot</a> · <a href="./assets/agent.png">Agent screenshot</a> · <a href="https://github.com/niT-Tin/oz/blob/master/README.zh-CN.md">中文介绍</a></p></noscript>
 </body>

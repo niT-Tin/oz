@@ -63,7 +63,7 @@ def check(root, expected_version=None):
         assert (root / rel).is_file(), f"Missing stylesheet asset: {rel}"
     assert "prefers-reduced-motion" in css and ":focus-visible" in css
     assert not re.search(r"font-size:[^;}]*vw", css), "Font size must respect text scaling"
-    for name in ("editor", "completion", "agent"):
+    for name in ("editor", "completion", "agent", "git", "markdown-terminal"):
         assert (root / "assets" / f"{name}.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     font = root / "assets/fonts/DMSans.woff2"
     assert font.read_bytes().startswith(b"wOF2")

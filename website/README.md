@@ -2,10 +2,11 @@
 
 A buildless English/Chinese site for GitHub Pages at
 <https://nit-tin.github.io/oz/>. The README and the gallery use the same PNGs in `website/assets/`.
-All three frames show oz editing its own `src/chart.zig` in a 100 × 25 PTY:
-the file tree at the `Options` declaration, ZLS completion for `std.Array`
-and an unsent prompt in a Codex thread. The masthead landscape is artwork
-typeset on a fixed character grid.
+The screenshots capture oz in a PTY with a deployment example. They show the
+file tree with Git status, ZLS completion, an unsent prompt in a Codex thread,
+a commit's diff in Git Review, and Markdown with a Mermaid preview replayed
+from oz's Kitty graphics output. The masthead landscape is artwork typeset on
+a fixed character grid.
 
 ## Preview and checks
 
