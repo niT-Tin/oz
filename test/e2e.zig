@@ -30255,6 +30255,9 @@ test "editing reliability: buffer/window switch rejects a pending completion" {
     try std.testing.expect(try erWaitBarrier(io, dir, "received-2", 5000));
     // Buffer switch: the pending list belongs to a.zig. Then window switch
     // (split) changes the window identity again.
+    // The peer barrier does not drain the PTY. Observe Insert first so the
+    // Normal wait cannot reuse the startup frame before Escape is decoded.
+    try gridWaitFor(&sess, &grid, "[INSERT]", 3000);
     try sess.send("\x1b");
     try gridWaitFor(&sess, &grid, "[NORMAL]", 3000);
     try sess.send(":e ");
@@ -30262,7 +30265,7 @@ test "editing reliability: buffer/window switch rejects a pending completion" {
     try sess.send("\r");
     try gridWaitFor(&sess, &grid, "const b = 1;", 5000);
     try sess.send(":vs\r");
-    try gridDrain(&sess, &grid, 300);
+    try gridWaitRowContains(&sess, &grid, 2, "│", 5000);
     try aiWriteFile(io, dir, "release-all", "go");
     try std.testing.expect(try erWaitBarrier(io, dir, "delivered-1", 5000));
     try gridDrain(&sess, &grid, 500);
