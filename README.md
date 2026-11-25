@@ -20,4 +20,8 @@ Files shows two Git status columns, index then worktree. `M.` means staged, `.M`
 
 Open Git Review with `Space g v` or `:GitReview`. Press `Tab` to switch between Changes and History, `Enter` to read a patch, and `o` to open the corresponding source line.
 
+## Markdown diagrams and images
+
+Ghostty and Kitty can show local Markdown images and PNG previews of Mermaid code blocks. For Mermaid, install the [Mermaid CLI](https://github.com/mermaid-js/mermaid-cli) with `npm install -g @mermaid-js/mermaid-cli`, then open a Markdown file with `OZ_MERMAID_CMD=mmdc oz notes.md`. A preview appears below each complete `mermaid` fence in Normal mode. The diagram source stays editable and remains readable when graphics or rendering are unavailable.
+
 [Connect a coding agent](https://nit-tin.github.io/oz/?lang=en#agents) · [Build from source](https://nit-tin.github.io/oz/?lang=en#download) · [Changelog](CHANGELOG.md) · [MIT license](LICENSE)

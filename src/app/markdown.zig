@@ -4,6 +4,7 @@ const buffer = @import("../buffer/root.zig");
 const syntax = @import("../syntax.zig");
 const wrap = @import("wrap.zig");
 const table_cell = @import("table_cell.zig");
+const mermaid = @import("mermaid.zig");
 
 pub const Gap = struct {
     start: u32,
@@ -28,6 +29,7 @@ pub const Line = struct {
     table: bool = false,
     cells: []const Cell = &.{},
     image: ?Image = null,
+    diagram: ?mermaid.Diagram = null,
 };
 
 pub const Layout = struct {
@@ -159,7 +161,7 @@ pub fn build(
         }
     }
     for (decors) |d| {
-        if (d.kind == .fence) try buildFence(a, pt, decors, win, layout, d, content_width);
+        if (d.kind == .fence) try buildFence(a, pt, decors, win, layout, d, content_width, visible);
         if (d.kind == .image and visible.contains(pt.lineOf(d.start))) try buildImage(a, pt, decors, layout, d, document_path);
     }
     return layout;
@@ -340,19 +342,23 @@ fn buildFence(
     layout: *Layout,
     fence: syntax.Decor,
     content_width: u32,
+    visible: LineRange,
 ) !void {
     var first: ?syntax.Decor = null;
     var last: ?syntax.Decor = null;
+    var body: ?syntax.Decor = null;
     var language: []const u8 = "code";
     for (decors) |d| {
         if (d.start < fence.start or d.end > fence.end) continue;
         if (d.kind == .fence_delimiter) {
             if (first == null or d.start < first.?.start) first = d;
             if (last == null or d.start > last.?.start) last = d;
-        } else if (d.kind == .fence_info and (first == null or d.start < first.?.end + 1)) {
+        } else if (d.kind == .fence_info) {
             const info = try copyRange(a, pt, d.start, d.end);
             language = std.mem.trim(u8, info, " \t");
             if (language.len == 0) language = "code";
+        } else if (d.kind == .fence_content) {
+            body = d;
         }
     }
     const open = first orelse return;
@@ -364,6 +370,17 @@ fn buildFence(
     const bottom = try fenceBorder(a, win, "╰", "╯", "", content_width);
     try replaceWholeLine(a, pt, layout, open_line, top, true);
     if (close.start != open.start) try replaceWholeLine(a, pt, layout, close_line, bottom, true);
+    var info_tokens = std.mem.tokenizeAny(u8, language, " \t");
+    if (close_line > open_line and visible.contains(close_line) and
+        std.ascii.eqlIgnoreCase(info_tokens.next() orelse "", "mermaid"))
+    {
+        if (body) |content| {
+            if (content.end - content.start <= mermaid.max_source_bytes) {
+                const source = try fenceSource(a, pt, decors, content);
+                if (source.len != 0) layout.entries.getPtr(close_line).?.diagram = mermaid.Diagram.init(source);
+            }
+        }
+    }
     var line = open_line + 1;
     while (line < close_line) : (line += 1) {
         if (layout.entries.get(line)) |existing| {
@@ -375,6 +392,24 @@ fn buildFence(
             try layout.entries.put(line, .{ .prefix = "│ ", .fence = true });
         }
     }
+}
+
+fn fenceSource(a: std.mem.Allocator, pt: *const buffer.PieceTable, decors: []const syntax.Decor, content: syntax.Decor) ![]const u8 {
+    const text = try a.alloc(u8, content.end - content.start);
+    var from = content.start;
+    var written: usize = 0;
+    for (decors[decorLowerBound(decors, content.start)..decorLowerBound(decors, content.end)]) |d| {
+        // Markdown quote and list prefixes are captured inside the code
+        // node, but are not part of the diagram text.
+        if (d.kind != .fence_continuation or d.start < from or d.end > content.end) continue;
+        const len = d.start - from;
+        pt.copyRange(from, text[written..][0..len]);
+        written += len;
+        from = d.end;
+    }
+    const end = written + content.end - from;
+    pt.copyRange(from, text[written..end]);
+    return std.mem.trim(u8, text[0..end], " \t\r\n");
 }
 
 fn buildImage(
@@ -822,6 +857,24 @@ test "markdown layout: fence labels and body rules" {
     const close = fixture.layout.get(2).?;
     try std.testing.expect(std.mem.startsWith(u8, close.gaps[0].text, "╰"));
     try std.testing.expect(std.mem.endsWith(u8, close.gaps[0].text, "╯"));
+}
+
+test "markdown layout: only complete Mermaid fences offer a diagram" {
+    const src = "\x60\x60\x60mermaid\nflowchart LR\n  A --> B\n\x60\x60\x60\n\n\x60\x60\x60mermaid\nA --> C\n";
+    var fixture = try TestLayout.init(src, null);
+    defer fixture.deinit();
+    try std.testing.expect(fixture.layout.get(0).?.diagram == null);
+    const diagram = fixture.layout.get(3).?.diagram.?;
+    try std.testing.expectEqualStrings("flowchart LR\n  A --> B", diagram.source);
+    try std.testing.expect(fixture.layout.get(5).?.diagram == null);
+}
+
+test "markdown layout: Mermaid handles spaced info strings and blockquote fences" {
+    const src = "> ~~~ Mermaid\n> flowchart LR\n>   A --> B\n> ~~~\n";
+    var fixture = try TestLayout.init(src, null);
+    defer fixture.deinit();
+    const diagram = fixture.layout.get(3).?.diagram.?;
+    try std.testing.expectEqualStrings("flowchart LR\n  A --> B", diagram.source);
 }
 
 test "markdown layout: local image path and remote fallback" {

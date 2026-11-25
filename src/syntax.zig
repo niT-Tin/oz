@@ -121,6 +121,8 @@ pub const Decor = struct {
         fence,
         fence_delimiter,
         fence_info,
+        fence_content,
+        fence_continuation,
         /// Block-level table and its header/body separator.
         table,
         table_delimiter,
@@ -1357,6 +1359,10 @@ pub const Highlighter = struct {
                 try out.append(arena, .{ .start = s, .end = e, .kind = .fence_delimiter });
             } else if (std.mem.eql(u8, name, "md.fence_info")) {
                 try out.append(arena, .{ .start = s, .end = e, .kind = .fence_info });
+            } else if (std.mem.eql(u8, name, "md.fence_content")) {
+                try out.append(arena, .{ .start = s, .end = e, .kind = .fence_content });
+            } else if (std.mem.eql(u8, name, "md.fence_continuation")) {
+                try out.append(arena, .{ .start = s, .end = e, .kind = .fence_continuation });
             } else if (std.mem.eql(u8, name, "md.table")) {
                 try out.append(arena, .{ .start = s, .end = e, .kind = .table });
             } else if (std.mem.eql(u8, name, "md.table_delimiter")) {

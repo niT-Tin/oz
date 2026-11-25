@@ -5602,6 +5602,73 @@ test "markdown: cell Normal keeps Vim motions and text objects inside the draft"
     try std.testing.expectEqualStrings("| Example | Kind |\n| --- | --- |\n| (new) left a right | safe |\n", saved);
 }
 
+test "markdown: Mermaid renders asynchronously and refreshes after an edit" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var dir_buf: [128:0]u8 = undefined;
+    const root = try aiMockDir(io, &dir_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const fixture =
+        \\#!/usr/bin/env python3
+        \\import os, pathlib, struct, sys, time, zlib
+        \\args = sys.argv
+        \\source = pathlib.Path(args[args.index("-i") + 1]).read_text()
+        \\output = pathlib.Path(args[args.index("-o") + 1])
+        \\gate = pathlib.Path(os.environ["OZ_MERMAID_TEST_DIR"])
+        \\width = 1 if "A --> B" in source else 2
+        \\(gate / f"source-{width}").write_text(source)
+        \\while not (gate / "release").exists():
+        \\    time.sleep(0.01)
+        \\def chunk(tag, data):
+        \\    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+        \\output.write_bytes(b"\x89PNG\r\n\x1a\n" +
+        \\    chunk(b"IHDR", struct.pack(">IIBBBBB", width, 1, 8, 2, 0, 0, 0)) +
+        \\    chunk(b"IDAT", zlib.compress(bytes(1 + width * 3))) + chunk(b"IEND", b""))
+        \\
+    ;
+    try aiWriteFile(io, root, "mmdc", fixture);
+    const tool = try std.fmt.allocPrint(a, "{s}/mmdc", .{root});
+    defer a.free(tool);
+    {
+        const file = try std.Io.Dir.openFileAbsolute(io, tool, .{});
+        defer file.close(io);
+        try file.setPermissions(io, .fromMode(0o755));
+    }
+    const tool_env = try std.fmt.allocPrint(a, "OZ_MERMAID_CMD={s}", .{tool});
+    defer a.free(tool_env);
+    const gate_env = try std.fmt.allocPrint(a, "OZ_MERMAID_TEST_DIR={s}", .{root});
+    defer a.free(gate_env);
+
+    var name: [192:0]u8 = undefined;
+    const path = try erFixture(io, &name, ".md", "# Guide\n\n\x60\x60\x60mermaid\nflowchart LR\n  A --> B\n\x60\x60\x60\n\nAfter diagram.\n");
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var sess = try Session.spawnEnvSize(io, &.{ oz_exe_path, path }, &.{ tool_env, gate_env }, 24, 80);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.init(a);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "After diagram.", 5000);
+    try std.testing.expect(try sess.waitFor("\x1b_Gi=1,s=1,v=1,a=q", 5000));
+    try sess.send("\x1b_Gi=1;OK\x1b\\");
+    try std.testing.expect(try erWaitBarrier(io, root, "source-1", 5000));
+
+    // Move to the Mermaid body while the child is blocked. The preview
+    // must arrive without another key after the child is released.
+    try sess.send("4jfB");
+    try gridWaitPosition(&sess, &grid, 5, 8, 5000);
+    try aiWriteFile(io, root, "release", "");
+    try std.testing.expect(try sess.waitFor("\x1b_Gf=100,s=1,v=1", 5000));
+    try std.testing.expect(try sess.waitFor("\x1b_Ga=p,i=", 5000));
+
+    try sess.send("rC");
+    try std.testing.expect(try erWaitBarrier(io, root, "source-2", 5000));
+    try std.testing.expect(try sess.waitFor("\x1b_Gf=100,s=2,v=1", 5000));
+    const updated = try aiReadFile(io, a, root, "source-2");
+    defer a.free(updated);
+    try std.testing.expectEqualStrings("flowchart LR\n  A --> C", updated);
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q!\r"));
+}
+
 test "markdown: local PNG uses Kitty graphics placement" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
