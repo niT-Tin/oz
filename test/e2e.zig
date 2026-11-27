@@ -34737,7 +34737,8 @@ test "git review: navigate staged, unstaged and historical patches at 80 and 120
         try gridWaitFor(&sess, &grid, "INDEX_ONLY_A", 6000);
         try std.testing.expect(grid.contains("NEWER_A") and !grid.contains("WORKTREE_ONLY_A"));
         try sess.send("\x1b");
-        try gridWaitFor(&sess, &grid, "Unstaged", 4000);
+        // The wide layout keeps the file list visible while the patch has focus.
+        try gridWaitFor(&sess, &grid, "Enter diff", 4000);
         try sess.send("j\r");
         try gridWaitFor(&sess, &grid, "WORKTREE_ONLY_A", 6000);
         try std.testing.expect(grid.contains("INDEX_ONLY_A") and !grid.contains("NEWER_A"));
