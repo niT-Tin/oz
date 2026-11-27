@@ -27,7 +27,12 @@ const Canvas = struct {
         // Paths, blobs, and messages are arbitrary Git bytes. Limit work to a
         // visible prefix and replace controls/invalid UTF-8 before vaxis sees it.
         const budget = @as(usize, c.win.width) * 8;
-        const src = text[0..@min(text.len, budget)];
+        const safe = try c.sanitize(text[0..@min(text.len, budget)]);
+        const fit = util.cellFitPrefix(c.win, safe, c.win.width);
+        _ = c.win.print(&.{.{ .text = fit.slice, .style = style }}, .{ .row_offset = @intCast(y), .wrap = .none });
+    }
+
+    fn sanitize(c: Canvas, src: []const u8) ![]const u8 {
         var safe: std.ArrayList(u8) = .empty;
         var pos: usize = 0;
         while (pos < src.len) {
@@ -47,8 +52,7 @@ const Canvas = struct {
                 }
             }
         }
-        const fit = util.cellFitPrefix(c.win, safe.items, c.win.width);
-        _ = c.win.print(&.{.{ .text = fit.slice, .style = style }}, .{ .row_offset = @intCast(y), .wrap = .none });
+        return safe.items;
     }
 
     fn fmt(c: Canvas, y: usize, comptime format: []const u8, args: anytype, fg: theme.Rgb, selected: bool) !void {
@@ -205,18 +209,24 @@ fn patchPane(c: Canvas, s: *review.State, aligned: bool) !void {
         try c.line(1, " Old", c.t.fg_dim, false);
         try c.area(half, 0, c.win.width - half, c.win.height).line(1, " New", c.t.fg_dim, false);
     } else try c.line(1, " Old  New", c.t.fg_dim, false);
+    if (c.win.height <= 2) return;
     if (v.rows.len == 0) return c.line(2, s.status(s.patchSlot(), "No textual changes"), c.t.fg_dim, false);
-    const row = @min(cur.row, v.rows.len - 1);
+    try patchRows(c.sub(2), v, cur.row, aligned, s.detail_open or s.change_focus);
+}
+
+fn patchRows(c: Canvas, v: patch.View, cursor: usize, aligned: bool, highlight: bool) !void {
+    const row = @min(cursor, v.rows.len - 1);
     const display = if (aligned) v.rows[row].pair else row;
     const count = if (aligned) v.pairs.len else v.rows.len;
-    const height: usize = c.win.height -| 2;
+    const height: usize = c.win.height;
+    const half = c.win.width / 2;
     // Keep several preceding lines of context without hiding a newly requested hunk.
     const start = if (v.rows[row].kind == .header) display else display -| (height / 3);
     const left = c.area(0, 0, half -| 1, c.win.height);
     const right = c.area(half, 0, c.win.width - half, c.win.height);
     for (start..@min(start + height, count)) |index| {
-        const y = index - start + 2;
-        const selected = index == display and (s.detail_open or s.change_focus);
+        const y = index - start;
+        const selected = index == display and highlight;
         const primary = if (aligned) v.pairs[index].preferred() else index;
         const r = v.rows[primary];
         if (r.kind == .header or r.kind == .note) {
@@ -227,6 +237,41 @@ fn patchPane(c: Canvas, s: *review.State, aligned: bool) !void {
             if (pair.right) |i| try patchLine(right, y, v.rows[i], .new, selected);
         } else try patchLine(c, y, r, .unified, selected);
     }
+}
+
+fn fileDiffLabel(c: Canvas, y: usize, label: []const u8, path: []const u8) !void {
+    const width = c.win.width -| label.len;
+    if (width == 0) return c.line(y, label, c.t.accent_alt, false);
+    const safe = try c.sanitize(path);
+    const fits = util.cellFitPrefix(c.win, safe, width).slice.len == safe.len;
+    if (fits) return c.fmt(y, "{s}{s}", .{ label, safe }, c.t.accent_alt, false);
+    const suffix = util.cellFitSuffix(c.win, safe, width - 1).slice;
+    try c.fmt(y, "{s}…{s}", .{ label, suffix }, c.t.accent_alt, false);
+}
+
+fn fileDiff(c: Canvas, s: *review.State, files: data.FilePair) !void {
+    const v = s.view();
+    const limited = if (s.result(s.patchSlot())) |result| result.patch_truncated else false;
+    try c.line(0, if (limited) " File diff · preview limited" else " File diff", c.t.accent, false);
+    const aligned = s.aligned(c.win.width);
+    const first_row: usize = if (aligned) 2 else 3;
+    if (aligned) {
+        const half = c.win.width / 2;
+        try fileDiffLabel(c.area(0, 0, half -| 1, c.win.height), 1, " Left  ", files.left);
+        try fileDiffLabel(c.area(half, 0, c.win.width - half, c.win.height), 1, " Right  ", files.right);
+        const divider = c.area(half - 1, 0, 1, c.win.height);
+        for (1..@max(c.win.height -| 1, 1)) |y| try divider.line(y, "│", c.t.win_sep, false);
+    } else {
+        try fileDiffLabel(c, 1, " Left   ", files.left);
+        try fileDiffLabel(c, 2, " Right  ", files.right);
+    }
+    if (c.win.height <= first_row + 1) return;
+    if (v.rows.len == 0) {
+        try c.line(first_row, s.status(s.patchSlot(), "Files are identical"), c.t.fg_dim, false);
+    } else {
+        try patchRows(c.area(0, first_row, c.win.width, c.win.height - first_row - 1), v, s.change.row, aligned, true);
+    }
+    try c.line(c.win.height - 1, s.notice orelse "[c/]c hunks   j/k scroll   v layout   o/O open left/right   q quit", c.t.fg_dim, false);
 }
 
 fn detailPane(c: Canvas, s: *review.State, aligned: bool) !void {
@@ -282,6 +327,7 @@ pub fn draw(app: *App, a: std.mem.Allocator, win: Window) !void {
     const s = &app.review;
     const c: Canvas = .{ .win = win, .a = a, .t = app.theme };
     if (win.width == 0 or win.height == 0) return;
+    if (s.file_diff) |files| return fileDiff(c, s, files);
     try c.line(0, if (s.tab == .changes) " Git Review    [Changes]   History" else " Git Review     Changes   [History]", c.t.accent, false);
     const list = s.result(s.listingSlot());
     const label = if (s.tab == .history and !s.detail_open) blk: {

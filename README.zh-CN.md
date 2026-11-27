@@ -20,4 +20,6 @@
 
 用 `Space g v` 或 `:GitReview` 打开 Git 审查。按 `Tab` 切换工作区变更和提交历史，`Enter` 查看差异，`o` 跳到源码对应行。
 
+用 `oz -d old.txt new.txt` 比较两个文件。需要 PATH 中有 Git，在仓库外也能使用。差异视图为只读，窄屏自动切换到单列。按 `[c`、`]c` 跳转差异块，宽屏可用 `v` 切换布局，`o`、`O` 分别打开左侧和右侧源文件，`q` 退出。
+
 [接入 coding agent](https://nit-tin.github.io/oz/?lang=zh#agents) · [从源码构建](https://nit-tin.github.io/oz/?lang=zh#download) · [更新日志](CHANGELOG.md) · [MIT 许可证](LICENSE)

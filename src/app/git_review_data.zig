@@ -61,6 +61,8 @@ pub const Commit = struct {
     graph: []const u8 = "",
 };
 
+pub const FilePair = struct { left: []const u8, right: []const u8 };
+
 pub const Request = union(enum) {
     changes,
     changes_shared: porcelain.ReviewTarget,
@@ -69,6 +71,7 @@ pub const Request = union(enum) {
     comparison: []const u8,
     detail: struct { hash: []const u8, parent_index: usize = 0 },
     patch: File,
+    file_diff: FilePair,
 
     fn clone(self: Request, a: Allocator) !Request {
         return switch (self) {
@@ -82,6 +85,10 @@ pub const Request = union(enum) {
             .comparison => |ref| .{ .comparison = try a.dupe(u8, ref) },
             .detail => |d| .{ .detail = .{ .hash = try a.dupe(u8, d.hash), .parent_index = d.parent_index } },
             .patch => |file| .{ .patch = try file.clone(a) },
+            .file_diff => |files| .{ .file_diff = .{
+                .left = try a.dupe(u8, files.left),
+                .right = try a.dupe(u8, files.right),
+            } },
         };
     }
 };
@@ -102,6 +109,7 @@ pub const Result = struct {
     removed: u64 = 0,
     patch: []const u8 = "",
     view: patch_view.View = .{},
+    file_pair: ?FilePair = null,
     problem: ?[]const u8 = null,
 };
 
@@ -160,6 +168,7 @@ pub const Job = struct {
     }
 
     fn load(self: *Job) !void {
+        if (self.request == .file_diff) return self.loadFileDiff(self.request.file_diff);
         self.result.root = chomp(try self.git(&.{ "rev-parse", "--show-toplevel" }));
         self.cwd = self.result.root;
         switch (self.request) {
@@ -169,6 +178,7 @@ pub const Job = struct {
             .comparison => |ref| try self.comparison(ref),
             .detail => |d| try self.detail(d.hash, d.parent_index),
             .patch => |file| try self.loadPatch(file),
+            .file_diff => unreachable,
         }
     }
 
@@ -483,7 +493,45 @@ pub const Job = struct {
         }
         const term = try child.wait(self.io);
         if (term != .exited or !(term.exited == 0 or (no_index and term.exited == 1))) return error.GitPatchUnavailable;
+        if (term.exited == 1 and out.items.len == 0) return error.GitPatchUnavailable;
         return out.items;
+    }
+
+    fn loadFileDiff(self: *Job, files: FilePair) !void {
+        const left = (try self.diffPath(files.left)) orelse return;
+        const right = (try self.diffPath(files.right)) orelse return;
+        self.result.file_pair = .{ .left = left, .right = right };
+        self.result.patch = self.streamPatch(&.{
+            "diff",    "--no-index",  "--no-ext-diff",          "--no-textconv", "--no-color",
+            "--patch", "--unified=3", "--inter-hunk-context=0", "--",            left,
+            right,
+        }, true) catch |err| switch (err) {
+            error.FileNotFound => {
+                self.result.problem = "File diff requires Git on PATH";
+                return;
+            },
+            else => return err,
+        };
+        self.result.view = try patch_view.parse(self.arena.allocator(), self.result.patch);
+    }
+
+    fn diffPath(self: *Job, path: []const u8) !?[]const u8 {
+        const a = self.arena.allocator();
+        const cwd = std.Io.Dir.cwd();
+        const info = cwd.statFile(self.io, path, .{}) catch |err| {
+            self.result.problem = try std.fmt.allocPrint(a, "Cannot read {s} ({s})", .{ path, @errorName(err) });
+            return null;
+        };
+        if (info.kind != .file) {
+            self.result.problem = try std.fmt.allocPrint(a, "Expected a regular file: {s}", .{path});
+            return null;
+        }
+        const resolved = try cwd.realPathFileAlloc(self.io, path, a);
+        cwd.access(self.io, resolved, .{ .read = true }) catch |err| {
+            self.result.problem = try std.fmt.allocPrint(a, "Cannot read {s} ({s})", .{ path, @errorName(err) });
+            return null;
+        };
+        return resolved;
     }
 
     fn loadPatch(self: *Job, file: File) !void {

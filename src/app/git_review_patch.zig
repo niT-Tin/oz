@@ -24,6 +24,12 @@ pub const View = struct {
     pairs: []const Pair = &.{},
     hunks: []const usize = &.{},
 
+    pub fn lineAt(self: View, at: usize, left: bool) ?u32 {
+        const pair = self.pairs[self.rows[at].pair];
+        const row = self.rows[(if (left) pair.left else pair.right) orelse return null];
+        return if (left) row.old else row.new;
+    }
+
     pub fn jump(self: View, at: usize, next: bool) usize {
         var lo: usize = 0;
         var hi = self.hunks.len;
@@ -57,7 +63,7 @@ pub fn parse(a: std.mem.Allocator, patch: []const u8) !View {
             old = rangeStart(fields.next() orelse continue, '-') orelse continue;
             new = rangeStart(fields.next() orelse continue, '+') orelse continue;
             try hunks.append(a, rows.items.len);
-            try rows.append(a, .{ .kind = .header, .text = line, .source_line = @max(new, 1) });
+            try rows.append(a, .{ .kind = .header, .text = line, .old = @max(old, 1), .new = @max(new, 1), .source_line = @max(new, 1) });
             first_change = true;
             continue;
         }

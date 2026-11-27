@@ -7,7 +7,7 @@ const data = @import("git_review_data.zig");
 const patch = @import("git_review_patch.zig");
 
 pub const Tab = enum { changes, history };
-const Slot = enum { changes, comparison, history, detail, change_patch, commit_patch };
+const Slot = enum { changes, comparison, history, detail, change_patch, commit_patch, file_diff };
 const Cache = struct {
     job: ?*data.Job = null,
     generation: u64 = 0,
@@ -23,6 +23,8 @@ pub const Cursor = struct { file: usize = 0, row: usize = 0, top: usize = 0 };
 
 pub const State = struct {
     open: bool = false,
+    file_diff: ?data.FilePair = null,
+    diff_prefix: ?enum { first, previous, next } = null,
     cwd: ?[]u8 = null,
     root: ?[]u8 = null,
     tab: Tab = .changes,
@@ -54,6 +56,10 @@ pub const State = struct {
         for (self.cache.values[0..]) |*c| c.clear();
         if (self.cwd) |cwd| a.free(cwd);
         if (self.root) |root| a.free(root);
+        if (self.file_diff) |pair| {
+            a.free(pair.left);
+            a.free(pair.right);
+        }
         if (self.history_tip) |tip| a.free(tip);
         self.message_previous.deinit(a);
         const caches = self.cache;
@@ -101,6 +107,7 @@ pub const State = struct {
     }
 
     pub fn patchSlot(self: *const State) Slot {
+        if (self.file_diff != null) return .file_diff;
         if (self.tab == .changes) return .change_patch;
         return if (self.commit.file == 0) .detail else .commit_patch;
     }
@@ -126,7 +133,7 @@ pub const State = struct {
     }
 
     pub fn aligned(self: *const State, width: usize) bool {
-        return split(width) and !self.unified;
+        return !self.unified and if (self.file_diff != null) width >= 72 else split(width);
     }
 };
 
@@ -138,6 +145,21 @@ pub fn open(app: *App) !void {
     else
         try app.currentRootDir();
     s.open = true;
+    schedule(app);
+}
+
+pub fn openFileDiff(app: *App, left: []const u8, right: []const u8) !void {
+    const s = &app.review;
+    s.close(app.alloc);
+    const cwd = try app.cwdPath();
+    errdefer app.alloc.free(cwd);
+    const owned_left = try app.alloc.dupe(u8, left);
+    errdefer app.alloc.free(owned_left);
+    const owned_right = try app.alloc.dupe(u8, right);
+    s.cwd = cwd;
+    s.file_diff = .{ .left = owned_left, .right = owned_right };
+    s.open = true;
+    s.change_focus = true;
     schedule(app);
 }
 
@@ -159,6 +181,7 @@ fn request(app: *App, slot: Slot, req: data.Request) void {
 fn schedule(app: *App) void {
     const s = &app.review;
     if (!s.open or s.running != null) return;
+    if (s.file_diff) |files| return request(app, .file_diff, .{ .file_diff = files });
     if (s.tab == .changes) {
         const changes = s.result(.changes) orelse return request(app, .changes, .changes);
         if (s.picker or changes.problem != null) return;
@@ -339,6 +362,7 @@ fn openSource(app: *App) !void {
 
 pub fn keyPress(app: *App, key: vaxis.Key) !void {
     const s = &app.review;
+    if (s.file_diff != null) return fileDiffKey(app, key);
     defer schedule(app);
     s.notice = null;
     const page: i32 = @max(@as(i32, app.vx.window().height) - 8, 1);
@@ -402,4 +426,62 @@ pub fn keyPress(app: *App, key: vaxis.Key) !void {
         resetDetail(s);
         s.parent = parent;
     }
+}
+
+fn fileDiffKey(app: *App, key: vaxis.Key) !void {
+    const s = &app.review;
+    const prefix = s.diff_prefix;
+    s.diff_prefix = null;
+    s.notice = null;
+    if (key.matches('q', .{}) or key.matches(vaxis.Key.escape, .{})) {
+        @import("buffers.zig").requestQuit(app, false);
+        return;
+    }
+    const page: i32 = @max(@as(i32, app.vx.window().height) - 3, 1);
+    if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) return move(app, 1);
+    if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) return move(app, -1);
+    if (key.matches(vaxis.Key.page_up, .{}) or key.matches('b', .{ .ctrl = true })) return move(app, -page);
+    if (key.matches(vaxis.Key.page_down, .{}) or key.matches('f', .{ .ctrl = true })) return move(app, page);
+    if (key.matches('o', .{})) return openFileDiffSource(app, true);
+    if (key.matches('O', .{})) return openFileDiffSource(app, false);
+    if (key.matches('v', .{})) s.unified = !s.unified;
+    if (key.matches('[', .{})) s.diff_prefix = .previous;
+    if (key.matches(']', .{})) s.diff_prefix = .next;
+    if (key.matches('c', .{}) and prefix != null and prefix.? != .first)
+        s.change.row = s.view().jump(s.change.row, prefix.? == .next);
+    if (key.matches('G', .{})) s.change.row = s.view().rows.len -| 1;
+    if (key.matches('g', .{})) {
+        if (prefix == .first) s.change.row = 0 else s.diff_prefix = .first;
+    }
+}
+
+fn openFileDiffSource(app: *App, left: bool) !void {
+    const s = &app.review;
+    const result = s.result(.file_diff) orelse return;
+    const files = result.file_pair orelse return;
+    if (result.problem != null) return;
+    const v = result.view;
+    const line = if (v.rows.len == 0) 1 else v.lineAt(@min(s.change.row, v.rows.len - 1), left) orelse {
+        s.notice = "The selected row has no line on this side";
+        return;
+    };
+    const path = if (left) files.left else files.right;
+    const stat = std.Io.Dir.cwd().statFile(app.io, path, .{}) catch {
+        s.notice = "Source file is no longer available";
+        return;
+    };
+    if (stat.kind != .file) {
+        s.notice = "Source is no longer a regular file";
+        return;
+    }
+    app.openFile(path) catch {
+        s.notice = "Could not open source file";
+        return;
+    };
+    if (!std.mem.eql(u8, app.cur().path orelse "", path)) {
+        s.notice = "Could not open source file";
+        return;
+    }
+    app.curCursor().* = app.cur().pt.lineStart(app.cur().pt.clampLine(line -| 1));
+    s.close(app.alloc);
 }

@@ -41,6 +41,18 @@ pub const std_options: std.Options = .{
 };
 
 pub fn main(init: std.process.Init) !void {
+    var it = std.process.Args.Iterator.init(init.minimal.args);
+    _ = it.next(); // program name
+    const first = it.next();
+    const files: ?[2][]const u8 = if (first) |arg| blk: {
+        if (!std.mem.eql(u8, arg, "-d") and !std.mem.eql(u8, arg, "--diff")) break :blk null;
+        var left = it.next() orelse diffUsage(init.io);
+        if (std.mem.eql(u8, left, "--")) left = it.next() orelse diffUsage(init.io);
+        const right = it.next() orelse diffUsage(init.io);
+        if (left.len == 0 or right.len == 0 or it.next() != null) diffUsage(init.io);
+        break :blk .{ left, right };
+    } else null;
+
     // Debug builds use the DebugAllocator, which captures a stack trace on
     // EVERY allocation — and MachO/DWARF stack unwinding on macOS is slow
     // enough to make typing visibly laggy once an LSP server is attached
@@ -53,10 +65,9 @@ pub fn main(init: std.process.Init) !void {
     defer app.destroy();
 
     // args: oz [file[:line]] ...
-    var it = std.process.Args.Iterator.init(init.minimal.args);
-    _ = it.next(); // program name
     var target_line: u32 = 0;
-    while (it.next()) |arg| {
+    var next = if (files == null) first else null;
+    while (next) |arg| : (next = it.next()) {
         if (arg.len == 0) continue;
         const content = arg[0 .. arg.len - 0];
         if (autil.parseLineArg(content)) |ln| {
@@ -128,10 +139,19 @@ pub fn main(init: std.process.Init) !void {
     // the CLI arg path edits cur() directly (no openInBuffer/switchTo), so
     // kick the LSP client and the git status refresh for the opened filetype
     // here.
-    app.ensureLsp();
-    app.scheduleGitStatus();
+    if (files) |pair| {
+        try @import("app/git_review.zig").openFileDiff(app, pair[0], pair[1]);
+    } else {
+        app.ensureLsp();
+        app.scheduleGitStatus();
+    }
     try app.loadRecent();
     defer app.saveRecent() catch {};
     try app.loadTheme();
     try app.run();
+}
+
+fn diffUsage(io: std.Io) noreturn {
+    std.Io.File.stderr().writeStreamingAll(io, "Usage: oz -d [--] <left-file> <right-file>\n") catch {};
+    std.process.exit(2);
 }

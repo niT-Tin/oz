@@ -20,4 +20,6 @@ Files shows two Git status columns, index then worktree. `M.` means staged, `.M`
 
 Open Git Review with `Space g v` or `:GitReview`. Press `Tab` to switch between Changes and History, `Enter` to read a patch, and `o` to open the corresponding source line.
 
+Compare two files with `oz -d old.txt new.txt`. Git must be on PATH. The read-only diff works outside a repository and uses a unified view in narrow terminals. Use `[c` and `]c` to jump between hunks, `v` to switch layouts on a wide terminal, `o` or `O` to open the left or right source, and `q` to quit.
+
 [Connect a coding agent](https://nit-tin.github.io/oz/?lang=en#agents) · [Build from source](https://nit-tin.github.io/oz/?lang=en#download) · [Changelog](CHANGELOG.md) · [MIT license](LICENSE)

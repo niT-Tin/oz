@@ -34593,6 +34593,100 @@ test "git: large tracked file drops a delayed dirty revision after undo and G" {
     try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q!\r"));
 }
 
+test "file diff: aligned hunks and literal paths outside Git" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128:0]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const left = "-old [a].txt";
+    const right = "new:2.txt";
+    var path_buf: [256]u8 = undefined;
+    const right_path = try bufPrintZ(&path_buf, "{s}/././././././././././././././././{s}", .{ root, right });
+    const block = "same\nsame\nsame\nsame\nsame\nsame\n";
+    const common = block ++ block ++ block;
+    const old_text = "HEAD\nALPHA-OLD\n" ++ common ++ "OMEGA-OLD\n";
+    const new_text = "HEAD\nALPHA-NEW\n" ++ common ++ "OMEGA-NEW\n";
+    try aiWriteFile(io, root, left, old_text);
+    try aiWriteFile(io, root, right, new_text);
+    var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "-d", "--", left, right_path }, null, 12, 90, root);
+    defer sess.close();
+    defer killPid(sess.pid);
+    var grid = try Grid.initSizedCols(a, 12, 90);
+    defer grid.deinit(a);
+    try gridWaitFor(&sess, &grid, "File diff", 5000);
+    try gridWaitFor(&sess, &grid, "ALPHA-NEW", 5000);
+    try std.testing.expect(grid.contains(left) and grid.contains(right));
+    const old = aiFindCell(&grid, "ALPHA-OLD") orelse return error.TestUnexpectedResult;
+    const new = aiFindCell(&grid, "ALPHA-NEW") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(old.row, new.row);
+    try std.testing.expect(old.col < new.col);
+    try std.testing.expect(!grid.contains("OMEGA-NEW"));
+
+    try sess.send("]c");
+    try gridWaitFor(&sess, &grid, "OMEGA-NEW", 5000);
+    try std.testing.expect(!grid.contains("ALPHA-NEW"));
+    try sess.send("[c");
+    try gridWaitFor(&sess, &grid, "ALPHA-NEW", 5000);
+    try sess.send("GO");
+    try gridWaitFor(&sess, &grid, "[NORMAL]", 5000);
+    try gridWaitPosition(&sess, &grid, 21, 0, 5000);
+    try std.testing.expect(grid.contains("OMEGA-NEW"));
+    try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit(":q\r"));
+
+    const old_saved = try aiReadFile(io, a, root, left);
+    defer a.free(old_saved);
+    const new_saved = try aiReadFile(io, a, root, right);
+    defer a.free(new_saved);
+    try std.testing.expectEqualStrings(old_text, old_saved);
+    try std.testing.expectEqualStrings(new_text, new_saved);
+}
+
+test "file diff: narrow view and clear identical, missing, and binary results" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var root_buf: [128:0]u8 = undefined;
+    const root = try aiMockDir(io, &root_buf);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try aiWriteFile(io, root, "left.txt", "old line\n");
+    try aiWriteFile(io, root, "right.txt", "new line\n");
+    try aiWriteFile(io, root, "left.bin", "old\x00data");
+    try aiWriteFile(io, root, "right.bin", "new\x00data");
+    const cases = [_]struct { lhs: []const u8, rhs: []const u8, wait: []const u8 }{
+        .{ .lhs = "left.txt", .rhs = "right.txt", .wait = "new line" },
+        .{ .lhs = "left.txt", .rhs = "left.txt", .wait = "Files are identical" },
+        .{ .lhs = "left.txt", .rhs = "missing.txt", .wait = "Cannot read missing.txt" },
+        .{ .lhs = ".", .rhs = "right.txt", .wait = "Expected a regular file" },
+        .{ .lhs = "left.bin", .rhs = "right.bin", .wait = "Binary files" },
+    };
+    for (cases) |case| {
+        var sess = try Session.spawnEnvSizeCwd(io, &.{ oz_exe_path, "--diff", case.lhs, case.rhs }, null, 16, 54, root);
+        defer sess.close();
+        defer killPid(sess.pid);
+        var grid = try Grid.initSizedCols(a, 16, 54);
+        defer grid.deinit(a);
+        try gridWaitFor(&sess, &grid, case.wait, 5000);
+        if (std.mem.eql(u8, case.rhs, "right.txt") and std.mem.eql(u8, case.lhs, "left.txt")) {
+            const old = aiFindCell(&grid, "old line") orelse return error.TestUnexpectedResult;
+            const new = aiFindCell(&grid, "new line") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(old.row + 1, new.row);
+        }
+        try std.testing.expectEqual(@as(u32, 0), try sess.commandAndWaitExit("q"));
+    }
+}
+
+test "file diff: invalid arguments report usage without a terminal" {
+    const result = try std.process.run(std.testing.allocator, std.testing.io, .{
+        .argv = &.{ oz_exe_path, "-d", "one-file" },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 2 }, result.term);
+    try std.testing.expect(std.mem.startsWith(u8, result.stderr, "Usage: oz -d"));
+}
+
 test "git review: navigate staged, unstaged and historical patches at 80 and 120 columns" {
     const io = std.testing.io;
     const a = std.testing.allocator;
@@ -34643,7 +34737,8 @@ test "git review: navigate staged, unstaged and historical patches at 80 and 120
         try gridWaitFor(&sess, &grid, "INDEX_ONLY_A", 6000);
         try std.testing.expect(grid.contains("NEWER_A") and !grid.contains("WORKTREE_ONLY_A"));
         try sess.send("\x1b");
-        try gridWaitFor(&sess, &grid, "Unstaged", 4000);
+        // The wide layout keeps the file list visible while the patch has focus.
+        try gridWaitFor(&sess, &grid, "Enter diff", 4000);
         try sess.send("j\r");
         try gridWaitFor(&sess, &grid, "WORKTREE_ONLY_A", 6000);
         try std.testing.expect(grid.contains("INDEX_ONLY_A") and !grid.contains("NEWER_A"));
